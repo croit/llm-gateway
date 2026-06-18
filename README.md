@@ -29,7 +29,7 @@ Every tool is **RBAC-gated per role**, and each user can flip their own grants o
 | **Memory** | `remember`, `recall` | Persist durable facts about the user (preferences, projects) and recall them in later conversations. |
 | **Network & ops** | `dns_lookup`, `whois_lookup`, `tls_cert`, `lookup_ip` | DNS-over-HTTPS records, RDAP domain registration, TLS-certificate inspection ("is this cert about to expire?"), and GeoIP for any IP or hostname. |
 | **Location** | `get_user_location` | Use the approximate IP-based location that's always in context, or ask the browser for precise GPS when the task needs it. |
-| **Utility** | `convert_currency`, `get_current_timestamp` | Convert currencies at daily ECB rates and get the timezone-aware current time. |
+| **Utility** | `convert_currency`, `get_current_timestamp`, `company_echo` | Convert currencies at daily ECB rates, get the timezone-aware current time, and echo a message back verbatim (`company_echo` is a built-in smoke test for the tool-call loop). |
 | **Knowledge base** | `rag_list_collections`, `rag_search` | Search operator-indexed codebases/corpora and get back the matching chunks with file paths, line ranges, and scores. |
 | **Integrations** | `mcp__<server>__*` | Call the tools of any bridged [MCP](https://modelcontextprotocol.io/) server. Each server's tools are namespaced so two servers can't collide. |
 
