@@ -9,6 +9,12 @@ target/
 # (transitive dep of the gateway build). Runtime Dockerfile COPYs it
 # into /usr/local/bin/typst alongside /app/gateway.
 !target/release/typst
+# pdfium shared library fetched into target/release/ by `mise run
+# fetch-pdfium` (transitive dep of the gateway build). Runtime
+# Dockerfile COPYs it into /usr/local/lib/libpdfium.so for the
+# fetch_attachment PDF reader's image tier. Without this re-include the
+# build context omits it and the COPY fails ("libpdfium.so: not found").
+!target/release/libpdfium.so
 .git/
 .gitignore
 .github/
