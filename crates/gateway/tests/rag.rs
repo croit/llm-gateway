@@ -204,7 +204,12 @@ async fn indexer_clones_chunks_embeds_then_search_returns_right_chunk() {
     assert_eq!(after.status, rag_db::CollectionStatus::Ready);
     assert!(after.last_indexed_commit.is_some());
 
-    let files = rag_db::list_files_for_collection(&pool, collection.id)
+    // Content now lives in the collection's own store, not the central DB.
+    let store = indexer
+        .collection_store(collection.id, after.data_uuid.as_deref().unwrap())
+        .await
+        .unwrap();
+    let files = rag_db::list_files_for_collection(&store, collection.id)
         .await
         .unwrap();
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
@@ -215,7 +220,7 @@ async fn indexer_clones_chunks_embeds_then_search_returns_right_chunk() {
     let total_chunks: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM rag_chunks WHERE collection_id = ?")
             .bind(collection.id)
-            .fetch_one(&pool)
+            .fetch_one(&store)
             .await
             .unwrap();
     assert!(
@@ -235,7 +240,7 @@ async fn indexer_clones_chunks_embeds_then_search_returns_right_chunk() {
     .pop()
     .unwrap();
 
-    let hits = search_chunks(&indexer, collection.id, &query_vec, 5)
+    let hits = search_chunks(&indexer, collection.id, "please find alpha", &query_vec, 5)
         .await
         .unwrap();
     assert!(!hits.is_empty(), "search returned no hits");
@@ -287,10 +292,15 @@ async fn reindex_after_edit_drops_old_chunks_and_picks_up_new_content() {
     .unwrap();
     indexer.index_one(collection.id).await.unwrap();
 
+    // Content lives in the collection's own store.
+    let store = indexer
+        .collection_store(collection.id, collection.data_uuid.as_deref().unwrap())
+        .await
+        .unwrap();
     let first_chunks: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM rag_chunks WHERE collection_id = ?")
             .bind(collection.id)
-            .fetch_one(&pool)
+            .fetch_one(&store)
             .await
             .unwrap();
     assert!(first_chunks > 0);
@@ -319,7 +329,7 @@ async fn reindex_after_edit_drops_old_chunks_and_picks_up_new_content() {
 
     // The collection's file count stays at 2 (no deletions), but the
     // alpha.txt content_hash must have changed.
-    let files = rag_db::list_files_for_collection(&pool, collection.id)
+    let files = rag_db::list_files_for_collection(&store, collection.id)
         .await
         .unwrap();
     let alpha = files.iter().find(|f| f.path == "alpha.txt").unwrap();
@@ -337,7 +347,7 @@ async fn reindex_after_edit_drops_old_chunks_and_picks_up_new_content() {
     .unwrap()
     .pop()
     .unwrap();
-    let hits = search_chunks(&indexer, collection.id, &qvec, 5)
+    let hits = search_chunks(&indexer, collection.id, "gamma please", &qvec, 5)
         .await
         .unwrap();
     assert!(!hits.is_empty());

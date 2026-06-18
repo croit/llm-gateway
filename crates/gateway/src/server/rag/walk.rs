@@ -65,6 +65,7 @@ impl Filter {
 
 #[derive(Debug, Clone)]
 enum Pattern {
+    All,               // bare `*` / `**` — match every path
     Extension(String), // ".rs" stored without the leading star+dot
     Prefix(String),    // "target/" stored as-is
     Contains(String),  // literal substring
@@ -72,7 +73,14 @@ enum Pattern {
 
 impl Pattern {
     fn parse(raw: &str) -> Self {
-        if let Some(rest) = raw.strip_prefix("*.") {
+        // A bare `*` (or `**`) is the operator's "everything" — the
+        // /rag form even hints `*.rs, *.md`, so people reach for `*`.
+        // We have no wildcard engine, so without this a lone `*` would
+        // fall through to `Contains("*")` and match nothing (no path
+        // holds a literal asterisk), silently indexing zero files.
+        if raw == "*" || raw == "**" {
+            Pattern::All
+        } else if let Some(rest) = raw.strip_prefix("*.") {
             Pattern::Extension(format!(".{rest}"))
         } else if raw.ends_with('/') {
             Pattern::Prefix(raw.to_string())
@@ -83,6 +91,7 @@ impl Pattern {
 
     fn matches(&self, path: &str) -> bool {
         match self {
+            Pattern::All => true,
             Pattern::Extension(ext) => path.ends_with(ext),
             Pattern::Prefix(p) => path.starts_with(p),
             Pattern::Contains(s) => path.contains(s),
@@ -204,6 +213,28 @@ mod tests {
         let f = Filter::new(&[], &["target/".into()], 1024);
         assert!(f.accepts("README.md"));
         assert!(f.accepts("src/main.rs"));
+    }
+
+    #[test]
+    fn bare_star_include_matches_everything() {
+        // Operators write `*` expecting "index everything" (it's the
+        // default the /rag form nudges toward). The hand-rolled matcher
+        // has no wildcard engine, so a literal `*` must be treated as
+        // match-all rather than a substring search for an asterisk —
+        // otherwise the include list rejects every file and the
+        // collection indexes nothing. Regression for the ceph-reef
+        // collection that indexed 0 files with `include = *`.
+        let f = Filter::new(&["*".into()], &["target/".into()], 1024);
+        assert!(f.accepts("README.md"));
+        assert!(f.accepts("src/osd/OSD.cc"));
+        // Excludes still win over a match-all include.
+        assert!(!f.accepts("target/debug/x"));
+    }
+
+    #[test]
+    fn double_star_include_matches_everything() {
+        let f = Filter::new(&["**".into()], &[], 1024);
+        assert!(f.accepts("a/b/c.py"));
     }
 
     #[test]

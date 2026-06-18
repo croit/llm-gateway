@@ -98,10 +98,14 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RagConfig {
-    /// Where the indexer stores its per-collection usearch files and
-    /// the git clone cache. The gateway will `mkdir -p` this on
-    /// startup, so the **parent** must already exist + be writable by
-    /// the runtime user (uid 1000 in the container image). Default is
+    /// Root for all per-collection RAG storage. Each collection gets its
+    /// own self-contained folder `<data_dir>/<uuid>/` holding `rag.sqlite`
+    /// (chunk text + FTS index), `index.usearch` (vectors), and `clone/`
+    /// (the git working tree). This is the only heavy / regenerable state,
+    /// so keep it separate from the precious central `[db].path` — e.g. on
+    /// a larger or cheaper drive/mount. The gateway `mkdir -p`s this on
+    /// startup, so the **parent** must already exist + be writable by the
+    /// runtime user (uid 1000 in the container image). Default is
     /// `data/rag` relative to the gateway's working directory.
     #[serde(default = "default_rag_data_dir")]
     pub data_dir: PathBuf,

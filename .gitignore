@@ -24,6 +24,11 @@ Cargo.lock.bak
 gateway.sqlite*
 /.playwright-cli/
 
+# Local dev RAG storage: the `[rag] data_dir` tree (default ./data/rag).
+# Per-collection sqlite + usearch vector indexes + git clone caches —
+# all regenerable and potentially many GB. Never commit.
+/data/
+
 # JS bundle source maps — emitted alongside crates/session-core/assets/*.js
 # by the esbuild step. The bundles themselves are committed (matching the
 # CSS bundle convention), but the maps are dev-only and large.

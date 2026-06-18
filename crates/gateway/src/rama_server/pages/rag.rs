@@ -383,8 +383,18 @@ pub async fn rag_delete(
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
+    // Capture the store-folder id before deleting the registry row so we
+    // can reap the on-disk folder (rag.sqlite + vectors + clone).
+    let uuid = rag_db::find_collection_by_id(&state.db, id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|c| c.data_uuid);
     match rag_db::delete_collection(&state.db, id).await {
         Ok(true) => {
+            if let (Some(indexer), Some(uuid)) = (state.indexer.as_ref(), uuid) {
+                indexer.drop_collection_storage(id, &uuid);
+            }
             let selector = format!("#rag-row-{id}");
             sse_response(&[
                 sse_patch(Some(&selector), Some("remove"), ""),

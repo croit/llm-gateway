@@ -66,6 +66,11 @@ impl CollectionStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Collection {
     pub id: i64,
+    /// Names this collection's on-disk store folder
+    /// (`<rag.data_dir>/<data_uuid>/`). `None` only for rows created
+    /// before the per-collection-store migration; the indexer assigns one
+    /// on the next index pass via [`assign_data_uuid`].
+    pub data_uuid: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub git_url: String,
@@ -127,6 +132,7 @@ fn map_collection_row(row: &SqliteRow) -> Result<Collection, DbError> {
     let status_s: String = row.try_get("status")?;
     Ok(Collection {
         id: row.try_get("id")?,
+        data_uuid: row.try_get("data_uuid")?,
         name: row.try_get("name")?,
         description: row.try_get("description")?,
         git_url: row.try_get("git_url")?,
@@ -146,7 +152,7 @@ fn map_collection_row(row: &SqliteRow) -> Result<Collection, DbError> {
     })
 }
 
-const COLLECTION_COLUMNS: &str = "id, name, description, git_url, git_ref, pat, \
+const COLLECTION_COLUMNS: &str = "id, data_uuid, name, description, git_url, git_ref, pat, \
      embedding_model, include_globs_json, exclude_globs_json, chunk_size, chunk_overlap, \
      status, last_indexed_at, last_indexed_commit, last_error, created_at, updated_at";
 
@@ -161,14 +167,18 @@ pub async fn create_collection(pool: &Pool, new: &NewCollection) -> Result<Colle
         column: "exclude_globs_json",
         source: e.into(),
     })?;
+    // Allocate the store-folder id up front so a freshly created
+    // collection already knows where its per-collection data will live.
+    let data_uuid = uuid::Uuid::new_v4().to_string();
     let id: i64 = sqlx::query_scalar(
         r#"INSERT INTO rag_collections
-           (name, description, git_url, git_ref, pat, embedding_model,
+           (data_uuid, name, description, git_url, git_ref, pat, embedding_model,
             include_globs_json, exclude_globs_json, chunk_size, chunk_overlap,
             status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
            RETURNING id"#,
     )
+    .bind(&data_uuid)
     .bind(&new.name)
     .bind(&new.description)
     .bind(&new.git_url)
@@ -288,6 +298,17 @@ pub async fn delete_collection(pool: &Pool, id: i64) -> Result<bool, DbError> {
         .await?
         .rows_affected();
     Ok(affected > 0)
+}
+
+/// Backfill the store-folder id for a pre-migration row that has none.
+/// Called by the indexer the first time it touches such a collection.
+pub async fn assign_data_uuid(pool: &Pool, id: i64, data_uuid: &str) -> Result<(), DbError> {
+    sqlx::query("UPDATE rag_collections SET data_uuid = ? WHERE id = ?")
+        .bind(data_uuid)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 // ---- file-side metadata ---------------------------------------------------
@@ -470,6 +491,61 @@ pub async fn max_vector_id(pool: &Pool, collection_id: i64) -> Result<Option<i64
     Ok(max)
 }
 
+/// Lexical (BM25) search over chunk text for one collection via the
+/// `rag_chunks_fts` index. Returns matching `vector_id`s best-first
+/// (smaller bm25 = better). The raw query is sanitised into a bag of
+/// OR-ed alphanumeric tokens (see [`fts_match_query`]) so arbitrary user
+/// prose can never trip FTS5's MATCH operator grammar, and so recall
+/// stays wide — BM25 ranking sorts out precision. An empty/too-short
+/// query yields no hits.
+pub async fn lexical_search(
+    pool: &Pool,
+    collection_id: i64,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<i64>, DbError> {
+    let match_query = fts_match_query(query);
+    if match_query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<i64> = sqlx::query_scalar(
+        r#"SELECT c.vector_id
+           FROM rag_chunks_fts
+           JOIN rag_chunks c ON c.id = rag_chunks_fts.rowid
+           WHERE rag_chunks_fts MATCH ?1 AND c.collection_id = ?2
+           ORDER BY bm25(rag_chunks_fts) ASC
+           LIMIT ?3"#,
+    )
+    .bind(&match_query)
+    .bind(collection_id)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Turn arbitrary user text into a safe FTS5 MATCH expression: lowercase
+/// alphanumeric tokens, de-duplicated, length >= 2, joined with ` OR `.
+/// Splitting on every non-alphanumeric char means `osd_op_timeout`
+/// becomes `osd OR op OR timeout`, which matches both the underscored
+/// identifier and a spaced-out "osd op timeout" query. Tokens are
+/// alphanumeric by construction, so there's nothing for FTS5 to
+/// misinterpret as a column filter, NEAR clause, or quote.
+fn fts_match_query(query: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut tokens: Vec<String> = Vec::new();
+    for raw in query.split(|c: char| !c.is_alphanumeric()) {
+        if raw.len() < 2 {
+            continue;
+        }
+        let tok = raw.to_lowercase();
+        if seen.insert(tok.clone()) {
+            tokens.push(tok);
+        }
+    }
+    tokens.join(" OR ")
+}
+
 /// Resolve a batch of `(collection_id, vector_id)` hits from a usearch
 /// search back into chunk rows so the tool can surface provenance.
 /// Preserves caller order; missing rows are dropped silently (they would
@@ -586,30 +662,39 @@ mod tests {
         assert!(after_ok.last_error.is_none());
     }
 
-    #[tokio::test]
-    async fn upsert_file_returns_stable_id_and_updates_hash() {
-        let pool = fresh().await;
-        let c = create_collection(&pool, &sample_new()).await.unwrap();
-        let id1 = upsert_file(&pool, c.id, "src/main.rs", "hash-a")
+    /// A standalone per-collection content store (files/chunks/FTS live
+    /// here now, not in the central DB). Returns the pool plus the
+    /// tempdir, which the caller must keep alive for the pool's lifetime.
+    async fn store() -> (Pool, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = crate::server::db::open_collection_store(&dir.path().join("rag.sqlite"))
             .await
             .unwrap();
-        let id2 = upsert_file(&pool, c.id, "src/main.rs", "hash-b")
+        (pool, dir)
+    }
+
+    #[tokio::test]
+    async fn upsert_file_returns_stable_id_and_updates_hash() {
+        let (store, _dir) = store().await;
+        let id1 = upsert_file(&store, 1, "src/main.rs", "hash-a")
+            .await
+            .unwrap();
+        let id2 = upsert_file(&store, 1, "src/main.rs", "hash-b")
             .await
             .unwrap();
         assert_eq!(id1, id2, "upsert must keep the same row id");
-        let files = list_files_for_collection(&pool, c.id).await.unwrap();
+        let files = list_files_for_collection(&store, 1).await.unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].content_hash, "hash-b");
     }
 
     #[tokio::test]
     async fn chunks_round_trip_with_vector_id_join() {
-        let pool = fresh().await;
-        let c = create_collection(&pool, &sample_new()).await.unwrap();
-        let f = upsert_file(&pool, c.id, "src/lib.rs", "h").await.unwrap();
+        let (store, _dir) = store().await;
+        let f = upsert_file(&store, 1, "src/lib.rs", "h").await.unwrap();
         insert_chunks(
-            &pool,
-            c.id,
+            &store,
+            1,
             &[
                 NewChunk {
                     file_id: f,
@@ -631,10 +716,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(max_vector_id(&pool, c.id).await.unwrap(), Some(11));
+        assert_eq!(max_vector_id(&store, 1).await.unwrap(), Some(11));
 
         // Caller-order preserved; missing ids dropped.
-        let resolved = chunks_by_vector_ids(&pool, c.id, &[11, 999, 10])
+        let resolved = chunks_by_vector_ids(&store, 1, &[11, 999, 10])
             .await
             .unwrap();
         assert_eq!(resolved.len(), 2);
@@ -643,38 +728,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_collection_cascades_files_and_chunks() {
-        let pool = fresh().await;
-        let c = create_collection(&pool, &sample_new()).await.unwrap();
-        let f = upsert_file(&pool, c.id, "src/x.rs", "h").await.unwrap();
+    async fn lexical_search_ranks_exact_token_hit() {
+        // FTS5 lexical side: an identifier query should match the chunk
+        // whose underscored symbol tokenizes to the same terms.
+        let (store, _dir) = store().await;
+        let f = upsert_file(&store, 1, "global.yaml.in", "h").await.unwrap();
         insert_chunks(
-            &pool,
-            c.id,
-            &[NewChunk {
-                file_id: f,
-                chunk_index: 0,
-                start_line: 1,
-                end_line: 1,
-                content: "x".into(),
-                vector_id: 1,
-            }],
+            &store,
+            1,
+            &[
+                NewChunk {
+                    file_id: f,
+                    chunk_index: 0,
+                    start_line: 1,
+                    end_line: 1,
+                    content: "name: osd_op_timeout desc: timeout for osd ops".into(),
+                    vector_id: 1,
+                },
+                NewChunk {
+                    file_id: f,
+                    chunk_index: 1,
+                    start_line: 2,
+                    end_line: 2,
+                    content: "crush choose_total_tries placement retries".into(),
+                    vector_id: 2,
+                },
+            ],
         )
         .await
         .unwrap();
-        assert!(delete_collection(&pool, c.id).await.unwrap());
-        assert!(
-            list_files_for_collection(&pool, c.id)
-                .await
-                .unwrap()
-                .is_empty()
+        let hits = lexical_search(&store, 1, "osd op timeout", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.first(),
+            Some(&1),
+            "exact-token chunk should rank first"
         );
-        let leftover: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM rag_chunks WHERE collection_id = ?")
-                .bind(c.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(leftover, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_collection_removes_registry_row() {
+        // Content lives in a separate per-collection store now, so there's
+        // no FK cascade to assert here — deleting the registry row just
+        // unregisters the collection (the indexer reaps the folder
+        // separately via `drop_collection_storage`).
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        assert!(find_collection_by_id(&pool, c.id).await.unwrap().is_some());
+        assert!(
+            c.data_uuid.is_some(),
+            "create must allocate a store folder id"
+        );
+        assert!(delete_collection(&pool, c.id).await.unwrap());
+        assert!(find_collection_by_id(&pool, c.id).await.unwrap().is_none());
+        assert!(
+            !delete_collection(&pool, c.id).await.unwrap(),
+            "deleting a missing row is a clean false"
+        );
     }
 
     #[tokio::test]

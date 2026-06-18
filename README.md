@@ -164,6 +164,36 @@ Notes:
 - Capability gating isn't done at the gateway — wire only multi-modal chat models into the pools. A mismatch surfaces as the upstream's own error in the chat bubble.
 - Past-turn attachments are stripped from the replayed history (kept as `[attached: name.ext (omitted)]` stubs) so the context window stays bounded.
 
+### RAG (codebase search)
+
+Point the gateway at git repositories; it clones, chunks, and embeds them, and exposes them to the chat model through the `rag_search` tool (plus `rag_list_collections`, so the model can discover what's available). It's for "answer from *our* code and docs" without stuffing a whole repo into the context window.
+
+**Requirements:** an `embedding`-kind upstream pool (chunks and queries are embedded through it), `git` on the host PATH (the indexer shells out to it — the container image ships it), and a `[rag]` block. The block is optional and has exactly one knob:
+
+```toml
+[rag]
+data_dir = "/mnt/data/gateway-rag"   # optional; default ./data/rag
+```
+
+Each collection gets a self-contained folder `<data_dir>/<uuid>/` holding its SQLite store (chunk text + lexical index), its `index.usearch` (vectors), and the git `clone/`. This is the heavy, fully regenerable state — put `data_dir` on a big/cheap disk, separate from the small `[db].path` you actually back up. Deleting a collection in the UI removes its folder.
+
+**Adding a collection.** As an admin, open `/rag` (or `POST /api/v0/rag/collections`) and provide: a name, git URL + branch/tag, an optional PAT for private repos, the embedding model id, include/exclude globs, and chunk size/overlap (characters; default 800/100). A background worker clones and embeds it; status moves `pending → cloning → indexing → ready` (or `error`, with the message shown). **Re-index** re-pulls and re-embeds only the files whose content changed.
+
+**Globs** match the repo-relative path, in three forms (there is no full glob engine):
+
+| Pattern | Matches |
+|---|---|
+| `*.rs`, `*.md` | file extension |
+| `src/`, `target/` | path prefix (note the trailing slash) |
+| `vendor`, `node_modules` | substring anywhere in the path |
+| `*` or `**` | everything |
+
+An empty include list means "everything not excluded." Binaries, files larger than 1 MB, and `.git/` are always skipped; excludes win over includes.
+
+**Retrieval is hybrid.** A query runs against both a dense vector index (usearch, cosine) and a lexical BM25 index (SQLite FTS5), and the two rankings are fused with reciprocal rank fusion. Dense recall catches paraphrases; lexical recall catches exact identifiers (e.g. `osd_op_timeout`) that embeddings tend to blur. Queries are embedded with an instruction prefix (asymmetric retrieval); documents are embedded bare.
+
+**Sizing.** The vector index dominates disk, at roughly `chunks × embedding_dims × 4 bytes`. With a 4096-dim model (e.g. `Qwen3-Embedding-8B`) that's ~16 KB per chunk, so a codebase that splits into ~100k chunks needs ~1.5 GB. Embedding is the slow part of indexing — budget time accordingly for large repos, and prefer narrow globs (source + docs) over `*` on a huge tree.
+
 ## Using the gateway
 
 **1 — Get an API token.** Either:

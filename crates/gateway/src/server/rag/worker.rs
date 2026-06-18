@@ -35,6 +35,12 @@ use crate::server::rag::index::{CollectionIndex, IndexError};
 use crate::server::rag::walk::{self, Filter};
 use crate::server::upstreams::UpstreamRegistry;
 
+/// Instruction prefix prepended to *query* embeddings (see
+/// [`Indexer::embed_query`]). Kept here next to the indexer so the
+/// query side and the (bare) document side are obviously paired.
+const QUERY_INSTRUCTION: &str = "Instruct: Given a code-search question, retrieve the source-code or \
+     documentation passages that answer it\nQuery: ";
+
 /// Tunable knobs the indexer reads at construction time. The default
 /// values are sized for "single small-medium codebase per collection";
 /// operators can tighten them in config when running on constrained
@@ -87,6 +93,9 @@ pub struct Indexer {
 }
 
 struct IndexerInner {
+    /// Central registry DB (`gateway.sqlite`) — holds `rag_collections`
+    /// config/status only. Per-collection content lives in each
+    /// collection's own store (see `stores`).
     db: Pool,
     upstreams: Arc<UpstreamRegistry>,
     http: reqwest::Client,
@@ -95,6 +104,10 @@ struct IndexerInner {
     /// search/insert. Kept around so subsequent operations skip the
     /// metadata-read + mmap setup.
     indexes: Mutex<HashMap<i64, Arc<CollectionIndex>>>,
+    /// One SQLite [`Pool`] per collection over its `rag.sqlite` store
+    /// (`<data_dir>/<uuid>/rag.sqlite`), opened lazily and cached so we
+    /// don't re-open the file per query. Keyed by collection id.
+    stores: Mutex<HashMap<i64, Pool>>,
 }
 
 impl Indexer {
@@ -140,6 +153,7 @@ impl Indexer {
                 http,
                 config,
                 indexes: Mutex::new(HashMap::new()),
+                stores: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -153,8 +167,9 @@ impl Indexer {
     }
 
     /// Embed a single text through the configured embedding model. The
-    /// search tool uses this to vectorise a user query before reaching
-    /// `search_chunks`.
+    /// indexer uses this for document chunks; queries should go through
+    /// [`Indexer::embed_query`] instead so they carry the instruction
+    /// prefix.
     pub async fn embed_one(&self, model: &str, text: &str) -> Result<Vec<f32>, EmbedError> {
         let mut out = embeddings::embed(
             &self.inner.http,
@@ -169,29 +184,78 @@ impl Indexer {
         })
     }
 
-    /// Path on disk for `collection_id`'s usearch file.
-    fn index_path(&self, collection_id: i64) -> PathBuf {
-        self.inner
-            .config
-            .data_dir
-            .join(format!("{collection_id}.usearch"))
+    /// Embed a user *query* for retrieval. Qwen3-Embedding (and the BGE /
+    /// E5 family generally) is instruction-tuned and **asymmetric**: the
+    /// query side is meant to carry a task instruction while the document
+    /// side is embedded bare. We embed chunks bare in [`Self::index_one`]
+    /// and add the instruction here, matching the model's recommended
+    /// format. This lifts the query and its matching passages into the
+    /// same region of the space, so a natural-language ask like "osd
+    /// operation timeout" lands near the option that defines it instead of
+    /// drifting toward lexically-similar but unrelated code.
+    ///
+    /// Embedding models that ignore the prefix simply treat it as a few
+    /// extra tokens — harmless. The prefix is deliberately generic so it
+    /// works for prose docs and source alike.
+    pub async fn embed_query(&self, model: &str, query: &str) -> Result<Vec<f32>, EmbedError> {
+        let text = format!("{QUERY_INSTRUCTION}{query}");
+        self.embed_one(model, &text).await
     }
 
-    /// Path on disk for `collection_id`'s clone cache.
-    fn clone_path(&self, collection_id: i64) -> PathBuf {
-        self.inner
-            .config
-            .data_dir
-            .join("cache")
-            .join(format!("{collection_id}"))
+    /// This collection's self-contained store folder,
+    /// `<data_dir>/<uuid>/`. All of a collection's regenerable state —
+    /// `rag.sqlite`, `index.usearch`, `clone/` — lives under here, so
+    /// teardown is a single `rm -rf`.
+    fn collection_dir(&self, uuid: &str) -> PathBuf {
+        self.inner.config.data_dir.join(uuid)
     }
 
-    /// Lookup-or-open the in-memory index handle for `collection_id`.
+    /// Path on disk for this collection's usearch vector file.
+    fn index_path(&self, uuid: &str) -> PathBuf {
+        self.collection_dir(uuid).join("index.usearch")
+    }
+
+    /// Path on disk for this collection's git clone working tree.
+    fn clone_path(&self, uuid: &str) -> PathBuf {
+        self.collection_dir(uuid).join("clone")
+    }
+
+    /// Lookup-or-open the per-collection SQLite store pool (its
+    /// `rag.sqlite`), cached by collection id.
+    pub async fn collection_store(
+        &self,
+        collection_id: i64,
+        uuid: &str,
+    ) -> Result<Pool, crate::server::db::DbError> {
+        if let Some(existing) = self
+            .inner
+            .stores
+            .lock()
+            .expect("indexer store cache mutex poisoned")
+            .get(&collection_id)
+        {
+            return Ok(existing.clone());
+        }
+        let path = self.collection_dir(uuid).join("rag.sqlite");
+        let pool = crate::server::db::open_collection_store(&path).await?;
+        let mut guard = self
+            .inner
+            .stores
+            .lock()
+            .expect("indexer store cache mutex poisoned");
+        // Another task may have opened it while we awaited; keep the first.
+        let entry = guard.entry(collection_id).or_insert(pool);
+        Ok(entry.clone())
+    }
+
+    /// Lookup-or-open the in-memory index handle for a collection (keyed
+    /// by id; file lives under the collection's `uuid` folder).
     /// `dimensions` is required for the first call — subsequent calls
     /// can pass `None` (we use the loaded index's dim).
     pub fn open_index(
         &self,
         collection_id: i64,
+        uuid: &str,
         dimensions: Option<usize>,
     ) -> Result<Arc<CollectionIndex>, IndexError> {
         let mut guard = self
@@ -202,7 +266,7 @@ impl Indexer {
         if let Some(existing) = guard.get(&collection_id) {
             return Ok(Arc::clone(existing));
         }
-        let path = self.index_path(collection_id);
+        let path = self.index_path(uuid);
         let dim = match (path.exists(), dimensions) {
             (true, _) => {
                 // Discover from the file header rather than trust the
@@ -229,6 +293,35 @@ impl Indexer {
         Ok(index)
     }
 
+    /// Tear down a collection's on-disk storage: evict the cached store
+    /// pool + index handle, then `rm -rf` its `<data_dir>/<uuid>/` folder
+    /// (rag.sqlite + index.usearch + clone/). Call after deleting the
+    /// central registry row. Best-effort on the filesystem — a failed
+    /// remove only logs, since the row is already gone.
+    pub fn drop_collection_storage(&self, collection_id: i64, uuid: &str) {
+        // Drop cached handles first so we're not holding the files open.
+        self.inner
+            .indexes
+            .lock()
+            .expect("indexer cache mutex poisoned")
+            .remove(&collection_id);
+        self.inner
+            .stores
+            .lock()
+            .expect("indexer store cache mutex poisoned")
+            .remove(&collection_id);
+        let dir = self.collection_dir(uuid);
+        if let Err(err) = std::fs::remove_dir_all(&dir)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                error = %err,
+                dir = %dir.display(),
+                "rag: failed to remove collection storage folder"
+            );
+        }
+    }
+
     /// Run the full pipeline against one collection. Returns the
     /// resolved HEAD commit on success. Any error path also surfaces
     /// `mark_failed` against the DB row.
@@ -248,13 +341,27 @@ impl Indexer {
             .await?
             .ok_or(WorkerError::NotFound { id: collection_id })?;
 
+        // Resolve this collection's store-folder id. Pre-migration rows
+        // have none yet; mint one and persist it so the folder is stable.
+        let uuid = match collection.data_uuid.clone() {
+            Some(u) => u,
+            None => {
+                let u = uuid::Uuid::new_v4().to_string();
+                rag_db::assign_data_uuid(&self.inner.db, collection.id, &u).await?;
+                u
+            }
+        };
+        // All content (files/chunks/FTS) goes to the per-collection store,
+        // never the central registry DB.
+        let store = self.collection_store(collection.id, &uuid).await?;
+
         rag_db::set_collection_status(
             &self.inner.db,
             collection.id,
             rag_db::CollectionStatus::Cloning,
         )
         .await?;
-        let clone_dir = self.clone_path(collection.id);
+        let clone_dir = self.clone_path(&uuid);
         let head = git::clone_or_update(
             &collection.git_url,
             &collection.git_ref,
@@ -278,11 +385,11 @@ impl Indexer {
         let walked = walk::walk(&clone_dir, &filter)?;
 
         // Snapshot the prior file state for diffing.
-        let prior = rag_db::list_files_for_collection(&self.inner.db, collection.id).await?;
+        let prior = rag_db::list_files_for_collection(&store, collection.id).await?;
         let mut prior_by_path: HashMap<String, rag_db::IndexedFile> =
             prior.into_iter().map(|f| (f.path.clone(), f)).collect();
 
-        let mut next_vector_id = rag_db::max_vector_id(&self.inner.db, collection.id)
+        let mut next_vector_id = rag_db::max_vector_id(&store, collection.id)
             .await?
             .map(|v| v + 1)
             .unwrap_or(1);
@@ -309,9 +416,8 @@ impl Indexer {
 
             // Re-embedding this file — drop the old chunks + vectors first.
             if let Some(prior_file) = prior_by_path.remove(&file.rel_path) {
-                let old_vids =
-                    rag_db::chunk_vector_ids_for_file(&self.inner.db, prior_file.id).await?;
-                rag_db::delete_chunks_for_file(&self.inner.db, prior_file.id).await?;
+                let old_vids = rag_db::chunk_vector_ids_for_file(&store, prior_file.id).await?;
+                rag_db::delete_chunks_for_file(&store, prior_file.id).await?;
                 if let Some(idx) = &index {
                     for vid in old_vids {
                         idx.remove(vid)?;
@@ -329,8 +435,7 @@ impl Indexer {
                 continue;
             }
 
-            let file_id =
-                rag_db::upsert_file(&self.inner.db, collection.id, &file.rel_path, &hash).await?;
+            let file_id = rag_db::upsert_file(&store, collection.id, &file.rel_path, &hash).await?;
 
             // Embed in batches; on the first response, open / sanity-check
             // the index using the discovered dimensionality.
@@ -351,7 +456,7 @@ impl Indexer {
                     Some(i) => Arc::clone(i),
                     None => {
                         dimensions = Some(dim);
-                        let opened = self.open_index(collection.id, Some(dim))?;
+                        let opened = self.open_index(collection.id, &uuid, Some(dim))?;
                         index = Some(Arc::clone(&opened));
                         opened
                     }
@@ -378,7 +483,7 @@ impl Indexer {
                     });
                     to_index.push((vid, vec.clone()));
                 }
-                rag_db::insert_chunks(&self.inner.db, collection.id, &new_chunks).await?;
+                rag_db::insert_chunks(&store, collection.id, &new_chunks).await?;
                 for (vid, vec) in to_index {
                     idx.add(vid, &vec)?;
                 }
@@ -388,9 +493,9 @@ impl Indexer {
         // Files left in `prior_by_path` are deletions on this pass — drop
         // their chunks/vectors so a tombstoned file disappears from search.
         for (_, gone) in prior_by_path.drain() {
-            let old_vids = rag_db::chunk_vector_ids_for_file(&self.inner.db, gone.id).await?;
-            rag_db::delete_chunks_for_file(&self.inner.db, gone.id).await?;
-            rag_db::delete_file(&self.inner.db, gone.id).await?;
+            let old_vids = rag_db::chunk_vector_ids_for_file(&store, gone.id).await?;
+            rag_db::delete_chunks_for_file(&store, gone.id).await?;
+            rag_db::delete_file(&store, gone.id).await?;
             if let Some(idx) = &index {
                 for vid in old_vids {
                     idx.remove(vid)?;
@@ -447,35 +552,103 @@ fn sha256_hex(s: &str) -> String {
     out
 }
 
-/// Convenience: search the in-memory index for `collection_id`,
-/// preserving the vector_id <-> chunk join. Public so the future
-/// `rag_search` tool can reach into the indexer directly without
-/// rebuilding the index cache.
+/// Reciprocal-rank-fusion constant. The standard k=60 from Cormack et
+/// al.; it damps the contribution of low-ranked items so the head of
+/// each list dominates without any single list being able to veto.
+const RRF_K: f64 = 60.0;
+/// Per-retriever candidate pool size relative to the caller's final `k`.
+/// We pull more from each side than we'll return so fusion has room to
+/// rerank across the dense and lexical signals.
+const CANDIDATE_MULTIPLIER: usize = 4;
+const MIN_CANDIDATES: usize = 20;
+
+/// Fuse several ranked id-lists into one via Reciprocal Rank Fusion.
+/// Each list contributes `1 / (RRF_K + rank)` to an id's score (rank
+/// 1-based). Rank position is all that matters — no need to calibrate a
+/// cosine distance against a BM25 score. Returns `(vector_id, score)`
+/// best-first, capped at `k`; ties break by id for deterministic output.
+fn reciprocal_rank_fusion(lists: &[&[i64]], k: usize) -> Vec<(i64, f64)> {
+    let mut scores: HashMap<i64, f64> = HashMap::new();
+    for list in lists {
+        for (rank, &id) in list.iter().enumerate() {
+            *scores.entry(id).or_insert(0.0) += 1.0 / (RRF_K + (rank as f64) + 1.0);
+        }
+    }
+    let mut ranked: Vec<(i64, f64)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    ranked.truncate(k);
+    ranked
+}
+
+/// Hybrid retrieval for `collection_id`: dense vector kNN fused with
+/// FTS5/BM25 lexical ranking. Dense recall catches paraphrase and
+/// conceptual matches; lexical recall catches exact identifiers
+/// (`osd_op_timeout`) that embeddings smear across neighbours. The two
+/// are combined with reciprocal rank fusion so neither dominates.
+///
+/// Either side degrading is non-fatal: a collection whose usearch file
+/// hasn't been built yet still answers from the lexical index, and a
+/// query with no usable lexical tokens still answers from vectors. The
+/// returned `f32` is the RRF score (higher = more relevant), not a
+/// cosine distance. Public so the `rag_search` tool can reach the
+/// indexer directly without rebuilding the index cache.
 pub async fn search_chunks(
     indexer: &Indexer,
     collection_id: i64,
+    query_text: &str,
     query_vec: &[f32],
     k: usize,
 ) -> Result<Vec<(rag_db::Chunk, f32)>, WorkerError> {
-    let index = match indexer.open_index(collection_id, None) {
-        Ok(i) => i,
-        // No on-disk index yet → collection never finished indexing.
-        Err(IndexError::Open { .. }) => return Ok(Vec::new()),
-        Err(other) => return Err(other.into()),
-    };
-    let hits = index.search(query_vec, k)?;
-    if hits.is_empty() {
+    if k == 0 {
         return Ok(Vec::new());
     }
-    let vids: Vec<i64> = hits.iter().map(|(v, _)| *v).collect();
-    let chunks = rag_db::chunks_by_vector_ids(&indexer.inner.db, collection_id, &vids).await?;
-    // Re-join in `hits` order, dropping any vector ids whose chunk row
-    // didn't come back (index/db drift; rare).
+
+    // Resolve the collection's store folder. No row, or no folder id yet
+    // (never indexed) → nothing to search.
+    let Some(collection) = rag_db::find_collection_by_id(&indexer.inner.db, collection_id).await?
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(uuid) = collection.data_uuid else {
+        return Ok(Vec::new());
+    };
+    let store = indexer.collection_store(collection_id, &uuid).await?;
+
+    let pool = (k * CANDIDATE_MULTIPLIER).max(MIN_CANDIDATES);
+
+    // Dense side. A missing on-disk index (collection never finished
+    // indexing) is not an error here — fall back to lexical-only.
+    let dense: Vec<i64> = match indexer.open_index(collection_id, &uuid, None) {
+        Ok(index) => index
+            .search(query_vec, pool)?
+            .into_iter()
+            .map(|(vid, _)| vid)
+            .collect(),
+        Err(IndexError::Open { .. }) => Vec::new(),
+        Err(other) => return Err(other.into()),
+    };
+
+    // Lexical side (BM25 over chunk text) — from the per-collection store.
+    let lexical = rag_db::lexical_search(&store, collection_id, query_text, pool).await?;
+
+    let fused = reciprocal_rank_fusion(&[&dense, &lexical], k);
+    if fused.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let vids: Vec<i64> = fused.iter().map(|(vid, _)| *vid).collect();
+    let chunks = rag_db::chunks_by_vector_ids(&store, collection_id, &vids).await?;
     let mut by_vid: HashMap<i64, rag_db::Chunk> =
         chunks.into_iter().map(|c| (c.vector_id, c)).collect();
-    Ok(hits
+    // Re-join in fused order, carrying the RRF score; drop any vector id
+    // whose chunk row didn't come back (index/db drift; rare).
+    Ok(fused
         .into_iter()
-        .filter_map(|(vid, score)| by_vid.remove(&vid).map(|c| (c, score)))
+        .filter_map(|(vid, score)| by_vid.remove(&vid).map(|c| (c, score as f32)))
         .collect())
 }
 
@@ -519,12 +692,12 @@ mod tests {
                 ..IndexerConfig::default()
             },
         );
-        let a = indexer.open_index(1, Some(4)).unwrap();
-        let b = indexer.open_index(1, Some(4)).unwrap();
+        let a = indexer.open_index(1, "uuid-1", Some(4)).unwrap();
+        let b = indexer.open_index(1, "uuid-1", Some(4)).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         // Discovery path: a fresh handle for collection 1 should accept
         // a `None` dim hint now that the file exists.
-        let c = indexer.open_index(1, None).unwrap();
+        let c = indexer.open_index(1, "uuid-1", None).unwrap();
         assert_eq!(c.dimensions(), 4);
     }
 }

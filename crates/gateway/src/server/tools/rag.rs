@@ -157,25 +157,29 @@ impl Tool for RagSearch {
                 )));
             }
 
+            // Asymmetric query embedding (instruction-prefixed); documents
+            // were embedded bare at index time. See `Indexer::embed_query`.
             let query_vec = indexer
-                .embed_one(&collection.embedding_model, &args.query)
+                .embed_query(&collection.embedding_model, &args.query)
                 .await
                 .map_err(|e| ToolError::Failed(format!("embedding query: {e}")))?;
-            let hits = worker::search_chunks(indexer, collection.id, &query_vec, top_k)
-                .await
-                .map_err(|e| ToolError::Failed(format!("searching index: {e}")))?;
+            let hits =
+                worker::search_chunks(indexer, collection.id, &args.query, &query_vec, top_k)
+                    .await
+                    .map_err(|e| ToolError::Failed(format!("searching index: {e}")))?;
 
             let results: Vec<Value> = hits
                 .into_iter()
-                .map(|(chunk, distance)| {
+                .map(|(chunk, score)| {
                     json!({
                         "file_path": chunk.file_path,
                         "start_line": chunk.start_line,
                         "end_line": chunk.end_line,
-                        // usearch's `Cos` metric returns cosine *distance*
-                        // (smaller = closer). Surface a similarity in
-                        // [-1, 1] so the model has a familiar shape.
-                        "similarity": 1.0 - distance,
+                        // Hybrid (dense + lexical) relevance via reciprocal
+                        // rank fusion — higher is more relevant. Relative,
+                        // not an absolute similarity; use it only to order
+                        // the hits within this result set.
+                        "score": score,
                         "content": chunk.content,
                     })
                 })
@@ -392,11 +396,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let f = rag_db::upsert_file(&pool, c.id, "src/alpha.rs", "hashA")
+        // Content lives in the per-collection store, not the central DB.
+        let uuid = c.data_uuid.clone().unwrap();
+        let store = indexer.collection_store(c.id, &uuid).await.unwrap();
+        let f = rag_db::upsert_file(&store, c.id, "src/alpha.rs", "hashA")
             .await
             .unwrap();
         rag_db::insert_chunks(
-            &pool,
+            &store,
             c.id,
             &[rag_db::NewChunk {
                 file_id: f,
@@ -410,7 +417,7 @@ mod tests {
         .await
         .unwrap();
         // Open the index, push the matching vector.
-        let idx = indexer.open_index(c.id, Some(4)).unwrap();
+        let idx = indexer.open_index(c.id, &uuid, Some(4)).unwrap();
         let v = embeddings::embed(
             &reqwest::Client::new(),
             &reg,
@@ -438,7 +445,9 @@ mod tests {
         .unwrap()
         .pop()
         .unwrap();
-        let raw = search_chunks(&indexer, c.id, &q, 5).await.unwrap();
+        let raw = search_chunks(&indexer, c.id, "alpha please", &q, 5)
+            .await
+            .unwrap();
         assert!(!raw.is_empty(), "lower layer returned no hits");
 
         let out = RagSearch

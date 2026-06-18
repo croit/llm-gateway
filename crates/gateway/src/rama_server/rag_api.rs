@@ -359,8 +359,20 @@ pub async fn delete_collection(
     if let Err(resp) = require_session(&state, &req).await {
         return resp;
     }
+    // Capture the store-folder id before deleting the registry row, so we
+    // can reap the on-disk folder afterwards.
+    let uuid = rag_db::find_collection_by_id(&state.db, id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|c| c.data_uuid);
     match rag_db::delete_collection(&state.db, id).await {
-        Ok(true) => json_ok(&json!({ "deleted": true })),
+        Ok(true) => {
+            if let (Some(indexer), Some(uuid)) = (state.indexer.as_ref(), uuid) {
+                indexer.drop_collection_storage(id, &uuid);
+            }
+            json_ok(&json!({ "deleted": true }))
+        }
         Ok(false) => not_found(&format!("no collection with id {id}")),
         Err(err) => {
             tracing::warn!(error = %err, %id, "delete rag collection");
