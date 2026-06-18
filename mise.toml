@@ -1,0 +1,152 @@
+# mise — toolchain + task runner for the LLM gateway project.
+# Run `mise install` once after cloning, then use `mise run <task>` for everything.
+# Docs: https://mise.jdx.dev/
+
+[tools]
+# `components` rides on mise's Rust plugin (which uses rustup under
+# the hood) — no separate `rustup component add` step needed at any
+# install site, CI or local. See https://mise.jdx.dev/lang/rust.html.
+rust = { version = "1.95", components = "rustfmt,clippy,cargo" }
+# cargo-binstall is what mise uses behind the `cargo:` backend to install Rust
+# binaries quickly (pre-built when available, source-build as fallback).
+cargo-binstall = "latest"
+# sccache wraps rustc to cache compilation artifacts. Optional and OFF by
+# default — no `RUSTC_WRAPPER` is set here. Local devs can opt in by setting
+# `RUSTC_WRAPPER=sccache` (and configuring a backend, e.g. local disk or S3).
+# CI does not use sccache; GitHub Actions caches the cargo registry + target/
+# via Swatinem/rust-cache instead.
+"cargo:sccache" = "latest"
+# Node is here for the Tailwind v4 + daisyUI CSS build in `ui/`.
+node = "24"
+# `typst` CLI for the `typst_<template>` tools. Resolved through
+# mise's registry (aqua → GitHub releases), so platform detection
+# is mise's problem. `mise run fetch-typst-cli` then copies the
+# installed binary into target/release/typst for the runtime image.
+typst = "0.14.2"
+
+[env]
+RUST_BACKTRACE = "1"
+RUST_LOG = "info,gateway=debug,cli=debug"
+# Secrets (API keys, tokens) go in the gitignored `mise.local.toml`, not
+# here — see `BRAVE_SEARCH_API_KEY` there. For the optional GeoIP
+# auto-updater (the `get_user_location` tool), set the IP2Location LITE
+# download token in `mise.local.toml`; `gateway.toml`'s `[geoip]
+# update_token_env` names which var to read (default below):
+# IP2LOCATION_TOKEN = "<your-ip2location-lite-token>"   # ← in mise.local.toml
+
+[tasks.dev]
+description = "Run the gateway (debug build) against the local config. Pair with `mise run watch-css` / `mise run watch-js` in another terminal for live asset reload."
+depends = ["build-assets"]
+run = "cargo run --package gateway"
+dir = "{{ config_root }}"
+
+[tasks.dev-build]
+description = "Debug build only — produces target/debug/gateway. Use this for fast iteration loops (typical ~2 s incremental vs ~11 s for a release build). For deploys / benchmarks use `mise run build` instead."
+depends = ["build-assets"]
+run = "cargo build --package gateway --bin gateway"
+
+[tasks.build]
+description = "Release build of the gateway binary. Slow (~12 s cold incremental, ~70 s from clean) — only use this when you actually want optimised output (deploys, perf measurement). For day-to-day work use `mise run dev` or `mise run dev-build`."
+depends = ["build-assets", "fetch-typst-cli"]
+run = "cargo build --release --package gateway --bin gateway"
+
+[tasks.fetch-typst-cli]
+description = "Copy mise's installed `typst` CLI into target/release/typst so the runtime Dockerfile picks it up via the same artifact pipeline that ships the gateway binary. The version + download URL are mise's responsibility — see the `typst` entry under [tools]."
+run = """
+set -eu
+mkdir -p target/release
+install -m 0755 "$(mise which typst)" target/release/typst
+target/release/typst --version
+"""
+
+[tasks.npm-install]
+description = "Install ui/ node_modules. Re-runs only when package.json/lock change."
+sources = ["ui/package.json", "ui/package-lock.json"]
+outputs = ["ui/node_modules/.package-lock.json"]
+run = "npm --prefix ui ci --no-audit --no-fund"
+
+[tasks.build-css]
+description = "Build the daisyUI/Tailwind CSS bundle into crates/session-core/assets/app.css. The gateway embeds this bundle via include_bytes! through session_core::assets; the @source globs in ui/src/main.css scan the gateway and session-core source files so utility classes used in either survive the Tailwind tree-shake."
+depends = ["npm-install"]
+sources = [
+    "ui/src/main.css",
+    "crates/gateway/src/**/*.rs",
+    "crates/session-core/src/**/*.rs",
+]
+outputs = ["crates/session-core/assets/app.css"]
+run = "npm --prefix ui run build-css"
+
+[tasks.watch-css]
+description = "Tailwind --watch on the CSS bundle. Run alongside `mise run dev`."
+depends = ["npm-install"]
+run = "npm --prefix ui run watch-css"
+
+[tasks.build-js]
+description = "Bundle the TypeScript page glue into crates/session-core/assets/{app,pcm-recorder}.js. Both binaries serve them through session_core::assets."
+depends = ["npm-install"]
+sources = ["ui/ts/**/*.ts", "crates/session-core/ui/ts/**/*.ts", "ui/tsconfig.json"]
+outputs = [
+    "crates/session-core/assets/app.js",
+    "crates/session-core/assets/pcm-recorder.js",
+]
+run = "npm --prefix ui run build-js"
+
+[tasks.watch-js]
+description = "esbuild --watch on the JS bundles. Run alongside `mise run dev`."
+depends = ["npm-install"]
+run = "npm --prefix ui run watch-js"
+
+[tasks.typecheck]
+description = "tsc --noEmit across ui/ts. esbuild strips types without checking; run this for real type errors."
+depends = ["npm-install"]
+sources = ["ui/ts/**/*.ts", "crates/session-core/ui/ts/**/*.ts", "ui/tsconfig.json"]
+run = "npm --prefix ui run typecheck"
+
+[tasks.build-assets]
+description = "Composite: produce both the CSS and JS bundles. Used as the dep for everything that builds the gateway binary so a fresh checkout produces working static assets without manual steps."
+depends = ["build-css", "build-js"]
+
+[tasks.dev-ui]
+description = "Stub gateway for local UI debugging: real rama server on :8080 against a wiremock chat + transcription backend with a pre-seeded session. Prints the session cookie to stdout so playwright (or curl) can drive any authed page (/, /tokens, /chat, /theme/toggle, /api/v0/*) without OIDC. See docs/dev-workflow.md → 'Debugging the UI'."
+depends = ["build-assets"]
+run = "cargo run --example dev_ui -p gateway"
+
+[tasks.test]
+description = "Run the workspace tests."
+depends = ["build-assets"]
+run = "cargo test --workspace"
+
+[tasks.test-nocapture]
+description = "Run tests with stdout/stderr visible."
+depends = ["build-assets"]
+run = "cargo test --workspace -- --nocapture"
+
+[tasks.lint]
+description = "Clippy + rustfmt + tsc --noEmit."
+depends = ["build-assets", "typecheck"]
+run = [
+    "cargo fmt --all -- --check",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+]
+
+[tasks.ci]
+description = "Everything CI runs: lint + test + release build of the gateway binary. mise fans out via the DAG."
+depends = ["lint", "test", "build"]
+
+[tasks.fmt]
+description = "Apply rustfmt across the workspace."
+run = "cargo fmt --all"
+
+[tasks.setup-hooks]
+description = "Enable the version-controlled git hooks (pre-push CI gate in .githooks/)."
+run = "git config core.hooksPath .githooks"
+
+[tasks.check]
+description = "Fast type-check across the workspace (no codegen)."
+run = "cargo check --workspace --all-targets"
+
+[tasks.cli]
+description = "Run the CLI from source. Pass args after `--`: `mise run cli -- auth login`."
+run = "cargo run --package cli --"
+
+

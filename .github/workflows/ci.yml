@@ -1,0 +1,149 @@
+# CI for the rama-based LLM gateway (GitHub Actions).
+#
+# Pipeline shape (mirrors the previous GitLab pipeline):
+#   1. ci        — one job runs lint + tests + release build via `mise run ci`,
+#                  sharing a single target/ so deps compile once. Uploads the
+#                  gateway + typst binaries as artifacts.
+#   2. container — builds the runtime image (thin Dockerfile that just COPYs the
+#                  artifacts; the CSS + datastar.js are baked into the binary via
+#                  include_bytes!). On pull requests it builds with --no-push to
+#                  validate the Dockerfile; on the default branch and tags it
+#                  pushes to GHCR.
+#
+# Toolchain + tasks come from mise.toml (jdx/mise-action installs Rust, Node,
+# typst, etc. and caches them). The old GitLab pipeline wrapped rustc in an
+# S3-backed sccache on croit-internal runners; that's dropped here in favour of
+# Swatinem/rust-cache (GitHub's cache backend) so the workflow needs no secrets
+# beyond the built-in GITHUB_TOKEN.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  IMAGE: ghcr.io/croit/llm-gateway
+  # The workspace compiles 2-3x in one job (clippy debug + test debug +
+  # release build) and lumis pulls in ~116 tree-sitter grammars, so the
+  # default-runner disk fills up. Dropping debuginfo from the dev/test
+  # profiles roughly halves target/ size (CI-only; no effect on local builds).
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  ci:
+    name: lint + test + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # ubuntu-latest ships ~25 GB of preinstalled SDKs we don't use; the big
+      # multi-profile Rust compile otherwise runs the runner out of disk
+      # ("No space left on device"). Reclaim it up front.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                      /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # Installs the toolchain pinned in mise.toml (Rust + components, Node,
+      # typst, cargo-binstall) and caches it across runs.
+      - uses: jdx/mise-action@v4
+
+      # Belt-and-suspenders: mise.toml requests the rustfmt/clippy components,
+      # but on the GitHub runner (which ships its own rustup) that doesn't
+      # always take, so `cargo fmt`/`clippy` via the pinned toolchain fail.
+      # Add them explicitly to the mise-selected toolchain.
+      - name: Ensure rustfmt + clippy
+        run: mise exec -- rustup component add rustfmt clippy
+
+      # Caches the cargo registry/git deps + target/ keyed on Cargo.lock.
+      - uses: Swatinem/rust-cache@v2
+
+      # `mise run ci` fans out lint (fmt + clippy -D warnings + tsc) + tests +
+      # release build through mise's DAG (each transitively builds the CSS/JS
+      # bundles). Produces target/release/gateway.
+      - name: mise run ci
+        env:
+          # build.rs embeds this as the §13 "Source" commit in the UI. Without
+          # it, build.rs falls back to `git rev-parse` (also fine here).
+          GIT_SHA: ${{ github.sha }}
+        run: mise run ci
+
+      - run: ls -lh target/release/gateway
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gateway-binaries
+          path: |
+            target/release/gateway
+            target/release/typst
+          retention-days: 7
+          if-no-files-found: error
+
+  container:
+    name: container image
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      # The Dockerfile COPYs the binaries built by the `ci` job — it does not
+      # compile anything. Pull them back into target/release/.
+      - uses: actions/download-artifact@v8
+        with:
+          name: gateway-binaries
+          path: target/release
+
+      # upload-artifact does not preserve the executable bit; restore it so the
+      # COPYed /app/gateway is runnable.
+      - name: Restore executable bits
+        run: chmod +x target/release/gateway target/release/typst
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Image tags + labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Only authenticate when we're actually going to push (not on PRs).
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # PR: build only (validate the Dockerfile). Branch/tag: build + push.
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

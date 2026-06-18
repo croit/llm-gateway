@@ -1,0 +1,34 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Claude Code session state
+.claude/
+
+# Local config and secrets
+*.local.toml
+.env
+.env.*
+!.env.example
+
+# Editor/OS
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# mise installs its tools project-locally if asked; tracked separately
+.mise.toml.local
+
+# Dev-mode SQLite (created by `mise run dev` when no $GATEWAY_CONFIG is set)
+gateway.sqlite*
+/.playwright-cli/
+
+# JS bundle source maps — emitted alongside crates/session-core/assets/*.js
+# by the esbuild step. The bundles themselves are committed (matching the
+# CSS bundle convention), but the maps are dev-only and large.
+crates/session-core/assets/*.js.map
+
+# GeoIP database 
+IP2LOCATION-LITE-DB11.BIN
+

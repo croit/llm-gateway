@@ -1,0 +1,81 @@
+# systemd-podman Quadlet for the LLM gateway.
+#
+# Install:
+#   sudo cp deploy/quadlet/gateway.container /etc/containers/systemd/
+#   sudo cp deploy/quadlet/gateway.volume    /etc/containers/systemd/
+#   sudo cp deploy/quadlet/gateway.example.env /etc/gateway/gateway.env
+#   sudo cp gateway.example.toml             /etc/gateway/config.toml
+#   sudo $EDITOR /etc/gateway/{gateway.env,config.toml}
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now gateway.service
+#
+# Quadlet generates `gateway.service` from this file. `Volume=gateway.volume`
+# resolves against `gateway.volume` (the sibling unit in this directory) and
+# the named volume's data is owned by Podman at /var/lib/containers/storage/.
+#
+# Update with a new image tag:
+#   sudo $EDITOR /etc/containers/systemd/gateway.container   # bump :latest → :<sha>
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart gateway.service
+#
+# Rolling back a bad release is just the inverse — bump the tag back and
+# `systemctl restart`. The DB lives in the named volume, so config + state
+# survive image swaps.
+
+[Unit]
+Description=LLM Gateway (OpenAI-compatible reverse proxy)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=gateway
+
+# Pin to a content-addressed digest in production. `:latest` is convenient
+# for first-time setup but `systemctl restart` won't see new pushes unless
+# you change the tag.
+Image=ghcr.io/croit/llm-gateway:latest
+
+# Bind on the host's loopback by default — put a TLS-terminating reverse
+# proxy (Caddy, Traefik, nginx) in front. Change to `8080:8080` to expose
+# directly, but you'll lose HTTPS + sane access logs.
+PublishPort=127.0.0.1:8080:8080
+
+# GATEWAY_SESSION_KEY + GATEWAY_OIDC_CLIENT_SECRET (and any
+# `<POOL>_API_KEY_…` env vars referenced from `config.toml`) live here.
+EnvironmentFile=/etc/gateway/gateway.env
+
+# Bind-mount the config read-only. `:z` relabels for SELinux; drop it on
+# distros that don't ship SELinux (Debian/Ubuntu) — harmless either way.
+Volume=/etc/gateway/config.toml:/etc/gateway/config.toml:ro,z
+
+# Persistent SQLite + session store. The named volume is declared in the
+# sibling `gateway.volume` unit. The container image runs as uid 1000
+# (`gateway`); `:U` tells Podman to chown the volume to the runtime user on
+# mount, otherwise SQLite gets EACCES on first start because Podman creates
+# named volumes root-owned by default.
+Volume=gateway.volume:/var/lib/gateway:z,U
+
+# Override the default `gateway.sqlite` (relative path → CWD which is /app
+# and would be ephemeral) to live on the persistent volume.
+Environment=GATEWAY_CONFIG=/etc/gateway/config.toml
+Environment=RUST_LOG=info,gateway=info
+
+# Drop all caps, no-new-privs, read-only root FS. The volume above + a small
+# tmpfs cover everything that needs to be writable.
+NoNewPrivileges=true
+DropCapability=ALL
+ReadOnly=true
+Tmpfs=/tmp
+
+# No `HealthCmd=` — the runtime image (debian:trixie-slim + tini + the server
+# binary) doesn't ship curl/wget, and adding either just for a health probe
+# bloats the image. systemd's `Restart=on-failure` covers crashes; for HTTP
+# health you're already running a reverse proxy in front (per the README),
+# which can probe `/healthz` from outside the container.
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target default.target

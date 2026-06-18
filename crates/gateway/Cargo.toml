@@ -1,0 +1,129 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+session-core = { path = "../session-core" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+jiff = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Rama HTTP framework — the entire server stack lives on top of it.
+rama = { workspace = true }
+# HTML templating macro for handler-side server-rendered pages.
+plait = { workspace = true }
+# Form-body parsing for the page-level POST handlers.
+serde_urlencoded = { workspace = true }
+# CommonMark → HTML for chat replies. Defaults reject raw HTML +
+# dangerous protocols (javascript:, vbscript:) so LLM output that
+# happens to include `<script>` is rendered as escaped text, not
+# active markup.
+markdown = { workspace = true }
+# Tree-sitter-backed syntax highlighter for fenced code blocks in
+# chat replies. Server-side: the `<pre><code class="language-…">`
+# emitted by `markdown` gets post-processed into inline-styled
+# spans before the page ships, so the browser does zero work and
+# we don't need a client-side highlighter on top of datastar.
+# We take the full `all-languages` default (117 tree-sitter
+# grammars) so anything an LLM emits — svelte, zig, terraform,
+# kotlin, … — colours correctly. Each grammar compiles via
+# build.rs and pads cold builds by a few seconds; that's the
+# trade-off we made deliberately.
+lumis = { workspace = true }
+# Already in the dep tree transitively via tracing-subscriber's
+# env-filter; pulling it in explicitly so the chat-render post-pass
+# can match fenced code blocks without inventing a hand-rolled
+# scanner. See `docs/dependencies.md`.
+regex = { workspace = true }
+# Pure-Rust neural VAD. ~110 KiB binary footprint, no ONNX runtime.
+# Used in rama_server::vad to strip leading/trailing silence from
+# uploaded voice notes before they hit Whisper (silence is the single
+# biggest source of Whisper hallucinations).
+earshot = "1"
+
+# MCP (Model Context Protocol) client. Lets the gateway connect to external
+# MCP servers — over stdio (subprocess) or streamable HTTP — and surface
+# their tools to the model alongside the built-in ones (see
+# `server::tools::mcp`). `default-features = false` drops the server side +
+# derive macros we don't use; the HTTP transport's reqwest shares the
+# workspace reqwest (inheriting rustls-tls) via Cargo feature unification.
+# Already in the lock tree transitively (via the ACP SDK) at this version.
+rmcp = { version = "1.7", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+
+# Async + I/O. `net` is enabled for the `tls_cert` tool's raw TCP connect
+# (the rest of the workspace pulls it transitively, but we depend on it
+# directly so the build doesn't rely on feature unification).
+tokio = { workspace = true, features = ["net"] }
+reqwest = { workspace = true }
+# `bytes`, `futures-util` and `futures-channel` are used via rama's
+# re-exports (`rama::bytes`, `rama::futures{,::channel}`) — same crates,
+# no separate pin.
+multer = { workspace = true }
+toml = { workspace = true }
+
+# Chat-attachment uploader. Each user-message file lands at
+# `<key_prefix>/<turn_id>/<filename>` in the configured bucket; the
+# resulting object URL goes into the model's `image_url` content
+# parts (and into the `[attached: …]` marker we keep in user_text
+# for replay).
+rust-s3 = { workspace = true }
+
+# Persistence + crypto + IDs.
+sqlx = { workspace = true }
+jsonwebtoken = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }
+# typst compile scratch dirs (one per render); tiny, no native deps.
+tempfile = "3"
+
+# `tls_cert` tool: a raw rustls handshake (no trust verification — we're
+# *inspecting* the presented cert, including expired/self-signed ones) +
+# x509 parsing for subject/issuer/SAN/validity.
+tokio-rustls = { workspace = true }
+x509-parser = "0.16"
+
+# GeoIP: client-IP → location lookup for the `get_user_location` tool.
+# `ip2location` reads the IP2Location LITE DB11 BIN; `notify` hot-reloads it
+# on change; `zip` unpacks the LITE distribution for the optional updater.
+ip2location = { workspace = true }
+notify = { workspace = true }
+zip = { workspace = true }
+
+# Vector index for the RAG subsystem (one index per collection, mmap'd).
+usearch = { workspace = true }
+
+[dev-dependencies]
+# wiremock spins up an in-process HTTP mock that stands in for upstream
+# LLM backends. Used by the integration tests in tests/ to exercise the
+# proxy path end-to-end without needing a real model server.
+wiremock = "0.6"
+# `http-body-util::BodyExt::collect()` is the canonical "consume the
+# rama Body into Bytes" call we need on the test side to inspect a
+# response body. rama re-exports it but having the direct dev-dep
+# makes the import obvious.
+http-body-util = "0.1"
+# Test-only: sign mock ID tokens with an RSA private key for the OIDC
+# integration test. We feed the matching public key into the mock
+# JWKS endpoint so our jsonwebtoken-based verifier accepts the token.
+rsa = { version = "0.9", features = ["sha2"] }

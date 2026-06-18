@@ -1,0 +1,20 @@
+{
+  "name": "ai-gateway-ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tailwind 4 + daisyUI v5 styling and TypeScript pipeline. Builds the CSS bundle and the per-page JS bundles into ../crates/session-core/assets/; the gateway embeds them via include_bytes! through session_core::assets so the bundle, the URL, and the cache key stay consistent.",
+  "scripts": {
+    "build-css": "tailwindcss -i src/main.css -o ../crates/session-core/assets/app.css --minify",
+    "watch-css": "tailwindcss -i src/main.css -o ../crates/session-core/assets/app.css --watch",
+    "build-js": "esbuild ts/app.ts ts/pcm-recorder.ts --bundle --format=iife --target=es2022 --minify --sourcemap=external --outdir=../crates/session-core/assets",
+    "watch-js": "esbuild ts/app.ts ts/pcm-recorder.ts --bundle --format=iife --target=es2022 --sourcemap=external --watch --outdir=../crates/session-core/assets",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.0.0",
+    "daisyui": "^5.0.0",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0"
+  }
+}

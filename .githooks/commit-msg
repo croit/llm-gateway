@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# commit-msg hook: reject co-author trailers.
+#
+# This project does not want `Co-authored-by:` lines in its history (e.g.
+# auto-appended AI/tool attributions). Any commit message containing such a
+# trailer is rejected. The author/committer identity is the source of truth.
+#
+# Genuine override: `git commit --no-verify`.
+set -euo pipefail
+
+msg_file="$1"
+
+# Match the git-canonical trailer case-insensitively, anchored to the start of
+# a line (ignoring leading whitespace). Lines inside the commented/diff section
+# git appends (with `-v`) start with '#', so a literal mention in a comment
+# isn't a real trailer — but those are stripped before this runs anyway.
+if grep -iEq '^[[:space:]]*Co-authored-by:' "$msg_file"; then
+    echo "commit-msg: 'Co-authored-by:' trailers are not allowed in this repository." >&2
+    echo "            Remove the trailer, or bypass with: git commit --no-verify" >&2
+    exit 1
+fi

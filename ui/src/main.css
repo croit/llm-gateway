@@ -1,0 +1,1540 @@
+/* Tailwind v4 + daisyUI v5 styling pipeline.
+ *
+ * daisyUI ships pure CSS components (.btn, .card, .alert, ...) plus a
+ * theme system on top of Tailwind v4 — no React, no JS-side component
+ * library. We use the class names directly in the rama page handlers.
+ *
+ * Output bundle: `../crates/gateway/assets/app.css`, served via the
+ * rama server's `assets::app_css` handler.
+ */
+
+@import "tailwindcss";
+@plugin "daisyui" {
+    /* `themes: false` so daisyUI doesn't emit its built-in light /
+     * dark palettes; we register our own custom "light" + "dark"
+     * themes below (shadcn-flavoured) with the same names so the
+     * cookie-driven `<html data-theme=…>` toggle keeps working. */
+    themes: false;
+}
+
+/* ---------------------------------------------------------------------------
+ * shadcn-flavoured daisyUI themes.
+ *
+ * Adapted from https://github.com/daniellionel01/daisyui-shadcn (only the
+ * light theme there). The user's ask was "shadcn colors with strong
+ * contrasts" + "not a fan of daisyUI's colourful buttons" — i.e. the
+ * canonical shadcn neutral palette where the primary action is near-black
+ * (light) / near-white (dark) and only the status colours (info / success
+ * / warning / error) carry hue.
+ *
+ * Light: white background, near-black foreground / primary, off-white
+ * surfaces, light-grey border.
+ * Dark : near-black background, near-white foreground / primary, the
+ * surface/border greys lifted off the background by ~5–13% lightness so
+ * cards still read as cards.
+ *
+ * Sticking with the daisyUI built-in theme names so pages/mod.rs's
+ * `Theme::as_str()` ("light"/"dark") and the cookie-driven toggle
+ * continue to work without changes.
+ * ------------------------------------------------------------------------ */
+
+@plugin "daisyui/theme" {
+    name: "light";
+    default: true;
+    prefersdark: false;
+    color-scheme: "light";
+
+    --color-base-100: oklch(100% 0 0);
+    --color-base-200: oklch(97% 0.002 286);
+    --color-base-300: oklch(92% 0.004 286);
+    --color-base-content: oklch(14% 0.013 285);
+
+    --color-primary: oklch(21% 0.006 286);
+    --color-primary-content: oklch(98% 0 0);
+
+    --color-secondary: oklch(97% 0.002 286);
+    --color-secondary-content: oklch(21% 0.006 286);
+
+    --color-accent: oklch(97% 0.002 286);
+    --color-accent-content: oklch(21% 0.006 286);
+
+    --color-neutral: oklch(21% 0.006 286);
+    --color-neutral-content: oklch(98% 0 0);
+
+    --color-info: oklch(64% 0.18 233);
+    --color-info-content: oklch(98% 0 0);
+
+    --color-success: oklch(60% 0.15 152);
+    --color-success-content: oklch(98% 0 0);
+
+    --color-warning: oklch(73% 0.18 65);
+    --color-warning-content: oklch(20% 0.05 65);
+
+    /* Matches shadcn's live `--destructive` (= #e40014 ≈ Tailwind
+     * red-600) on ui.shadcn.com. The destructive button & badge
+     * paint this colour as TEXT on a 10 %-alpha surface of itself —
+     * captured by the `.btn-error` / `.badge-error` overrides below.
+     * No `--color-error-content` for filled white text: shadcn's
+     * tonal destructive uses `text-destructive` (i.e. the token
+     * itself) for the foreground, not a contrasting near-white. */
+    --color-error: oklch(51.2% 0.244 27.5);
+    --color-error-content: oklch(98% 0 0);
+
+    --radius-selector: 0.375rem;
+    --radius-field: 0.5rem;
+    --radius-box: 0.625rem;
+    --size-selector: 0.25rem;
+    --size-field: 0.25rem;
+    --border: 1px;
+    --depth: 0;
+    --noise: 0;
+}
+
+@plugin "daisyui/theme" {
+    name: "dark";
+    default: false;
+    prefersdark: true;
+    color-scheme: "dark";
+
+    --color-base-100: oklch(14% 0.013 285);
+    --color-base-200: oklch(21% 0.006 286);
+    --color-base-300: oklch(27% 0.008 286);
+    --color-base-content: oklch(98% 0 0);
+
+    --color-primary: oklch(98% 0 0);
+    --color-primary-content: oklch(21% 0.006 286);
+
+    --color-secondary: oklch(27% 0.008 286);
+    --color-secondary-content: oklch(98% 0 0);
+
+    --color-accent: oklch(27% 0.008 286);
+    --color-accent-content: oklch(98% 0 0);
+
+    --color-neutral: oklch(98% 0 0);
+    --color-neutral-content: oklch(21% 0.006 286);
+
+    --color-info: oklch(64% 0.18 233);
+    --color-info-content: oklch(98% 0 0);
+
+    --color-success: oklch(60% 0.15 152);
+    --color-success-content: oklch(98% 0 0);
+
+    --color-warning: oklch(73% 0.18 65);
+    --color-warning-content: oklch(20% 0.05 65);
+
+    /* Matches shadcn's live `--destructive` in `.dark` (= #ff6568 ≈
+     * Tailwind red-400). It's *brighter* than the light token so the
+     * 20 %-alpha tonal surface + same-colour foreground (set by
+     * `.btn-error` / `.badge-error` below) still reads as a clear
+     * red against a near-black canvas. */
+    --color-error: oklch(70.4% 0.191 22.2);
+    --color-error-content: oklch(98% 0 0);
+
+    --radius-selector: 0.375rem;
+    --radius-field: 0.5rem;
+    --radius-box: 0.625rem;
+    --size-selector: 0.25rem;
+    --size-field: 0.25rem;
+    --border: 1px;
+    --depth: 0;
+    --noise: 0;
+}
+
+/* Tailwind v4's content scanner needs to know which files reference
+ * utility class names so it can tree-shake the bundle. Our HTML lives
+ * inside Rust string literals; the scanner is content-agnostic and
+ * pattern-matches likely class names regardless of extension.
+ *
+ * `session-core` owns the shared chat-UI primitives (icons,
+ * transcript bubbles, composer) — its source files have to scan
+ * too, otherwise utility classes that only appear there (e.g.
+ * `animate-spin` on the spinner icon, the `chat-prose` rules'
+ * dependencies) get dropped from the compiled bundle. */
+@source "../../crates/gateway/src/rama_server/**/*.rs";
+/* Tool implementations inject their own HTML over SSE — the in-chat
+ * "share your location?" card lives in `server/tools/location.rs`. Scan
+ * the tools tree (the only server code that emits HTML), or its utility
+ * classes (`btn-xs`, `border-l-warning`, …) silently drop out of the
+ * bundle and the injected markup renders unstyled. */
+@source "../../crates/gateway/src/server/tools/**/*.rs";
+@source "../../crates/gateway/assets/app.js";
+@source "../../crates/session-core/src/**/*.rs";
+@source "../../crates/session-core/ui/ts/**/*.ts";
+
+/* ----------------------------------------------------------------------------
+ * Component refinements (focus, buttons, toasts).
+ *
+ * These all live in `@layer utilities` (unlayered within it) so they outrank
+ * daisyUI's `@layer utilities { @layer daisyui.…{ … } }` sub-layer per CSS
+ * Cascade Layers spec — earlier attempts in `@layer components` lost
+ * unconditionally regardless of specificity.
+ *
+ * Goal: keep daisyUI's tokens + class names, override geometry / colour
+ * details to land near shadcn's defaults (smaller buttons, softer focus
+ * ring, sonner-style toasts).
+ * ------------------------------------------------------------------------- */
+
+@layer utilities {
+    /* shadcn-style soft focus: subtle border darken + a 3px halo at
+     * ~15% of base-content alpha. Replaces the previous loud 40%
+     * ring; matches the feel of the chat composer's
+     * `.chat-composer:focus-within` so every input feels the same
+     * when keyboard-focused. */
+    .input:focus,
+    .input:focus-visible,
+    .input:focus-within,
+    .select:focus,
+    .select:focus-visible,
+    .select:focus-within,
+    .textarea:focus,
+    .textarea:focus-visible,
+    .textarea:focus-within {
+        outline: none;
+        border-color: color-mix(in oklch, var(--color-base-content) 35%, transparent);
+        box-shadow: 0 0 0 3px color-mix(in oklch, var(--color-base-content) 12%, transparent);
+    }
+
+    /* shadcn-flavoured buttons. daisyUI's defaults are 3rem tall with
+     * 0.5rem radius and depth shadows; shadcn's are 2.25rem tall,
+     * 0.375rem radius, tiny shadow on filled variants, hover dims the
+     * background to 90 %. We keep daisyUI's variant class names
+     * (`btn-primary`, `btn-ghost`, `btn-outline`, `btn-error`,
+     * `btn-circle`, `btn-square`, `btn-sm`) and override the geometry
+     * + hover here. */
+    .btn {
+        min-height: 2.25rem;
+        height: 2.25rem;
+        font-size: 0.875rem;
+        font-weight: 500;
+        padding-inline: 1rem;
+        border-radius: 0.375rem;
+        transition: background-color 150ms ease-out,
+                    border-color 150ms ease-out,
+                    opacity 150ms ease-out;
+    }
+    .btn-sm {
+        min-height: 2rem;
+        height: 2rem;
+        font-size: 0.8125rem;
+        padding-inline: 0.75rem;
+    }
+    .btn-circle,
+    .btn-square {
+        width: 2.25rem;
+        padding: 0;
+    }
+    .btn-sm.btn-circle,
+    .btn-sm.btn-square {
+        width: 2rem;
+    }
+    .btn-circle {
+        border-radius: 9999px;
+    }
+    /* Filled primary — `shadow-xs` + 10 % hover dim. */
+    .btn-primary {
+        box-shadow: 0 1px 2px 0 oklch(0% 0 0 / 0.05);
+    }
+    .btn-primary:hover {
+        background-color: color-mix(in oklch, var(--color-primary) 90%, transparent);
+    }
+    /* Shadcn destructive — captured directly off ui.shadcn.com via
+     * playwright. Both `<Button variant="destructive">` and
+     * `<Badge variant="destructive">` paint:
+     *   bg-destructive/10 text-destructive hover:bg-destructive/20
+     *   dark:bg-destructive/20 dark:hover:bg-destructive/30
+     *   border border-transparent
+     * i.e. a tonal-red surface (10 % alpha of the destructive token)
+     * with the destructive token itself as the *foreground colour* —
+     * the "red on red with contrast" pattern, NOT `text-white` over a
+     * solid-red bg. The README of shadcn ships `button.tsx` with the
+     * older `text-white` variant; the live registry on their site
+     * does not.
+     *
+     * `.alert-error` joins the chip set because daisy's default is
+     * a solid-red banner with `--color-error-content` text — way
+     * louder than the rest of the gateway's error surfaces (toast
+     * left-rule, badge, button). With the same tonal treatment the
+     * inline chat error sits beside the tokens-page revoke button
+     * without visual whiplash.
+     *
+     * Transparent border + no shadow — these are tonal chips, they
+     * don't lift off the surface; the geometry comes from the shared
+     * `.btn` / `.badge` / `.alert` rules above. */
+    .btn-error,
+    .badge-error,
+    .alert-error {
+        background-color: color-mix(in oklch, var(--color-error) 10%, transparent);
+        color: var(--color-error);
+        border-color: transparent;
+        box-shadow: none;
+    }
+    .btn-error:hover {
+        background-color: color-mix(in oklch, var(--color-error) 20%, transparent);
+    }
+    [data-theme="dark"] .btn-error,
+    [data-theme="dark"] .badge-error,
+    [data-theme="dark"] .alert-error {
+        background-color: color-mix(in oklch, var(--color-error) 20%, transparent);
+    }
+    [data-theme="dark"] .btn-error:hover {
+        background-color: color-mix(in oklch, var(--color-error) 30%, transparent);
+    }
+    /* Outline: white-ish surface + thin border, hover lifts to base-200. */
+    .btn-outline {
+        background-color: var(--color-base-100);
+        border: 1px solid var(--color-base-300);
+        color: var(--color-base-content);
+        box-shadow: 0 1px 2px 0 oklch(0% 0 0 / 0.05);
+    }
+    .btn-outline:hover {
+        background-color: var(--color-base-200);
+    }
+    /* Ghost: transparent until hover. */
+    .btn-ghost:hover {
+        background-color: var(--color-base-200);
+    }
+    /* Soft focus ring matching the input override. */
+    .btn:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px color-mix(in oklch, var(--color-base-content) 15%, transparent);
+    }
+    .btn-primary:focus-visible,
+    .btn-error:focus-visible,
+    .btn-outline:focus-visible {
+        box-shadow: 0 1px 2px 0 oklch(0% 0 0 / 0.05),
+                    0 0 0 3px color-mix(in oklch, var(--color-base-content) 15%, transparent);
+    }
+
+    /* shadcn-flavoured inputs / selects / textareas. daisyUI's
+     * defaults are 3rem tall with a 0.5rem radius and 1rem text;
+     * shadcn's are 2.25rem (h-9), 0.375rem (rounded-md), 0.875rem
+     * (text-sm), with a thin border + shadow-xs. We keep daisyUI's
+     * class names so existing markup (`input input-bordered`,
+     * `select select-bordered`, etc.) just works.
+     *
+     * `.input` / `.textarea` keep a transparent background so a
+     * field nested inside a `bg-base-200` card reads as inset.
+     * `.select` is opaque (`bg-base-100`) because its closed state
+     * sits as a chip on top of arbitrary surrounding content
+     * (e.g. the chat header model picker) — a transparent select
+     * makes the displayed value bleed into whatever's behind it.
+     * shadcn's live Select component does the same thing (filled
+     * neutral surface).
+     */
+    .input,
+    .select {
+        appearance: none !important;
+        height: 2.25rem;
+        min-height: 2.25rem;
+        font-size: 0.875rem;
+        border-radius: 0.375rem;
+        border: 1px solid var(--color-base-300);
+        padding-inline: 0.75rem;
+        box-shadow: 0 1px 2px 0 oklch(0% 0 0 / 0.05);
+    }
+    .input {
+        background-color: transparent;
+    }
+    .select {
+        background-color: var(--color-base-100);
+        color: var(--color-base-content);
+    }
+    .select option {
+        background-color: var(--color-base-100);
+        color: var(--color-base-content);
+    }
+    .textarea {
+        font-size: 0.875rem;
+        line-height: 1.4;
+        border-radius: 0.375rem;
+        border: 1px solid var(--color-base-300);
+        background-color: transparent;
+        padding: 0.5rem 0.75rem;
+        min-height: 4rem;
+        box-shadow: 0 1px 2px 0 oklch(0% 0 0 / 0.05);
+    }
+
+    /* shadcn-flavoured cards. shadcn cards are flat (no shadow on
+     * the body) but use --card == --background with a strong border
+     * to differentiate; ours invert that — same border, but the
+     * surface lifts to `bg-base-200` so cards read as raised against
+     * the `bg-base-100` page. Combined with a `rounded-xl` corner
+     * radius and a subtle shadow, that gives the "more contrast"
+     * the user asked for without bumping into shadcn's flat default.
+     *
+     * `bg-base-200` here is the unconditional surface — templates
+     * shouldn't add an explicit `bg-base-100` utility on `.card`
+     * elements any more (that'd flatten the card again). The override
+     * doesn't touch padding / border-color — daisyUI's defaults
+     * (`card-body` padding, `--color-base-300` border) stay. */
+    .card {
+        background-color: var(--color-base-200);
+        border-radius: 0.75rem;
+        box-shadow:
+            0 1px 3px 0 oklch(0% 0 0 / 0.10),
+            0 1px 2px -1px oklch(0% 0 0 / 0.08);
+        /* Kills the bright-white card-border flash on Idiomorph SSE
+         * patches that change a non-card element into a card (most
+         * visibly: chat → dashboard, where the chat page's header
+         * row gets morphed into the dashboard's signed-in card).
+         *
+         * daisyUI's `.card` ships `outline: 0 solid #0000` plus
+         * `transition: outline .2s ease-in-out` so the focus outline
+         * fades in / out. The side effect: when an element *becomes*
+         * a card by class change, the browser transitions its outline
+         * from the previous computed value (`medium currentColor
+         * solid` — ~3 px near-white in dark mode) down to the
+         * `.card`-specified `0 solid #0000` over 200 ms. That's the
+         * white halo the user keeps seeing for ~200 ms after a
+         * chat→dashboard nav.
+         *
+         * Cards aren't focusable here (no `tabindex`), so the focus
+         * animation has no payoff. Disable the transition entirely. */
+        transition: none;
+    }
+
+    /* shadcn-flavoured badges. daisyUI's defaults are taller and
+     * have a softer pill radius; shadcn pills are tighter — small
+     * text, font-medium, pill-rounded, slight inline padding. We
+     * keep daisyUI's variant classes (`badge-secondary` for the
+     * neutral filled chip, `badge-error` for the destructive filled
+     * chip) but pin the geometry. */
+    .badge {
+        height: auto;
+        padding: 0.125rem 0.5rem;
+        font-size: 0.75rem;
+        font-weight: 500;
+        line-height: 1.25;
+        border-radius: 9999px;
+    }
+
+    /* Sonner-flavoured toasts. The container is daisyUI's
+     * `.toast.toast-bottom.toast-end` (already a fixed-positioned
+     * stack); each `.toast-item` is a neutral card with a 4 px
+     * status-tinted left rule and a pronounced drop shadow so it
+     * lifts off the page. Slide-up entrance keeps the motion gentle. */
+    .toast-item {
+        background: var(--color-base-100);
+        color: var(--color-base-content);
+        border: 1px solid var(--color-base-300);
+        border-radius: 0.5rem;
+        box-shadow:
+            0 4px 6px -1px oklch(0% 0 0 / 0.10),
+            0 2px 4px -2px oklch(0% 0 0 / 0.10),
+            0 10px 24px -8px oklch(0% 0 0 / 0.18);
+        padding: 0.75rem 1rem;
+        font-size: 0.875rem;
+        line-height: 1.4;
+        max-width: 24rem;
+        animation: toast-enter 220ms cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    @keyframes toast-enter {
+        from {
+            opacity: 0;
+            transform: translateY(8px);
+        }
+        to {
+            opacity: 1;
+            transform: translateY(0);
+        }
+    }
+
+    /* Send → stop swap in the chat composer.
+     *
+     * Must live in `@layer utilities` (not `@layer components` like
+     * the rest of `.chat-composer__*`) because daisyUI's `.btn` rule
+     * ships in `@layer utilities` and sets `display: inline-flex`.
+     * Cascade-layer order is utilities > components, so a
+     * components-layer `display: none` loses to daisy's btn
+     * regardless of selector specificity and the stop button would
+     * always be visible.
+     *
+     * The `#chat-form`'s `data-class` binding toggles
+     * `chat-composer--streaming` off the `$chatStreaming` datastar
+     * signal — set by the composer's submit handler on the way out,
+     * flipped back by a `datastar-patch-signals` SSE event at the
+     * end of the turn (or optimistically on the stop button click).
+     * Stop hides the voice button too — recording mid-stream makes
+     * no sense. */
+    .chat-composer__stop {
+        display: none;
+    }
+    .chat-composer--streaming .chat-composer__send,
+    .chat-composer--streaming .voice-control {
+        display: none;
+    }
+    .chat-composer--streaming .chat-composer__stop {
+        display: inline-flex;
+    }
+}
+
+/* App-specific rules that aren't covered by daisyUI components. */
+@layer components {
+
+    /* Mic-button state. The button renders three inline spans
+     * (`.mic-idle`, `.mic-recording`, `.mic-transcribing`); CSS picks
+     * which is visible based on `data-recording` / `data-transcribing`
+     * attributes set by app.js.
+     *
+     * Transitions:
+     *   idle → recording   on first click (start capture)
+     *   recording → transcribing  on second click (stop + POST WAV)
+     *   transcribing → idle  once the /api/v0/transcriptions response
+     *                        lands (success or error).
+     *
+     * The transcribing state was added to give the user feedback
+     * during the network round-trip — before this, the button just
+     * snapped back to its idle mic icon while the request was in
+     * flight, so a slow whisper response felt like a hang. */
+    .mic-idle,
+    .mic-recording,
+    .mic-transcribing {
+        align-items: center;
+        gap: 0.375rem;
+        line-height: 1;
+    }
+    .mic-idle svg,
+    .mic-recording svg,
+    .mic-transcribing svg {
+        vertical-align: middle;
+    }
+    .mic-idle { display: inline-flex; }
+    .mic-recording { display: none; }
+    .mic-transcribing { display: none; }
+    [data-recording="1"] > .mic-idle { display: none; }
+    [data-recording="1"] > .mic-recording { display: inline-flex; }
+    [data-transcribing="1"] > .mic-idle,
+    [data-transcribing="1"] > .mic-recording { display: none; }
+    [data-transcribing="1"] > .mic-transcribing { display: inline-flex; }
+
+    /* Thinking indicator. The chat stream's initial event renders a
+     * `.thinking` sibling next to `<div id="active-text">`. Once a
+     * delta lands and `#active-text` is no longer empty, the
+     * `:has()` selector hides the spinner. */
+    #active-reply:has(#active-text:not(:empty)) .thinking {
+        display: none;
+    }
+
+    /* ------------------------------------------------------------
+     * Global app sidebar
+     *
+     * The sidebar is the only navigation chrome — top-level nav,
+     * conversation list, and user controls in one column. Pinned at
+     * 18rem wide on lg+ (the daisyUI drawer handles the
+     * `lg:drawer-open` class), and a slide-over on smaller screens.
+     *
+     * Visual tone: subtle. Background sits a small step away from
+     * the main canvas (`base-200`), borders are a half-strength
+     * `base-300`. Active rows get a soft tinted background (not
+     * daisyUI's harsh `menu-active` color inversion) and slightly
+     * bolder text. Hover is barely there but enough to confirm
+     * pointer feedback.
+     * ------------------------------------------------------------ */
+
+    .app-sidebar {
+        width: 18rem;
+        min-height: 100%;
+        background: var(--color-base-200);
+        border-right: 1px solid
+            color-mix(in oklch, var(--color-base-300) 60%, transparent);
+        display: flex;
+        flex-direction: column;
+        font-size: 0.875rem;
+    }
+
+    .app-sidebar__brand {
+        padding: 1rem 1rem 0.5rem;
+    }
+    .app-sidebar__brand-link {
+        font-weight: 600;
+        color: var(--color-base-content);
+        letter-spacing: -0.01em;
+    }
+
+    .app-sidebar__primary {
+        display: flex;
+        flex-direction: column;
+        gap: 0.125rem;
+        padding: 0.25rem 0.5rem 0.5rem;
+    }
+    .app-sidebar__nav-link {
+        display: flex;
+        align-items: center;
+        gap: 0.625rem;
+        padding: 0.4rem 0.625rem;
+        border-radius: 0.5rem;
+        color: color-mix(in oklch, var(--color-base-content) 78%, transparent);
+        transition: background-color 120ms ease-out, color 120ms ease-out;
+    }
+    /* iOS Safari treats `:hover` rules as a tap-to-prime then
+     * tap-to-click two-stage gesture (the famous "double-tap
+     * problem"). Gating every visual-hover rule behind
+     * `@media (hover: hover)` means touch devices never enter that
+     * priming state — a single tap fires click immediately. Desktop
+     * browsers with a real mouse still get the hover affordance. */
+    @media (hover: hover) {
+        .app-sidebar__nav-link:hover {
+            background: color-mix(in oklch, var(--color-base-300) 55%, transparent);
+            color: var(--color-base-content);
+        }
+    }
+    .app-sidebar__nav-link--active {
+        background: color-mix(in oklch, var(--color-base-300) 85%, transparent);
+        color: var(--color-base-content);
+        font-weight: 500;
+    }
+
+    .app-sidebar__sessions-section {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        margin-top: 0.5rem;
+        border-top: 1px solid
+            color-mix(in oklch, var(--color-base-300) 60%, transparent);
+    }
+    .app-sidebar__sessions-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.75rem 1rem 0.25rem;
+    }
+    .app-sidebar__sessions-label {
+        font-size: 0.6875rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: color-mix(in oklch, var(--color-base-content) 50%, transparent);
+        font-weight: 600;
+    }
+    .app-sidebar__new-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 1.5rem;
+        height: 1.5rem;
+        border-radius: 0.375rem;
+        color: color-mix(in oklch, var(--color-base-content) 60%, transparent);
+        transition: background-color 120ms ease-out, color 120ms ease-out;
+    }
+    @media (hover: hover) {
+        .app-sidebar__new-btn:hover {
+            background: color-mix(in oklch, var(--color-base-300) 70%, transparent);
+            color: var(--color-base-content);
+        }
+    }
+    .app-sidebar__sessions {
+        list-style: none;
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 0.125rem 0.5rem 0.5rem;
+        margin: 0;
+        scrollbar-gutter: stable;
+    }
+
+    .session-row__item {
+        margin: 0;
+        /* Positioning context for the delete-form overlay below.
+         * The whole `<a>` is the clickable row; the delete sits on
+         * top of the right edge. */
+        position: relative;
+    }
+    .session-row {
+        display: flex;
+        align-items: center;
+        /* Reserve enough right padding for the absolutely-positioned
+         * trash button so the title never visually crashes into it. */
+        padding: 0.375rem 2rem 0.375rem 0.5rem;
+        border-radius: 0.5rem;
+        color: color-mix(in oklch, var(--color-base-content) 78%, transparent);
+        transition: background-color 120ms ease-out, color 120ms ease-out;
+        min-width: 0;
+        /* Belt for the title's `text-overflow: ellipsis`: even if a
+         * future restructure drops the `min-width: 0` on the title
+         * span, the row itself clips. Without this a very long title
+         * would push the sidebar's flex layout out instead of
+         * ellipsizing. */
+        overflow: hidden;
+    }
+    @media (hover: hover) {
+        .session-row:hover {
+            background: color-mix(in oklch, var(--color-base-300) 50%, transparent);
+            color: var(--color-base-content);
+        }
+    }
+    .session-row--active {
+        background: color-mix(in oklch, var(--color-base-300) 80%, transparent);
+        color: var(--color-base-content);
+        font-weight: 500;
+    }
+    .session-row__title {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 0.875rem;
+    }
+    .session-row__delete-form {
+        position: absolute;
+        right: 0.375rem;
+        top: 50%;
+        transform: translateY(-50%);
+    }
+    /* Delete button: hover-revealed on devices with a real pointer,
+     * always visible (but subdued) on touch. Touch devices can't
+     * surface a "hover state" so the only signal that a row is
+     * deletable would otherwise be a long-press — better to just
+     * show the trash at low opacity. */
+    .session-row__delete {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 1.375rem;
+        height: 1.375rem;
+        border-radius: 0.375rem;
+        color: color-mix(in oklch, var(--color-base-content) 40%, transparent);
+        opacity: 0.6;
+        transition: opacity 120ms ease-out, background-color 120ms ease-out,
+            color 120ms ease-out;
+    }
+    @media (hover: hover) {
+        .session-row__delete {
+            opacity: 0;
+        }
+        .session-row__item:hover .session-row__delete,
+        .session-row__item:focus-within .session-row__delete {
+            opacity: 1;
+        }
+        .session-row__delete:hover {
+            background: color-mix(in oklch, var(--color-error) 18%, transparent);
+            color: var(--color-error);
+        }
+    }
+
+    .app-sidebar__user {
+        border-top: 1px solid
+            color-mix(in oklch, var(--color-base-300) 60%, transparent);
+        padding: 0.5rem 0.625rem 0.625rem 1rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        min-width: 0;
+    }
+    .app-sidebar__email {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 0.75rem;
+        color: color-mix(in oklch, var(--color-base-content) 60%, transparent);
+    }
+    .app-sidebar__user-actions {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+        flex-shrink: 0;
+    }
+
+    /* Floating drawer-open trigger on mobile.
+     *
+     * Pure icon — sits absolute over the chat content; tap target is
+     * 2.25rem for ergonomics while the visible glyph is 18px. Same
+     * frosted backdrop-blur disc as `.chat-composer` so the trigger
+     * sits clearly above whatever's scrolling behind it on the
+     * conversation; without it the icon collides with code-block
+     * surfaces and message bubbles on a dark theme.
+     *
+     * Blur value routed through `--chat-frost` (see `.chat-composer`)
+     * because writing a literal `backdrop-filter` declaration gets
+     * stripped by Lightning CSS.
+     */
+    .app-mobile-menu-btn {
+        position: absolute;
+        top: 0.5rem;
+        left: 0.5rem;
+        z-index: 10;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.25rem;
+        height: 2.25rem;
+        background: transparent;
+        --chat-frost: blur(12px) saturate(140%);
+        backdrop-filter: var(--chat-frost);
+        border: 1px solid
+            color-mix(in oklch, var(--color-base-content) 12%, transparent);
+        border-radius: 9999px;
+        color: var(--color-base-content);
+        cursor: pointer;
+    }
+
+    /* Tokens page — the empty-state paragraph below the list. Hidden
+     * while the `<ul>` has children; the moment SSE patches remove
+     * the last row, the `:has(li)` test flips and the empty paragraph
+     * appears. Inverse-direction sibling combinator + :has() is how
+     * we keep the markup symmetric server-side (always render both
+     * elements) without server-side branching for the empty state. */
+    .token-list-empty {
+        display: none;
+    }
+    .token-list:not(:has(li)) + .token-list-empty {
+        display: block;
+    }
+
+    /* Chat page layout.
+     *
+     * `<main class="chat-main">` is a flex column inside the drawer's
+     * `drawer-content` (which is already a full-viewport-height flex
+     * column thanks to the `h-dvh` on `.app-shell`). Three rows
+     * top-to-bottom:
+     *   1. header strip (title + model pickers)  — flex-shrink: 0
+     *   2. `#conversation`                        — flex: 1, scrolls
+     *   3. `.chat-composer`                       — flex-shrink: 0
+     *
+     * The flex column does the pinning so the composer stays at the
+     * bottom even when the conversation is empty.
+     */
+    .chat-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        column-gap: 0.75rem;
+        row-gap: 0.5rem;
+        padding-bottom: 0.75rem;
+        margin-bottom: 0.75rem;
+        border-bottom: 1px solid
+            color-mix(in oklch, var(--color-base-300) 50%, transparent);
+        flex-shrink: 0;
+        min-width: 0;
+    }
+    .chat-header__title {
+        min-width: 0;
+        flex: 1 1 12rem;
+    }
+    .chat-header__pickers {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        min-width: 0;
+    }
+    /* Model / voice select chips.
+     *
+     * daisyUI v5 stamps `.select` with `padding-inline: .75rem` from
+     * inside `@layer utilities` *unlayered* — same slot Tailwind's
+     * own utilities live in — so a plain `.pr-9` utility from a
+     * class attribute doesn't always win the cascade. We use a
+     * dedicated `.chat-model-select` class with higher specificity
+     * (compound `select.chat-model-select`) and `!important` to nail
+     * down the right padding + max width regardless of source order.
+     *
+     * `padding-right` of ~2.25rem leaves clear space for daisyUI's
+     * chevron glyph, which sits ~16-20px from the right edge.
+     * `max-width: 14rem` caps the chip so a long model id like
+     * `mistralai/Voxtral-Mini-4B-Realtime-2602` doesn't blow the
+     * mobile header out of the viewport — the closed-state text
+     * truncates with an ellipsis instead. */
+    select.chat-model-select {
+        max-width: 14rem !important;
+        padding-right: 2.25rem !important;
+        text-overflow: ellipsis;
+        overflow: hidden;
+        white-space: nowrap;
+    }
+    .chat-main > #conversation {
+        flex: 1 1 auto;
+        overflow-y: auto;
+        min-height: 0;
+        scrollbar-gutter: stable;
+        /* Clearance for the floating composer at the bottom on every
+         * viewport size — the composer is absolute (see below), so
+         * without bottom padding the last message would sit
+         * permanently behind it. The generous value (well beyond the
+         * composer's own height) doubles as a scroll spacer so the last
+         * message can be scrolled up clear of the composer rather than
+         * ending flush against it. */
+        padding-bottom: 9rem;
+    }
+    /* Composer floats absolutely over the conversation at every
+     * viewport size — no sticky page-bg "bar" framing the bottom of
+     * the chat. The conversation's own padding-bottom keeps content
+     * out from under it; scrolling lets messages briefly pass behind
+     * it. Same trick as mobile, just now applied universally. */
+    .chat-main > .chat-composer {
+        position: absolute;
+        left: 1rem;
+        right: 1rem;
+        bottom: 1rem;
+        margin-top: 0;
+    }
+    /* Phone (< sm = 640px): the floating drawer-open button overlays
+     * the conversation at the top, so reserve top clearance inside
+     * #conversation's padding (parent chat-main has no top padding
+     * on phone — see `main_class_for`). On `sm:` the chat-header is
+     * visible and takes that role, so no extra padding-top here. */
+    @media (max-width: 639px) {
+        .chat-main > #conversation {
+            padding-top: 3rem;
+        }
+    }
+
+    #conversation {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+        padding-bottom: 1.5rem;
+    }
+    /* User bubbles right-align with a width cap. `position: relative`
+     * anchors the absolutely-positioned hover actions below. */
+    #conversation > .chat-msg--user {
+        align-self: flex-end;
+        max-width: min(80%, 36rem);
+        background: var(--color-base-200);
+        padding: 0.75rem 1rem;
+        border-radius: 1rem;
+        white-space: pre-wrap;
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        position: relative;
+    }
+    /* Attachment slots inside a user bubble. The bubble itself uses
+     * `white-space: pre-wrap` so freshly-typed messages keep their
+     * newlines; the prose slot inherits that. Images get a max-size
+     * cap so a portrait-orientation phone screenshot doesn't blow
+     * the bubble out of the conversation column. */
+    .chat-msg__prose {
+        margin: 0;
+    }
+    .chat-msg__attachment-image {
+        display: block;
+        max-width: 100%;
+    }
+    .chat-msg__attachment-image > img {
+        display: block;
+        max-width: 100%;
+        max-height: 18rem;
+        width: auto;
+        height: auto;
+        border-radius: 0.5rem;
+        background: var(--color-base-100);
+    }
+    .chat-msg__attachment-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.4rem 0.625rem;
+        border-radius: 0.5rem;
+        background: var(--color-base-100);
+        border: 1px solid var(--color-base-300);
+        font-size: 0.8125rem;
+        color: var(--color-base-content);
+        text-decoration: none;
+        max-width: 100%;
+        white-space: normal;
+        align-self: flex-start;
+    }
+    @media (hover: hover) {
+        .chat-msg__attachment-chip:hover {
+            background: var(--color-base-200);
+            text-decoration: none;
+        }
+    }
+    .chat-msg__attachment-icon {
+        display: inline-flex;
+        color: color-mix(in oklch, var(--color-base-content) 65%, transparent);
+        flex-shrink: 0;
+    }
+    .chat-msg__attachment-name {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow-wrap: anywhere;
+    }
+    .chat-msg__attachment-meta {
+        font-size: 0.6875rem;
+        color: color-mix(in oklch, var(--color-base-content) 55%, transparent);
+        flex-shrink: 0;
+    }
+    /* Per-message hover actions: Edit (user) / Retry (assistant).
+     * Absolutely positioned just under the bubble so they overlay the
+     * gap instead of adding height — the conversation layout doesn't
+     * shift whether or not they're shown. */
+    .chat-msg__actions {
+        position: absolute;
+        top: calc(100% - 0.25rem);
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.12s ease-in-out;
+        font-size: 0.75rem;
+        z-index: 1;
+    }
+    #conversation > .chat-msg--user .chat-msg__actions {
+        right: 0.25rem;
+        justify-content: flex-end;
+    }
+    #conversation > .chat-msg--assistant .chat-msg__actions {
+        left: 0;
+    }
+    @media (hover: hover) {
+        #conversation > .chat-msg--user:hover .chat-msg__actions,
+        #conversation > .chat-msg--assistant:hover .chat-msg__actions {
+            opacity: 1;
+            pointer-events: auto;
+        }
+    }
+    /* Touch devices can't hover — keep the actions in flow + visible so
+     * they stay tappable (a little extra height is fine there). */
+    @media (hover: none) {
+        .chat-msg__actions {
+            position: static;
+            margin-top: 0.25rem;
+            opacity: 1;
+            pointer-events: auto;
+        }
+    }
+    .chat-msg__action {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+        padding: 0.15rem 0.45rem;
+        border-radius: 0.375rem;
+        color: color-mix(in oklch, var(--color-base-content) 60%, transparent);
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        font-size: 0.75rem;
+        line-height: 1.2;
+    }
+    @media (hover: hover) {
+        .chat-msg__action:hover {
+            background: var(--color-base-200);
+            color: var(--color-base-content);
+        }
+    }
+    /* Inline edit form, revealed by toggling `.editing` on the bubble. */
+    .chat-msg__edit {
+        display: none;
+    }
+    .chat-msg--user.editing .chat-msg__body,
+    .chat-msg--user.editing .chat-msg__actions {
+        display: none;
+    }
+    .chat-msg--user.editing {
+        /* Give the editor room even if the original message was short. */
+        width: min(80%, 36rem);
+    }
+    .chat-msg--user.editing .chat-msg__edit {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+    .chat-msg__edit-textarea {
+        width: 100%;
+        min-height: 3rem;
+        resize: vertical;
+        border-radius: 0.5rem;
+        border: 1px solid var(--color-base-300);
+        background: var(--color-base-100);
+        color: var(--color-base-content);
+        padding: 0.5rem 0.625rem;
+        font: inherit;
+    }
+    .chat-msg__edit-actions {
+        display: flex;
+        gap: 0.5rem;
+        justify-content: flex-end;
+    }
+    /* Assistant bubbles are full-width with no chrome. `position:
+     * relative` anchors the absolutely-positioned hover Retry action. */
+    #conversation > .chat-msg--assistant,
+    #conversation > #active-reply {
+        align-self: stretch;
+        position: relative;
+    }
+
+    /* Tool-call activity rows inside an assistant bubble. Each row
+     * is a `<details>` element rendered by the chat-stream loop the
+     * moment the model emits a `tool_calls` delta — gives the user
+     * a live view of what the model is doing during the (often
+     * seconds-long) gap before content streams. The row's summary
+     * shows a spinner while the tool runs and flips to a check
+     * when the result lands; the body holds the input + output
+     * JSON, collapsed by default so the bubble stays compact.
+     *
+     * Same markup is folded into the final bubble swap so the
+     * rows persist as a per-turn record of which tools fired with
+     * what args and what they returned. */
+    .tool-calls {
+        gap: 0.375rem;
+        margin-bottom: 0.5rem;
+    }
+    .tool-call {
+        background: var(--color-base-200);
+        border-radius: 0.5rem;
+        font-size: 0.8125rem;
+        overflow: hidden;
+    }
+    .tool-call__summary {
+        list-style: none;
+        cursor: pointer;
+        padding: 0.5rem 0.75rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        color: var(--color-base-content);
+        user-select: none;
+    }
+    .tool-call__summary::-webkit-details-marker {
+        display: none;
+    }
+    /* Tiny disclosure caret built from a rotating right-arrow glyph
+     * so we don't need an extra icon dep. Rotates 90° when the
+     * details element is open. */
+    .tool-call__summary::after {
+        content: "›";
+        margin-left: auto;
+        font-size: 1rem;
+        line-height: 1;
+        color: color-mix(in oklch, var(--color-base-content) 50%, transparent);
+        transition: rotate 150ms ease-out;
+    }
+    .tool-call[open] > .tool-call__summary::after {
+        rotate: 90deg;
+    }
+    .tool-call__indicator {
+        display: inline-flex;
+        align-items: center;
+        color: color-mix(in oklch, var(--color-base-content) 70%, transparent);
+    }
+    .tool-call[open] > .tool-call__summary > .tool-call__indicator,
+    .tool-call:not([open]) > .tool-call__summary > .tool-call__indicator {
+        flex-shrink: 0;
+    }
+    .tool-call__label {
+        color: color-mix(in oklch, var(--color-base-content) 65%, transparent);
+        font-weight: 400;
+    }
+    .tool-call__name {
+        font-family: var(--font-mono);
+        font-weight: 600;
+        color: var(--color-base-content);
+    }
+    .tool-call__body {
+        padding: 0 0.75rem 0.75rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+    .tool-call__section-label {
+        font-size: 0.6875rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: color-mix(in oklch, var(--color-base-content) 50%, transparent);
+        margin-bottom: 0.25rem;
+    }
+    .tool-call__code {
+        background: var(--color-base-100);
+        border: 1px solid var(--color-base-300);
+        border-radius: 0.375rem;
+        padding: 0.5rem 0.625rem;
+        font-family: var(--font-mono);
+        font-size: 0.75rem;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-word;
+        overflow-x: auto;
+        max-height: 16rem;
+        overflow-y: auto;
+        margin: 0;
+    }
+
+    /* Reasoning / "thinking" block. Rendered by the chat-stream
+     * loop when `delta.reasoning_content` lands on a chunk (requires
+     * vLLM's `--reasoning-parser` for the model in question — qwen3,
+     * deepseek_r1, etc.). Open while the model is still thinking
+     * so the user can watch the stream; closes on completion so the
+     * final bubble shows a compact `Thought for X.Xs` summary, click
+     * to re-expand. The `:empty` rule keeps the slot invisible when
+     * the model didn't emit any reasoning at all. */
+    .thinking-block-slot:empty {
+        display: none;
+    }
+    .thinking-block {
+        margin-bottom: 0.5rem;
+        font-size: 0.8125rem;
+    }
+    .thinking-block__summary {
+        list-style: none;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.25rem 0.5rem;
+        border-radius: 0.375rem;
+        color: color-mix(in oklch, var(--color-base-content) 65%, transparent);
+        user-select: none;
+    }
+    .thinking-block__summary::-webkit-details-marker {
+        display: none;
+    }
+    .thinking-block__summary::after {
+        content: "›";
+        font-size: 1rem;
+        line-height: 1;
+        transition: rotate 150ms ease-out;
+    }
+    .thinking-block[open] > .thinking-block__summary::after {
+        rotate: 90deg;
+    }
+    .thinking-block__summary:hover {
+        background: var(--color-base-200);
+    }
+
+    /* Sticky composer pinned to the viewport bottom. The form is the
+     * card surface; the textarea and the action overlay sit inside a
+     * relative `.chat-composer__field` so the mic / send buttons can
+     * absolute-position to the top-right corner.
+     *
+     * Focus ring is drawn on the form itself (via :focus-within) so
+     * the whole composer lights up together — the inner textarea has
+     * `outline: none` because its own ring would clip against the
+     * card's rounded corners. */
+    .chat-composer {
+        position: sticky;
+        bottom: 1rem;
+        z-index: 20;
+        margin-top: 0.75rem;
+        /* No solid card background — the composer floats over the
+         * conversation. A frosted backdrop-blur softens whatever
+         * scrolls behind so the text stays readable without a
+         * full-width bg "bar" appearing on dark themes. The thin
+         * base-300 border keeps the input shape legible.
+         *
+         * The blur is routed through `--chat-frost` because writing
+         * a literal `backdrop-filter: blur(...)` here gets silently
+         * stripped by Lightning CSS (Tailwind v4's processor) — only
+         * the `-webkit-` alias survived, which Safari honours but
+         * Chromium ignores. Using a CSS variable for the value
+         * defeats whatever de-duping pass was eating it. */
+        background: transparent;
+        --chat-frost: blur(12px) saturate(140%);
+        backdrop-filter: var(--chat-frost);
+        border: 1px solid
+            color-mix(in oklch, var(--color-base-content) 12%, transparent);
+        border-radius: 1.5rem;
+        transition: border-color 150ms ease-out;
+    }
+    .chat-composer:focus-within {
+        border-color: color-mix(in oklch, var(--color-base-content) 30%, transparent);
+    }
+    /* Drag-target outline — applied while a file is hovering. The
+     * dragover/dragleave handlers in composer.ts toggle it. */
+    .chat-composer--drag {
+        border-color: color-mix(in oklch, var(--color-primary) 60%, transparent);
+        box-shadow: 0 0 0 3px color-mix(in oklch, var(--color-primary) 20%, transparent);
+    }
+    /* Chip strip above the textarea. Hidden when empty (no
+     * children). Wraps onto multiple rows for batch picks. */
+    .chat-composer__chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.375rem;
+        padding: 0.5rem 0.75rem 0;
+    }
+    .chat-composer__chips:empty {
+        display: none;
+    }
+    .chat-composer__chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.375rem;
+        padding: 0.25rem 0.5rem;
+        border-radius: 0.5rem;
+        background: var(--color-base-200);
+        border: 1px solid var(--color-base-300);
+        font-size: 0.8125rem;
+        max-width: 16rem;
+    }
+    .chat-composer__chip-label {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .chat-composer__chip-size {
+        font-size: 0.6875rem;
+        color: color-mix(in oklch, var(--color-base-content) 55%, transparent);
+        flex-shrink: 0;
+    }
+    .chat-composer__chip-remove {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 1.125rem;
+        height: 1.125rem;
+        border-radius: 9999px;
+        background: transparent;
+        color: color-mix(in oklch, var(--color-base-content) 60%, transparent);
+        font-size: 0.875rem;
+        line-height: 1;
+        flex-shrink: 0;
+    }
+    @media (hover: hover) {
+        .chat-composer__chip-remove:hover {
+            background: color-mix(in oklch, var(--color-error) 18%, transparent);
+            color: var(--color-error);
+        }
+    }
+    .chat-composer__field {
+        position: relative;
+    }
+    /* Textarea autosizes between min-height and max-height. We use
+     * the native `field-sizing: content` (Chrome 123+, Edge 123+,
+     * Firefox 123+, Safari 18+) — past max-height the textarea
+     * scrolls internally. No JS autosize needed. */
+    .chat-composer__textarea {
+        /* `display: block` is load-bearing for the centering: textareas
+         * are `inline-block` by default, which makes the parent reserve
+         * a slug of line-box descender room (~7 px) below them, and
+         * that pushes everything visually above the centre of the
+         * composer card. Block layout eliminates the slug, so the
+         * action overlay's `align-items: center` actually lands on
+         * the composer's mid-line. */
+        display: block;
+        background: transparent;
+        border: 0;
+        box-shadow: none;
+        resize: none;
+        field-sizing: content;
+        min-height: 3rem;
+        max-height: 14rem;
+        width: 100%;
+        /* Right padding leaves room for the absolute mic/send button so
+         * typed text doesn't run under it. */
+        padding: 0.75rem 3rem 0.75rem 1.125rem;
+        color: inherit;
+        outline: none;
+        font: inherit;
+        line-height: 1.5;
+    }
+    .chat-composer__textarea:focus,
+    .chat-composer__textarea:focus-visible {
+        outline: none;
+        box-shadow: none;
+    }
+    /* Absolute overlay holding the mic / send buttons. `height: 3rem`
+     * matches the textarea's single-line min-height; `align-items:
+     * center` then lands the button vertical center on the first
+     * line of text — regardless of whether the textarea has grown. */
+    .chat-composer__action {
+        position: absolute;
+        top: 0;
+        right: 0.5rem;
+        height: 3rem;
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+    }
+
+    /* Mic / send toggle. Default state (empty textarea, placeholder
+     * showing): mic visible, send hidden. As soon as the user types,
+     * `:placeholder-shown` flips off → send shows, voice-control hides.
+     *
+     * `:has(.voice-control)` guards the send-hide rule so on
+     * voice-less builds the send button is always visible (otherwise
+     * an empty textarea + no mic would leave nothing to click). */
+    .chat-composer__send {
+        display: inline-flex;
+    }
+    .chat-composer__field:has(.voice-control):has(.chat-composer__textarea:placeholder-shown)
+        .chat-composer__send {
+        display: none;
+    }
+    .chat-composer__field:has(.chat-composer__textarea:not(:placeholder-shown))
+        .voice-control {
+        display: none;
+    }
+    /* Voice activity meter — bars driven by RMS in app.js. */
+    .voice-control {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.375rem;
+    }
+    .voice-level {
+        --vol: 0;
+        display: none;
+        align-items: center;
+        gap: 0.1875rem;
+        height: 1.5rem;
+        padding: 0 0.125rem;
+    }
+    .voice-control:has([data-recording="1"]) .voice-level {
+        display: inline-flex;
+    }
+    .voice-level > span {
+        display: inline-block;
+        width: 3px;
+        background: var(--color-error);
+        border-radius: 9999px;
+        transform-origin: center;
+        transform: scaleY(calc(0.25 + var(--vol) * 0.75));
+        transition: transform 90ms linear;
+    }
+    .voice-level > span:nth-child(1) { height: 55%; }
+    .voice-level > span:nth-child(2) { height: 90%; }
+    .voice-level > span:nth-child(3) { height: 70%; }
+    .voice-level > span:nth-child(4) { height: 45%; }
+
+}
+
+/* Markdown styling for chat replies + reasoning blocks.
+ *
+ * Replaces the `@tailwindcss/typography` prose-modifier recipe — the
+ * per-render-site class string had grown to ~30 modifiers, which was
+ * a misery to read or tweak.
+ *
+ * Both classes share one set of rules with native CSS nesting
+ * (Tailwind v4 / Lightning CSS); they parameterise font-size, line
+ * height, text colour, and a few other knobs via custom properties.
+ * `.thinking-prose` overrides just those properties + adds the left
+ * rail; everything else (selectors, structural sizes, GFM extras
+ * like task lists and strikethrough) is shared.
+ *
+ * Lives in `@layer utilities` so it outranks daisyUI's prose styling
+ * in the cascade. */
+@layer utilities {
+    .chat-prose,
+    .thinking-prose {
+        /* Knobs the two classes parameterise. Defaults = chat reply
+         * sizes; `.thinking-prose` ratchets these down below. */
+        --prose-size: 0.875rem;
+        --prose-line: 1.55;
+        --prose-color: var(--color-base-content);
+        --prose-block-margin: 0.5em;
+        --prose-li-margin: 0.15em;
+        --prose-list-indent: 1.5em;
+        --prose-h1-size: 1.25rem;
+        --prose-h2-size: 1.125rem;
+        --prose-h3-size: 1rem;
+        --prose-h4-size: 0.95rem;
+        --prose-code-size: 0.85em;
+        --prose-code-color: inherit;
+        --prose-pre-size: 0.8125rem;
+        --prose-pre-line: 1.5;
+
+        font-size: var(--prose-size);
+        line-height: var(--prose-line);
+        color: var(--prose-color);
+        max-width: none;
+
+        & > :first-child { margin-top: 0; }
+        & > :last-child { margin-bottom: 0; }
+
+        & p, & ul, & ol { margin: var(--prose-block-margin) 0; }
+        & ul { list-style: disc; padding-inline-start: var(--prose-list-indent); }
+        & ol { list-style: decimal; padding-inline-start: var(--prose-list-indent); }
+        & li { margin: var(--prose-li-margin) 0; }
+        /* GFM task lists render as `<li><input type="checkbox">…`.
+         * Pull the bullet, line up the checkbox with the text. */
+        & li:has(> input[type="checkbox"]) { list-style: none; margin-inline-start: -1em; }
+        & li > input[type="checkbox"] {
+            margin-inline-end: 0.4em;
+            vertical-align: middle;
+        }
+
+        & h1 { font-size: var(--prose-h1-size); font-weight: 600; margin: 0.75em 0 0.4em; line-height: 1.3; }
+        & h2 { font-size: var(--prose-h2-size); font-weight: 600; margin: 0.75em 0 0.4em; line-height: 1.3; }
+        & h3 { font-size: var(--prose-h3-size); font-weight: 600; margin: 0.65em 0 0.35em; line-height: 1.35; }
+        & h4, & h5, & h6 { font-size: var(--prose-h4-size); font-weight: 600; margin: 0.6em 0 0.3em; }
+
+        & strong { font-weight: 600; }
+        & em { font-style: italic; }
+        /* GFM strikethrough. */
+        & del, & s { text-decoration: line-through; opacity: 0.75; }
+        & a {
+            color: var(--color-primary);
+            text-decoration: none;
+            &:hover { text-decoration: underline; }
+        }
+
+        & blockquote {
+            margin: var(--prose-block-margin) 0;
+            padding-inline-start: 0.875em;
+            border-inline-start: 3px solid var(--color-base-300);
+        }
+        & hr {
+            margin: 1em 0;
+            border: 0;
+            border-top: 1px solid var(--color-base-300);
+        }
+
+        & code {
+            background: var(--color-base-200);
+            border: 1px solid var(--color-base-300);
+            padding: 0.1em 0.35em;
+            border-radius: 0.25rem;
+            font-size: var(--prose-code-size);
+            color: var(--prose-code-color);
+        }
+        & pre {
+            margin: 0.6em 0;
+            padding: 0.6em 0.8em;
+            font-size: var(--prose-pre-size);
+            line-height: var(--prose-pre-line);
+            background: var(--color-base-200);
+            color: var(--color-base-content);
+            border: 1px solid var(--color-base-300);
+            border-radius: 0.375rem;
+            overflow-x: auto;
+
+            & code {
+                background: transparent;
+                border: 0;
+                padding: 0;
+                font-size: inherit;
+                color: inherit;
+            }
+        }
+
+        /* GFM tables. */
+        & table {
+            margin: 0.6em 0;
+            font-size: var(--prose-pre-size);
+            border-collapse: collapse;
+        }
+        & th, & td {
+            padding: 0.35em 0.5em;
+            border: 1px solid var(--color-base-300);
+        }
+        & th { font-weight: 600; background: var(--color-base-200); }
+    }
+
+    /* Reasoning / "thinking" block body. Smaller, dimmer, and with a
+     * left rail so the chain-of-thought reads as secondary commentary
+     * relative to the answer above it. */
+    .thinking-prose {
+        --prose-size: 0.75rem;
+        --prose-color: color-mix(in oklch, var(--color-base-content) 55%, transparent);
+        --prose-block-margin: 0.25em;
+        --prose-li-margin: 0.125em;
+        --prose-list-indent: 1.25em;
+        --prose-h1-size: 0.8125rem;
+        --prose-h2-size: 0.8125rem;
+        --prose-h3-size: 0.75rem;
+        --prose-h4-size: 0.75rem;
+        --prose-code-size: 0.7rem;
+        --prose-code-color: color-mix(in oklch, var(--color-base-content) 75%, transparent);
+        --prose-pre-size: 0.7rem;
+
+        margin-top: 0.5rem;
+        padding-inline-start: 0.75rem;
+        border-inline-start: 2px solid var(--color-base-300);
+    }
+}

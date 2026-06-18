@@ -1,0 +1,122 @@
+id = "letter"
+description = """
+Render a corporate letter on company stationery (logo, DIN-style letterhead, \
+structured legal footer). Use for outgoing correspondence. You only choose the \
+legal entity and language and write the content — all company data (address, \
+register, VAT, bank/IBAN) is built in per entity, so never ask the user for those.
+
+Before you call this tool, slow down and think the whole letter through so \
+NOTHING from the request is lost. Re-read the user's message and enumerate \
+every detail it carries — recipient organization AND contact person, every \
+address line (street, postal code + city, country), the actual ask, any dates \
+or figures — then map each into the right field. After drafting, verify the \
+recipient block names the company and (if a contact person was given) that \
+person, each EXACTLY ONCE: the company goes in recipient_name when the letter \
+is addressed to an organization and must NOT be repeated in recipient_address. \
+Also verify the body opens with a salutation and that no requested detail was \
+dropped. Better to reason a little longer than to omit a detail — or to print \
+it twice.
+"""
+output_basename = "letter"
+
+[[field]]
+name = "entity"
+required = false
+description = """
+Which legal entity sends the letter — drives the letterhead address and the \
+legal/bank footer. \"de\" = Example GmbH (Germany, the default); \"us\" = \
+Example Corp Inc. Choose by the SENDER's entity: use \"us\" when the letter \
+goes out on behalf of the US entity — e.g. the sender works for it, or the \
+recipient is in the USA/Canada. Otherwise use \"de\"."""
+
+[[field]]
+name = "language"
+required = false
+description = """
+Letter language, Example GmbH only: \"en\" (English, the default) or \"de\" \
+(German) — set \"de\" only for a German letter. Ignored for Example Corp Inc, \
+which is always English."""
+
+[[field]]
+name = "recipient_name"
+required = true
+description = """
+The single TOP line of the recipient block. If the letter is addressed to an \
+organization, put the company/organization name here; if it is addressed to a \
+person directly (no organization), put that person's full name here. This is \
+ONE line only, and it must NEVER be repeated inside recipient_address — \
+recipient_address holds only the lines that come below it."""
+
+[[field]]
+name = "recipient_address"
+required = true
+description = """
+The address lines printed BELOW recipient_name, newline-separated (one line \
+per line). Do NOT repeat recipient_name here — it already prints on the line \
+above, and repeating it makes the company (or person) appear twice. Put each \
+of the following on its own line, in this order, and include every one the \
+request gives: a \"z. Hd. …\" / \"Attn: …\" line for the contact person WHEN \
+recipient_name holds the organization (so the person is not lost); the \
+organization line ONLY WHEN recipient_name holds a person (so the organization \
+is not lost); then the street; then the postal code + city; then the country. \
+The goal: the organization and the contact person EACH appear exactly once \
+across recipient_name + recipient_address — never dropped, never doubled. \
+Example — a letter to Jane Roe at the organization \"Acme Co.\" → \
+recipient_name = \"Acme Co.\", recipient_address = \"Attn: Jane Roe\\n123 Main \
+Street\\n10115 Berlin\\nGermany\" (the organization is NOT repeated in \
+recipient_address)."""
+
+[[field]]
+name = "subject"
+required = true
+description = "Letter subject — printed bold above the body."
+
+[[field]]
+name = "body"
+required = true
+description = """
+Letter body as prose paragraphs, separated by blank lines (the template handles \
+spacing). ALWAYS open with a salutation line addressing the recipient in the \
+letter's language — never skip it — e.g. \"Sehr geehrte Frau Dr. Roe,\" or \
+\"Dear Dr. Roe,\" (use \"Sehr geehrte Damen und Herren," / \"Dear Sir or \
+Madam,\" only when no contact person is known). Do NOT write a \
+sign-off — no \"Mit freundlichen Grüßen\" / \"Sincerely\" / \"Kind regards\" and \
+no sender name at the end: the template appends the closing and signature for \
+you. Writing one yourself produces a duplicate closing. Write PLAIN TEXT only — \
+no Markdown: do not use **, *, #, or \"- \"/\"* \" bullet markers, they print \
+literally. To enumerate points, use flowing prose or short separate paragraphs \
+(each separated by a blank line), not a bullet list."""
+
+[[field]]
+name = "sender_name"
+required = false
+default_from = "user.name"
+description = """
+Name of the person the letter is FROM — shown in the top-right contact block \
+and under the signature. LEAVE THIS UNSET in the normal case: the tool fills it \
+with the signed-in user's name automatically. Only set it when the letter is \
+written on someone else's behalf (e.g. an assistant drafting for a manager). \
+sender_name and sender_email travel together: if you set one for a different \
+sender, set the other too — supplying either turns off the auto-fill for BOTH, \
+so the one you omit would otherwise print blank."""
+
+[[field]]
+name = "sender_title"
+required = false
+description = "Sender's role/title, e.g. \"Geschäftsführer\" (optional)."
+
+[[field]]
+name = "sender_email"
+required = false
+default_from = "user.email"
+description = """
+Sender's email for the top-right contact block. LEAVE THIS UNSET in the normal \
+case: the tool fills it with the signed-in user's email automatically. Only set \
+it when the sender is someone other than the signed-in user — and in that case \
+set sender_name too: supplying either of the two turns off the auto-fill for \
+BOTH, so the one you omit would otherwise print blank."""
+
+[[field]]
+name = "sender_phone"
+required = false
+description = "Sender's phone for the top-right contact block (optional)."

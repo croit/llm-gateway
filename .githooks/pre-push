@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Pre-push CI gate.
+#
+# Runs the same lint + test that CI's `ci` job runs (via the very same
+# mise tasks, so this can't drift from `.github/workflows/ci.yml` → `mise run ci`):
+#   - mise run lint  → cargo fmt --all --check, clippy --workspace
+#                      --all-targets -D warnings, tsc --noEmit
+#   - mise run test  → cargo test --workspace
+# It does NOT run the release builds — those are slow and a compile error
+# surfaces in the test step anyway.
+#
+# A push only triggers CI, so gating at push (not every commit) catches the
+# breakage at the point it matters while leaving WIP commits cheap.
+#
+# Genuine emergency / WIP push: `git push --no-verify`.
+set -euo pipefail
+
+# Git hooks inherit a minimal PATH; make the usual mise install locations and
+# Homebrew reachable so `mise` and the toolchains it shims resolve.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+if ! command -v mise >/dev/null 2>&1; then
+  echo "pre-push: mise not on PATH — install mise, or bypass with 'git push --no-verify'" >&2
+  exit 1
+fi
+
+echo "pre-push: running lint + workspace tests (mirrors CI; bypass with --no-verify)…"
+# Separate invocations: `mise run lint test` would pass "test" as an argument
+# to the lint task, not run it as a second task. set -e aborts on the first
+# failure.
+mise run lint
+mise run test
+echo "pre-push: all checks passed ✓"

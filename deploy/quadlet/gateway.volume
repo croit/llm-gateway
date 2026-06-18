@@ -1,0 +1,6 @@
+# Named volume for the gateway's SQLite DB + session store. Lives under
+# /var/lib/containers/storage/volumes/systemd-gateway/_data on the host;
+# survives `systemctl restart gateway.service` and image swaps.
+
+[Volume]
+VolumeName=systemd-gateway

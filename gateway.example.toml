@@ -1,0 +1,241 @@
+# gateway.example.toml — copy to `gateway.toml` for local development, or
+# point `$GATEWAY_CONFIG` at this file.
+
+[bind]
+host = "127.0.0.1"
+port = 8080
+
+[db]
+path = "gateway.sqlite"
+
+[gateway]
+public_url = "http://localhost:8080"
+token_ttl_days = 90
+session_key_env = "GATEWAY_SESSION_KEY"
+
+# ---- Upstream pools --------------------------------------------------------
+# Each [upstream_pools.<name>] block defines a logical pool of backends that
+# serve the same kind of model (chat, transcription, embedding). The picker
+# strategy chooses one healthy backend per request:
+#   - round_robin     (default rotation)
+#   - least_inflight  (prefers the least-loaded backend; recommended)
+
+[upstream_pools.local_chat]
+kind = "chat"
+strategy = "least_inflight"
+
+[[upstream_pools.local_chat.backend]]
+name = "gpu-01"
+base_url = "http://gpu-01.internal:8000/v1"
+# api_key_env = "GPU01_KEY"   # uncomment if the backend needs a bearer
+max_inflight = 16
+weight = 1
+
+[[upstream_pools.local_chat.backend]]
+name = "gpu-02"
+base_url = "http://gpu-02.internal:8000/v1"
+max_inflight = 16
+weight = 1
+
+# Second pool for Whisper-style transcription. /v1/audio/transcriptions
+# routes here when the request's `model` field is advertised by any
+# backend in a transcription-kind pool.
+# [upstream_pools.local_whisper]
+# kind = "transcription"
+# strategy = "round_robin"
+# # Fallback model ids for backends that don't expose a usable `/models`
+# # endpoint (e.g. a Voxtral realtime server). Advertised in /v1/models and
+# # used for routing only while the probe reports nothing. Can also be set
+# # per-backend (below), which takes precedence over this pool-level list.
+# models = ["mistralai/Voxtral-Mini-4B-Realtime-2602"]
+#
+# [[upstream_pools.local_whisper.backend]]
+# name = "whisper-01"
+# base_url = "http://whisper-01.internal:9000/v1"
+# health_path = "/models"   # Whisper-only servers may need a different path
+# # models = ["whisper-1"]  # per-backend fallback; overrides the pool list
+
+# ---- Model → pool routing --------------------------------------------------
+# No static route table. The health probe hits each backend's `/models`
+# endpoint every 5 s, parses the OpenAI envelope (`{"data":[{"id":...}]}`),
+# and routes by what each backend reports. Load a model on a backend in
+# the right kind of pool and it becomes routable automatically — no
+# config edit required. (Run /v1/models or check the chat picker to see
+# what the gateway has discovered.)
+#
+# Model id resolution precedence per backend, highest first:
+#   1. what the backend's `/models` probe reports (authoritative);
+#   2. that backend's `models = [...]` (a fallback, more specific);
+#   3. the pool's `models = [...]` (a fallback, least specific).
+# The first non-empty source wins, so config is a fallback for backends that
+# can't self-report — not a supplement to a live probe.
+#
+# /v1/models lists EVERY model across ALL pools/kinds (chat + transcription +
+# embedding), de-duplicated by id — OpenAI parity; clients select by id.
+
+# ---- OIDC ------------------------------------------------------------------
+# Required for /auth/login and `gw auth login` to work.
+
+# [oidc]
+# issuer = "https://id.example.com/realms/company"
+# client_id = "llm-gateway"
+# client_secret_env = "GATEWAY_OIDC_CLIENT_SECRET"
+# scopes = ["email", "profile", "groups"]
+# roles_claim = "groups"
+
+# ---- RBAC ------------------------------------------------------------------
+# Map OIDC claim values to internal role IDs, and declare what each role can
+# access. The default_role applies to every authenticated user.
+
+# [rbac]
+# default_role = "user"
+#
+# [[rbac.mapping]]
+# oidc_claim = "groups"
+# oidc_value = "engineering"
+# role = "engineering"
+#
+# [[rbac.mapping]]
+# oidc_claim = "groups"
+# oidc_value = "admin"
+# role = "admin"
+
+# [[roles]]
+# id = "user"
+# models = ["*"]
+# tools = []
+#
+# [[roles]]
+# id = "engineering"
+# models = ["*"]
+# # Grant `enable_tools` (always-on core) so the model can turn on extra
+# # tool groups mid-conversation — see docs/tool-context-optimization.md.
+# tools = ["enable_tools", "get_current_timestamp", "get_user_location", "remember", "recall"]
+#
+# [[roles]]
+# id = "admin"
+# models = ["*"]
+# tools = ["*"]
+
+# ---- Chat attachments (S3) -------------------------------------------------
+# The chat composer accepts any file (paperclip / drag-drop / clipboard
+# paste). Each upload lands at `<key_prefix>/<turn_id>/<filename>` in the
+# bucket; the gateway then presigns a GET URL (1 h TTL) rooted at the
+# same endpoint and hands that to the upstream LLM as `image_url`
+# content (for images) or alongside a `[gw-attachment …]` marker (for
+# everything else, with text/* and known data formats also inlined as a
+# fenced block). Bucket stays private; no public-read ACL needed.
+#
+# Capability gating is intentionally NOT done here — operators are
+# expected to point [upstream_pools] at multi-modal chat models only;
+# any model/attachment mismatch surfaces as the upstream's own error.
+#
+# Past-turn attachments are stripped from the replayed history (kept as
+# brief `[attached: name.ext (omitted)]` stubs) so a long conversation
+# never blows up the context window.
+
+# [chat.s3]
+# # `endpoint` is both the upload host AND the presigned-URL root, so
+# # it must be reachable from the upstream LLM's network (not just the
+# # gateway's). Path-style requests are always used.
+# endpoint        = "https://s3.eu-central-1.amazonaws.com"
+# region          = "eu-central-1"
+# bucket          = "my-gateway-attachments"
+# # Env-var NAMES (not the secret values themselves — same pattern as
+# # session_key_env / client_secret_env).
+# access_key_env  = "GATEWAY_S3_ACCESS_KEY"
+# secret_key_env  = "GATEWAY_S3_SECRET_KEY"
+# # Object key prefix inside the bucket. Optional; defaults to
+# # "chat-attachments". Useful when the bucket is shared with other
+# # workloads.
+# # key_prefix    = "chat-attachments"
+
+# ---- Typst templates -------------------------------------------------------
+# Per-template tools (`typst_<id>`) the model can call to render
+# PDFs/letters/presentations in your corporate design. The gateway
+# scans `templates_dir` at startup; each subdirectory containing a
+# `template.toml` manifest (and the `template.typ` it points at)
+# becomes one tool. Field schemas in the manifest become the tool's
+# JSON schema, so the model sees exact field names / types.
+#
+# The `typst` CLI must be on PATH for the rendered output to be
+# produced; if it isn't, the tools still register but every call
+# returns a clean error.
+#
+# See `examples/typst-templates/letter/` in the repo for a working
+# template + manifest pair to copy.
+#
+# The container image bakes the in-repo templates to `/opt/typst-templates`
+# (see Dockerfile), so the templates ship and version with the binary. Point
+# `templates_dir` there and DON'T bind-mount a host dir over `/opt/typst-templates`
+# — a stale host copy shadows the baked-in templates and silently pins an old
+# design. Use a host mount only if you deliberately maintain templates out-of-band.
+
+# [typst]
+# templates_dir = "/opt/typst-templates"
+
+# ---- GeoIP -----------------------------------------------------------------
+# Lets the `get_user_location` tool resolve a caller's source IP to a
+# coarse city/country (so the assistant can answer "weather here?" without
+# the user naming a city). Uses an IP2Location LITE DB11 `.BIN`.
+#
+# Entirely optional: with no `[geoip]` block — or with the file missing —
+# the gateway boots and runs unchanged; the tool just falls back to a
+# browser-shared position (or reports the location as unknown).
+#
+# The `.BIN` is hot-reloaded: drop a new file at `db_path` (or let the
+# weekly updater do it) and the running gateway picks it up without a
+# restart. `update_token_env` names the env var holding an IP2Location
+# download token (register a free LITE account at ip2location.com); when
+# set, a weekly background task refreshes `db_path`. Leave it unset to
+# manage the file yourself.
+
+# [geoip]
+# db_path          = "data/ip2location/IP2LOCATION-LITE-DB11.BIN"
+# update_token_env = "IP2LOCATION_TOKEN"
+
+# ---------------------------------------------------------------------------
+# External MCP (Model Context Protocol) servers.
+#
+# Each `[[mcp.servers]]` is connected at startup and its tools appear in chat
+# (and on /tools, grouped under "Integrations") as `mcp__<name>__<tool>`.
+# Optional: with no `[mcp]` block the gateway exposes only its built-in tools.
+# A server that's unreachable at boot is logged and skipped — it never blocks
+# startup. Exactly one transport per server:
+#
+#   * stdio — `command` (+ optional `args` / `env`) spawns the server as a
+#     subprocess. The child inherits the gateway's environment. NOTE: the
+#     deploy image is minimal (no node/python), so stdio is mainly for local
+#     dev; in production prefer http to a server running as its own container.
+#   * http  — `url` is the server's streamable-HTTP endpoint. Authenticate
+#     with `bearer_token_env` (names an env var holding the raw token; sent as
+#     `Authorization: Bearer <token>`) and/or literal `headers` (e.g. an
+#     `X-Api-Key`). Keep secrets in the environment via `bearer_token_env`.
+
+# [[mcp.servers]]
+# name    = "files"                       # → tools mcp__files__*
+# command = "npx"
+# args    = ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+
+# [[mcp.servers]]
+# name            = "acme"                # → tools mcp__acme__*
+# url             = "https://mcp.acme.example/mcp"
+# bearer_token_env = "ACME_MCP_TOKEN"     # → Authorization: Bearer <$ACME_MCP_TOKEN>
+# headers         = { X-Tenant = "acme" }
+
+# --- RAG (retrieval-augmented generation) ------------------------------
+# Operator-managed indexed codebases. Collections are added via the /rag
+# page (admin-only) or POST /api/v0/rag/collections; the gateway clones
+# them, chunks every file, embeds each chunk through one of the
+# `kind = "embedding"` pools above, and stores vectors in a per-collection
+# usearch file on disk. The `rag_search` + `rag_list_collections` tools
+# expose these collections to the chat model.
+#
+# `data_dir` MUST live on a writable filesystem. The container image
+# ships with a read-only rootfs (see deploy/quadlet/gateway.container ->
+# ReadOnly=true), so the default `data/rag` ONLY works for local dev.
+# Production: point this at a subdirectory of the same named volume that
+# backs [db].path (e.g. /var/lib/gateway/rag) so the index files + clone
+# cache survive image swaps.
+# [rag]
+# data_dir = "/var/lib/gateway/rag"

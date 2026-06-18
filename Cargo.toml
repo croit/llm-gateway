@@ -1,0 +1,223 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shared",
+    "crates/session-core",
+    "crates/gateway",
+    "crates/cli",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+# Pinned-once-here, used everywhere. See docs/dependencies.md for the rules.
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+thiserror = "2"
+anyhow = "1"
+jiff = { version = "0.2", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# TLS handshake helper for the `tls_cert` gateway tool — a raw rustls
+# connect with verification disabled so we can inspect the presented
+# certificate (including expired / self-signed ones).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+toml = "0.8"
+multer = "3"
+# S3 (or S3-compatible) client for chat attachments. The gateway
+# uploads each attached file to a bucket and includes the public
+# object URL in OpenAI's `image_url` content parts (or in a
+# `[attached: url=…]` marker for non-image files). Default features
+# bring in tokio + native HTTPS via the `tokio` + `with-tokio`
+# features. `no-verify-ssl` is intentionally NOT enabled — operators
+# must point at a proper TLS endpoint.
+rust-s3 = { version = "0.36", default-features = false, features = ["tokio-rustls-tls"] }
+
+# GeoIP. `ip2location` reads an IP2Location LITE DB11 `.BIN` (memory-mapped,
+# sync, Send+Sync) — shared behind an `Arc` and hot-swapped when the file
+# changes. Resolves a client IP → city/country/lat-lon so the AI can learn
+# where the user is. `notify` watches the DB path and
+# triggers a reload without a restart (operator drop-in or the weekly updater).
+# `zip` unpacks the IP2Location LITE distribution the optional updater downloads
+# (deflate-only — the LITE archives use standard deflate; avoids the C-backed
+# bzip2/lzma/zstd codecs in zip's default features).
+ip2location = "0.6"
+notify = "8"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+async-trait = "0.1"
+
+# Persistence + crypto.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate"] }
+rand = "0.9"
+sha2 = "0.10"
+hmac = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
+url = "2"
+webbrowser = "1"
+# Pinned to the `rust_crypto` (pure-Rust) backend: v10 dropped the bundled
+# crypto provider, so a backend must be selected explicitly. `rust_crypto`
+# avoids the aws-lc-sys C/cmake build the alternative would add. v10.3+ also
+# fixes CVE-2026-25537 (string-typed `nbf`/`exp` claims silently skipping
+# validation).
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
+
+# HTTP framework + proxying. `http-full` covers server, client, codec, and
+# the datastar SSE helpers; rustls/tls deliberately omitted so the build
+# doesn't pull aws-lc-sys (cmake-only). TLS is fronted by the reverse
+# proxy in deployments; outbound HTTPS uses reqwest's ring-backed rustls.
+rama = { git = "https://github.com/plabayo/rama", rev = "5ba0ada6b89defec9eb8cbdc645b4080c950651e", default-features = false, features = ["http-full", "tower"] }
+
+# HTML templating — `html! { ... }` macro for plait, used in the
+# rama_server::pages module for type-checked server-rendered HTML.
+plait = "0.8"
+
+# Chat-render pipeline. Pinned at the workspace level so `gateway`
+# and `session-core` can't drift apart on the highlighter version.
+# See docs/dependencies.md for the rationale on `lumis`'s grammar set
+# and the chat-render post-pass that runs `markdown` then `lumis` then
+# a regex rewrite of lumis' outer `<pre>`.
+#
+# We deliberately do NOT use lumis' `all-languages` default: it pulls in
+# `lang-caddy` (tree-sitter-caddy), the only GPL-3.0 grammar in the set.
+# Statically linking GPL-3.0 would force the whole binary to GPL-3.0,
+# which is incompatible with this project's AGPL-3.0 license. Instead we enable
+# `all-languages` minus `lang-caddy` explicitly — every other grammar is
+# MIT/Apache-2.0. Only Caddyfile code blocks lose highlighting (they fall
+# back to plain text). On a lumis upgrade, re-sync this list with the
+# crate's `all-languages` feature and confirm no new GPL/AGPL grammars
+# were added (check tree-sitter-* license fields).
+markdown = "1"
+lumis = { version = "0.9", default-features = false, features = [
+    "lang-arduino",
+    "lang-angular",
+    "lang-asm",
+    "lang-astro",
+    "lang-bash",
+    "lang-bicep",
+    "lang-c",
+    "lang-clojure",
+    "lang-cmake",
+    "lang-comment",
+    "lang-commonlisp",
+    "lang-cpp",
+    "lang-csharp",
+    "lang-css",
+    "lang-csv",
+    "lang-d",
+    "lang-dart",
+    "lang-diff",
+    "lang-dockerfile",
+    "lang-dot",
+    "lang-eex",
+    "lang-ejs",
+    "lang-elixir",
+    "lang-elm",
+    "lang-editorconfig",
+    "lang-erb",
+    "lang-erlang",
+    "lang-fish",
+    "lang-fortran",
+    "lang-fsharp",
+    "lang-gitattributes",
+    "lang-gitignore",
+    "lang-gleam",
+    "lang-glimmer",
+    "lang-glsl",
+    "lang-go",
+    "lang-graphql",
+    "lang-haskell",
+    "lang-hcl",
+    "lang-heex",
+    "lang-html",
+    "lang-http",
+    "lang-iex",
+    "lang-ini",
+    "lang-java",
+    "lang-javascript",
+    "lang-json",
+    "lang-json5",
+    "lang-jinja",
+    "lang-jinja-inline",
+    "lang-just",
+    "lang-javadoc",
+    "lang-jq",
+    "lang-julia",
+    "lang-kdl",
+    "lang-kotlin",
+    "lang-latex",
+    "lang-liquid",
+    "lang-llvm",
+    "lang-lua",
+    "lang-luadoc",
+    "lang-make",
+    "lang-matlab",
+    "lang-mermaid",
+    "lang-markdown",
+    "lang-markdown-inline",
+    "lang-nginx",
+    "lang-nim",
+    "lang-nix",
+    "lang-nushell",
+    "lang-objc",
+    "lang-ocaml",
+    "lang-pascal",
+    "lang-perl",
+    "lang-php",
+    "lang-powershell",
+    "lang-prisma",
+    "lang-protobuf",
+    "lang-puppet",
+    "lang-python",
+    "lang-qmljs",
+    "lang-r",
+    "lang-racket",
+    "lang-regex",
+    "lang-rst",
+    "lang-ruby",
+    "lang-rust",
+    "lang-scala",
+    "lang-scss",
+    "lang-scheme",
+    "lang-sql",
+    "lang-solidity",
+    "lang-surface",
+    "lang-svelte",
+    "lang-swift",
+    "lang-systemverilog",
+    "lang-tcl",
+    "lang-terraform",
+    "lang-toml",
+    "lang-tsx",
+    "lang-typescript",
+    "lang-typst",
+    "lang-vim",
+    "lang-vhdl",
+    "lang-vue",
+    "lang-wat",
+    "lang-wgsl",
+    "lang-xml",
+    "lang-yaml",
+    "lang-zig",
+    "lang-zsh",
+] }
+regex = "1"
+
+# In-process vector index for the RAG subsystem. Unum's usearch — a
+# single-header C++ HNSW served via a thin Rust wrapper; the crate's
+# build.rs compiles the C++ into the binary, so no runtime .so / .dylib
+# and no network at build time. One index file per collection, mmap'd
+# on open. `default-features = false` drops the `numkong` SIMD helper
+# (its FP8 / SME-dispatch C files segfault Apple-Silicon clang); usearch
+# falls back to its built-in distance kernels, which is plenty for our
+# scale (codebase RAG, tens of thousands of chunks per collection).
+usearch = { version = "2.25", default-features = false }

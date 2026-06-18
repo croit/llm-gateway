@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 48" role="img" aria-label="Example Corp">
+  <rect x="0" y="8" width="32" height="32" rx="7" fill="#2563EB"/>
+  <rect x="9" y="17" width="14" height="14" rx="3" fill="#ffffff"/>
+  <text x="44" y="32" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#0F172A">Example Corp</text>
+</svg>

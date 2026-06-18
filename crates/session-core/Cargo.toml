@@ -1,0 +1,49 @@
+[package]
+name = "session-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Shared scaffolding for the chat-style "session" surface that the
+# gateway is built on: the per-user worker registry, the
+# `SessionDriver` abstraction, the `TurnUpdate` broadcast variants,
+# the HTTP server primitives + asset/chrome handlers, and the chat
+# renderers. Carved out as its own crate so a future second consumer
+# can paint the same bubbles without forking the gateway.
+
+[dependencies]
+tokio = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+# UI rendering. The chat transcript + composer renderers live here so
+# any consumer paints the same bubbles. `lumis` is heavy at compile
+# time (117 tree-sitter grammars via build.rs) but baked into one
+# place rather than each bin.
+plait = { workspace = true }
+markdown = { workspace = true }
+lumis = { workspace = true }
+regex = { workspace = true }
+
+# HTTP server primitives + asset/chrome handlers shared with both
+# binaries. `rama` is the server stack; its re-exports cover the
+# buffer type (`rama::bytes`, for the SSE payloads `chrome::sse_*`
+# produce) and the SSE-streamer's channel/sink (`rama::futures`).
+# `sha2` is for the cache-busting hash on asset URLs.
+rama = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+
+# Persistence. Pool type + macros pulled in; the gateway's worker
+# harness calls session-core to read and write turns. session-core
+# does not manage migrations itself — the gateway owns its
+# `migrations/` directory and chooses when to apply the
+# session-related ones.
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jiff = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }

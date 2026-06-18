@@ -1,0 +1,100 @@
+LLM Gateway
+Copyright (C) croit GmbH and contributors
+
+This product is licensed under the GNU Affero General Public License v3.0
+(AGPL-3.0-only); see the LICENSE file for the full terms.
+
+It includes and/or links third-party components that remain under their own
+licenses. The list below covers the components that ship inside the binary or
+that carry attribution/notice obligations. It is not a substitute for a full
+dependency audit — run `cargo about generate` or `cargo deny check licenses`
+for an exhaustive, machine-generated manifest of every transitive crate.
+
+================================================================================
+Assets compiled into the binary (via `include_bytes!`)
+================================================================================
+
+- Datastar (https://data-star.dev/) — MIT License.
+  Copyright © Star Federation.
+  Bundled verbatim as `crates/session-core/assets/datastar.js` and served from
+  the binary.
+
+- Tailwind CSS v4 (https://tailwindcss.com/) — MIT License.
+  Copyright (c) Tailwind Labs, Inc.
+  Compiled into `crates/session-core/assets/app.css`.
+
+- daisyUI v5 (https://daisyui.com/) — MIT License.
+  Copyright (c) 2020 Pouya Saadeghi.
+  Compiled into `crates/session-core/assets/app.css`.
+
+The above components are distributed under the MIT License. As the MIT License
+requires, the following permission notice accompanies each of them:
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+The remaining bundled JavaScript (`app.js`, `pcm-recorder.js`) is part of this
+project and is covered by the project's AGPL-3.0 license.
+
+================================================================================
+Notable Rust dependencies
+================================================================================
+
+The dependency tree is overwhelmingly MIT and/or Apache-2.0. Components worth
+calling out explicitly:
+
+- attohttpc — Mozilla Public License 2.0 (MPL-2.0).
+  Pulled in transitively via `rust-s3` -> `aws-creds`. MPL-2.0 is a file-level
+  weak copyleft: modifications to attohttpc's own source files must remain
+  under MPL-2.0, but it imposes no copyleft on this project's code.
+
+- usearch — Apache-2.0. A C++ HNSW index compiled and statically linked into
+  the binary; permissive, no copyleft.
+
+- ip2location (Rust crate) — MIT. Reads the IP2Location LITE database (see the
+  data attribution below); the crate itself carries no attribution obligation.
+
+GPL/AGPL note: the `lumis` syntax highlighter is configured WITHOUT its
+`all-languages` default to deliberately exclude `lang-caddy`
+(`tree-sitter-caddy`), the only GPL-3.0-licensed grammar in the set. Every
+grammar that ships is MIT or Apache-2.0. See the comment on the `lumis`
+dependency in the workspace `Cargo.toml`. If you upgrade `lumis`, re-verify
+that no new GPL/AGPL grammar was introduced.
+
+================================================================================
+Data (not committed to this repository; obligations apply when deployed)
+================================================================================
+
+- IP2Location LITE (DB11) — the optional GeoIP feature reads an
+  IP2Location LITE database. The LITE data is distributed by IP2Location under
+  the Creative Commons Attribution-ShareAlike 4.0 license and is NOT included
+  in this repository. If you enable the feature and/or distribute the database,
+  you must attribute IP2Location, e.g.:
+
+    "This product includes IP2Location LITE data available from
+     https://lite.ip2location.com"
+
+  Verify the current LITE license terms directly with IP2Location.
+
+================================================================================
+Example assets (under `examples/`, not part of the binary)
+================================================================================
+
+- Urbanist font family (`examples/typst-templates/letter/fonts/`) — SIL Open
+  Font License 1.1. The full license text is shipped alongside the fonts as
+  `OFL.txt` and must remain with them on redistribution.

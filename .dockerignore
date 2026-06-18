@@ -1,0 +1,24 @@
+target/
+**/target/
+# But the runtime Dockerfile needs the release binary from CI's
+# `ci` job artifact — re-include it so the image build's COPY finds
+# the file. Without this, the build logs "No files to copy" and the
+# resulting image is missing /app/gateway.
+!target/release/gateway
+# typst CLI fetched into target/release/ by `mise run fetch-typst-cli`
+# (transitive dep of the gateway build). Runtime Dockerfile COPYs it
+# into /usr/local/bin/typst alongside /app/gateway.
+!target/release/typst
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+.DS_Store
+.env
+.env.*
+docs/
+*.md
+!crates/**/*.md
+dist/
+.mise/
