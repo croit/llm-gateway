@@ -2,15 +2,49 @@
 
 Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests across multiple backends — with OIDC login, per-user API tokens, RBAC-gated server-side tools, and a built-in chat UI. Self-hostable, one binary, SQLite for state.
 
+![The built-in chat UI answering a question by calling the web-search tool mid-completion — the reasoning step, the tool calls, and the final markdown answer all render inline.](docs/img/chat.png)
+
 ## What it does
 
 - **OpenAI-compatible API** — `POST /v1/chat/completions` (streaming + non-streaming), `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, and `GET /v1/models`. Point any OpenAI SDK at it.
 - **Multi-backend routing** — named upstream pools (`chat` / `transcription` / `embedding` kinds). Each pool load-balances across its backends (round-robin or least-in-flight) with per-backend health probes. Models are discovered live from each backend's `/models` endpoint, so loading a model on a backend makes it routable with no config change.
 - **OIDC login** — browser sign-in against your identity provider; the gateway then issues its own `gwk_…` API tokens. Provider secrets come only from the environment.
 - **Per-user tokens + RBAC** — tokens are SHA-256-hashed at rest and revocable. Roles (mapped from OIDC claims) gate which models and server-side tools each user may use.
-- **Server-side tools** — the gateway can run tools mid-completion: web search, fetch-URL, geolocation, durable memory, DNS / WHOIS / TLS-certificate lookups, currency conversion, Wikipedia, RAG search, Typst document rendering, plus any bridged MCP servers. The client just sees a normal completion.
+- **Server-side tools** — the gateway runs tools *mid-completion* (web search, fetch-URL, document rendering, RAG, network lookups, and more); the client just sees a normal completion. Full list in [Tools the model can call](#tools-the-model-can-call).
 - **Chat UI** — a server-rendered, mobile-friendly chat at `/chat` with persisted multi-conversation history, token-by-token streaming, file attachments, and resume-on-reconnect (every turn is written to SQLite as it happens).
 - **RAG** — operator-managed, indexed codebases that the chat model can search.
+
+## Tools the model can call
+
+This is the part most "OpenAI-compatible proxy" projects don't have. The gateway can execute tools **server-side, in the middle of a completion**: the model asks to search the web, read a PDF you attached, render a branded PDF, or query an indexed codebase — the gateway runs it, feeds the result back, and the client just receives one ordinary completion with the finished answer. It works identically through the raw `/v1/chat/completions` API and the built-in chat UI.
+
+Every tool is **RBAC-gated per role**, and each user can flip their own grants on and off on the `/tools` page:
+
+![The /tools page: server-side tools grouped by category, each with its function name, a plain-English description, and a per-user on/off switch.](docs/img/tools.png)
+
+| Category | Tools | What the model can do |
+|---|---|---|
+| **Web & retrieval** | `search_web`, `fetch_url`, `wikipedia` | Search the web (SearXNG or Brave), fetch any URL (text → UTF-8, images → viewable, other binary → metadata), and pull encyclopedic summaries. |
+| **Documents** | `fetch_attachment`, `upload_attachment`, `typst_*` | Read files the user attached — including **two-tier PDF** reading (extract the text layer first; rasterize scanned pages for a vision model if that comes back empty) — attach files back into its own reply, and render **PDF/PNG documents** from operator-defined Typst templates (invoices, letters, reports). |
+| **Memory** | `remember`, `recall` | Persist durable facts about the user (preferences, projects) and recall them in later conversations. |
+| **Network & ops** | `dns_lookup`, `whois_lookup`, `tls_cert`, `lookup_ip` | DNS-over-HTTPS records, RDAP domain registration, TLS-certificate inspection ("is this cert about to expire?"), and GeoIP for any IP or hostname. |
+| **Location** | `get_user_location` | Use the approximate IP-based location that's always in context, or ask the browser for precise GPS when the task needs it. |
+| **Utility** | `convert_currency`, `get_current_timestamp` | Convert currencies at daily ECB rates and get the timezone-aware current time. |
+| **Knowledge base** | `rag_list_collections`, `rag_search` | Search operator-indexed codebases/corpora and get back the matching chunks with file paths, line ranges, and scores. |
+| **Integrations** | `mcp__<server>__*` | Call the tools of any bridged [MCP](https://modelcontextprotocol.io/) server. Each server's tools are namespaced so two servers can't collide. |
+
+**Tools turn themselves on.** Tools start *off* to keep the model's tool list short — short lists are cheaper and the model picks tools more accurately. When a request needs a capability the model doesn't currently have, it calls a built-in `enable_tools` tool to switch the relevant ones on; their real schemas appear on the next turn and stay on for the rest of the conversation. So the model reaches for exactly what it needs, when it needs it, without the operator wiring per-conversation tool lists — all still bounded by what the user's role permits.
+
+## The built-in web UI
+
+Beyond `/chat`, the gateway ships a small operator and account UI — no separate dashboard to deploy. Admin pages are gated to the `admin` role.
+
+| | |
+|---|---|
+| ![The backends page: each upstream pool with its kind, load-balancing strategy, per-backend health, in-flight load against capacity, and the models each one currently advertises.](docs/img/backends.png) | ![The RAG page: a form to index a new collection from a git repo (embedding model, branch, include/exclude globs, chunk size) and a list of existing collections with their indexing status.](docs/img/rag.png) |
+| **Backends** (`/admin/backends`) — live health, in-flight load, and discovered models for every upstream pool. | **RAG** (`/rag`) — index a codebase from a git URL and watch it go from *pending* to *ready*. |
+
+There's also `/tokens` (mint and revoke your `gwk_…` API tokens), `/memory` (view and edit what the assistant has remembered about you), and `/admin/models` (server-wide sampling defaults per model).
 
 ## Stack
 
@@ -19,7 +53,7 @@ Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests acro
 - **[plait](https://github.com/devashishdxt/plait)** — type-checked, auto-escaping server-rendered HTML (`html! { … }`).
 - **[datastar](https://data-star.dev/)** — client-side reactivity over SSE, self-hosted from the binary.
 - **[daisyUI v5](https://daisyui.com/) + Tailwind v4** — design system, compiled to a single CSS file at build time.
-- **sqlx + SQLite** — all persistent state (users, tokens, sessions, chat history, RAG metadata).
+- **sqlx + SQLite** — persistent state (users, tokens, sessions, chat history, RAG collection registry). Bulk RAG content — chunk text, lexical index, vectors — lives in per-collection stores under `[rag].data_dir`, not in the main DB.
 
 The CSS bundle and `datastar.js` are baked into the binary via `include_bytes!`, so the runtime image needs no asset directory.
 
@@ -101,7 +135,7 @@ Optional blocks, each documented inline in `gateway.example.toml`:
 - `[typst]` — register document-rendering tools from a templates directory.
 - `[geoip]` — IP→location for the `get_user_location` tool (IP2Location LITE database).
 - `[[mcp.servers]]` — bridge external MCP tool servers.
-- `[rag]` — indexed-codebase retrieval.
+- `[rag]` — index git repos and search them from chat (see [RAG](#rag-codebase-search)).
 
 ### Chat attachments (S3)
 

@@ -129,6 +129,16 @@ jobs:
             type=ref,event=tag
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
+          # metadata-action derives org.opencontainers.image.description from the
+          # GitHub repo's description, which is empty here — so the package page on
+          # GHCR reads "No description provided". Set the OCI labels explicitly so
+          # the description (and a readable title) ship with every pushed image
+          # regardless of the repo's About field. `source`/`url`/`revision` are
+          # still filled in automatically by metadata-action.
+          labels: |
+            org.opencontainers.image.title=LLM Gateway
+            org.opencontainers.image.description=Authenticated, OpenAI-API-compatible LLM gateway — multi-backend routing, OIDC login, per-user API tokens, RBAC-gated server-side tools, RAG, and a built-in chat UI. One Rust binary, SQLite for state.
+            org.opencontainers.image.licenses=AGPL-3.0-only
 
       # Only authenticate when we're actually going to push (not on PRs).
       - name: Log in to GHCR
