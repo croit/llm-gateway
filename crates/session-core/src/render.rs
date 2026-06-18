@@ -479,9 +479,7 @@ pub fn render_assistant_turn(t: &TurnWithTools, actions: Option<&str>) -> Html {
             // so datastar's morph preserves user open/close state
             // across re-renders.
             div(id: (tools_id), class: "tool-calls flex flex-col") {
-                for c in tools.iter() {
-                    (render_tool_call(c))
-                }
+                (render_tool_call_list(&tools, &turn.id))
             }
             // Main response text. Each prose segment is its own
             // markdown-rendered block, with attachment chips/images
@@ -628,6 +626,97 @@ fn truncate_for_display(raw: String) -> String {
         head_end,
     ));
     out
+}
+
+/// How many tool-call rows render flat before we fold them into one
+/// expandable group. A few read fine inline; a dozen identical "Used
+/// rag_search" rows just bury the answer (and push it down behind the
+/// composer), so past this count we collapse them behind a single
+/// summary the reader can unfold on click.
+const TOOL_GROUP_THRESHOLD: usize = 3;
+
+/// Render a turn's tool calls. At or below [`TOOL_GROUP_THRESHOLD`] each
+/// call is its own `<details>` row (the original behaviour). Above it,
+/// the rows are wrapped in a single collapsed `<details>` group whose
+/// summary tallies the calls by name — so a tool-heavy turn stays one
+/// compact line until the reader expands it, rather than swamping the
+/// viewport. The individual rows (with their stable `tc-<id>` ids) live
+/// unchanged inside the group, so streaming morphs and per-row
+/// open/close state keep working.
+pub fn render_tool_call_list(tools: &[ToolCall], turn_id: &str) -> Html {
+    if tools.len() <= TOOL_GROUP_THRESHOLD {
+        return html! {
+            for c in tools.iter() {
+                (render_tool_call(c))
+            }
+        }
+        .to_html();
+    }
+
+    let group_id = format!("turn-{turn_id}-tools-group");
+    let any_running = tools.iter().any(|c| c.status == ToolCallStatus::Running);
+    let any_errored = tools.iter().any(|c| c.status == ToolCallStatus::Errored);
+
+    // Tally by name, preserving first-seen order so the breakdown reads
+    // in call order rather than hash order.
+    let mut tally: Vec<(String, usize)> = Vec::new();
+    for c in tools {
+        if let Some(entry) = tally.iter_mut().find(|(n, _)| *n == c.name) {
+            entry.1 += 1;
+        } else {
+            tally.push((c.name.clone(), 1));
+        }
+    }
+    let breakdown = tally
+        .iter()
+        .map(|(n, count)| {
+            if *count > 1 {
+                format!("{n} ×{count}")
+            } else {
+                n.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let label = if any_running {
+        "Running tools"
+    } else if any_errored {
+        "Tool calls"
+    } else {
+        "Used tools"
+    };
+    let summary_text = format!("{} calls · {breakdown}", tools.len());
+
+    html! {
+        // Collapsed by default (like the thinking block). The reader
+        // unfolds it on click; `data-preserve-attr="open"` keeps that
+        // choice across morph re-renders.
+        details(
+            id: (group_id),
+            class: "tool-calls-group",
+            "data-preserve-attr": "open"
+        ) {
+            summary(class: "tool-call__summary tool-calls-group__summary") {
+                span(class: "tool-call__indicator") {
+                    if any_running {
+                        (icons::spinner(14))
+                    } else if any_errored {
+                        (icons::alert(14))
+                    } else {
+                        (icons::check(14))
+                    }
+                }
+                span(class: "tool-call__label") { (label) " " }
+                span(class: "tool-call__name") { (summary_text) }
+            }
+            div(class: "tool-calls-group__body flex flex-col") {
+                for c in tools.iter() {
+                    (render_tool_call(c))
+                }
+            }
+        }
+    }
+    .to_html()
 }
 
 /// One tool-call row. `<details>` so the user can expand to see
@@ -1038,6 +1127,81 @@ mod tests {
         assert!(
             composer(false).contains("chatStreaming: false"),
             "an idle composer must not show the streaming/stop state"
+        );
+    }
+
+    fn tool_call(id: &str, name: &str, status: ToolCallStatus) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            turn_id: "t1".into(),
+            seq: 0,
+            name: name.into(),
+            arguments_json: "{}".into(),
+            output_json: Some("{}".into()),
+            status,
+            created_at: jiff::Timestamp::now(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn few_tool_calls_render_flat_without_a_group() {
+        let calls: Vec<ToolCall> = (0..TOOL_GROUP_THRESHOLD)
+            .map(|i| tool_call(&format!("c{i}"), "rag_search", ToolCallStatus::Completed))
+            .collect();
+        let html = render_tool_call_list(&calls, "t1").to_string();
+        assert!(
+            !html.contains("tool-calls-group"),
+            "at/below the threshold the rows stay flat: {html}"
+        );
+        // Each individual row is still present.
+        assert_eq!(
+            html.matches("tool-call__name").count(),
+            TOOL_GROUP_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn many_tool_calls_collapse_into_one_group_with_a_tally() {
+        let calls: Vec<ToolCall> = (0..13)
+            .map(|i| tool_call(&format!("c{i}"), "rag_search", ToolCallStatus::Completed))
+            .collect();
+        let html = render_tool_call_list(&calls, "t1").to_string();
+        assert!(
+            html.contains("tool-calls-group"),
+            "expected a group wrapper"
+        );
+        // Summary tallies them by name so the reader sees the count
+        // without unfolding.
+        assert!(
+            html.contains("13 calls"),
+            "summary should show the count: {html}"
+        );
+        assert!(
+            html.contains("rag_search ×13"),
+            "summary should tally by name: {html}"
+        );
+        // The individual rows still live inside (unfold on click).
+        assert!(html.contains("tc-c0") && html.contains("tc-c12"));
+        // Stable group id so morph preserves the open/close toggle.
+        assert!(html.contains("turn-t1-tools-group"));
+    }
+
+    #[test]
+    fn group_summary_reflects_mixed_names_and_running_state() {
+        let mut calls = vec![
+            tool_call("a", "rag_search", ToolCallStatus::Completed),
+            tool_call("b", "rag_search", ToolCallStatus::Completed),
+            tool_call("c", "fetch_url", ToolCallStatus::Completed),
+            tool_call("d", "rag_search", ToolCallStatus::Running),
+        ];
+        calls[3].status = ToolCallStatus::Running;
+        let html = render_tool_call_list(&calls, "t9").to_string();
+        assert!(html.contains("rag_search ×3"), "tally per name: {html}");
+        assert!(html.contains("fetch_url"), "all names listed: {html}");
+        assert!(
+            html.contains("Running tools"),
+            "any running call flips the group label to running: {html}"
         );
     }
 
