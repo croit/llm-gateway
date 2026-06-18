@@ -54,6 +54,23 @@ ip2location = "0.6"
 notify = "8"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
+# PDF reading for the `fetch_attachment` tool — two model-driven tiers:
+#   * pdf-extract (MIT, pure Rust via lopdf) pulls the text layer out of a
+#     PDF held in memory. This is the cheap default tier (`mode="text"`): a
+#     text PDF reads like any other text attachment, no native deps.
+#   * pdfium-render (Apache-2.0/MIT) drives Chromium's `pdfium` (BSD-3-Clause)
+#     to rasterise pages to bitmaps for the escalation tier (`mode="images"`,
+#     for scanned/image-only PDFs the text layer can't cover). The bindings
+#     are pre-generated (no bindgen/clang at build time) and `pdfium` itself
+#     is loaded *dynamically at runtime* — the build never needs the native
+#     library, and when it's absent at runtime the tool returns a clean
+#     "renderer unavailable" note instead of crashing. `image` (MIT/Apache-2.0,
+#     png-only to keep the codec set minimal) encodes the rendered bitmaps to
+#     PNG for the vision `image_url` content parts.
+pdf-extract = "0.10"
+pdfium-render = "0.9"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 async-trait = "0.1"
 
 # Persistence + crypto.

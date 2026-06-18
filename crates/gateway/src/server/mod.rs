@@ -14,6 +14,7 @@ pub mod db;
 pub mod embeddings;
 pub mod geoip;
 pub mod model_defaults;
+pub mod pdf;
 pub mod rag;
 pub mod rbac;
 pub mod state;

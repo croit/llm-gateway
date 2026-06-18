@@ -113,6 +113,14 @@ zip = { workspace = true }
 # Vector index for the RAG subsystem (one index per collection, mmap'd).
 usearch = { workspace = true }
 
+# PDF reading for the `fetch_attachment` tool. `pdf-extract` is the pure-Rust
+# text tier; `pdfium-render` + `image` rasterise pages to PNG for the
+# vision escalation tier (pdfium loaded dynamically at runtime — see the
+# workspace Cargo.toml for the licensing + native-lib rationale).
+pdf-extract = { workspace = true }
+pdfium-render = { workspace = true }
+image = { workspace = true }
+
 [dev-dependencies]
 # wiremock spins up an in-process HTTP mock that stands in for upstream
 # LLM backends. Used by the integration tests in tests/ to exercise the

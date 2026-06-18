@@ -47,7 +47,7 @@ run = "cargo build --package gateway --bin gateway"
 
 [tasks.build]
 description = "Release build of the gateway binary. Slow (~12 s cold incremental, ~70 s from clean) — only use this when you actually want optimised output (deploys, perf measurement). For day-to-day work use `mise run dev` or `mise run dev-build`."
-depends = ["build-assets", "fetch-typst-cli"]
+depends = ["build-assets", "fetch-typst-cli", "fetch-pdfium"]
 run = "cargo build --release --package gateway --bin gateway"
 
 [tasks.fetch-typst-cli]
@@ -57,6 +57,35 @@ set -eu
 mkdir -p target/release
 install -m 0755 "$(mise which typst)" target/release/typst
 target/release/typst --version
+"""
+
+[tasks.fetch-pdfium]
+description = "Download the prebuilt pdfium shared library (Chromium's PDF engine, BSD-3) into target/release/ so the runtime Dockerfile COPYs it (PDFIUM_LIB_PATH) and the fetch_attachment PDF reader's image tier (scanned PDFs → page images) works out of the box. Mirrors fetch-typst-cli: rides the same artifact pipeline as the gateway binary. Pinned to PDFIUM_TAG — bump = edit one line. Cached via a tag-stamp sidecar so repeat release builds don't re-download."
+run = """
+set -eu
+# Bump this to upgrade pdfium. Tags: https://github.com/bblanchon/pdfium-binaries/releases
+PDFIUM_TAG="chromium/7891"
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64)  asset=pdfium-linux-x64.tgz;   lib=libpdfium.so ;;
+  Linux-aarch64) asset=pdfium-linux-arm64.tgz; lib=libpdfium.so ;;
+  Darwin-arm64)  asset=pdfium-mac-arm64.tgz;   lib=libpdfium.dylib ;;
+  Darwin-x86_64) asset=pdfium-mac-x64.tgz;     lib=libpdfium.dylib ;;
+  *) echo "fetch-pdfium: unsupported platform $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+mkdir -p target/release
+stamp="target/release/.pdfium-tag"
+if [ -f "target/release/$lib" ] && [ "$(cat "$stamp" 2>/dev/null || true)" = "$PDFIUM_TAG" ]; then
+  echo "fetch-pdfium: target/release/$lib already at $PDFIUM_TAG — skipping"
+  exit 0
+fi
+url="https://github.com/bblanchon/pdfium-binaries/releases/download/$PDFIUM_TAG/$asset"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+curl -fsSL "$url" -o "$tmp/pdfium.tgz"
+tar -xzf "$tmp/pdfium.tgz" -C "$tmp" "lib/$lib"
+install -m 0644 "$tmp/lib/$lib" "target/release/$lib"
+printf '%s' "$PDFIUM_TAG" > "$stamp"
+ls -lh "target/release/$lib"
 """
 
 [tasks.npm-install]

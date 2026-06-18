@@ -399,9 +399,40 @@ pub fn is_inline_text(mime: &str, filename: &str) -> bool {
     )
 }
 
+/// True when an attachment should be treated as a PDF — the
+/// `fetch_attachment` tool routes these through its dedicated
+/// text-extraction / page-rendering tiers instead of the generic
+/// binary "ask the user to re-upload" stub. Mirrors `is_inline_text`'s
+/// mime-first, extension-fallback shape so a PDF served as
+/// `application/octet-stream` (some buckets do this) is still caught.
+pub fn is_pdf(mime: &str, filename: &str) -> bool {
+    if mime.eq_ignore_ascii_case("application/pdf")
+        || mime.eq_ignore_ascii_case("application/x-pdf")
+    {
+        return true;
+    }
+    std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_pdf_matches_mime_and_extension() {
+        assert!(is_pdf("application/pdf", "sponsor.pdf"));
+        assert!(is_pdf("APPLICATION/PDF", "sponsor.pdf"));
+        assert!(is_pdf("application/x-pdf", "sponsor.pdf"));
+        // Buckets that serve a generic octet-stream still get caught by ext.
+        assert!(is_pdf("application/octet-stream", "sponsor.PDF"));
+        assert!(!is_pdf("application/octet-stream", "data.bin"));
+        assert!(!is_pdf("text/csv", "data.csv"));
+        // A PDF is never inline-text — the two classifiers must not overlap.
+        assert!(!is_inline_text("application/pdf", "sponsor.pdf"));
+    }
 
     #[test]
     fn parse_returns_attachment_struct() {

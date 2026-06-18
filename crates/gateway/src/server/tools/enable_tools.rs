@@ -225,7 +225,8 @@ fn target_for_key(key: &str) -> EnableTarget {
         ),
         "fetch_attachment" => (
             "Read an attachment",
-            "open a file the user attached to this chat and read its contents",
+            "open a file the user attached to this chat and read its contents \
+             (text, images, and PDFs — including scanned PDFs as page images)",
         ),
         "upload_attachment" => (
             "Attach a file to your reply",

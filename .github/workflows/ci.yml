@@ -91,6 +91,7 @@ jobs:
           path: |
             target/release/gateway
             target/release/typst
+            target/release/libpdfium.so
           retention-days: 7
           if-no-files-found: error
 

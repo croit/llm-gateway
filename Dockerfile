@@ -74,13 +74,27 @@ COPY --chown=root:root --chmod=0755 target/release/typst /usr/local/bin/typst
 # here, so the read-only image layer is enough — no writable volume needed.
 COPY --chown=gateway:gateway examples/typst-templates /opt/typst-templates
 
+# pdfium shared library for the `fetch_attachment` PDF reader's image
+# tier (scanned PDFs → page images for a vision model). Staged into
+# target/release/ by the `fetch-pdfium` mise task, a dep of `mise run
+# build` — the same artifact pipeline as the gateway + typst binaries,
+# so it's always present in a CI or `mise run build` context (this COPY
+# fails the build if it isn't — run `mise run fetch-pdfium` first). The
+# gateway loads it at runtime from `PDFIUM_LIB_PATH` (set below); the
+# text-extraction tier needs no native lib, so a PDF's text still reads
+# even if pdfium ever fails to load. Chromium's pdfium is BSD-3-Clause.
+# `0644` is enough — it's dlopen'd, not exec'd.
+COPY --chown=root:root --chmod=0644 target/release/libpdfium.so /usr/local/lib/libpdfium.so
+
 USER gateway
 
 # Rama listens on the address resolved from the IP/PORT env vars; binding
 # 0.0.0.0 inside a container is what makes the published port reachable.
+# PDFIUM_LIB_PATH points the PDF reader at the bundled pdfium above.
 ENV IP=0.0.0.0 \
     PORT=8080 \
-    RUST_LOG=info,gateway=info
+    RUST_LOG=info,gateway=info \
+    PDFIUM_LIB_PATH=/usr/local/lib/libpdfium.so
 
 EXPOSE 8080
 

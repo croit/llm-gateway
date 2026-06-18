@@ -308,7 +308,8 @@ fn append_base64(out: &mut String, bytes: &[u8]) {
 // in `session-core::attachments`. Re-exported here so existing
 // gateway call sites keep working.
 pub use session_core::attachments::{
-    ParsedAttachment, dedupe_filename, is_inline_text, parse_markers, strip_markers_for_replay,
+    ParsedAttachment, dedupe_filename, is_inline_text, is_pdf, parse_markers,
+    strip_markers_for_replay,
 };
 
 /// Reserve a unique filename for an upload that's about to land in
