@@ -352,6 +352,79 @@ pub async fn chat_share_toggle(
 }
 
 // ---------------------------------------------------------------------------
+// POST /chat/{id}/fork — copy a shared conversation into the viewer's
+// account so the recipient can keep chatting (and re-share their copy).
+
+pub async fn chat_fork(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    let (session, user) = match require_session_or_redirect(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let datastar = is_datastar_request(req.headers());
+
+    // Recipient-only: the source must be readable (owner or shared) AND not
+    // already owned by the viewer. Forking your own chat is a no-op — the
+    // button is only rendered for read-only viewers, but guard the endpoint
+    // too so a hand-crafted POST can't clone-spam an owner's own session.
+    let src = match chat::get_session_readable(&state.db, &user.id, &session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return see_other("/chat"),
+        Err(err) => return internal_error_html(&user.email, &err.to_string()),
+    };
+    if src.user_id == user.id {
+        if !datastar {
+            return see_other(&format!("/chat/{session_id}"));
+        }
+        return sse_response(&[sse_toast(&super::Flash {
+            kind: super::FlashKind::Info,
+            message: "This conversation is already in your chats.".into(),
+        })]);
+    }
+
+    let (new_session, copies) = match chat::fork_session(&state.db, &src, &user.id).await {
+        Ok(v) => v,
+        Err(err) => return internal_error_html(&user.email, &err.to_string()),
+    };
+
+    // Best-effort: copy the attachment bytes to the new turn-scoped keys.
+    // A copy failure leaves a marker pointing at an empty key (a broken
+    // thumbnail) but the conversation text — the main value — still lands,
+    // so we warn rather than roll the whole fork back.
+    if let Some(cfg) = state.config.chat.s3.as_ref() {
+        for c in &copies {
+            if let Err(err) =
+                chat_attachments::copy_object(cfg, &c.from_turn_id, &c.to_turn_id, &c.filename)
+                    .await
+            {
+                tracing::warn!(
+                    from = %c.from_turn_id, file = %c.filename,
+                    "fork: failed to copy attachment object: {err}"
+                );
+            }
+        }
+    } else if !copies.is_empty() {
+        tracing::warn!(
+            count = copies.len(),
+            "fork: chat attachments not configured; copied conversation references unreachable files"
+        );
+    }
+
+    // Land the viewer in their fresh copy — it's owned by them now, so it
+    // renders editable. Datastar morphs in place + updates the sidebar/URL;
+    // a plain POST gets a redirect.
+    let impersonating = session.impersonator_id.is_some();
+    if datastar {
+        render_chat_response(state.clone(), &user, new_session, true, impersonating).await
+    } else {
+        see_other(&format!("/chat/{}", new_session.id))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // POST /chat/{id}/messages — submit + spawn worker + SSE.
 
 pub async fn chat_message_send(

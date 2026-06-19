@@ -436,6 +436,164 @@ pub async fn delete_session(pool: &Pool, user_id: &str, session_id: &str) -> Res
     Ok(result.rows_affected() > 0)
 }
 
+/// One attachment object that the fork path must copy in the blob
+/// store: the source turn-scoped key, the destination turn-scoped key,
+/// and the (raw, un-encoded) filename they share. Returned by
+/// [`fork_session`] so the gateway — which owns the S3 client —
+/// performs the byte copy while this crate stays storage-agnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentCopy {
+    pub from_turn_id: String,
+    pub to_turn_id: String,
+    pub filename: String,
+}
+
+/// Copy an entire conversation into `new_user_id`'s account as a fresh,
+/// **private** session (re-sharing is the new owner's decision). Title
+/// and turn history are copied 1-to-1; every turn (and its tool calls)
+/// gets a fresh id. Runs in one transaction.
+///
+/// Attachment markers in the copied turn text are rewritten so their
+/// `/chat/attachment/<turn>/<file>` proxy URLs point at the *new* turn
+/// ids — otherwise the fork's bubbles would reference the original
+/// owner's turns and break the moment they un-share or delete. The
+/// returned [`AttachmentCopy`] list tells the caller which blob objects
+/// to duplicate (deduped, so a file referenced twice copies once); the
+/// bytes themselves live in S3, which this crate doesn't touch.
+///
+/// An `in_progress` turn (a shared chat forked mid-stream) is copied as
+/// `errored`, never live — the fork has no worker driving it, so a
+/// copied spinner would hang forever.
+pub async fn fork_session(
+    pool: &Pool,
+    src: &Session,
+    new_user_id: &str,
+) -> Result<(Session, Vec<AttachmentCopy>), DbError> {
+    let src_turns = list_turns(pool, &src.id).await?;
+
+    // Pre-mint every new turn id up front: a composer attachment's proxy
+    // URL keys off the assistant turn id, which can be a *different* turn
+    // than the one whose text carries the marker, so we need the whole
+    // old→new map available while rewriting any single turn.
+    let id_map: std::collections::HashMap<String, String> = src_turns
+        .iter()
+        .map(|t| (t.turn.id.clone(), Uuid::new_v4().to_string()))
+        .collect();
+
+    let now = Timestamp::now();
+    let new_session = Session {
+        id: Uuid::new_v4().to_string(),
+        user_id: new_user_id.to_string(),
+        title: src.title.clone(),
+        created_at: now,
+        updated_at: now,
+        shared: false,
+    };
+
+    // Collect the blob copies as we go, deduped on (source turn, file):
+    // the same object can be referenced by markers in more than one turn.
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut copies: Vec<AttachmentCopy> = Vec::new();
+    let mut record = |text: &str| {
+        for att in crate::attachments::parse_markers(text) {
+            let Some(old_turn) = crate::attachments::proxy_url_turn_id(&att.url) else {
+                continue;
+            };
+            let Some(new_turn) = id_map.get(old_turn) else {
+                continue;
+            };
+            if seen.insert((old_turn.to_string(), att.filename.clone())) {
+                copies.push(AttachmentCopy {
+                    from_turn_id: old_turn.to_string(),
+                    to_turn_id: new_turn.clone(),
+                    filename: att.filename,
+                });
+            }
+        }
+    };
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"INSERT INTO chat_sessions (id, user_id, title, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?)"#,
+    )
+    .bind(&new_session.id)
+    .bind(&new_session.user_id)
+    .bind(new_session.title.as_deref())
+    .bind(new_session.created_at.to_string())
+    .bind(new_session.updated_at.to_string())
+    .execute(&mut *tx)
+    .await?;
+
+    for tw in &src_turns {
+        let turn = &tw.turn;
+        let new_turn_id = id_map.get(&turn.id).expect("minted for every src turn");
+
+        let user_content = turn.user_content.as_ref().map(|t| {
+            record(t);
+            crate::attachments::remap_attachment_turn_ids(t, &id_map)
+        });
+        let content = turn.content.as_ref().map(|t| {
+            record(t);
+            crate::attachments::remap_attachment_turn_ids(t, &id_map)
+        });
+
+        // Never copy an in-progress turn as live — no worker drives the
+        // fork, so it would spin forever. Stamp it errored + completed.
+        let (status, completed_at) = if turn.status == TurnStatus::InProgress {
+            (TurnStatus::Errored, Some(now))
+        } else {
+            (turn.status, turn.completed_at)
+        };
+
+        sqlx::query(
+            r#"INSERT INTO chat_turns
+                  (id, session_id, seq, role, user_content, model, content,
+                   reasoning, reasoning_elapsed_ms, status, error_message,
+                   created_at, completed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(new_turn_id)
+        .bind(&new_session.id)
+        .bind(turn.seq)
+        .bind(turn.role.as_str())
+        .bind(user_content)
+        .bind(turn.model.as_deref())
+        .bind(content)
+        .bind(turn.reasoning.as_deref())
+        .bind(turn.reasoning_elapsed_ms)
+        .bind(status.as_str())
+        .bind(turn.error_message.as_deref())
+        .bind(turn.created_at.to_string())
+        .bind(completed_at.map(|t| t.to_string()))
+        .execute(&mut *tx)
+        .await?;
+
+        for tc in &tw.tool_calls {
+            sqlx::query(
+                r#"INSERT INTO chat_tool_calls
+                      (id, turn_id, seq, name, arguments_json, output_json,
+                       status, created_at, completed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&tc.id)
+            .bind(new_turn_id)
+            .bind(tc.seq)
+            .bind(&tc.name)
+            .bind(&tc.arguments_json)
+            .bind(tc.output_json.as_deref())
+            .bind(tc.status.as_str())
+            .bind(tc.created_at.to_string())
+            .bind(tc.completed_at.map(|t| t.to_string()))
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await?;
+
+    Ok((new_session, copies))
+}
+
 /// Bump `updated_at` so the session floats to the top of the sidebar.
 /// Called after a new turn lands.
 pub async fn touch_session(pool: &Pool, session_id: &str) -> Result<(), DbError> {
@@ -1571,5 +1729,113 @@ mod tests {
                 .unwrap();
             assert_eq!(row, "errored");
         }
+    }
+
+    async fn seed_user(pool: &Pool, id: &str) {
+        sqlx::query(
+            r#"INSERT INTO users (id, email, name, roles_json, created_at, updated_at)
+               VALUES (?, ?, 'U', '[]', ?, ?)"#,
+        )
+        .bind(id)
+        .bind(format!("{id}@example.com"))
+        .bind(Timestamp::now().to_string())
+        .bind(Timestamp::now().to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_session_copies_turns_into_new_owner_unshared() {
+        let pool = pool().await;
+        seed_user(&pool, "u2").await;
+        let src = create_session(&pool, "u1").await.unwrap();
+        set_session_title(&pool, &src.id, "Plans").await.unwrap();
+        set_shared(&pool, "u1", &src.id, true).await.unwrap();
+        create_user_turn(&pool, &src.id, "t0", "hello")
+            .await
+            .unwrap();
+        let a = create_assistant_turn_in_progress(&pool, &src.id, "t1", "gpt")
+            .await
+            .unwrap();
+        append_content(&pool, &a.id, "hi there").await.unwrap();
+        finalize_turn(&pool, &a.id, TurnStatus::Completed, None)
+            .await
+            .unwrap();
+
+        let src = get_session(&pool, "u1", &src.id).await.unwrap().unwrap();
+        let (fork, copies) = fork_session(&pool, &src, "u2").await.unwrap();
+
+        // New owner, private, title carried over, distinct id.
+        assert_eq!(fork.user_id, "u2");
+        assert!(!fork.shared);
+        assert_eq!(fork.title.as_deref(), Some("Plans"));
+        assert_ne!(fork.id, src.id);
+        assert!(copies.is_empty(), "no attachments in this conversation");
+
+        // Turns copied 1-to-1 with fresh ids, same order + payload.
+        let orig = list_turns(&pool, &src.id).await.unwrap();
+        let copy = list_turns(&pool, &fork.id).await.unwrap();
+        assert_eq!(copy.len(), orig.len());
+        assert_eq!(copy[0].turn.user_content.as_deref(), Some("hello"));
+        assert_eq!(copy[1].turn.content.as_deref(), Some("hi there"));
+        assert_eq!(copy[1].turn.status, TurnStatus::Completed);
+        for (o, c) in orig.iter().zip(&copy) {
+            assert_ne!(o.turn.id, c.turn.id, "turn ids must be fresh");
+            assert_eq!(c.turn.session_id, fork.id);
+        }
+        // The original is untouched.
+        assert_eq!(orig.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fork_session_remaps_attachment_markers_and_lists_copies() {
+        let pool = pool().await;
+        seed_user(&pool, "u2").await;
+        let src = create_session(&pool, "u1").await.unwrap();
+        // A user turn whose marker URL points at its own turn id "t0".
+        let marker =
+            crate::attachments::marker_line("c.png", "image/png", "/chat/attachment/t0/c.png", 9);
+        create_user_turn(&pool, &src.id, "t0", &format!("see\n{marker}"))
+            .await
+            .unwrap();
+
+        let src = get_session(&pool, "u1", &src.id).await.unwrap().unwrap();
+        let (fork, copies) = fork_session(&pool, &src, "u2").await.unwrap();
+        let copy = list_turns(&pool, &fork.id).await.unwrap();
+        let new_turn_id = &copy[0].turn.id;
+
+        // Marker URL now points at the NEW turn id, not the original t0.
+        let body = copy[0].turn.user_content.clone().unwrap();
+        assert!(
+            body.contains(&format!("/chat/attachment/{new_turn_id}/c.png")),
+            "marker not remapped: {body}"
+        );
+        assert!(!body.contains("/chat/attachment/t0/"), "stale url: {body}");
+
+        // And the blob-copy descriptor maps t0 → the new turn.
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].from_turn_id, "t0");
+        assert_eq!(&copies[0].to_turn_id, new_turn_id);
+        assert_eq!(copies[0].filename, "c.png");
+    }
+
+    #[tokio::test]
+    async fn fork_session_copies_in_progress_turn_as_errored() {
+        let pool = pool().await;
+        seed_user(&pool, "u2").await;
+        let src = create_session(&pool, "u1").await.unwrap();
+        create_user_turn(&pool, &src.id, "t0", "go").await.unwrap();
+        // Left in_progress — a chat forked mid-stream.
+        create_assistant_turn_in_progress(&pool, &src.id, "t1", "gpt")
+            .await
+            .unwrap();
+
+        let src = get_session(&pool, "u1", &src.id).await.unwrap().unwrap();
+        let (fork, _) = fork_session(&pool, &src, "u2").await.unwrap();
+        let copy = list_turns(&pool, &fork.id).await.unwrap();
+        // The copied assistant turn is errored (never a hung spinner).
+        assert_eq!(copy[1].turn.status, TurnStatus::Errored);
+        assert!(copy[1].turn.completed_at.is_some());
     }
 }

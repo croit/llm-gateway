@@ -286,6 +286,38 @@ where
     out
 }
 
+/// Pull the `<turn_id>` segment out of a gateway attachment proxy URL
+/// of the form `/chat/attachment/<turn_id>/<filename>`. Returns `None`
+/// for any other URL shape (legacy presigned links, external URLs) so
+/// callers leave those untouched. The filename segment may be
+/// percent-encoded; this only looks at the turn-id segment, which is a
+/// UUID and never encoded.
+pub fn proxy_url_turn_id(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("/chat/attachment/")?;
+    let slash = rest.find('/')?;
+    Some(&rest[..slash])
+}
+
+/// Rewrite every attachment marker's proxy URL so its `<turn_id>`
+/// segment is replaced by `map[<turn_id>]`, leaving the (possibly
+/// percent-encoded) filename segment and every other field untouched.
+/// Markers whose turn id isn't in `map`, or whose URL isn't a proxy
+/// URL, are left as-is. Used by the fork path so a copied conversation's
+/// bubbles point at the new owner's turn-scoped attachment keys.
+pub fn remap_attachment_turn_ids(
+    text: &str,
+    map: &std::collections::HashMap<String, String>,
+) -> String {
+    rewrite_marker_urls(text, |att| {
+        let rest = att.url.strip_prefix("/chat/attachment/")?;
+        let slash = rest.find('/')?;
+        let old = &rest[..slash];
+        let new = map.get(old)?;
+        let file_seg = &rest[slash + 1..];
+        Some(format!("/chat/attachment/{new}/{file_seg}"))
+    })
+}
+
 /// Replace each `[gw-attachment …]` marker (and any immediately
 /// following fenced block left over from older persisted rows that
 /// inlined text content) with a stub naming the file and an opaque
@@ -562,6 +594,57 @@ mod tests {
         // `.env` is a dotfile, not a "" stem with `env` extension.
         let a = marker_line(".env", "text/plain", "https://e/a", 1);
         assert_eq!(dedupe_filename(&a, ".env"), ".env-2");
+    }
+
+    #[test]
+    fn proxy_url_turn_id_extracts_turn_segment() {
+        assert_eq!(
+            proxy_url_turn_id("/chat/attachment/t-1/chart.png"),
+            Some("t-1")
+        );
+        // Percent-encoded filename segment is irrelevant to the turn id.
+        assert_eq!(
+            proxy_url_turn_id("/chat/attachment/t-1/my%20file.png"),
+            Some("t-1")
+        );
+        // Non-proxy URLs (legacy presigned, external) yield None.
+        assert_eq!(proxy_url_turn_id("https://bucket/x.png"), None);
+        assert_eq!(proxy_url_turn_id("/chat/attachment/t-1"), None);
+    }
+
+    #[test]
+    fn remap_turn_ids_rewrites_only_mapped_markers() {
+        use std::collections::HashMap;
+        let a = marker_line("a.png", "image/png", "/chat/attachment/old-1/a.png", 1);
+        let b = marker_line("b.png", "image/png", "/chat/attachment/old-2/b.png", 2);
+        // Only old-1 is in the map; old-2's marker must survive untouched.
+        let map = HashMap::from([("old-1".to_string(), "new-1".to_string())]);
+        let out = remap_attachment_turn_ids(&format!("{a}\n{b}"), &map);
+        assert!(
+            out.contains(r#"url="/chat/attachment/new-1/a.png""#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"url="/chat/attachment/old-2/b.png""#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn remap_turn_ids_preserves_encoded_filename_segment() {
+        use std::collections::HashMap;
+        let m = marker_line(
+            "my file.png",
+            "image/png",
+            "/chat/attachment/old/my%20file.png",
+            3,
+        );
+        let map = HashMap::from([("old".to_string(), "new".to_string())]);
+        let out = remap_attachment_turn_ids(&m, &map);
+        assert!(
+            out.contains(r#"url="/chat/attachment/new/my%20file.png""#),
+            "{out}"
+        );
     }
 
     #[test]

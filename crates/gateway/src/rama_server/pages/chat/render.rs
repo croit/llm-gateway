@@ -106,6 +106,12 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
             // Export is available to anyone who can read the chat (owner or a
             // shared viewer), so it lives outside the owner-only block below.
             (render_export_control(&session_id))
+            // A read-only viewer (recipient of a shared chat) gets the inverse
+            // of the owner controls: a "fork into my chats" button instead of
+            // the model pickers + share toggle.
+            if read_only {
+                (render_fork_control(&session_id))
+            }
             if !read_only {
             div(class: "chat-header__pickers hidden sm:flex") {
                 if models_empty {
@@ -318,6 +324,29 @@ pub(super) fn render_share_control(share_url: &str, shared: bool) -> Html {
             title: "Shared chats are readable by any signed-in user who has the link"
         ) {
             (label)
+        }
+    }
+    .to_html()
+}
+
+/// "Continue in my chats": shown to a read-only viewer of a shared
+/// conversation. A standalone `@post` button (same pattern as the share
+/// toggle — no enclosing `<form>`, the handler keys off the path) that
+/// copies the conversation into the viewer's account and navigates into
+/// the editable copy. Owner-only mutation it is *not*: the endpoint
+/// re-checks that the caller isn't the owner.
+pub(super) fn render_fork_control(session_id: &str) -> Html {
+    let fork_url = format!("/chat/{session_id}/fork");
+    html! {
+        button(
+            id: "fork-button",
+            type: "button",
+            "data-on:click": (format!("@post('{fork_url}')")),
+            class: "btn btn-primary btn-sm whitespace-nowrap",
+            title: "Copy this conversation into your own chats so you can keep chatting"
+        ) {
+            (icons::copy(16))
+            span(class: "hidden sm:inline") { "Continue in my chats" }
         }
     }
     .to_html()
@@ -566,6 +595,34 @@ mod tests {
                 "Markdown export link missing (read_only={read_only}): {body}"
             );
         }
+    }
+
+    #[test]
+    fn fork_button_only_for_read_only_viewer_and_posts_plainly() {
+        // The recipient of a shared chat (read_only) gets a fork button wired
+        // to POST /chat/{id}/fork; the owner never sees it.
+        let owner = page_body_ro(None, false);
+        assert!(
+            !owner.contains("/chat/s1/fork"),
+            "owner must not see the fork button: {owner}"
+        );
+
+        let viewer = page_body_ro(None, true);
+        assert!(
+            viewer.contains("id=\"fork-button\""),
+            "read-only viewer must see the fork button: {viewer}"
+        );
+        // Same plain-@post contract as the share toggle (no enclosing form).
+        assert!(
+            viewer.contains("@post(&#39;/chat/s1/fork&#39;)"),
+            "fork button must POST plainly to the fork endpoint: {viewer}"
+        );
+        // A read-only viewer has no composer, so forking is the only way to
+        // continue — the message endpoint must stay absent.
+        assert!(
+            !viewer.contains("/chat/s1/messages"),
+            "read-only view must not expose the message endpoint: {viewer}"
+        );
     }
 
     #[test]

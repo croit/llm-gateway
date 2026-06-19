@@ -105,6 +105,31 @@ pub async fn upload(
     })
 }
 
+/// Server-side copy one attachment object from `from_turn`'s key to
+/// `to_turn`'s key (same filename). Used by the fork path: the bytes
+/// never transit the gateway — S3 duplicates the object internally —
+/// so forking a conversation with large attachments stays cheap.
+pub async fn copy_object(
+    cfg: &S3Config,
+    from_turn: &str,
+    to_turn: &str,
+    filename: &str,
+) -> Result<(), AttachmentError> {
+    if filename.is_empty() || filename.contains('/') {
+        return Err(AttachmentError::BadFilename(filename.to_string()));
+    }
+    let bucket = open_bucket(cfg)?;
+    let from = object_key(&cfg.key_prefix, from_turn, filename);
+    let to = object_key(&cfg.key_prefix, to_turn, filename);
+    let status = bucket.copy_object_internal(&from, &to).await?;
+    if !(200..300).contains(&status) {
+        return Err(AttachmentError::Client(S3Error::Io(std::io::Error::other(
+            format!("s3 COPY returned status {status}"),
+        ))));
+    }
+    Ok(())
+}
+
 fn open_bucket(cfg: &S3Config) -> Result<Bucket, AttachmentError> {
     let access = cfg
         .access_key()
