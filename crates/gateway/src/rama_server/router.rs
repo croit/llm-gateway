@@ -80,6 +80,11 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_get("/admin/models", pages::admin_models_index)
         .with_post("/admin/models", pages::admin_models_save)
         .with_get("/admin/backends", pages::admin_backends_index)
+        .with_get("/admin/users", pages::admin_users_index)
+        // Target id rides in the POST body (not the path) — rama lowercases
+        // path segments, which would mangle case-sensitive OIDC subjects.
+        .with_post("/admin/users/impersonate", pages::users_impersonate)
+        .with_post("/impersonate/stop", pages::impersonate_stop)
         .with_get("/rag", pages::rag_index)
         .with_post("/rag", pages::rag_create)
         .with_post("/rag/{id}/reindex", pages::rag_reindex)

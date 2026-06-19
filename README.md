@@ -44,7 +44,7 @@ Beyond `/chat`, the gateway ships a small operator and account UI — no separat
 | ![The backends page: each upstream pool with its kind, load-balancing strategy, per-backend health, in-flight load against capacity, and the models each one currently advertises.](docs/img/backends.png) | ![The RAG page: a form to index a new collection from a git repo (embedding model, branch, include/exclude globs, chunk size) and a list of existing collections with their indexing status.](docs/img/rag.png) |
 | **Backends** (`/admin/backends`) — live health, in-flight load, and discovered models for every upstream pool. | **RAG** (`/rag`) — index a codebase from a git URL and watch it go from *pending* to *ready*. |
 
-There's also `/tokens` (mint and revoke your `gwk_…` API tokens), `/memory` (view and edit what the assistant has remembered about you), and `/admin/models` (server-wide sampling defaults per model).
+There's also `/tokens` (mint and revoke your `gwk_…` API tokens), `/memory` (view and edit what the assistant has remembered about you), `/admin/models` (server-wide sampling defaults per model), and `/admin/users` (registered users with their resolved roles). The users page can also let an admin **impersonate** another user for debugging — every impersonation is audited and shows a persistent banner. Impersonation is **opt-in**: it's off unless you set `[gateway].allow_impersonation = true` (default `false`), in which case the Impersonate buttons appear and `POST /admin/users/impersonate` is accepted; otherwise the buttons are hidden and that endpoint returns 403.
 
 ## Stack
 
@@ -98,9 +98,10 @@ port = 8080
 path = "gateway.sqlite"
 
 [gateway]
-public_url      = "https://gateway.example.com"   # external URL; used to build the OIDC callback
-token_ttl_days  = 90
-session_key_env = "GATEWAY_SESSION_KEY"            # names the env var holding a 64-hex (32-byte) key
+public_url          = "https://gateway.example.com" # external URL; used to build the OIDC callback
+token_ttl_days      = 90
+session_key_env     = "GATEWAY_SESSION_KEY"          # names the env var holding a 64-hex (32-byte) key
+allow_impersonation = false                          # opt-in admin impersonation (default false); see below
 
 # At least one upstream pool. `kind` is chat | transcription | embedding.
 [upstream_pools.local_chat]
@@ -234,7 +235,8 @@ In a clone, run it via `mise run cli -- <args>`; a release build produces a stan
 | `GET /v1/models` | Bearer token | All discovered models across pools (deduplicated by id). |
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness probes. |
 | `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory` | session cookie | Web UI. |
-| `/rag`, `/admin/models`, `/admin/backends` | admin role | Admin UI. |
+| `/admin/users`, `/rag`, `/admin/models`, `/admin/backends` | admin role | Admin UI (the users page lists registered users and starts impersonation). |
+| `POST /impersonate/stop` | session cookie | End an active impersonation and return to your own account. |
 | `/api/v0/*` | session cookie | JSON APIs backing the UI. |
 
 The `/v1/*` endpoints require `Authorization: Bearer gwk_…`. Client `Authorization` headers are dropped at the proxy and the configured upstream key (if any) is injected; hop-by-hop headers are filtered both ways; upstream 4xx/5xx are relayed verbatim. The UI pages use the signed session cookie minted at OIDC login.

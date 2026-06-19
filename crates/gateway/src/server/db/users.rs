@@ -97,6 +97,17 @@ pub async fn find_by_id(pool: &Pool, id: &str) -> Result<Option<User>, DbError> 
     row.as_ref().map(map_row).transpose()
 }
 
+/// Every registered user, newest first. Powers the admin `/admin/users`
+/// roster. Users are created lazily on first OIDC login (see
+/// `oidc_handlers::callback`), so this is "everyone who has ever signed
+/// in", not a pre-provisioned directory.
+pub async fn list_all(pool: &Pool) -> Result<Vec<User>, DbError> {
+    let rows = sqlx::query("SELECT * FROM users ORDER BY created_at DESC, id")
+        .fetch_all(pool)
+        .await?;
+    rows.iter().map(map_row).collect()
+}
+
 /// Updates just the `timezone` column for an existing user. Bumps
 /// `updated_at`. Called from the `POST /api/v0/me/timezone` handler
 /// after the browser's `Intl.DateTimeFormat().resolvedOptions().
@@ -253,6 +264,18 @@ mod tests {
     async fn find_by_id_returns_none_for_unknown() {
         let pool = pool().await;
         assert!(find_by_id(&pool, "nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_all_returns_every_user() {
+        let pool = pool().await;
+        assert!(list_all(&pool).await.unwrap().is_empty());
+        upsert(&pool, &fixture("u1")).await.unwrap();
+        upsert(&pool, &fixture("u2")).await.unwrap();
+        let all = list_all(&pool).await.unwrap();
+        assert_eq!(all.len(), 2);
+        let ids: Vec<&str> = all.iter().map(|u| u.id.as_str()).collect();
+        assert!(ids.contains(&"u1") && ids.contains(&"u2"));
     }
 
     #[tokio::test]

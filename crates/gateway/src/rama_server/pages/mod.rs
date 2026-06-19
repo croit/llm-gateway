@@ -61,6 +61,9 @@ enum NavItem {
     Backends,
     /// Admin-only RAG collection management page (`/rag`).
     Rag,
+    /// Admin-only registered-users roster + impersonation (`/admin/users`).
+    /// Same `admin`-role gate as the other admin entries.
+    Users,
 }
 
 /// Datastar directive that intercepts the click and triggers an
@@ -209,6 +212,7 @@ fn render_app_sidebar(
                 (sidebar_nav_link("/memory", NavItem::Memory, active, icons::folder(16), "Memory"))
                 (sidebar_nav_link("/tokens", NavItem::Tokens, active, icons::key(16), "Tokens"))
                 if is_admin {
+                    (sidebar_nav_link("/admin/users", NavItem::Users, active, icons::users(16), "Users"))
                     (sidebar_nav_link("/admin/models", NavItem::Admin, active, icons::sliders(16), "Models"))
                     (sidebar_nav_link("/admin/backends", NavItem::Backends, active, icons::cube(16), "Backends"))
                     (sidebar_nav_link("/rag", NavItem::Rag, active, icons::folder(16), "RAG"))
@@ -377,12 +381,22 @@ fn nav_or_html_page(
     title: &str,
     user_email: &str,
     is_admin: bool,
+    impersonating: bool,
     body: Html,
     url: &str,
     chat: &SidebarChat,
 ) -> Response {
     if !datastar {
-        return html_authed_page(theme, Some(active), title, user_email, is_admin, body, chat);
+        return html_authed_page(
+            theme,
+            Some(active),
+            title,
+            user_email,
+            is_admin,
+            impersonating,
+            body,
+            chat,
+        );
     }
     let main_class = main_class_for(Some(active));
     let main_html = html! {
@@ -445,16 +459,27 @@ fn main_class_for(active: Option<NavItem>) -> &'static str {
 /// the global sidebar, theme toggle, and conversation list. `active`
 /// marks the currently-selected primary-nav item (None for pages
 /// that don't belong to one, like the error pages).
+#[allow(clippy::too_many_arguments)]
 fn html_authed_page(
     theme: Theme,
     active: Option<NavItem>,
     title: &str,
     user_email: &str,
     is_admin: bool,
+    impersonating: bool,
     body: Html,
     chat: &SidebarChat,
 ) -> Response {
-    let html = layout_authed(theme, active, title, user_email, is_admin, body, chat);
+    let html = layout_authed(
+        theme,
+        active,
+        title,
+        user_email,
+        is_admin,
+        impersonating,
+        body,
+        chat,
+    );
     html_response(html)
 }
 
@@ -469,6 +494,7 @@ fn layout_authed(
     title: &str,
     user_email: &str,
     is_admin: bool,
+    impersonating: bool,
     body: Html,
     chat: &SidebarChat,
 ) -> String {
@@ -534,6 +560,16 @@ fn layout_authed(
                         ) {
                             (icons::menu(18))
                         }
+                        // Impersonation banner. A sibling of `main` (not
+                        // inside it) so Datastar in-page navigation — which
+                        // outer-patches `main`, `#app-sidebar`, and `title`
+                        // but nothing else — leaves it standing for the whole
+                        // impersonation session. Only full-page loads (the
+                        // start/stop redirects) re-render the shell, which is
+                        // exactly when the banner should appear or vanish.
+                        if impersonating {
+                            (render_impersonation_banner(user_email))
+                        }
                         main(class: (main_class)) {
                             (body)
                         }
@@ -552,6 +588,42 @@ fn layout_authed(
         }
     };
     frag.to_html().to_string()
+}
+
+/// Persistent, deliberately loud banner shown on every authed page while
+/// the current session is an admin impersonation. `email` is the *target*
+/// being acted as (the session's effective user). The "Return to your
+/// account" control is a plain form POST to `/impersonate/stop` — no
+/// Datastar — so it triggers a full navigation that re-renders the shell
+/// without the banner and drops the impersonation cookie. Full
+/// impersonation is unrestricted by design (the admin can act entirely as
+/// the user); this banner + the impersonation_audit trail are the
+/// accountability controls.
+fn render_impersonation_banner(email: &str) -> Html {
+    let email = email.to_string();
+    html! {
+        div(
+            id: "impersonation-banner",
+            class: "shrink-0 flex items-center gap-3 px-4 py-2 \
+                    bg-warning text-warning-content border-b border-warning/40",
+            role: "alert"
+        ) {
+            (icons::alert(18))
+            span(class: "text-sm font-medium min-w-0 break-words") {
+                "You are impersonating " strong { (email) } "."
+            }
+            form(
+                method: "post",
+                action: "/impersonate/stop",
+                class: "m-0 ml-auto shrink-0"
+            ) {
+                button(type: "submit", class: "btn btn-sm") {
+                    "Return to your account"
+                }
+            }
+        }
+    }
+    .to_html()
 }
 
 // The toast auto-dismiss + voice-composer glue lives in
@@ -744,6 +816,12 @@ pub use rag::{
     rag_index, rag_ref_delete, rag_ref_reindex, rag_ref_set_primary, rag_reindex, rag_update,
 };
 
+// Admin user roster + impersonation (`/admin/users`, `/admin/users/impersonate`)
+// plus the un-gated `/impersonate/stop`. Roster + start are admin-only; stop is
+// reachable by the impersonated (possibly non-admin) session so it can get back.
+mod admin_users;
+pub use admin_users::{impersonate_stop, users_impersonate, users_index as admin_users_index};
+
 fn internal_error_html(user_email: &str, message: &str) -> Response {
     let body = html! {
         div(class: "alert alert-error max-w-md mx-auto items-start") {
@@ -764,6 +842,7 @@ fn internal_error_html(user_email: &str, message: &str) -> Response {
                 None,
                 "Error — LLM Gateway",
                 user_email,
+                false,
                 false,
                 body,
                 &SidebarChat::default(),
@@ -796,6 +875,7 @@ pub(super) fn forbidden_html(user_email: &str, message: &str) -> Response {
                 None,
                 "Forbidden — LLM Gateway",
                 user_email,
+                false,
                 false,
                 body,
                 &SidebarChat::default(),

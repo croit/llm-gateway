@@ -57,7 +57,7 @@ mod title;
 // GET /chat — redirect to latest (or new) session.
 
 pub async fn chat_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
+    let (session, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
@@ -67,7 +67,14 @@ pub async fn chat_index(State(state): State<Arc<RamaState>>, req: Request) -> Re
         Err(resp) => return resp,
     };
     if datastar {
-        render_chat_response(state.clone(), &user, target, datastar).await
+        render_chat_response(
+            state.clone(),
+            &user,
+            target,
+            datastar,
+            session.impersonator_id.is_some(),
+        )
+        .await
     } else {
         see_other(&format!("/chat/{}", target.id))
     }
@@ -94,7 +101,7 @@ pub async fn chat_session_view(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
+    let (session, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
@@ -106,7 +113,14 @@ pub async fn chat_session_view(
         Ok(None) => return see_other("/chat"),
         Err(err) => return internal_error_html(&user.email, &err.to_string()),
     };
-    render_chat_response(state.clone(), &user, target, datastar).await
+    render_chat_response(
+        state.clone(),
+        &user,
+        target,
+        datastar,
+        session.impersonator_id.is_some(),
+    )
+    .await
 }
 
 async fn render_chat_response(
@@ -114,6 +128,7 @@ async fn render_chat_response(
     user: &User,
     active: chat::Session,
     datastar: bool,
+    impersonating: bool,
 ) -> Response {
     let theme = Theme::from_headers(&rama::http::HeaderMap::new());
     let sessions = match chat::list_sessions(&state.db, &user.id).await {
@@ -198,6 +213,7 @@ async fn render_chat_response(
             &format!("{title} — LLM Gateway"),
             &user.email,
             is_admin(&state, user),
+            impersonating,
             body,
             &url,
             &chat_sidebar,
@@ -209,6 +225,7 @@ async fn render_chat_response(
             &format!("{title} — LLM Gateway"),
             &user.email,
             is_admin(&state, user),
+            impersonating,
             body,
             &chat_sidebar,
         )
@@ -219,7 +236,7 @@ async fn render_chat_response(
 // POST /chat/sessions — new session + nav to it.
 
 pub async fn chat_session_create(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
+    let (session, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
@@ -229,7 +246,14 @@ pub async fn chat_session_create(State(state): State<Arc<RamaState>>, req: Reque
         Err(err) => return internal_error_html(&user.email, &err.to_string()),
     };
     if datastar {
-        render_chat_response(state.clone(), &user, new_session, true).await
+        render_chat_response(
+            state.clone(),
+            &user,
+            new_session,
+            true,
+            session.impersonator_id.is_some(),
+        )
+        .await
     } else {
         see_other(&format!("/chat/{}", new_session.id))
     }
@@ -243,7 +267,7 @@ pub async fn chat_session_delete(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
+    let (session, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
@@ -262,7 +286,14 @@ pub async fn chat_session_delete(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    render_chat_response(state.clone(), &user, next, datastar).await
+    render_chat_response(
+        state.clone(),
+        &user,
+        next,
+        datastar,
+        session.impersonator_id.is_some(),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

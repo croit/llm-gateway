@@ -35,7 +35,7 @@ use crate::server::upstreams::{PickerStrategy, PoolKind};
 pub async fn backends_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
-    let (_session, user) = match require_admin_or_403(&state, &req).await {
+    let (session, user) = match require_admin_or_403(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
@@ -79,6 +79,7 @@ pub async fn backends_index(State(state): State<Arc<RamaState>>, req: Request) -
         "Upstream backends — LLM Gateway",
         &user.email,
         is_admin(&state, &user),
+        session.impersonator_id.is_some(),
         body,
         "/admin/backends",
         &chat,

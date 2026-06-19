@@ -49,7 +49,7 @@ pub async fn tokens_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     let theme = Theme::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
 
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
+    let (session, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
@@ -70,6 +70,7 @@ pub async fn tokens_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         "API tokens — LLM Gateway",
         &user.email,
         is_admin(&state, &user),
+        session.impersonator_id.is_some(),
         body,
         "/tokens",
         &chat,

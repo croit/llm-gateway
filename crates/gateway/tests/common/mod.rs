@@ -171,6 +171,16 @@ pub async fn state_with_chat_and_embed(chat_model: &str, embed_model: &str) -> R
 /// whose `roles` includes `"admin"`. Tests that don't care use
 /// `state_with_chat_pool`.
 pub async fn state_with_admin_rbac(upstream_url: &str) -> RamaState {
+    state_with_admin_rbac_cfg(upstream_url, true).await
+}
+
+/// Same as [`state_with_admin_rbac`] but with `[gateway].allow_impersonation`
+/// turned off, for tests that exercise the impersonation kill switch.
+pub async fn state_with_admin_rbac_no_impersonation(upstream_url: &str) -> RamaState {
+    state_with_admin_rbac_cfg(upstream_url, false).await
+}
+
+async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool) -> RamaState {
     use gateway::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
     let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
 
@@ -212,7 +222,9 @@ pub async fn state_with_admin_rbac(upstream_url: &str) -> RamaState {
     };
     let rbac = Arc::new(Resolver::build(rbac_config, vec![admin_role]).unwrap());
 
-    let app = AppState::new(Config::default(), pool.clone(), registry, tools, rbac);
+    let mut config = Config::default();
+    config.gateway.allow_impersonation = allow_impersonation;
+    let app = AppState::new(config, pool.clone(), registry, tools, rbac);
     let sessions = SessionStore::new(pool, TEST_SECRET);
     RamaState::new(app, sessions)
 }

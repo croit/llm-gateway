@@ -300,6 +300,16 @@ pub struct GatewayConfig {
     /// `openssl rand -hex 32` and put it in `$GATEWAY_SESSION_KEY` rather than
     /// in this file — the file is for the *name* of the env var.
     pub session_key_env: String,
+    /// Whether admins may impersonate other users from `/admin/users`.
+    /// Default `false` (opt-in) — impersonation is a powerful, privileged
+    /// capability, so it's off unless explicitly enabled. Set
+    /// `allow_impersonation = true` to turn it on; the Impersonate buttons
+    /// then appear and `POST /admin/users/impersonate` works. While disabled
+    /// the buttons are hidden and that endpoint returns 403. Stopping an
+    /// already-active impersonation (`/impersonate/stop`) always works, so
+    /// nobody is trapped mid-session if the flag is flipped at runtime.
+    #[serde(default)]
+    pub allow_impersonation: bool,
 }
 
 impl Default for GatewayConfig {
@@ -308,6 +318,7 @@ impl Default for GatewayConfig {
             public_url: "http://localhost:8080".into(),
             token_ttl_days: 90,
             session_key_env: "GATEWAY_SESSION_KEY".into(),
+            allow_impersonation: false,
         }
     }
 }

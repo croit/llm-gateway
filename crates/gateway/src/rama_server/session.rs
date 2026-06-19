@@ -65,6 +65,12 @@ pub struct Session {
     /// after the first authed page load runs `app.js`. None until the
     /// browser tells us, or for sessions created before the migration.
     pub timezone: Option<String>,
+    /// Set when this session is an admin *impersonating* another user:
+    /// `user_id` is the target being acted as, `impersonator_id` is the
+    /// admin who started it. None for ordinary sessions. Drives the
+    /// persistent impersonation banner and the `/impersonate/stop` route.
+    /// See `migrations/0018_impersonation.sql`.
+    pub impersonator_id: Option<String>,
 }
 
 impl SessionStore {
@@ -86,17 +92,43 @@ impl SessionStore {
         user_id: &str,
         ttl: Duration,
     ) -> Result<Session, SessionError> {
+        self.insert(user_id, None, ttl).await
+    }
+
+    /// Mints an impersonation session: `user_id` is the target the admin
+    /// will act as, `impersonator_id` is the admin themselves. The whole
+    /// app reads `session.user_id`, so the resulting cookie makes every
+    /// handler behave as the target — `impersonator_id` is what the
+    /// banner and `/impersonate/stop` use to find the way back.
+    pub async fn create_impersonation(
+        &self,
+        target_user_id: &str,
+        impersonator_id: &str,
+    ) -> Result<Session, SessionError> {
+        self.insert(target_user_id, Some(impersonator_id), DEFAULT_TTL)
+            .await
+    }
+
+    /// Shared INSERT for both ordinary and impersonation sessions.
+    async fn insert(
+        &self,
+        user_id: &str,
+        impersonator_id: Option<&str>,
+        ttl: Duration,
+    ) -> Result<Session, SessionError> {
         let id = random_session_id();
         let now = Timestamp::now();
         let expires =
             now + SignedDuration::try_from(ttl).unwrap_or(SignedDuration::from_hours(24 * 7));
         sqlx::query(
-            "INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO sessions (id, user_id, created_at, expires_at, impersonator_id) \
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(user_id)
         .bind(now.to_string())
         .bind(expires.to_string())
+        .bind(impersonator_id)
         .execute(&self.db)
         .await?;
         Ok(Session {
@@ -104,6 +136,7 @@ impl SessionStore {
             user_id: user_id.to_string(),
             expires_at: expires,
             timezone: None,
+            impersonator_id: impersonator_id.map(str::to_string),
         })
     }
 
@@ -111,13 +144,16 @@ impl SessionStore {
     /// expired. Expired rows are left for a future GC pass; we just hide
     /// them at read time so a clock-skew gap doesn't grant access.
     pub async fn lookup(&self, id: &str) -> Result<Option<Session>, SessionError> {
-        let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT user_id, created_at, expires_at, timezone FROM sessions WHERE id = ?",
+        // (user_id, created_at, expires_at, timezone, impersonator_id)
+        type Row = (String, String, String, Option<String>, Option<String>);
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT user_id, created_at, expires_at, timezone, impersonator_id \
+                 FROM sessions WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.db)
         .await?;
-        let Some((user_id, _created, expires_at, timezone)) = row else {
+        let Some((user_id, _created, expires_at, timezone, impersonator_id)) = row else {
             return Ok(None);
         };
         let expires_at: Timestamp = expires_at.parse().map_err(|_| SessionError::Malformed)?;
@@ -129,6 +165,7 @@ impl SessionStore {
             user_id,
             expires_at,
             timezone,
+            impersonator_id,
         }))
     }
 
@@ -398,6 +435,41 @@ mod tests {
         assert!(store.delete(&session.id).await.unwrap());
         assert!(store.lookup(&session.id).await.unwrap().is_none());
         assert!(!store.delete(&session.id).await.unwrap()); // idempotent
+    }
+
+    #[tokio::test]
+    async fn impersonation_session_carries_impersonator_id() {
+        let store = store().await;
+        let now = Timestamp::now();
+        for id in ["root", "victim"] {
+            crate::server::db::users::upsert(
+                &store.db,
+                &crate::server::db::users::User {
+                    id: id.into(),
+                    email: format!("{id}@x"),
+                    name: None,
+                    roles: vec![],
+                    created_at: now,
+                    updated_at: now,
+                    timezone: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // An ordinary session has no impersonator.
+        let plain = store.create("root").await.unwrap();
+        assert_eq!(plain.impersonator_id, None);
+
+        // An impersonation session acts as the target, remembers the admin.
+        let imp = store.create_impersonation("victim", "root").await.unwrap();
+        assert_eq!(imp.user_id, "victim");
+        assert_eq!(imp.impersonator_id.as_deref(), Some("root"));
+
+        // And it round-trips through lookup.
+        let fetched = store.lookup(&imp.id).await.unwrap().unwrap();
+        assert_eq!(fetched.user_id, "victim");
+        assert_eq!(fetched.impersonator_id.as_deref(), Some("root"));
     }
 
     #[tokio::test]

@@ -12,6 +12,13 @@ path = "gateway.sqlite"
 public_url = "http://localhost:8080"
 token_ttl_days = 90
 session_key_env = "GATEWAY_SESSION_KEY"
+# Let admins impersonate other users from /admin/users (debugging aid; every
+# impersonation is audited and shows a persistent banner). Default false
+# (opt-in) — it's a privileged capability, so it's off unless you enable it
+# here. While disabled the Impersonate buttons are hidden and the
+# POST /admin/users/impersonate endpoint returns 403. Stopping an already-active
+# impersonation still works regardless.
+allow_impersonation = false
 
 # ---- Upstream pools --------------------------------------------------------
 # Each [upstream_pools.<name>] block defines a logical pool of backends that
