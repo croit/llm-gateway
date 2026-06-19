@@ -506,6 +506,7 @@ async fn state_with_backend_api_key(
     pools.insert(
         "pool".to_string(),
         UpstreamPoolConfig {
+            compliance: Default::default(),
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),

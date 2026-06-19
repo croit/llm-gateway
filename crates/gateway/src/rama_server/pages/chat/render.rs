@@ -15,6 +15,16 @@ use session_core::db::{Session, TurnWithTools};
 use session_core::icons;
 use session_core::render;
 
+/// One selectable chat model + its data-handling flags. `gdpr`/`nda` are
+/// `true` (clear) for the common case; a `false` drives the dropdown-label
+/// suffix and the per-conversation warning banner. Built from
+/// `UpstreamRegistry::models_with_compliance_for_kind`.
+pub(super) struct ChatModelOption {
+    pub id: String,
+    pub gdpr: bool,
+    pub nda: bool,
+}
+
 /// Inputs the chat-page handler passes through to one render call.
 /// Owns no state — the handler builds it fresh per request from
 /// `RamaState` + DB.
@@ -26,7 +36,7 @@ pub(super) struct ChatPage<'a> {
     /// section emits the auto-tail `data-init`. None when there's
     /// no live worker for this session.
     pub in_flight_turn_id: Option<&'a str>,
-    pub models: &'a [String],
+    pub models: &'a [ChatModelOption],
     pub transcription_models: &'a [String],
     pub error_msg: Option<&'a str>,
     /// Viewer is not the owner (the session is shared): render read-only —
@@ -41,8 +51,24 @@ pub(super) struct ChatPage<'a> {
 /// (see `render_app_sidebar` in pages/mod.rs); we don't render
 /// it here.
 pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
-    let models_vec: Vec<String> = page.models.to_vec();
-    let models_empty = models_vec.is_empty();
+    let models_empty = page.models.is_empty();
+    // (value, label) per option — label carries the compliance suffix, value
+    // stays the raw id so the form still posts the real model name.
+    let model_options: Vec<(String, String)> = page
+        .models
+        .iter()
+        .map(|m| (m.id.clone(), model_label(m)))
+        .collect();
+    // Compliance UI is owner-only (a read-only shared viewer sends nothing)
+    // and only meaningful when there's a real model picker. The signal store
+    // is emitted whenever the picker is shown (so the picker's `data-on:change`
+    // always writes a declared signal); each banner is emitted only when some
+    // model actually trips that flag, so an all-clear deployment carries no
+    // banner markup at all.
+    let show_compliance = !page.read_only && !models_empty;
+    let any_gdpr_flagged = page.models.iter().any(|m| !m.gdpr);
+    let any_nda_flagged = page.models.iter().any(|m| !m.nda);
+    let compliance_signals = compliance_signals(page.models);
     let voice_models: Vec<String> = page.transcription_models.to_vec();
     let has_voice = !voice_models.is_empty();
     let session_id = page.active.id.clone();
@@ -100,10 +126,13 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                             name: "model",
                             form: "chat-form",
                             "aria-label": "Chat model",
+                            // Track the picked model so the compliance banner
+                            // below reacts when the user switches models.
+                            "data-on:change": "$selectedModel = evt.target.value",
                             class: "select select-bordered select-sm chat-model-select"
                         ) {
-                            for m in models_vec.iter() {
-                                option(value: (m.clone())) { (m.clone()) }
+                            for (value, label) in model_options.iter() {
+                                option(value: (value.clone())) { (label.clone()) }
                             }
                         }
                     }
@@ -126,6 +155,57 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
             }
             (render_share_control(&share_url, page.shared))
             }
+            }
+        }
+
+        // Per-conversation compliance banners. Rendered up front (before any
+        // prompt) and reactive: `data-show` keys off `$selectedModel`, which
+        // the model picker updates on change, so the right warning appears the
+        // moment a flagged model is selected. The signal store is emitted
+        // whenever the picker is shown (so the picker's `data-on:change` always
+        // writes a declared signal); each banner is emitted only when some
+        // model trips that flag — an all-clear deployment carries no banner.
+        if show_compliance {
+            // Carries the signal store, and on mount syncs `selectedModel`
+            // from the picker's *actual* value. The seed in `data-signals` is
+            // only the server's guess (first option); a browser-restored
+            // selection (new conversation / reload) or a flagged default can
+            // differ without ever firing a `change`, which is exactly when the
+            // banner would otherwise stay hidden. Reading the live DOM value at
+            // `data-init` covers that; `change` keeps it live afterwards.
+            div(
+                "data-signals": (compliance_signals),
+                "data-init": "$selectedModel = document.getElementById('model')?.value ?? $selectedModel",
+                style: "display:none"
+            ) {}
+            if any_gdpr_flagged {
+                div(
+                    class: "alert alert-error mb-2",
+                    role: "alert",
+                    "data-show": "$gdprFlagged.includes($selectedModel)",
+                    style: "display:none"
+                ) {
+                    (icons::alert(20))
+                    span {
+                        "You are sending data to a non-GDPR-compliant model. \
+                         Do not enter personal information (names, emails, \
+                         addresses, customer or employee data)."
+                    }
+                }
+            }
+            if any_nda_flagged {
+                div(
+                    class: "alert alert-error mb-2",
+                    role: "alert",
+                    "data-show": "$ndaFlagged.includes($selectedModel)",
+                    style: "display:none"
+                ) {
+                    (icons::alert(20))
+                    span {
+                        "This model is not covered by a confidentiality agreement. \
+                         Do not send NDA-protected or proprietary material."
+                    }
+                }
             }
         }
 
@@ -157,6 +237,43 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
         }
     }
     .to_html()
+}
+
+/// Dropdown label for one model: the raw id, plus a parenthetical suffix
+/// naming each restriction so the user sees it before opening any banner.
+fn model_label(m: &ChatModelOption) -> String {
+    match (m.gdpr, m.nda) {
+        (true, true) => m.id.clone(),
+        (false, true) => format!("{} (non-GDPR)", m.id),
+        (true, false) => format!("{} (confidential-restricted)", m.id),
+        (false, false) => format!("{} (non-GDPR, confidential-restricted)", m.id),
+    }
+}
+
+/// Builds the datastar signal store the compliance banners read:
+///   - `selectedModel` seeded to the default (first) option, so the banner is
+///     correct on load before any `change` event;
+///   - `gdprFlagged` / `ndaFlagged`: the model ids that trip each warning.
+///
+/// A JS object literal with JSON arrays (valid datastar `data-signals`).
+fn compliance_signals(models: &[ChatModelOption]) -> String {
+    let gdpr_flagged: Vec<&str> = models
+        .iter()
+        .filter(|m| !m.gdpr)
+        .map(|m| m.id.as_str())
+        .collect();
+    let nda_flagged: Vec<&str> = models
+        .iter()
+        .filter(|m| !m.nda)
+        .map(|m| m.id.as_str())
+        .collect();
+    let default_model = models.first().map(|m| m.id.as_str()).unwrap_or("");
+    format!(
+        "{{selectedModel: {}, gdprFlagged: {}, ndaFlagged: {}}}",
+        serde_json::to_string(default_model).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(&gdpr_flagged).unwrap_or_else(|_| "[]".into()),
+        serde_json::to_string(&nda_flagged).unwrap_or_else(|_| "[]".into()),
+    )
 }
 
 fn session_label(session: &Session) -> String {
@@ -272,6 +389,128 @@ mod tests {
             shared: false,
         })
         .to_string()
+    }
+
+    fn page_body_with_models(models: &[ChatModelOption], read_only: bool) -> String {
+        let s = session();
+        render_chat_page(ChatPage {
+            active: &s,
+            turns: &[],
+            in_flight_turn_id: None,
+            models,
+            transcription_models: &[],
+            error_msg: None,
+            read_only,
+            shared: false,
+        })
+        .to_string()
+    }
+
+    fn opt(id: &str, gdpr: bool, nda: bool) -> ChatModelOption {
+        ChatModelOption {
+            id: id.into(),
+            gdpr,
+            nda,
+        }
+    }
+
+    #[test]
+    fn model_label_suffixes_each_restriction() {
+        assert_eq!(model_label(&opt("qwen", true, true)), "qwen");
+        assert_eq!(
+            model_label(&opt("glm-4.6", false, true)),
+            "glm-4.6 (non-GDPR)"
+        );
+        assert_eq!(
+            model_label(&opt("x", true, false)),
+            "x (confidential-restricted)"
+        );
+        assert_eq!(
+            model_label(&opt("glm-5.2", false, false)),
+            "glm-5.2 (non-GDPR, confidential-restricted)"
+        );
+    }
+
+    #[test]
+    fn compliant_models_emit_no_warning_banner_or_flags() {
+        // All-clear models: the option carries no suffix, and the flag arrays
+        // are empty so the banner can never show.
+        let body = page_body_with_models(&[opt("qwen", true, true)], false);
+        assert!(
+            !body.contains("non-GDPR"),
+            "no suffix for clear model: {body}"
+        );
+        assert!(
+            body.contains("gdprFlagged: []") && body.contains("ndaFlagged: []"),
+            "clear models must yield empty flag arrays: {body}"
+        );
+        assert!(
+            !body.contains("non-GDPR-compliant model"),
+            "no GDPR banner copy expected: {body}"
+        );
+    }
+
+    #[test]
+    fn flagged_model_wires_dropdown_suffix_signals_and_banner() {
+        // The end-to-end wiring for a non-GDPR model: dropdown suffix, the
+        // model in the gdprFlagged signal array, the default selected model
+        // seeded, and the reactive banner present (hidden until selected).
+        let body = page_body_with_models(&[opt("glm-4.6", false, true)], false);
+        assert!(
+            body.contains("glm-4.6 (non-GDPR)"),
+            "dropdown option must show the suffix: {body}"
+        );
+        // Attribute values are HTML-escaped (`"` → `&quot;`); the browser
+        // un-escapes them before datastar parses the object literal.
+        assert!(
+            body.contains(r#"gdprFlagged: [&quot;glm-4.6&quot;]"#),
+            "model must be in the gdprFlagged signal array: {body}"
+        );
+        assert!(
+            body.contains(r#"selectedModel: &quot;glm-4.6&quot;"#),
+            "default model must seed selectedModel: {body}"
+        );
+        assert!(
+            body.contains("$gdprFlagged.includes($selectedModel)"),
+            "GDPR banner must react to the selected model: {body}"
+        );
+        assert!(
+            body.contains("non-GDPR-compliant model. Do not enter personal"),
+            "GDPR banner copy must be present: {body}"
+        );
+        // nda is clear here → it must not land in the nda array.
+        assert!(
+            body.contains("ndaFlagged: []"),
+            "nda-clear model must not be flagged for NDA: {body}"
+        );
+        // The picker must update the signal on change.
+        assert!(
+            body.contains("$selectedModel = evt.target.value"),
+            "model select must update selectedModel on change: {body}"
+        );
+        // …and the banner must reflect the *initial* selection too — a
+        // browser-restored / default flagged model fires no change event, so
+        // the signal has to sync from the live picker value on mount or the
+        // banner silently stays hidden (regression guard).
+        // `'` is HTML-escaped to `&#39;` in the attribute value.
+        assert!(
+            body.contains(r#"$selectedModel = document.getElementById(&#39;model&#39;)?.value"#),
+            "compliance signals must sync from the picker on data-init: {body}"
+        );
+    }
+
+    #[test]
+    fn read_only_viewer_sees_no_compliance_ui() {
+        // A read-only shared viewer sends nothing, so no picker and no banner.
+        let body = page_body_with_models(&[opt("glm-4.6", false, false)], true);
+        assert!(
+            !body.contains("gdprFlagged"),
+            "read-only view must not wire compliance signals: {body}"
+        );
+        assert!(
+            !body.contains("non-GDPR-compliant model"),
+            "read-only view must not show the banner: {body}"
+        );
     }
 
     #[test]

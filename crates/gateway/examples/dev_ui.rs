@@ -131,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
     pools.insert(
         "chat".to_string(),
         UpstreamPoolConfig {
+            compliance: Default::default(),
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
@@ -148,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
     pools.insert(
         "voice".to_string(),
         UpstreamPoolConfig {
+            compliance: Default::default(),
             kind: PoolKind::Transcription,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),

@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::RwLock;
 use thiserror::Error;
 
-use super::config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig};
+use super::config::{BackendConfig, Compliance, PickerStrategy, PoolKind, UpstreamPoolConfig};
 
 /// A single upstream backend with the runtime state we need to schedule it.
 pub struct Backend {
@@ -142,6 +142,9 @@ pub struct Pool {
     pub kind: PoolKind,
     pub strategy: PickerStrategy,
     pub backends: Vec<Arc<Backend>>,
+    /// Data-handling attributes for every model this pool serves (default
+    /// all-clear). Drives advisory chat-UI warnings; never affects routing.
+    pub compliance: Compliance,
     /// Cursor for round-robin.
     rr_cursor: AtomicUsize,
 }
@@ -166,6 +169,7 @@ impl Pool {
             kind: cfg.kind,
             strategy: cfg.strategy,
             backends,
+            compliance: cfg.compliance,
             rr_cursor: AtomicUsize::new(0),
         }
     }
@@ -348,6 +352,29 @@ impl UpstreamRegistry {
         self.collect_models(|_| true)
     }
 
+    /// Sorted list of `(model_id, merged_compliance)` for every model served
+    /// by a pool of `kind`. When the same id is served by multiple pools the
+    /// flags are merged **most-restrictively** (a flag is clear only if it's
+    /// clear on *every* serving pool) — so a model that's GDPR-safe on one
+    /// upstream but not another is treated as not-safe. Backs the chat-UI
+    /// model dropdown labels and the per-conversation warning banner.
+    pub fn models_with_compliance_for_kind(&self, kind: PoolKind) -> Vec<(String, Compliance)> {
+        let mut merged: HashMap<String, Compliance> = HashMap::new();
+        for pool in self.pools.values().filter(|p| p.kind == kind) {
+            for backend in &pool.backends {
+                for id in backend.models_snapshot() {
+                    let entry = merged.entry(id).or_default();
+                    // AND the flags: clear only where every serving pool is clear.
+                    entry.gdpr &= pool.compliance.gdpr;
+                    entry.nda &= pool.compliance.nda;
+                }
+            }
+        }
+        let mut out: Vec<(String, Compliance)> = merged.into_iter().collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// True if any pool of `kind` knows `model` (probe- or config-derived),
     /// regardless of backend health. Used to decide 404 (`model_not_found`)
     /// vs 503 before routing — see `acquire_for`.
@@ -443,8 +470,24 @@ mod tests {
         backends: Vec<BackendConfig>,
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
+            compliance: Default::default(),
             kind,
             strategy,
+            models: Vec::new(),
+            backend: backends,
+        }
+    }
+
+    /// Pool carrying explicit compliance flags.
+    fn pool_config_with_compliance(
+        kind: PoolKind,
+        compliance: Compliance,
+        backends: Vec<BackendConfig>,
+    ) -> UpstreamPoolConfig {
+        UpstreamPoolConfig {
+            compliance,
+            kind,
+            strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
             backend: backends,
         }
@@ -457,6 +500,7 @@ mod tests {
         backends: Vec<BackendConfig>,
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
+            compliance: Default::default(),
             kind,
             strategy: PickerStrategy::RoundRobin,
             models: models.iter().map(|s| (*s).to_string()).collect(),
@@ -601,6 +645,90 @@ mod tests {
             vec!["whisper-1"]
         );
         assert!(reg.models_for_kind(PoolKind::Embedding).is_empty());
+    }
+
+    #[test]
+    fn compliance_flags_attach_per_model_and_default_clear() {
+        let reg = build(vec![
+            (
+                "zai",
+                pool_config_with_compliance(
+                    PoolKind::Chat,
+                    Compliance {
+                        gdpr: false,
+                        nda: false,
+                    },
+                    vec![backend("zai", 16)],
+                ),
+            ),
+            (
+                "qwen",
+                pool_config(
+                    PoolKind::Chat,
+                    PickerStrategy::RoundRobin,
+                    vec![backend("qwen", 16)],
+                ),
+            ),
+        ]);
+        seed_models(&reg, "zai", 0, &["glm-4.6"]);
+        seed_models(&reg, "qwen", 0, &["qwen-3"]);
+
+        let map: std::collections::HashMap<String, Compliance> = reg
+            .models_with_compliance_for_kind(PoolKind::Chat)
+            .into_iter()
+            .collect();
+        // Flagged pool propagates to its model…
+        assert_eq!(
+            map["glm-4.6"],
+            Compliance {
+                gdpr: false,
+                nda: false
+            }
+        );
+        // …and a pool with no compliance block stays all-clear.
+        assert!(map["qwen-3"].is_all_clear());
+    }
+
+    #[test]
+    fn compliance_merges_most_restrictively_across_pools() {
+        // Same model id served by two pools: one GDPR-safe, one not. The
+        // merge must take the restrictive view (not safe).
+        let reg = build(vec![
+            (
+                "safe",
+                pool_config(
+                    PoolKind::Chat,
+                    PickerStrategy::RoundRobin,
+                    vec![backend("safe", 16)],
+                ),
+            ),
+            (
+                "unsafe",
+                pool_config_with_compliance(
+                    PoolKind::Chat,
+                    Compliance {
+                        gdpr: false,
+                        nda: true,
+                    },
+                    vec![backend("unsafe", 16)],
+                ),
+            ),
+        ]);
+        seed_models(&reg, "safe", 0, &["shared"]);
+        seed_models(&reg, "unsafe", 0, &["shared"]);
+
+        let map: std::collections::HashMap<String, Compliance> = reg
+            .models_with_compliance_for_kind(PoolKind::Chat)
+            .into_iter()
+            .collect();
+        // gdpr false on one pool wins; nda clear on both stays clear.
+        assert_eq!(
+            map["shared"],
+            Compliance {
+                gdpr: false,
+                nda: true
+            }
+        );
     }
 
     #[test]

@@ -18,7 +18,52 @@ pub struct UpstreamPoolConfig {
     /// precedence (probe → backend `models` → pool `models`).
     #[serde(default)]
     pub models: Vec<String>,
+    /// Data-handling/compliance attributes for every model this pool serves.
+    /// Absent block ⇒ [`Compliance::default`] (all-clear): no UI warning. Set
+    /// a flag to `false` to surface a per-conversation warning banner in the
+    /// chat UI — purely advisory signalling, no request-blocking. Lives at the
+    /// pool level because residency/coverage is a property of the upstream
+    /// endpoint, not the individual model id.
+    #[serde(default)]
+    pub compliance: Compliance,
     pub backend: Vec<BackendConfig>,
+}
+
+/// Per-pool data-handling attributes, surfaced to the user as chat-UI warnings
+/// when a flag is `false`. Both default to `true` (compliant), so an existing
+/// config with no `[upstream_pools.x.compliance]` block keeps today's
+/// no-warning behaviour — you opt **in** to a warning by declaring `false`.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Compliance {
+    /// `false` ⇒ data sent here leaves the EU / has no GDPR safeguards. Warns
+    /// the user not to enter personal data.
+    #[serde(default = "default_true")]
+    pub gdpr: bool,
+    /// `false` ⇒ the endpoint is not covered by a confidentiality agreement.
+    /// Warns the user not to send NDA-protected / proprietary material.
+    #[serde(default = "default_true")]
+    pub nda: bool,
+}
+
+impl Default for Compliance {
+    fn default() -> Self {
+        Self {
+            gdpr: true,
+            nda: true,
+        }
+    }
+}
+
+impl Compliance {
+    /// True when every flag is clear — the common case, drawn with no warning.
+    pub fn is_all_clear(&self) -> bool {
+        self.gdpr && self.nda
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
@@ -157,6 +202,39 @@ mod tests {
         let p: UpstreamPoolConfig = toml::from_str(s).unwrap();
         assert!(p.models.is_empty());
         assert!(p.backend[0].models.is_empty());
+    }
+
+    #[test]
+    fn compliance_absent_defaults_to_all_clear() {
+        let s = r#"
+            kind = "chat"
+
+            [[backend]]
+            name = "x"
+            base_url = "http://x"
+        "#;
+        let p: UpstreamPoolConfig = toml::from_str(s).unwrap();
+        assert_eq!(p.compliance, Compliance::default());
+        assert!(p.compliance.is_all_clear());
+        assert!(p.compliance.gdpr && p.compliance.nda);
+    }
+
+    #[test]
+    fn compliance_flags_parse_and_partial_block_keeps_other_true() {
+        let s = r#"
+            kind = "chat"
+
+            [compliance]
+            gdpr = false
+
+            [[backend]]
+            name = "zai"
+            base_url = "https://api.z.ai/api/coding/paas/v4"
+        "#;
+        let p: UpstreamPoolConfig = toml::from_str(s).unwrap();
+        assert!(!p.compliance.gdpr, "explicit gdpr=false must parse");
+        assert!(p.compliance.nda, "unspecified nda must default true");
+        assert!(!p.compliance.is_all_clear());
     }
 
     #[test]

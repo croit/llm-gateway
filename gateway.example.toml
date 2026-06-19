@@ -37,6 +37,15 @@ base_url = "http://gpu-02.internal:8000/v1"
 max_inflight = 16
 weight = 1
 
+# Optional data-handling flags for every model this pool serves. Both default
+# to true (compliant) — omit the block entirely and nothing changes. Set a flag
+# to false to surface an advisory warning in the chat UI (a dropdown-label
+# suffix + a red banner shown before any prompt). Purely informational: it does
+# NOT block or inspect requests. Use for non-EU / third-party providers, e.g.:
+#   [upstream_pools.zai.compliance]
+#   gdpr = false   # data leaves the EU / no GDPR safeguards → warn: no personal data
+#   nda  = false   # not covered by a confidentiality agreement → warn: no NDA material
+
 # Second pool for Whisper-style transcription. /v1/audio/transcriptions
 # routes here when the request's `model` field is advertised by any
 # backend in a transcription-kind pool.

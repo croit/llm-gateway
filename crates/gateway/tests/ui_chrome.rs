@@ -220,6 +220,7 @@ async fn transcription_models_lists_discovered_models() {
     pools.insert(
         "voice".to_string(),
         UpstreamPoolConfig {
+            compliance: Default::default(),
             kind: PoolKind::Transcription,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
@@ -292,6 +293,7 @@ async fn session_transcribe_forwards_multipart_to_upstream() {
     pools.insert(
         "voice".to_string(),
         UpstreamPoolConfig {
+            compliance: Default::default(),
             kind: PoolKind::Transcription,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
@@ -409,6 +411,7 @@ async fn session_transcribe_rejects_too_short_audio() {
     pools.insert(
         "voice".to_string(),
         UpstreamPoolConfig {
+            compliance: Default::default(),
             kind: PoolKind::Transcription,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),

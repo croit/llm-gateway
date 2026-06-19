@@ -951,10 +951,17 @@ async fn list_transcription_models(state: &RamaState) -> Vec<String> {
         .models_for_kind(crate::server::upstreams::PoolKind::Transcription)
 }
 
-async fn list_chat_models(state: &RamaState) -> Vec<String> {
+async fn list_chat_models(state: &RamaState) -> Vec<render::ChatModelOption> {
     state
         .upstreams
-        .models_for_kind(crate::server::upstreams::PoolKind::Chat)
+        .models_with_compliance_for_kind(crate::server::upstreams::PoolKind::Chat)
+        .into_iter()
+        .map(|(id, c)| render::ChatModelOption {
+            id,
+            gdpr: c.gdpr,
+            nda: c.nda,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

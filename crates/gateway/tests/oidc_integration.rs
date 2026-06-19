@@ -156,6 +156,7 @@ async fn state_with_oidc(idp_uri: &str, roles_claim: Option<&str>) -> RamaState 
     let tools = Arc::new(ToolRegistry::new());
     let rbac = Arc::new(Resolver::empty());
     let _: UpstreamPoolConfig = UpstreamPoolConfig {
+        compliance: Default::default(),
         kind: PoolKind::Chat,
         strategy: upstreams::config::PickerStrategy::RoundRobin,
         models: Vec::new(),

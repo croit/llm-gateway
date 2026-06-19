@@ -265,6 +265,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
     pools.insert(
         "embed".to_string(),
         UpstreamPoolConfig {
+            compliance: Default::default(),
             kind: PoolKind::Embedding,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
@@ -282,6 +283,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
     pools.insert(
         "chat".to_string(),
         UpstreamPoolConfig {
+            compliance: Default::default(),
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),

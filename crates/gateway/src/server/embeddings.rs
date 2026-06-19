@@ -148,6 +148,7 @@ mod tests {
         pools.insert(
             "embed".to_string(),
             UpstreamPoolConfig {
+                compliance: Default::default(),
                 kind: PoolKind::Embedding,
                 strategy: PickerStrategy::RoundRobin,
                 models: Vec::new(),
