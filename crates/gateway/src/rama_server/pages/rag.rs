@@ -169,16 +169,42 @@ pub async fn rag_create(State(state): State<Arc<RamaState>>, req: Request) -> Re
 
 /// Re-patch a collection's `#rag-row-{id}` with its current refs + a toast.
 async fn row_patch(state: &RamaState, collection_id: i64, msg: String) -> Response {
+    row_patch_inner(state, collection_id, msg, None).await
+}
+
+/// Like [`row_patch`] but also resets the named form after the patch. Used by
+/// the add-source / bulk-add handlers: datastar morphs the row in place, which
+/// otherwise preserves the value the operator just typed — making a successful
+/// add look like it did nothing.
+async fn row_patch_reset(
+    state: &RamaState,
+    collection_id: i64,
+    msg: String,
+    reset_form_id: &str,
+) -> Response {
+    row_patch_inner(state, collection_id, msg, Some(reset_form_id)).await
+}
+
+async fn row_patch_inner(
+    state: &RamaState,
+    collection_id: i64,
+    msg: String,
+    reset_form_id: Option<&str>,
+) -> Response {
     match row_html(state, collection_id).await {
         Some(html) => {
             let selector = format!("#rag-row-{collection_id}");
-            sse_response(&[
-                sse_patch(Some(&selector), Some("outer"), &html),
-                sse_toast(&Flash {
-                    kind: FlashKind::Success,
-                    message: msg,
-                }),
-            ])
+            let mut events = vec![sse_patch(Some(&selector), Some("outer"), &html)];
+            if let Some(form_id) = reset_form_id {
+                events.push(sse_script(&format!(
+                    "document.getElementById('{form_id}')?.reset()"
+                )));
+            }
+            events.push(sse_toast(&Flash {
+                kind: FlashKind::Success,
+                message: msg,
+            }));
+            sse_response(&events)
         }
         None => toast(FlashKind::Error, "collection not found"),
     }
@@ -193,6 +219,24 @@ async fn requeue_ref(state: &RamaState, ref_id: i64) {
     } else {
         let _ = rag_db::request_ref_reindex(&state.db, ref_id).await;
     }
+}
+
+/// After a source change on an AGGREGATE collection, re-queue its primary ref —
+/// the primary holds the one unified index (built from every source), so it
+/// must rebuild for the change to take effect. No-op for versioned collections,
+/// whose refs build independently. Returns true if it re-queued the primary.
+async fn requeue_unified_if_aggregate(state: &RamaState, collection_id: i64) -> bool {
+    let Ok(Some(c)) = rag_db::find_collection_by_id(&state.db, collection_id).await else {
+        return false;
+    };
+    if c.search_mode != rag_db::SearchMode::Aggregate {
+        return false;
+    }
+    if let Ok(Some(p)) = rag_db::primary_ref(&state.db, collection_id).await {
+        requeue_ref(state, p.id).await;
+        return true;
+    }
+    false
 }
 
 /// POST /rag/{id}/reindex — re-queue *all* of a collection's refs.
@@ -283,7 +327,16 @@ pub async fn rag_add_ref(
             );
         }
     }
-    row_patch(&state, id, format!("Queued indexing of `{git_ref}`.")).await
+    // Aggregate: rebuild the unified index (on the primary) to fold in the
+    // new source. (The new source row itself is config-only there.)
+    requeue_unified_if_aggregate(&state, id).await;
+    row_patch_reset(
+        &state,
+        id,
+        format!("Queued indexing of `{git_ref}`."),
+        &format!("rag-addsrc-{id}"),
+    )
+    .await
 }
 
 #[derive(serde::Deserialize)]
@@ -369,12 +422,15 @@ pub async fn rag_add_sources_bulk(
             Err(_) => skipped += 1,
         }
     }
+    // Aggregate: rebuild the unified index (primary) once, covering all the
+    // newly-added sources.
+    requeue_unified_if_aggregate(&state, id).await;
     let msg = if skipped > 0 {
         format!("Queued {added} source(s); skipped {skipped} duplicate(s).")
     } else {
         format!("Queued indexing of {added} source(s).")
     };
-    row_patch(&state, id, msg).await
+    row_patch_reset(&state, id, msg, &format!("rag-bulk-{id}")).await
 }
 
 /// POST /rag/refs/{ref_id}/reindex — re-queue a single ref.
@@ -389,7 +445,11 @@ pub async fn rag_ref_reindex(
     let Ok(Some(r)) = rag_db::find_ref_by_id(&state.db, ref_id).await else {
         return toast(FlashKind::Error, "ref not found");
     };
-    requeue_ref(&state, ref_id).await;
+    // Aggregate: there's one unified index (on the primary); re-index rebuilds
+    // the whole collection. Versioned: re-index just this ref.
+    if !requeue_unified_if_aggregate(&state, r.collection_id).await {
+        requeue_ref(&state, ref_id).await;
+    }
     row_patch(
         &state,
         r.collection_id,
@@ -446,6 +506,9 @@ pub async fn rag_ref_delete(
             return toast(FlashKind::Error, "could not delete ref");
         }
     }
+    // Aggregate: rebuild the unified index (on the possibly-newly-promoted
+    // primary) so the removed source drops out of the corpus.
+    requeue_unified_if_aggregate(&state, collection_id).await;
     row_patch(
         &state,
         collection_id,
@@ -554,7 +617,10 @@ pub async fn rag_update(
     };
 
     let git_url = form.git_url.trim();
-    if git_url.is_empty() {
+    // Aggregate collections carry no single repo URL (each source has its
+    // own), so the collection-level Git URL is optional for them — only
+    // versioned collections require it.
+    if git_url.is_empty() && existing.search_mode == rag_db::SearchMode::Versioned {
         return toast(FlashKind::Error, "Git URL is required.");
     }
     let embedding_model = form.embedding_model.trim();
@@ -788,6 +854,11 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
     let add_ref_directive = format!("@post('{add_ref_action}', {{contentType: 'form'}})");
     let bulk_action = format!("/rag/{}/refs/bulk", c.id);
     let bulk_directive = format!("@post('{bulk_action}', {{contentType: 'form'}})");
+    // Stable form ids so the add-source / bulk handlers can reset the form
+    // after a successful submit (datastar morph otherwise keeps the typed
+    // value in the field, which reads as "did nothing").
+    let add_src_form_id = format!("rag-addsrc-{}", c.id);
+    let bulk_form_id = format!("rag-bulk-{}", c.id);
     let pat_hint = if c.pat.is_some() { "PAT set" } else { "no PAT" };
     let description = c.description.clone().unwrap_or_default();
     let aggregate = c.search_mode == rag_db::SearchMode::Aggregate;
@@ -848,6 +919,7 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
                 // Add-source form. Aggregate collections take a repo URL plus
                 // an optional ref; versioned ones just a ref of the one repo.
                 form(
+                    id: (add_src_form_id),
                     action: (add_ref_action),
                     method: "post",
                     class: "flex items-center gap-2 mt-1 flex-wrap",
@@ -885,6 +957,7 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
                 // ` @ref`. The fast path for many-repo corpora like Proxmox.
                 if aggregate {
                     form(
+                        id: (bulk_form_id),
                         action: (bulk_action),
                         method: "post",
                         class: "flex flex-col gap-1 mt-1",
@@ -1162,11 +1235,13 @@ fn render_edit_form(c: &rag_db::Collection, embedding_models: &[String]) -> Html
                             );
                         }
                         label(class: "form-control w-full") {
-                            div(class: "label") { span(class: "label-text") { "Git URL" } }
+                            // Not `required`: aggregate collections leave this
+                            // empty (sources bring their own URLs). The server
+                            // only enforces it for versioned collections.
+                            div(class: "label") { span(class: "label-text") { "Git URL (versioned only)" } }
                             input(
                                 name: "git_url",
                                 type: "text",
-                                required: "required",
                                 value: (c.git_url.clone()),
                                 class: "input input-bordered w-full"
                             );

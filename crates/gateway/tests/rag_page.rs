@@ -752,4 +752,38 @@ async fn admin_creates_aggregate_collection_and_bulk_adds_sources() {
         "dup-skip toast missing\n{body}"
     );
     assert_eq!(rag_db::list_refs(&db, c.id).await.unwrap().len(), 3);
+
+    // Editing an aggregate collection must NOT require a Git URL (it has
+    // none — each source brings its own). Updating with an empty git_url
+    // should succeed, not bounce with "Git URL is required".
+    let update = "git_url=\
+        &git_ref=master\
+        &embedding_model=embed-1\
+        &description=updated+desc\
+        &chunk_size=800\
+        &chunk_overlap=100";
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/rag/{}/update", c.id),
+            &cookie,
+            Some(update),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8(common::read_body(resp).await.to_vec()).unwrap();
+    assert!(
+        !body.contains("Git URL is required"),
+        "aggregate edit was wrongly rejected for empty Git URL\n{body}"
+    );
+    assert_eq!(
+        rag_db::find_collection_by_id(&db, c.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .description
+            .as_deref(),
+        Some("updated desc")
+    );
 }

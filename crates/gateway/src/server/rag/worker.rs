@@ -410,6 +410,14 @@ impl Indexer {
         else {
             return Ok(()); // collection deleted
         };
+        // Aggregate collections keep ONE unified index, held by the primary
+        // ref (its build folds in every source). The other source rows are
+        // config only — never built. Park them as `ready` so the poll loop
+        // doesn't keep re-picking them; the unified index is what's searched.
+        if collection.search_mode == rag_db::SearchMode::Aggregate && !rref.is_primary {
+            rag_db::set_ref_status(&self.inner.db, ref_id, rag_db::CollectionStatus::Ready).await?;
+            return Ok(());
+        }
         let old_uuid = rref.data_uuid.clone();
         // Always build into a *fresh* folder so the live store keeps serving
         // searches until we atomically swap onto the new one.
@@ -454,20 +462,61 @@ impl Indexer {
 
         rag_db::set_ref_status(&self.inner.db, ref_id, rag_db::CollectionStatus::Cloning).await?;
         let clone_dir = self.clone_path(build_uuid);
-        // Aggregate collections give each source its own repo URL; versioned
-        // ones inherit the collection's. The PAT is the collection's (one
-        // credential covers its sources).
-        let head = git::clone_or_update(
-            rref.effective_git_url(collection),
-            &rref.git_ref,
-            collection.pat.as_deref(),
-            &clone_dir,
-        )
-        .await?;
+        let filter = Filter::new(
+            &collection.include_globs,
+            &collection.exclude_globs,
+            self.inner.config.max_file_bytes,
+        );
 
-        if self.superseded(ref_id).await? {
-            return Ok(false);
-        }
+        // Gather the files to index plus a commit marker. Two shapes:
+        //   * Versioned ref → clone its one repo; index it as-is.
+        //   * Aggregate primary ref → this ref IS the collection's single
+        //     unified index. Clone EVERY source repo into `clone/<label>/`
+        //     and index the combined tree under that prefix, so the whole
+        //     collection is one searchable corpus (global dense + lexical
+        //     ranking) with self-describing paths like
+        //     `pve-manager/src/PVE/HA/NodeStatus.pm`.
+        let (walked, head) = if collection.search_mode == rag_db::SearchMode::Aggregate {
+            let sources = rag_db::list_refs(&self.inner.db, collection.id).await?;
+            let mut files: Vec<walk::WalkedFile> = Vec::new();
+            let mut commits: Vec<String> = Vec::new();
+            for src in &sources {
+                let label = src.source_label(collection);
+                let sub = clone_dir.join(&label);
+                let sha = git::clone_or_update(
+                    src.effective_git_url(collection),
+                    &src.git_ref,
+                    collection.pat.as_deref(),
+                    &sub,
+                )
+                .await?;
+                commits.push(format!("{label}:{sha}"));
+                if self.superseded(ref_id).await? {
+                    return Ok(false);
+                }
+                for mut wf in walk::walk(&sub, &filter)? {
+                    wf.rel_path = format!("{label}/{}", wf.rel_path);
+                    files.push(wf);
+                }
+            }
+            // Deterministic order across runs (and a stable commit marker that
+            // changes whenever any source's head moves).
+            files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+            (files, sha256_hex(&commits.join("\n")))
+        } else {
+            let sha = git::clone_or_update(
+                rref.effective_git_url(collection),
+                &rref.git_ref,
+                collection.pat.as_deref(),
+                &clone_dir,
+            )
+            .await?;
+            if self.superseded(ref_id).await? {
+                return Ok(false);
+            }
+            (walk::walk(&clone_dir, &filter)?, sha)
+        };
+
         rag_db::set_ref_status(&self.inner.db, ref_id, rag_db::CollectionStatus::Indexing).await?;
 
         // Fresh, uncached store + index for this build.
@@ -476,13 +525,6 @@ impl Indexer {
         )
         .await?;
         let index_path = self.index_path(build_uuid);
-
-        let filter = Filter::new(
-            &collection.include_globs,
-            &collection.exclude_globs,
-            self.inner.config.max_file_bytes,
-        );
-        let walked = walk::walk(&clone_dir, &filter)?;
 
         let mut next_vector_id = 1i64;
         let mut dimensions: Option<usize> = None;
@@ -569,6 +611,24 @@ impl Indexer {
         // the ref to `pending` while we built, this affects 0 rows and we
         // report "superseded" so the caller discards the build.
         let swapped = rag_db::swap_ref_index(&self.inner.db, ref_id, build_uuid, &head).await? == 1;
+        // `next_vector_id` starts at 1 and increments per indexed chunk, so it
+        // is still 1 iff nothing was indexed. An empty index that's silently
+        // "ready" almost always means the include globs matched no files —
+        // surface that instead of letting it look healthy.
+        if swapped && next_vector_id == 1 {
+            tracing::warn!(
+                ref_id,
+                files = walked.len(),
+                "ref indexed 0 chunks — include globs likely match nothing"
+            );
+            let _ = rag_db::set_ref_warning(
+                &self.inner.db,
+                ref_id,
+                "Indexed 0 files — nothing matched the collection's include globs. \
+                 Check the include patterns (e.g. add *.pm, *.js, *.adoc for non-Rust repos).",
+            )
+            .await;
+        }
         Ok(swapped)
     }
 }

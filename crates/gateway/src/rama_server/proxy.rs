@@ -993,7 +993,9 @@ async fn forward_streaming_with_tools(
         })
 }
 
-const STREAM_TOOL_LOOP_MAX_ROUNDS: u32 = 10;
+// Shared cap (one source of truth) so the streaming proxy, the buffered
+// runner, and the chat driver can't drift apart on round limits.
+use runner::MAX_TOOL_ROUNDS as STREAM_TOOL_LOOP_MAX_ROUNDS;
 
 #[derive(Default)]
 struct StreamToolCallAcc {

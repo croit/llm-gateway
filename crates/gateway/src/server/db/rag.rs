@@ -686,6 +686,21 @@ pub async fn mark_ref_failed(pool: &Pool, ref_id: i64, message: &str) -> Result<
     Ok(affected)
 }
 
+/// Record a non-fatal advisory on a ref without changing its status —
+/// e.g. "indexed 0 files". Surfaced in the admin UI like an error so a
+/// likely misconfiguration (include globs that match nothing) is visible
+/// instead of a silently-empty "ready" source.
+pub async fn set_ref_warning(pool: &Pool, ref_id: i64, message: &str) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    sqlx::query("UPDATE rag_collection_refs SET last_error = ?, updated_at = ? WHERE id = ?")
+        .bind(message)
+        .bind(&now)
+        .bind(ref_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Admin-side: (re-)queue a ref for indexing. Flips to `pending` and clears
 /// the prior error. Keeps `data_uuid` + commit so the existing index stays
 /// searchable until the rebuild swaps in. A running build sees the status
@@ -1401,6 +1416,30 @@ mod tests {
         let searchable = searchable_refs(&pool, c.id).await.unwrap();
         assert_eq!(searchable.len(), 1);
         assert_eq!(searchable[0].id, a.id);
+    }
+
+    #[tokio::test]
+    async fn set_ref_warning_records_advisory_without_changing_status() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let r = add_ref(&pool, c.id, "main", None, true).await.unwrap();
+        set_ref_status(&pool, r.id, CollectionStatus::Indexing)
+            .await
+            .unwrap();
+        swap_ref_index(&pool, r.id, &r.data_uuid, "sha")
+            .await
+            .unwrap();
+        set_ref_warning(&pool, r.id, "Indexed 0 files — check globs")
+            .await
+            .unwrap();
+        let after = find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
+        // Still ready/searchable, but the advisory is visible.
+        assert_eq!(after.status, CollectionStatus::Ready);
+        assert!(after.is_searchable());
+        assert_eq!(
+            after.last_error.as_deref(),
+            Some("Indexed 0 files — check globs")
+        );
     }
 
     #[tokio::test]

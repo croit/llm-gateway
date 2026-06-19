@@ -29,9 +29,44 @@ use session_core::workers::TurnUpdate;
 use crate::rama_server::state::RamaState;
 use crate::server::tools::{ToolContext, runner};
 
-/// Bounded tool-call rounds so a runaway model can't keep us in the
-/// loop forever. Matches the pre-persistence default.
-const MAX_ROUNDS: u32 = 10;
+/// Reasoning tags some vLLM reasoning-parser configs leak into the *content*
+/// channel even though reasoning is delivered separately via
+/// `reasoning_content`. We strip them so a stray `</think>` never shows up in
+/// the rendered answer.
+const THINK_TAGS: [&str; 2] = ["<think>", "</think>"];
+
+/// Pull the safe-to-emit prefix out of `buf`, removing any complete
+/// `<think>`/`</think>` tags and holding back a trailing run that could be the
+/// start of one (so a tag split across stream deltas is still removed). The
+/// held-back tail stays in `buf` for the next delta; flush it at stream end.
+fn take_safe_content(buf: &mut String) -> String {
+    for tag in THINK_TAGS {
+        if buf.contains(tag) {
+            *buf = buf.replace(tag, "");
+        }
+    }
+    // Longest suffix of `buf` that is a strict prefix of some tag — keep it.
+    let mut hold = 0;
+    for tag in THINK_TAGS {
+        for k in (1..tag.len()).rev() {
+            let cut = buf.len().saturating_sub(k);
+            if buf.is_char_boundary(cut) && buf[cut..] == tag[..k] {
+                hold = hold.max(k);
+                break;
+            }
+        }
+    }
+    let split = buf.len() - hold;
+    let emit = buf[..split].to_string();
+    *buf = buf[split..].to_string();
+    emit
+}
+
+// Bounded tool-call rounds so a runaway model can't keep us in the loop
+// forever. Shared with the `/v1` proxy + buffered runner (one source of
+// truth). The *last* round withholds tools (see the loop) so the model is
+// forced to produce a final answer instead of ending the turn empty.
+use crate::server::tools::runner::MAX_TOOL_ROUNDS as MAX_ROUNDS;
 
 #[derive(Default)]
 struct ToolCallAcc {
@@ -103,10 +138,19 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
     let mut started_reasoning: Option<std::time::Instant> = None;
     let mut frozen_reasoning_elapsed = false;
 
-    for _round in 0..MAX_ROUNDS {
+    for round in 0..MAX_ROUNDS {
         if ctx.cancel.load(Ordering::SeqCst) {
             return Ok(());
         }
+
+        // On the final allowed round, withhold tools so the model is forced
+        // to answer from what it already gathered. Without this, a model that
+        // keeps calling tools right up to MAX_ROUNDS exits the loop having
+        // just fired more calls — with no round left to consume them — and
+        // the turn ends with no visible answer (the "stuck after N tool
+        // calls" failure). Withholding tools turns that last round into a
+        // guaranteed text answer.
+        let final_round = round + 1 == MAX_ROUNDS;
 
         // Build the request. `stream: true` so we can forward
         // content deltas; tools injected if the user has any
@@ -124,8 +168,15 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             .state
             .allowed_tools_for_session(&d.tool_ctx.roles, &d.tool_ctx.user_id, &ctx.session_id)
             .await;
-        runner::inject_tools(&mut request_body, &d.state.tools, &allowed_tools)
-            .map_err(upstream_err)?;
+        if final_round {
+            tracing::info!(
+                max_rounds = MAX_ROUNDS,
+                "tool-round budget reached; requesting final answer with tools withheld"
+            );
+        } else {
+            runner::inject_tools(&mut request_body, &d.state.tools, &allowed_tools)
+                .map_err(upstream_err)?;
+        }
         // Fill in admin-configured sampling defaults (temperature,
         // top_p, etc.) for keys the chat-page composer didn't set.
         // Same call goes through `proxy.rs` for /v1 callers — keeps
@@ -187,6 +238,9 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         // without this the turn streams for minutes and ends empty.
         let mut content_guard = crate::loop_guard::LoopGuard::new();
         let mut reasoning_guard = crate::loop_guard::LoopGuard::new();
+        // Carry buffer for stripping stray `<think>`/`</think>` tags out of the
+        // content channel without breaking on a tag split across deltas.
+        let mut content_tag_buf = String::new();
         let mut upstream_stream = upstream.bytes_stream();
 
         'chunks: while let Some(chunk) = upstream_stream.next().await {
@@ -273,15 +327,20 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                             .map_err(upstream_err)?;
                             frozen_reasoning_elapsed = true;
                         }
-                        round_content.push_str(content);
-                        chat::append_content(&d.state.db, &ctx.assistant_turn_id, content)
-                            .await
-                            .map_err(upstream_err)?;
-                        let _ = ctx.broadcast.send(TurnUpdate::Tick);
-                        if content_guard.push(content) {
-                            return Err(TurnError::Aborted {
-                                message: crate::loop_guard::LOOP_MESSAGE.into(),
-                            });
+                        // Strip stray reasoning tags leaked into content.
+                        content_tag_buf.push_str(content);
+                        let emit = take_safe_content(&mut content_tag_buf);
+                        if !emit.is_empty() {
+                            round_content.push_str(&emit);
+                            chat::append_content(&d.state.db, &ctx.assistant_turn_id, &emit)
+                                .await
+                                .map_err(upstream_err)?;
+                            let _ = ctx.broadcast.send(TurnUpdate::Tick);
+                            if content_guard.push(&emit) {
+                                return Err(TurnError::Aborted {
+                                    message: crate::loop_guard::LOOP_MESSAGE.into(),
+                                });
+                            }
                         }
                     }
 
@@ -310,6 +369,21 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             }
         }
         drop(acquired);
+
+        // Flush any held-back content tail (a partial tag that never
+        // completed is real content, minus any complete tag still in it).
+        if !content_tag_buf.is_empty() {
+            for tag in THINK_TAGS {
+                content_tag_buf = content_tag_buf.replace(tag, "");
+            }
+            if !content_tag_buf.is_empty() {
+                round_content.push_str(&content_tag_buf);
+                chat::append_content(&d.state.db, &ctx.assistant_turn_id, &content_tag_buf)
+                    .await
+                    .map_err(upstream_err)?;
+                let _ = ctx.broadcast.send(TurnUpdate::Tick);
+            }
+        }
 
         if ctx.cancel.load(Ordering::SeqCst) {
             return Ok(());
@@ -562,5 +636,50 @@ fn upstream_err<E: std::fmt::Display>(e: E) -> TurnError {
 fn transport_err<E: std::fmt::Display>(e: E) -> TurnError {
     TurnError::Transport {
         message: e.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{THINK_TAGS, take_safe_content};
+
+    /// Feed `deltas` through the streaming stripper and flush, returning the
+    /// full emitted content (what the user would see).
+    fn stream(deltas: &[&str]) -> String {
+        let mut buf = String::new();
+        let mut out = String::new();
+        for d in deltas {
+            buf.push_str(d);
+            out.push_str(&take_safe_content(&mut buf));
+        }
+        for tag in THINK_TAGS {
+            buf = buf.replace(tag, "");
+        }
+        out.push_str(&buf);
+        out
+    }
+
+    #[test]
+    fn plain_content_passes_through() {
+        assert_eq!(stream(&["Hello, ", "world!"]), "Hello, world!");
+    }
+
+    #[test]
+    fn strips_whole_think_tags() {
+        assert_eq!(stream(&["</think>answer here"]), "answer here");
+        assert_eq!(stream(&["<think>x</think>y"]), "xy");
+    }
+
+    #[test]
+    fn strips_tag_split_across_deltas() {
+        // The leaked `</think>` arriving in two chunks must still be removed.
+        assert_eq!(stream(&["answer </th", "ink>more"]), "answer more");
+    }
+
+    #[test]
+    fn preserves_lone_angle_bracket_that_is_not_a_tag() {
+        // A `<` that never becomes a tag is delayed, never dropped.
+        assert_eq!(stream(&["a < b"]), "a < b");
+        assert_eq!(stream(&["value <", " 5 end"]), "value < 5 end");
     }
 }

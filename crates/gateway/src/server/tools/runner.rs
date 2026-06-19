@@ -22,7 +22,7 @@
 //!      owns the message history on this path, so we can't run ours and
 //!      yield mid-turn without dropping or orphaning the client's calls.
 //!    - If no tool_calls at all, return the final assistant message.
-//! 4. Hard bound: [`MAX_ROUNDS`].
+//! 4. Hard bound: [`MAX_TOOL_ROUNDS`].
 //!
 //! Streaming caveat: this path always returns non-streaming. If the client
 //! requested `stream: true` and the user has any allowed tools, we still
@@ -36,7 +36,10 @@ use serde_json::{Value, json};
 
 use crate::server::tools::{Tool, ToolContext, ToolError, ToolRegistry};
 
-const MAX_ROUNDS: u32 = 10;
+/// Hard cap on tool-call rounds per turn — the single source of truth shared
+/// by every tool loop (this buffered runner, the chat-UI driver, and the `/v1`
+/// streaming proxy) so the caps can't silently diverge again.
+pub const MAX_TOOL_ROUNDS: u32 = 16;
 const PER_REQUEST_TOOL_CONCURRENCY: usize = 4;
 const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -94,8 +97,8 @@ where
 
     let mut rounds = 0u32;
     loop {
-        if rounds > MAX_ROUNDS {
-            return Err(LoopError::LoopExhausted(MAX_ROUNDS));
+        if rounds > MAX_TOOL_ROUNDS {
+            return Err(LoopError::LoopExhausted(MAX_TOOL_ROUNDS));
         }
 
         let (status, body_bytes) = upstream(request_body.clone()).await?;
