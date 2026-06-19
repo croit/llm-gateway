@@ -195,6 +195,9 @@ async fn main() -> anyhow::Result<()> {
         state.http.clone(),
         indexer_config,
     );
+    // Re-queue any ref left mid-build by a previous crash/restart and reap
+    // orphaned build folders before the loop starts handling new work.
+    indexer.recover_on_startup().await;
     srv::rag::worker::spawn(indexer.clone());
     state = state.with_indexer(indexer);
 

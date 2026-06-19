@@ -541,3 +541,121 @@ async fn non_admin_post_is_forbidden() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn admin_can_add_set_primary_reindex_and_delete_refs() {
+    use gateway::server::db::rag as rag_db;
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie =
+        seed_session_with_roles(&state, "boss", "boss@example.com", vec!["admin".into()]).await;
+    let c = rag_db::create_collection(
+        &state.db,
+        &rag_db::NewCollection {
+            name: "ceph".into(),
+            description: None,
+            git_url: "https://example.invalid".into(),
+            git_ref: "main".into(),
+            pat: None,
+            embedding_model: "embed-1".into(),
+            include_globs: vec![],
+            exclude_globs: vec![],
+            chunk_size: 800,
+            chunk_overlap: 100,
+        },
+    )
+    .await
+    .unwrap();
+    let db = state.db.clone();
+    let app = common::app(state);
+
+    // Add the first ref → becomes primary; the row shows it.
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/rag/{}/refs", c.id),
+            &cookie,
+            Some("git_ref=reef"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8(common::read_body(resp).await.to_vec()).unwrap();
+    assert!(body.contains("reef"), "added ref missing\n{body}");
+    assert!(body.contains("primary"), "first ref should be primary");
+
+    // Add a second ref → not primary.
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/rag/{}/refs", c.id),
+            &cookie,
+            Some("git_ref=squid"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let refs = rag_db::list_refs(&db, c.id).await.unwrap();
+    assert_eq!(refs.len(), 2);
+    let reef = refs.iter().find(|r| r.git_ref == "reef").unwrap().clone();
+    let squid = refs.iter().find(|r| r.git_ref == "squid").unwrap().clone();
+    assert!(reef.is_primary && !squid.is_primary);
+
+    // Promote squid to primary.
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/rag/refs/{}/primary", squid.id),
+            &cookie,
+            Some(""),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        rag_db::primary_ref(&db, c.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .git_ref,
+        "squid"
+    );
+
+    // Re-index reef (sitting in `error`) → flips back to `pending`.
+    rag_db::set_ref_status(&db, reef.id, rag_db::CollectionStatus::Error)
+        .await
+        .unwrap();
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/rag/refs/{}/reindex", reef.id),
+            &cookie,
+            Some(""),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        rag_db::find_ref_by_id(&db, reef.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        rag_db::CollectionStatus::Pending
+    );
+
+    // Delete reef → only squid remains.
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/rag/refs/{}/delete", reef.id),
+            &cookie,
+            Some(""),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let remaining = rag_db::list_refs(&db, c.id).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].git_ref, "squid");
+}

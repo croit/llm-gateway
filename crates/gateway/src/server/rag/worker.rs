@@ -93,21 +93,24 @@ pub struct Indexer {
 }
 
 struct IndexerInner {
-    /// Central registry DB (`gateway.sqlite`) — holds `rag_collections`
-    /// config/status only. Per-collection content lives in each
-    /// collection's own store (see `stores`).
+    /// Central registry DB (`gateway.sqlite`) — holds the collection config
+    /// and the `rag_collection_refs` rows. Per-ref content lives in each
+    /// ref's own store folder (see `stores`).
     db: Pool,
     upstreams: Arc<UpstreamRegistry>,
     http: reqwest::Client,
     config: IndexerConfig,
-    /// One [`CollectionIndex`] per collection, opened lazily on first
-    /// search/insert. Kept around so subsequent operations skip the
-    /// metadata-read + mmap setup.
+    /// One [`CollectionIndex`] per **ref** (keyed by ref id), opened lazily
+    /// on first search. Kept around so subsequent searches skip the
+    /// metadata-read + mmap setup. Evicted on a zero-downtime swap so the
+    /// next search reopens the ref's new store folder.
     indexes: Mutex<HashMap<i64, Arc<CollectionIndex>>>,
-    /// One SQLite [`Pool`] per collection over its `rag.sqlite` store
-    /// (`<data_dir>/<uuid>/rag.sqlite`), opened lazily and cached so we
-    /// don't re-open the file per query. Keyed by collection id.
+    /// One SQLite [`Pool`] per **ref** over its `rag.sqlite` store, keyed by
+    /// ref id. Opened lazily, evicted on swap.
     stores: Mutex<HashMap<i64, Pool>>,
+    /// Wakes the background loop immediately when a ref is (re-)queued, so
+    /// a "Re-index" click doesn't wait out the poll interval.
+    kick: tokio::sync::Notify,
 }
 
 impl Indexer {
@@ -154,6 +157,7 @@ impl Indexer {
                 config,
                 indexes: Mutex::new(HashMap::new()),
                 stores: Mutex::new(HashMap::new()),
+                kick: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -293,89 +297,182 @@ impl Indexer {
         Ok(index)
     }
 
-    /// Tear down a collection's on-disk storage: evict the cached store
-    /// pool + index handle, then `rm -rf` its `<data_dir>/<uuid>/` folder
-    /// (rag.sqlite + index.usearch + clone/). Call after deleting the
-    /// central registry row. Best-effort on the filesystem — a failed
-    /// remove only logs, since the row is already gone.
-    pub fn drop_collection_storage(&self, collection_id: i64, uuid: &str) {
-        // Drop cached handles first so we're not holding the files open.
+    /// Evict a ref's cached store pool + index handle so the next search
+    /// reopens from the ref's current `data_uuid` folder. Called after a
+    /// zero-downtime swap (the folder changed) and on teardown.
+    fn evict_ref_caches(&self, ref_id: i64) {
         self.inner
             .indexes
             .lock()
             .expect("indexer cache mutex poisoned")
-            .remove(&collection_id);
+            .remove(&ref_id);
         self.inner
             .stores
             .lock()
             .expect("indexer store cache mutex poisoned")
-            .remove(&collection_id);
+            .remove(&ref_id);
+    }
+
+    /// `rm -rf` a store folder, best-effort (a missing folder is fine).
+    fn discard_dir(&self, uuid: &str) {
         let dir = self.collection_dir(uuid);
         if let Err(err) = std::fs::remove_dir_all(&dir)
             && err.kind() != std::io::ErrorKind::NotFound
         {
-            tracing::warn!(
-                error = %err,
-                dir = %dir.display(),
-                "rag: failed to remove collection storage folder"
-            );
+            tracing::warn!(error = %err, dir = %dir.display(), "rag: failed to remove store folder");
         }
     }
 
-    /// Run the full pipeline against one collection. Returns the
-    /// resolved HEAD commit on success. Any error path also surfaces
-    /// `mark_failed` against the DB row.
-    pub async fn index_one(&self, collection_id: i64) -> Result<String, WorkerError> {
-        match self.index_one_inner(collection_id).await {
-            Ok(sha) => Ok(sha),
+    /// Tear down a ref's on-disk storage: evict its cached handles, then
+    /// `rm -rf` its `<data_dir>/<uuid>/` folder. Call after deleting the
+    /// ref row (or all refs of a collection being deleted).
+    pub fn drop_ref_storage(&self, ref_id: i64, uuid: &str) {
+        self.evict_ref_caches(ref_id);
+        self.discard_dir(uuid);
+    }
+
+    /// (Re-)queue a ref for indexing and wake the worker immediately, so a
+    /// "Re-index" click takes effect now rather than after the poll
+    /// interval. The running build (if any) sees `status != indexing` at
+    /// its next checkpoint and aborts, then this requeue is picked up.
+    pub async fn request_reindex(&self, ref_id: i64) -> Result<(), crate::server::db::DbError> {
+        rag_db::request_ref_reindex(&self.inner.db, ref_id).await?;
+        self.inner.kick.notify_one();
+        Ok(())
+    }
+
+    /// True if the in-flight build of `ref_id` has been superseded — the
+    /// ref was re-queued (`status='pending'`) or deleted. Checked between
+    /// embed batches so a re-index aborts the wasted work early; the final
+    /// `swap_ref_index` (guarded by `status='indexing'`) is the backstop.
+    async fn superseded(&self, ref_id: i64) -> Result<bool, WorkerError> {
+        match rag_db::find_ref_by_id(&self.inner.db, ref_id).await? {
+            None => Ok(true),
+            Some(r) => Ok(r.status == rag_db::CollectionStatus::Pending),
+        }
+    }
+
+    /// Startup recovery: re-queue refs left mid-build by a crash/restart,
+    /// and reap orphaned store folders no ref points at (interrupted
+    /// builds). Call once before [`spawn`].
+    pub async fn recover_on_startup(&self) {
+        match rag_db::reset_stalled_refs(&self.inner.db).await {
+            Ok(n) if n > 0 => tracing::info!(refs = n, "rag: re-queued refs stalled at startup"),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(error = %err, "rag: startup stalled-ref reset failed"),
+        }
+        // Reap store folders not referenced by any ref (leftover build dirs).
+        let live: std::collections::HashSet<String> =
+            match rag_db::all_ref_data_uuids(&self.inner.db).await {
+                Ok(v) => v.into_iter().collect(),
+                Err(err) => {
+                    tracing::warn!(error = %err, "rag: could not list live store folders");
+                    return;
+                }
+            };
+        let Ok(entries) = std::fs::read_dir(&self.inner.config.data_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !live.contains(&name) {
+                tracing::info!(dir = %name, "rag: reaping orphaned store folder");
+                self.discard_dir(&name);
+            }
+        }
+    }
+
+    /// (Re-)index one ref. Builds the whole index fresh into a new store
+    /// folder and atomically swaps the ref onto it — zero-downtime, since
+    /// the ref keeps serving its previous index until the swap. Failures
+    /// are recorded against the ref (guarded so a concurrent re-queue isn't
+    /// clobbered).
+    pub async fn index_ref(&self, ref_id: i64) -> Result<(), WorkerError> {
+        match self.index_ref_inner(ref_id).await {
+            Ok(()) => Ok(()),
             Err(err) => {
                 let msg = err.to_string();
-                let _ = rag_db::mark_failed(&self.inner.db, collection_id, &msg).await;
+                let _ = rag_db::mark_ref_failed(&self.inner.db, ref_id, &msg).await;
                 Err(err)
             }
         }
     }
 
-    async fn index_one_inner(&self, collection_id: i64) -> Result<String, WorkerError> {
-        let collection = rag_db::find_collection_by_id(&self.inner.db, collection_id)
-            .await?
-            .ok_or(WorkerError::NotFound { id: collection_id })?;
-
-        // Resolve this collection's store-folder id. Pre-migration rows
-        // have none yet; mint one and persist it so the folder is stable.
-        let uuid = match collection.data_uuid.clone() {
-            Some(u) => u,
-            None => {
-                let u = uuid::Uuid::new_v4().to_string();
-                rag_db::assign_data_uuid(&self.inner.db, collection.id, &u).await?;
-                u
-            }
+    async fn index_ref_inner(&self, ref_id: i64) -> Result<(), WorkerError> {
+        let Some(rref) = rag_db::find_ref_by_id(&self.inner.db, ref_id).await? else {
+            return Ok(()); // ref deleted before we reached it
         };
-        // All content (files/chunks/FTS) goes to the per-collection store,
-        // never the central registry DB.
-        let store = self.collection_store(collection.id, &uuid).await?;
+        let Some(collection) =
+            rag_db::find_collection_by_id(&self.inner.db, rref.collection_id).await?
+        else {
+            return Ok(()); // collection deleted
+        };
+        let old_uuid = rref.data_uuid.clone();
+        // Always build into a *fresh* folder so the live store keeps serving
+        // searches until we atomically swap onto the new one.
+        let build_uuid = uuid::Uuid::new_v4().to_string();
 
-        rag_db::set_collection_status(
-            &self.inner.db,
-            collection.id,
-            rag_db::CollectionStatus::Cloning,
-        )
-        .await?;
-        let clone_dir = self.clone_path(&uuid);
+        match self.build_ref(&collection, &rref, &build_uuid).await {
+            // Swapped: drop cached handles so searches reopen the new folder,
+            // then reap the old store.
+            Ok(true) => {
+                self.evict_ref_caches(ref_id);
+                if old_uuid != build_uuid {
+                    self.discard_dir(&old_uuid);
+                }
+                Ok(())
+            }
+            // Superseded by a re-queue / delete — throw the build away; the
+            // live index is untouched.
+            Ok(false) => {
+                self.discard_dir(&build_uuid);
+                Ok(())
+            }
+            Err(err) => {
+                self.discard_dir(&build_uuid);
+                Err(err)
+            }
+        }
+    }
+
+    /// Clone → chunk → embed into `build_uuid`'s fresh store, then
+    /// atomically swap the ref onto it. `Ok(true)` = swapped (now live);
+    /// `Ok(false)` = the build was superseded (re-queued / deleted) and the
+    /// caller should discard it. The build uses *local* store + index
+    /// handles, never the cached (live) ones, so concurrent searches keep
+    /// hitting the old index until the swap.
+    async fn build_ref(
+        &self,
+        collection: &rag_db::Collection,
+        rref: &rag_db::CollectionRef,
+        build_uuid: &str,
+    ) -> Result<bool, WorkerError> {
+        let ref_id = rref.id;
+
+        rag_db::set_ref_status(&self.inner.db, ref_id, rag_db::CollectionStatus::Cloning).await?;
+        let clone_dir = self.clone_path(build_uuid);
         let head = git::clone_or_update(
             &collection.git_url,
-            &collection.git_ref,
+            &rref.git_ref,
             collection.pat.as_deref(),
             &clone_dir,
         )
         .await?;
 
-        rag_db::set_collection_status(
-            &self.inner.db,
-            collection.id,
-            rag_db::CollectionStatus::Indexing,
+        if self.superseded(ref_id).await? {
+            return Ok(false);
+        }
+        rag_db::set_ref_status(&self.inner.db, ref_id, rag_db::CollectionStatus::Indexing).await?;
+
+        // Fresh, uncached store + index for this build.
+        let store = crate::server::db::open_collection_store(
+            &self.collection_dir(build_uuid).join("rag.sqlite"),
         )
         .await?;
+        let index_path = self.index_path(build_uuid);
 
         let filter = Filter::new(
             &collection.include_globs,
@@ -384,48 +481,18 @@ impl Indexer {
         );
         let walked = walk::walk(&clone_dir, &filter)?;
 
-        // Snapshot the prior file state for diffing.
-        let prior = rag_db::list_files_for_collection(&store, collection.id).await?;
-        let mut prior_by_path: HashMap<String, rag_db::IndexedFile> =
-            prior.into_iter().map(|f| (f.path.clone(), f)).collect();
-
-        let mut next_vector_id = rag_db::max_vector_id(&store, collection.id)
-            .await?
-            .map(|v| v + 1)
-            .unwrap_or(1);
+        let mut next_vector_id = 1i64;
         let mut dimensions: Option<usize> = None;
-        let mut index: Option<Arc<CollectionIndex>> = None;
+        let mut index: Option<CollectionIndex> = None;
 
         for file in &walked {
-            let bytes = match std::fs::read(&file.abs_path) {
-                Ok(b) => b,
+            let content = match std::fs::read(&file.abs_path) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(_) => continue, // binary — skip
+                },
                 Err(_) => continue,
             };
-            let content = match String::from_utf8(bytes) {
-                Ok(s) => s,
-                // Binary file — skip silently; the walker is best-effort
-                // and binaries shouldn't have been included anyway.
-                Err(_) => continue,
-            };
-            let hash = sha256_hex(&content);
-            if let Some(existing) = prior_by_path.remove(&file.rel_path)
-                && existing.content_hash == hash
-            {
-                continue;
-            }
-
-            // Re-embedding this file — drop the old chunks + vectors first.
-            if let Some(prior_file) = prior_by_path.remove(&file.rel_path) {
-                let old_vids = rag_db::chunk_vector_ids_for_file(&store, prior_file.id).await?;
-                rag_db::delete_chunks_for_file(&store, prior_file.id).await?;
-                if let Some(idx) = &index {
-                    for vid in old_vids {
-                        idx.remove(vid)?;
-                    }
-                }
-            }
-            // ... or this file is *new*; still safe to fall through.
-
             let pieces: Vec<ChunkPiece> = chunk::chunk_text(
                 &content,
                 collection.chunk_size as usize,
@@ -434,12 +501,15 @@ impl Indexer {
             if pieces.is_empty() {
                 continue;
             }
-
+            let hash = sha256_hex(&content);
             let file_id = rag_db::upsert_file(&store, collection.id, &file.rel_path, &hash).await?;
 
-            // Embed in batches; on the first response, open / sanity-check
-            // the index using the discovered dimensionality.
             for batch in pieces.chunks(self.inner.config.embed_batch_size) {
+                // Abort early if a re-queue / delete superseded this build,
+                // so we don't burn embedding calls on a doomed run.
+                if self.superseded(ref_id).await? {
+                    return Ok(false);
+                }
                 let inputs: Vec<String> = batch.iter().map(|p| p.content.clone()).collect();
                 let vectors = embeddings::embed(
                     &self.inner.http,
@@ -452,21 +522,17 @@ impl Indexer {
                     continue;
                 }
                 let dim = vectors[0].len();
-                let idx = match &index {
-                    Some(i) => Arc::clone(i),
-                    None => {
-                        dimensions = Some(dim);
-                        let opened = self.open_index(collection.id, &uuid, Some(dim))?;
-                        index = Some(Arc::clone(&opened));
-                        opened
-                    }
-                };
+                if index.is_none() {
+                    dimensions = Some(dim);
+                    index = Some(CollectionIndex::open_or_create(&index_path, dim)?);
+                }
                 if dimensions != Some(dim) {
                     return Err(WorkerError::Index(IndexError::BadVectorLen {
                         expected: dimensions.unwrap_or(0),
                         got: dim,
                     }));
                 }
+                let idx = index.as_ref().expect("index opened above");
 
                 let mut new_chunks: Vec<rag_db::NewChunk> = Vec::with_capacity(batch.len());
                 let mut to_index: Vec<(i64, Vec<f32>)> = Vec::with_capacity(batch.len());
@@ -490,31 +556,25 @@ impl Indexer {
             }
         }
 
-        // Files left in `prior_by_path` are deletions on this pass — drop
-        // their chunks/vectors so a tombstoned file disappears from search.
-        for (_, gone) in prior_by_path.drain() {
-            let old_vids = rag_db::chunk_vector_ids_for_file(&store, gone.id).await?;
-            rag_db::delete_chunks_for_file(&store, gone.id).await?;
-            rag_db::delete_file(&store, gone.id).await?;
-            if let Some(idx) = &index {
-                for vid in old_vids {
-                    idx.remove(vid)?;
-                }
-            }
-        }
-
         if let Some(idx) = &index {
             idx.save()?;
         }
-        rag_db::mark_indexed(&self.inner.db, collection.id, &head).await?;
-        Ok(head)
+        // Flush + close the build store before the swap points searches at it.
+        store.close().await;
+
+        // Atomic swap, guarded by `status='indexing'`: if a re-queue flipped
+        // the ref to `pending` while we built, this affects 0 rows and we
+        // report "superseded" so the caller discards the build.
+        let swapped = rag_db::swap_ref_index(&self.inner.db, ref_id, build_uuid, &head).await? == 1;
+        Ok(swapped)
     }
 }
 
 /// Spawn the background loop. Runs forever until the gateway shuts down.
-/// Each tick: pick the oldest `pending` collection (or `error` ones that
-/// were re-queued via [`rag_db::request_reindex`]) and run the pipeline.
-/// Failures are logged + recorded against the row; the loop never panics.
+/// Each pass indexes every `pending` ref (oldest-queued first), serially.
+/// It then sleeps until the next poll tick *or* an explicit kick (a
+/// "Re-index" click), whichever comes first, so re-indexes start promptly.
+/// Failures are logged + recorded against the ref; the loop never panics.
 pub fn spawn(indexer: Indexer) {
     let inner = indexer.clone();
     tokio::spawn(async move {
@@ -523,18 +583,19 @@ pub fn spawn(indexer: Indexer) {
             if let Err(err) = drain_once(&inner).await {
                 tracing::warn!(error = %err, "rag indexer pass failed");
             }
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = inner.inner.kick.notified() => {}
+            }
         }
     });
 }
 
 async fn drain_once(indexer: &Indexer) -> Result<(), WorkerError> {
-    let pending = rag_db::list_collections(&indexer.inner.db).await?;
-    for c in pending {
-        if matches!(c.status, rag_db::CollectionStatus::Pending)
-            && let Err(err) = indexer.index_one(c.id).await
-        {
-            tracing::warn!(collection_id = c.id, error = %err, "rag: indexing failed");
+    let pending = rag_db::list_pending_refs(&indexer.inner.db).await?;
+    for r in pending {
+        if let Err(err) = indexer.index_ref(r.id).await {
+            tracing::warn!(ref_id = r.id, error = %err, "rag: indexing failed");
         }
     }
     Ok(())
@@ -598,7 +659,7 @@ fn reciprocal_rank_fusion(lists: &[&[i64]], k: usize) -> Vec<(i64, f64)> {
 /// indexer directly without rebuilding the index cache.
 pub async fn search_chunks(
     indexer: &Indexer,
-    collection_id: i64,
+    rref: &rag_db::CollectionRef,
     query_text: &str,
     query_vec: &[f32],
     k: usize,
@@ -607,22 +668,13 @@ pub async fn search_chunks(
         return Ok(Vec::new());
     }
 
-    // Resolve the collection's store folder. No row, or no folder id yet
-    // (never indexed) → nothing to search.
-    let Some(collection) = rag_db::find_collection_by_id(&indexer.inner.db, collection_id).await?
-    else {
-        return Ok(Vec::new());
-    };
-    let Some(uuid) = collection.data_uuid else {
-        return Ok(Vec::new());
-    };
-    let store = indexer.collection_store(collection_id, &uuid).await?;
-
+    // Store + index live in this ref's own folder, cached by ref id.
+    let store = indexer.collection_store(rref.id, &rref.data_uuid).await?;
     let pool = (k * CANDIDATE_MULTIPLIER).max(MIN_CANDIDATES);
 
-    // Dense side. A missing on-disk index (collection never finished
-    // indexing) is not an error here — fall back to lexical-only.
-    let dense: Vec<i64> = match indexer.open_index(collection_id, &uuid, None) {
+    // Dense side. A missing on-disk index (ref never finished its first
+    // build) is not an error here — fall back to lexical-only.
+    let dense: Vec<i64> = match indexer.open_index(rref.id, &rref.data_uuid, None) {
         Ok(index) => index
             .search(query_vec, pool)?
             .into_iter()
@@ -632,8 +684,8 @@ pub async fn search_chunks(
         Err(other) => return Err(other.into()),
     };
 
-    // Lexical side (BM25 over chunk text) — from the per-collection store.
-    let lexical = rag_db::lexical_search(&store, collection_id, query_text, pool).await?;
+    // Lexical side (BM25 over chunk text) — from this ref's store.
+    let lexical = rag_db::lexical_search(&store, rref.collection_id, query_text, pool).await?;
 
     let fused = reciprocal_rank_fusion(&[&dense, &lexical], k);
     if fused.is_empty() {
@@ -641,7 +693,7 @@ pub async fn search_chunks(
     }
 
     let vids: Vec<i64> = fused.iter().map(|(vid, _)| *vid).collect();
-    let chunks = rag_db::chunks_by_vector_ids(&store, collection_id, &vids).await?;
+    let chunks = rag_db::chunks_by_vector_ids(&store, rref.collection_id, &vids).await?;
     let mut by_vid: HashMap<i64, rag_db::Chunk> =
         chunks.into_iter().map(|c| (c.vector_id, c)).collect();
     // Re-join in fused order, carrying the RRF score; drop any vector id

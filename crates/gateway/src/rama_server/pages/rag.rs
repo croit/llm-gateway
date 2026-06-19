@@ -64,12 +64,19 @@ pub async fn rag_index(State(state): State<Arc<RamaState>>, req: Request) -> Res
             Vec::new()
         }
     };
+    // Pair each collection with its refs for rendering.
+    let mut rows: Vec<(rag_db::Collection, Vec<rag_db::CollectionRef>)> =
+        Vec::with_capacity(collections.len());
+    for c in collections {
+        let refs = rag_db::list_refs(&state.db, c.id).await.unwrap_or_default();
+        rows.push((c, refs));
+    }
     let embedding_models = {
         let mut m = state.upstreams.models_for_kind(PoolKind::Embedding);
         m.sort();
         m
     };
-    let body = render_body(&collections, &embedding_models);
+    let body = render_body(&rows, &embedding_models);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     nav_or_html_page(
         datastar,
@@ -118,19 +125,62 @@ pub async fn rag_create(State(state): State<Arc<RamaState>>, req: Request) -> Re
             );
         }
     };
-    let row_html = render_row(&created).to_string();
+    // Create the collection's first (primary) ref from the form's
+    // branch/tag/commit field, and kick the indexer so it starts now.
+    match rag_db::add_ref(&state.db, created.id, &new.git_ref, true).await {
+        Ok(r) => {
+            if let Some(indexer) = state.indexer.as_ref() {
+                let _ = indexer.request_reindex(r.id).await;
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "create initial ref"),
+    }
+    let refs = rag_db::list_refs(&state.db, created.id)
+        .await
+        .unwrap_or_default();
+    let row_html = render_row(&created, &refs).to_string();
     sse_response(&[
         sse_patch(Some("#rag-list"), Some("append"), &row_html),
         sse_script("document.getElementById('rag-create-form').reset()"),
         sse_toast(&Flash {
             kind: FlashKind::Success,
-            message: format!("Indexing `{}` was queued.", created.name),
+            message: format!(
+                "Indexing `{}` @ `{}` was queued.",
+                created.name, new.git_ref
+            ),
         }),
     ])
 }
 
-/// POST /rag/{id}/reindex — flip the row back to `pending`. The
-/// background worker picks it up on the next tick.
+/// Re-patch a collection's `#rag-row-{id}` with its current refs + a toast.
+async fn row_patch(state: &RamaState, collection_id: i64, msg: String) -> Response {
+    match row_html(state, collection_id).await {
+        Some(html) => {
+            let selector = format!("#rag-row-{collection_id}");
+            sse_response(&[
+                sse_patch(Some(&selector), Some("outer"), &html),
+                sse_toast(&Flash {
+                    kind: FlashKind::Success,
+                    message: msg,
+                }),
+            ])
+        }
+        None => toast(FlashKind::Error, "collection not found"),
+    }
+}
+
+/// Re-queue a ref: flip it to `pending` (so the worker rebuilds it) and,
+/// if an indexer is wired, wake it immediately. The DB write is what makes
+/// the re-index happen; the kick just makes it prompt.
+async fn requeue_ref(state: &RamaState, ref_id: i64) {
+    if let Some(indexer) = state.indexer.as_ref() {
+        let _ = indexer.request_reindex(ref_id).await;
+    } else {
+        let _ = rag_db::request_ref_reindex(&state.db, ref_id).await;
+    }
+}
+
+/// POST /rag/{id}/reindex — re-queue *all* of a collection's refs.
 pub async fn rag_reindex(
     State(state): State<Arc<RamaState>>,
     Path(id): Path<i64>,
@@ -139,25 +189,154 @@ pub async fn rag_reindex(
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
-    if let Err(err) = rag_db::request_reindex(&state.db, id).await {
-        tracing::warn!(error = %err, %id, "rag reindex");
-        return toast(FlashKind::Error, "could not queue re-index");
-    }
-    let Ok(Some(updated)) = rag_db::find_collection_by_id(&state.db, id).await else {
-        return toast(FlashKind::Error, "collection not found");
+    let refs = match rag_db::list_refs(&state.db, id).await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(error = %err, %id, "rag reindex");
+            return toast(FlashKind::Error, "could not queue re-index");
+        }
     };
-    let selector = format!("#rag-row-{}", updated.id);
-    sse_response(&[
-        sse_patch(
-            Some(&selector),
-            Some("outer"),
-            &render_row(&updated).to_string(),
-        ),
-        sse_toast(&Flash {
-            kind: FlashKind::Success,
-            message: format!("Queued re-index of `{}`.", updated.name),
-        }),
-    ])
+    for r in &refs {
+        requeue_ref(&state, r.id).await;
+    }
+    row_patch(
+        &state,
+        id,
+        format!("Queued re-index of {} ref(s).", refs.len()),
+    )
+    .await
+}
+
+#[derive(serde::Deserialize)]
+struct AddRefForm {
+    git_ref: String,
+}
+
+/// POST /rag/{id}/refs — add a branch/tag/commit ref to a collection and
+/// queue its first index.
+pub async fn rag_add_ref(
+    State(state): State<Arc<RamaState>>,
+    Path(id): Path<i64>,
+    req: Request,
+) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let form: AddRefForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+    };
+    let git_ref = form.git_ref.trim();
+    if git_ref.is_empty() {
+        return toast(FlashKind::Error, "Ref (branch/tag/commit) is required.");
+    }
+    // The first ref of a collection becomes its primary (search default).
+    let is_primary = rag_db::list_refs(&state.db, id)
+        .await
+        .map(|r| r.is_empty())
+        .unwrap_or(false);
+    match rag_db::add_ref(&state.db, id, git_ref, is_primary).await {
+        Ok(r) => {
+            if let Some(indexer) = state.indexer.as_ref() {
+                let _ = indexer.request_reindex(r.id).await;
+            }
+        }
+        Err(err) => {
+            let s = err.to_string();
+            tracing::warn!(error = %err, %id, "add rag ref");
+            return toast(
+                FlashKind::Error,
+                if s.contains("UNIQUE") || s.contains("constraint") {
+                    format!("ref `{git_ref}` already exists on this collection")
+                } else {
+                    "could not add ref".to_string()
+                },
+            );
+        }
+    }
+    row_patch(&state, id, format!("Queued indexing of `{git_ref}`.")).await
+}
+
+/// POST /rag/refs/{ref_id}/reindex — re-queue a single ref.
+pub async fn rag_ref_reindex(
+    State(state): State<Arc<RamaState>>,
+    Path(ref_id): Path<i64>,
+    req: Request,
+) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let Ok(Some(r)) = rag_db::find_ref_by_id(&state.db, ref_id).await else {
+        return toast(FlashKind::Error, "ref not found");
+    };
+    requeue_ref(&state, ref_id).await;
+    row_patch(
+        &state,
+        r.collection_id,
+        format!("Queued re-index of `{}`.", r.git_ref),
+    )
+    .await
+}
+
+/// POST /rag/refs/{ref_id}/primary — make this ref the search default.
+pub async fn rag_ref_set_primary(
+    State(state): State<Arc<RamaState>>,
+    Path(ref_id): Path<i64>,
+    req: Request,
+) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let Ok(Some(r)) = rag_db::find_ref_by_id(&state.db, ref_id).await else {
+        return toast(FlashKind::Error, "ref not found");
+    };
+    if let Err(err) = rag_db::set_primary(&state.db, ref_id).await {
+        tracing::warn!(error = %err, %ref_id, "set primary ref");
+        return toast(FlashKind::Error, "could not set primary");
+    }
+    row_patch(
+        &state,
+        r.collection_id,
+        format!("`{}` is now the default ref.", r.git_ref),
+    )
+    .await
+}
+
+/// POST /rag/refs/{ref_id}/delete — drop one ref + its store folder.
+pub async fn rag_ref_delete(
+    State(state): State<Arc<RamaState>>,
+    Path(ref_id): Path<i64>,
+    req: Request,
+) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let Ok(Some(r)) = rag_db::find_ref_by_id(&state.db, ref_id).await else {
+        return toast(FlashKind::Error, "ref not found");
+    };
+    let collection_id = r.collection_id;
+    match rag_db::delete_ref(&state.db, ref_id).await {
+        Ok(uuid) => {
+            if let (Some(indexer), Some(uuid)) = (state.indexer.as_ref(), uuid) {
+                indexer.drop_ref_storage(ref_id, &uuid);
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, %ref_id, "delete rag ref");
+            return toast(FlashKind::Error, "could not delete ref");
+        }
+    }
+    row_patch(
+        &state,
+        collection_id,
+        format!("Removed ref `{}`.", r.git_ref),
+    )
+    .await
 }
 
 /// POST /rag/{id}/edit-form — SSE-swap the row to an editable form.
@@ -201,20 +380,11 @@ pub async fn rag_cancel_edit(
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
-    let collection = match rag_db::find_collection_by_id(&state.db, id).await {
-        Ok(Some(c)) => c,
-        Ok(None) => return toast(FlashKind::Error, "Collection not found."),
-        Err(err) => {
-            tracing::warn!(error = %err, %id, "lookup rag collection");
-            return toast(FlashKind::Error, "Could not load collection.");
-        }
+    let Some(html) = row_html(&state, id).await else {
+        return toast(FlashKind::Error, "Collection not found.");
     };
     let selector = format!("#rag-row-{id}");
-    sse_response(&[sse_patch(
-        Some(&selector),
-        Some("outer"),
-        &render_row(&collection).to_string(),
-    )])
+    sse_response(&[sse_patch(Some(&selector), Some("outer"), &html)])
 }
 
 #[derive(Deserialize)]
@@ -356,12 +526,13 @@ pub async fn rag_update(
             return toast(FlashKind::Error, "Saved but reload failed.");
         }
     };
+    let refs = rag_db::list_refs(&state.db, id).await.unwrap_or_default();
     let selector = format!("#rag-row-{id}");
     sse_response(&[
         sse_patch(
             Some(&selector),
             Some("outer"),
-            &render_row(&updated).to_string(),
+            &render_row(&updated, &refs).to_string(),
         ),
         sse_toast(&Flash {
             kind: FlashKind::Success,
@@ -383,17 +554,15 @@ pub async fn rag_delete(
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
-    // Capture the store-folder id before deleting the registry row so we
-    // can reap the on-disk folder (rag.sqlite + vectors + clone).
-    let uuid = rag_db::find_collection_by_id(&state.db, id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|c| c.data_uuid);
+    // Capture every ref's store folder before the cascade delete so we can
+    // reap them all (each ref has its own <data_dir>/<uuid>/).
+    let refs = rag_db::list_refs(&state.db, id).await.unwrap_or_default();
     match rag_db::delete_collection(&state.db, id).await {
         Ok(true) => {
-            if let (Some(indexer), Some(uuid)) = (state.indexer.as_ref(), uuid) {
-                indexer.drop_collection_storage(id, &uuid);
+            if let Some(indexer) = state.indexer.as_ref() {
+                for r in &refs {
+                    indexer.drop_ref_storage(r.id, &r.data_uuid);
+                }
             }
             let selector = format!("#rag-row-{id}");
             sse_response(&[
@@ -486,28 +655,16 @@ fn status_badge(status: rag_db::CollectionStatus) -> Html {
     .to_html()
 }
 
-fn render_row(c: &rag_db::Collection) -> Html {
+fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
     let dom_id = format!("rag-row-{}", c.id);
-    let reindex_action = format!("/rag/{}/reindex", c.id);
     let delete_action = format!("/rag/{}/delete", c.id);
     let edit_action = format!("/rag/{}/edit-form", c.id);
-    let reindex_directive = format!("@post('{reindex_action}', {{contentType: 'form'}})");
+    let add_ref_action = format!("/rag/{}/refs", c.id);
     let delete_directive = format!("@post('{delete_action}', {{contentType: 'form'}})");
     let edit_directive = format!("@post('{edit_action}', {{contentType: 'form'}})");
-    let last_indexed = c
-        .last_indexed_at
-        .map(|t| t.strftime("%Y-%m-%d %H:%M UTC").to_string())
-        .unwrap_or_else(|| "never".to_string());
-    let last_commit = c
-        .last_indexed_commit
-        .as_deref()
-        .unwrap_or("—")
-        .chars()
-        .take(8)
-        .collect::<String>();
+    let add_ref_directive = format!("@post('{add_ref_action}', {{contentType: 'form'}})");
     let pat_hint = if c.pat.is_some() { "PAT set" } else { "no PAT" };
     let description = c.description.clone().unwrap_or_default();
-    let status = c.status;
     html! {
         li(
             id: (dom_id),
@@ -517,20 +674,15 @@ fn render_row(c: &rag_db::Collection) -> Html {
                 div(class: "flex-1 min-w-0") {
                     div(class: "flex items-center gap-2") {
                         span(class: "text-base font-medium") { (c.name.clone()) }
-                        (status_badge(status))
                     }
                     if !description.is_empty() {
                         p(class: "text-sm text-base-content/70 mt-0.5") { (description) }
                     }
                     p(class: "text-xs text-base-content/60 mt-1 font-mono break-all") {
-                        (c.git_url.clone()) " @ " (c.git_ref.clone()) " · " (pat_hint)
+                        (c.git_url.clone()) " · " (pat_hint)
                     }
                     p(class: "text-xs text-base-content/60 mt-1") {
-                        "embed: " (c.embedding_model.clone()) " · last indexed " (last_indexed)
-                        " · commit " (last_commit)
-                    }
-                    if let Some(err) = c.last_error.as_ref() {
-                        p(class: "text-xs text-error mt-1 break-all") { "error: " (err.clone()) }
+                        "embed: " (c.embedding_model.clone())
                     }
                 }
                 div(class: "flex flex-col gap-2 shrink-0") {
@@ -543,26 +695,105 @@ fn render_row(c: &rag_db::Collection) -> Html {
                         button(type: "submit", class: "btn btn-sm btn-outline") { "Edit" }
                     }
                     form(
-                        action: (reindex_action.clone()),
-                        method: "post",
-                        class: "m-0",
-                        "data-on:submit__prevent": (reindex_directive)
-                    ) {
-                        button(type: "submit", class: "btn btn-sm") { "Re-index" }
-                    }
-                    form(
                         action: (delete_action.clone()),
                         method: "post",
                         class: "m-0",
                         "data-on:submit__prevent": (delete_directive)
                     ) {
-                        button(type: "submit", class: "btn btn-sm btn-outline btn-error") { "Delete" }
+                        button(type: "submit", class: "btn btn-sm btn-outline btn-error") { "Delete collection" }
                     }
+                }
+            }
+            // Per-ref rows: each branch/tag/commit indexed independently.
+            div(class: "mt-1 pl-3 border-l border-base-300 flex flex-col gap-1.5") {
+                for r in refs.iter() {
+                    (render_ref(r))
+                }
+                form(
+                    action: (add_ref_action),
+                    method: "post",
+                    class: "flex items-center gap-2 mt-1",
+                    "data-on:submit__prevent": (add_ref_directive)
+                ) {
+                    input(
+                        type: "text",
+                        name: "git_ref",
+                        placeholder: "branch, tag, or commit",
+                        required: "required",
+                        class: "input input-bordered input-xs w-56"
+                    );
+                    button(type: "submit", class: "btn btn-xs") { "Add ref" }
                 }
             }
         }
     }
     .to_html()
+}
+
+/// One ref row inside a collection: its name, primary badge, status,
+/// last-indexed provenance, and per-ref actions (re-index / set-primary /
+/// delete).
+fn render_ref(r: &rag_db::CollectionRef) -> Html {
+    let dom_id = format!("rag-ref-{}", r.id);
+    let reindex_action = format!("/rag/refs/{}/reindex", r.id);
+    let delete_action = format!("/rag/refs/{}/delete", r.id);
+    let primary_action = format!("/rag/refs/{}/primary", r.id);
+    let reindex_directive = format!("@post('{reindex_action}', {{contentType: 'form'}})");
+    let delete_directive = format!("@post('{delete_action}', {{contentType: 'form'}})");
+    let primary_directive = format!("@post('{primary_action}', {{contentType: 'form'}})");
+    let last_indexed = r
+        .last_indexed_at
+        .map(|t| t.strftime("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "never".to_string());
+    let last_commit = r
+        .last_indexed_commit
+        .as_deref()
+        .unwrap_or("—")
+        .chars()
+        .take(8)
+        .collect::<String>();
+    html! {
+        div(id: (dom_id), class: "flex items-center gap-2 text-sm flex-wrap") {
+            span(class: "font-mono") { (r.git_ref.clone()) }
+            if r.is_primary {
+                span(class: "badge badge-sm") { "primary" }
+            }
+            (status_badge(r.status))
+            span(class: "text-xs text-base-content/60") {
+                "indexed " (last_indexed) " · " (last_commit)
+            }
+            if let Some(err) = r.last_error.as_ref() {
+                span(class: "text-xs text-error break-all") { "error: " (err.clone()) }
+            }
+            div(class: "flex items-center gap-1 ml-auto") {
+                form(action: (reindex_action), method: "post", class: "m-0", "data-on:submit__prevent": (reindex_directive)) {
+                    button(type: "submit", class: "btn btn-xs") { "Re-index" }
+                }
+                if !r.is_primary {
+                    form(action: (primary_action), method: "post", class: "m-0", "data-on:submit__prevent": (primary_directive)) {
+                        button(type: "submit", class: "btn btn-xs btn-ghost") { "Set primary" }
+                    }
+                }
+                form(action: (delete_action), method: "post", class: "m-0", "data-on:submit__prevent": (delete_directive)) {
+                    button(type: "submit", class: "btn btn-xs btn-ghost btn-error") { "Remove ref" }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// Fetch a collection + its refs and render its row. Used by the ref/edit
+/// handlers to re-patch a single `#rag-row-{id}`.
+async fn row_html(state: &RamaState, collection_id: i64) -> Option<String> {
+    let c = rag_db::find_collection_by_id(&state.db, collection_id)
+        .await
+        .ok()
+        .flatten()?;
+    let refs = rag_db::list_refs(&state.db, collection_id)
+        .await
+        .unwrap_or_default();
+    Some(render_row(&c, &refs).to_string())
 }
 
 fn render_create_form(embedding_models: &[String]) -> Html {
@@ -916,7 +1147,10 @@ fn embedding_model_field(models: &[String], selected: Option<&str>) -> Html {
     .to_html()
 }
 
-fn render_body(list: &[rag_db::Collection], embedding_models: &[String]) -> Html {
+fn render_body(
+    list: &[(rag_db::Collection, Vec<rag_db::CollectionRef>)],
+    embedding_models: &[String],
+) -> Html {
     html! {
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
             div(class: "flex items-center gap-2 mb-2") {
@@ -938,8 +1172,8 @@ fn render_body(list: &[rag_db::Collection], embedding_models: &[String]) -> Html
                         id: "rag-list",
                         class: "flex flex-col divide-y divide-base-300"
                     ) {
-                        for c in list.iter() {
-                            (render_row(c))
+                        for (c, refs) in list.iter() {
+                            (render_row(c, refs))
                         }
                     }
                     if list.is_empty() {

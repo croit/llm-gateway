@@ -117,9 +117,13 @@ struct Doc {
     content: &'static str,
 }
 
-/// Seed a ready collection from `docs` by hand (skip the git/clone path —
-/// that's covered in tests/rag.rs). Returns `(collection_id, data_uuid)`.
-async fn seed_collection(indexer: &Indexer, reg: &UpstreamRegistry, docs: &[Doc]) -> (i64, String) {
+/// Seed a ready primary ref from `docs` by hand (skip the git/clone path —
+/// that's covered in tests/rag.rs). Returns the ready `CollectionRef`.
+async fn seed_collection(
+    indexer: &Indexer,
+    reg: &UpstreamRegistry,
+    docs: &[Doc],
+) -> rag_db::CollectionRef {
     let central = indexer.db();
     let c = rag_db::create_collection(
         central,
@@ -138,10 +142,10 @@ async fn seed_collection(indexer: &Indexer, reg: &UpstreamRegistry, docs: &[Doc]
     )
     .await
     .unwrap();
+    let r = rag_db::add_ref(central, c.id, "main", true).await.unwrap();
 
-    let uuid = c.data_uuid.clone().unwrap();
-    let store = indexer.collection_store(c.id, &uuid).await.unwrap();
-    let idx = indexer.open_index(c.id, &uuid, Some(4)).unwrap();
+    let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
+    let idx = indexer.open_index(r.id, &r.data_uuid, Some(4)).unwrap();
     for (vid, d) in (1i64..).zip(docs.iter()) {
         let file_id = rag_db::upsert_file(&store, c.id, d.path, "hash")
             .await
@@ -173,10 +177,16 @@ async fn seed_collection(indexer: &Indexer, reg: &UpstreamRegistry, docs: &[Doc]
         idx.add(vid, &v).unwrap();
     }
     drop(idx);
-    rag_db::mark_indexed(central, c.id, "deadbeef")
+    rag_db::set_ref_status(central, r.id, rag_db::CollectionStatus::Indexing)
         .await
         .unwrap();
-    (c.id, uuid)
+    rag_db::swap_ref_index(central, r.id, &r.data_uuid, "deadbeef")
+        .await
+        .unwrap();
+    rag_db::find_ref_by_id(central, r.id)
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -214,7 +224,7 @@ async fn hybrid_recovers_exact_identifier_that_dense_only_misses() {
             content: "name: osd_op_timeout desc: timeout for ops handled by osds default 0",
         },
     ];
-    let (cid, uuid) = seed_collection(&indexer, &reg, &docs).await;
+    let r = seed_collection(&indexer, &reg, &docs).await;
 
     let query = "osd op timeout";
     let qvec = indexer.embed_query(EMBED_MODEL, query).await.unwrap();
@@ -222,7 +232,7 @@ async fn hybrid_recovers_exact_identifier_that_dense_only_misses() {
     // Dense-only baseline: top-3 by vector distance. The drift stub puts
     // the query on top of the 3 CRUSH chunks, so the answer is shut out.
     let dense_top3: Vec<String> = indexer
-        .open_index(cid, &uuid, None)
+        .open_index(r.id, &r.data_uuid, None)
         .unwrap()
         .search(&qvec, 3)
         .unwrap()
@@ -237,7 +247,7 @@ async fn hybrid_recovers_exact_identifier_that_dense_only_misses() {
 
     // Hybrid: the lexical side matches osd/op/timeout against
     // `osd_op_timeout` and RRF lifts it into the results.
-    let hits = search_chunks(&indexer, cid, query, &qvec, 5).await.unwrap();
+    let hits = search_chunks(&indexer, &r, query, &qvec, 5).await.unwrap();
     let files: Vec<&str> = hits.iter().map(|(c, _)| c.file_path.as_str()).collect();
     assert!(
         files.contains(&"src/common/options/global.yaml.in"),
@@ -279,8 +289,8 @@ async fn lexical_alone_answers_when_vector_index_is_absent() {
     )
     .await
     .unwrap();
-    let uuid = c.data_uuid.clone().unwrap();
-    let store = indexer.collection_store(c.id, &uuid).await.unwrap();
+    let r = rag_db::add_ref(&pool, c.id, "main", true).await.unwrap();
+    let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
     let file_id = rag_db::upsert_file(&store, c.id, "src/common/options/global.yaml.in", "h")
         .await
         .unwrap();
@@ -300,7 +310,7 @@ async fn lexical_alone_answers_when_vector_index_is_absent() {
     .unwrap();
 
     let qvec = vec![0.0_f32; 4]; // no index to search anyway
-    let hits = search_chunks(&indexer, c.id, "osd op timeout", &qvec, 5)
+    let hits = search_chunks(&indexer, &r, "osd op timeout", &qvec, 5)
         .await
         .unwrap();
     let files: Vec<&str> = hits.iter().map(|(c, _)| c.file_path.as_str()).collect();

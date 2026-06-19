@@ -359,17 +359,15 @@ pub async fn delete_collection(
     if let Err(resp) = require_session(&state, &req).await {
         return resp;
     }
-    // Capture the store-folder id before deleting the registry row, so we
-    // can reap the on-disk folder afterwards.
-    let uuid = rag_db::find_collection_by_id(&state.db, id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|c| c.data_uuid);
+    // Capture every ref's store folder before the cascade delete so we can
+    // reap them all (each ref has its own <data_dir>/<uuid>/).
+    let refs = rag_db::list_refs(&state.db, id).await.unwrap_or_default();
     match rag_db::delete_collection(&state.db, id).await {
         Ok(true) => {
-            if let (Some(indexer), Some(uuid)) = (state.indexer.as_ref(), uuid) {
-                indexer.drop_collection_storage(id, &uuid);
+            if let Some(indexer) = state.indexer.as_ref() {
+                for r in &refs {
+                    indexer.drop_ref_storage(r.id, &r.data_uuid);
+                }
             }
             json_ok(&json!({ "deleted": true }))
         }

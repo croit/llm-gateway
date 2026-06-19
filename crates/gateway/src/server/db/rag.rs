@@ -311,6 +311,343 @@ pub async fn assign_data_uuid(pool: &Pool, id: i64, data_uuid: &str) -> Result<(
     Ok(())
 }
 
+// ---- collection refs (branches / tags / commits) -------------------------
+//
+// A collection's source is configured once; each branch / tag / commit it
+// indexes is a `rag_collection_refs` row, built and searched independently
+// (its own `data_uuid` store folder, its own status + last-indexed commit).
+// Exactly one ref per collection is `is_primary` — the one `rag_search`
+// uses when the caller doesn't name a ref.
+
+/// One indexed ref of a collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionRef {
+    pub id: i64,
+    pub collection_id: i64,
+    pub git_ref: String,
+    pub is_primary: bool,
+    /// Names this ref's on-disk store folder (`<rag.data_dir>/<data_uuid>/`).
+    pub data_uuid: String,
+    pub status: CollectionStatus,
+    pub last_indexed_at: Option<Timestamp>,
+    pub last_indexed_commit: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+impl CollectionRef {
+    /// A ref is searchable once it has completed at least one full index
+    /// (its `data_uuid` then points at a complete store). Stays searchable
+    /// on that store even while a later re-index rebuilds in a fresh folder.
+    pub fn is_searchable(&self) -> bool {
+        self.last_indexed_commit.is_some()
+    }
+}
+
+const REF_COLUMNS: &str = "id, collection_id, git_ref, is_primary, data_uuid, status, \
+     last_indexed_at, last_indexed_commit, last_error, created_at, updated_at";
+
+fn map_ref_row(row: &SqliteRow) -> Result<CollectionRef, DbError> {
+    let last_indexed_at: Option<String> = row.try_get("last_indexed_at")?;
+    let last_indexed_at = last_indexed_at
+        .map(|s| parse_ts(&s, "last_indexed_at"))
+        .transpose()?;
+    let created_at_s: String = row.try_get("created_at")?;
+    let updated_at_s: String = row.try_get("updated_at")?;
+    let status_s: String = row.try_get("status")?;
+    let is_primary: i64 = row.try_get("is_primary")?;
+    Ok(CollectionRef {
+        id: row.try_get("id")?,
+        collection_id: row.try_get("collection_id")?,
+        git_ref: row.try_get("git_ref")?,
+        is_primary: is_primary != 0,
+        data_uuid: row.try_get("data_uuid")?,
+        status: CollectionStatus::from_db(&status_s),
+        last_indexed_at,
+        last_indexed_commit: row.try_get("last_indexed_commit")?,
+        last_error: row.try_get("last_error")?,
+        created_at: parse_ts(&created_at_s, "created_at")?,
+        updated_at: parse_ts(&updated_at_s, "updated_at")?,
+    })
+}
+
+/// All refs of a collection, primary first then oldest-first.
+pub async fn list_refs(pool: &Pool, collection_id: i64) -> Result<Vec<CollectionRef>, DbError> {
+    let q = format!(
+        "SELECT {REF_COLUMNS} FROM rag_collection_refs WHERE collection_id = ? \
+         ORDER BY is_primary DESC, created_at ASC, id ASC"
+    );
+    let rows = sqlx::query(&q).bind(collection_id).fetch_all(pool).await?;
+    rows.iter().map(map_ref_row).collect()
+}
+
+pub async fn find_ref(
+    pool: &Pool,
+    collection_id: i64,
+    git_ref: &str,
+) -> Result<Option<CollectionRef>, DbError> {
+    let q = format!(
+        "SELECT {REF_COLUMNS} FROM rag_collection_refs WHERE collection_id = ? AND git_ref = ?"
+    );
+    let row = sqlx::query(&q)
+        .bind(collection_id)
+        .bind(git_ref)
+        .fetch_optional(pool)
+        .await?;
+    row.as_ref().map(map_ref_row).transpose()
+}
+
+pub async fn find_ref_by_id(pool: &Pool, ref_id: i64) -> Result<Option<CollectionRef>, DbError> {
+    let q = format!("SELECT {REF_COLUMNS} FROM rag_collection_refs WHERE id = ?");
+    let row = sqlx::query(&q).bind(ref_id).fetch_optional(pool).await?;
+    row.as_ref().map(map_ref_row).transpose()
+}
+
+/// The collection's primary ref (the search default), if any.
+pub async fn primary_ref(
+    pool: &Pool,
+    collection_id: i64,
+) -> Result<Option<CollectionRef>, DbError> {
+    let q = format!(
+        "SELECT {REF_COLUMNS} FROM rag_collection_refs \
+         WHERE collection_id = ? AND is_primary = 1"
+    );
+    let row = sqlx::query(&q)
+        .bind(collection_id)
+        .fetch_optional(pool)
+        .await?;
+    row.as_ref().map(map_ref_row).transpose()
+}
+
+/// Add a ref to a collection. Allocates its store-folder id. If
+/// `is_primary`, demotes the current primary first (the partial unique
+/// index allows only one). New refs start `pending` for the indexer.
+pub async fn add_ref(
+    pool: &Pool,
+    collection_id: i64,
+    git_ref: &str,
+    is_primary: bool,
+) -> Result<CollectionRef, DbError> {
+    let now = Timestamp::now().to_string();
+    let data_uuid = uuid::Uuid::new_v4().to_string();
+    let mut tx = pool.begin().await?;
+    if is_primary {
+        sqlx::query("UPDATE rag_collection_refs SET is_primary = 0 WHERE collection_id = ?")
+            .bind(collection_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let id: i64 = sqlx::query_scalar(
+        r#"INSERT INTO rag_collection_refs
+           (collection_id, git_ref, is_primary, data_uuid, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'pending', ?, ?)
+           RETURNING id"#,
+    )
+    .bind(collection_id)
+    .bind(git_ref)
+    .bind(is_primary as i64)
+    .bind(&data_uuid)
+    .bind(&now)
+    .bind(&now)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    find_ref_by_id(pool, id)
+        .await?
+        .ok_or_else(|| sqlx::Error::RowNotFound.into())
+}
+
+/// Make `ref_id` the collection's primary, demoting whatever was primary.
+pub async fn set_primary(pool: &Pool, ref_id: i64) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    let mut tx = pool.begin().await?;
+    let collection_id: Option<i64> =
+        sqlx::query_scalar("SELECT collection_id FROM rag_collection_refs WHERE id = ?")
+            .bind(ref_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(cid) = collection_id {
+        sqlx::query("UPDATE rag_collection_refs SET is_primary = 0 WHERE collection_id = ?")
+            .bind(cid)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE rag_collection_refs SET is_primary = 1, updated_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(ref_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Delete a ref. Returns its `data_uuid` so the caller can reap the
+/// on-disk store folder. If the deleted ref was the collection's primary
+/// and other refs remain, one of them is promoted so the collection never
+/// ends up primary-less (which would break `rag_search`'s default-to-primary
+/// resolution). A searchable ref (one that has been indexed) is preferred;
+/// otherwise the oldest remaining ref is picked.
+pub async fn delete_ref(pool: &Pool, ref_id: i64) -> Result<Option<String>, DbError> {
+    let now = Timestamp::now().to_string();
+    let mut tx = pool.begin().await?;
+    let row: Option<(Option<String>, i64, i64)> = sqlx::query_as(
+        "SELECT data_uuid, collection_id, is_primary FROM rag_collection_refs WHERE id = ?",
+    )
+    .bind(ref_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((data_uuid, collection_id, was_primary)) = row else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    sqlx::query("DELETE FROM rag_collection_refs WHERE id = ?")
+        .bind(ref_id)
+        .execute(&mut *tx)
+        .await?;
+    if was_primary == 1 {
+        // Promote a survivor: prefer one that is already searchable, then
+        // fall back to the oldest. NULLs sort last under `IS NOT NULL DESC`.
+        let next: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM rag_collection_refs WHERE collection_id = ? \
+             ORDER BY (last_indexed_commit IS NOT NULL) DESC, id ASC LIMIT 1",
+        )
+        .bind(collection_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(next_id) = next {
+            sqlx::query(
+                "UPDATE rag_collection_refs SET is_primary = 1, updated_at = ? WHERE id = ?",
+            )
+            .bind(&now)
+            .bind(next_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(data_uuid)
+}
+
+/// Indexer-only: set a ref's lifecycle status.
+pub async fn set_ref_status(
+    pool: &Pool,
+    ref_id: i64,
+    status: CollectionStatus,
+) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    sqlx::query("UPDATE rag_collection_refs SET status = ?, updated_at = ? WHERE id = ?")
+        .bind(status.as_str())
+        .bind(&now)
+        .bind(ref_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Indexer-only: a successful (re-)index lands here. Atomically swaps the
+/// ref onto the freshly-built `new_data_uuid` store, stamps the commit, and
+/// flips to `ready` — but only `WHERE status='indexing'`, so a concurrent
+/// re-index that flipped the ref back to `pending` makes this a no-op (the
+/// stale build is then discarded by the caller). Returns rows affected
+/// (0 = superseded, the swap did not happen).
+pub async fn swap_ref_index(
+    pool: &Pool,
+    ref_id: i64,
+    new_data_uuid: &str,
+    commit_sha: &str,
+) -> Result<u64, DbError> {
+    let now = Timestamp::now().to_string();
+    let affected = sqlx::query(
+        r#"UPDATE rag_collection_refs
+           SET data_uuid = ?, last_indexed_commit = ?, last_indexed_at = ?,
+               status = 'ready', last_error = NULL, updated_at = ?
+           WHERE id = ? AND status = 'indexing'"#,
+    )
+    .bind(new_data_uuid)
+    .bind(commit_sha)
+    .bind(&now)
+    .bind(&now)
+    .bind(ref_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected)
+}
+
+/// Indexer-only: a failed run. Status → `error` (message stored), but only
+/// `WHERE status='indexing'` so it can't clobber a re-index that re-queued
+/// the ref. The ref keeps its prior `data_uuid` + commit, so a previously
+/// completed index stays searchable. Returns rows affected.
+pub async fn mark_ref_failed(pool: &Pool, ref_id: i64, message: &str) -> Result<u64, DbError> {
+    let now = Timestamp::now().to_string();
+    let affected = sqlx::query(
+        r#"UPDATE rag_collection_refs
+           SET status = 'error', last_error = ?, updated_at = ?
+           WHERE id = ? AND status = 'indexing'"#,
+    )
+    .bind(message)
+    .bind(&now)
+    .bind(ref_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected)
+}
+
+/// Admin-side: (re-)queue a ref for indexing. Flips to `pending` and clears
+/// the prior error. Keeps `data_uuid` + commit so the existing index stays
+/// searchable until the rebuild swaps in. A running build sees the status
+/// is no longer `indexing` at its next checkpoint and aborts.
+pub async fn request_ref_reindex(pool: &Pool, ref_id: i64) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    sqlx::query(
+        r#"UPDATE rag_collection_refs
+           SET status = 'pending', last_error = NULL, updated_at = ?
+           WHERE id = ?"#,
+    )
+    .bind(&now)
+    .bind(ref_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Refs the indexer should pick up, oldest-queued first.
+pub async fn list_pending_refs(pool: &Pool) -> Result<Vec<CollectionRef>, DbError> {
+    let q = format!(
+        "SELECT {REF_COLUMNS} FROM rag_collection_refs WHERE status = 'pending' \
+         ORDER BY updated_at ASC, id ASC"
+    );
+    let rows = sqlx::query(&q).fetch_all(pool).await?;
+    rows.iter().map(map_ref_row).collect()
+}
+
+/// Startup recovery: any ref left mid-build (`cloning`/`indexing`) by a
+/// crash or restart is orphaned — no worker resumes it. Flip them back to
+/// `pending` so they re-run. Returns how many were reset.
+pub async fn reset_stalled_refs(pool: &Pool) -> Result<u64, DbError> {
+    let now = Timestamp::now().to_string();
+    let affected = sqlx::query(
+        "UPDATE rag_collection_refs SET status = 'pending', updated_at = ? \
+         WHERE status IN ('cloning', 'indexing')",
+    )
+    .bind(&now)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected)
+}
+
+/// Every `data_uuid` currently referenced by a ref — the set of live store
+/// folders. Used to reap orphaned build folders left by interrupted runs.
+pub async fn all_ref_data_uuids(pool: &Pool) -> Result<Vec<String>, DbError> {
+    let rows: Vec<String> = sqlx::query_scalar("SELECT data_uuid FROM rag_collection_refs")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
 // ---- file-side metadata ---------------------------------------------------
 
 /// One indexed source file. `content_hash` is the diff key: the indexer
@@ -785,6 +1122,126 @@ mod tests {
         assert!(
             !delete_collection(&pool, c.id).await.unwrap(),
             "deleting a missing row is a clean false"
+        );
+    }
+
+    #[tokio::test]
+    async fn refs_add_list_primary_and_delete() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let reef = add_ref(&pool, c.id, "reef", true).await.unwrap();
+        assert!(reef.is_primary);
+        assert!(!reef.is_searchable(), "a fresh ref has no completed index");
+        let squid = add_ref(&pool, c.id, "squid", false).await.unwrap();
+        assert!(!squid.is_primary);
+        assert_eq!(
+            primary_ref(&pool, c.id).await.unwrap().unwrap().git_ref,
+            "reef"
+        );
+        let refs = list_refs(&pool, c.id).await.unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].git_ref, "reef", "primary lists first");
+
+        // Re-point primary; exactly one primary survives.
+        set_primary(&pool, squid.id).await.unwrap();
+        assert_eq!(
+            primary_ref(&pool, c.id).await.unwrap().unwrap().git_ref,
+            "squid"
+        );
+        let primaries = list_refs(&pool, c.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.is_primary)
+            .count();
+        assert_eq!(primaries, 1);
+
+        assert_eq!(
+            find_ref(&pool, c.id, "reef").await.unwrap().unwrap().id,
+            reef.id
+        );
+        let uuid = delete_ref(&pool, reef.id).await.unwrap();
+        assert_eq!(uuid.as_deref(), Some(reef.data_uuid.as_str()));
+        assert_eq!(list_refs(&pool, c.id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_primary_promotes_a_survivor() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let primary = add_ref(&pool, c.id, "primary", true).await.unwrap();
+        let fresh_ref = add_ref(&pool, c.id, "fresh", false).await.unwrap();
+        let indexed = add_ref(&pool, c.id, "indexed", false).await.unwrap();
+        // Make `indexed` searchable so it is the preferred promotion target
+        // over the never-indexed `fresh` ref.
+        set_ref_status(&pool, indexed.id, CollectionStatus::Indexing)
+            .await
+            .unwrap();
+        swap_ref_index(&pool, indexed.id, "u-indexed", "sha")
+            .await
+            .unwrap();
+
+        // Deleting the primary must hand primacy to the searchable survivor,
+        // never leave the collection without a primary.
+        delete_ref(&pool, primary.id).await.unwrap();
+        let now_primary = primary_ref(&pool, c.id).await.unwrap();
+        assert_eq!(
+            now_primary.as_ref().map(|r| r.git_ref.as_str()),
+            Some("indexed"),
+            "searchable survivor is promoted"
+        );
+        assert!(fresh_ref.id != now_primary.unwrap().id);
+
+        // Deleting down to the last ref leaves no primary, but that is the
+        // empty case (no survivor to promote), not a primary-less collection
+        // with refs still present.
+        delete_ref(&pool, indexed.id).await.unwrap();
+        delete_ref(&pool, fresh_ref.id).await.unwrap();
+        assert!(list_refs(&pool, c.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ref_swap_and_reindex_are_status_guarded() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let r = add_ref(&pool, c.id, "reef", true).await.unwrap();
+
+        // Swap is a no-op unless the ref is mid-index.
+        assert_eq!(swap_ref_index(&pool, r.id, "u1", "sha1").await.unwrap(), 0);
+
+        set_ref_status(&pool, r.id, CollectionStatus::Indexing)
+            .await
+            .unwrap();
+        assert_eq!(swap_ref_index(&pool, r.id, "u1", "sha1").await.unwrap(), 1);
+        let after = find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
+        assert_eq!(after.status, CollectionStatus::Ready);
+        assert_eq!(after.data_uuid, "u1");
+        assert!(after.is_searchable());
+
+        // A re-queue must not be clobbered by a stale build finishing.
+        request_ref_reindex(&pool, r.id).await.unwrap();
+        assert_eq!(
+            swap_ref_index(&pool, r.id, "u2", "sha2").await.unwrap(),
+            0,
+            "swap must not overwrite a re-queued ref"
+        );
+        let after = find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
+        assert_eq!(after.data_uuid, "u1", "old index stays live");
+        assert!(after.is_searchable());
+    }
+
+    #[tokio::test]
+    async fn reset_stalled_refs_requeues_orphans() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let r = add_ref(&pool, c.id, "reef", true).await.unwrap();
+        set_ref_status(&pool, r.id, CollectionStatus::Cloning)
+            .await
+            .unwrap();
+        assert_eq!(reset_stalled_refs(&pool).await.unwrap(), 1);
+        assert_eq!(
+            find_ref_by_id(&pool, r.id).await.unwrap().unwrap().status,
+            CollectionStatus::Pending
         );
     }
 

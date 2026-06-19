@@ -195,18 +195,22 @@ async fn indexer_clones_chunks_embeds_then_search_returns_right_chunk() {
     .await
     .unwrap();
 
-    indexer.index_one(collection.id).await.unwrap();
-
-    let after = rag_db::find_collection_by_id(&pool, collection.id)
+    // Index the collection's primary ref.
+    let r = rag_db::add_ref(&pool, collection.id, "main", true)
         .await
-        .unwrap()
         .unwrap();
+    indexer.index_ref(r.id).await.unwrap();
+
+    // Re-fetch the ref: a successful build swapped its data_uuid + marked it
+    // ready/searchable.
+    let after = rag_db::find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
     assert_eq!(after.status, rag_db::CollectionStatus::Ready);
     assert!(after.last_indexed_commit.is_some());
+    assert!(after.is_searchable());
 
-    // Content now lives in the collection's own store, not the central DB.
+    // Content lives in the ref's own store.
     let store = indexer
-        .collection_store(collection.id, after.data_uuid.as_deref().unwrap())
+        .collection_store(after.id, &after.data_uuid)
         .await
         .unwrap();
     let files = rag_db::list_files_for_collection(&store, collection.id)
@@ -240,7 +244,7 @@ async fn indexer_clones_chunks_embeds_then_search_returns_right_chunk() {
     .pop()
     .unwrap();
 
-    let hits = search_chunks(&indexer, collection.id, "please find alpha", &query_vec, 5)
+    let hits = search_chunks(&indexer, &after, "please find alpha", &query_vec, 5)
         .await
         .unwrap();
     assert!(!hits.is_empty(), "search returned no hits");
@@ -290,13 +294,14 @@ async fn reindex_after_edit_drops_old_chunks_and_picks_up_new_content() {
     )
     .await
     .unwrap();
-    indexer.index_one(collection.id).await.unwrap();
-
-    // Content lives in the collection's own store.
-    let store = indexer
-        .collection_store(collection.id, collection.data_uuid.as_deref().unwrap())
+    let r = rag_db::add_ref(&pool, collection.id, "main", true)
         .await
         .unwrap();
+    indexer.index_ref(r.id).await.unwrap();
+
+    // Content lives in the ref's own store (re-fetch for its current uuid).
+    let r = rag_db::find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
+    let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
     let first_chunks: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM rag_chunks WHERE collection_id = ?")
             .bind(collection.id)
@@ -324,11 +329,13 @@ async fn reindex_after_edit_drops_old_chunks_and_picks_up_new_content() {
             .success()
     );
 
-    rag_db::request_reindex(&pool, collection.id).await.unwrap();
-    indexer.index_one(collection.id).await.unwrap();
+    rag_db::request_ref_reindex(&pool, r.id).await.unwrap();
+    indexer.index_ref(r.id).await.unwrap();
 
-    // The collection's file count stays at 2 (no deletions), but the
-    // alpha.txt content_hash must have changed.
+    // The rebuild swapped in a fresh store; re-fetch the ref + reopen it.
+    let r = rag_db::find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
+    let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
+    // File count stays at 2 (no deletions), but alpha.txt's hash changed.
     let files = rag_db::list_files_for_collection(&store, collection.id)
         .await
         .unwrap();
@@ -347,7 +354,7 @@ async fn reindex_after_edit_drops_old_chunks_and_picks_up_new_content() {
     .unwrap()
     .pop()
     .unwrap();
-    let hits = search_chunks(&indexer, collection.id, "gamma please", &qvec, 5)
+    let hits = search_chunks(&indexer, &r, "gamma please", &qvec, 5)
         .await
         .unwrap();
     assert!(!hits.is_empty());

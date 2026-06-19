@@ -39,8 +39,10 @@ impl Tool for RagListCollections {
         ToolDef::function(
             self.id(),
             "List the codebases / corpora available for retrieval-augmented \
-             generation. Returns each collection's name, description, and \
-             readiness — pass a `name` back to `rag_search` to query it.",
+             generation. Each collection lists the indexed refs \
+             (branches / tags / commits) you can search, and which is the \
+             default. Pass a collection `name` to `rag_search` (and \
+             optionally a `ref`) to query it.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -55,20 +57,38 @@ impl Tool for RagListCollections {
                 .indexer
                 .as_ref()
                 .ok_or_else(|| ToolError::Failed("RAG is not configured on this gateway".into()))?;
-            let rows = rag_db::list_collections(indexer.db())
+            let cols = rag_db::list_collections(indexer.db())
                 .await
                 .map_err(|e| ToolError::Failed(format!("listing collections: {e}")))?;
-            let items: Vec<Value> = rows
-                .iter()
-                .map(|c| {
-                    json!({
-                        "name": c.name,
-                        "description": c.description,
-                        "status": c.status.as_str(),
-                        "last_indexed_at": c.last_indexed_at.map(|t| t.to_string()),
+            let mut items: Vec<Value> = Vec::new();
+            for c in &cols {
+                let refs = rag_db::list_refs(indexer.db(), c.id)
+                    .await
+                    .map_err(|e| ToolError::Failed(format!("listing refs: {e}")))?;
+                // Only advertise collections with at least one searchable
+                // ref — a collection still building its first index isn't
+                // queryable yet.
+                if !refs.iter().any(|r| r.is_searchable()) {
+                    continue;
+                }
+                let ref_items: Vec<Value> = refs
+                    .iter()
+                    .map(|r| {
+                        json!({
+                            "ref": r.git_ref,
+                            "primary": r.is_primary,
+                            "searchable": r.is_searchable(),
+                            "status": r.status.as_str(),
+                            "last_indexed_at": r.last_indexed_at.map(|t| t.to_string()),
+                        })
                     })
-                })
-                .collect();
+                    .collect();
+                items.push(json!({
+                    "name": c.name,
+                    "description": c.description,
+                    "refs": ref_items,
+                }));
+            }
             Ok(json!({ "collections": items }))
         })
     }
@@ -80,6 +100,10 @@ pub struct RagSearch;
 struct SearchArgs {
     query: String,
     collection: String,
+    /// Which branch/tag/commit to search. Omitted → the collection's
+    /// primary ref. (`ref` is a Rust keyword, hence the rename.)
+    #[serde(default, rename = "ref")]
+    git_ref: Option<String>,
     #[serde(default)]
     top_k: Option<u32>,
 }
@@ -97,9 +121,9 @@ impl Tool for RagSearch {
             self.id(),
             "Search an indexed codebase or corpus for passages relevant to a \
              natural-language query. Call `rag_list_collections` first if you \
-             don't know which collections are available. Returns the top-k \
-             matching chunks with file path, line range, similarity score, \
-             and the chunk content.",
+             don't know which collections (and which of their refs) are \
+             available. Returns the top-k matching chunks with file path, \
+             line range, relevance score, and the chunk content.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -113,6 +137,13 @@ impl Tool for RagSearch {
                         "type": "string",
                         "description": "Name of the indexed collection to search. \
                                         Get the list with `rag_list_collections`."
+                    },
+                    "ref": {
+                        "type": "string",
+                        "description": "Which branch / tag / commit to search. \
+                                        Omit to search the collection's default \
+                                        (primary) ref. See `rag_list_collections` \
+                                        for each collection's available refs."
                     },
                     "top_k": {
                         "type": "integer",
@@ -129,7 +160,8 @@ impl Tool for RagSearch {
         Box::pin(async move {
             let args: SearchArgs = serde_json::from_value(args).map_err(|e| {
                 ToolError::InvalidArgs(format!(
-                    "expected {{query: string, collection: string, top_k?: integer}}: {e}"
+                    "expected {{query: string, collection: string, ref?: string, \
+                     top_k?: integer}}: {e}"
                 ))
             })?;
             let indexer = ctx
@@ -148,12 +180,36 @@ impl Tool for RagSearch {
                         args.collection
                     ))
                 })?;
-            if collection.status != rag_db::CollectionStatus::Ready {
+
+            // Resolve the ref: the one the caller named, else the primary.
+            let rref = match &args.git_ref {
+                Some(r) => rag_db::find_ref(indexer.db(), collection.id, r)
+                    .await
+                    .map_err(|e| ToolError::Failed(format!("looking up ref: {e}")))?
+                    .ok_or_else(|| {
+                        ToolError::Failed(format!(
+                            "collection `{}` has no ref `{}` — call rag_list_collections to see \
+                             its available refs",
+                            collection.name, r
+                        ))
+                    })?,
+                None => rag_db::primary_ref(indexer.db(), collection.id)
+                    .await
+                    .map_err(|e| ToolError::Failed(format!("looking up primary ref: {e}")))?
+                    .ok_or_else(|| {
+                        ToolError::Failed(format!(
+                            "collection `{}` has no indexed refs yet",
+                            collection.name
+                        ))
+                    })?,
+            };
+            if !rref.is_searchable() {
                 return Err(ToolError::Failed(format!(
-                    "collection `{}` is not ready (status = {}); ask the operator to wait for \
-                     indexing to complete or to re-queue if it failed",
+                    "ref `{}` of `{}` is not ready yet (status = {}); its first index hasn't \
+                     completed — wait for it or re-queue if it failed",
+                    rref.git_ref,
                     collection.name,
-                    collection.status.as_str()
+                    rref.status.as_str()
                 )));
             }
 
@@ -163,10 +219,9 @@ impl Tool for RagSearch {
                 .embed_query(&collection.embedding_model, &args.query)
                 .await
                 .map_err(|e| ToolError::Failed(format!("embedding query: {e}")))?;
-            let hits =
-                worker::search_chunks(indexer, collection.id, &args.query, &query_vec, top_k)
-                    .await
-                    .map_err(|e| ToolError::Failed(format!("searching index: {e}")))?;
+            let hits = worker::search_chunks(indexer, &rref, &args.query, &query_vec, top_k)
+                .await
+                .map_err(|e| ToolError::Failed(format!("searching index: {e}")))?;
 
             let results: Vec<Value> = hits
                 .into_iter()
@@ -186,6 +241,7 @@ impl Tool for RagSearch {
                 .collect();
             Ok(json!({
                 "collection": collection.name,
+                "ref": rref.git_ref,
                 "hits": results,
             }))
         })
@@ -322,7 +378,7 @@ mod tests {
                 ..IndexerConfig::default()
             },
         );
-        rag_db::create_collection(
+        let c = rag_db::create_collection(
             &pool,
             &rag_db::NewCollection {
                 name: "demo".into(),
@@ -339,6 +395,22 @@ mod tests {
         )
         .await
         .unwrap();
+        // A collection with no searchable ref is not advertised.
+        let out = RagListCollections
+            .run(ctx_with(indexer.clone()), json!({}))
+            .await
+            .unwrap();
+        assert!(out["collections"].as_array().unwrap().is_empty());
+
+        // Add a ref and bring it to ready → now listed with its refs.
+        let r = rag_db::add_ref(&pool, c.id, "reef", true).await.unwrap();
+        rag_db::set_ref_status(&pool, r.id, rag_db::CollectionStatus::Indexing)
+            .await
+            .unwrap();
+        rag_db::swap_ref_index(&pool, r.id, &r.data_uuid, "deadbeef")
+            .await
+            .unwrap();
+
         let out = RagListCollections
             .run(ctx_with(indexer), json!({}))
             .await
@@ -346,7 +418,11 @@ mod tests {
         let cs = out["collections"].as_array().unwrap();
         assert_eq!(cs.len(), 1);
         assert_eq!(cs[0]["name"], "demo");
-        assert_eq!(cs[0]["status"], "pending");
+        let refs = cs[0]["refs"].as_array().unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0]["ref"], "reef");
+        assert_eq!(refs[0]["primary"], true);
+        assert_eq!(refs[0]["searchable"], true);
     }
 
     #[tokio::test]
@@ -396,9 +472,9 @@ mod tests {
         )
         .await
         .unwrap();
-        // Content lives in the per-collection store, not the central DB.
-        let uuid = c.data_uuid.clone().unwrap();
-        let store = indexer.collection_store(c.id, &uuid).await.unwrap();
+        // Each ref owns its store; add a primary ref and seed it by hand.
+        let r = rag_db::add_ref(&pool, c.id, "main", true).await.unwrap();
+        let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
         let f = rag_db::upsert_file(&store, c.id, "src/alpha.rs", "hashA")
             .await
             .unwrap();
@@ -416,8 +492,7 @@ mod tests {
         )
         .await
         .unwrap();
-        // Open the index, push the matching vector.
-        let idx = indexer.open_index(c.id, &uuid, Some(4)).unwrap();
+        let idx = indexer.open_index(r.id, &r.data_uuid, Some(4)).unwrap();
         let v = embeddings::embed(
             &reqwest::Client::new(),
             &reg,
@@ -429,9 +504,15 @@ mod tests {
         .pop()
         .unwrap();
         idx.add(1, &v).unwrap();
-        // Drop manually so we can search via the cached handle.
         drop(idx);
-        rag_db::mark_indexed(&pool, c.id, "deadbeef").await.unwrap();
+        // Bring the ref to `ready` on its current store so it's searchable.
+        rag_db::set_ref_status(&pool, r.id, rag_db::CollectionStatus::Indexing)
+            .await
+            .unwrap();
+        rag_db::swap_ref_index(&pool, r.id, &r.data_uuid, "deadbeef")
+            .await
+            .unwrap();
+        let r = rag_db::find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
 
         // Sanity-check the lower layer first so a search-tool failure
         // doesn't get blamed on the index plumbing.
@@ -445,7 +526,7 @@ mod tests {
         .unwrap()
         .pop()
         .unwrap();
-        let raw = search_chunks(&indexer, c.id, "alpha please", &q, 5)
+        let raw = search_chunks(&indexer, &r, "alpha please", &q, 5)
             .await
             .unwrap();
         assert!(!raw.is_empty(), "lower layer returned no hits");
@@ -458,6 +539,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["collection"], "code");
+        assert_eq!(out["ref"], "main");
         let hits = out["hits"].as_array().unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["file_path"], "src/alpha.rs");
@@ -478,7 +560,7 @@ mod tests {
                 ..IndexerConfig::default()
             },
         );
-        rag_db::create_collection(
+        let c = rag_db::create_collection(
             &pool,
             &rag_db::NewCollection {
                 name: "still-pending".into(),
@@ -495,6 +577,8 @@ mod tests {
         )
         .await
         .unwrap();
+        // A primary ref exists but hasn't completed its first index.
+        rag_db::add_ref(&pool, c.id, "main", true).await.unwrap();
         let err = RagSearch
             .run(
                 ctx_with(indexer),
