@@ -44,6 +44,7 @@ use session_core::chrome::{
 use session_core::{RegisterOutcome, TurnUpdate};
 
 use session_core::db as chat;
+use session_core::export;
 
 use crate::rama_server::state::RamaState;
 use crate::server::chat_attachments;
@@ -1086,6 +1087,153 @@ fn augment_user_text(turn_id: &str, submit: &ChatSubmit) -> String {
 // presign-everywhere design is gone: the proxy route requires the
 // session cookie AND verifies the turn belongs to the cookie
 // holder.
+
+// ---------------------------------------------------------------------------
+// GET /chat/{id}/export.md  and  GET /chat/{id}/export.pdf
+//
+// Download the whole conversation as a self-contained document. Both
+// formats share the same gate as the chat view (owner OR shared) and the
+// same body builder in `session_core::export`; only the serialization and
+// the response headers differ. The Markdown path is pure-Rust; the PDF
+// path shells out to the bundled `typst` CLI (the same engine the letter
+// templates use).
+
+/// GET /chat/{id}/export.md
+pub async fn chat_export_markdown(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    let (session, turns) = match load_exportable_chat(&state, &session_id, &req).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let opts = export::ExportOpts {
+        base_url: &state.config.gateway.public_url,
+    };
+    let body = export::to_markdown(&session, &turns, &opts);
+    download_response(
+        "text/markdown; charset=utf-8",
+        &export_filename(&session, "md"),
+        body.into_bytes(),
+    )
+}
+
+/// GET /chat/{id}/export.pdf
+pub async fn chat_export_pdf(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    let (session, turns) = match load_exportable_chat(&state, &session_id, &req).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let opts = export::ExportOpts {
+        base_url: &state.config.gateway.public_url,
+    };
+    let source = export::to_typst(&session, &turns, &opts);
+    match crate::server::typst::compile_source(&source).await {
+        Ok(pdf) => download_response("application/pdf", &export_filename(&session, "pdf"), pdf),
+        Err(crate::server::typst::CompileError::BinaryNotFound) => export_error(
+            rama::http::StatusCode::SERVICE_UNAVAILABLE,
+            "PDF export unavailable: the typst CLI is not installed on the gateway",
+        ),
+        Err(err) => {
+            tracing::error!(error = %err, %session_id, "chat PDF export compile");
+            export_error(
+                rama::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "PDF export failed",
+            )
+        }
+    }
+}
+
+/// Shared loader for the export handlers: authenticate, then fetch the
+/// session (owner OR shared) and its turns. Mirrors `chat_session_view`'s
+/// readability gate so a shared conversation is exportable by a viewer
+/// while a private one stays owner-only.
+async fn load_exportable_chat(
+    state: &Arc<RamaState>,
+    session_id: &str,
+    req: &Request,
+) -> Result<(chat::Session, Vec<chat::TurnWithTools>), Response> {
+    let (_session, user) = require_session_or_redirect(state, req).await?;
+    let session = match chat::get_session_readable(&state.db, &user.id, session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Err(see_other("/chat")),
+        Err(err) => return Err(internal_error_html(&user.email, &err.to_string())),
+    };
+    let turns = match chat::list_turns(&state.db, &session.id).await {
+        Ok(t) => t,
+        Err(err) => return Err(internal_error_html(&user.email, &err.to_string())),
+    };
+    Ok((session, turns))
+}
+
+/// Build an attachment download response with the right headers.
+fn download_response(content_type: &str, filename: &str, bytes: Vec<u8>) -> Response {
+    Response::builder()
+        .status(rama::http::StatusCode::OK)
+        .header(rama::http::header::CONTENT_TYPE, content_type)
+        .header(rama::http::header::CONTENT_LENGTH, bytes.len())
+        .header(
+            rama::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        // Exports reflect live conversation state — never cache.
+        .header(rama::http::header::CACHE_CONTROL, "no-store")
+        .body(bytes.into())
+        .unwrap_or_else(|err| {
+            tracing::error!(error = %err, "export response build");
+            export_error(
+                rama::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "response build",
+            )
+        })
+}
+
+fn export_error(status: rama::http::StatusCode, msg: &str) -> Response {
+    Response::builder()
+        .status(status)
+        .header(
+            rama::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )
+        .body(msg.to_string().into())
+        .unwrap()
+}
+
+/// `<slug>.<ext>` download filename derived from the session title, with
+/// a stable fallback so an untitled chat still produces a sane name.
+fn export_filename(session: &chat::Session, ext: &str) -> String {
+    let slug = slugify(session.title.as_deref().unwrap_or(""));
+    let stem = if slug.is_empty() {
+        let short = session.id.split('-').next().unwrap_or(&session.id);
+        format!("chat-{short}")
+    } else {
+        slug
+    };
+    format!("{stem}.{ext}")
+}
+
+/// Lowercase ASCII slug: alnum kept, every other run collapsed to a
+/// single `-`, trimmed, capped so a long title can't blow up the header.
+fn slugify(title: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    trimmed.chars().take(60).collect::<String>()
+}
 
 // ---------------------------------------------------------------------------
 // GET /chat/attachment/{turn_id}/{filename} — bytes for one attachment.

@@ -403,6 +403,35 @@ async fn run_typst(mut cmd: Command) -> Result<(), CompileError> {
     Ok(())
 }
 
+/// Compile a complete, self-contained Typst `source` string to a PDF.
+///
+/// Unlike [`compile`], there's no manifest, no `--input` plumbing and no
+/// PNG/source side-products: the caller (chat export) hands us a full
+/// document it generated and just wants the bytes back. The source is
+/// written into a fresh tempdir which doubles as `--root`, so it can't
+/// read anything outside it. Typst's bundled fonts cover the export
+/// template, so no `--font-path` is needed.
+pub async fn compile_source(source: &str) -> Result<Vec<u8>, CompileError> {
+    let workdir = tempfile::tempdir()?;
+    let src_path = workdir.path().join("export.typ");
+    let pdf_path = workdir.path().join("export.pdf");
+    tokio::fs::write(&src_path, source).await?;
+
+    let mut cmd = Command::new("typst");
+    cmd.arg("compile")
+        .arg("--root")
+        .arg(workdir.path())
+        .arg(&src_path)
+        .arg(&pdf_path);
+    run_typst(cmd).await?;
+
+    let pdf = tokio::fs::read(&pdf_path).await?;
+    if pdf.len() > MAX_PDF_BYTES {
+        return Err(CompileError::TooLarge(pdf.len()));
+    }
+    Ok(pdf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +452,21 @@ description = "Stub template for tests"
         );
         std::fs::write(tdir.join("template.toml"), toml).unwrap();
         tdir
+    }
+
+    #[tokio::test]
+    async fn compile_source_produces_a_pdf() {
+        // Exercises the chat-export path end to end against the real
+        // typst CLI. Skips (rather than fails) when typst isn't on PATH
+        // so the suite still passes on a machine without it.
+        let source = "#set page(width: 6cm, height: 4cm)\n= Export\n\nHello, world.\n";
+        match compile_source(source).await {
+            Ok(pdf) => assert!(pdf.starts_with(b"%PDF"), "output is not a PDF"),
+            Err(CompileError::BinaryNotFound) => {
+                eprintln!("skipping: typst not installed");
+            }
+            Err(err) => panic!("compile_source failed: {err}"),
+        }
     }
 
     #[test]

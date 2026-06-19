@@ -73,11 +73,14 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
             // chips chew ~70px of vertical space and most mobile sessions keep
             // the default model) + the always-visible share toggle. Owner-only
             // — a read-only viewer changes nothing here.
-            if !read_only {
             // `ml-auto`: with the title hidden on mobile this stays pinned
             // right (away from the top-left floating drawer button) instead of
             // collapsing left under `justify-content: space-between`.
             div(class: "flex items-center gap-2 ml-auto") {
+            // Export is available to anyone who can read the chat (owner or a
+            // shared viewer), so it lives outside the owner-only block below.
+            (render_export_control(&session_id))
+            if !read_only {
             div(class: "chat-header__pickers hidden sm:flex") {
                 if models_empty {
                     input(
@@ -203,6 +206,37 @@ pub(super) fn render_share_control(share_url: &str, shared: bool) -> Html {
     .to_html()
 }
 
+/// Export menu: a `<details>`-based daisyUI dropdown with one plain
+/// download link per format. Pure HTML — no datastar directives — so the
+/// browser performs an ordinary GET and the handler's
+/// `Content-Disposition: attachment` triggers a download. The links must
+/// stay free of `data-on:*` so the SPA-nav path doesn't swallow them and
+/// try to morph a binary/markdown body into the page.
+pub(super) fn render_export_control(session_id: &str) -> Html {
+    let md_url = format!("/chat/{session_id}/export.md");
+    let pdf_url = format!("/chat/{session_id}/export.pdf");
+    html! {
+        details(class: "dropdown dropdown-end") {
+            summary(
+                class: "btn btn-ghost btn-sm whitespace-nowrap",
+                title: "Download this conversation"
+            ) {
+                (icons::download(16))
+                span(class: "hidden sm:inline") { "Export" }
+            }
+            ul(class: "dropdown-content menu bg-base-100 rounded-box z-10 mt-1 w-48 p-2 shadow") {
+                li {
+                    a(href: (pdf_url), download: "download") { "PDF document" }
+                }
+                li {
+                    a(href: (md_url), download: "download") { "Markdown (.md)" }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +256,10 @@ mod tests {
     }
 
     fn page_body(in_flight: Option<&str>) -> String {
+        page_body_ro(in_flight, false)
+    }
+
+    fn page_body_ro(in_flight: Option<&str>, read_only: bool) -> String {
         let s = session();
         render_chat_page(ChatPage {
             active: &s,
@@ -230,7 +268,7 @@ mod tests {
             models: &[],
             transcription_models: &[],
             error_msg: None,
-            read_only: false,
+            read_only,
             shared: false,
         })
         .to_string()
@@ -270,6 +308,37 @@ mod tests {
         assert!(
             page_body(None).contains("chatStreaming: false"),
             "an idle page must not seed the streaming/stop state"
+        );
+    }
+
+    #[test]
+    fn export_links_present_for_owner_and_shared_viewer() {
+        // The export menu links straight at the download endpoints and must
+        // be reachable by both the owner and a read-only viewer of a shared
+        // chat — so it lives outside the owner-only header block.
+        for read_only in [false, true] {
+            let body = page_body_ro(None, read_only);
+            assert!(
+                body.contains("/chat/s1/export.pdf"),
+                "PDF export link missing (read_only={read_only}): {body}"
+            );
+            assert!(
+                body.contains("/chat/s1/export.md"),
+                "Markdown export link missing (read_only={read_only}): {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_links_are_plain_downloads_not_spa_nav() {
+        // A `data-on:*` directive here would let the SPA-nav path intercept
+        // the click and try to morph a binary PDF into the page. The links
+        // must stay plain anchors with `download`.
+        let menu = render_export_control("s1").to_string();
+        assert!(menu.contains("download"), "expected download attr: {menu}");
+        assert!(
+            !menu.contains("data-on"),
+            "export links must not carry datastar directives: {menu}"
         );
     }
 }

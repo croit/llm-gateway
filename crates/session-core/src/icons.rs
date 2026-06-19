@@ -229,6 +229,14 @@ pub fn paperclip(size: u32) -> Html {
     ))
 }
 
+/// Download — tray with a down-arrow. Chat-export menu trigger.
+pub fn download(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>"#,
+    ))
+}
+
 /// X-mark — composer chip remove button + generic dismiss.
 pub fn x_mark(size: u32) -> Html {
     raw(render(
