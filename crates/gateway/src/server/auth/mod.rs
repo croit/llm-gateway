@@ -18,4 +18,9 @@ pub struct UserCtx {
     pub user_id: String,
     pub token_id: String,
     pub roles: Vec<String>,
+    /// The token's master "tool use" switch. When `false` the request
+    /// path injects no gateway tools at all (pure passthrough), so the
+    /// per-capability `token_tool_prefs` never come into play. Default
+    /// for every token is off — see `RamaState::allowed_tools_for_token`.
+    pub tools_enabled: bool,
 }

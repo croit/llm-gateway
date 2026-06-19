@@ -20,6 +20,7 @@ use rama::http::service::web::extract::State;
 use rama::http::{Request, Response};
 use serde::Deserialize;
 
+use super::tool_toggles::{self, ToggleCtx};
 use super::{
     NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, read_form,
     require_session_or_redirect, toast,
@@ -30,7 +31,17 @@ use session_core::chrome::{
 
 use crate::rama_server::state::RamaState;
 use crate::server::db::{user_tool_prefs, users};
-use crate::server::tools::catalog::{self, Category, ToolEntry};
+use crate::server::tools::catalog::ToolEntry;
+
+/// Where a `/tools` toggle posts + how its row id is namespaced. The
+/// prefix is `tool-row` so the DOM ids stay exactly as before the toggle
+/// list was extracted into the shared component.
+fn toggle_ctx() -> ToggleCtx {
+    ToggleCtx {
+        post_path: "/tools/toggle".to_string(),
+        row_id_prefix: "tool-row".to_string(),
+    }
+}
 
 /// Tool id whose presence in a user's grants unlocks the
 /// browser-location sharing card on this page.
@@ -88,10 +99,9 @@ pub async fn tools_index(State(state): State<Arc<RamaState>>, req: Request) -> R
 }
 
 /// The tools the user's roles grant, grouped + de-noised for display.
+/// Thin wrapper over the shared component's resolver.
 fn entries_for_user(state: &RamaState, roles: &[String]) -> Vec<ToolEntry> {
-    let role_ids = state.rbac.role_ids_for(roles);
-    let allowed = state.rbac.allowed_tools(&role_ids, &state.tools);
-    catalog::entries(&state.tools, &allowed)
+    tool_toggles::entries_for_roles(state, roles)
 }
 
 // ---------------------------------------------------------------------------
@@ -133,8 +143,9 @@ pub async fn tools_toggle(State(state): State<Arc<RamaState>>, req: Request) -> 
         return toast(FlashKind::Error, "could not save preference");
     }
 
-    let selector = format!("#tool-row-{}", entry.key);
-    let row_html = render_tool_row(&entry, enabled).to_string();
+    let ctx = toggle_ctx();
+    let selector = format!("#{}", ctx.row_id(&entry.key));
+    let row_html = tool_toggles::render_toggle_row(&entry, enabled, &ctx).to_string();
     let verb = if enabled { "enabled" } else { "disabled" };
     sse_response(&[
         sse_patch(Some(&selector), Some("outer"), &row_html),
@@ -153,10 +164,9 @@ fn render_tools_body(
     disabled: &HashSet<String>,
     geo_label: Option<&str>,
 ) -> Html {
-    // Section order follows `Category::order`; `catalog::entries`
-    // already sorts entries that way, so we just walk and break on
-    // category change.
-    let groups = group_by_category(entries);
+    // The grouped category cards come from the shared `tool_toggles`
+    // component — the same list the per-token panel on /tokens renders.
+    let sections = tool_toggles::render_toggle_sections(entries, disabled, &toggle_ctx());
     html! {
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
         h1(class: "text-2xl font-bold mb-2") { "Tools" }
@@ -176,18 +186,7 @@ fn render_tools_body(
                 }
             }
         }
-        for (category, rows) in groups.iter() {
-            section(class: "card border border-base-300 mb-6") {
-                div(class: "card-body") {
-                    h2(class: "card-title text-base") { (category.label()) }
-                    div(class: "flex flex-col divide-y divide-base-300") {
-                        for entry in rows.iter() {
-                            (render_tool_row(entry, !disabled.contains(&entry.key)))
-                        }
-                    }
-                }
-            }
-        }
+        (sections)
         }
     }
     .to_html()
@@ -226,73 +225,6 @@ fn render_location_card(status: &str) -> Html {
                     span(class: "text-xs text-base-content/60", "data-geo-status": "") {
                         (status)
                     }
-                }
-            }
-        }
-    }
-    .to_html()
-}
-
-/// Split the (already category-sorted) entries into contiguous groups,
-/// preserving order. Returns `(category, entries)` pairs.
-fn group_by_category(entries: &[ToolEntry]) -> Vec<(Category, Vec<ToolEntry>)> {
-    let mut groups: Vec<(Category, Vec<ToolEntry>)> = Vec::new();
-    for entry in entries {
-        match groups.last_mut() {
-            Some((cat, rows)) if *cat == entry.category => rows.push(entry.clone()),
-            _ => groups.push((entry.category, vec![entry.clone()])),
-        }
-    }
-    groups
-}
-
-/// One tool row: a human title with the underlying function name as a
-/// subtle mono badge, the plain-language description below, and a
-/// daisyUI toggle on the right. The toggle is a checkbox inside a form
-/// that `@post`s on change; the SSE response swaps this same row back
-/// in with the persisted state.
-fn render_tool_row(entry: &ToolEntry, enabled: bool) -> Html {
-    let row_id = format!("tool-row-{}", entry.key);
-    let title = entry.title.clone();
-    let tech = entry.tech.clone();
-    let description = entry.description.clone();
-    let key = entry.key.clone();
-    // Datastar: serialise + POST the form on toggle, apply the SSE
-    // patch in place. `action` stays as the no-JS fallback.
-    let directive = "@post('/tools/toggle', {contentType: 'form'})";
-    html! {
-        div(id: (row_id), class: "flex items-center gap-4 py-3") {
-            div(class: "flex-1 min-w-0") {
-                div(class: "flex items-baseline gap-2 flex-wrap") {
-                    span(class: "text-sm font-medium text-base-content") { (title) }
-                    code(class: "text-xs text-base-content/50 font-mono") { (tech) }
-                }
-                div(class: "text-xs text-base-content/60 mt-0.5") { (description) }
-            }
-            form(
-                action: "/tools/toggle",
-                method: "post",
-                class: "m-0",
-                "data-on:change__prevent": (directive)
-            ) {
-                input(type: "hidden", name: "tool_key", value: (key));
-                if enabled {
-                    input(
-                        type: "checkbox",
-                        name: "enabled",
-                        value: "true",
-                        class: "toggle toggle-primary",
-                        checked: "checked",
-                        "aria-label": "Toggle tool"
-                    );
-                } else {
-                    input(
-                        type: "checkbox",
-                        name: "enabled",
-                        value: "true",
-                        class: "toggle toggle-primary",
-                        "aria-label": "Toggle tool"
-                    );
                 }
             }
         }

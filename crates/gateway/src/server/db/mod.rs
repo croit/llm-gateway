@@ -17,6 +17,7 @@ pub mod chat_session_tools;
 pub mod cli_logins;
 pub mod model_defaults;
 pub mod rag;
+pub mod token_tool_prefs;
 pub mod tokens;
 pub mod user_memories;
 pub mod user_tool_prefs;

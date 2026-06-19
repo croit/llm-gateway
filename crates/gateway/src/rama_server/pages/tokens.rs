@@ -10,6 +10,7 @@
 //! Shared chrome (layout, SSE framing, toast types, session gate)
 //! lives in the parent `pages` module and is imported via `super`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
@@ -19,8 +20,9 @@ use rama::http::{Request, Response};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use super::tool_toggles::{self, ToggleCtx};
 use super::{
-    NavItem, fetch_sidebar_chat, internal_error_html, is_admin, nav_or_html_page,
+    NavItem, fetch_sidebar_chat, internal_error_html, is_admin, nav_or_html_page, read_form,
     require_session_or_redirect,
 };
 use session_core::chrome::{
@@ -31,8 +33,18 @@ use session_core::icons;
 
 use crate::rama_server::state::RamaState;
 use crate::server::auth::token;
-use crate::server::db::tokens;
 use crate::server::db::users::User;
+use crate::server::db::{token_tool_prefs, tokens};
+use crate::server::tools::catalog::ToolEntry;
+
+/// Where a per-token capability toggle posts + how its rows are
+/// namespaced (one list per token, so DOM ids can't collide).
+fn token_toggle_ctx(token_id: &str) -> ToggleCtx {
+    ToggleCtx {
+        post_path: format!("/tokens/{token_id}/tools/toggle"),
+        row_id_prefix: format!("token-{token_id}-toolrow"),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tokens
@@ -61,7 +73,17 @@ pub async fn tokens_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         }
     };
     let account = AccountSummary::new(&user, &state.rbac.role_ids_for(&user.roles));
-    let body = render_tokens_body(&list, None, &account);
+    // The capability catalog is the same for every token (it's the
+    // user's role grants); each token carries its own disabled set.
+    let entries = tool_toggles::entries_for_roles(&state, &user.roles);
+    let mut rows: Vec<(TokenRowData, HashSet<String>)> = Vec::with_capacity(list.len());
+    for t in &list {
+        let disabled = token_tool_prefs::disabled_for_token(&state.db, &t.id)
+            .await
+            .unwrap_or_default();
+        rows.push((TokenRowData::from(t), disabled));
+    }
+    let body = render_tokens_body(&rows, &entries, None, &account);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     nav_or_html_page(
         datastar,
@@ -128,6 +150,9 @@ pub async fn tokens_create(State(state): State<Arc<RamaState>>, req: Request) ->
         last_used_at: None,
         expires_at,
         revoked_at: None,
+        // Tool use is opt-in; a freshly minted token starts off and the
+        // user flips it on via the per-token panel below.
+        tools_enabled: false,
     };
     if let Err(err) = tokens::insert(&state.db, &row).await {
         tracing::warn!(error = %err, "storing token");
@@ -140,8 +165,11 @@ pub async fn tokens_create(State(state): State<Arc<RamaState>>, req: Request) ->
     //   2. Replace `#token-minted-banner` with the filled banner.
     //   3. Reset the create form so the next mint starts clean.
     //   4. Append a success toast.
+    let entries = tool_toggles::entries_for_roles(&state, &user.roles);
     let row_data = TokenRowData::from(&row);
-    let row_html = render_token_row(&row_data).to_string();
+    // A brand-new token has no disabled keys yet (and tool use is off, so
+    // the panel renders collapsed regardless).
+    let row_html = render_token_row(&row_data, &entries, &HashSet::new()).to_string();
     let banner_html = render_minted_banner(&MintedBanner {
         name: row.name.clone(),
         plaintext,
@@ -158,17 +186,21 @@ pub async fn tokens_create(State(state): State<Arc<RamaState>>, req: Request) ->
     ])
 }
 
-/// Helper: the active variant of a row, rendered fresh from the DB so
-/// we never drift between what the page initially showed and what
-/// `tokens_revoke` patches in.
+/// Helper: a token row rendered fresh from the DB (row line + its tool
+/// panel) so we never drift between what the page initially showed and
+/// what an SSE patch swaps in. `roles` resolves the capability catalog.
 async fn render_row_after_state_change(
     state: &RamaState,
-    user_id: &str,
+    user: &User,
     token_id: &str,
 ) -> Option<String> {
-    let list = tokens::list_for_user(&state.db, user_id).await.ok()?;
+    let list = tokens::list_for_user(&state.db, &user.id).await.ok()?;
     let token = list.iter().find(|t| t.id == token_id)?;
-    Some(render_token_row(&TokenRowData::from(token)).to_string())
+    let entries = tool_toggles::entries_for_roles(state, &user.roles);
+    let disabled = token_tool_prefs::disabled_for_token(&state.db, token_id)
+        .await
+        .unwrap_or_default();
+    Some(render_token_row(&TokenRowData::from(token), &entries, &disabled).to_string())
 }
 
 /// POST /tokens/{id}/revoke — form action from the row's Revoke
@@ -185,7 +217,7 @@ pub async fn tokens_revoke(
     };
     match tokens::revoke(&state.db, &user.id, &token_id).await {
         Ok(true) => {
-            let Some(row_html) = render_row_after_state_change(&state, &user.id, &token_id).await
+            let Some(row_html) = render_row_after_state_change(&state, &user, &token_id).await
             else {
                 return sse_toast_response(FlashKind::Error, "Revoked token not found.");
             };
@@ -236,6 +268,113 @@ pub async fn tokens_delete(
             sse_toast_response(FlashKind::Error, "Remove failed.")
         }
     }
+}
+
+/// Form body for the per-token master "tool use" switch. `enabled` is
+/// present (checkbox checked) or absent — same convergence trick as the
+/// `/tools` page.
+#[derive(Deserialize)]
+struct MasterForm {
+    enabled: Option<String>,
+}
+
+/// Form body for one per-token capability toggle.
+#[derive(Deserialize)]
+struct ToolToggleForm {
+    tool_key: String,
+    enabled: Option<String>,
+}
+
+/// True if `token_id` belongs to `user_id` (any state — we only gate
+/// writes on ownership, not on revoked/expired).
+async fn owns_token(state: &RamaState, user_id: &str, token_id: &str) -> bool {
+    tokens::list_for_user(&state.db, user_id)
+        .await
+        .map(|list| list.iter().any(|t| t.id == token_id))
+        .unwrap_or(false)
+}
+
+/// POST /tokens/{id}/tools/master — flip a token's master "tool use"
+/// switch. Re-renders the whole row so the capability panel appears /
+/// disappears with the switch.
+pub async fn tokens_tools_master(
+    State(state): State<Arc<RamaState>>,
+    Path(token_id): Path<String>,
+    req: Request,
+) -> Response {
+    let (_, user) = match require_session_or_redirect(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let (_, body) = req.into_parts();
+    let form: MasterForm = match read_form(body).await {
+        Ok(f) => f,
+        Err(resp) => return resp,
+    };
+    let enabled = form.enabled.is_some();
+    match tokens::set_tools_enabled(&state.db, &user.id, &token_id, enabled).await {
+        Ok(true) => {}
+        Ok(false) => return sse_toast_response(FlashKind::Error, "Token not found."),
+        Err(err) => {
+            tracing::warn!(error = %err, %token_id, "set tools_enabled");
+            return sse_toast_response(FlashKind::Error, "Could not update token.");
+        }
+    }
+    let Some(row_html) = render_row_after_state_change(&state, &user, &token_id).await else {
+        return sse_toast_response(FlashKind::Error, "Token not found.");
+    };
+    let selector = format!("#token-row-{token_id}");
+    let verb = if enabled { "enabled" } else { "disabled" };
+    sse_response(&[
+        sse_patch(Some(&selector), Some("outer"), &row_html),
+        sse_toast(&Flash {
+            kind: FlashKind::Success,
+            message: format!("Tool use {verb} for this token."),
+        }),
+    ])
+}
+
+/// POST /tokens/{id}/tools/toggle — flip one capability for a token.
+/// Patches just that capability's row in place.
+pub async fn tokens_tools_toggle(
+    State(state): State<Arc<RamaState>>,
+    Path(token_id): Path<String>,
+    req: Request,
+) -> Response {
+    let (_, user) = match require_session_or_redirect(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let (_, body) = req.into_parts();
+    let form: ToolToggleForm = match read_form(body).await {
+        Ok(f) => f,
+        Err(resp) => return resp,
+    };
+    if !owns_token(&state, &user.id, &token_id).await {
+        return sse_toast_response(FlashKind::Error, "Token not found.");
+    }
+    // Only a key the user's roles actually expose can be toggled — the
+    // panel never offers others, so a request for one is bogus.
+    let entries = tool_toggles::entries_for_roles(&state, &user.roles);
+    let Some(entry) = entries.iter().find(|e| e.key == form.tool_key) else {
+        return sse_toast_response(FlashKind::Error, "Unknown tool.");
+    };
+    let enabled = form.enabled.is_some();
+    if let Err(err) = token_tool_prefs::set(&state.db, &token_id, &entry.key, enabled).await {
+        tracing::warn!(error = %err, %token_id, tool_key = %entry.key, "token tool pref save");
+        return sse_toast_response(FlashKind::Error, "Could not save preference.");
+    }
+    let ctx = token_toggle_ctx(&token_id);
+    let selector = format!("#{}", ctx.row_id(&entry.key));
+    let row_html = tool_toggles::render_toggle_row(entry, enabled, &ctx).to_string();
+    let verb = if enabled { "enabled" } else { "disabled" };
+    sse_response(&[
+        sse_patch(Some(&selector), Some("outer"), &row_html),
+        sse_toast(&Flash {
+            kind: FlashKind::Success,
+            message: format!("{} {} for this token.", entry.title, verb),
+        }),
+    ])
 }
 
 struct MintedBanner {
@@ -304,11 +443,11 @@ fn render_account_section(account: &AccountSummary) -> Html {
 }
 
 fn render_tokens_body(
-    list: &[tokens::Token],
+    rows: &[(TokenRowData, HashSet<String>)],
+    entries: &[ToolEntry],
     minted: Option<&MintedBanner>,
     account: &AccountSummary,
 ) -> Html {
-    let rows: Vec<TokenRowData> = list.iter().map(TokenRowData::from).collect();
     // The banner is either the rendered minted-card or an empty
     // placeholder that the create handler can patch in via SSE
     // (`mode outer` on `#token-minted-banner`).
@@ -387,8 +526,8 @@ fn render_tokens_body(
                     id: "token-list",
                     class: "token-list flex flex-col divide-y divide-base-300"
                 ) {
-                    for r in rows.iter() {
-                        (render_token_row(r))
+                    for (r, disabled) in rows.iter() {
+                        (render_token_row(r, entries, disabled))
                     }
                 }
                 p(class: "token-list-empty text-base-content/60 text-sm") {
@@ -413,6 +552,8 @@ struct TokenRowData {
     revoked: bool,
     revoke_action: String,
     delete_action: String,
+    /// Master "tool use" switch state — drives the per-token tool panel.
+    tools_enabled: bool,
 }
 
 impl TokenRowData {
@@ -449,17 +590,95 @@ impl From<&tokens::Token> for TokenRowData {
             revoked,
             revoke_action: format!("/tokens/{}/revoke", t.id),
             delete_action: format!("/tokens/{}/delete", t.id),
+            tools_enabled: t.tools_enabled,
         }
     }
 }
 
+/// Datastar directive for the master "tool use" switch form.
+fn master_directive(token_id: &str) -> String {
+    format!("@post('/tokens/{token_id}/tools/master', {{contentType: 'form'}})")
+}
+
+/// The per-token tool controls shown under an active token: a master
+/// "tool use" switch and, when on, the capability toggle list (the same
+/// grouped component the `/tools` page renders). Tokens start with tool
+/// use off, so the capability list is hidden until the owner opts in.
+fn render_token_tools_panel(
+    token_id: &str,
+    tools_enabled: bool,
+    entries: &[ToolEntry],
+    disabled: &HashSet<String>,
+) -> Html {
+    let master_action = format!("/tokens/{token_id}/tools/master");
+    let directive = master_directive(token_id);
+    let sections = if tools_enabled {
+        Some(tool_toggles::render_toggle_sections(
+            entries,
+            disabled,
+            &token_toggle_ctx(token_id),
+        ))
+    } else {
+        None
+    };
+    html! {
+        div(class: "mt-3 pl-1") {
+            form(
+                action: (master_action),
+                method: "post",
+                class: "m-0 flex items-center gap-3",
+                "data-on:change__prevent": (directive)
+            ) {
+                if tools_enabled {
+                    input(
+                        type: "checkbox",
+                        name: "enabled",
+                        value: "true",
+                        class: "toggle toggle-primary toggle-sm",
+                        checked: "checked",
+                        "aria-label": "Tool use"
+                    );
+                } else {
+                    input(
+                        type: "checkbox",
+                        name: "enabled",
+                        value: "true",
+                        class: "toggle toggle-primary toggle-sm",
+                        "aria-label": "Tool use"
+                    );
+                }
+                span(class: "text-sm font-medium text-base-content") { "Tool use" }
+                span(class: "text-xs text-base-content/60") {
+                    "Let this token call gateway tools (web search, RAG, …)."
+                }
+            }
+            if let Some(sections) = &sections {
+                details(class: "mt-2") {
+                    summary(class: "text-sm text-base-content/70 cursor-pointer select-none") {
+                        "Capabilities"
+                    }
+                    div(class: "mt-2") { (sections) }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
 /// Single row in the token list. Single source of truth for both the
 /// initial page render and the datastar SSE patches that surgically
-/// swap (revoke) or replace (active ↔ revoked) a row in place.
-fn render_token_row(r: &TokenRowData) -> Html {
+/// swap (revoke) or replace (active ↔ revoked) a row in place. Active
+/// tokens carry a per-token tool panel below the row line; `entries` is
+/// the capability catalog and `disabled` this token's off keys.
+fn render_token_row(r: &TokenRowData, entries: &[ToolEntry], disabled: &HashSet<String>) -> Html {
     let dom_id = r.dom_id();
+    // A revoked token can't authenticate, so its tool config is moot — no
+    // panel there.
+    let panel =
+        (!r.revoked).then(|| render_token_tools_panel(&r.id, r.tools_enabled, entries, disabled));
     html! {
-        li(id: (dom_id), class: "flex items-center gap-4 py-3") {
+        li(id: (dom_id), class: "py-3") {
+        div(class: "flex items-center gap-4") {
             div(class: "flex-1 min-w-0") {
                 div(class: "text-sm font-medium text-base-content") {
                     (r.name.clone())
@@ -508,6 +727,10 @@ fn render_token_row(r: &TokenRowData) -> Html {
                     ) { "Revoke" }
                 }
             }
+        }
+        if let Some(panel) = &panel {
+            (panel)
+        }
         }
     }
     .to_html()

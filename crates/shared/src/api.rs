@@ -34,6 +34,14 @@ pub struct TokenSummary {
     pub last_used_at: Option<Timestamp>,
     pub expires_at: Timestamp,
     pub revoked: bool,
+    /// Master "tool use" switch — `false` (the default) means this token
+    /// gets no gateway tools (pure passthrough).
+    #[serde(default)]
+    pub tools_enabled: bool,
+    /// Toggle keys this token has explicitly disabled (only meaningful
+    /// when `tools_enabled`). A capability not listed is on by default.
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +49,25 @@ pub struct CreateTokenRequest {
     pub name: String,
     /// Token lifetime in days. Falls back to the server's default if missing.
     pub ttl_days: Option<i64>,
+    /// Whether the new token may use gateway tools at all. Defaults to
+    /// `false` (off) — a token is born without tool access until opted in.
+    #[serde(default)]
+    pub tools_enabled: Option<bool>,
+    /// Toggle keys to disable up-front (only meaningful when
+    /// `tools_enabled`). Lets a caller mint a locked-down token in one
+    /// call, e.g. `["rag_search"]` for a "no RAG" token.
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+}
+
+/// Set a token's tool configuration wholesale — the master switch plus
+/// the full set of disabled toggle keys. Replaces any previous per-token
+/// tool prefs. Backs `PUT /api/v0/tokens/{id}/tools`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateTokenToolsRequest {
+    pub tools_enabled: bool,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

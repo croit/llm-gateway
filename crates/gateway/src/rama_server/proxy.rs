@@ -76,9 +76,11 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
         );
     };
 
-    let allowed_tools = state
-        .allowed_tools_for_user(&user.roles, &user.user_id)
-        .await;
+    // Per-token resolution: RBAC − the user's global /tools toggles −
+    // this token's disabled capabilities, gated behind the token's master
+    // "tool use" switch (off by default → empty → byte-dumb passthrough
+    // below). One call covers buffered, streaming, and passthrough.
+    let allowed_tools = state.allowed_tools_for_token(&user).await;
 
     // Apply admin-configured sampling defaults for the named model
     // before either branch consumes the body. Client keys win

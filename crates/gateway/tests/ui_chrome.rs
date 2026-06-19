@@ -145,6 +145,7 @@ async fn revoke_returns_sse_with_row_swap_and_toast() {
             last_used_at: None,
             expires_at: now + SignedDuration::from_hours(1),
             revoked_at: None,
+            tools_enabled: true,
         },
     )
     .await

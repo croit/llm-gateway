@@ -331,6 +331,9 @@ pub async fn seed_user_with_token(state: &RamaState, user_id: &str) -> String {
             last_used_at: None,
             expires_at: now + SignedDuration::from_hours(1),
             revoked_at: None,
+            // Test tokens have tool use on so the gateway-tool paths the
+            // proxy/tool tests exercise are actually reachable.
+            tools_enabled: true,
         },
     )
     .await

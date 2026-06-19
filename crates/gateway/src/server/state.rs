@@ -72,6 +72,37 @@ impl AppState {
         allowed
     }
 
+    /// The tool ids an **API token** may use this request — the per-token
+    /// overlay on top of [`Self::allowed_tools_for_user`]:
+    ///
+    /// ```text
+    /// effective = (rbac_allowed − user_global_disabled − token_disabled)  if tools_enabled
+    ///           = ∅                                                       otherwise (DEFAULT)
+    /// ```
+    ///
+    /// The master `tools_enabled` flag defaults off, so a token sees no
+    /// gateway tools until its owner opts in; an empty result makes the
+    /// proxy take its byte-dumb 1:1 passthrough. Once on, the
+    /// `token_tool_prefs` rows subtract individual capabilities (same
+    /// toggle-key semantics as the `/tools` page). RBAC + the user's
+    /// global toggles stay the outer bound — a token can only ever
+    /// *narrow*, never grant. A DB hiccup on the per-token lookup degrades
+    /// to "nothing disabled" rather than failing the request. This is the
+    /// single home every bearer (`/v1`) path resolves through, so buffered,
+    /// streaming, and passthrough can't drift.
+    pub async fn allowed_tools_for_token(&self, ctx: &crate::server::auth::UserCtx) -> Vec<String> {
+        if !ctx.tools_enabled {
+            return Vec::new();
+        }
+        let mut allowed = self.allowed_tools_for_user(&ctx.roles, &ctx.user_id).await;
+        let disabled =
+            crate::server::db::token_tool_prefs::disabled_for_token(&self.db, &ctx.token_id)
+                .await
+                .unwrap_or_default();
+        crate::server::tools::catalog::retain_enabled(&mut allowed, &disabled);
+        allowed
+    }
+
     /// The tool ids to inject for a turn **in a given conversation**: the
     /// per-user grant from [`Self::allowed_tools_for_user`], narrowed to
     /// `enable_tools` (the always-on bootstrap) plus whatever groups this
@@ -129,5 +160,138 @@ impl AppState {
     pub fn with_indexer(mut self, indexer: Indexer) -> Self {
         self.indexer = Some(indexer);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::auth::UserCtx;
+    use crate::server::config::Config;
+    use crate::server::db::{self, token_tool_prefs};
+    use crate::server::rbac::config::{RbacConfig, RoleConfig};
+    use crate::server::tools::search_web::SearchWeb;
+    use crate::server::tools::time::CurrentTimestamp;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    /// AppState whose single role grants `*` (every registered tool), with
+    /// a couple of easy-to-build tools registered. Enough to exercise the
+    /// per-token gate without a live upstream.
+    async fn star_state() -> AppState {
+        let db = db::open(Path::new(":memory:")).await.unwrap();
+        let upstreams = UpstreamRegistry::new(&HashMap::new()).unwrap();
+        let tools = Arc::new(ToolRegistry::new().with(SearchWeb).with(CurrentTimestamp));
+        let role = RoleConfig {
+            id: "all".into(),
+            models: vec!["*".into()],
+            tools: vec!["*".into()],
+        };
+        let rbac = Arc::new(
+            Resolver::build(
+                RbacConfig {
+                    default_role: Some("all".into()),
+                    mappings: vec![],
+                },
+                vec![role],
+            )
+            .unwrap(),
+        );
+        AppState::new(Config::default(), db, upstreams, tools, rbac)
+    }
+
+    fn ctx(token_id: &str, tools_enabled: bool) -> UserCtx {
+        UserCtx {
+            user_id: "alice".into(),
+            token_id: token_id.into(),
+            roles: vec![], // empty → default role "all" applies
+            tools_enabled,
+        }
+    }
+
+    /// Seed a user + token so `token_tool_prefs` (FK to tokens) can hold
+    /// rows for `token_id`.
+    async fn seed_token(state: &AppState, token_id: &str) {
+        let now = jiff::Timestamp::now();
+        db::users::upsert(
+            &state.db,
+            &db::users::User {
+                id: "alice".into(),
+                email: "alice@example.com".into(),
+                name: None,
+                roles: vec![],
+                created_at: now,
+                updated_at: now,
+                timezone: None,
+            },
+        )
+        .await
+        .unwrap();
+        db::tokens::insert(
+            &state.db,
+            &db::tokens::Token {
+                id: token_id.into(),
+                user_id: "alice".into(),
+                name: token_id.into(),
+                hash: format!("hash-{token_id}"),
+                created_at: now,
+                last_used_at: None,
+                expires_at: now + jiff::SignedDuration::from_hours(24),
+                revoked_at: None,
+                tools_enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn master_off_yields_no_tools() {
+        let state = star_state().await;
+        // Default for a token is off → empty → proxy takes byte-dumb path.
+        assert!(
+            state
+                .allowed_tools_for_token(&ctx("tok", false))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn master_on_with_no_prefs_grants_the_full_user_set() {
+        let state = star_state().await;
+        let got = state.allowed_tools_for_token(&ctx("tok", true)).await;
+        assert!(got.contains(&"search_web".to_string()));
+        assert!(got.contains(&"get_current_timestamp".to_string()));
+    }
+
+    #[tokio::test]
+    async fn master_on_subtracts_a_disabled_capability() {
+        let state = star_state().await;
+        seed_token(&state, "tok").await;
+        token_tool_prefs::set(&state.db, "tok", "search_web", false)
+            .await
+            .unwrap();
+        let got = state.allowed_tools_for_token(&ctx("tok", true)).await;
+        assert!(
+            !got.contains(&"search_web".to_string()),
+            "disabled key removed"
+        );
+        assert!(
+            got.contains(&"get_current_timestamp".to_string()),
+            "siblings kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_prefs_are_scoped_per_token() {
+        // Disabling on one token must not leak to another.
+        let state = star_state().await;
+        seed_token(&state, "tok-a").await;
+        token_tool_prefs::set(&state.db, "tok-a", "search_web", false)
+            .await
+            .unwrap();
+        let other = state.allowed_tools_for_token(&ctx("tok-b", true)).await;
+        assert!(other.contains(&"search_web".to_string()));
     }
 }

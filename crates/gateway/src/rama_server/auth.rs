@@ -58,6 +58,7 @@ pub async fn require_bearer(state: &RamaState, headers: &HeaderMap) -> Result<Us
         user_id: user.id,
         token_id: token_row.id,
         roles: user.roles,
+        tools_enabled: token_row.tools_enabled,
     })
 }
 

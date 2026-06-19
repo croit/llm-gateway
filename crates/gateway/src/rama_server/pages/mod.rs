@@ -776,8 +776,17 @@ pub use chat::{
 // CRUD handlers, the list + row + minted-banner renderers all live in
 // `tokens.rs`. Re-export the four handler entry points so the router
 // continues to call `pages::tokens_index` etc. without any change.
+// Reusable tool on/off toggle list shared by /tools and the /tokens
+// per-token panel (`tool_toggles`). The resolver helpers are re-exported
+// so the JSON token API can validate toggle keys against the same source.
+mod tool_toggles;
+pub use tool_toggles::{entries_for_roles, valid_keys};
+
 mod tokens;
-pub use tokens::{tokens_create, tokens_delete, tokens_index, tokens_revoke};
+pub use tokens::{
+    tokens_create, tokens_delete, tokens_index, tokens_revoke, tokens_tools_master,
+    tokens_tools_toggle,
+};
 
 // ---------------------------------------------------------------------------
 // Tools

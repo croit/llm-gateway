@@ -268,6 +268,9 @@ async fn seed_admin_with_bearer(state: &RamaState, user_id: &str) -> String {
             last_used_at: None,
             expires_at: Timestamp::now() + SignedDuration::from_hours(1),
             revoked_at: None,
+            // Tool use on so the per-user pref subtraction is observable on
+            // the proxy tool path.
+            tools_enabled: true,
         },
     )
     .await
@@ -397,4 +400,173 @@ async fn disabling_memory_drops_both_remember_and_recall() {
     );
     // A sibling tool is unaffected.
     assert!(tool_names.contains(&"search_web"));
+}
+
+// ---------------------------------------------------------------------------
+// Per-token tool gating (the master switch + per-token disable keys).
+
+/// Seed an `admin` user + a bearer with an explicit `tools_enabled`
+/// state, returning `(plaintext, token_id)` so the test can set
+/// per-token prefs against the id.
+async fn seed_bearer_with_tools(
+    state: &RamaState,
+    user_id: &str,
+    tools_enabled: bool,
+) -> (String, String) {
+    use gateway::server::auth::token;
+    use gateway::server::db::tokens;
+    let _ = seed_session_with_roles(state, user_id, &["admin"]).await;
+    let (plaintext, hash) = token::mint();
+    let id = Uuid::new_v4().to_string();
+    tokens::insert(
+        &state.db,
+        &tokens::Token {
+            id: id.clone(),
+            user_id: user_id.into(),
+            name: "test".into(),
+            hash,
+            created_at: Timestamp::now(),
+            last_used_at: None,
+            expires_at: Timestamp::now() + SignedDuration::from_hours(1),
+            revoked_at: None,
+            tools_enabled,
+        },
+    )
+    .await
+    .unwrap();
+    (plaintext, id)
+}
+
+fn plain_reply_mock() -> Mock {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "x",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }]
+        })))
+}
+
+/// A token with tool use **off** (the default) gets the byte-dumb
+/// passthrough: the gateway injects no `tools` and stamps no
+/// `x-gateway-tool-rounds` header, even though the user's roles grant
+/// every tool.
+#[tokio::test]
+async fn token_with_tool_use_off_gets_passthrough() {
+    let upstream = MockServer::start().await;
+    plain_reply_mock().mount(&upstream).await;
+
+    let state = Arc::new(state_with_tools(&upstream.uri()).await);
+    let (bearer, _id) = seed_bearer_with_tools(&state, "alice", false).await;
+    let app = router(state.clone());
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": "model-a", "messages": [{"role": "user", "content": "hi"}]})
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Byte-dumb path never sets this header.
+    assert!(
+        resp.headers().get("x-gateway-tool-rounds").is_none(),
+        "tool-use-off token must take the passthrough path"
+    );
+
+    let requests = upstream.received_requests().await.unwrap();
+    let forwarded: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(
+        forwarded.get("tools").is_none(),
+        "no gateway tools should be injected, got: {forwarded}"
+    );
+}
+
+/// Same user, a token with tool use **on**: gateway tools are injected.
+/// Flipping the master switch is what gates the whole feature.
+#[tokio::test]
+async fn token_with_tool_use_on_injects_gateway_tools() {
+    let upstream = MockServer::start().await;
+    plain_reply_mock().mount(&upstream).await;
+
+    let state = Arc::new(state_with_tools(&upstream.uri()).await);
+    let (bearer, _id) = seed_bearer_with_tools(&state, "alice", true).await;
+    let app = router(state.clone());
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": "model-a", "messages": [{"role": "user", "content": "hi"}]})
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let requests = upstream.received_requests().await.unwrap();
+    let forwarded: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let tool_names: Vec<&str> = forwarded["tools"]
+        .as_array()
+        .expect("tool-use-on token gets a tools array")
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(tool_names.contains(&"search_web"), "got: {tool_names:?}");
+}
+
+/// A per-token disabled capability is dropped from the upstream request
+/// while the token's other tools remain — the "no RAG token" shape.
+#[tokio::test]
+async fn per_token_disabled_capability_is_not_injected() {
+    let upstream = MockServer::start().await;
+    plain_reply_mock().mount(&upstream).await;
+
+    let state = Arc::new(state_with_tools(&upstream.uri()).await);
+    let (bearer, id) = seed_bearer_with_tools(&state, "alice", true).await;
+    // This token alone drops search_web (stand-in for a "no RAG" token).
+    db::token_tool_prefs::set(&state.db, &id, "search_web", false)
+        .await
+        .unwrap();
+    let app = router(state.clone());
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": "model-a", "messages": [{"role": "user", "content": "hi"}]})
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let requests = upstream.received_requests().await.unwrap();
+    let forwarded: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let tool_names: Vec<&str> = forwarded["tools"]
+        .as_array()
+        .expect("forwarded request carries a tools array")
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(
+        !tool_names.contains(&"search_web"),
+        "per-token disabled tool must not be offered, got: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"fetch_url"),
+        "other tools still offered, got: {tool_names:?}"
+    );
 }

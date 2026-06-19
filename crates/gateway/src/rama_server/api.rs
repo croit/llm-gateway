@@ -27,13 +27,15 @@ use rama::http::{Request, Response, StatusCode, header};
 use serde_json::json;
 use shared::api::{
     CreateTokenRequest, CreateTokenResponse, DeleteResponse, Me, RevokeResponse, TokenSummary,
+    UpdateTokenToolsRequest,
 };
 use uuid::Uuid;
 
+use crate::rama_server::pages::{entries_for_roles, valid_keys};
 use crate::rama_server::session::Session;
 use crate::rama_server::state::RamaState;
 use crate::server::auth::token;
-use crate::server::db::{tokens, users};
+use crate::server::db::{token_tool_prefs, tokens, users};
 
 // ---------------------------------------------------------------------------
 // Session gate
@@ -100,7 +102,11 @@ pub async fn list_tokens(State(state): State<Arc<RamaState>>, req: Request) -> R
             return internal_error("listing tokens failed");
         }
     };
-    let out: Vec<TokenSummary> = list.into_iter().map(to_summary).collect();
+    let mut out: Vec<TokenSummary> = Vec::with_capacity(list.len());
+    for t in list {
+        let disabled = disabled_tools_for(&state, &t.id).await;
+        out.push(to_summary(t, disabled));
+    }
     json_ok(&out)
 }
 
@@ -129,6 +135,26 @@ pub async fn create_token(State(state): State<Arc<RamaState>>, req: Request) -> 
         .unwrap_or(state.config.gateway.token_ttl_days)
         .clamp(1, 365 * 5);
 
+    // Tool config (defaults: off, nothing disabled). Validate the
+    // requested disable keys against the caller's own grant so we never
+    // persist a key their roles don't expose.
+    let tools_enabled = body.tools_enabled.unwrap_or(false);
+    let user = match users::find_by_id(&state.db, &session.user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return internal_error("session references missing user"),
+        Err(err) => {
+            tracing::warn!(error = %err, "user lookup");
+            return internal_error("user lookup failed");
+        }
+    };
+    let allowed_keys = valid_keys(&entries_for_roles(&state, &user.roles));
+    let mut disabled: Vec<String> = body.disabled_tools.clone();
+    disabled.sort();
+    disabled.dedup();
+    if let Some(bad) = disabled.iter().find(|k| !allowed_keys.contains(*k)) {
+        return invalid_request(&format!("unknown tool key `{bad}`"));
+    }
+
     let now = Timestamp::now();
     let expires_at = now + SignedDuration::from_hours(24 * ttl_days);
     let (plaintext, hash) = token::mint();
@@ -141,15 +167,90 @@ pub async fn create_token(State(state): State<Arc<RamaState>>, req: Request) -> 
         last_used_at: None,
         expires_at,
         revoked_at: None,
+        tools_enabled,
     };
     if let Err(err) = tokens::insert(&state.db, &row).await {
         tracing::warn!(error = %err, "storing token");
         return internal_error("storing token failed");
     }
+    for key in &disabled {
+        if let Err(err) = token_tool_prefs::set(&state.db, &row.id, key, false).await {
+            tracing::warn!(error = %err, token_id = %row.id, tool_key = %key, "token tool pref save");
+            return internal_error("storing token tool prefs failed");
+        }
+    }
+    let summary = to_summary(row, disabled);
     json_ok(&CreateTokenResponse {
-        token: to_summary(row),
+        token: summary,
         plaintext,
     })
+}
+
+/// PUT /api/v0/tokens/{id}/tools — replace a token's tool configuration:
+/// the master switch plus the full set of disabled toggle keys. Owner-only
+/// (a non-owned id 404s); disable keys are validated against the caller's
+/// own grant. Replaces any previous per-token tool prefs.
+pub async fn update_token_tools(
+    State(state): State<Arc<RamaState>>,
+    Path(token_id): Path<String>,
+    req: Request,
+) -> Response {
+    let session = match require_session(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let (_, body) = req.into_parts();
+    let body_bytes = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return invalid_request(&msg),
+    };
+    let body: UpdateTokenToolsRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(err) => {
+            return invalid_request(&format!("body is not an UpdateTokenToolsRequest: {err}"));
+        }
+    };
+
+    let user = match users::find_by_id(&state.db, &session.user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return internal_error("session references missing user"),
+        Err(err) => {
+            tracing::warn!(error = %err, "user lookup");
+            return internal_error("user lookup failed");
+        }
+    };
+    let allowed_keys = valid_keys(&entries_for_roles(&state, &user.roles));
+    let mut disabled: Vec<String> = body.disabled_tools.clone();
+    disabled.sort();
+    disabled.dedup();
+    if let Some(bad) = disabled.iter().find(|k| !allowed_keys.contains(*k)) {
+        return invalid_request(&format!("unknown tool key `{bad}`"));
+    }
+
+    // Master switch, scoped to the owner — a non-owned/missing id is a 404.
+    match tokens::set_tools_enabled(&state.db, &session.user_id, &token_id, body.tools_enabled)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return not_found("token not found"),
+        Err(err) => {
+            tracing::warn!(error = %err, %token_id, "set tools_enabled");
+            return internal_error("updating token failed");
+        }
+    }
+
+    // Replace prefs: write an explicit on/off for every key the user can
+    // see, so a key dropped from `disabled_tools` flips back on.
+    let disabled_set: std::collections::HashSet<&String> = disabled.iter().collect();
+    for key in &allowed_keys {
+        let enabled = !disabled_set.contains(key);
+        if let Err(err) = token_tool_prefs::set(&state.db, &token_id, key, enabled).await {
+            tracing::warn!(error = %err, %token_id, tool_key = %key, "token tool pref save");
+            return internal_error("storing token tool prefs failed");
+        }
+    }
+
+    json_ok(&json!({ "ok": true, "tools_enabled": body.tools_enabled, "disabled_tools": disabled }))
 }
 
 /// POST /api/v0/tokens/{id}/revoke — flip `revoked_at` on an owned active row.
@@ -389,7 +490,7 @@ pub async fn delete_token(
 // ---------------------------------------------------------------------------
 // Shared helpers (response builders + utilities)
 
-fn to_summary(t: tokens::Token) -> TokenSummary {
+fn to_summary(t: tokens::Token, disabled_tools: Vec<String>) -> TokenSummary {
     TokenSummary {
         id: t.id,
         name: t.name,
@@ -397,7 +498,20 @@ fn to_summary(t: tokens::Token) -> TokenSummary {
         last_used_at: t.last_used_at,
         expires_at: t.expires_at,
         revoked: t.revoked_at.is_some(),
+        tools_enabled: t.tools_enabled,
+        disabled_tools,
     }
+}
+
+/// The token's disabled toggle keys, sorted for a stable response.
+async fn disabled_tools_for(state: &RamaState, token_id: &str) -> Vec<String> {
+    let mut keys: Vec<String> = token_tool_prefs::disabled_for_token(&state.db, token_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    keys.sort();
+    keys
 }
 
 /// Validate a browser-reported lat/lon pair. On success returns a
@@ -441,6 +555,10 @@ fn unauthorized(message: &str) -> Response {
 
 fn internal_error(message: &str) -> Response {
     error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+}
+
+fn not_found(message: &str) -> Response {
+    error_envelope(StatusCode::NOT_FOUND, "not_found", message)
 }
 
 fn error_envelope(status: StatusCode, code: &str, message: &str) -> Response {

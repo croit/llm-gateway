@@ -279,6 +279,9 @@ async fn finish_cli_login(state: &RamaState, cli_state: &str, user_id: &str) -> 
             last_used_at: None,
             expires_at,
             revoked_at: None,
+            // Tool use is opt-in per token; a fresh CLI token starts with
+            // gateway tools off until the owner enables it on /tokens.
+            tools_enabled: false,
         },
     )
     .await;

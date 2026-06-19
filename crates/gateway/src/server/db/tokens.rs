@@ -18,6 +18,10 @@ pub struct Token {
     pub last_used_at: Option<Timestamp>,
     pub expires_at: Timestamp,
     pub revoked_at: Option<Timestamp>,
+    /// Master "tool use" switch for this token. Default `false` (off): a
+    /// token sees gateway tools only after its owner turns this on. The
+    /// per-capability `token_tool_prefs` rows only matter when this is on.
+    pub tools_enabled: bool,
 }
 
 /// What the UI sees about a token — never includes `hash` or plaintext.
@@ -66,6 +70,7 @@ fn map_row(row: &SqliteRow) -> Result<Token, DbError> {
     let last_used_at_s: Option<String> = row.try_get("last_used_at")?;
     let expires_at_s: String = row.try_get("expires_at")?;
     let revoked_at_s: Option<String> = row.try_get("revoked_at")?;
+    let tools_enabled: i64 = row.try_get("tools_enabled")?;
 
     Ok(Token {
         id,
@@ -86,14 +91,15 @@ fn map_row(row: &SqliteRow) -> Result<Token, DbError> {
                 source: e.into(),
             })?,
         revoked_at: parse_optional_ts(revoked_at_s, "revoked_at")?,
+        tools_enabled: tools_enabled != 0,
     })
 }
 
 pub async fn insert(pool: &Pool, t: &Token) -> Result<(), DbError> {
     sqlx::query(
         r#"INSERT INTO tokens
-               (id, user_id, name, hash, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?)"#,
+               (id, user_id, name, hash, created_at, expires_at, tools_enabled)
+           VALUES (?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(&t.id)
     .bind(&t.user_id)
@@ -101,9 +107,33 @@ pub async fn insert(pool: &Pool, t: &Token) -> Result<(), DbError> {
     .bind(&t.hash)
     .bind(t.created_at.to_string())
     .bind(t.expires_at.to_string())
+    .bind(i64::from(t.tools_enabled))
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Flip a token's master "tool use" switch. Scoped by `user_id` so a
+/// caller can only ever change their own token. Returns `Ok(false)` if
+/// no row matched (didn't exist or wrong owner).
+pub async fn set_tools_enabled(
+    pool: &Pool,
+    user_id: &str,
+    token_id: &str,
+    enabled: bool,
+) -> Result<bool, DbError> {
+    let result = sqlx::query(
+        r#"UPDATE tokens
+              SET tools_enabled = ?
+            WHERE id = ?
+              AND user_id = ?"#,
+    )
+    .bind(i64::from(enabled))
+    .bind(token_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Look up a token by its SHA-256 hash. Returns None for missing, revoked, or
@@ -223,6 +253,7 @@ mod tests {
             last_used_at: None,
             expires_at: now + jiff::SignedDuration::from_hours(24),
             revoked_at: None,
+            tools_enabled: false,
         }
     }
 
@@ -351,6 +382,80 @@ mod tests {
         let list = list_for_user(&pool, &uid).await.unwrap();
         let ids: Vec<&str> = list.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["t-c", "t-b", "t-a"]);
+    }
+
+    #[tokio::test]
+    async fn tools_enabled_defaults_off_and_round_trips() {
+        let (pool, uid) = setup().await;
+        // Born off.
+        let mut t = fixture(&uid, "t-tools", "hash-tools");
+        assert!(!t.tools_enabled);
+        insert(&pool, &t).await.unwrap();
+        let got = find_active_by_hash(&pool, "hash-tools")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!got.tools_enabled, "default is off");
+
+        // Flip on, scoped to the owner.
+        assert!(
+            set_tools_enabled(&pool, &uid, "t-tools", true)
+                .await
+                .unwrap()
+        );
+        let got = find_active_by_hash(&pool, "hash-tools")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got.tools_enabled);
+
+        // A non-owner can't flip it.
+        assert!(
+            !set_tools_enabled(&pool, "other-user", "t-tools", false)
+                .await
+                .unwrap()
+        );
+
+        // Inserting a token born-on also round-trips.
+        t.id = "t-tools-on".into();
+        t.hash = "hash-tools-on".into();
+        t.tools_enabled = true;
+        insert(&pool, &t).await.unwrap();
+        assert!(
+            find_active_by_hash(&pool, "hash-tools-on")
+                .await
+                .unwrap()
+                .unwrap()
+                .tools_enabled
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_token_cascades_its_tool_prefs() {
+        use super::super::token_tool_prefs;
+        let (pool, uid) = setup().await;
+        let t = fixture(&uid, "t-casc", "hash-casc");
+        insert(&pool, &t).await.unwrap();
+        token_tool_prefs::set(&pool, "t-casc", "rag_search", false)
+            .await
+            .unwrap();
+        assert!(
+            !token_tool_prefs::disabled_for_token(&pool, "t-casc")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(revoke(&pool, &uid, "t-casc").await.unwrap());
+        assert!(delete_if_revoked(&pool, &uid, "t-casc").await.unwrap());
+
+        // FK ON DELETE CASCADE dropped the prefs along with the token.
+        assert!(
+            token_tool_prefs::disabled_for_token(&pool, "t-casc")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
