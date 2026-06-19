@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+
 // Copyright (C) 2026 croit GmbH
 
 //! Dev / playwright harness: spins up the FULL rama gateway against an
@@ -23,12 +24,15 @@
 //! convenience.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gateway::rama_server::{RamaState, SessionStore, router};
+use gateway::server::config::SkillsConfig;
 use gateway::server::rbac::RoleConfig;
 use gateway::server::rbac::{Resolver, config::RbacConfig};
-use gateway::server::tools::{ToolRegistry, echo, fetch_url, search_web, time};
+use gateway::server::skills::SkillStore;
+use gateway::server::tools::{ToolRegistry, echo, fetch_url, read_skill, search_web, time};
 use gateway::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
@@ -170,40 +174,52 @@ async fn main() -> anyhow::Result<()> {
     // first chat-page render lands on empty dropdowns until the
     // looping probe catches up 5 s later.
     upstreams::health::spawn(registry.clone()).await;
-    let app = AppState::new(
-        Config::default(),
-        pool.clone(),
-        registry,
-        // All tools + a single role granting every one of them to
-        // the seed user, so the chat UI exercises the tool-loop
-        // branch of `chat_stream` rather than skipping it. The
-        // wiremock backend below doesn't actually invoke tools (it
-        // just streams a canned reply), so no tool execution
-        // happens against it — but the gateway-side path is fully
-        // exercised, which is what we want for playwright /
-        // local-browser debugging.
-        Arc::new(
-            ToolRegistry::new()
-                .with(echo::Echo)
-                .with(time::CurrentTimestamp)
-                .with(fetch_url::FetchUrl)
-                .with(search_web::SearchWeb),
-        ),
-        Arc::new(
-            Resolver::build(
-                RbacConfig {
-                    default_role: Some("dev".into()),
-                    mappings: vec![],
-                },
-                vec![RoleConfig {
-                    id: "dev".into(),
-                    models: vec!["*".into()],
-                    tools: vec!["*".into()],
-                }],
-            )
-            .expect("dev_ui RBAC build"),
-        ),
+    // Skills (for the /admin/skills screenshot + local debugging): load the
+    // repo's `data/skills` bundles into a hot-reloadable store, grant the dev
+    // role every skill, and register `read_skill`. Mirrors `main.rs`.
+    //
+    // A single `admin` role granting every tool + skill to the seed user, so
+    // the operator/admin pages (/admin/*, /rag) are reachable and the skills
+    // pages show content. Set on `config.roles` too (not just the Resolver) so
+    // the skills page's "Granted to" column resolves it. The wiremock backend
+    // doesn't actually invoke tools — the gateway-side path is what we want
+    // for playwright / local-browser debugging.
+    let roles = vec![RoleConfig {
+        id: "admin".into(),
+        models: vec!["*".into()],
+        tools: vec!["*".into()],
+        skills: vec!["*".into()],
+    }];
+    let config = Config {
+        skills: Some(SkillsConfig {
+            dir: PathBuf::from("data/skills"),
+        }),
+        roles: roles.clone(),
+        ..Config::default()
+    };
+    let rbac = Arc::new(
+        Resolver::build(
+            RbacConfig {
+                default_role: Some("admin".into()),
+                mappings: vec![],
+            },
+            roles,
+        )
+        .expect("dev_ui RBAC build"),
     );
+    let skill_store = Arc::new(SkillStore::load(PathBuf::from("data/skills")));
+    let tools = Arc::new(
+        ToolRegistry::new()
+            .with(echo::Echo)
+            .with(time::CurrentTimestamp)
+            .with(fetch_url::FetchUrl)
+            .with(search_web::SearchWeb)
+            .with(read_skill::ReadSkill::new(
+                skill_store.clone(),
+                rbac.clone(),
+            )),
+    );
+    let app = AppState::new(config, pool.clone(), registry, tools, rbac).with_skills(skill_store);
     let sessions = SessionStore::new(pool, SESSION_SECRET);
     let state = RamaState::new(app, sessions);
 

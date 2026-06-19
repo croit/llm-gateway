@@ -447,6 +447,7 @@ mod tests {
                 id: "user".into(),
                 tools: vec!["*".into()],
                 models: vec!["*".into()],
+                skills: vec![],
             }],
             ..Config::default()
         };

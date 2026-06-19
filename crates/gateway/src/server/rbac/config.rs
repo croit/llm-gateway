@@ -40,4 +40,11 @@ pub struct RoleConfig {
     /// Tool IDs this role grants. `"*"` expands to every registered tool.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Skill names this role grants. `"*"` expands to every loaded skill.
+    /// Empty (the default) means the role sees no skills, so a deployment
+    /// that adds `[skills]` doesn't silently expose them to every role.
+    /// Gates both the system-message skill listing and the `read_skill`
+    /// tool. See `server::skills`.
+    #[serde(default)]
+    pub skills: Vec<String>,
 }

@@ -127,11 +127,16 @@ weight = 1
 # # Grant `enable_tools` (always-on core) so the model can turn on extra
 # # tool groups mid-conversation — see docs/tool-context-optimization.md.
 # tools = ["enable_tools", "get_current_timestamp", "get_user_location", "remember", "recall"]
+# # Skill names this role may load (see [skills] below). "*" = all loaded
+# # skills; omit/empty to grant none. Requires the `read_skill` tool too,
+# # which `tools = ["*"]` covers.
+# skills = ["croit-brand-guardian"]
 #
 # [[roles]]
 # id = "admin"
 # models = ["*"]
 # tools = ["*"]
+# skills = ["*"]
 
 # ---- Chat attachments (S3) -------------------------------------------------
 # The chat composer accepts any file (paperclip / drag-drop / clipboard
@@ -189,6 +194,25 @@ weight = 1
 
 # [typst]
 # templates_dir = "/opt/typst-templates"
+
+# ---- Agent Skills ----------------------------------------------------------
+# Operator-installed instruction bundles the chat model loads on demand via
+# the `read_skill` tool — brand guidelines, house style, domain playbooks.
+# Each skill's name + description is advertised to the model in its system
+# context (cheap metadata); when a request matches, the model pulls the full
+# SKILL.md body, and any referenced `references/`/`assets/` file (e.g. an SVG
+# logo it inlines into an HTML answer).
+#
+# Drop bundles into `dir` and restart (no hot-reload). A bundle is either a
+# directory holding a `SKILL.md`, or a `*.skill` zip of one (extracted into
+# `<dir>/.cache/` at startup). With no valid bundle the `read_skill` tool
+# isn't even registered.
+#
+# RBAC-gated per role via each role's `skills` list (see [[roles]] above) —
+# exactly like `tools`. A role sees only the skills it's granted.
+
+# [skills]
+# dir = "/opt/skills"
 
 # ---- GeoIP -----------------------------------------------------------------
 # Lets the `get_user_location` tool resolve a caller's source IP to a

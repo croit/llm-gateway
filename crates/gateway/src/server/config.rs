@@ -92,6 +92,45 @@ pub struct Config {
     /// same named volume that backs `[db].path`).
     #[serde(default)]
     pub rag: Option<RagConfig>,
+    /// Agent Skills the gateway makes available to the chat model.
+    /// Optional — with no `[skills]` block none are loaded and the
+    /// `read_skill` tool is not registered. When set, `dir` is scanned at
+    /// startup for skill bundles (a directory holding a `SKILL.md`, or a
+    /// `*.skill` zip of one); each becomes an operator-managed capability
+    /// the model can load on demand. RBAC-gated per role via the role's
+    /// `skills` list, exactly like `tools`. See `server::skills`.
+    #[serde(default)]
+    pub skills: Option<SkillsConfig>,
+}
+
+/// Skills directory. Mirrors `[rag] data_dir` / `[typst] templates_dir`:
+/// a single operator-owned folder scanned once at startup. No hot-reload —
+/// restart to pick up new or changed skills.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsConfig {
+    /// Root holding one skill per entry. An entry is either a directory
+    /// containing a `SKILL.md` (optionally nested one level, e.g. the
+    /// folder a `*.skill` archive unzips to) or a `*.skill` file (a zip of
+    /// such a directory), which is extracted into `<dir>/.cache/` at
+    /// startup. The gateway only reads this directory; operators populate
+    /// it out-of-band (drop a bundle in and restart), just like Typst
+    /// templates. Default is `data/skills` relative to the gateway's
+    /// working directory.
+    #[serde(default = "default_skills_dir")]
+    pub dir: PathBuf,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_skills_dir(),
+        }
+    }
+}
+
+fn default_skills_dir() -> PathBuf {
+    PathBuf::from("data/skills")
 }
 
 /// RAG indexer state directory + tuning knobs.

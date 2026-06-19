@@ -13,6 +13,7 @@ Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests acro
 - **Server-side tools** — the gateway runs tools *mid-completion* (web search, fetch-URL, document rendering, RAG, network lookups, and more); the client just sees a normal completion. Full list in [Tools the model can call](#tools-the-model-can-call).
 - **Chat UI** — a server-rendered, mobile-friendly chat at `/chat` with persisted multi-conversation history, token-by-token streaming, file attachments, and resume-on-reconnect (every turn is written to SQLite as it happens).
 - **RAG** — operator-managed, indexed codebases that the chat model can search.
+- **Agent Skills** — drop a `SKILL.md` bundle (or `.skill` archive) in and the chat model loads it on demand to follow your house style, brand, or domain playbooks — progressive disclosure, no fine-tuning. Upload, view, and delete them at `/admin/skills`, live (no restart), RBAC-gated per role. See [Agent Skills](#agent-skills).
 
 ## Tools the model can call
 
@@ -32,6 +33,7 @@ Every tool is **RBAC-gated per role**, and each user can flip their own grants o
 | **Utility** | `convert_currency`, `get_current_timestamp`, `company_echo` | Convert currencies at daily ECB rates, get the timezone-aware current time, and echo a message back verbatim (`company_echo` is a built-in smoke test for the tool-call loop). |
 | **Knowledge base** | `rag_list_collections`, `rag_search` | Search operator-indexed codebases/corpora and get back the matching chunks with file paths, line ranges, and scores. |
 | **Integrations** | `mcp__<server>__*` | Call the tools of any bridged [MCP](https://modelcontextprotocol.io/) server. Each server's tools are namespaced so two servers can't collide. |
+| **Skills** | `read_skill` | Load an operator-installed [skill](#agent-skills) — brand guidelines, house style, domain playbooks — then apply it: pull the `SKILL.md`, then any referenced asset (e.g. an SVG to inline). |
 
 **Tools turn themselves on.** Tools start *off* to keep the model's tool list short — short lists are cheaper and the model picks tools more accurately. When a request needs a capability the model doesn't currently have, it calls a built-in `enable_tools` tool to switch the relevant ones on; their real schemas appear on the next turn and stay on for the rest of the conversation. So the model reaches for exactly what it needs, when it needs it, without the operator wiring per-conversation tool lists — all still bounded by what the user's role permits.
 
@@ -195,6 +197,21 @@ An empty include list means "everything not excluded." Binaries, files larger th
 
 **Sizing.** The vector index dominates disk, at roughly `chunks × embedding_dims × 4 bytes`. With a 4096-dim model (e.g. `Qwen3-Embedding-8B`) that's ~16 KB per chunk, so a codebase that splits into ~100k chunks needs ~1.5 GB. Embedding is the slow part of indexing — budget time accordingly for large repos, and prefer narrow globs (source + docs) over `*` on a huge tree.
 
+### Agent Skills
+
+Skills are operator-installed instruction bundles the chat model loads on demand — house style, brand guidelines, domain playbooks — without fine-tuning or stuffing everything into the system prompt. A skill is a `SKILL.md` (YAML frontmatter `name` + `description`, then a markdown body) plus optional `references/` and `assets/`. The model only sees each permitted skill's name + description up front (cheap); when a request matches, it calls `read_skill` to pull the full body, then `read_skill(name, path)` for a referenced file (e.g. an SVG logo to inline into HTML). Once loaded in a conversation the guidance stays applied for the rest of it.
+
+![The /admin/skills page: an upload control, the list of loaded skills with the selected bundle's file tree, and that skill's rendered SKILL.md alongside which roles it's granted to.](docs/img/skills.png)
+
+**Managing skills.** Point `[skills]` at a directory and drop bundles in:
+
+```toml
+[skills]
+dir = "/var/lib/gateway/skills"   # optional; default ./data/skills
+```
+
+As an admin, open `/admin/skills` to **upload** a `.skill` archive (a zip of a `SKILL.md` bundle), **view** a skill's rendered `SKILL.md` + file tree, and **delete** one — all live, with no restart: the store re-scans the directory and hot-swaps the loaded set. RBAC gates which roles may use which skill via each role's `skills` list (`["*"]` for all), exactly like `tools`; `read_skill` rides along automatically for any role that's been granted a skill.
+
 ## Using the gateway
 
 **1 — Get an API token.** Either:
@@ -235,7 +252,7 @@ In a clone, run it via `mise run cli -- <args>`; a release build produces a stan
 | `GET /v1/models` | Bearer token | All discovered models across pools (deduplicated by id). |
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness probes. |
 | `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory` | session cookie | Web UI. |
-| `/admin/users`, `/rag`, `/admin/models`, `/admin/backends` | admin role | Admin UI (the users page lists registered users and starts impersonation). |
+| `/admin/users`, `/rag`, `/admin/models`, `/admin/backends`, `/admin/skills` | admin role | Admin UI (the users page lists registered users and starts impersonation). |
 | `POST /impersonate/stop` | session cookie | End an active impersonation and return to your own account. |
 | `/api/v0/*` | session cookie | JSON APIs backing the UI. |
 

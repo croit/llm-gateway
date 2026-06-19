@@ -57,6 +57,13 @@ async fn main() -> anyhow::Result<()> {
     // mistaken for a hung process — see `spawn_heartbeat`.
     srv::upstreams::health::spawn_heartbeat(upstreams.clone());
 
+    // Build the RBAC resolver up front: the `read_skill` tool holds a clone
+    // so it can authorize skill access at call time, the same way the rest of
+    // the gateway resolves roles → grants.
+    let rbac = srv::rbac::Resolver::build(config.rbac.clone(), config.roles.clone())
+        .map_err(|e| anyhow::anyhow!("building RBAC resolver: {e}"))?;
+    let rbac = Arc::new(rbac);
+
     let mut tool_registry = srv::tools::ToolRegistry::new()
         .with(srv::tools::echo::Echo)
         .with(srv::tools::time::CurrentTimestamp)
@@ -142,11 +149,32 @@ async fn main() -> anyhow::Result<()> {
     // that the next round's `allowed_tools_for_session` picks up.
     let enable_tools = srv::tools::enable_tools::EnableTools::from_registry(&tool_registry);
     tool_registry = tool_registry.with(enable_tools);
-    let tools = Arc::new(tool_registry);
 
-    let rbac = srv::rbac::Resolver::build(config.rbac.clone(), config.roles.clone())
-        .map_err(|e| anyhow::anyhow!("building RBAC resolver: {e}"))?;
-    let rbac = Arc::new(rbac);
+    // Agent Skills: a hot-reloadable store over `[skills] dir` (admin upload /
+    // delete re-scan and swap it live — no restart). Registered *after*
+    // `enable_tools` (so the loader isn't itself an enableable group — it's
+    // always-on when the caller has a permitted skill; see
+    // `AppState::allowed_tools_for_session`). When `[skills]` is configured we
+    // register `read_skill` even if the dir is currently empty, so an upload
+    // works without a restart; skill-less deployments (no `[skills]` block)
+    // keep the exact same tool surface.
+    let skill_store = config.skills.as_ref().map(|skills_cfg| {
+        let store = srv::skills::SkillStore::load(skills_cfg.dir.clone());
+        tracing::info!(
+            dir = %skills_cfg.dir.display(),
+            count = store.current().len(),
+            "loaded skills store"
+        );
+        Arc::new(store)
+    });
+    if let Some(store) = skill_store.as_ref() {
+        tool_registry = tool_registry.with(srv::tools::read_skill::ReadSkill::new(
+            store.clone(),
+            rbac.clone(),
+        ));
+        tracing::info!(tool = "read_skill", "registered skills tool");
+    }
+    let tools = Arc::new(tool_registry);
 
     // Session HMAC key, read from $GATEWAY_SESSION_KEY — a single 64-hex
     // value (32 bytes) so an operator only has to configure one knob.
@@ -161,6 +189,9 @@ async fn main() -> anyhow::Result<()> {
     let mut state = AppState::new(config, db, upstreams, tools, rbac);
     if let Some(client) = oidc {
         state = state.with_oidc(client);
+    }
+    if let Some(store) = skill_store {
+        state = state.with_skills(store);
     }
 
     // GeoIP (client-IP → coarse location) for the `get_user_location`

@@ -539,7 +539,18 @@ async fn build_request_context(d: &OpenAiDriver) -> Option<String> {
         .filter(|e| !e.is_empty());
     let timezone = user.as_ref().and_then(|u| u.timezone.clone());
 
-    if ip.is_none() && geo.is_none() && timezone.is_none() && name.is_none() && email.is_none() {
+    // Skills the caller's roles permit: not-yet-loaded ones advertised as
+    // `name: description` (the model loads via `read_skill`); already-loaded
+    // ones re-injected with their full guidance so it persists across turns.
+    let skills = build_skills_section(d).await;
+
+    if ip.is_none()
+        && geo.is_none()
+        && timezone.is_none()
+        && name.is_none()
+        && email.is_none()
+        && skills.is_none()
+    {
         return None;
     }
 
@@ -591,7 +602,118 @@ async fn build_request_context(d: &OpenAiDriver) -> Option<String> {
     if let Some(tz) = &timezone {
         let _ = writeln!(out, "- Timezone: {tz}");
     }
+    if let Some(skills) = skills {
+        out.push_str(&skills);
+    }
     Some(out)
+}
+
+/// The skills section of the request-context message: every skill the
+/// caller's roles permit, as `name: description`. Returns `None` when no
+/// skills are loaded or the caller's roles grant none — the listing is then
+/// omitted entirely (and the always-on `read_skill` rule in
+/// `AppState::allowed_tools_for_session` likewise sees an empty set, so the
+/// loader tool isn't injected either). Names come straight from the loaded
+/// registry; descriptions are the bundle authors' own, written to trigger
+/// the model — so no language-specific keyword matching lives here.
+async fn build_skills_section(d: &OpenAiDriver) -> Option<String> {
+    let registry = d.state.skills.as_ref()?.current();
+    let allowed = d.state.allowed_skills_for(&d.tool_ctx.roles);
+    if allowed.is_empty() {
+        return None;
+    }
+    // Skills already loaded in this conversation (sticky). Chat path only;
+    // a DB hiccup degrades to "nothing loaded" (the model just reloads).
+    let loaded: Vec<String> = match d.tool_ctx.session_id.as_deref() {
+        Some(session_id) => {
+            crate::server::db::chat_session_skills::loaded_for_session(&d.state.db, session_id)
+                .await
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    // Loaded ∩ permitted, in load order (RBAC re-checked here, so a
+    // since-revoked skill drops out even with a stale row). Not-loaded =
+    // the rest of the permitted set, advertised for the model to load.
+    let loaded_allowed: Vec<String> = loaded
+        .iter()
+        .filter(|n| allowed.iter().any(|a| a == *n))
+        .cloned()
+        .collect();
+    let not_loaded: Vec<String> = allowed
+        .iter()
+        .filter(|n| !loaded_allowed.iter().any(|l| l == *n))
+        .cloned()
+        .collect();
+
+    let mut out = String::new();
+    if let Some(listing) = render_skill_listing(&registry, &not_loaded) {
+        out.push_str(&listing);
+    }
+    if let Some(active) = render_active_skills(&registry, &loaded_allowed) {
+        out.push_str(&active);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Format the skills section from a registry and the caller's permitted
+/// skill names. Pure (no `AppState`) so the wiring is unit-testable.
+/// Returns `None` when `allowed` is empty — the section is then omitted
+/// entirely, and `read_skill` likewise stays out of the tools list.
+fn render_skill_listing(
+    registry: &crate::server::skills::SkillRegistry,
+    allowed: &[String],
+) -> Option<String> {
+    use std::fmt::Write as _;
+
+    if allowed.is_empty() {
+        return None;
+    }
+    let mut s = String::from(
+        "\nInstalled skills — each is operator-provided guidance for a kind of task. When \
+         the user's request matches what a skill is for, call `read_skill(name)` to load \
+         its full instructions BEFORE you produce the output, then `read_skill(name, path)` \
+         for any reference or asset file it names. Available skills:\n",
+    );
+    for name in allowed {
+        if let Some(skill) = registry.get(name) {
+            let _ = writeln!(s, "- {}: {}", skill.name, skill.description);
+        }
+    }
+    Some(s)
+}
+
+/// Re-inject the full guidance of skills already loaded this conversation, so
+/// it keeps applying without the model re-reading (the sticky half of Agent
+/// Skills). Each skill's `SKILL.md` body is read fresh and spliced in under a
+/// header; a body that fails to read is skipped (the listing path still lets
+/// the model reload it). Pure apart from the per-skill file read, so the
+/// formatting is unit-testable via [`render_active_skills`] over a temp
+/// bundle. Returns `None` when nothing is loaded.
+fn render_active_skills(
+    registry: &crate::server::skills::SkillRegistry,
+    loaded: &[String],
+) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let mut s = String::new();
+    for name in loaded {
+        let Some(skill) = registry.get(name) else {
+            continue;
+        };
+        let Ok(body) = skill.body() else {
+            continue;
+        };
+        if s.is_empty() {
+            s.push_str(
+                "\nActive skills — you have loaded these; apply their guidance to what you \
+                 produce. Use `read_skill(name, path)` to pull any reference or asset file \
+                 they mention.\n",
+            );
+        }
+        let _ = write!(s, "\n### Skill: {}\n{}\n", skill.name, body.trim_end());
+    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Convert a persisted turn into the OpenAI-format message for the
@@ -641,7 +763,9 @@ fn transport_err<E: std::fmt::Display>(e: E) -> TurnError {
 
 #[cfg(test)]
 mod tests {
-    use super::{THINK_TAGS, take_safe_content};
+    use super::{THINK_TAGS, render_active_skills, render_skill_listing, take_safe_content};
+    use crate::server::skills::{Skill, SkillRegistry};
+    use std::path::PathBuf;
 
     /// Feed `deltas` through the streaming stripper and flush, returning the
     /// full emitted content (what the user would see).
@@ -681,5 +805,56 @@ mod tests {
         // A `<` that never becomes a tag is delayed, never dropped.
         assert_eq!(stream(&["a < b"]), "a < b");
         assert_eq!(stream(&["value <", " 5 end"]), "value < 5 end");
+    }
+
+    fn registry(entries: &[(&str, &str)]) -> SkillRegistry {
+        SkillRegistry::new(entries.iter().map(|(n, d)| Skill {
+            name: (*n).to_string(),
+            description: (*d).to_string(),
+            root: PathBuf::from("/nonexistent"),
+        }))
+    }
+
+    #[test]
+    fn listing_includes_only_permitted_skills_with_descriptions() {
+        // Two loaded, one permitted: the listing names the permitted one
+        // (with its description) and the loader instruction, and never
+        // mentions the skill the caller can't use.
+        let reg = registry(&[
+            ("brand", "Enforce the brand."),
+            ("legal", "Apply the contract template."),
+        ]);
+        let out = render_skill_listing(&reg, &["brand".to_string()]).expect("a listing");
+        assert!(out.contains("read_skill(name)"));
+        assert!(out.contains("brand: Enforce the brand."));
+        assert!(!out.contains("legal"));
+    }
+
+    #[test]
+    fn no_permitted_skills_means_no_listing() {
+        let reg = registry(&[("brand", "Enforce the brand.")]);
+        assert!(render_skill_listing(&reg, &[]).is_none());
+    }
+
+    #[test]
+    fn active_skills_reinject_the_full_body() {
+        use crate::server::skills::discover;
+        // A real on-disk bundle so `body()` reads actual content — this is
+        // the sticky half: a loaded skill's instructions get spliced back in.
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("brand");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(
+            bundle.join("SKILL.md"),
+            "---\nname: brand\ndescription: d\n---\n\nAlways use purple #8E54E9.\n",
+        )
+        .unwrap();
+        let reg = SkillRegistry::new(discover(dir.path()).unwrap());
+
+        // Loaded → body present; not loaded → nothing.
+        let out = render_active_skills(&reg, &["brand".to_string()]).expect("active section");
+        assert!(out.contains("### Skill: brand"));
+        assert!(out.contains("Always use purple #8E54E9."));
+        assert!(render_active_skills(&reg, &[]).is_none());
     }
 }

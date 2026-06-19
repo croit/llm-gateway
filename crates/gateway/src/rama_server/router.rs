@@ -88,6 +88,10 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         // path segments, which would mangle case-sensitive OIDC subjects.
         .with_post("/admin/users/impersonate", pages::users_impersonate)
         .with_post("/impersonate/stop", pages::impersonate_stop)
+        .with_get("/admin/skills", pages::admin_skills_index)
+        .with_get("/admin/skills/download", pages::admin_skills_download)
+        .with_post("/admin/skills/upload", pages::admin_skills_upload)
+        .with_post("/admin/skills/delete", pages::admin_skills_delete)
         .with_get("/rag", pages::rag_index)
         .with_post("/rag", pages::rag_create)
         .with_post("/rag/{id}/reindex", pages::rag_reindex)

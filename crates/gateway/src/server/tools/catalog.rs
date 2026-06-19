@@ -128,7 +128,7 @@ fn category_for(tool_id: &str) -> Category {
     match tool_id {
         "search_web" | "fetch_url" | "lookup_ip" | "dns_lookup" | "whois_lookup" | "tls_cert"
         | "wikipedia" => Category::Web,
-        "fetch_attachment" | "upload_attachment" => Category::Documents,
+        "fetch_attachment" | "upload_attachment" | "read_skill" => Category::Documents,
         _ if tool_id.starts_with(TYPST_PREFIX) => Category::Documents,
         "remember" | "recall" => Category::Memory,
         _ if tool_id.starts_with(crate::server::tools::mcp::MCP_ID_PREFIX) => {
@@ -219,6 +219,11 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Currency conversion",
             "Converts an amount between currencies using daily ECB reference rates, so the \
              assistant gives a real figure instead of guessing the exchange rate.",
+        ),
+        "read_skill" => (
+            "Skills",
+            "Lets the assistant load an operator-installed skill — brand guidelines, house \
+             style, domain playbooks — and apply it to what it writes or builds for you.",
         ),
         _ => return None,
     };

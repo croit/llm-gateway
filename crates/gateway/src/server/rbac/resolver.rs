@@ -102,6 +102,36 @@ impl Resolver {
         out
     }
 
+    /// Union of skill names granted by any of the user's roles, filtered to
+    /// skills that are actually loaded. `"*"` in a role's `skills` list
+    /// expands to every loaded skill. Mirrors [`Self::allowed_tools`] — the
+    /// outer authorization bound for both the system-message skill listing
+    /// and the `read_skill` tool.
+    pub fn allowed_skills(
+        &self,
+        role_ids: &[String],
+        registry: &crate::server::skills::SkillRegistry,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for role_id in role_ids {
+            let Some(role) = self.roles.get(role_id) else {
+                continue;
+            };
+            for skill in &role.skills {
+                if skill == "*" {
+                    for name in registry.names() {
+                        if !out.iter().any(|s| s == name) {
+                            out.push(name.to_string());
+                        }
+                    }
+                } else if registry.get(skill).is_some() && !out.iter().any(|s| s == skill) {
+                    out.push(skill.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// True if any of the user's roles permits the given model. `"*"` matches
     /// anything; a trailing `*` is a prefix match.
     pub fn model_allowed(&self, role_ids: &[String], model: &str) -> bool {
@@ -142,7 +172,28 @@ mod tests {
             id: id.into(),
             tools: tools.iter().map(|s| (*s).to_string()).collect(),
             models: models.iter().map(|s| (*s).to_string()).collect(),
+            skills: Vec::new(),
         }
+    }
+
+    fn role_with_skills(id: &str, skills: &[&str]) -> RoleConfig {
+        RoleConfig {
+            id: id.into(),
+            tools: Vec::new(),
+            models: Vec::new(),
+            skills: skills.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// A registry of empty-bodied skills with the given names, for RBAC
+    /// tests (which only care about name membership, not file contents).
+    fn skill_registry(names: &[&str]) -> crate::server::skills::SkillRegistry {
+        use crate::server::skills::Skill;
+        crate::server::skills::SkillRegistry::new(names.iter().map(|n| Skill {
+            name: (*n).to_string(),
+            description: "d".into(),
+            root: std::path::PathBuf::from("/nonexistent").join(n),
+        }))
     }
 
     fn mapping(claim: &str, value: &str, role: &str) -> RoleMapping {
@@ -285,6 +336,47 @@ mod tests {
         .unwrap();
         let tools = r.allowed_tools(&["nobody".into()], &reg);
         assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn allowed_skills_unions_and_filters_to_loaded() {
+        let reg = skill_registry(&["brand", "legal"]);
+        let r = Resolver::build(
+            RbacConfig::default(),
+            vec![
+                role_with_skills("user", &["brand", "ghost"]),
+                role_with_skills("eng", &["legal"]),
+            ],
+        )
+        .unwrap();
+        let skills = r.allowed_skills(&["user".into(), "eng".into()], &reg);
+        // `ghost` isn't loaded → filtered out; `brand` + `legal` survive.
+        assert!(skills.contains(&"brand".to_string()));
+        assert!(skills.contains(&"legal".to_string()));
+        assert_eq!(skills.len(), 2);
+    }
+
+    #[test]
+    fn allowed_skills_wildcard_expands_to_all_loaded() {
+        let reg = skill_registry(&["brand", "legal"]);
+        let r = Resolver::build(
+            RbacConfig::default(),
+            vec![role_with_skills("admin", &["*"])],
+        )
+        .unwrap();
+        let skills = r.allowed_skills(&["admin".into()], &reg);
+        assert_eq!(skills.len(), 2);
+        assert!(skills.contains(&"brand".to_string()));
+        assert!(skills.contains(&"legal".to_string()));
+    }
+
+    #[test]
+    fn allowed_skills_empty_grant_yields_nothing() {
+        // A role that grants no skills sees none, even with skills loaded —
+        // adding `[skills]` must not silently expose them.
+        let reg = skill_registry(&["brand"]);
+        let r = Resolver::build(RbacConfig::default(), vec![role("user", &["*"], &["*"])]).unwrap();
+        assert!(r.allowed_skills(&["user".into()], &reg).is_empty());
     }
 
     #[test]

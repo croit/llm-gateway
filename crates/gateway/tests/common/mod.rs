@@ -219,6 +219,7 @@ async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool
         id: "admin".into(),
         models: vec!["*".into()],
         tools: vec!["*".into()],
+        skills: vec![],
     };
     let rbac = Arc::new(Resolver::build(rbac_config, vec![admin_role]).unwrap());
 

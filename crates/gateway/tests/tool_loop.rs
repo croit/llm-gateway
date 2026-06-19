@@ -77,6 +77,7 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
             id: "engineer".into(),
             models: vec!["*".into()],
             tools: vec!["company_echo".into()],
+            skills: vec![],
         }],
     )
     .unwrap();

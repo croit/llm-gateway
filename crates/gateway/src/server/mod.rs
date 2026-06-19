@@ -17,6 +17,7 @@ pub mod model_defaults;
 pub mod pdf;
 pub mod rag;
 pub mod rbac;
+pub mod skills;
 pub mod state;
 pub mod tools;
 pub mod typst;

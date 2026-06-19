@@ -9,6 +9,7 @@ use crate::server::db::Pool;
 use crate::server::geoip::GeoIp;
 use crate::server::rag::worker::Indexer;
 use crate::server::rbac::Resolver;
+use crate::server::skills::SkillStore;
 use crate::server::tools::ToolRegistry;
 use crate::server::upstreams::UpstreamRegistry;
 
@@ -33,6 +34,12 @@ pub struct AppState {
     /// `rag_search` / `rag_list_collections` then surface a clear "not
     /// configured" error rather than silently misroute.
     pub indexer: Option<Indexer>,
+    /// Loaded Agent Skills, behind a hot-reloadable store (admin upload /
+    /// delete re-scan and swap it live). `None` when `[skills]` isn't
+    /// configured; an empty store is fine (uploads populate it without a
+    /// restart). RBAC narrows which skills each caller sees (see
+    /// [`Self::allowed_skills_for`]).
+    pub skills: Option<Arc<SkillStore>>,
 }
 
 impl AppState {
@@ -53,7 +60,21 @@ impl AppState {
             rbac,
             geoip: None,
             indexer: None,
+            skills: None,
         }
+    }
+
+    /// Skill names this caller's roles permit, intersected with what's
+    /// loaded. Empty when `[skills]` isn't configured. The single home for
+    /// skill authorization, shared by the chat system-message listing, the
+    /// `read_skill`-always-on rule below, and the admin page — so they can't
+    /// drift, the same way [`Self::allowed_tools_for_user`] anchors tools.
+    pub fn allowed_skills_for(&self, roles: &[String]) -> Vec<String> {
+        let Some(store) = self.skills.as_ref() else {
+            return Vec::new();
+        };
+        let role_ids = self.rbac.role_ids_for(roles);
+        self.rbac.allowed_skills(&role_ids, &store.current())
     }
 
     /// The tool ids a user may actually use this request: the union of
@@ -126,13 +147,26 @@ impl AppState {
         session_id: &str,
     ) -> Vec<String> {
         use crate::server::tools::catalog::{BOOTSTRAP_TOOL_ID, entry_key_for};
+        use crate::server::tools::read_skill::READ_SKILL_ID;
 
         let mut allowed = self.allowed_tools_for_user(roles, user_id).await;
         let enabled =
             crate::server::db::chat_session_tools::enabled_keys_for_session(&self.db, session_id)
                 .await
                 .unwrap_or_default();
-        allowed.retain(|id| id == BOOTSTRAP_TOOL_ID || enabled.contains(entry_key_for(id)));
+        // `read_skill` is always-on (like the `enable_tools` bootstrap) *when*
+        // the caller has at least one permitted skill: the system message
+        // advertises those skills every turn, so the loader must always be
+        // callable — making the model enable it first would be pointless
+        // friction. With no permitted skills it stays lazy (and is usually not
+        // even registered), so skill-less deployments are unaffected.
+        let skill_loader_on = allowed.iter().any(|id| id == READ_SKILL_ID)
+            && !self.allowed_skills_for(roles).is_empty();
+        allowed.retain(|id| {
+            id == BOOTSTRAP_TOOL_ID
+                || (skill_loader_on && id == READ_SKILL_ID)
+                || enabled.contains(entry_key_for(id))
+        });
         // Deterministic, cache-friendly order: enable_tools first (identical
         // across every conversation), then the per-conversation tail sorted
         // by toggle key then id.
@@ -161,6 +195,88 @@ impl AppState {
         self.indexer = Some(indexer);
         self
     }
+
+    pub fn with_skills(mut self, skills: Arc<SkillStore>) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+}
+
+#[cfg(test)]
+mod skill_overlay_tests {
+    use super::*;
+    use crate::server::config::Config;
+    use crate::server::db;
+    use crate::server::rbac::config::{RbacConfig, RoleConfig};
+    use crate::server::skills::{Skill, SkillRegistry, SkillStore};
+    use crate::server::tools::enable_tools::EnableTools;
+    use crate::server::tools::read_skill::{READ_SKILL_ID, ReadSkill};
+
+    /// Build an `AppState` whose single role grants every tool + model and
+    /// the given `skill_grant` (`["*"]`, `["brand"]`, or `[]`), with one
+    /// skill `brand` loaded and `read_skill` + `enable_tools` registered.
+    async fn state_with_skill_grant(skill_grant: &[&str]) -> AppState {
+        let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+        let registry = SkillRegistry::new([Skill {
+            name: "brand".into(),
+            description: "Enforce the brand.".into(),
+            root: std::path::PathBuf::from("/nonexistent"),
+        }]);
+        let skills = Arc::new(SkillStore::with_registry(
+            std::path::PathBuf::from("/nonexistent"),
+            registry,
+        ));
+        let config = Config {
+            rbac: RbacConfig {
+                default_role: Some("user".into()),
+                mappings: vec![],
+            },
+            roles: vec![RoleConfig {
+                id: "user".into(),
+                tools: vec!["*".into()],
+                models: vec!["*".into()],
+                skills: skill_grant.iter().map(|s| (*s).to_string()).collect(),
+            }],
+            ..Config::default()
+        };
+        let rbac = Arc::new(Resolver::build(config.rbac.clone(), config.roles.clone()).unwrap());
+        let mut reg = ToolRegistry::new().with(ReadSkill::new(skills.clone(), rbac.clone()));
+        let et = EnableTools::from_registry(&reg);
+        reg = reg.with(et);
+        let upstreams = UpstreamRegistry::new(&config.upstream_pools).unwrap();
+        AppState::new(config, pool, upstreams, Arc::new(reg), rbac).with_skills(skills)
+    }
+
+    #[tokio::test]
+    async fn read_skill_is_always_on_when_caller_has_a_permitted_skill() {
+        // Fresh session, nothing enabled: `read_skill` rides in alongside the
+        // bootstrap because the role permits the loaded `brand` skill — the
+        // model can act on the system-message skill listing immediately, no
+        // enable_tools round needed.
+        let state = state_with_skill_grant(&["*"]).await;
+        let allowed = state
+            .allowed_tools_for_session(&["user".into()], "u1", "s1")
+            .await;
+        assert!(
+            allowed.iter().any(|id| id == READ_SKILL_ID),
+            "read_skill should be always-on with a permitted skill: {allowed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_skill_stays_lazy_when_no_skill_is_permitted() {
+        // Same loaded skill, but the role grants no skills: `read_skill` must
+        // not be force-injected (it's RBAC-granted via `*` but falls back to
+        // the normal lazy/enable_tools path).
+        let state = state_with_skill_grant(&[]).await;
+        let allowed = state
+            .allowed_tools_for_session(&["user".into()], "u1", "s1")
+            .await;
+        assert!(
+            !allowed.iter().any(|id| id == READ_SKILL_ID),
+            "read_skill must stay lazy with no permitted skill: {allowed:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -186,6 +302,7 @@ mod tests {
             id: "all".into(),
             models: vec!["*".into()],
             tools: vec!["*".into()],
+            skills: vec![],
         };
         let rbac = Arc::new(
             Resolver::build(

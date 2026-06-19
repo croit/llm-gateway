@@ -83,6 +83,7 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
         id: "admin".into(),
         models: vec!["*".into()],
         tools: vec!["*".into()],
+        skills: vec![],
     };
     let rbac = Arc::new(Resolver::build(rbac_config, vec![admin_role]).unwrap());
 

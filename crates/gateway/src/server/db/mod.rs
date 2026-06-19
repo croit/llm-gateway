@@ -13,6 +13,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use thiserror::Error;
 
 pub mod audit;
+pub mod chat_session_skills;
 pub mod chat_session_tools;
 pub mod cli_logins;
 pub mod model_defaults;

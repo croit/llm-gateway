@@ -330,6 +330,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
                 id: "admin".into(),
                 models: vec!["*".into()],
                 tools: vec!["*".into()],
+                skills: vec![],
             }],
         )
         .unwrap(),

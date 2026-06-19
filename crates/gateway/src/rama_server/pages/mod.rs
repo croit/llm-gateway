@@ -64,6 +64,9 @@ enum NavItem {
     /// Admin-only registered-users roster + impersonation (`/admin/users`).
     /// Same `admin`-role gate as the other admin entries.
     Users,
+    /// Admin-only installed-skills overview (`/admin/skills`). Same
+    /// `admin`-role gate as the other operator pages.
+    Skills,
 }
 
 /// Datastar directive that intercepts the click and triggers an
@@ -216,6 +219,7 @@ fn render_app_sidebar(
                     (sidebar_nav_link("/admin/models", NavItem::Admin, active, icons::sliders(16), "Models"))
                     (sidebar_nav_link("/admin/backends", NavItem::Backends, active, icons::cube(16), "Backends"))
                     (sidebar_nav_link("/rag", NavItem::Rag, active, icons::folder(16), "RAG"))
+                    (sidebar_nav_link("/admin/skills", NavItem::Skills, active, icons::sliders(16), "Skills"))
                 }
             }
             div(class: "app-sidebar__sessions-section") {
@@ -817,6 +821,13 @@ pub use admin::{models_index as admin_models_index, models_save as admin_models_
 // same `admin`-role gate as the model-defaults page.
 mod backends;
 pub use backends::backends_index as admin_backends_index;
+
+// Admin skills viewer + manager (`/admin/skills`, upload, delete). Same admin gate.
+mod skills;
+pub use skills::{
+    skills_delete as admin_skills_delete, skills_download as admin_skills_download,
+    skills_index as admin_skills_index, skills_upload as admin_skills_upload,
+};
 
 // Admin RAG-collections CRUD (`/rag`). Same admin gate.
 mod rag;

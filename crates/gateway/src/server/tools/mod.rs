@@ -33,6 +33,7 @@ pub mod mcp;
 pub mod memory;
 pub mod netcheck;
 pub mod rag;
+pub mod read_skill;
 pub mod registry;
 pub mod runner;
 pub mod search_web;
