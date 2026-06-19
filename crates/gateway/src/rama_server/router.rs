@@ -71,6 +71,8 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/chat/{id}/turns/{turn_id}/edit", pages::chat_edit)
         .with_post("/chat/{id}/delete", pages::chat_session_delete)
         .with_post("/chat/{id}/share", pages::chat_share_toggle)
+        .with_get("/chat/{id}/export.md", pages::chat_export_markdown)
+        .with_get("/chat/{id}/export.pdf", pages::chat_export_pdf)
         .with_get(
             "/chat/attachment/{turn_id}/{filename}",
             pages::chat_attachment,

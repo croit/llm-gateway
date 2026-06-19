@@ -1096,13 +1096,13 @@ fn render_create_form(embedding_models: &[String]) -> Html {
                             class: "input input-bordered w-full"
                         );
                     }
-                    label(class: "label cursor-pointer justify-start gap-3 md:col-span-2") {
+                    label(class: "flex items-start gap-3 md:col-span-2 cursor-pointer") {
                         input(
                             name: "aggregate",
                             type: "checkbox",
-                            class: "checkbox checkbox-sm"
+                            class: "checkbox checkbox-sm mt-0.5 shrink-0"
                         );
-                        span(class: "label-text") {
+                        span(class: "label-text min-w-0") {
                             "Aggregate (multi-source): search across many repos as one corpus. "
                             "Leave the Git URL empty and add each source repo after creating. "
                             "Branch / tag becomes the default ref for added sources."

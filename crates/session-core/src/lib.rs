@@ -26,6 +26,7 @@ pub mod chat;
 pub mod chrome;
 pub mod db;
 pub mod driver;
+pub mod export;
 pub mod icons;
 pub mod render;
 pub mod worker;
