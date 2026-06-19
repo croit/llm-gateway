@@ -76,6 +76,10 @@ impl Tool for RagListCollections {
                     .map(|r| {
                         json!({
                             "ref": r.git_ref,
+                            // For aggregate collections this is the source repo
+                            // (e.g. `qemu-server`) you can pass as `ref` to
+                            // scope a search to one component.
+                            "source": r.source_label(c),
                             "primary": r.is_primary,
                             "searchable": r.is_searchable(),
                             "status": r.status.as_str(),
@@ -86,6 +90,9 @@ impl Tool for RagListCollections {
                 items.push(json!({
                     "name": c.name,
                     "description": c.description,
+                    // `aggregate`: rag_search with no `ref` searches ALL sources
+                    // at once (one corpus). `versioned`: it uses the primary ref.
+                    "mode": c.search_mode.as_str(),
                     "refs": ref_items,
                 }));
             }
@@ -100,8 +107,10 @@ pub struct RagSearch;
 struct SearchArgs {
     query: String,
     collection: String,
-    /// Which branch/tag/commit to search. Omitted → the collection's
-    /// primary ref. (`ref` is a Rust keyword, hence the rename.)
+    /// Which ref/source to search. Omitted → the collection's default: the
+    /// primary ref (versioned collections) or all sources (aggregate). For
+    /// aggregate collections this names a source repo (e.g. `qemu-server`);
+    /// for versioned ones a branch/tag/commit. (`ref` is a Rust keyword.)
     #[serde(default, rename = "ref")]
     git_ref: Option<String>,
     #[serde(default)]
@@ -140,10 +149,13 @@ impl Tool for RagSearch {
                     },
                     "ref": {
                         "type": "string",
-                        "description": "Which branch / tag / commit to search. \
-                                        Omit to search the collection's default \
-                                        (primary) ref. See `rag_list_collections` \
-                                        for each collection's available refs."
+                        "description": "Which ref/source to search. Omit to search \
+                                        the collection's default — its primary ref, \
+                                        or for an aggregate collection ALL of its \
+                                        sources at once. For an aggregate collection \
+                                        this names one source repo (e.g. \
+                                        `qemu-server`); for a versioned one a branch \
+                                        / tag / commit. See `rag_list_collections`."
                     },
                     "top_k": {
                         "type": "integer",
@@ -181,70 +193,174 @@ impl Tool for RagSearch {
                     ))
                 })?;
 
-            // Resolve the ref: the one the caller named, else the primary.
-            let rref = match &args.git_ref {
-                Some(r) => rag_db::find_ref(indexer.db(), collection.id, r)
-                    .await
-                    .map_err(|e| ToolError::Failed(format!("looking up ref: {e}")))?
-                    .ok_or_else(|| {
-                        ToolError::Failed(format!(
-                            "collection `{}` has no ref `{}` — call rag_list_collections to see \
-                             its available refs",
-                            collection.name, r
-                        ))
-                    })?,
-                None => rag_db::primary_ref(indexer.db(), collection.id)
-                    .await
-                    .map_err(|e| ToolError::Failed(format!("looking up primary ref: {e}")))?
-                    .ok_or_else(|| {
-                        ToolError::Failed(format!(
-                            "collection `{}` has no indexed refs yet",
-                            collection.name
-                        ))
-                    })?,
-            };
-            if !rref.is_searchable() {
-                return Err(ToolError::Failed(format!(
-                    "ref `{}` of `{}` is not ready yet (status = {}); its first index hasn't \
-                     completed — wait for it or re-queue if it failed",
-                    rref.git_ref,
-                    collection.name,
-                    rref.status.as_str()
-                )));
-            }
+            // Resolve which source(s) to search. Versioned collections
+            // search exactly one ref (named or primary); aggregate ones fan
+            // out across all searchable sources (or the named source).
+            let plan = resolve_search(indexer.db(), &collection, args.git_ref.as_deref()).await?;
 
             // Asymmetric query embedding (instruction-prefixed); documents
             // were embedded bare at index time. See `Indexer::embed_query`.
+            // Embedded ONCE and reused across every source in the fan-out.
             let query_vec = indexer
                 .embed_query(&collection.embedding_model, &args.query)
                 .await
                 .map_err(|e| ToolError::Failed(format!("embedding query: {e}")))?;
-            let hits = worker::search_chunks(indexer, &rref, &args.query, &query_vec, top_k)
-                .await
-                .map_err(|e| ToolError::Failed(format!("searching index: {e}")))?;
 
-            let results: Vec<Value> = hits
-                .into_iter()
-                .map(|(chunk, score)| {
-                    json!({
-                        "file_path": chunk.file_path,
-                        "start_line": chunk.start_line,
-                        "end_line": chunk.end_line,
-                        // Hybrid (dense + lexical) relevance via reciprocal
-                        // rank fusion — higher is more relevant. Relative,
-                        // not an absolute similarity; use it only to order
-                        // the hits within this result set.
-                        "score": score,
-                        "content": chunk.content,
-                    })
-                })
-                .collect();
-            Ok(json!({
-                "collection": collection.name,
-                "ref": rref.git_ref,
-                "hits": results,
-            }))
+            match plan {
+                SearchPlan::Single(rref) => {
+                    let hits =
+                        worker::search_chunks(indexer, &rref, &args.query, &query_vec, top_k)
+                            .await
+                            .map_err(|e| ToolError::Failed(format!("searching index: {e}")))?;
+                    let results: Vec<Value> = hits.into_iter().map(hit_json).collect();
+                    Ok(json!({
+                        "collection": collection.name,
+                        "ref": rref.git_ref,
+                        "hits": results,
+                    }))
+                }
+                SearchPlan::Aggregate(refs) => {
+                    // Search every source, tag each hit with its origin repo,
+                    // then merge into one global top-k by fused score.
+                    let mut all: Vec<(String, String, rag_db::Chunk, f32)> = Vec::new();
+                    for r in &refs {
+                        let label = r.source_label(&collection);
+                        let hits =
+                            worker::search_chunks(indexer, r, &args.query, &query_vec, top_k)
+                                .await
+                                .map_err(|e| {
+                                    ToolError::Failed(format!("searching `{label}`: {e}"))
+                                })?;
+                        for (chunk, score) in hits {
+                            all.push((label.clone(), r.git_ref.clone(), chunk, score));
+                        }
+                    }
+                    all.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+                    all.truncate(top_k);
+                    let results: Vec<Value> = all
+                        .into_iter()
+                        .map(|(source, git_ref, chunk, score)| {
+                            json!({
+                                "source": source,
+                                "ref": git_ref,
+                                "file_path": chunk.file_path,
+                                "start_line": chunk.start_line,
+                                "end_line": chunk.end_line,
+                                "score": score,
+                                "content": chunk.content,
+                            })
+                        })
+                        .collect();
+                    Ok(json!({
+                        "collection": collection.name,
+                        "mode": "aggregate",
+                        "sources_searched": refs.len(),
+                        "hits": results,
+                    }))
+                }
+            }
         })
+    }
+}
+
+/// What `rag_search` will actually query, after resolving collection mode
+/// and the caller's optional `ref`.
+enum SearchPlan {
+    /// One ref (versioned: named or primary).
+    Single(rag_db::CollectionRef),
+    /// Many sources merged into one ranking (aggregate: all, or the
+    /// source(s) matching a named repo). Always ≥1 entry.
+    Aggregate(Vec<rag_db::CollectionRef>),
+}
+
+/// Render one versioned-search hit. The `score` is hybrid (dense + lexical)
+/// reciprocal-rank-fusion relevance — relative ordering only, not an
+/// absolute similarity.
+fn hit_json((chunk, score): (rag_db::Chunk, f32)) -> Value {
+    json!({
+        "file_path": chunk.file_path,
+        "start_line": chunk.start_line,
+        "end_line": chunk.end_line,
+        "score": score,
+        "content": chunk.content,
+    })
+}
+
+async fn resolve_search(
+    db: &crate::server::db::Pool,
+    collection: &rag_db::Collection,
+    git_ref: Option<&str>,
+) -> Result<SearchPlan, ToolError> {
+    use rag_db::SearchMode;
+    let not_ready = |r: &rag_db::CollectionRef| {
+        ToolError::Failed(format!(
+            "ref `{}` of `{}` is not ready yet (status = {}); its first index hasn't \
+             completed — wait for it or re-queue if it failed",
+            r.git_ref,
+            collection.name,
+            r.status.as_str()
+        ))
+    };
+    match (git_ref, collection.search_mode) {
+        // Versioned: exactly one ref, named or primary.
+        (Some(r), SearchMode::Versioned) => {
+            let rref = rag_db::find_ref(db, collection.id, r)
+                .await
+                .map_err(|e| ToolError::Failed(format!("looking up ref: {e}")))?
+                .ok_or_else(|| {
+                    ToolError::Failed(format!(
+                        "collection `{}` has no ref `{}` — call rag_list_collections to see \
+                         its available refs",
+                        collection.name, r
+                    ))
+                })?;
+            if !rref.is_searchable() {
+                return Err(not_ready(&rref));
+            }
+            Ok(SearchPlan::Single(rref))
+        }
+        (None, SearchMode::Versioned) => {
+            let rref = rag_db::primary_ref(db, collection.id)
+                .await
+                .map_err(|e| ToolError::Failed(format!("looking up primary ref: {e}")))?
+                .ok_or_else(|| {
+                    ToolError::Failed(format!(
+                        "collection `{}` has no indexed refs yet",
+                        collection.name
+                    ))
+                })?;
+            if !rref.is_searchable() {
+                return Err(not_ready(&rref));
+            }
+            Ok(SearchPlan::Single(rref))
+        }
+        // Aggregate: all searchable sources, or those matching a named repo.
+        (maybe_named, SearchMode::Aggregate) => {
+            let refs = rag_db::searchable_refs(db, collection.id)
+                .await
+                .map_err(|e| ToolError::Failed(format!("listing sources: {e}")))?;
+            let refs = match maybe_named {
+                Some(name) => refs
+                    .into_iter()
+                    .filter(|x| x.source_label(collection) == name || x.git_ref == name)
+                    .collect::<Vec<_>>(),
+                None => refs,
+            };
+            if refs.is_empty() {
+                return Err(ToolError::Failed(match maybe_named {
+                    Some(name) => format!(
+                        "collection `{}` has no searchable source matching `{}` — call \
+                         rag_list_collections to see its sources",
+                        collection.name, name
+                    ),
+                    None => format!(
+                        "collection `{}` has no searchable sources yet",
+                        collection.name
+                    ),
+                }));
+            }
+            Ok(SearchPlan::Aggregate(refs))
+        }
     }
 }
 
@@ -391,6 +507,7 @@ mod tests {
                 exclude_globs: vec![],
                 chunk_size: 100,
                 chunk_overlap: 10,
+                search_mode: rag_db::SearchMode::Versioned,
             },
         )
         .await
@@ -403,7 +520,9 @@ mod tests {
         assert!(out["collections"].as_array().unwrap().is_empty());
 
         // Add a ref and bring it to ready → now listed with its refs.
-        let r = rag_db::add_ref(&pool, c.id, "reef", true).await.unwrap();
+        let r = rag_db::add_ref(&pool, c.id, "reef", None, true)
+            .await
+            .unwrap();
         rag_db::set_ref_status(&pool, r.id, rag_db::CollectionStatus::Indexing)
             .await
             .unwrap();
@@ -468,12 +587,15 @@ mod tests {
                 exclude_globs: vec![],
                 chunk_size: 100,
                 chunk_overlap: 10,
+                search_mode: rag_db::SearchMode::Versioned,
             },
         )
         .await
         .unwrap();
         // Each ref owns its store; add a primary ref and seed it by hand.
-        let r = rag_db::add_ref(&pool, c.id, "main", true).await.unwrap();
+        let r = rag_db::add_ref(&pool, c.id, "main", None, true)
+            .await
+            .unwrap();
         let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
         let f = rag_db::upsert_file(&store, c.id, "src/alpha.rs", "hashA")
             .await
@@ -548,6 +670,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_search_fans_out_across_sources() {
+        let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+        let upstream = embedding_upstream().await;
+        let reg = registry(&upstream.uri());
+        let indexer = Indexer::new(
+            pool.clone(),
+            Arc::clone(&reg),
+            reqwest::Client::new(),
+            IndexerConfig {
+                data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
+                ..IndexerConfig::default()
+            },
+        );
+        let c = rag_db::create_collection(
+            &pool,
+            &rag_db::NewCollection {
+                name: "proxmox".into(),
+                description: None,
+                git_url: "https://example.invalid/default.git".into(),
+                git_ref: "master".into(),
+                pat: None,
+                embedding_model: "embed-test".into(),
+                include_globs: vec![],
+                exclude_globs: vec![],
+                chunk_size: 100,
+                chunk_overlap: 10,
+                search_mode: rag_db::SearchMode::Aggregate,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Seed two different repos on the same branch, each in its own store.
+        // (url, file, content) → content's one_hot vector is its dense rep.
+        let sources = [
+            ("https://x/pve-manager.git", "PVE/Manager.pm", "alpha alpha"),
+            (
+                "https://x/qemu-server.git",
+                "PVE/QemuServer.pm",
+                "beta beta",
+            ),
+        ];
+        for (url, file, content) in sources {
+            let r = rag_db::add_ref(&pool, c.id, "master", Some(url), false)
+                .await
+                .unwrap();
+            let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
+            let f = rag_db::upsert_file(&store, c.id, file, "h").await.unwrap();
+            rag_db::insert_chunks(
+                &store,
+                c.id,
+                &[rag_db::NewChunk {
+                    file_id: f,
+                    chunk_index: 0,
+                    start_line: 1,
+                    end_line: 2,
+                    content: content.into(),
+                    vector_id: 1,
+                }],
+            )
+            .await
+            .unwrap();
+            let idx = indexer.open_index(r.id, &r.data_uuid, Some(4)).unwrap();
+            let v = embeddings::embed(
+                &reqwest::Client::new(),
+                &reg,
+                "embed-test",
+                &[content.to_string()],
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+            idx.add(1, &v).unwrap();
+            drop(idx);
+            rag_db::set_ref_status(&pool, r.id, rag_db::CollectionStatus::Indexing)
+                .await
+                .unwrap();
+            rag_db::swap_ref_index(&pool, r.id, &r.data_uuid, "sha")
+                .await
+                .unwrap();
+        }
+
+        // No ref → fan out over ALL sources, merged into one ranking. The
+        // alpha query ranks the pve-manager chunk top; each hit is tagged
+        // with its origin repo.
+        let out = RagSearch
+            .run(
+                ctx_with(indexer.clone()),
+                json!({ "query": "alpha please", "collection": "proxmox", "top_k": 5 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["mode"], "aggregate");
+        assert_eq!(out["sources_searched"], 2);
+        let hits = out["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "aggregate search returned no hits");
+        assert_eq!(hits[0]["source"], "pve-manager");
+        assert_eq!(hits[0]["ref"], "master");
+        assert!(hits[0]["content"].as_str().unwrap().contains("alpha"));
+        assert!(
+            hits.iter()
+                .all(|h| h.get("source").and_then(Value::as_str).is_some()),
+            "every aggregate hit must carry a source label"
+        );
+
+        // A named source scopes the fan-out to just that repo.
+        let out = RagSearch
+            .run(
+                ctx_with(indexer),
+                json!({ "query": "beta please", "collection": "proxmox", "ref": "qemu-server" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["sources_searched"], 1);
+        let hits = out["hits"].as_array().unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|h| h["source"] == "qemu-server"));
+    }
+
+    #[tokio::test]
     async fn search_rejects_not_ready_collection_with_status_hint() {
         let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
         let upstream = embedding_upstream().await;
@@ -573,12 +816,15 @@ mod tests {
                 exclude_globs: vec![],
                 chunk_size: 100,
                 chunk_overlap: 10,
+                search_mode: rag_db::SearchMode::Versioned,
             },
         )
         .await
         .unwrap();
         // A primary ref exists but hasn't completed its first index.
-        rag_db::add_ref(&pool, c.id, "main", true).await.unwrap();
+        rag_db::add_ref(&pool, c.id, "main", None, true)
+            .await
+            .unwrap();
         let err = RagSearch
             .run(
                 ctx_with(indexer),

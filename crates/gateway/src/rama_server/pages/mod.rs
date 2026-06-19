@@ -739,8 +739,8 @@ pub use backends::backends_index as admin_backends_index;
 // Admin RAG-collections CRUD (`/rag`). Same admin gate.
 mod rag;
 pub use rag::{
-    rag_add_ref, rag_cancel_edit, rag_create, rag_delete, rag_edit_form, rag_index, rag_ref_delete,
-    rag_ref_reindex, rag_ref_set_primary, rag_reindex, rag_update,
+    rag_add_ref, rag_add_sources_bulk, rag_cancel_edit, rag_create, rag_delete, rag_edit_form,
+    rag_index, rag_ref_delete, rag_ref_reindex, rag_ref_set_primary, rag_reindex, rag_update,
 };
 
 fn internal_error_html(user_email: &str, message: &str) -> Response {

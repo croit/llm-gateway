@@ -177,6 +177,7 @@ async fn admin_reindex_flips_status_back_to_pending() {
             exclude_globs: vec![],
             chunk_size: 800,
             chunk_overlap: 100,
+            search_mode: rag_db::SearchMode::Versioned,
         },
     )
     .await
@@ -221,6 +222,7 @@ async fn admin_delete_removes_row() {
             exclude_globs: vec![],
             chunk_size: 800,
             chunk_overlap: 100,
+            search_mode: rag_db::SearchMode::Versioned,
         },
     )
     .await
@@ -371,6 +373,7 @@ async fn admin_edit_form_then_update_round_trip() {
             exclude_globs: vec![],
             chunk_size: 400,
             chunk_overlap: 50,
+            search_mode: rag_db::SearchMode::Versioned,
         },
     )
     .await
@@ -454,6 +457,7 @@ async fn update_with_empty_pat_keeps_existing_pat() {
             exclude_globs: vec![],
             chunk_size: 800,
             chunk_overlap: 100,
+            search_mode: rag_db::SearchMode::Versioned,
         },
     )
     .await
@@ -503,6 +507,7 @@ async fn cancel_edit_returns_display_row_without_saving() {
             exclude_globs: vec![],
             chunk_size: 800,
             chunk_overlap: 100,
+            search_mode: rag_db::SearchMode::Versioned,
         },
     )
     .await
@@ -561,6 +566,7 @@ async fn admin_can_add_set_primary_reindex_and_delete_refs() {
             exclude_globs: vec![],
             chunk_size: 800,
             chunk_overlap: 100,
+            search_mode: rag_db::SearchMode::Versioned,
         },
     )
     .await
@@ -658,4 +664,90 @@ async fn admin_can_add_set_primary_reindex_and_delete_refs() {
     let remaining = rag_db::list_refs(&db, c.id).await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].git_ref, "squid");
+}
+
+#[tokio::test]
+async fn admin_creates_aggregate_collection_and_bulk_adds_sources() {
+    use gateway::server::db::rag as rag_db;
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie =
+        seed_session_with_roles(&state, "boss", "boss@example.com", vec!["admin".into()]).await;
+    let db = state.db.clone();
+    let app = common::app(state);
+
+    // Create an aggregate collection — empty Git URL is allowed here, the
+    // `aggregate` checkbox is ticked, and `master` is the default ref.
+    let form = "name=proxmox\
+        &git_url=\
+        &git_ref=master\
+        &embedding_model=embed-1\
+        &include_globs=*.pm\
+        &aggregate=on";
+    let resp = app
+        .serve(req_with_cookie(Method::POST, "/rag", &cookie, Some(form)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8(common::read_body(resp).await.to_vec()).unwrap();
+    assert!(
+        body.contains("aggregate"),
+        "aggregate badge missing\n{body}"
+    );
+
+    let c = rag_db::find_collection_by_name(&db, "proxmox")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(c.search_mode, rag_db::SearchMode::Aggregate);
+    // Aggregate collections start with no refs — sources are added below.
+    assert!(rag_db::list_refs(&db, c.id).await.unwrap().is_empty());
+
+    // Bulk-add three sources; the third pins an explicit `@stable-8` ref.
+    let bulk = "sources=https://github.com/proxmox/pve-manager.git%0A\
+        https://github.com/proxmox/qemu-server.git%0A\
+        https://github.com/proxmox/pve-docs.git%20%40stable-8";
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/rag/{}/refs/bulk", c.id),
+            &cookie,
+            Some(bulk),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8(common::read_body(resp).await.to_vec()).unwrap();
+    assert!(
+        body.contains("Queued indexing of 3 source(s)."),
+        "bulk toast missing\n{body}"
+    );
+
+    let refs = rag_db::list_refs(&db, c.id).await.unwrap();
+    assert_eq!(refs.len(), 3);
+    let by_label: std::collections::HashMap<String, &rag_db::CollectionRef> =
+        refs.iter().map(|r| (r.source_label(&c), r)).collect();
+    assert_eq!(by_label["pve-manager"].git_ref, "master");
+    assert_eq!(by_label["qemu-server"].git_ref, "master");
+    assert_eq!(by_label["pve-docs"].git_ref, "stable-8");
+    assert_eq!(
+        by_label["pve-manager"].git_url.as_deref(),
+        Some("https://github.com/proxmox/pve-manager.git")
+    );
+
+    // Re-posting the same list is idempotent — duplicates are skipped.
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/rag/{}/refs/bulk", c.id),
+            &cookie,
+            Some(bulk),
+        ))
+        .await
+        .unwrap();
+    let body = String::from_utf8(common::read_body(resp).await.to_vec()).unwrap();
+    assert!(
+        body.contains("skipped 3 duplicate"),
+        "dup-skip toast missing\n{body}"
+    );
+    assert_eq!(rag_db::list_refs(&db, c.id).await.unwrap().len(), 3);
 }

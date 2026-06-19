@@ -46,6 +46,11 @@ struct CreateForm {
     exclude_globs: Option<String>,
     chunk_size: Option<i64>,
     chunk_overlap: Option<i64>,
+    /// Checkbox: absent when unticked, `Some(..)` when ticked. Aggregate =
+    /// one searchable corpus spanning many source repos (each added as a
+    /// source); versioned = branches/tags of one repo.
+    #[serde(default)]
+    aggregate: Option<String>,
 }
 
 /// GET /rag — admin-only list of indexed collections with a create
@@ -125,16 +130,29 @@ pub async fn rag_create(State(state): State<Arc<RamaState>>, req: Request) -> Re
             );
         }
     };
-    // Create the collection's first (primary) ref from the form's
-    // branch/tag/commit field, and kick the indexer so it starts now.
-    match rag_db::add_ref(&state.db, created.id, &new.git_ref, true).await {
-        Ok(r) => {
-            if let Some(indexer) = state.indexer.as_ref() {
-                let _ = indexer.request_reindex(r.id).await;
+    // Versioned collections get their first (primary) ref from the form's
+    // branch/tag field, kicked to index now. Aggregate collections start
+    // empty — the operator adds each source repo below (singly or in bulk).
+    let toast_msg = match new.search_mode {
+        rag_db::SearchMode::Versioned => {
+            match rag_db::add_ref(&state.db, created.id, &new.git_ref, None, true).await {
+                Ok(r) => {
+                    if let Some(indexer) = state.indexer.as_ref() {
+                        let _ = indexer.request_reindex(r.id).await;
+                    }
+                }
+                Err(err) => tracing::warn!(error = %err, "create initial ref"),
             }
+            format!(
+                "Indexing `{}` @ `{}` was queued.",
+                created.name, new.git_ref
+            )
         }
-        Err(err) => tracing::warn!(error = %err, "create initial ref"),
-    }
+        rag_db::SearchMode::Aggregate => format!(
+            "Created `{}` (aggregate). Add source repos below to index them.",
+            created.name
+        ),
+    };
     let refs = rag_db::list_refs(&state.db, created.id)
         .await
         .unwrap_or_default();
@@ -144,10 +162,7 @@ pub async fn rag_create(State(state): State<Arc<RamaState>>, req: Request) -> Re
         sse_script("document.getElementById('rag-create-form').reset()"),
         sse_toast(&Flash {
             kind: FlashKind::Success,
-            message: format!(
-                "Indexing `{}` @ `{}` was queued.",
-                created.name, new.git_ref
-            ),
+            message: toast_msg,
         }),
     ])
 }
@@ -210,6 +225,10 @@ pub async fn rag_reindex(
 #[derive(serde::Deserialize)]
 struct AddRefForm {
     git_ref: String,
+    /// Optional per-source repo URL (aggregate collections). Empty/absent →
+    /// inherit the collection's `git_url` (versioned collections).
+    #[serde(default)]
+    git_url: Option<String>,
 }
 
 /// POST /rag/{id}/refs — add a branch/tag/commit ref to a collection and
@@ -235,12 +254,17 @@ pub async fn rag_add_ref(
     if git_ref.is_empty() {
         return toast(FlashKind::Error, "Ref (branch/tag/commit) is required.");
     }
+    let git_url = form
+        .git_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     // The first ref of a collection becomes its primary (search default).
     let is_primary = rag_db::list_refs(&state.db, id)
         .await
         .map(|r| r.is_empty())
         .unwrap_or(false);
-    match rag_db::add_ref(&state.db, id, git_ref, is_primary).await {
+    match rag_db::add_ref(&state.db, id, git_ref, git_url, is_primary).await {
         Ok(r) => {
             if let Some(indexer) = state.indexer.as_ref() {
                 let _ = indexer.request_reindex(r.id).await;
@@ -260,6 +284,97 @@ pub async fn rag_add_ref(
         }
     }
     row_patch(&state, id, format!("Queued indexing of `{git_ref}`.")).await
+}
+
+#[derive(serde::Deserialize)]
+struct BulkAddForm {
+    sources: String,
+}
+
+/// Parse one bulk-add line into `(git_url, git_ref)`. Format per line:
+/// `<url>` or `<url> <ref>` or `<url> @<ref>` (whitespace-separated). Blank
+/// lines and `#` comments yield `None`. `default_ref` fills in a missing ref.
+fn parse_bulk_line(line: &str, default_ref: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let url = parts.next()?.to_string();
+    let git_ref = parts
+        .next()
+        .map(|r| r.trim_start_matches('@'))
+        .filter(|r| !r.is_empty())
+        .unwrap_or(default_ref)
+        .to_string();
+    Some((url, git_ref))
+}
+
+/// POST /rag/{id}/refs/bulk — add many sources at once (one repo per line).
+/// The ergonomic path for aggregate collections like Proxmox (~40 repos).
+/// Each line lacking an explicit ref inherits the collection's `git_ref`.
+pub async fn rag_add_sources_bulk(
+    State(state): State<Arc<RamaState>>,
+    Path(id): Path<i64>,
+    req: Request,
+) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let collection = match rag_db::find_collection_by_id(&state.db, id).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return toast(FlashKind::Error, "collection not found"),
+        Err(err) => {
+            tracing::warn!(error = %err, %id, "bulk add: lookup");
+            return toast(FlashKind::Error, "could not load collection");
+        }
+    };
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let form: BulkAddForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+    };
+    let parsed: Vec<(String, String)> = form
+        .sources
+        .lines()
+        .filter_map(|l| parse_bulk_line(l, &collection.git_ref))
+        .collect();
+    if parsed.is_empty() {
+        return toast(FlashKind::Error, "No source URLs found.");
+    }
+    let had_refs = rag_db::list_refs(&state.db, id)
+        .await
+        .map(|r| !r.is_empty())
+        .unwrap_or(false);
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    for (i, (url, git_ref)) in parsed.iter().enumerate() {
+        // First source of an empty collection becomes primary (harmless in
+        // aggregate mode, where search ignores primacy, but keeps the
+        // one-primary invariant satisfied for the UI).
+        let is_primary = !had_refs && i == 0;
+        match rag_db::add_ref(&state.db, id, git_ref, Some(url.as_str()), is_primary).await {
+            Ok(r) => {
+                added += 1;
+                if let Some(indexer) = state.indexer.as_ref() {
+                    let _ = indexer.request_reindex(r.id).await;
+                }
+            }
+            // A duplicate (same url+ref already present) is skipped, not fatal —
+            // bulk re-paste should be idempotent.
+            Err(_) => skipped += 1,
+        }
+    }
+    let msg = if skipped > 0 {
+        format!("Queued {added} source(s); skipped {skipped} duplicate(s).")
+    } else {
+        format!("Queued indexing of {added} source(s).")
+    };
+    row_patch(&state, id, msg).await
 }
 
 /// POST /rag/refs/{ref_id}/reindex — re-queue a single ref.
@@ -593,8 +708,15 @@ fn validate(form: CreateForm) -> Result<rag_db::NewCollection, String> {
     if name.is_empty() || name.len() > 64 {
         return Err("Name must be 1..=64 characters.".into());
     }
+    let search_mode = if form.aggregate.is_some() {
+        rag_db::SearchMode::Aggregate
+    } else {
+        rag_db::SearchMode::Versioned
+    };
     let git_url = form.git_url.trim();
-    if git_url.is_empty() {
+    // Aggregate collections carry no single repo — each source brings its
+    // own URL — so the collection-level Git URL is optional there.
+    if git_url.is_empty() && search_mode == rag_db::SearchMode::Versioned {
         return Err("Git URL is required.".into());
     }
     let embedding_model = form.embedding_model.trim();
@@ -630,6 +752,7 @@ fn validate(form: CreateForm) -> Result<rag_db::NewCollection, String> {
         exclude_globs: split_globs(form.exclude_globs),
         chunk_size,
         chunk_overlap,
+        search_mode,
     })
 }
 
@@ -663,8 +786,18 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
     let delete_directive = format!("@post('{delete_action}', {{contentType: 'form'}})");
     let edit_directive = format!("@post('{edit_action}', {{contentType: 'form'}})");
     let add_ref_directive = format!("@post('{add_ref_action}', {{contentType: 'form'}})");
+    let bulk_action = format!("/rag/{}/refs/bulk", c.id);
+    let bulk_directive = format!("@post('{bulk_action}', {{contentType: 'form'}})");
     let pat_hint = if c.pat.is_some() { "PAT set" } else { "no PAT" };
     let description = c.description.clone().unwrap_or_default();
+    let aggregate = c.search_mode == rag_db::SearchMode::Aggregate;
+    // Aggregate collections have no single repo URL — summarise by source
+    // count instead. Versioned ones show their one repo.
+    let meta_line = if aggregate {
+        format!("{} source(s) · {}", refs.len(), pat_hint)
+    } else {
+        format!("{} · {}", c.git_url, pat_hint)
+    };
     html! {
         li(
             id: (dom_id),
@@ -674,12 +807,15 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
                 div(class: "flex-1 min-w-0") {
                     div(class: "flex items-center gap-2") {
                         span(class: "text-base font-medium") { (c.name.clone()) }
+                        if aggregate {
+                            span(class: "badge badge-sm badge-secondary") { "aggregate" }
+                        }
                     }
                     if !description.is_empty() {
                         p(class: "text-sm text-base-content/70 mt-0.5") { (description) }
                     }
                     p(class: "text-xs text-base-content/60 mt-1 font-mono break-all") {
-                        (c.git_url.clone()) " · " (pat_hint)
+                        (meta_line)
                     }
                     p(class: "text-xs text-base-content/60 mt-1") {
                         "embed: " (c.embedding_model.clone())
@@ -704,25 +840,66 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
                     }
                 }
             }
-            // Per-ref rows: each branch/tag/commit indexed independently.
+            // Per-ref/source rows: each indexed independently in its own store.
             div(class: "mt-1 pl-3 border-l border-base-300 flex flex-col gap-1.5") {
                 for r in refs.iter() {
-                    (render_ref(r))
+                    (render_ref(c, r))
                 }
+                // Add-source form. Aggregate collections take a repo URL plus
+                // an optional ref; versioned ones just a ref of the one repo.
                 form(
                     action: (add_ref_action),
                     method: "post",
-                    class: "flex items-center gap-2 mt-1",
+                    class: "flex items-center gap-2 mt-1 flex-wrap",
                     "data-on:submit__prevent": (add_ref_directive)
                 ) {
-                    input(
-                        type: "text",
-                        name: "git_ref",
-                        placeholder: "branch, tag, or commit",
-                        required: "required",
-                        class: "input input-bordered input-xs w-56"
-                    );
-                    button(type: "submit", class: "btn btn-xs") { "Add ref" }
+                    if aggregate {
+                        input(
+                            type: "text",
+                            name: "git_url",
+                            placeholder: "https://github.com/org/repo.git",
+                            required: "required",
+                            class: "input input-bordered input-xs w-80"
+                        );
+                        input(
+                            type: "text",
+                            name: "git_ref",
+                            placeholder: "ref (default: collection's)",
+                            value: (c.git_ref.clone()),
+                            required: "required",
+                            class: "input input-bordered input-xs w-44"
+                        );
+                        button(type: "submit", class: "btn btn-xs") { "Add source" }
+                    } else {
+                        input(
+                            type: "text",
+                            name: "git_ref",
+                            placeholder: "branch, tag, or commit",
+                            required: "required",
+                            class: "input input-bordered input-xs w-56"
+                        );
+                        button(type: "submit", class: "btn btn-xs") { "Add ref" }
+                    }
+                }
+                // Bulk add (aggregate only): one repo per line, optional
+                // ` @ref`. The fast path for many-repo corpora like Proxmox.
+                if aggregate {
+                    form(
+                        action: (bulk_action),
+                        method: "post",
+                        class: "flex flex-col gap-1 mt-1",
+                        "data-on:submit__prevent": (bulk_directive)
+                    ) {
+                        textarea(
+                            name: "sources",
+                            rows: "4",
+                            placeholder: "Bulk add — one repo per line, optional @ref:\nhttps://github.com/proxmox/pve-manager.git\nhttps://github.com/proxmox/qemu-server.git @master",
+                            class: "textarea textarea-bordered textarea-xs w-full font-mono"
+                        ) {}
+                        div {
+                            button(type: "submit", class: "btn btn-xs") { "Add sources (bulk)" }
+                        }
+                    }
                 }
             }
         }
@@ -730,10 +907,11 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
     .to_html()
 }
 
-/// One ref row inside a collection: its name, primary badge, status,
+/// One ref/source row inside a collection: its name, primary badge, status,
 /// last-indexed provenance, and per-ref actions (re-index / set-primary /
-/// delete).
-fn render_ref(r: &rag_db::CollectionRef) -> Html {
+/// delete). For aggregate collections the source repo (e.g. `qemu-server`)
+/// is shown as the label, since every source there shares the same `git_ref`.
+fn render_ref(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Html {
     let dom_id = format!("rag-ref-{}", r.id);
     let reindex_action = format!("/rag/refs/{}/reindex", r.id);
     let delete_action = format!("/rag/refs/{}/delete", r.id);
@@ -752,10 +930,20 @@ fn render_ref(r: &rag_db::CollectionRef) -> Html {
         .chars()
         .take(8)
         .collect::<String>();
+    let aggregate = c.search_mode == rag_db::SearchMode::Aggregate;
+    // Aggregate: lead with the source repo and show the ref after it.
+    // Versioned: the ref is the label (one repo, many refs).
+    let label = if aggregate {
+        format!("{} @ {}", r.source_label(c), r.git_ref)
+    } else {
+        r.git_ref.clone()
+    };
     html! {
         div(id: (dom_id), class: "flex items-center gap-2 text-sm flex-wrap") {
-            span(class: "font-mono") { (r.git_ref.clone()) }
-            if r.is_primary {
+            span(class: "font-mono") { (label) }
+            // Primacy is meaningful only for versioned collections (the
+            // search default); aggregate search ignores it.
+            if r.is_primary && !aggregate {
                 span(class: "badge badge-sm") { "primary" }
             }
             (status_badge(r.status))
@@ -769,13 +957,13 @@ fn render_ref(r: &rag_db::CollectionRef) -> Html {
                 form(action: (reindex_action), method: "post", class: "m-0", "data-on:submit__prevent": (reindex_directive)) {
                     button(type: "submit", class: "btn btn-xs") { "Re-index" }
                 }
-                if !r.is_primary {
+                if !r.is_primary && !aggregate {
                     form(action: (primary_action), method: "post", class: "m-0", "data-on:submit__prevent": (primary_directive)) {
                         button(type: "submit", class: "btn btn-xs btn-ghost") { "Set primary" }
                     }
                 }
                 form(action: (delete_action), method: "post", class: "m-0", "data-on:submit__prevent": (delete_directive)) {
-                    button(type: "submit", class: "btn btn-xs btn-ghost btn-error") { "Remove ref" }
+                    button(type: "submit", class: "btn btn-xs btn-ghost btn-error") { "Remove" }
                 }
             }
         }
@@ -834,11 +1022,13 @@ fn render_create_form(embedding_models: &[String]) -> Html {
                         );
                     }
                     label(class: "form-control w-full") {
-                        div(class: "label") { span(class: "label-text") { "Git URL" } }
+                        // Not `required`: aggregate collections leave this empty
+                        // (each source brings its own URL). The server enforces
+                        // a non-empty URL for versioned collections.
+                        div(class: "label") { span(class: "label-text") { "Git URL (versioned only)" } }
                         input(
                             name: "git_url",
                             type: "text",
-                            required: "required",
                             placeholder: "https://example.com/org/repo.git",
                             class: "input input-bordered w-full"
                         );
@@ -905,6 +1095,18 @@ fn render_create_form(embedding_models: &[String]) -> Html {
                             min: "0",
                             class: "input input-bordered w-full"
                         );
+                    }
+                    label(class: "label cursor-pointer justify-start gap-3 md:col-span-2") {
+                        input(
+                            name: "aggregate",
+                            type: "checkbox",
+                            class: "checkbox checkbox-sm"
+                        );
+                        span(class: "label-text") {
+                            "Aggregate (multi-source): search across many repos as one corpus. "
+                            "Leave the Git URL empty and add each source repo after creating. "
+                            "Branch / tag becomes the default ref for added sources."
+                        }
                     }
                 }
                 div(class: "card-actions justify-end mt-2") {

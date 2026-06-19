@@ -190,13 +190,14 @@ async fn indexer_clones_chunks_embeds_then_search_returns_right_chunk() {
             exclude_globs: Vec::new(),
             chunk_size: 80,
             chunk_overlap: 10,
+            search_mode: rag_db::SearchMode::Versioned,
         },
     )
     .await
     .unwrap();
 
     // Index the collection's primary ref.
-    let r = rag_db::add_ref(&pool, collection.id, "main", true)
+    let r = rag_db::add_ref(&pool, collection.id, "main", None, true)
         .await
         .unwrap();
     indexer.index_ref(r.id).await.unwrap();
@@ -290,11 +291,12 @@ async fn reindex_after_edit_drops_old_chunks_and_picks_up_new_content() {
             exclude_globs: Vec::new(),
             chunk_size: 80,
             chunk_overlap: 10,
+            search_mode: rag_db::SearchMode::Versioned,
         },
     )
     .await
     .unwrap();
-    let r = rag_db::add_ref(&pool, collection.id, "main", true)
+    let r = rag_db::add_ref(&pool, collection.id, "main", None, true)
         .await
         .unwrap();
     indexer.index_ref(r.id).await.unwrap();

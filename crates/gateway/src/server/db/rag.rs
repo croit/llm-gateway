@@ -61,6 +61,37 @@ impl CollectionStatus {
     }
 }
 
+/// How `rag_search` resolves a query when the caller names no `ref`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    /// Refs are versions of the *same* repo (e.g. Ceph reef vs squid).
+    /// Default search uses the collection's primary ref — versions are not
+    /// mixed.
+    Versioned,
+    /// Sources are *different* repos forming one body of knowledge (e.g.
+    /// all Proxmox repos). Default search fans out across every searchable
+    /// source and merges the hits into one ranking.
+    Aggregate,
+}
+
+impl SearchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchMode::Versioned => "versioned",
+            SearchMode::Aggregate => "aggregate",
+        }
+    }
+
+    /// Lenient parse — an unknown value falls back to `Versioned`, the
+    /// pre-multi-source behaviour, so a stray row can't break rendering.
+    fn from_db(s: &str) -> Self {
+        match s {
+            "aggregate" => Self::Aggregate,
+            _ => Self::Versioned,
+        }
+    }
+}
+
 /// One configured codebase. Fields mirror the migration; see `0013_rag.sql`
 /// for the why-each-column commentary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +112,8 @@ pub struct Collection {
     pub exclude_globs: Vec<String>,
     pub chunk_size: i64,
     pub chunk_overlap: i64,
+    /// How `rag_search` resolves a ref-less query. See [`SearchMode`].
+    pub search_mode: SearchMode,
     pub status: CollectionStatus,
     pub last_indexed_at: Option<Timestamp>,
     pub last_indexed_commit: Option<String>,
@@ -104,6 +137,7 @@ pub struct NewCollection {
     pub exclude_globs: Vec<String>,
     pub chunk_size: i64,
     pub chunk_overlap: i64,
+    pub search_mode: SearchMode,
 }
 
 fn parse_ts(s: &str, column: &'static str) -> Result<Timestamp, DbError> {
@@ -130,6 +164,7 @@ fn map_collection_row(row: &SqliteRow) -> Result<Collection, DbError> {
     let created_at_s: String = row.try_get("created_at")?;
     let updated_at_s: String = row.try_get("updated_at")?;
     let status_s: String = row.try_get("status")?;
+    let search_mode_s: String = row.try_get("search_mode")?;
     Ok(Collection {
         id: row.try_get("id")?,
         data_uuid: row.try_get("data_uuid")?,
@@ -143,6 +178,7 @@ fn map_collection_row(row: &SqliteRow) -> Result<Collection, DbError> {
         exclude_globs: decode_globs(&exclude_globs_json, "exclude_globs_json")?,
         chunk_size: row.try_get("chunk_size")?,
         chunk_overlap: row.try_get("chunk_overlap")?,
+        search_mode: SearchMode::from_db(&search_mode_s),
         status: CollectionStatus::from_db(&status_s),
         last_indexed_at,
         last_indexed_commit: row.try_get("last_indexed_commit")?,
@@ -154,7 +190,7 @@ fn map_collection_row(row: &SqliteRow) -> Result<Collection, DbError> {
 
 const COLLECTION_COLUMNS: &str = "id, data_uuid, name, description, git_url, git_ref, pat, \
      embedding_model, include_globs_json, exclude_globs_json, chunk_size, chunk_overlap, \
-     status, last_indexed_at, last_indexed_commit, last_error, created_at, updated_at";
+     search_mode, status, last_indexed_at, last_indexed_commit, last_error, created_at, updated_at";
 
 pub async fn create_collection(pool: &Pool, new: &NewCollection) -> Result<Collection, DbError> {
     let now = Timestamp::now();
@@ -174,8 +210,8 @@ pub async fn create_collection(pool: &Pool, new: &NewCollection) -> Result<Colle
         r#"INSERT INTO rag_collections
            (data_uuid, name, description, git_url, git_ref, pat, embedding_model,
             include_globs_json, exclude_globs_json, chunk_size, chunk_overlap,
-            status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            search_mode, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
            RETURNING id"#,
     )
     .bind(&data_uuid)
@@ -189,6 +225,7 @@ pub async fn create_collection(pool: &Pool, new: &NewCollection) -> Result<Colle
     .bind(&exclude_json)
     .bind(new.chunk_size)
     .bind(new.chunk_overlap)
+    .bind(new.search_mode.as_str())
     .bind(&now_s)
     .bind(&now_s)
     .fetch_one(pool)
@@ -325,6 +362,10 @@ pub struct CollectionRef {
     pub id: i64,
     pub collection_id: i64,
     pub git_ref: String,
+    /// This source's own repo URL, or `None` to use the collection's
+    /// `git_url`. Set for aggregate collections where each source is a
+    /// different repo; `None` for versioned collections (refs of one repo).
+    pub git_url: Option<String>,
     pub is_primary: bool,
     /// Names this ref's on-disk store folder (`<rag.data_dir>/<data_uuid>/`).
     pub data_uuid: String,
@@ -343,9 +384,38 @@ impl CollectionRef {
     pub fn is_searchable(&self) -> bool {
         self.last_indexed_commit.is_some()
     }
+
+    /// The URL the indexer should clone for this source: its own `git_url`
+    /// override if set, else the collection's `git_url`.
+    pub fn effective_git_url<'a>(&'a self, collection: &'a Collection) -> &'a str {
+        self.git_url.as_deref().unwrap_or(&collection.git_url)
+    }
+
+    /// Short human label for the source, derived from its effective URL —
+    /// the last path segment without a `.git` suffix (e.g. `qemu-server`).
+    /// Used to tell aggregate hits apart by originating repo.
+    pub fn source_label(&self, collection: &Collection) -> String {
+        repo_basename(self.effective_git_url(collection))
+    }
 }
 
-const REF_COLUMNS: &str = "id, collection_id, git_ref, is_primary, data_uuid, status, \
+/// Last path segment of a git URL, minus any `.git` suffix. Falls back to
+/// the trimmed input when there's no separator.
+pub fn repo_basename(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    let last = trimmed
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches(".git");
+    if last.is_empty() {
+        trimmed.to_string()
+    } else {
+        last.to_string()
+    }
+}
+
+const REF_COLUMNS: &str = "id, collection_id, git_ref, git_url, is_primary, data_uuid, status, \
      last_indexed_at, last_indexed_commit, last_error, created_at, updated_at";
 
 fn map_ref_row(row: &SqliteRow) -> Result<CollectionRef, DbError> {
@@ -361,6 +431,7 @@ fn map_ref_row(row: &SqliteRow) -> Result<CollectionRef, DbError> {
         id: row.try_get("id")?,
         collection_id: row.try_get("collection_id")?,
         git_ref: row.try_get("git_ref")?,
+        git_url: row.try_get("git_url")?,
         is_primary: is_primary != 0,
         data_uuid: row.try_get("data_uuid")?,
         status: CollectionStatus::from_db(&status_s),
@@ -377,6 +448,22 @@ pub async fn list_refs(pool: &Pool, collection_id: i64) -> Result<Vec<Collection
     let q = format!(
         "SELECT {REF_COLUMNS} FROM rag_collection_refs WHERE collection_id = ? \
          ORDER BY is_primary DESC, created_at ASC, id ASC"
+    );
+    let rows = sqlx::query(&q).bind(collection_id).fetch_all(pool).await?;
+    rows.iter().map(map_ref_row).collect()
+}
+
+/// Every searchable source of a collection — those that have completed at
+/// least one index (`last_indexed_commit IS NOT NULL`). Used by aggregate
+/// search to fan out across all repos of the collection.
+pub async fn searchable_refs(
+    pool: &Pool,
+    collection_id: i64,
+) -> Result<Vec<CollectionRef>, DbError> {
+    let q = format!(
+        "SELECT {REF_COLUMNS} FROM rag_collection_refs \
+         WHERE collection_id = ? AND last_indexed_commit IS NOT NULL \
+         ORDER BY created_at ASC, id ASC"
     );
     let rows = sqlx::query(&q).bind(collection_id).fetch_all(pool).await?;
     rows.iter().map(map_ref_row).collect()
@@ -420,13 +507,16 @@ pub async fn primary_ref(
     row.as_ref().map(map_ref_row).transpose()
 }
 
-/// Add a ref to a collection. Allocates its store-folder id. If
+/// Add a ref/source to a collection. Allocates its store-folder id.
+/// `git_url` is the source's own repo (aggregate collections) or `None` to
+/// inherit the collection's `git_url` (versioned collections). If
 /// `is_primary`, demotes the current primary first (the partial unique
 /// index allows only one). New refs start `pending` for the indexer.
 pub async fn add_ref(
     pool: &Pool,
     collection_id: i64,
     git_ref: &str,
+    git_url: Option<&str>,
     is_primary: bool,
 ) -> Result<CollectionRef, DbError> {
     let now = Timestamp::now().to_string();
@@ -440,12 +530,13 @@ pub async fn add_ref(
     }
     let id: i64 = sqlx::query_scalar(
         r#"INSERT INTO rag_collection_refs
-           (collection_id, git_ref, is_primary, data_uuid, status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'pending', ?, ?)
+           (collection_id, git_ref, git_url, is_primary, data_uuid, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
            RETURNING id"#,
     )
     .bind(collection_id)
     .bind(git_ref)
+    .bind(git_url)
     .bind(is_primary as i64)
     .bind(&data_uuid)
     .bind(&now)
@@ -941,6 +1032,7 @@ mod tests {
             exclude_globs: vec!["target/".into()],
             chunk_size: 800,
             chunk_overlap: 100,
+            search_mode: SearchMode::Versioned,
         }
     }
 
@@ -1129,10 +1221,10 @@ mod tests {
     async fn refs_add_list_primary_and_delete() {
         let pool = fresh().await;
         let c = create_collection(&pool, &sample_new()).await.unwrap();
-        let reef = add_ref(&pool, c.id, "reef", true).await.unwrap();
+        let reef = add_ref(&pool, c.id, "reef", None, true).await.unwrap();
         assert!(reef.is_primary);
         assert!(!reef.is_searchable(), "a fresh ref has no completed index");
-        let squid = add_ref(&pool, c.id, "squid", false).await.unwrap();
+        let squid = add_ref(&pool, c.id, "squid", None, false).await.unwrap();
         assert!(!squid.is_primary);
         assert_eq!(
             primary_ref(&pool, c.id).await.unwrap().unwrap().git_ref,
@@ -1169,9 +1261,9 @@ mod tests {
     async fn deleting_primary_promotes_a_survivor() {
         let pool = fresh().await;
         let c = create_collection(&pool, &sample_new()).await.unwrap();
-        let primary = add_ref(&pool, c.id, "primary", true).await.unwrap();
-        let fresh_ref = add_ref(&pool, c.id, "fresh", false).await.unwrap();
-        let indexed = add_ref(&pool, c.id, "indexed", false).await.unwrap();
+        let primary = add_ref(&pool, c.id, "primary", None, true).await.unwrap();
+        let fresh_ref = add_ref(&pool, c.id, "fresh", None, false).await.unwrap();
+        let indexed = add_ref(&pool, c.id, "indexed", None, false).await.unwrap();
         // Make `indexed` searchable so it is the preferred promotion target
         // over the never-indexed `fresh` ref.
         set_ref_status(&pool, indexed.id, CollectionStatus::Indexing)
@@ -1204,7 +1296,7 @@ mod tests {
     async fn ref_swap_and_reindex_are_status_guarded() {
         let pool = fresh().await;
         let c = create_collection(&pool, &sample_new()).await.unwrap();
-        let r = add_ref(&pool, c.id, "reef", true).await.unwrap();
+        let r = add_ref(&pool, c.id, "reef", None, true).await.unwrap();
 
         // Swap is a no-op unless the ref is mid-index.
         assert_eq!(swap_ref_index(&pool, r.id, "u1", "sha1").await.unwrap(), 0);
@@ -1230,11 +1322,92 @@ mod tests {
         assert!(after.is_searchable());
     }
 
+    #[test]
+    fn repo_basename_strips_path_and_git_suffix() {
+        assert_eq!(
+            repo_basename("https://github.com/proxmox/qemu-server.git"),
+            "qemu-server"
+        );
+        assert_eq!(
+            repo_basename("https://github.com/proxmox/pve-manager"),
+            "pve-manager"
+        );
+        assert_eq!(
+            repo_basename("git@github.com:proxmox/pve-docs.git"),
+            "pve-docs"
+        );
+        assert_eq!(repo_basename("file:///tmp/repo/"), "repo");
+    }
+
+    #[tokio::test]
+    async fn aggregate_sources_share_a_ref_but_differ_by_url() {
+        let pool = fresh().await;
+        let mut new = sample_new();
+        new.search_mode = SearchMode::Aggregate;
+        new.git_url = "https://fallback.invalid/default.git".into();
+        let c = create_collection(&pool, &new).await.unwrap();
+        assert_eq!(c.search_mode, SearchMode::Aggregate);
+
+        // Two different repos on the SAME branch must coexist — the old
+        // UNIQUE(collection_id, git_ref) is replaced by a url-aware index.
+        let a = add_ref(
+            &pool,
+            c.id,
+            "master",
+            Some("https://x/pve-manager.git"),
+            false,
+        )
+        .await
+        .unwrap();
+        let b = add_ref(
+            &pool,
+            c.id,
+            "master",
+            Some("https://x/qemu-server.git"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.source_label(&c), "pve-manager");
+        assert_eq!(b.source_label(&c), "qemu-server");
+        assert_eq!(a.effective_git_url(&c), "https://x/pve-manager.git");
+
+        // The same (url, ref) twice is still rejected (idempotent bulk-add).
+        assert!(
+            add_ref(
+                &pool,
+                c.id,
+                "master",
+                Some("https://x/pve-manager.git"),
+                false
+            )
+            .await
+            .is_err(),
+            "duplicate source must be rejected"
+        );
+
+        // A source with no url inherits the collection's url.
+        let inherit = add_ref(&pool, c.id, "dev", None, false).await.unwrap();
+        assert_eq!(inherit.effective_git_url(&c), c.git_url.as_str());
+
+        // Nothing is searchable until an index completes.
+        assert!(searchable_refs(&pool, c.id).await.unwrap().is_empty());
+        set_ref_status(&pool, a.id, CollectionStatus::Indexing)
+            .await
+            .unwrap();
+        swap_ref_index(&pool, a.id, "uuid-a", "sha-a")
+            .await
+            .unwrap();
+        let searchable = searchable_refs(&pool, c.id).await.unwrap();
+        assert_eq!(searchable.len(), 1);
+        assert_eq!(searchable[0].id, a.id);
+    }
+
     #[tokio::test]
     async fn reset_stalled_refs_requeues_orphans() {
         let pool = fresh().await;
         let c = create_collection(&pool, &sample_new()).await.unwrap();
-        let r = add_ref(&pool, c.id, "reef", true).await.unwrap();
+        let r = add_ref(&pool, c.id, "reef", None, true).await.unwrap();
         set_ref_status(&pool, r.id, CollectionStatus::Cloning)
             .await
             .unwrap();

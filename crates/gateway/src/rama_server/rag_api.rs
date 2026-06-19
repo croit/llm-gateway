@@ -199,6 +199,9 @@ pub async fn create_collection(State(state): State<Arc<RamaState>>, req: Request
         exclude_globs: body.exclude_globs,
         chunk_size: body.chunk_size,
         chunk_overlap: body.chunk_overlap,
+        // The JSON API creates single-repo (versioned) collections; aggregate
+        // multi-source collections are driven through the /rag admin UI.
+        search_mode: rag_db::SearchMode::Versioned,
     };
     match rag_db::create_collection(&state.db, &new).await {
         Ok(c) => (

@@ -454,8 +454,11 @@ impl Indexer {
 
         rag_db::set_ref_status(&self.inner.db, ref_id, rag_db::CollectionStatus::Cloning).await?;
         let clone_dir = self.clone_path(build_uuid);
+        // Aggregate collections give each source its own repo URL; versioned
+        // ones inherit the collection's. The PAT is the collection's (one
+        // credential covers its sources).
         let head = git::clone_or_update(
-            &collection.git_url,
+            rref.effective_git_url(collection),
             &rref.git_ref,
             collection.pat.as_deref(),
             &clone_dir,

@@ -86,6 +86,7 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/rag/{id}/cancel-edit", pages::rag_cancel_edit)
         .with_post("/rag/{id}/update", pages::rag_update)
         .with_post("/rag/{id}/refs", pages::rag_add_ref)
+        .with_post("/rag/{id}/refs/bulk", pages::rag_add_sources_bulk)
         .with_post("/rag/refs/{ref_id}/reindex", pages::rag_ref_reindex)
         .with_post("/rag/refs/{ref_id}/primary", pages::rag_ref_set_primary)
         .with_post("/rag/refs/{ref_id}/delete", pages::rag_ref_delete)

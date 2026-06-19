@@ -138,11 +138,14 @@ async fn seed_collection(
             exclude_globs: vec![],
             chunk_size: 800,
             chunk_overlap: 100,
+            search_mode: rag_db::SearchMode::Versioned,
         },
     )
     .await
     .unwrap();
-    let r = rag_db::add_ref(central, c.id, "main", true).await.unwrap();
+    let r = rag_db::add_ref(central, c.id, "main", None, true)
+        .await
+        .unwrap();
 
     let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
     let idx = indexer.open_index(r.id, &r.data_uuid, Some(4)).unwrap();
@@ -285,11 +288,14 @@ async fn lexical_alone_answers_when_vector_index_is_absent() {
             exclude_globs: vec![],
             chunk_size: 800,
             chunk_overlap: 100,
+            search_mode: rag_db::SearchMode::Versioned,
         },
     )
     .await
     .unwrap();
-    let r = rag_db::add_ref(&pool, c.id, "main", true).await.unwrap();
+    let r = rag_db::add_ref(&pool, c.id, "main", None, true)
+        .await
+        .unwrap();
     let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
     let file_id = rag_db::upsert_file(&store, c.id, "src/common/options/global.yaml.in", "h")
         .await
