@@ -42,6 +42,18 @@ use crate::server::tools::{Tool, ToolContext, ToolError, ToolRegistry};
 pub const MAX_TOOL_ROUNDS: u32 = 16;
 const PER_REQUEST_TOOL_CONCURRENCY: usize = 4;
 const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Tool-result context budget (mirrors Anthropic's tool-result clearing:
+/// trigger on size, keep the recent few, stub older ones re-callably).
+/// Only kicks in once the cumulative `role:"tool"` content exceeds this, so
+/// short conversations keep the full history and the prompt cache intact
+/// (clearing invalidates the cached prefix).
+const TOOL_OUTPUT_BUDGET: usize = 128 * 1024;
+/// When evicting, keep the last N tool results verbatim.
+const TOOL_OUTPUT_KEEP_FULL: usize = 3;
+/// Only stub older tool results bigger than this. Set above the sandbox
+/// preview size so a small `{preview, full_output_ref}` result is never
+/// stubbed (which would drop the ref it carries).
+const TOOL_OUTPUT_STUB_THRESHOLD: usize = 8192;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoopError {
@@ -156,6 +168,16 @@ where
             &split.gateway_owned,
             &tool_results,
         )?;
+
+        // Cap the cumulative context cost of accumulated tool results across
+        // rounds: once over budget, keep the last few verbatim and stub older
+        // large ones.
+        enforce_tool_output_budget(
+            &mut request_body,
+            TOOL_OUTPUT_BUDGET,
+            TOOL_OUTPUT_KEEP_FULL,
+            TOOL_OUTPUT_STUB_THRESHOLD,
+        );
 
         rounds += 1;
     }
@@ -347,7 +369,10 @@ pub(crate) async fn execute_tool_calls(
                 args = %truncate_for_log(&call.arguments_raw),
                 "tool call started"
             );
-            let outcome = tokio::time::timeout(TOOL_TIMEOUT, tool.run(ctx, args)).await;
+            // Most tools finish well within TOOL_TIMEOUT; a few (the sandbox
+            // family) declare a longer ceiling via `max_duration`.
+            let tool_timeout = tool.max_duration().unwrap_or(TOOL_TIMEOUT);
+            let outcome = tokio::time::timeout(tool_timeout, tool.run(ctx, args)).await;
             let elapsed_ms = started.elapsed().as_millis();
             let body = match outcome {
                 Ok(Ok(value)) => {
@@ -380,12 +405,11 @@ pub(crate) async fn execute_tool_calls(
                     tracing::warn!(
                         tool = %call.name,
                         elapsed_ms,
-                        timeout_secs = TOOL_TIMEOUT.as_secs(),
+                        timeout_secs = tool_timeout.as_secs(),
                         "tool timed out"
                     );
                     error_to_tool_message(&format!(
-                        "tool execution timed out after {:?}",
-                        TOOL_TIMEOUT
+                        "tool execution timed out after {tool_timeout:?}"
                     ))
                 }
             };
@@ -466,6 +490,90 @@ fn append_round_to_messages(
         }));
     }
     Ok(())
+}
+
+/// Once the cumulative `role:"tool"` content exceeds `budget`, keep the last
+/// `keep_full` results verbatim and replace the *content* of older, large ones
+/// with a short re-callable stub — preserving each message and its
+/// `tool_call_id` so the tool_call ↔ result pairing is never orphaned
+/// (upstreams reject an orphaned tool result). Bounds prompt growth without
+/// touching short conversations (which keeps the prompt cache warm). A
+/// stubbed result's `full_output_ref` (if any) is carried into the stub so the
+/// model can still `read_sandbox_output` it. Only string contents are stubbed
+/// (array/`tool_content_parts` results, e.g. inline images, are left intact).
+fn enforce_tool_output_budget(
+    request: &mut Value,
+    budget: usize,
+    keep_full: usize,
+    stub_threshold: usize,
+) {
+    let Some(messages) = request.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let content_len = |m: &Value| -> usize {
+        m.get("content")
+            .and_then(|c| c.as_str())
+            .map(str::len)
+            .unwrap_or(0)
+    };
+    let tool_idxs: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .map(|(i, _)| i)
+        .collect();
+    if tool_idxs.len() <= keep_full {
+        return;
+    }
+    // Trigger only when we're actually over budget.
+    let total: usize = tool_idxs.iter().map(|&i| content_len(&messages[i])).sum();
+    if total <= budget {
+        return;
+    }
+    let stub_until = tool_idxs.len() - keep_full;
+    for &i in &tool_idxs[..stub_until] {
+        let len = content_len(&messages[i]);
+        if len <= stub_threshold {
+            continue;
+        }
+        let ref_hint = messages[i]
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map(output_ref_hint)
+            .unwrap_or_default();
+        messages[i]["content"] = Value::String(format!(
+            "[earlier tool output cleared to save context ({len} chars). Re-run the tool to \
+             regenerate it{ref_hint}.]"
+        ));
+    }
+}
+
+/// If a stubbed tool result carried `full_output_ref`(s) (the sandbox preview
+/// shape), surface them so the model can still retrieve the output after
+/// eviction. Returns e.g. ` — or read it with read_sandbox_output id="t/x.txt"`.
+fn output_ref_hint(content: &str) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(content) else {
+        return String::new();
+    };
+    let mut refs: Vec<&str> = ["stdout", "stderr"]
+        .iter()
+        .filter_map(|k| {
+            v.get(k)
+                .and_then(|s| s.get("full_output_ref"))
+                .and_then(|r| r.as_str())
+        })
+        .collect();
+    refs.dedup();
+    match refs.as_slice() {
+        [] => String::new(),
+        ids => format!(
+            " — or read it with read_sandbox_output ({})",
+            ids.iter()
+                .map(|id| format!("id=\"{id}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -819,5 +927,92 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, LoopError::LoopExhausted(_)), "{err:?}");
+    }
+
+    fn body_with_tool_results(contents: &[(&str, String)]) -> Value {
+        let mut messages = vec![json!({"role": "user", "content": "hi"})];
+        for (id, content) in contents {
+            messages.push(json!({"role": "assistant", "tool_calls": [{"id": id}]}));
+            messages.push(json!({"role": "tool", "tool_call_id": id, "content": content}));
+        }
+        json!({ "messages": messages })
+    }
+
+    #[test]
+    fn budget_stubs_old_tool_results_keeps_recent_and_pairing() {
+        let big = "x".repeat(10_000);
+        let mut body = body_with_tool_results(&[
+            ("a", big.clone()),
+            ("b", big.clone()),
+            ("c", big.clone()),
+            ("d", big.clone()),
+        ]);
+        // total 40 KB > budget 4 KB → triggers; keep last 3 → only "a" stubbed.
+        enforce_tool_output_budget(&mut body, 4096, 3, 4096);
+        let msgs = body["messages"].as_array().unwrap();
+        let tool = |id: &str| {
+            msgs.iter()
+                .find(|m| m["tool_call_id"] == json!(id))
+                .unwrap()
+        };
+        assert!(
+            tool("a")["content"]
+                .as_str()
+                .unwrap()
+                .contains("cleared to save context")
+        );
+        assert_eq!(tool("a")["tool_call_id"], json!("a")); // pairing intact
+        for id in ["b", "c", "d"] {
+            assert_eq!(tool(id)["content"], json!(big), "{id} kept verbatim");
+        }
+    }
+
+    #[test]
+    fn budget_noop_under_budget_even_with_many_results() {
+        // 4 small results (8 KB total) under a 128 KB budget → no eviction, so
+        // the prompt cache stays intact.
+        let small = "y".repeat(2_000);
+        let mut body = body_with_tool_results(&[
+            ("a", small.clone()),
+            ("b", small.clone()),
+            ("c", small.clone()),
+            ("d", small.clone()),
+        ]);
+        enforce_tool_output_budget(&mut body, 128 * 1024, 3, 4096);
+        let msgs = body["messages"].as_array().unwrap();
+        let a = msgs
+            .iter()
+            .find(|m| m["tool_call_id"] == json!("a"))
+            .unwrap();
+        assert_eq!(a["content"], json!(small), "not stubbed under budget");
+    }
+
+    #[test]
+    fn budget_stub_preserves_output_ref() {
+        // A sandbox preview result carries full_output_ref; eviction must keep
+        // the ref so the model can still read it.
+        let with_ref = json!({
+            "stdout": {"preview": "x".repeat(9_000), "full_output_ref": "t-1/stdout.txt"}
+        })
+        .to_string();
+        let other = "z".repeat(9_000);
+        let mut body = body_with_tool_results(&[
+            ("a", with_ref),
+            ("b", other.clone()),
+            ("c", other.clone()),
+            ("d", other.clone()),
+        ]);
+        enforce_tool_output_budget(&mut body, 4096, 3, 4096);
+        let stub = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["tool_call_id"] == json!("a"))
+            .unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(stub.contains("read_sandbox_output"), "{stub}");
+        assert!(stub.contains("t-1/stdout.txt"), "{stub}");
     }
 }

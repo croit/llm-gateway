@@ -1,0 +1,13 @@
+# Egress network for sandboxes that are granted network access.
+#
+# `Internal=true` is the whole point: a sandbox attached here has NO direct
+# route to the internet. Its only path out is the egress proxy (which sits
+# on this network AND a normal network), reached via the HTTPS_PROXY env the
+# runner injects. So even adversarial code can only talk to hosts the
+# proxy's allowlist permits — default-deny egress, enforced at two layers.
+#
+# Install: sudo cp deploy/quadlet/sandbox-egress.network /etc/containers/systemd/
+
+[Network]
+NetworkName=sandbox-egress
+Internal=true

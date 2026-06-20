@@ -30,7 +30,7 @@ use rama::net::address::SocketAddress;
 use serde_json::json;
 
 use crate::rama_server::RamaState;
-use crate::rama_server::{api, cli_handlers, oidc_handlers, pages, proxy, rag_api};
+use crate::rama_server::{api, cli_handlers, oidc_handlers, pages, proxy, rag_api, sandbox_api};
 use session_core::assets;
 
 /// Builds the rama router. State is shared via `Arc` since handlers
@@ -124,6 +124,9 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/v1/chat/completions", proxy::chat_completions)
         .with_post("/v1/audio/transcriptions", proxy::transcribe)
         .with_post("/v1/embeddings", proxy::embeddings)
+        // Bearer-authed download of a file a sandbox run produced for an
+        // API caller (scoped to the caller's user; see `sandbox_api`).
+        .with_get("/v1/sandbox/files/{run}/{filename}", sandbox_api::download)
         .with_get("/auth/login", oidc_handlers::login)
         .with_get("/auth/callback", oidc_handlers::callback)
         .with_post("/auth/logout", oidc_handlers::logout)

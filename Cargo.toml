@@ -5,6 +5,7 @@ members = [
     "crates/session-core",
     "crates/gateway",
     "crates/cli",
+    "crates/sandbox-runner",
 ]
 
 [workspace.package]

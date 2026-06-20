@@ -1,0 +1,11 @@
+# Egress allowlist for the sandbox proxy — one destination per line.
+# A leading dot matches subdomains (e.g. `.pythonhosted.org`).
+# Default-deny: anything not listed here is blocked. Keep this tight.
+
+# Python package installs (pip).
+pypi.org
+files.pythonhosted.org
+
+# Add scraping / API targets your users genuinely need, e.g.:
+# .wikipedia.org
+# api.example.com

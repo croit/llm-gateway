@@ -36,6 +36,7 @@ pub mod rag;
 pub mod read_skill;
 pub mod registry;
 pub mod runner;
+pub mod sandbox;
 pub mod search_web;
 pub mod time;
 pub mod typst_render;
@@ -219,6 +220,16 @@ pub trait Tool: Send + Sync + 'static {
     /// Executes the tool. Returns a JSON value that's stringified into the
     /// `role: "tool"` message we send back to the model in the next round.
     fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a>;
+
+    /// Optional per-tool wall-clock ceiling the runner enforces around
+    /// [`Tool::run`]. `None` (the default) uses the runner's standard
+    /// per-tool timeout. Override it for tools that legitimately run long
+    /// — e.g. the sandbox tools, whose jobs (document rendering, headless
+    /// browser, cold-start) can exceed the default. Returning a value
+    /// shorter than the default is fine too.
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 #[cfg(test)]

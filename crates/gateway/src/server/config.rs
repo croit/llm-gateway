@@ -108,6 +108,49 @@ pub struct Config {
     /// `retention_days` to bound the raw-event window. See `server::usage`.
     #[serde(default)]
     pub usage: UsageConfig,
+    /// Code-execution sandbox. Optional — with no `[sandbox]` block the
+    /// `run_in_sandbox` tool family is not registered and the gateway
+    /// boots fine. When set, `runner_url` points at the standalone
+    /// `sandbox-runner` service, which holds podman access and executes
+    /// untrusted/LLM code in single-use sandboxes; the gateway only
+    /// talks HTTP to it. See `server::tools::sandbox`.
+    #[serde(default)]
+    pub sandbox: Option<SandboxConfig>,
+}
+
+/// Sandbox tool settings. The heavy lifting (isolation, warm pool, egress
+/// allowlist) lives in the separate `sandbox-runner` service; the gateway
+/// just needs to know where it is and how patient to be.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxConfig {
+    /// Master switch. `true` (default) registers the sandbox tools; set
+    /// `false` to turn the whole feature off without deleting the block
+    /// (e.g. to keep `runner_url` around while disabling it). Per-tool and
+    /// per-user/-token control is separate (RBAC + the `/tools` toggles).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Base URL of the sandbox-runner service, e.g.
+    /// `http://sandbox-runner:9000`. MUST be reachable only from the
+    /// gateway (internal network / mTLS) — it executes arbitrary code.
+    pub runner_url: String,
+    /// HTTP timeout for a single `/run` call. Should exceed the runner's
+    /// own per-job timeout plus sandbox cold-start margin.
+    #[serde(default = "default_sandbox_timeout")]
+    pub timeout_secs: u64,
+    /// Largest single produced file the gateway will accept back from a
+    /// run and store. Larger artifacts are dropped with a note in the
+    /// tool result rather than bloating storage / the model context.
+    #[serde(default = "default_sandbox_max_artifact")]
+    pub max_artifact_bytes: u64,
+}
+
+fn default_sandbox_timeout() -> u64 {
+    120
+}
+
+fn default_sandbox_max_artifact() -> u64 {
+    25 * 1024 * 1024
 }
 
 /// Usage-metrics knobs. Recording is decoupled from the request path (a

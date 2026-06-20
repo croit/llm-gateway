@@ -8,6 +8,7 @@
 //! place.
 
 pub mod api;
+pub mod sandbox;
 
 /// Healthcheck response body shape. Tiny, but having it here keeps the gateway
 /// and CLI from drifting on string literals.

@@ -40,6 +40,13 @@ Image=ghcr.io/croit/llm-gateway:latest
 # directly, but you'll lose HTTPS + sane access logs.
 PublishPort=127.0.0.1:8080:8080
 
+# Code-execution sandbox (optional): no network change needed here. The
+# sandbox-runner is a host service bound to this host's podman bridge gateway IP
+# (usually 10.88.0.1), which the gateway already reaches over the default
+# network. Just set `[sandbox] runner_url = "http://10.88.0.1:9000"` in
+# config.toml and deploy the runner (deploy/sandbox/setup-sandbox.sh). See
+# docs/sandbox.md.
+
 # GATEWAY_SESSION_KEY + GATEWAY_OIDC_CLIENT_SECRET (and any
 # `<POOL>_API_KEY_…` env vars referenced from `config.toml`) live here.
 EnvironmentFile=/etc/gateway/gateway.env

@@ -1,0 +1,39 @@
+# Allowlisting egress proxy for networked sandbox runs.
+#
+# Sits on `sandbox-egress` (where the sandboxes can reach it) AND the
+# default network (where it alone has internet). Sandboxes get the internet
+# only through this proxy, which only forwards to hosts in allowlist.txt —
+# so `pip install` and scraping work against permitted hosts and nothing
+# else. Default-deny: an empty allowlist blocks everything.
+#
+# Install:
+#   sudo mkdir -p /etc/gateway/sandbox
+#   sudo cp deploy/quadlet/squid.conf      /etc/gateway/sandbox/squid.conf
+#   sudo cp deploy/quadlet/allowlist.txt   /etc/gateway/sandbox/allowlist.txt
+#   sudo cp deploy/quadlet/egress-proxy.container /etc/containers/systemd/
+#   sudo systemctl daemon-reload && sudo systemctl start egress-proxy.service
+
+[Unit]
+Description=Sandbox egress allowlist proxy (squid)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=egress-proxy
+Image=docker.io/ubuntu/squid:latest
+
+# Two interfaces: reachable by sandboxes (internal) + reaches the internet.
+# Use the .network UNIT for sandbox-egress so Quadlet creates it and orders
+# this service after it; `podman` is the built-in default network.
+Network=sandbox-egress.network
+Network=podman
+
+Volume=/etc/gateway/sandbox/squid.conf:/etc/squid/squid.conf:ro,z
+Volume=/etc/gateway/sandbox/allowlist.txt:/etc/squid/allowlist.txt:ro,z
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target default.target

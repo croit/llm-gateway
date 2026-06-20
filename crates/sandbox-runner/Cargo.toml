@@ -1,0 +1,31 @@
+[package]
+name = "sandbox-runner"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sandbox-runner"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+async-trait = { workspace = true }
+
+# Spawning + driving `podman` subprocesses: `process` for the child,
+# `io-util` for piping the job JSON over its stdin/stdout, `time` for
+# the per-run wall-clock timeout.
+tokio = { workspace = true, features = ["io-util", "time"] }
+
+# Same HTTP framework as the gateway, so the two services share one
+# stack. We only need the server side here.
+rama = { workspace = true }

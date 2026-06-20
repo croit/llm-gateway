@@ -36,6 +36,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   IMAGE: ghcr.io/croit/llm-gateway
+  # Companion images for the code-execution sandbox feature (see docs/sandbox.md).
+  IMAGE_SANDBOX: ghcr.io/croit/llm-gateway-sandbox
+  IMAGE_RUNNER: ghcr.io/croit/llm-gateway-sandbox-runner
   # The workspace compiles 2-3x in one job (clippy debug + test debug +
   # release build) and lumis pulls in ~116 tree-sitter grammars, so the
   # default-runner disk fills up. Dropping debuginfo from the dev/test
@@ -83,13 +86,20 @@ jobs:
           GIT_SHA: ${{ github.sha }}
         run: mise run ci
 
-      - run: ls -lh target/release/gateway
+      # The sandbox-runner ships as its own image (COPY-prebuilt, like the
+      # gateway) so its image build needs no Rust toolchain. Deps are already
+      # warm from `mise run ci`, so this is a fast incremental compile.
+      - name: Build sandbox-runner binary
+        run: mise exec -- cargo build --release -p sandbox-runner
+
+      - run: ls -lh target/release/gateway target/release/sandbox-runner
 
       - uses: actions/upload-artifact@v7
         with:
           name: gateway-binaries
           path: |
             target/release/gateway
+            target/release/sandbox-runner
             target/release/typst
             target/release/libpdfium.so
           retention-days: 7
@@ -156,5 +166,119 @@ jobs:
           context: .
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # Sandbox companion images. These are large (LibreOffice + Chromium + the
+  # data/science stack) and self-contained (no Rust artifact needed for the
+  # gold image), so they only build+push on `push` to main/tags — not on every
+  # PR — to keep PR CI fast. Validate Containerfile changes locally with
+  # `docker build` (see docs/sandbox.md). amd64 (the llm01 target); the
+  # Containerfiles are arch-aware (TARGETARCH) if multi-arch is added later.
+  sandbox-image:
+    name: sandbox gold image
+    needs: ci
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      # The gold image is multi-GB (LibreOffice, Chromium, scipy/sklearn/…);
+      # reclaim the runner's preinstalled SDKs so the build doesn't run out of
+      # disk.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                      /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Image tags + labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_SANDBOX }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=LLM Gateway Sandbox
+            org.opencontainers.image.description=Batteries-included workload image for the LLM gateway code-execution sandbox — python + data/science stack, LibreOffice, pandoc, typst, ffmpeg, duckdb, ripgrep/jq, tshark, tesseract OCR, headless Chromium. Runs under gVisor (runsc) / crun.
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: sandbox-image
+          file: sandbox-image/Containerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  sandbox-runner-image:
+    name: sandbox runner image
+    needs: ci
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      # COPY-prebuilt, like the gateway image: pull the binary the `ci` job
+      # built and restore its executable bit (upload-artifact drops it).
+      - uses: actions/download-artifact@v8
+        with:
+          name: gateway-binaries
+          path: target/release
+      - name: Restore executable bit
+        run: chmod +x target/release/sandbox-runner
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Image tags + labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_RUNNER }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=LLM Gateway Sandbox Runner
+            org.opencontainers.image.description=Privileged helper for the LLM gateway sandbox — spawns single-use, gVisor-isolated sandboxes (holds the podman socket); the gateway talks to it over HTTP.
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Multi-stage Containerfile compiles the runner from the workspace, so the
+      # context is the repo root (target/ is excluded via .dockerignore).
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/sandbox-runner/Containerfile
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

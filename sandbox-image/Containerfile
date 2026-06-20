@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 croit GmbH
+#
+# Gold workload image for the LLM-gateway sandbox.
+#
+# Goal: a batteries-included environment so the model can act like a
+# capable system engineer — debug large (and compressed) log files, work
+# with office documents, and convert between the common file formats —
+# without needing network access at runtime. The isolation is the OCI
+# runtime it runs under (gVisor/runsc in production); the SAME image runs
+# unchanged under any OCI runtime (runsc/crun/runc). The `sandbox-runner`
+# boots one throwaway container per job from this image and pipes work to
+# `/usr/local/bin/sandbox-agent`.
+#
+# It is deliberately large (LibreOffice + Chromium + data libs). Pull it
+# once; runs are then cold-start only. amd64-targeted binary downloads
+# (typst/duckdb/yq) match the production host; adjust for other arches.
+#
+# Build:
+#   podman build -t ghcr.io/croit/llm-gateway-sandbox:latest sandbox-image/
+
+FROM debian:trixie-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/pw
+
+# --- System packages -------------------------------------------------------
+# Grouped by purpose; --no-install-recommends keeps the (already large)
+# image from ballooning further.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        # language runtimes + build toolchain (so pip can compile, and the
+        # model can build/run small C programs like a real engineer)
+        python3 python3-pip python3-venv \
+        build-essential make pkg-config \
+        # base utilities + networking/sysadmin
+        ca-certificates curl wget git openssl \
+        dnsutils iputils-ping netcat-openbsd rsync iproute2 \
+        # packet-capture analysis (read uploaded .pcap/.pcapng; tshark = wireshark CLI)
+        tshark tcpdump \
+        # archives / (de)compression — logs ship gzip/zstd/bz2/xz, releases as 7z/zip
+        xz-utils zstd bzip2 gzip zip unzip p7zip-full cpio tar \
+        # log + text + data wrangling on the command line
+        ripgrep grep gawk sed jq less file binutils xxd bsdextrautils \
+        moreutils dateutils tree pv lnav sqlite3 \
+        # office documents (writer/calc/impress/draw) + conversion/rendering
+        libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw \
+        pandoc weasyprint \
+        # PDF tooling
+        poppler-utils ghostscript qpdf \
+        # images + media + fast image conversion
+        ffmpeg imagemagick libvips-tools \
+        # OCR (scanned docs/screenshots; eng+deu), diagrams, file-type sniffing
+        tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu graphviz libmagic1 \
+        # fonts for document/chart rendering (Latin + CJK + emoji)
+        fonts-dejavu fonts-liberation fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/*
+
+# ImageMagick ships a hardened policy that blocks PDF/PS (a web-server
+# concern); inside a single-use sandbox that just gets in the way of format
+# conversion. Relax the PDF/PS coder restriction wherever the policy lives.
+RUN for p in /etc/ImageMagick-*/policy.xml; do \
+        [ -f "$p" ] && sed -i '/rights="none" pattern="\(PDF\|PS\|EPS\|XPS\)"/d' "$p" || true; \
+    done
+
+# --- Python libraries ------------------------------------------------------
+# Install into a venv rather than the distro Python: trixie's Python is
+# externally-managed, and `pip --break-system-packages` trips over
+# dpkg-installed deps it can't cleanly upgrade ("uninstall-no-record-file").
+# A venv is isolated and conflict-free; putting it first on PATH makes
+# `python3`/`pip` resolve to it (so the agent's `python3 script` sees the libs).
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+RUN pip install --no-cache-dir \
+        # data analysis / fast columnar (great for large CSV/JSON/Parquet logs)
+        pandas numpy matplotlib polars pyarrow duckdb \
+        # scientific / stats / symbolic / plotting
+        scipy scikit-learn statsmodels sympy seaborn \
+        # CSV/JSON/YAML/XML/TOML wrangling + schema + file-type sniffing
+        csvkit tabulate pyyaml xmltodict jsonschema tomli-w python-magic jc \
+        # office formats (incl. legacy .xls read)
+        openpyxl xlsxwriter xlrd python-docx python-pptx odfpy \
+        # PDF read/write/manipulate/render (PyMuPDF = fitz)
+        pypdf pdfplumber pymupdf reportlab img2pdf weasyprint markdown \
+        # images / computer vision / OCR
+        pillow opencv-python-headless imageio pytesseract \
+        # parsing + http (in-sandbox fetching when egress is on)
+        lxml beautifulsoup4 requests python-dateutil regex \
+        # databases + network/ops clients (runtime use still egress-gated)
+        sqlalchemy "psycopg[binary]" pymysql dnspython paramiko \
+        # packet-capture parsing
+        scapy dpkt \
+        # diagrams + readable output + system info
+        graphviz rich humanize psutil \
+        # headless browser driver
+        playwright \
+    # playwright --with-deps installs browser OS libs via apt, so refresh the
+    # package lists (wiped above) for the duration of this step.
+    && apt-get update \
+    && python -m playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod -R a+rX /opt/venv /opt/pw
+
+# --- Standalone CLI binaries (arch-aware) ----------------------------------
+# typst (pinned), DuckDB CLI (SQL over CSV/JSON/Parquet — a workhorse for
+# log/data debugging), and yq (YAML processor). TARGETARCH is provided by
+# BuildKit (amd64 / arm64), so the image builds natively on both. duckdb/yq
+# track latest; pin the URLs if you need fully reproducible builds.
+ARG TARGETARCH
+ARG TYPST_VERSION=v0.13.1
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) typst_arch=x86_64;  dl_arch=amd64 ;; \
+        arm64) typst_arch=aarch64; dl_arch=arm64 ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/typst/typst/releases/download/${TYPST_VERSION}/typst-${typst_arch}-unknown-linux-musl.tar.xz" \
+        | tar -xJ -C /tmp; \
+    install -m 0755 "/tmp/typst-${typst_arch}-unknown-linux-musl/typst" /usr/local/bin/typst; \
+    rm -rf /tmp/typst-*; \
+    curl -fsSL -o /tmp/duckdb.zip "https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-${dl_arch}.zip"; \
+    unzip -o /tmp/duckdb.zip -d /usr/local/bin; \
+    rm /tmp/duckdb.zip; \
+    curl -fsSL -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${dl_arch}"; \
+    chmod 0755 /usr/local/bin/yq
+
+# --- Agent + runtime user --------------------------------------------------
+# The job marshaller the runner pipes RunRequest/RunResponse through.
+COPY sandbox-agent /usr/local/bin/sandbox-agent
+RUN chmod 0755 /usr/local/bin/sandbox-agent
+
+# Defense-in-depth: strip every setuid/setgid bit. The job runs as a non-root
+# user with no-new-privileges + cap-drop=ALL, so SUID binaries (mount, su,
+# passwd, …) can't escalate anyway — removing the bit just deletes the surface.
+# Run as root, before dropping to the sandbox user below.
+RUN find / -xdev -type f -perm /6000 -exec chmod -s {} + 2>/dev/null || true
+
+# Run as a non-root user. The runtime additionally drops all capabilities,
+# mounts a read-only rootfs, and gives a tmpfs /work — see the runner's
+# podman flags.
+RUN useradd --create-home --uid 1001 --shell /usr/sbin/nologin sandbox \
+    && mkdir -p /work && chown sandbox:sandbox /work
+USER sandbox
+WORKDIR /work
+
+# The runner keeps pooled containers alive with `sleep infinity` and execs
+# `sandbox-agent` per job; this default is just a sane fallback.
+CMD ["sleep", "infinity"]

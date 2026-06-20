@@ -16,6 +16,7 @@ pub mod pages;
 pub mod proxy;
 pub mod rag_api;
 pub mod router;
+pub mod sandbox_api;
 pub mod session;
 pub mod state;
 pub mod vad;

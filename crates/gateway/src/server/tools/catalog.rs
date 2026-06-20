@@ -43,6 +43,8 @@ const HIDDEN: &[&str] = &["company_echo"];
 pub enum Category {
     Web,
     Documents,
+    /// Sandboxed code execution (`run_in_sandbox` + its presets).
+    Code,
     Memory,
     /// Tools bridged from an external MCP server (`mcp__*`).
     Integrations,
@@ -55,6 +57,7 @@ impl Category {
         match self {
             Category::Web => "Web & Network",
             Category::Documents => "Attachments & Documents",
+            Category::Code => "Code & Sandbox",
             Category::Memory => "Memory",
             Category::Integrations => "Integrations",
             Category::Utility => "Utility",
@@ -66,9 +69,10 @@ impl Category {
         match self {
             Category::Web => 0,
             Category::Documents => 1,
-            Category::Memory => 2,
-            Category::Integrations => 3,
-            Category::Utility => 4,
+            Category::Code => 2,
+            Category::Memory => 3,
+            Category::Integrations => 4,
+            Category::Utility => 5,
         }
     }
 }
@@ -129,6 +133,9 @@ fn category_for(tool_id: &str) -> Category {
         "search_web" | "fetch_url" | "lookup_ip" | "dns_lookup" | "whois_lookup" | "tls_cert"
         | "wikipedia" => Category::Web,
         "fetch_attachment" | "upload_attachment" | "read_skill" => Category::Documents,
+        "run_in_sandbox" | "generate_document" | "capture_webpage" | "read_sandbox_output" => {
+            Category::Code
+        }
         _ if tool_id.starts_with(TYPST_PREFIX) => Category::Documents,
         "remember" | "recall" => Category::Memory,
         _ if tool_id.starts_with(crate::server::tools::mcp::MCP_ID_PREFIX) => {
@@ -224,6 +231,28 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Skills",
             "Lets the assistant load an operator-installed skill — brand guidelines, house \
              style, domain playbooks — and apply it to what it writes or builds for you.",
+        ),
+        "run_in_sandbox" => (
+            "Code sandbox",
+            "Lets the assistant run Python or shell in a secure throwaway sandbox — for data \
+             analysis, charts, calculations, running command-line tools, and generating \
+             files it returns to you. Each run is isolated and starts clean.",
+        ),
+        "generate_document" => (
+            "Document generation",
+            "Lets the assistant turn its writing into a finished PDF, Word, or PowerPoint \
+             file you can download — built in the sandbox from Markdown.",
+        ),
+        "capture_webpage" => (
+            "Web page capture",
+            "Lets the assistant open a web page in a headless browser and hand you a \
+             full-page screenshot, a PDF, or its extracted text. Needs operator-enabled \
+             network access.",
+        ),
+        "read_sandbox_output" => (
+            "Read large sandbox output",
+            "Lets the assistant grep or page through a large result a previous sandbox \
+             run produced, without pulling the whole thing back into the conversation.",
         ),
         _ => return None,
     };

@@ -248,6 +248,27 @@ weight = 1
 # db_path          = "data/ip2location/IP2LOCATION-LITE-DB11.BIN"
 # update_token_env = "IP2LOCATION_TOKEN"
 
+# ---- Code-execution sandbox ------------------------------------------------
+# Registers the `run_in_sandbox`, `generate_document`, and `capture_webpage`
+# tools, which let the model run Python/shell, build documents, and capture
+# web pages inside a single-use, strongly-isolated sandbox. The heavy lifting
+# (gVisor isolation, warm pool, default-deny egress allowlist) lives in
+# the separate `sandbox-runner` service — see docs/sandbox.md for the full
+# setup (gVisor install, Quadlets, egress proxy). With no `[sandbox]` block the
+# tools aren't registered and the gateway is unchanged.
+#
+# `runner_url` MUST be reachable only from the gateway (internal network /
+# mTLS) — the runner executes arbitrary code. Produced files are returned as
+# chat attachments in the UI, and as bearer-authed download URLs
+# (`/v1/sandbox/files/...`, scoped to the caller) on the API path; both need
+# `[chat.s3]` configured.
+
+# [sandbox]
+# enabled           = true       # master switch; false keeps the block but disables the tools
+# runner_url        = "http://10.88.0.1:9000"  # host runner on the podman bridge gateway IP (no gateway network change needed)
+# timeout_secs      = 120        # HTTP timeout for one /run call
+# max_artifact_bytes = 26214400  # 25 MiB — larger produced files are dropped
+
 # ---------------------------------------------------------------------------
 # External MCP (Model Context Protocol) servers.
 #

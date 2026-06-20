@@ -15,6 +15,9 @@ target/
 # fetch_attachment PDF reader's image tier. Without this re-include the
 # build context omits it and the COPY fails ("libpdfium.so: not found").
 !target/release/libpdfium.so
+# Sandbox-runner binary (built by CI's `ci` job / `cargo build --release -p
+# sandbox-runner`), COPYed by deploy/sandbox-runner/Containerfile.
+!target/release/sandbox-runner
 .git/
 .gitignore
 .github/

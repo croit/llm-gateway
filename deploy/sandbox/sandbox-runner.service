@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 croit GmbH
+#
+# Host systemd unit for the sandbox-runner.
+#
+# Why a host service and not a Quadlet container: the runner spawns each job
+# under the gVisor (runsc) runtime via `podman --runtime runsc`. Remote podman
+# (a container talking to the host socket) does NOT accept `--runtime` — the
+# runtime is server-side there — so a containerised runner cannot select gVisor.
+# Running the binary on the host drives LOCAL podman, where `--runtime` works.
+#
+# Networking: the runner binds the host's podman bridge GATEWAY IP (the default
+# network's gateway, usually 10.88.0.1). The gateway container is already on
+# that bridge, so it reaches the runner there; the IP exists only on the bridge,
+# never on an external interface. No change to the gateway's own networking is
+# needed (it keeps reaching its model upstreams). setup-sandbox.sh detects the
+# IP and rewrites SANDBOX_BIND below.
+#
+# The binary is installed to /usr/local/bin/sandbox-runner by
+# deploy/sandbox/setup-sandbox.sh (extracted from the pinned runner image).
+#
+# Install: sudo cp deploy/sandbox/sandbox-runner.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now sandbox-runner.service
+
+[Unit]
+Description=LLM Gateway code-execution sandbox runner (host service)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# Host podman bridge gateway IP. 10.88.0.1 is the podman default; setup-sandbox.sh
+# detects the real value and rewrites it. The gateway config's runner_url must match.
+Environment=SANDBOX_BIND=10.88.0.1:9000
+Environment=SANDBOX_RUNTIME=runsc
+Environment=SANDBOX_IMAGE=ghcr.io/croit/llm-gateway-sandbox:latest
+Environment=RUST_LOG=info,sandbox_runner=info
+# Egress (optional): uncomment / set by `setup-sandbox.sh --egress`.
+#Environment=SANDBOX_EGRESS_NETWORK=sandbox-egress
+#Environment=SANDBOX_EGRESS_PROXY=http://egress-proxy:3128
+ExecStart=/usr/local/bin/sandbox-runner
+# Deprioritise the runner for the host OOM-killer: a sandbox memory bomb (which
+# runs with --oom-score-adj=1000) gets reaped first, so the runner survives.
+OOMScoreAdjust=-800
+# Backstop: at boot the bridge IP may not be up until the first podman container
+# starts; retry until the bind succeeds.
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

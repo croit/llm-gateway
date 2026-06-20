@@ -143,6 +143,24 @@ async fn main() -> anyhow::Result<()> {
             tool_registry = tool_registry.with(tool);
         }
     }
+    // Code-execution sandbox. Registered only when `[sandbox]` points at a
+    // reachable sandbox-runner; the three tools share one HTTP client.
+    match config.sandbox.as_ref() {
+        Some(sandbox_cfg) if sandbox_cfg.enabled => {
+            let client = srv::tools::sandbox::SandboxClient::new(
+                Arc::new(sandbox_cfg.clone()),
+                config.gateway.public_url.clone(),
+            );
+            tool_registry = tool_registry
+                .with(srv::tools::sandbox::RunInSandbox(client.clone()))
+                .with(srv::tools::sandbox::GenerateDocument(client.clone()))
+                .with(srv::tools::sandbox::CaptureWebpage(client))
+                .with(srv::tools::sandbox::ReadSandboxOutput);
+            tracing::info!(runner = %sandbox_cfg.runner_url, "registered sandbox tools");
+        }
+        Some(_) => tracing::info!("[sandbox] enabled = false — sandbox tools not registered"),
+        None => tracing::info!("no [sandbox] config — sandbox tools not registered"),
+    }
     // `enable_tools` is registered last so its catalog snapshot covers every
     // other tool (static + typst + MCP). It's part of the always-on core so
     // the model can always reach it; calling it writes per-conversation rows

@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 croit GmbH
+#
+# Runtime-only image for the sandbox-runner.
+#
+# Like the gateway's Dockerfile, the binary is built OUTSIDE this file (CI's
+# `ci` job, or `cargo build --release -p sandbox-runner` locally) and COPYed
+# in — so the image needs no Rust toolchain (and we avoid pulling clang/
+# libclang for a transitive bindgen dep).
+#
+# NOTE: the runner is NOT run as a container in production — it runs as a host
+# systemd service (deploy/sandbox/sandbox-runner.service) so it can drive LOCAL
+# podman and select the gVisor runtime (remote podman over the socket can't
+# pass --runtime). This image is the delivery vehicle: setup-sandbox.sh extracts
+# /usr/local/bin/sandbox-runner from it. It still ships a podman client so the
+# binary can also be exercised in-container for testing.
+#
+# Build (from the repo root, after building the binary):
+#   cargo build --release -p sandbox-runner
+#   docker build -f deploy/sandbox-runner/Containerfile -t llm-gateway-sandbox-runner .
+
+FROM debian:trixie-slim
+
+# `podman` here is used as a REMOTE client against the host socket
+# (CONTAINER_HOST), so it only needs the CLI, not a full container stack.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        podman ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY target/release/sandbox-runner /usr/local/bin/sandbox-runner
+
+ENTRYPOINT ["/usr/local/bin/sandbox-runner"]

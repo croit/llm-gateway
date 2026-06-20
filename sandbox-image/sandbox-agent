@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 croit GmbH
+#
+# In-image job marshaller for the LLM-gateway sandbox.
+#
+# The `sandbox-runner` service pipes a RunRequest (JSON) to this program's
+# stdin via `podman exec -i <container> /usr/local/bin/sandbox-agent`, and
+# reads a RunResponse (JSON) back on stdout. All file I/O, code execution,
+# the inner timeout, and artifact collection happen here, inside the
+# MicroVM — the runner stays a thin orchestrator.
+#
+# Contract (shared::sandbox):
+#   in : {"language":"python"|"bash","code":str,
+#         "files":[{"name":str,"content_b64":str}],
+#         "timeout_secs":int|null,"network":bool}
+#   out: {"exit_code":int,"stdout":str,"stderr":str,
+#         "artifacts":[{"name":str,"size":int,"mime":str,"content_b64":str}],
+#         "duration_ms":int,"timed_out":bool,"output_truncated":bool}
+
+import base64
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+# `/work` in the container image; overridden to a temp dir by the runner's
+# dev-only LocalBackend, which runs this agent directly on the host.
+WORK = os.environ.get("SANDBOX_AGENT_WORK", "/work")
+DEFAULT_TIMEOUT = 60
+# Stdout/stderr are also clamped by the runner; this is a first-line guard
+# so a runaway job can't OOM the agent building a giant string.
+MAX_STREAM = 4 * 1024 * 1024
+MAX_ARTIFACT = 64 * 1024 * 1024
+# Above this, the full stream is also saved as a downloadable artifact, so the
+# gateway can return a small preview + a `full_output_ref` (pointers-as-context)
+# and the model reads the rest on demand. Kept modest so moderately-large output
+# is addressable via a ref rather than inlined.
+PRESERVE_THRESHOLD = 32 * 1024
+
+MIME = {
+    "pdf": "application/pdf",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "svg": "image/svg+xml",
+    "webp": "image/webp",
+    "txt": "text/plain",
+    "md": "text/markdown",
+    "csv": "text/csv",
+    "json": "application/json",
+    "html": "text/html",
+    "xml": "application/xml",
+    "zip": "application/zip",
+    "mp4": "video/mp4",
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
+
+def mime_for(name):
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    return MIME.get(ext, "application/octet-stream")
+
+
+def safe_name(name):
+    """Reject path separators / traversal; a single path segment only."""
+    return name and name not in (".", "..") and "/" not in name and "\\" not in name
+
+
+def fail(msg, code=2):
+    json.dump(
+        {
+            "exit_code": code,
+            "stdout": "",
+            "stderr": msg,
+            "artifacts": [],
+            "duration_ms": 0,
+            "timed_out": False,
+            "output_truncated": False,
+        },
+        sys.stdout,
+    )
+    sys.exit(0)
+
+
+def main():
+    try:
+        req = json.load(sys.stdin)
+    except Exception as e:  # noqa: BLE001
+        fail(f"sandbox-agent: bad request json: {e}")
+
+    language = req.get("language")
+    code = req.get("code", "")
+    files = req.get("files") or []
+    timeout = req.get("timeout_secs") or DEFAULT_TIMEOUT
+
+    os.makedirs(WORK, exist_ok=True)
+    # Materialize input files and remember them so they're not mistaken for
+    # produced artifacts.
+    inputs = set()
+    for f in files:
+        name = f.get("name", "")
+        if not safe_name(name):
+            fail(f"sandbox-agent: unsafe input filename {name!r}")
+        try:
+            data = base64.b64decode(f.get("content_b64", ""), validate=False)
+        except Exception as e:  # noqa: BLE001
+            fail(f"sandbox-agent: bad base64 for {name!r}: {e}")
+        with open(os.path.join(WORK, name), "wb") as fh:
+            fh.write(data)
+        inputs.add(name)
+
+    # Build the command. The script body goes to a UNIQUE temp file (not a
+    # fixed path) so concurrent jobs that share a /tmp — e.g. the dev
+    # local-unsafe backend — never clobber each other's code; and it lives
+    # outside /work so it isn't collected as an artifact. Run with cwd=/work.
+    if language == "python":
+        suffix, interp = ".py", "python3"
+    elif language == "bash":
+        suffix, interp = ".sh", "bash"
+    else:
+        fail(f"sandbox-agent: unsupported language {language!r}")
+    fd, script = tempfile.mkstemp(prefix="sandbox_main_", suffix=suffix)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(code)
+    argv = [interp, script]
+
+    started = time.monotonic()
+    timed_out = False
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=WORK,
+            # HOME on the writable workdir so tools that need a profile dir
+            # (LibreOffice, matplotlib, etc.) work under the read-only rootfs.
+            # WORK is unique per job, so concurrent jobs don't share a profile.
+            env={**os.environ, "HOME": WORK},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+        )
+        exit_code = proc.returncode
+        out = proc.stdout
+        errb = proc.stderr
+    except subprocess.TimeoutExpired as e:
+        timed_out = True
+        exit_code = -1
+        out = e.stdout or b""
+        errb = e.stderr or b""
+    duration_ms = int((time.monotonic() - started) * 1000)
+    try:
+        os.remove(script)
+    except OSError:
+        pass
+
+    truncated = False
+    stdout = out.decode("utf-8", "replace")
+    stderr = errb.decode("utf-8", "replace")
+    if len(stdout) > MAX_STREAM:
+        stdout = stdout[:MAX_STREAM]
+        truncated = True
+    if len(stderr) > MAX_STREAM:
+        stderr = stderr[:MAX_STREAM]
+        truncated = True
+    if timed_out:
+        stderr += f"\nsandbox-agent: timed out after {timeout}s"
+
+    # Preserve the FULL stream as a downloadable artifact when it's large, so
+    # the head+tail truncation applied on the way to the model never loses
+    # data. Only when sizable, and never clobber a file the user's code wrote.
+    for full_bytes, fname in ((out, "stdout.txt"), (errb, "stderr.txt")):
+        fpath = os.path.join(WORK, fname)
+        if len(full_bytes) > PRESERVE_THRESHOLD and not os.path.exists(fpath):
+            with open(fpath, "wb") as fh:
+                fh.write(full_bytes)
+
+    # Collect produced files: anything in /work not present as an input.
+    artifacts = []
+    for entry in sorted(os.listdir(WORK)):
+        if entry in inputs:
+            continue
+        path = os.path.join(WORK, entry)
+        if not os.path.isfile(path):
+            continue
+        size = os.path.getsize(path)
+        if size == 0 or size > MAX_ARTIFACT:
+            continue
+        with open(path, "rb") as fh:
+            data = fh.read()
+        artifacts.append(
+            {
+                "name": entry,
+                "size": size,
+                "mime": mime_for(entry),
+                "content_b64": base64.b64encode(data).decode("ascii"),
+            }
+        )
+
+    json.dump(
+        {
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "artifacts": artifacts,
+            "duration_ms": duration_ms,
+            "timed_out": timed_out,
+            "output_truncated": truncated,
+        },
+        sys.stdout,
+    )
+
+
+if __name__ == "__main__":
+    main()
