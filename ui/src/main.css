@@ -584,6 +584,62 @@
         font-weight: 500;
     }
 
+    /* Collapsible nav-group. The header is a button; the open/closed
+     * state lives on `<html data-nav-{key}>` (set server-side from the
+     * `nav_sections` cookie, flipped in place by /nav/toggle), so it
+     * survives the SPA sidebar morph — the markup below is identical in
+     * both states and the rules at the end do the showing/hiding. */
+    .app-sidebar__group {
+        display: flex;
+        flex-direction: column;
+    }
+    .app-sidebar__group-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+        padding: 0.6rem 0.625rem 0.2rem;
+        cursor: pointer;
+        user-select: none;
+    }
+    .app-sidebar__group-label {
+        font-size: 0.6875rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: color-mix(in oklch, var(--color-base-content) 50%, transparent);
+        font-weight: 600;
+        transition: color 120ms ease-out;
+    }
+    @media (hover: hover) {
+        .app-sidebar__group-header:hover .app-sidebar__group-label {
+            color: color-mix(in oklch, var(--color-base-content) 75%, transparent);
+        }
+    }
+    .app-sidebar__group-chevron {
+        display: inline-flex;
+        color: color-mix(in oklch, var(--color-base-content) 40%, transparent);
+        transition: transform 150ms ease-out;
+    }
+    .app-sidebar__group-items {
+        display: flex;
+        flex-direction: column;
+        gap: 0.125rem;
+        overflow: hidden;
+    }
+    /* Collapsed: hide the group's links + rotate the chevron to point
+     * right. One rule per group (CSS can't bind an `<html>` attr value
+     * to a descendant's `data-group`). */
+    html[data-nav-workspace="closed"] .app-sidebar__group[data-group="workspace"] .app-sidebar__group-items,
+    html[data-nav-account="closed"] .app-sidebar__group[data-group="account"] .app-sidebar__group-items,
+    html[data-nav-admin="closed"] .app-sidebar__group[data-group="admin"] .app-sidebar__group-items {
+        display: none;
+    }
+    html[data-nav-workspace="closed"] .app-sidebar__group[data-group="workspace"] .app-sidebar__group-chevron,
+    html[data-nav-account="closed"] .app-sidebar__group[data-group="account"] .app-sidebar__group-chevron,
+    html[data-nav-admin="closed"] .app-sidebar__group[data-group="admin"] .app-sidebar__group-chevron {
+        transform: rotate(-90deg);
+    }
+
     .app-sidebar__sessions-section {
         flex: 1 1 auto;
         min-height: 0;

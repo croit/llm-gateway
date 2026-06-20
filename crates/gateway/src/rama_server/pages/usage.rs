@@ -27,7 +27,7 @@ use rama::http::{Request, Response};
 use serde::Deserialize;
 
 use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_session_or_redirect};
-use session_core::chrome::{Theme, is_datastar_request};
+use session_core::chrome::{NavSections, Theme, is_datastar_request};
 use session_core::icons;
 
 use crate::rama_server::state::RamaState;
@@ -52,6 +52,7 @@ struct UsageQuery {
 /// "All users" toggle (`?scope=all`) that widens it to the whole roster.
 pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
@@ -108,6 +109,7 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
     nav_or_html_page(
         datastar,
         theme,
+        nav,
         NavItem::Usage,
         title,
         &user.email,

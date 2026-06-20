@@ -38,8 +38,8 @@ use session_core::chat::{
     spawn_session_stream_response, sse_error_response,
 };
 use session_core::chrome::{
-    Theme, is_datastar_request, read_body_to_bytes, see_other, sse_patch, sse_response,
-    sse_signals, sse_toast,
+    NavSections, Theme, is_datastar_request, read_body_to_bytes, see_other, sse_patch,
+    sse_response, sse_signals, sse_toast,
 };
 use session_core::{RegisterOutcome, TurnUpdate};
 
@@ -62,6 +62,8 @@ pub async fn chat_index(State(state): State<Arc<RamaState>>, req: Request) -> Re
         Err(resp) => return resp,
     };
     let datastar = is_datastar_request(req.headers());
+    let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     let target = match resolve_landing_session(&state, &user).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -73,6 +75,8 @@ pub async fn chat_index(State(state): State<Arc<RamaState>>, req: Request) -> Re
             target,
             datastar,
             session.impersonator_id.is_some(),
+            theme,
+            nav,
         )
         .await
     } else {
@@ -106,6 +110,8 @@ pub async fn chat_session_view(
         Err(resp) => return resp,
     };
     let datastar = is_datastar_request(req.headers());
+    let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     // Readable = owned OR shared. A non-owner viewing a shared chat gets a
     // read-only render (see `render_chat_response`); mutations stay owner-only.
     let target = match chat::get_session_readable(&state.db, &user.id, &session_id).await {
@@ -119,18 +125,22 @@ pub async fn chat_session_view(
         target,
         datastar,
         session.impersonator_id.is_some(),
+        theme,
+        nav,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn render_chat_response(
     state: Arc<RamaState>,
     user: &User,
     active: chat::Session,
     datastar: bool,
     impersonating: bool,
+    theme: Theme,
+    nav: NavSections,
 ) -> Response {
-    let theme = Theme::from_headers(&rama::http::HeaderMap::new());
     let sessions = match chat::list_sessions(&state.db, &user.id).await {
         Ok(s) => s,
         Err(err) => return internal_error_html(&user.email, &err.to_string()),
@@ -209,6 +219,7 @@ async fn render_chat_response(
         nav_or_html_page(
             true,
             theme,
+            nav,
             NavItem::Chat,
             &format!("{title} — LLM Gateway"),
             &user.email,
@@ -221,6 +232,7 @@ async fn render_chat_response(
     } else {
         html_authed_page(
             theme,
+            nav,
             Some(NavItem::Chat),
             &format!("{title} — LLM Gateway"),
             &user.email,
@@ -252,6 +264,8 @@ pub async fn chat_session_create(State(state): State<Arc<RamaState>>, req: Reque
             new_session,
             true,
             session.impersonator_id.is_some(),
+            Theme::from_headers(req.headers()),
+            NavSections::from_headers(req.headers()),
         )
         .await
     } else {
@@ -292,6 +306,8 @@ pub async fn chat_session_delete(
         next,
         datastar,
         session.impersonator_id.is_some(),
+        Theme::from_headers(req.headers()),
+        NavSections::from_headers(req.headers()),
     )
     .await
 }
@@ -418,7 +434,16 @@ pub async fn chat_fork(
     // a plain POST gets a redirect.
     let impersonating = session.impersonator_id.is_some();
     if datastar {
-        render_chat_response(state.clone(), &user, new_session, true, impersonating).await
+        render_chat_response(
+            state.clone(),
+            &user,
+            new_session,
+            true,
+            impersonating,
+            Theme::from_headers(req.headers()),
+            NavSections::from_headers(req.headers()),
+        )
+        .await
     } else {
         see_other(&format!("/chat/{}", new_session.id))
     }

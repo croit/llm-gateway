@@ -35,7 +35,9 @@ use super::{
     NavItem, fetch_sidebar_chat, forbidden_html, is_admin, nav_or_html_page, require_admin_or_403,
     require_session_or_redirect,
 };
-use session_core::chrome::{Theme, is_datastar_request, read_body_to_bytes, see_other};
+use session_core::chrome::{
+    NavSections, Theme, is_datastar_request, read_body_to_bytes, see_other,
+};
 use session_core::icons;
 
 use crate::rama_server::session::COOKIE_NAME;
@@ -45,6 +47,7 @@ use crate::server::db::{audit, users};
 /// GET /admin/users — the roster + recent impersonation trail.
 pub async fn users_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, admin) = match require_admin_or_403(&state, &req).await {
         Ok(s) => s,
@@ -78,6 +81,7 @@ pub async fn users_index(State(state): State<Arc<RamaState>>, req: Request) -> R
     nav_or_html_page(
         datastar,
         theme,
+        nav,
         NavItem::Users,
         "Users — LLM Gateway",
         &admin.email,

@@ -24,7 +24,9 @@ use rama::http::service::web::extract::State;
 use rama::http::{Request, Response};
 
 use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_admin_or_403};
-use session_core::chrome::{Theme, is_datastar_request, read_body_to_bytes, see_other};
+use session_core::chrome::{
+    NavSections, Theme, is_datastar_request, read_body_to_bytes, see_other,
+};
 use session_core::icons;
 
 /// GET /admin/skills/download?skill=<name> — re-package an installed skill as
@@ -84,6 +86,7 @@ struct SkillView {
 /// skill's detail to show; defaults to the first loaded skill.
 pub async fn skills_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
         Ok(s) => s,
@@ -94,6 +97,7 @@ pub async fn skills_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         &state,
         datastar,
         theme,
+        nav,
         &user,
         session.impersonator_id.is_some(),
         selected.as_deref(),
@@ -107,6 +111,7 @@ pub async fn skills_index(State(state): State<Arc<RamaState>>, req: Request) -> 
 /// re-renders the page with an inline error.
 pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
         Ok(s) => s,
@@ -117,6 +122,7 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
             &state,
             datastar,
             theme,
+            nav,
             &user,
             session.impersonator_id.is_some(),
             None,
@@ -139,6 +145,7 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
                 &state,
                 datastar,
                 theme,
+                nav,
                 &user,
                 session.impersonator_id.is_some(),
                 None,
@@ -154,6 +161,7 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
                 &state,
                 datastar,
                 theme,
+                nav,
                 &user,
                 session.impersonator_id.is_some(),
                 None,
@@ -166,6 +174,7 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
                 &state,
                 datastar,
                 theme,
+                nav,
                 &user,
                 session.impersonator_id.is_some(),
                 None,
@@ -183,6 +192,7 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
                 &state,
                 datastar,
                 theme,
+                nav,
                 &user,
                 session.impersonator_id.is_some(),
                 None,
@@ -198,6 +208,7 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
 /// back to the list.
 pub async fn skills_delete(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
         Ok(s) => s,
@@ -214,6 +225,7 @@ pub async fn skills_delete(State(state): State<Arc<RamaState>>, req: Request) ->
                 &state,
                 datastar,
                 theme,
+                nav,
                 &user,
                 session.impersonator_id.is_some(),
                 None,
@@ -230,6 +242,7 @@ pub async fn skills_delete(State(state): State<Arc<RamaState>>, req: Request) ->
                 &state,
                 datastar,
                 theme,
+                nav,
                 &user,
                 session.impersonator_id.is_some(),
                 None,
@@ -246,6 +259,7 @@ pub async fn skills_delete(State(state): State<Arc<RamaState>>, req: Request) ->
                 &state,
                 datastar,
                 theme,
+                nav,
                 &user,
                 session.impersonator_id.is_some(),
                 None,
@@ -323,10 +337,12 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 /// Shared renderer for the GET path and the post-mutation error paths.
+#[allow(clippy::too_many_arguments)]
 async fn render_page(
     state: &RamaState,
     datastar: bool,
     theme: Theme,
+    nav: NavSections,
     user: &User,
     impersonating: bool,
     selected_name: Option<&str>,
@@ -347,6 +363,7 @@ async fn render_page(
     nav_or_html_page(
         datastar,
         theme,
+        nav,
         NavItem::Skills,
         "Skills — LLM Gateway",
         &user.email,

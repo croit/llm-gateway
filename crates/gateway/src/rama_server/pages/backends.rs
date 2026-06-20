@@ -22,7 +22,7 @@ use rama::http::service::web::extract::State;
 use rama::http::{Request, Response};
 
 use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_admin_or_403};
-use session_core::chrome::{Theme, is_datastar_request};
+use session_core::chrome::{NavSections, Theme, is_datastar_request};
 use session_core::icons;
 
 use crate::rama_server::state::RamaState;
@@ -40,6 +40,7 @@ const BUCKETS: i64 = 12;
 /// this the card order would flap between renders).
 pub async fn backends_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
         Ok(s) => s,
@@ -92,6 +93,7 @@ pub async fn backends_index(State(state): State<Arc<RamaState>>, req: Request) -
     nav_or_html_page(
         datastar,
         theme,
+        nav,
         NavItem::Backends,
         "Upstream backends — LLM Gateway",
         &user.email,

@@ -30,7 +30,8 @@ use super::{
     require_session_or_redirect, toast,
 };
 use session_core::chrome::{
-    Flash, FlashKind, Theme, is_datastar_request, sse_patch, sse_response, sse_script, sse_toast,
+    Flash, FlashKind, NavSections, Theme, is_datastar_request, sse_patch, sse_response, sse_script,
+    sse_toast,
 };
 use session_core::icons;
 
@@ -152,6 +153,7 @@ fn resolve_tz(name: &str) -> TimeZone {
 /// GET /scheduled — the management page: a builder form + the user's list.
 pub async fn scheduled_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
@@ -171,6 +173,7 @@ pub async fn scheduled_index(State(state): State<Arc<RamaState>>, req: Request) 
     nav_or_html_page(
         datastar,
         theme,
+        nav,
         NavItem::Scheduled,
         "Scheduled actions — LLM Gateway",
         &user.email,
@@ -251,6 +254,7 @@ pub async fn scheduled_edit_form(
     req: Request,
 ) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
@@ -270,6 +274,7 @@ pub async fn scheduled_edit_form(
     nav_or_html_page(
         datastar,
         theme,
+        nav,
         NavItem::Scheduled,
         "Edit scheduled action — LLM Gateway",
         &user.email,

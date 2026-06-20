@@ -113,6 +113,10 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/rag/refs/{ref_id}/primary", pages::rag_ref_set_primary)
         .with_post("/rag/refs/{ref_id}/delete", pages::rag_ref_delete)
         .with_post("/theme/toggle", session_core::chrome::theme_toggle)
+        .with_post(
+            "/nav/toggle/{section}",
+            session_core::chrome::nav_sections_toggle,
+        )
         .with_get("/v1/models", proxy::list_models)
         // Catch-all param: model ids contain `/` (e.g.
         // `mistralai/Voxtral-Mini-4B-Realtime-2602`).

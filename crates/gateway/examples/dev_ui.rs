@@ -190,9 +190,13 @@ async fn main() -> anyhow::Result<()> {
         tools: vec!["*".into()],
         skills: vec!["*".into()],
     }];
+    // Generic, non-croit demo skills shipped beside this example (the real
+    // `data/skills` is gitignored local data) — keeps README screenshots clean.
+    // Absolute, CARGO_MANIFEST_DIR-anchored so it resolves regardless of cwd.
+    let skills_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/demo-skills");
     let config = Config {
         skills: Some(SkillsConfig {
-            dir: PathBuf::from("data/skills"),
+            dir: skills_dir.clone(),
         }),
         roles: roles.clone(),
         ..Config::default()
@@ -207,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .expect("dev_ui RBAC build"),
     );
-    let skill_store = Arc::new(SkillStore::load(PathBuf::from("data/skills")));
+    let skill_store = Arc::new(SkillStore::load(skills_dir));
     let tools = Arc::new(
         ToolRegistry::new()
             .with(echo::Echo)
@@ -243,6 +247,11 @@ async fn main() -> anyhow::Result<()> {
         },
     )
     .await?;
+
+    // --- Seed representative (non-croit) demo data so the README pages
+    // render populated instead of empty "create your first…" states.
+    seed_demo_data(&state).await?;
+
     let session = state.sessions.create("dev").await?;
     let cookie = state.sessions.sign(&session.id);
 
@@ -262,5 +271,162 @@ async fn main() -> anyhow::Result<()> {
     router::serve(Arc::new(state), addr).await?;
     drop(chat_mock);
     drop(voice_mock);
+    Ok(())
+}
+
+/// Seed a handful of realistic, **non-croit** rows so the README
+/// screenshots show populated pages: one finished chat conversation, a few
+/// scheduled actions, and two indexed RAG collections. All owned by the
+/// `dev` user. In-memory DB, so this is rebuilt fresh on every launch.
+async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
+    use gateway::server::db::rag;
+    use gateway::server::scheduled::{self, NewAction};
+    use session_core::db::{self as chatdb, ToolCallStatus, TurnStatus};
+
+    // --- A finished chat conversation showcasing the tool-call loop:
+    // reasoning → web search → page fetch → a markdown answer with a source.
+    const REASONING: &str = "This is a configuration question with a canonical \
+        answer in the official nginx module docs, so I'll search for the \
+        ngx_http_gzip_module page and quote the key directives rather than rely \
+        on memory.";
+    const ANSWER_MD: &str = "Here's a minimal gzip setup for nginx:\n\n\
+        ```nginx\n\
+        gzip on;\n\
+        gzip_types text/plain text/css application/json application/javascript;\n\
+        gzip_min_length 1024;\n\
+        gzip_comp_level 5;\n\
+        ```\n\n\
+        - `gzip on;` turns compression on.\n\
+        - `gzip_types` lists the MIME types to compress (HTML is always included).\n\
+        - `gzip_min_length` skips tiny responses where compression isn't worth the CPU.\n\n\
+        **Source:** [nginx — ngx_http_gzip_module](https://nginx.org/en/docs/http/ngx_http_gzip_module.html)";
+    let s = chatdb::create_session(&state.db, "dev").await?;
+    chatdb::set_session_title(&state.db, &s.id, "Enabling gzip in nginx").await?;
+    let u = uuid::Uuid::new_v4().to_string();
+    chatdb::create_user_turn(
+        &state.db,
+        &s.id,
+        &u,
+        "How do I turn on gzip compression in nginx? Give me a minimal config and cite the official docs.",
+    )
+    .await?;
+    let a = uuid::Uuid::new_v4().to_string();
+    chatdb::create_assistant_turn_in_progress(&state.db, &s.id, &a, "demo-model").await?;
+    chatdb::append_reasoning(&state.db, &a, REASONING).await?;
+    chatdb::set_reasoning_elapsed(&state.db, &a, 1400).await?;
+    // Tool call 1 — web search.
+    chatdb::insert_running_tool_call(
+        &state.db,
+        &a,
+        "call_search",
+        "search_web",
+        r#"{"query":"nginx ngx_http_gzip_module enable gzip directives"}"#,
+    )
+    .await?;
+    chatdb::complete_tool_call(
+        &state.db,
+        "call_search",
+        r#"{"results":[{"title":"Module ngx_http_gzip_module","url":"https://nginx.org/en/docs/http/ngx_http_gzip_module.html","snippet":"A filter that compresses responses with the gzip method. Directives: gzip, gzip_types, gzip_min_length, gzip_comp_level."}]}"#,
+        ToolCallStatus::Completed,
+    )
+    .await?;
+    // Tool call 2 — fetch the doc page.
+    chatdb::insert_running_tool_call(
+        &state.db,
+        &a,
+        "call_fetch",
+        "fetch_url",
+        r#"{"url":"https://nginx.org/en/docs/http/ngx_http_gzip_module.html"}"#,
+    )
+    .await?;
+    chatdb::complete_tool_call(
+        &state.db,
+        "call_fetch",
+        r#"{"url":"https://nginx.org/en/docs/http/ngx_http_gzip_module.html","text":"Syntax: gzip on | off; Default: gzip off; Context: http, server, location. Enables or disables gzipping of responses. gzip_types, gzip_min_length and gzip_comp_level tune which responses are compressed and how hard."}"#,
+        ToolCallStatus::Completed,
+    )
+    .await?;
+    chatdb::append_content(&state.db, &a, ANSWER_MD).await?;
+    chatdb::finalize_turn(&state.db, &a, TurnStatus::Completed, None).await?;
+
+    // --- Scheduled actions ----------------------------------------------
+    let schedules = [
+        (
+            "Daily standup digest",
+            "Summarize yesterday's merged PRs and open blockers into a short standup digest.",
+            "0 8 * * 1-5",
+            "2026-06-22T08:00:00Z",
+        ),
+        (
+            "Weekly dependency report",
+            "List dependencies with new releases this week and flag any security advisories.",
+            "0 9 * * 1",
+            "2026-06-22T09:00:00Z",
+        ),
+        (
+            "Monthly cost summary",
+            "Summarize this month's API usage and token spend, with the three biggest line items.",
+            "0 7 1 * *",
+            "2026-07-01T07:00:00Z",
+        ),
+    ];
+    for (name, prompt, cron, next) in schedules {
+        scheduled::create(
+            &state.db,
+            NewAction {
+                user_id: "dev".into(),
+                name: name.into(),
+                prompt: prompt.into(),
+                model: "demo-model".into(),
+                cron: cron.into(),
+                timezone: "Europe/Berlin".into(),
+                tools_enabled: true,
+                next_run_at: Some(next.parse()?),
+            },
+        )
+        .await?;
+    }
+
+    // --- RAG collections (indexed → "ready", with a resolved commit) -----
+    let collections = [
+        (
+            "acme-docs",
+            "Product documentation for the Acme platform",
+            "https://github.com/acme/docs.git",
+            "main",
+            "a1b2c3d",
+        ),
+        (
+            "acme-api",
+            "Backend API service — handlers, models, and OpenAPI specs",
+            "https://github.com/acme/api.git",
+            "release-2.4",
+            "9f4e210",
+        ),
+    ];
+    for (name, desc, git_url, git_ref, commit) in collections {
+        let c = rag::create_collection(
+            &state.db,
+            &rag::NewCollection {
+                name: name.into(),
+                description: Some(desc.into()),
+                git_url: git_url.into(),
+                git_ref: git_ref.into(),
+                pat: None,
+                embedding_model: "demo-embed".into(),
+                include_globs: vec!["**/*.md".into(), "**/*.rs".into()],
+                exclude_globs: vec!["target/**".into(), "node_modules/**".into()],
+                chunk_size: 800,
+                chunk_overlap: 100,
+                search_mode: rag::SearchMode::Versioned,
+            },
+        )
+        .await?;
+        rag::mark_indexed(&state.db, c.id, commit).await?;
+        let r = rag::add_ref(&state.db, c.id, git_ref, None, true).await?;
+        rag::set_ref_status(&state.db, r.id, rag::CollectionStatus::Indexing).await?;
+        rag::swap_ref_index(&state.db, r.id, &uuid::Uuid::new_v4().to_string(), commit).await?;
+    }
+
     Ok(())
 }

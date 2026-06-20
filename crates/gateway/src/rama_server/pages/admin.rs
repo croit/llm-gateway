@@ -22,7 +22,8 @@ use rama::http::{Request, Response};
 
 use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_admin_or_403};
 use session_core::chrome::{
-    Flash, FlashKind, Theme, is_datastar_request, read_body_to_bytes, sse_response, sse_toast,
+    Flash, FlashKind, NavSections, Theme, is_datastar_request, read_body_to_bytes, sse_response,
+    sse_toast,
 };
 use session_core::icons;
 
@@ -37,6 +38,7 @@ use crate::server::upstreams::PoolKind;
 /// scratch).
 pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
         Ok(s) => s,
@@ -65,6 +67,7 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     nav_or_html_page(
         datastar,
         theme,
+        nav,
         NavItem::Admin,
         "Model defaults — LLM Gateway",
         &user.email,

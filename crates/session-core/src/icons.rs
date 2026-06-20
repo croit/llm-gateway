@@ -258,6 +258,32 @@ pub fn cube(size: u32) -> Html {
     ))
 }
 
+/// CPU / chip — the admin model-defaults nav link. Distinct from the
+/// `sliders` icon so Models, Tools, and Skills don't collide visually.
+pub fn cpu(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3"/><path d="M15 1v3"/><path d="M9 20v3"/><path d="M15 20v3"/><path d="M20 9h3"/><path d="M20 14h3"/><path d="M1 9h3"/><path d="M1 14h3"/>"#,
+    ))
+}
+
+/// Sparkles — the admin skills nav link.
+pub fn sparkles(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<path d="M12 3l1.9 5.8a2 2 0 0 0 1.3 1.3L21 12l-5.8 1.9a2 2 0 0 0-1.3 1.3L12 21l-1.9-5.8a2 2 0 0 0-1.3-1.3L3 12l5.8-1.9a2 2 0 0 0 1.3-1.3z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/>"#,
+    ))
+}
+
+/// Database (stacked cylinder) — the admin RAG-collections nav link.
+/// Distinct from `folder`, which Memory keeps.
+pub fn database(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>"#,
+    ))
+}
+
 /// Users (two people) — the admin user-roster nav link.
 pub fn users(size: u32) -> Html {
     raw(render(

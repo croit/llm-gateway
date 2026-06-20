@@ -26,8 +26,8 @@ use super::{
     require_session_or_redirect,
 };
 use session_core::chrome::{
-    Flash, FlashKind, Theme, is_datastar_request, read_body_to_bytes, sse_patch, sse_response,
-    sse_script, sse_toast,
+    Flash, FlashKind, NavSections, Theme, is_datastar_request, read_body_to_bytes, sse_patch,
+    sse_response, sse_script, sse_toast,
 };
 use session_core::icons;
 
@@ -59,6 +59,7 @@ struct CreateTokenForm {
 /// caller's tokens plus an inline form to mint a new one.
 pub async fn tokens_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
 
     let (session, user) = match require_session_or_redirect(&state, &req).await {
@@ -88,6 +89,7 @@ pub async fn tokens_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     nav_or_html_page(
         datastar,
         theme,
+        nav,
         NavItem::Tokens,
         "API tokens — LLM Gateway",
         &user.email,

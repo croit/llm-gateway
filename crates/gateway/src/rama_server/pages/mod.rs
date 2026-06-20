@@ -17,8 +17,8 @@ use rama::http::{Body, Method, Request, Response, StatusCode, header};
 
 use session_core::assets;
 use session_core::chrome::{
-    self, Flash, FlashKind, Theme, html_response, read_body_to_bytes, see_other, sse_patch,
-    sse_response, sse_script, sse_toast,
+    self, Flash, FlashKind, NavSections, Theme, html_response, read_body_to_bytes, see_other,
+    sse_patch, sse_response, sse_script, sse_toast,
 };
 use session_core::icons;
 
@@ -215,19 +215,32 @@ fn render_app_sidebar(
                     "LLM Gateway"
                 }
             }
+            // Chat is the hero entry — always visible, never inside a
+            // collapsible group. The rest are grouped (Workspace /
+            // Account / Admin); each group folds independently, with the
+            // open/closed state persisted via the `nav_sections` cookie
+            // and driven purely by `<html data-nav-*>` + CSS (see
+            // `nav_group`), so a nav patch that re-renders this sidebar
+            // never has to know the fold state.
             nav(class: "app-sidebar__primary") {
                 (sidebar_nav_link("/chat", NavItem::Chat, active, icons::message(16), "Chat"))
-                (sidebar_nav_link("/tools", NavItem::Tools, active, icons::sliders(16), "Tools"))
-                (sidebar_nav_link("/memory", NavItem::Memory, active, icons::folder(16), "Memory"))
-                (sidebar_nav_link("/scheduled", NavItem::Scheduled, active, icons::clock(16), "Scheduled"))
-                (sidebar_nav_link("/usage", NavItem::Usage, active, icons::chart(16), "Usage"))
-                (sidebar_nav_link("/tokens", NavItem::Tokens, active, icons::key(16), "Tokens"))
+                (nav_group("workspace", "Workspace", html! {
+                    (sidebar_nav_link("/memory", NavItem::Memory, active, icons::folder(16), "Memory"))
+                    (sidebar_nav_link("/scheduled", NavItem::Scheduled, active, icons::clock(16), "Scheduled"))
+                    (sidebar_nav_link("/tools", NavItem::Tools, active, icons::sliders(16), "Tools"))
+                }.to_html()))
+                (nav_group("account", "Account", html! {
+                    (sidebar_nav_link("/tokens", NavItem::Tokens, active, icons::key(16), "Tokens"))
+                    (sidebar_nav_link("/usage", NavItem::Usage, active, icons::chart(16), "Usage"))
+                }.to_html()))
                 if is_admin {
-                    (sidebar_nav_link("/admin/users", NavItem::Users, active, icons::users(16), "Users"))
-                    (sidebar_nav_link("/admin/models", NavItem::Admin, active, icons::sliders(16), "Models"))
-                    (sidebar_nav_link("/admin/backends", NavItem::Backends, active, icons::cube(16), "Backends"))
-                    (sidebar_nav_link("/rag", NavItem::Rag, active, icons::folder(16), "RAG"))
-                    (sidebar_nav_link("/admin/skills", NavItem::Skills, active, icons::sliders(16), "Skills"))
+                    (nav_group("admin", "Admin", html! {
+                        (sidebar_nav_link("/admin/users", NavItem::Users, active, icons::users(16), "Users"))
+                        (sidebar_nav_link("/admin/models", NavItem::Admin, active, icons::cpu(16), "Models"))
+                        (sidebar_nav_link("/admin/backends", NavItem::Backends, active, icons::cube(16), "Backends"))
+                        (sidebar_nav_link("/rag", NavItem::Rag, active, icons::database(16), "RAG"))
+                        (sidebar_nav_link("/admin/skills", NavItem::Skills, active, icons::sparkles(16), "Skills"))
+                    }.to_html()))
                 }
             }
             div(class: "app-sidebar__sessions-section") {
@@ -323,6 +336,38 @@ fn sidebar_nav_link(
     .to_html()
 }
 
+/// A collapsible group of nav links with an uppercase header + a
+/// chevron. The header `POST`s to `/nav/toggle/{key}`, which flips the
+/// `nav_sections` cookie and sets `<html data-nav-{key}>` in place; the
+/// CSS (`html[data-nav-{key}="closed"] .app-sidebar__group[data-group=…]`)
+/// hides the items + rotates the chevron. Rendering is stateless — the
+/// markup is identical open or closed, so a nav patch that re-renders the
+/// sidebar doesn't need to know the fold state (it lives on `<html>`,
+/// which patches never touch).
+fn nav_group(key: &str, label: &str, items: Html) -> Html {
+    let key = key.to_string();
+    let label = label.to_string();
+    let directive = format!("@post('/nav/toggle/{key}')");
+    let aria = format!("Toggle {label} section");
+    html! {
+        div(class: "app-sidebar__group", "data-group": (key)) {
+            button(
+                type: "button",
+                class: "app-sidebar__group-header",
+                "data-on:click__prevent": (directive),
+                "aria-label": (aria)
+            ) {
+                span(class: "app-sidebar__group-label") { (label) }
+                span(class: "app-sidebar__group-chevron") { (icons::chevron_down(14)) }
+            }
+            div(class: "app-sidebar__group-items") {
+                (items)
+            }
+        }
+    }
+    .to_html()
+}
+
 /// One conversation row in the sidebar. Hover reveals the delete
 /// button; active row gets a soft tinted background.
 fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>) -> Html {
@@ -389,6 +434,7 @@ fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>) -> Html {
 fn nav_or_html_page(
     datastar: bool,
     theme: Theme,
+    nav: NavSections,
     active: NavItem,
     title: &str,
     user_email: &str,
@@ -401,6 +447,7 @@ fn nav_or_html_page(
     if !datastar {
         return html_authed_page(
             theme,
+            nav,
             Some(active),
             title,
             user_email,
@@ -474,6 +521,7 @@ fn main_class_for(active: Option<NavItem>) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 fn html_authed_page(
     theme: Theme,
+    nav: NavSections,
     active: Option<NavItem>,
     title: &str,
     user_email: &str,
@@ -484,6 +532,7 @@ fn html_authed_page(
 ) -> Response {
     let html = layout_authed(
         theme,
+        nav,
         active,
         title,
         user_email,
@@ -502,6 +551,7 @@ fn html_authed_page(
 #[allow(clippy::too_many_arguments)]
 fn layout_authed(
     theme: Theme,
+    nav: NavSections,
     active: Option<NavItem>,
     title: &str,
     user_email: &str,
@@ -516,8 +566,22 @@ fn layout_authed(
     let app_src = assets::app_js_url();
     let pcm_recorder = assets::pcm_recorder_js_url();
     let main_class = main_class_for(active);
+    // Sidebar nav-group fold state rides on `<html>` (NOT inside the
+    // nav-patched `#app-sidebar`) so it survives SPA navigation — the
+    // collapse CSS keys off these attributes; `nav_sections_toggle`
+    // flips them in place.
+    let nav_workspace = NavSections::attr(nav.workspace);
+    let nav_account = NavSections::attr(nav.account);
+    let nav_admin = NavSections::attr(nav.admin);
     let frag = html! {
-        html(lang: "en", "data-theme": (theme_str), class: (theme_str)) {
+        html(
+            lang: "en",
+            "data-theme": (theme_str),
+            class: (theme_str),
+            "data-nav-workspace": (nav_workspace),
+            "data-nav-account": (nav_account),
+            "data-nav-admin": (nav_admin)
+        ) {
             head {
                 meta(charset: "utf-8");
                 meta(name: "viewport", content: "width=device-width, initial-scale=1");
@@ -885,6 +949,7 @@ fn internal_error_html(user_email: &str, message: &str) -> Response {
         .body(
             layout_authed(
                 Theme::Dark,
+                NavSections::default(),
                 None,
                 "Error — LLM Gateway",
                 user_email,
@@ -918,6 +983,7 @@ pub(super) fn forbidden_html(user_email: &str, message: &str) -> Response {
         .body(
             layout_authed(
                 Theme::Dark,
+                NavSections::default(),
                 None,
                 "Forbidden — LLM Gateway",
                 user_email,

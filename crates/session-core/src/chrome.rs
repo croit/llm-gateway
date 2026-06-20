@@ -12,6 +12,7 @@
 //! page shape, and the page handlers themselves.
 
 use plait::{Html, ToHtml, html};
+use rama::http::service::web::extract::Path;
 use rama::http::service::web::response::IntoResponse;
 use rama::http::{Body, HeaderMap, HeaderValue, Request, Response, StatusCode, header};
 
@@ -124,6 +125,154 @@ pub async fn theme_toggle(req: Request) -> Response {
     ]);
     resp.headers_mut()
         .append(header::SET_COOKIE, set_theme_header(next));
+    resp
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar section collapse state.
+
+/// Cookie carrying which sidebar nav-groups the user has expanded.
+/// Read on every full page render (to paint the initial `<html>`
+/// `data-nav-*` attributes); written by [`nav_sections_toggle`] after a
+/// flip. Mirrors the `theme` cookie pattern — server-side, so the state
+/// survives both a full reload *and* the SPA sidebar morph: the
+/// attributes live on `<html>`, which nav patches never replace, and the
+/// CSS keys off them.
+pub const NAV_SECTIONS_COOKIE: &str = "nav_sections";
+
+/// The collapsible sidebar nav-groups + their open/closed state.
+///
+/// Defaults: Workspace open, Account + Admin collapsed — the common case
+/// is reaching for a workspace page (Memory / Scheduled / Tools), while
+/// Account and Admin are occasional. A first-time visitor (no cookie)
+/// gets these defaults; once they toggle anything the full open-set is
+/// persisted explicitly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct NavSections {
+    pub workspace: bool,
+    pub account: bool,
+    pub admin: bool,
+}
+
+impl Default for NavSections {
+    fn default() -> Self {
+        Self {
+            workspace: true,
+            account: false,
+            admin: false,
+        }
+    }
+}
+
+impl NavSections {
+    /// Parse the `nav_sections` cookie. Absent → [`Default`] (Workspace
+    /// open). Present → exactly the listed groups are open; a
+    /// present-but-`none` value means all collapsed, which is distinct
+    /// from absent (default).
+    pub fn from_headers(headers: &HeaderMap) -> Self {
+        match read_cookie(headers, NAV_SECTIONS_COOKIE) {
+            Some(v) => Self::parse(&v),
+            None => Self::default(),
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        let mut s = Self {
+            workspace: false,
+            account: false,
+            admin: false,
+        };
+        for token in value.split(',') {
+            match token.trim() {
+                "workspace" => s.workspace = true,
+                "account" => s.account = true,
+                "admin" => s.admin = true,
+                _ => {}
+            }
+        }
+        s
+    }
+
+    /// Serialise to the cookie value: a comma list of open groups, or
+    /// `none` when all are collapsed — so the stored value is never empty
+    /// and always overrides the absent-cookie default.
+    fn serialize(self) -> String {
+        let mut open = Vec::new();
+        if self.workspace {
+            open.push("workspace");
+        }
+        if self.account {
+            open.push("account");
+        }
+        if self.admin {
+            open.push("admin");
+        }
+        if open.is_empty() {
+            "none".to_string()
+        } else {
+            open.join(",")
+        }
+    }
+
+    /// Flip the named group. Unknown names are ignored.
+    fn toggle(&mut self, section: &str) {
+        match section {
+            "workspace" => self.workspace = !self.workspace,
+            "account" => self.account = !self.account,
+            "admin" => self.admin = !self.admin,
+            _ => {}
+        }
+    }
+
+    /// `Some(open?)` for a known group, `None` for an unknown name.
+    fn is_open(self, section: &str) -> Option<bool> {
+        match section {
+            "workspace" => Some(self.workspace),
+            "account" => Some(self.account),
+            "admin" => Some(self.admin),
+            _ => None,
+        }
+    }
+
+    /// `"open"` / `"closed"` — the value used for the `<html>`
+    /// `data-nav-*` attributes the collapse CSS keys off.
+    pub fn attr(open: bool) -> &'static str {
+        if open { "open" } else { "closed" }
+    }
+}
+
+/// `Set-Cookie` value for the nav-sections preference. 1-year max-age,
+/// same as the theme cookie, so the layout rides reloads + fresh tabs.
+fn set_nav_sections_header(sections: NavSections) -> HeaderValue {
+    let value = format!(
+        "{NAV_SECTIONS_COOKIE}={}; Path=/; SameSite=Lax; Max-Age={}",
+        sections.serialize(),
+        60 * 60 * 24 * 365
+    );
+    HeaderValue::try_from(value).expect("nav_sections cookie value is ascii")
+}
+
+/// Handler: POST /nav/toggle/{section}. Flips one sidebar group's
+/// open/closed state in the cookie and returns an SSE patch that sets
+/// the matching `<html data-nav-{section}>` attribute in place — the CSS
+/// keyed off that attribute shows/hides the group's items. Because the
+/// attribute lives on `<html>` (outside the nav-patched `#app-sidebar`),
+/// the state survives both an in-page navigation and a full reload
+/// (which re-reads the cookie). Mirrors [`theme_toggle`].
+pub async fn nav_sections_toggle(Path(section): Path<String>, req: Request) -> Response {
+    let mut sections = NavSections::from_headers(req.headers());
+    sections.toggle(&section);
+    let Some(open) = sections.is_open(&section) else {
+        // Unknown group — no-op, leave the cookie untouched. `section`
+        // is now known to be one of the literal group names, so it's
+        // safe to splice into the script below.
+        return sse_response(&[]);
+    };
+    let attr = NavSections::attr(open);
+    let script = format!("document.documentElement.setAttribute('data-nav-{section}', '{attr}');");
+    let mut resp = sse_response(&[sse_script(&script)]);
+    resp.headers_mut()
+        .append(header::SET_COOKIE, set_nav_sections_header(sections));
     resp
 }
 

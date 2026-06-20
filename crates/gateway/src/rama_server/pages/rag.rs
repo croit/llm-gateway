@@ -25,8 +25,8 @@ use serde::Deserialize;
 
 use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_admin_or_403};
 use session_core::chrome::{
-    Flash, FlashKind, Theme, is_datastar_request, read_body_to_bytes, sse_patch, sse_response,
-    sse_script, sse_toast,
+    Flash, FlashKind, NavSections, Theme, is_datastar_request, read_body_to_bytes, sse_patch,
+    sse_response, sse_script, sse_toast,
 };
 use session_core::icons;
 
@@ -57,6 +57,7 @@ struct CreateForm {
 /// form at the top.
 pub async fn rag_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
         Ok(s) => s,
@@ -86,6 +87,7 @@ pub async fn rag_index(State(state): State<Arc<RamaState>>, req: Request) -> Res
     nav_or_html_page(
         datastar,
         theme,
+        nav,
         NavItem::Rag,
         "RAG collections — LLM Gateway",
         &user.email,

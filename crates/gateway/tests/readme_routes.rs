@@ -36,6 +36,7 @@ const UNDOCUMENTED: &[&str] = &[
     "/assets/*",     // static bundles baked in via include_bytes
     "/auth/*",       // OIDC browser flow + CLI device-flow handoff (covered in prose)
     "/theme/toggle", // UI affordance, not an API surface
+    "/nav/toggle",   // UI affordance — collapse/expand a sidebar nav-group
 ];
 
 /// `pat` covers concrete path `actual`. A trailing `/*` is a prefix glob;
