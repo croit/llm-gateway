@@ -56,7 +56,9 @@ pub async fn require_bearer(state: &RamaState, headers: &HeaderMap) -> Result<Us
 
     Ok(UserCtx {
         user_id: user.id,
+        user_email: user.email,
         token_id: token_row.id,
+        token_name: token_row.name,
         roles: user.roles,
         tools_enabled: token_row.tools_enabled,
     })

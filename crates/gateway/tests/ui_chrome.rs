@@ -249,7 +249,11 @@ async fn transcription_models_lists_discovered_models() {
         Arc::new(Resolver::empty()),
     );
     let sessions = SessionStore::new(pool, common::TEST_SECRET);
-    let state = RamaState::new(app, sessions);
+    let state = RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    );
     let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
     let app = router(Arc::new(state));
 
@@ -319,7 +323,11 @@ async fn session_transcribe_forwards_multipart_to_upstream() {
         Arc::new(Resolver::empty()),
     );
     let sessions = SessionStore::new(pool, common::TEST_SECRET);
-    let state = RamaState::new(app, sessions);
+    let state = RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    );
     let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
     let app = router(Arc::new(state));
 
@@ -437,7 +445,11 @@ async fn session_transcribe_rejects_too_short_audio() {
         Arc::new(Resolver::empty()),
     );
     let sessions = SessionStore::new(pool, common::TEST_SECRET);
-    let state = RamaState::new(app, sessions);
+    let state = RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    );
     let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
     let app = router(Arc::new(state));
 

@@ -20,6 +20,20 @@ session_key_env = "GATEWAY_SESSION_KEY"
 # impersonation still works regardless.
 allow_impersonation = false
 
+# ---- Usage metrics ---------------------------------------------------------
+# Per-user / per-backend request + token accounting, surfaced at /usage (and
+# the per-backend sparkline on /admin/backends). Recording is decoupled from
+# the request path (a bounded channel drained by a batched background writer),
+# so it adds negligible load — but it's a production kill switch if you ever
+# need it: set `enabled = false` to stop all measurement (no writer task, no
+# per-request work) and keep serving. The block is optional; these are the
+# defaults.
+[usage]
+enabled = true
+# Days of raw per-request rows to keep (pruned hourly); daily rollups are kept
+# forever regardless. Keep this above ~62 so the "last month" view stays exact.
+retention_days = 90
+
 # ---- Upstream pools --------------------------------------------------------
 # Each [upstream_pools.<name>] block defines a logical pool of backends that
 # serve the same kind of model (chat, transcription, embedding). The picker

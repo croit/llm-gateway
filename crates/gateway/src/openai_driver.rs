@@ -27,6 +27,7 @@ use session_core::driver::{SessionContext, SessionDriver, TurnError};
 use session_core::workers::TurnUpdate;
 
 use crate::rama_server::state::RamaState;
+use crate::server::db::usage::{self, UsageKind, UsageRecord, UsageSource};
 use crate::server::tools::{ToolContext, runner};
 
 /// Reasoning tags some vLLM reasoning-parser configs leak into the *content*
@@ -88,6 +89,10 @@ struct ToolCallAcc {
 pub struct OpenAiDriver {
     pub state: Arc<RamaState>,
     pub tool_ctx: ToolContext,
+    /// Which access method this turn belongs to for usage accounting:
+    /// `Chat` for the interactive UI, `Scheduled` for a cron-fired run.
+    /// (`/v1` callers go through `rama_server::proxy`, not this driver.)
+    pub source: UsageSource,
 }
 
 /// Build the per-turn [`ToolContext`] for a persisted chat session. This
@@ -183,6 +188,22 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
     let mut started_reasoning: Option<std::time::Instant> = None;
     let mut frozen_reasoning_elapsed = false;
 
+    // Email for the usage row, looked up once (best-effort; the user_id is
+    // always present even if this read fails). The chat/scheduler paths
+    // carry no API token, so token fields stay `None`. Skipped entirely when
+    // metrics are disabled — no extra DB read on the kill-switched path.
+    let metrics_on = d.state.usage.is_enabled();
+    let user_email = if metrics_on {
+        crate::server::db::users::find_by_id(&d.state.db, &d.tool_ctx.user_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.email)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
     for round in 0..MAX_ROUNDS {
         if ctx.cancel.load(Ordering::SeqCst) {
             return Ok(());
@@ -200,11 +221,23 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         // Build the request. `stream: true` so we can forward
         // content deltas; tools injected if the user has any
         // granted.
+        // `stream_options.include_usage` asks the upstream for a trailing
+        // usage frame (prompt/completion token counts) — we own this
+        // request, so unlike the /v1 passthrough we always opt in. It's
+        // parsed for metrics below and otherwise ignored (its `choices` is
+        // empty, so the delta loop skips it). Omitted when metrics are off,
+        // so a disabled gateway doesn't even alter the upstream request.
         let mut request_body = serde_json::json!({
             "model": ctx.model,
             "messages": messages,
             "stream": true,
         });
+        if metrics_on && let Some(obj) = request_body.as_object_mut() {
+            obj.insert(
+                "stream_options".into(),
+                serde_json::json!({"include_usage": true}),
+            );
+        }
         // Re-resolve the per-conversation tool overlay each round so a
         // mid-turn `enable_tools` call surfaces the newly-enabled schemas
         // on the next round. Cheap (sub-ms SQLite hit) and the only way
@@ -240,6 +273,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             .acquire_for(&ctx.model, crate::server::upstreams::PoolKind::Chat)
             .map_err(upstream_err)?;
         let backend = acquired.backend();
+        let backend_name = backend.name.clone();
         let url = format!("{}/chat/completions", backend.base_url);
         let mut http_req = d
             .state
@@ -256,11 +290,21 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         if let Some(key) = backend.api_key.as_deref() {
             http_req = http_req.bearer_auth(key);
         }
+        let started = std::time::Instant::now();
         let upstream = http_req.send().await.map_err(transport_err)?;
         if !upstream.status().is_success() {
             let status = upstream.status();
             let bytes = upstream.bytes().await.unwrap_or_default();
             drop(acquired);
+            emit_usage(
+                d,
+                &user_email,
+                &ctx.model,
+                &backend_name,
+                status.as_u16(),
+                started,
+                (None, None, None),
+            );
             return Err(TurnError::Upstream {
                 message: format!(
                     "upstream {status}: {}",
@@ -271,6 +315,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                 ),
             });
         }
+        let status_code = upstream.status().as_u16();
 
         let mut round_content = String::new();
         let mut tool_acc: std::collections::BTreeMap<usize, ToolCallAcc> =
@@ -286,6 +331,8 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         // Carry buffer for stripping stray `<think>`/`</think>` tags out of the
         // content channel without breaking on a tag split across deltas.
         let mut content_tag_buf = String::new();
+        // Token counts from the trailing `usage` frame (we set include_usage).
+        let mut round_tokens: (Option<i64>, Option<i64>, Option<i64>) = (None, None, None);
         let mut upstream_stream = upstream.bytes_stream();
 
         'chunks: while let Some(chunk) = upstream_stream.next().await {
@@ -310,6 +357,12 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+                    // The trailing usage frame carries token counts and an
+                    // empty `choices` — grab it before the delta guard below
+                    // skips choice-less frames.
+                    if v.get("usage").is_some_and(|u| !u.is_null()) {
+                        round_tokens = usage::usage_from_value(&v);
+                    }
                     let delta = match v.pointer("/choices/0/delta") {
                         Some(d) => d,
                         None => continue,
@@ -349,7 +402,17 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                             // Drop the upstream stream (closes the
                             // connection) and finalize the turn as errored
                             // with a clear message. The partial reasoning
-                            // already streamed stays visible.
+                            // already streamed stays visible. The backend
+                            // call was real, so still record it.
+                            emit_usage(
+                                d,
+                                &user_email,
+                                &ctx.model,
+                                &backend_name,
+                                status_code,
+                                started,
+                                round_tokens,
+                            );
                             return Err(TurnError::Aborted {
                                 message: crate::loop_guard::LOOP_MESSAGE.into(),
                             });
@@ -382,6 +445,15 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                                 .map_err(upstream_err)?;
                             let _ = ctx.broadcast.send(TurnUpdate::Tick);
                             if content_guard.push(&emit) {
+                                emit_usage(
+                                    d,
+                                    &user_email,
+                                    &ctx.model,
+                                    &backend_name,
+                                    status_code,
+                                    started,
+                                    round_tokens,
+                                );
                                 return Err(TurnError::Aborted {
                                     message: crate::loop_guard::LOOP_MESSAGE.into(),
                                 });
@@ -414,6 +486,17 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             }
         }
         drop(acquired);
+
+        // One usage row per upstream round (a tool-using turn emits several).
+        emit_usage(
+            d,
+            &user_email,
+            &ctx.model,
+            &backend_name,
+            status_code,
+            started,
+            round_tokens,
+        );
 
         // Flush any held-back content tail (a partial tag that never
         // completed is real content, minus any complete tag still in it).
@@ -792,6 +875,37 @@ fn message_for_history(turn: &Turn) -> Option<serde_json::Value> {
             }))
         }
     }
+}
+
+/// Emit one usage row for an upstream round on the chat/scheduler path.
+/// Fire-and-forget; never affects the turn. Token counts come from the
+/// trailing `usage` frame (we set `include_usage`), `None` if absent.
+fn emit_usage(
+    d: &OpenAiDriver,
+    user_email: &str,
+    model: &str,
+    backend: &str,
+    status: u16,
+    started: std::time::Instant,
+    tokens: (Option<i64>, Option<i64>, Option<i64>),
+) {
+    let (prompt_tokens, completion_tokens, total_tokens) = tokens;
+    d.state.usage.emit(UsageRecord {
+        created_at: jiff::Timestamp::now(),
+        user_id: d.tool_ctx.user_id.clone(),
+        user_email: (!user_email.is_empty()).then(|| user_email.to_string()),
+        token_id: None,
+        token_name: None,
+        source: d.source,
+        kind: UsageKind::Chat,
+        backend: backend.to_string(),
+        model: model.to_string(),
+        status,
+        duration_ms: started.elapsed().as_millis() as i64,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+    });
 }
 
 fn upstream_err<E: std::fmt::Display>(e: E) -> TurnError {

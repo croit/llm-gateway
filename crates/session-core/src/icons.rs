@@ -58,6 +58,14 @@ pub fn sun(size: u32) -> Html {
     ))
 }
 
+/// Bar chart (lucide `bar-chart-3`) — the Usage / statistics nav entry.
+pub fn chart(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>"#,
+    ))
+}
+
 /// Clock — the Scheduled-actions nav entry + schedule affordances.
 pub fn clock(size: u32) -> Html {
     raw(render(

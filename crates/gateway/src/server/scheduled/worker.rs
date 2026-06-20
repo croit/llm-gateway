@@ -183,6 +183,7 @@ async fn try_run_action(
     let driver = Box::new(crate::openai_driver::OpenAiDriver {
         state: state.clone(),
         tool_ctx,
+        source: crate::server::db::usage::UsageSource::Scheduled,
     });
 
     // No registry slot and a throwaway broadcast channel: a scheduled run

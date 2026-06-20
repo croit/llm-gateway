@@ -16,7 +16,14 @@ pub mod token;
 #[derive(Debug, Clone)]
 pub struct UserCtx {
     pub user_id: String,
+    /// Resolved during auth (the user row is loaded anyway). Denormalised
+    /// onto usage rows so the metrics page needs no join and survives a
+    /// user deletion. Empty when unknown.
+    pub user_email: String,
     pub token_id: String,
+    /// The token's display name, resolved during auth. Denormalised onto
+    /// usage rows for the per-token breakdown.
+    pub token_name: String,
     pub roles: Vec<String>,
     /// The token's master "tool use" switch. When `false` the request
     /// path injects no gateway tools at all (pure passthrough), so the

@@ -63,6 +63,7 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/memory", pages::memory_create)
         .with_post("/memory/{id}/edit", pages::memory_edit)
         .with_post("/memory/{id}/delete", pages::memory_delete)
+        .with_get("/usage", pages::usage_index)
         .with_get("/scheduled", pages::scheduled_index)
         .with_post("/scheduled", pages::scheduled_create)
         .with_post("/scheduled/preview", pages::scheduled_preview)

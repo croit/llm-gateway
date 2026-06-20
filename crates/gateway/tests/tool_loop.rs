@@ -90,7 +90,11 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
         Arc::new(rbac),
     );
     let sessions = SessionStore::new(pool, common::TEST_SECRET);
-    RamaState::new(app, sessions)
+    RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    )
 }
 
 /// Seed a user with the OIDC role + a bearer token.

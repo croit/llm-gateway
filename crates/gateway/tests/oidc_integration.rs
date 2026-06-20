@@ -169,7 +169,11 @@ async fn state_with_oidc(idp_uri: &str, roles_claim: Option<&str>) -> RamaState 
 
     let app = AppState::new(config, pool.clone(), registry, tools, rbac).with_oidc(oidc);
     let sessions = SessionStore::new(pool, common::TEST_SECRET);
-    RamaState::new(app, sessions)
+    RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    )
 }
 
 #[tokio::test]

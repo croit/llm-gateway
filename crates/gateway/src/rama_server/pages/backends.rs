@@ -26,7 +26,13 @@ use session_core::chrome::{Theme, is_datastar_request};
 use session_core::icons;
 
 use crate::rama_server::state::RamaState;
+use crate::server::db::usage;
 use crate::server::upstreams::{PickerStrategy, PoolKind};
+
+/// Sparkline window: `BUCKETS` buckets of `BUCKET_MINUTES` each =
+/// the last hour, in 5-minute steps.
+const BUCKET_MINUTES: i64 = 5;
+const BUCKETS: i64 = 12;
 
 /// GET /admin/backends — one card per pool, each listing its backends
 /// with health, in-flight load, and advertised models. Pools are
@@ -39,6 +45,13 @@ pub async fn backends_index(State(state): State<Arc<RamaState>>, req: Request) -
         Ok(s) => s,
         Err(resp) => return resp,
     };
+
+    // Recent per-backend request activity for the sparkline (last hour in
+    // 5-min buckets). Best-effort: a metrics hiccup just yields flat lines.
+    let now = jiff::Timestamp::now();
+    let rates = usage::recent_buckets_by_backend(&state.db, now, BUCKET_MINUTES, BUCKETS)
+        .await
+        .unwrap_or_default();
 
     let mut pools: Vec<PoolView> = state
         .upstreams
@@ -57,6 +70,10 @@ pub async fn backends_index(State(state): State<Arc<RamaState>>, req: Request) -
                         inflight: b.inflight(),
                         max_inflight: b.max_inflight,
                         models,
+                        recent: rates
+                            .get(&b.name)
+                            .cloned()
+                            .unwrap_or_else(|| vec![0; BUCKETS as usize]),
                     }
                 })
                 .collect();
@@ -100,6 +117,9 @@ struct BackendView {
     inflight: u32,
     max_inflight: u32,
     models: Vec<String>,
+    /// Request counts per 5-min bucket over the last hour, oldest → newest
+    /// (always `BUCKETS` long; all-zero when idle).
+    recent: Vec<i64>,
 }
 
 impl BackendView {
@@ -224,6 +244,12 @@ fn render_backend_row(b: &BackendView) -> Html {
     let inflight = b.inflight.to_string();
     let max_inflight = b.max_inflight.to_string();
     let models = b.models.clone();
+    // Recent activity: last 3 / 6 / 12 five-minute buckets = 15 / 30 / 60 min.
+    let tail = |n: usize| -> i64 { b.recent.iter().rev().take(n).sum() };
+    let c15 = tail(3);
+    let c30 = tail(6);
+    let c60: i64 = b.recent.iter().sum();
+    let spark = sparkline_svg(&b.recent);
     html! {
         div(class: "flex flex-col gap-2 rounded-lg border border-base-300 p-3") {
             div(class: "flex items-center justify-between gap-3 flex-wrap") {
@@ -236,15 +262,26 @@ fn render_backend_row(b: &BackendView) -> Html {
                         }
                     }
                 }
-                div(class: "flex items-center gap-2 shrink-0") {
-                    span(class: "text-xs text-base-content/60 tabular-nums") {
-                        "inflight " (load)
+                // Inflight bar, and directly underneath it the recent
+                // request rate: a 1-hour sparkline (5-min buckets) + the
+                // 15/30/60-minute totals. Right-aligned to sit under the bar.
+                div(class: "flex flex-col items-end gap-1 shrink-0") {
+                    div(class: "flex items-center gap-2") {
+                        span(class: "text-xs text-base-content/60 tabular-nums") {
+                            "inflight " (load)
+                        }
+                        progress(
+                            class: (bar_class),
+                            value: (inflight),
+                            max: (max_inflight)
+                        ) {}
                     }
-                    progress(
-                        class: (bar_class),
-                        value: (inflight),
-                        max: (max_inflight)
-                    ) {}
+                    div(class: "flex items-center gap-2 text-base-content/50") {
+                        span(class: "text-xs tabular-nums whitespace-nowrap") {
+                            "15m " (c15.to_string()) " · 30m " (c30.to_string()) " · 60m " (c60.to_string())
+                        }
+                        span(class: "text-primary") { #(spark.clone()) }
+                    }
                 }
             }
             div(class: "flex flex-wrap gap-1") {
@@ -261,4 +298,37 @@ fn render_backend_row(b: &BackendView) -> Html {
         }
     }
     .to_html()
+}
+
+/// A tiny inline-SVG bar sparkline of `values` (oldest → newest), inheriting
+/// the surrounding text color via `currentColor`. Bars are normalised to the
+/// window's own max; idle buckets render as faint stubs so an all-zero series
+/// still reads as a flat baseline rather than a blank gap. No JS, no chart
+/// library — same self-contained-SVG approach as `icons`.
+fn sparkline_svg(values: &[i64]) -> String {
+    const BAR_W: i64 = 6;
+    const GAP: i64 = 2;
+    const H: i64 = 20;
+    let n = values.len().max(1) as i64;
+    let width = n * (BAR_W + GAP) - GAP;
+    let max = values.iter().copied().max().unwrap_or(0).max(1);
+    let mut bars = String::new();
+    for (i, &v) in values.iter().enumerate() {
+        let bh = if v <= 0 {
+            2
+        } else {
+            (((v as f64 / max as f64) * (H as f64 - 2.0)).round() as i64).clamp(2, H)
+        };
+        let x = i as i64 * (BAR_W + GAP);
+        let y = H - bh;
+        let opacity = if v <= 0 { "0.2" } else { "0.85" };
+        bars.push_str(&format!(
+            "<rect x=\"{x}\" y=\"{y}\" width=\"{BAR_W}\" height=\"{bh}\" rx=\"1\" \
+             fill=\"currentColor\" opacity=\"{opacity}\"/>"
+        ));
+    }
+    format!(
+        "<svg width=\"{width}\" height=\"{H}\" viewBox=\"0 0 {width} {H}\" fill=\"none\" \
+         class=\"inline-block shrink-0 align-middle\" aria-hidden=\"true\">{bars}</svg>"
+    )
 }

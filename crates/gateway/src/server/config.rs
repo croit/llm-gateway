@@ -101,6 +101,42 @@ pub struct Config {
     /// `skills` list, exactly like `tools`. See `server::skills`.
     #[serde(default)]
     pub skills: Option<SkillsConfig>,
+    /// Usage accounting (per-user / per-backend request metrics). Always
+    /// present with sane defaults — there's no way to mis-configure it into
+    /// failing a request, since recording is fire-and-forget. Set
+    /// `[usage] enabled = false` to turn measurement off entirely, or tune
+    /// `retention_days` to bound the raw-event window. See `server::usage`.
+    #[serde(default)]
+    pub usage: UsageConfig,
+}
+
+/// Usage-metrics knobs. Recording is decoupled from the request path (a
+/// bounded channel drained by a background batched writer), so these only
+/// affect how much history is kept and whether measurement runs at all.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UsageConfig {
+    /// Master switch. When `false`, no `UsageRecord`s are emitted, the
+    /// writer/maintenance tasks aren't spawned, and hot paths skip the
+    /// record-building work entirely — a production kill switch if metrics
+    /// ever cost too much. The `/usage` page still renders (with a "metrics
+    /// disabled" notice). Default `true`.
+    pub enabled: bool,
+    /// How many days of raw `usage_events` rows to keep. Older rows are
+    /// pruned hourly; the `usage_daily` rollups are kept forever regardless.
+    /// Must comfortably exceed the longest UI period ("start of last month",
+    /// ~62 days back) so those queries stay on the precise raw path. Default
+    /// 90.
+    pub retention_days: i64,
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: 90,
+        }
+    }
 }
 
 /// Skills directory. Mirrors `[rag] data_dir` / `[typst] templates_dir`:

@@ -320,7 +320,9 @@ mod tests {
     fn ctx(token_id: &str, tools_enabled: bool) -> UserCtx {
         UserCtx {
             user_id: "alice".into(),
+            user_email: "alice@example.com".into(),
             token_id: token_id.into(),
+            token_name: token_id.into(),
             roles: vec![], // empty → default role "all" applies
             tools_enabled,
         }

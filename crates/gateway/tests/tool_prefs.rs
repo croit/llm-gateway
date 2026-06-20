@@ -89,7 +89,11 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
 
     let app = AppState::new(Config::default(), pool.clone(), registry, tools, rbac);
     let sessions = SessionStore::new(pool, common::TEST_SECRET);
-    RamaState::new(app, sessions)
+    RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    )
 }
 
 /// Seed a user with the given OIDC roles + an active session; return

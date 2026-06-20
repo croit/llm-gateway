@@ -879,6 +879,7 @@ async fn spawn_assistant_worker(
     let driver = Box::new(crate::openai_driver::OpenAiDriver {
         state: state.clone(),
         tool_ctx,
+        source: crate::server::db::usage::UsageSource::Chat,
     });
     let driver_ctx = session_core::driver::SessionContext {
         user_id: Some(user.id.clone()),

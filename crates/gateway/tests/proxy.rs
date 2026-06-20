@@ -98,6 +98,60 @@ async fn v1_chat_completions_relays_through_upstream() {
 }
 
 #[tokio::test]
+async fn v1_chat_completion_records_a_usage_row() {
+    use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
+    use jiff::Timestamp;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+        })))
+        .mount(&upstream)
+        .await;
+
+    // Opt into a live metered usage sink (the harness default is disabled).
+    let state = common::state_with_chat_pool(&upstream.uri()).await;
+    let metered = gateway::server::usage::spawn(state.db.clone(), 90);
+    let state = state.with_usage(metered);
+    let db = state.db.clone();
+    let bearer = common::seed_user_with_token(&state, "alice").await;
+    let app = common::app(state);
+
+    let body = json!({"model": "model-a", "messages": []}).to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Drain the response so the streaming relay task runs to completion and
+    // emits its usage record.
+    let _ = common::read_body(resp).await;
+
+    // The batched writer flushes within ~500ms; poll a little past that.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    let now = Timestamp::now();
+    let bounds = period_bounds(Period::Today, "UTC", now);
+    let agg = aggregate(&db, bounds, &Filter::default(), 90, now, true)
+        .await
+        .unwrap();
+    assert_eq!(agg.summary.requests, 1, "one upstream call recorded");
+    assert_eq!(agg.summary.total_tokens, 18, "usage block parsed from body");
+    assert_eq!(agg.by_source[0].key, "v1_api");
+    assert_eq!(agg.by_backend[0].key, "mock");
+    assert_eq!(agg.by_model[0].key, "model-a");
+    assert_eq!(agg.by_user[0].key, "alice");
+    assert_eq!(agg.by_user[0].label, "alice@example.com");
+}
+
+#[tokio::test]
 async fn v1_embeddings_relays_through_upstream() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
@@ -527,5 +581,9 @@ async fn state_with_backend_api_key(
     let rbac = Arc::new(Resolver::empty());
     let app = AppState::new(Config::default(), pool.clone(), registry, tools, rbac);
     let sessions = SessionStore::new(pool, common::TEST_SECRET);
-    RamaState::new(app, sessions)
+    RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    )
 }

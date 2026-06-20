@@ -221,7 +221,11 @@ async fn main() -> anyhow::Result<()> {
     );
     let app = AppState::new(config, pool.clone(), registry, tools, rbac).with_skills(skill_store);
     let sessions = SessionStore::new(pool, SESSION_SECRET);
-    let state = RamaState::new(app, sessions);
+    let state = RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    );
 
     // --- Seed a user + session so the authed UI is reachable ---------
     use gateway::server::db::users;

@@ -232,7 +232,17 @@ async fn main() -> anyhow::Result<()> {
     srv::rag::worker::spawn(indexer.clone());
     state = state.with_indexer(indexer);
 
-    let state = Arc::new(gateway::rama_server::RamaState::new(state, sessions));
+    // Usage metrics: a batched background writer + retention-prune task,
+    // fronted by a fire-and-forget handle on the shared state. When
+    // `[usage] enabled = false` the handle is a no-op and no tasks spawn.
+    let usage = if state.config.usage.enabled {
+        srv::usage::spawn(state.db.clone(), state.config.usage.retention_days)
+    } else {
+        tracing::info!("usage metrics disabled via [usage].enabled = false");
+        srv::usage::UsageHandle::disabled()
+    };
+
+    let state = Arc::new(gateway::rama_server::RamaState::new(state, sessions, usage));
 
     // Scheduled actions: start the background loop that fires due actions
     // (the `scheduled_actions` table is created by migration 0021).

@@ -58,7 +58,11 @@ fn state_from_registry(db_pool: db::Pool, registry: Arc<upstreams::UpstreamRegis
     let rbac = Arc::new(Resolver::empty());
     let app = AppState::new(Config::default(), db_pool.clone(), registry, tools, rbac);
     let sessions = SessionStore::new(db_pool, TEST_SECRET);
-    RamaState::new(app, sessions)
+    RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    )
 }
 
 /// Build a `RamaState` wired to a single backend pool (chat kind).
@@ -227,7 +231,11 @@ async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool
     config.gateway.allow_impersonation = allow_impersonation;
     let app = AppState::new(config, pool.clone(), registry, tools, rbac);
     let sessions = SessionStore::new(pool, TEST_SECRET);
-    RamaState::new(app, sessions)
+    RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    )
 }
 
 /// Test-only: pretend the health probe just ran and advertise `models`

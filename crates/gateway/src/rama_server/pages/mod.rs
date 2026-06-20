@@ -54,6 +54,9 @@ enum NavItem {
     /// Per-user scheduled-actions page (`/scheduled`). Shown to every
     /// signed-in user; each manages their own schedules.
     Scheduled,
+    /// Usage statistics (`/usage`). Shown to every signed-in user (scoped
+    /// to their own requests); admins get an in-page "All users" toggle.
+    Usage,
     /// Admin-only pages (model defaults, future operator tooling).
     /// The sidebar entry is only rendered for users whose `roles`
     /// includes `"admin"`; non-admins never see it.
@@ -217,6 +220,7 @@ fn render_app_sidebar(
                 (sidebar_nav_link("/tools", NavItem::Tools, active, icons::sliders(16), "Tools"))
                 (sidebar_nav_link("/memory", NavItem::Memory, active, icons::folder(16), "Memory"))
                 (sidebar_nav_link("/scheduled", NavItem::Scheduled, active, icons::clock(16), "Scheduled"))
+                (sidebar_nav_link("/usage", NavItem::Usage, active, icons::chart(16), "Usage"))
                 (sidebar_nav_link("/tokens", NavItem::Tokens, active, icons::key(16), "Tokens"))
                 if is_admin {
                     (sidebar_nav_link("/admin/users", NavItem::Users, active, icons::users(16), "Users"))
@@ -858,6 +862,11 @@ pub use rag::{
 // reachable by the impersonated (possibly non-admin) session so it can get back.
 mod admin_users;
 pub use admin_users::{impersonate_stop, users_impersonate, users_index as admin_users_index};
+
+// Usage statistics: `/usage` for every signed-in user (scoped to their own
+// requests), with an admin-only in-page "All users" toggle (`?scope=all`).
+mod usage;
+pub use usage::usage_index;
 
 fn internal_error_html(user_email: &str, message: &str) -> Response {
     let body = html! {

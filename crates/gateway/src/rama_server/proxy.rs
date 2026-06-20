@@ -22,14 +22,89 @@ use rama::http::service::web::response::IntoResponse;
 use rama::http::{HeaderMap, HeaderName, Method, Request, Response, StatusCode};
 use serde_json::{Value, json};
 
+use std::time::Instant;
+
+use jiff::Timestamp;
+
 use crate::rama_server::auth::require_bearer;
 use crate::rama_server::state::RamaState;
 use crate::rama_server::vad;
 use crate::server::auth::UserCtx;
+use crate::server::db::usage::{self, UsageKind, UsageRecord, UsageSource};
 use crate::server::tools::ToolContext;
 use crate::server::tools::runner::{self, LoopError};
 use crate::server::upstreams::registry::{Acquired, RouteError};
 use crate::server::upstreams::{AcquireError, PoolKind};
+use crate::server::usage::UsageHandle;
+
+/// Identity + classification for a usage measurement, built once per
+/// request and finished off (backend, status, latency, tokens) at each
+/// upstream call. The `model` is carried here because the byte-dumb
+/// `forward`/`forward_streaming` helpers are generic over the path.
+#[derive(Clone)]
+struct RecordParams {
+    user_id: String,
+    user_email: String,
+    token_id: Option<String>,
+    token_name: Option<String>,
+    source: UsageSource,
+    kind: UsageKind,
+    model: String,
+}
+
+impl RecordParams {
+    /// A `/v1` (bearer) measurement: the access method is `v1_api` and the
+    /// token id/name carry through for the per-token breakdown.
+    fn v1(user: &UserCtx, kind: UsageKind, model: String) -> Self {
+        Self {
+            user_id: user.user_id.clone(),
+            user_email: user.user_email.clone(),
+            token_id: Some(user.token_id.clone()),
+            token_name: Some(user.token_name.clone()),
+            source: UsageSource::V1Api,
+            kind,
+            model,
+        }
+    }
+
+    /// Finish the measurement and hand it to the (fire-and-forget) sink.
+    /// `tokens` is `(prompt, completion, total)` — any may be `None` when
+    /// the upstream didn't report usage.
+    fn emit(
+        &self,
+        sink: &UsageHandle,
+        backend: &str,
+        status: u16,
+        started: Instant,
+        tokens: (Option<i64>, Option<i64>, Option<i64>),
+    ) {
+        let (prompt_tokens, completion_tokens, total_tokens) = tokens;
+        sink.emit(UsageRecord {
+            created_at: Timestamp::now(),
+            user_id: self.user_id.clone(),
+            user_email: Some(self.user_email.clone()).filter(|s| !s.is_empty()),
+            token_id: self.token_id.clone(),
+            token_name: self.token_name.clone(),
+            source: self.source,
+            kind: self.kind,
+            backend: backend.to_string(),
+            model: self.model.clone(),
+            status,
+            duration_ms: started.elapsed().as_millis() as i64,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        });
+    }
+}
+
+/// Token counts from a buffered JSON body (or `(None, None, None)` if it
+/// doesn't parse / carries no `usage`).
+fn tokens_from_bytes(bytes: &Bytes) -> (Option<i64>, Option<i64>, Option<i64>) {
+    serde_json::from_slice::<Value>(bytes)
+        .map(|v| usage::usage_from_value(&v))
+        .unwrap_or((None, None, None))
+}
 
 /// `POST /v1/chat/completions`. Two paths under one handler:
 ///
@@ -105,6 +180,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
             Ok(a) => a,
             Err(e) => return route_error_response(e),
         };
+        let rec = RecordParams::v1(&user, UsageKind::Chat, model.clone());
         return forward_streaming(
             &state,
             acquired,
@@ -112,6 +188,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
             "chat/completions",
             parts.headers,
             body,
+            rec,
         )
         .await;
     }
@@ -182,6 +259,9 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     let state_clone = state.clone();
     let model_clone = model.clone();
     let headers_clone = parts.headers.clone();
+    // One usage row per upstream round — built per request, finished off
+    // with backend/status/latency/tokens inside the loop closure.
+    let rec = RecordParams::v1(&user, UsageKind::Chat, model.clone());
 
     let outcome = runner::run_with_tools(
         &state.tools,
@@ -192,11 +272,14 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
             let state = state_clone.clone();
             let model = model_clone.clone();
             let headers = headers_clone.clone();
+            let rec = rec.clone();
             async move {
                 let acquired = state
                     .upstreams
                     .acquire_for(&model, PoolKind::Chat)
                     .map_err(|e| LoopError::Upstream(e.to_string()))?;
+                let backend_name = acquired.backend().name.clone();
+                let started = Instant::now();
                 let serialized = serde_json::to_vec(&body_value)
                     .map_err(|e| LoopError::Upstream(format!("serialise: {e}")))?;
                 let url = format!("{}/chat/completions", acquired.backend().base_url);
@@ -210,17 +293,46 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
                 if let Some(key) = acquired.backend().api_key.as_deref() {
                     http = http.bearer_auth(key);
                 }
-                let resp = http
-                    .body(serialized)
-                    .send()
-                    .await
-                    .map_err(|e| LoopError::Upstream(e.to_string()))?;
+                // A backend was contacted, so the call is counted either way
+                // — a transport/read failure records a 502 row (parallel to
+                // `forward`), keeping error accounting consistent across paths.
+                let resp = match http.body(serialized).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        drop(acquired);
+                        rec.emit(
+                            &state.usage,
+                            &backend_name,
+                            StatusCode::BAD_GATEWAY.as_u16(),
+                            started,
+                            (None, None, None),
+                        );
+                        return Err(LoopError::Upstream(e.to_string()));
+                    }
+                };
                 let status = resp.status().as_u16();
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| LoopError::Upstream(e.to_string()))?;
+                let bytes = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        drop(acquired);
+                        rec.emit(
+                            &state.usage,
+                            &backend_name,
+                            StatusCode::BAD_GATEWAY.as_u16(),
+                            started,
+                            (None, None, None),
+                        );
+                        return Err(LoopError::Upstream(e.to_string()));
+                    }
+                };
                 drop(acquired);
+                rec.emit(
+                    &state.usage,
+                    &backend_name,
+                    status,
+                    started,
+                    tokens_from_bytes(&bytes),
+                );
                 Ok((status, bytes))
             }
         },
@@ -274,7 +386,7 @@ fn loop_error_response(err: LoopError) -> Response {
 /// upstream.
 pub async fn transcribe(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
-    let _user = match require_bearer(&state, &parts.headers).await {
+    let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
         Err(resp) => return resp,
     };
@@ -282,7 +394,9 @@ pub async fn transcribe(State(state): State<Arc<RamaState>>, req: Request) -> Re
         Ok(b) => b,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
     };
-    handle_transcription(state, parts.headers, body).await
+    // Model is parsed inside; `handle_transcription` fills it into `rec`.
+    let rec = RecordParams::v1(&user, UsageKind::Transcription, String::new());
+    handle_transcription(state, parts.headers, body, rec).await
 }
 
 /// `POST /api/v0/transcriptions` — session-authed mirror of
@@ -310,12 +424,34 @@ pub async fn transcribe_session(State(state): State<Arc<RamaState>>, req: Reques
             );
         }
     };
-    let _ = session;
+    // Browser-composer transcription is part of chat-UI usage: source
+    // `chat`, no API token. Email is best-effort (one indexed read) so the
+    // per-user breakdown reads nicely; user_id is always present. Skipped
+    // when metrics are disabled (no extra DB read on the kill-switched path).
+    let user_email = if state.usage.is_enabled() {
+        crate::server::db::users::find_by_id(&state.db, &session.user_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.email)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let rec = RecordParams {
+        user_id: session.user_id.clone(),
+        user_email,
+        token_id: None,
+        token_name: None,
+        source: UsageSource::Chat,
+        kind: UsageKind::Transcription,
+        model: String::new(),
+    };
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
     };
-    handle_transcription(state, parts.headers, body).await
+    handle_transcription(state, parts.headers, body, rec).await
 }
 
 /// Shared body of both transcription handlers: parse → VAD-trim → rebuild
@@ -325,6 +461,7 @@ async fn handle_transcription(
     state: Arc<RamaState>,
     mut headers: HeaderMap,
     body: Bytes,
+    mut rec: RecordParams,
 ) -> Response {
     let fields = match parse_multipart_fields(&headers, body).await {
         Ok(f) => f,
@@ -392,6 +529,7 @@ async fn handle_transcription(
         Ok(a) => a,
         Err(e) => return route_error_response(e),
     };
+    rec.model = model;
     forward(
         &state,
         acquired,
@@ -399,6 +537,7 @@ async fn handle_transcription(
         "audio/transcriptions",
         headers,
         new_body,
+        rec,
     )
     .await
 }
@@ -549,7 +688,7 @@ async fn read_body_to_bytes(body: rama::http::Body) -> Result<Bytes, String> {
 pub async fn embeddings(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     // Bearer required; no per-model RBAC gate here, matching the chat path.
-    let _user = match require_bearer(&state, &parts.headers).await {
+    let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
         Err(resp) => return resp,
     };
@@ -570,6 +709,7 @@ pub async fn embeddings(State(state): State<Arc<RamaState>>, req: Request) -> Re
         Ok(a) => a,
         Err(e) => return route_error_response(e),
     };
+    let rec = RecordParams::v1(&user, UsageKind::Embedding, model);
     forward(
         &state,
         acquired,
@@ -577,6 +717,7 @@ pub async fn embeddings(State(state): State<Arc<RamaState>>, req: Request) -> Re
         "embeddings",
         parts.headers,
         body,
+        rec,
     )
     .await
 }
@@ -694,6 +835,7 @@ async fn forward(
     upstream_path: &str,
     client_headers: HeaderMap,
     body: Bytes,
+    rec: RecordParams,
 ) -> Response {
     // Outbound HTTP via reqwest, by design. Rama serves the inbound
     // side; reqwest handles outbound. Same split most rust web
@@ -702,7 +844,9 @@ async fn forward(
     // aws-lc-sys → cmake) and its concrete type is ugly enough as a
     // struct field that the maintenance cost doesn't pay for itself.
     let backend = acquired.backend();
+    let backend_name = backend.name.clone();
     let url = format!("{}/{}", backend.base_url, upstream_path);
+    let started = Instant::now();
 
     let mut req = state.http.request(method, &url);
     for (name, value) in &client_headers {
@@ -718,6 +862,13 @@ async fn forward(
         Ok(r) => r,
         Err(err) => {
             drop(acquired);
+            rec.emit(
+                &state.usage,
+                &backend_name,
+                StatusCode::BAD_GATEWAY.as_u16(),
+                started,
+                (None, None, None),
+            );
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 "upstream_unreachable",
@@ -736,6 +887,13 @@ async fn forward(
         Ok(b) => b,
         Err(err) => {
             drop(acquired);
+            rec.emit(
+                &state.usage,
+                &backend_name,
+                StatusCode::BAD_GATEWAY.as_u16(),
+                started,
+                (None, None, None),
+            );
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 "upstream_unreachable",
@@ -744,6 +902,16 @@ async fn forward(
         }
     };
     drop(acquired);
+
+    // One row per upstream call. Embeddings carry a `usage` block;
+    // transcription responses don't, so tokens come back `None` there.
+    rec.emit(
+        &state.usage,
+        &backend_name,
+        status.as_u16(),
+        started,
+        tokens_from_bytes(&bytes),
+    );
 
     let mut builder = Response::builder()
         .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
@@ -782,11 +950,14 @@ async fn forward_streaming(
     upstream_path: &str,
     client_headers: HeaderMap,
     body: Bytes,
+    rec: RecordParams,
 ) -> Response {
     use rama::futures::StreamExt;
 
     let backend = acquired.backend();
+    let backend_name = backend.name.clone();
     let url = format!("{}/{}", backend.base_url, upstream_path);
+    let started = Instant::now();
 
     let mut req = state.http.request(method, &url);
     for (name, value) in &client_headers {
@@ -802,6 +973,13 @@ async fn forward_streaming(
         Ok(r) => r,
         Err(err) => {
             drop(acquired);
+            rec.emit(
+                &state.usage,
+                &backend_name,
+                StatusCode::BAD_GATEWAY.as_u16(),
+                started,
+                (None, None, None),
+            );
             return error_response(
                 StatusCode::BAD_GATEWAY,
                 "upstream_unreachable",
@@ -816,6 +994,7 @@ async fn forward_streaming(
         .filter(|(n, _)| is_response_header_forwarded(n))
         .map(|(n, v)| (n.clone(), v.clone()))
         .collect();
+    let usage_sink = state.usage.clone();
 
     // Relay each upstream SSE frame 1:1, but tap the deltas through a
     // repetition guard in parallel. If the model collapses into a loop we
@@ -833,11 +1012,18 @@ async fn forward_streaming(
         let mut content_guard = crate::loop_guard::LoopGuard::new();
         let mut reasoning_guard = crate::loop_guard::LoopGuard::new();
         let mut looped = false;
+        // Token counts ride the trailing `usage` frame — present only when
+        // the *client* asked for `stream_options.include_usage`. We tap it
+        // passively (never inject the option) so a passthrough client's
+        // stream is unchanged; callers who don't opt in get NULL tokens.
+        let mut tokens: (Option<i64>, Option<i64>, Option<i64>) = (None, None, None);
         'frames: while let Some(frame) = upstream_stream.next().await {
             let Ok(frame) = frame else { break };
             // Forward first so the client gets output with no added latency.
             if tx.unbounded_send(Ok(frame.clone())).is_err() {
-                return; // client disconnected
+                // Client disconnected — still record the call (partial).
+                rec.emit(&usage_sink, &backend_name, status.as_u16(), started, tokens);
+                return;
             }
             buf.extend_from_slice(&frame);
             while let Some(idx) = buf.windows(2).position(|w| w == b"\n\n") {
@@ -853,6 +1039,9 @@ async fn forward_streaming(
                     let Ok(v) = serde_json::from_str::<Value>(payload) else {
                         continue;
                     };
+                    if v.get("usage").is_some_and(|u| !u.is_null()) {
+                        tokens = usage::usage_from_value(&v);
+                    }
                     if let Some(t) = v
                         .pointer("/choices/0/delta/content")
                         .and_then(|c| c.as_str())
@@ -880,6 +1069,17 @@ async fn forward_streaming(
             let _ = tx.unbounded_send(Ok(loop_error_chunk()));
             let _ = tx.unbounded_send(Ok(Bytes::from("data: [DONE]\n\n")));
         }
+        // Non-streaming requests also take this path: the upstream replies
+        // with one plain JSON body (no `data:` frames), so `buf` holds it
+        // whole at the end. If we never saw an SSE usage frame, try parsing
+        // that body for the `usage` block. For real SSE streams `buf` is
+        // drained frame-by-frame and empty here, so this is a no-op.
+        if tokens == (None, None, None)
+            && let Ok(v) = serde_json::from_slice::<Value>(&buf)
+        {
+            tokens = usage::usage_from_value(&v);
+        }
+        rec.emit(&usage_sink, &backend_name, status.as_u16(), started, tokens);
     });
     let body = rama::http::Body::from_stream(rx);
 
@@ -956,6 +1156,10 @@ async fn forward_streaming_with_tools(
         indexer: state.indexer.clone(),
     };
 
+    // One usage row per upstream round; built here where the bearer's
+    // identity + token are known, finished off inside the loop.
+    let rec = RecordParams::v1(&user, UsageKind::Chat, model.clone());
+
     // rama::futures::channel::mpsc::unbounded matches the pattern used by
     // the chat-page SSE producer (`pages/chat/mod.rs`).
     let (mut tx, rx) = mpsc::unbounded::<Result<Bytes, std::io::Error>>();
@@ -967,6 +1171,7 @@ async fn forward_streaming_with_tools(
             request_body,
             client_headers,
             tool_ctx,
+            rec,
             &mut tx,
         )
         .await
@@ -1086,12 +1291,14 @@ fn synth_client_tool_call_chunks(
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive_streaming_tool_loop(
     state: Arc<RamaState>,
     model: String,
     mut request_body: Value,
     client_headers: HeaderMap,
     tool_ctx: ToolContext,
+    rec: RecordParams,
     tx: &mut mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
     use rama::futures::StreamExt;
@@ -1101,6 +1308,8 @@ async fn drive_streaming_tool_loop(
             .upstreams
             .acquire_for(&model, PoolKind::Chat)
             .map_err(|e| e.to_string())?;
+        let backend_name = acquired.backend().name.clone();
+        let started = Instant::now();
         let url = format!("{}/chat/completions", acquired.backend().base_url);
         let serialized = serde_json::to_vec(&request_body).map_err(|e| e.to_string())?;
 
@@ -1124,11 +1333,31 @@ async fn drive_streaming_tool_loop(
             http = http.bearer_auth(key);
         }
 
-        let upstream = http.send().await.map_err(|e| e.to_string())?;
+        let upstream = match http.send().await {
+            Ok(u) => u,
+            Err(e) => {
+                drop(acquired);
+                rec.emit(
+                    &state.usage,
+                    &backend_name,
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                    started,
+                    (None, None, None),
+                );
+                return Err(e.to_string());
+            }
+        };
         if !upstream.status().is_success() {
             let status = upstream.status();
             let bytes = upstream.bytes().await.unwrap_or_default();
             drop(acquired);
+            rec.emit(
+                &state.usage,
+                &backend_name,
+                status.as_u16(),
+                started,
+                (None, None, None),
+            );
             return Err(format!(
                 "upstream {status}: {}",
                 String::from_utf8_lossy(&bytes)
@@ -1137,6 +1366,7 @@ async fn drive_streaming_tool_loop(
                     .collect::<String>()
             ));
         }
+        let status_code = upstream.status().as_u16();
 
         let mut tool_acc: BTreeMap<usize, StreamToolCallAcc> = BTreeMap::new();
         let mut chunk_meta = ChunkMeta::default();
@@ -1147,6 +1377,9 @@ async fn drive_streaming_tool_loop(
         // progressing answer is never cut short.
         let mut content_guard = crate::loop_guard::LoopGuard::new();
         let mut reasoning_guard = crate::loop_guard::LoopGuard::new();
+        // Token counts ride the trailing `usage` frame when the client opted
+        // into `stream_options.include_usage` (we never inject it on /v1).
+        let mut round_tokens: (Option<i64>, Option<i64>, Option<i64>) = (None, None, None);
         let mut sse = upstream.bytes_stream();
 
         while let Some(chunk) = sse.next().await {
@@ -1175,6 +1408,9 @@ async fn drive_streaming_tool_loop(
                         continue;
                     };
                     chunk_meta.absorb(&v);
+                    if v.get("usage").is_some_and(|u| !u.is_null()) {
+                        round_tokens = usage::usage_from_value(&v);
+                    }
                     if let Some(t) = v
                         .pointer("/choices/0/delta/content")
                         .and_then(|c| c.as_str())
@@ -1233,6 +1469,13 @@ async fn drive_streaming_tool_loop(
                     .map_err(|e| format!("client disconnected: {e}"))?;
             }
         }
+        rec.emit(
+            &state.usage,
+            &backend_name,
+            status_code,
+            started,
+            round_tokens,
+        );
         drop(acquired);
 
         if tool_acc.is_empty() {

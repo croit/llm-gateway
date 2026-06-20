@@ -260,7 +260,7 @@ In a clone, run it via `mise run cli -- <args>`; a release build produces a stan
 | `POST /v1/audio/transcriptions` | Bearer token | Whisper-style transcription (multipart upload). |
 | `GET /v1/models` | Bearer token | All discovered models across pools (deduplicated by id). |
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness probes. |
-| `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled` | session cookie | Web UI. |
+| `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled`, `/usage` | session cookie | Web UI (`/usage` shows your own request/token usage; admins get an in-page "All users" toggle). |
 | `/admin/users`, `/rag`, `/admin/models`, `/admin/backends`, `/admin/skills` | admin role | Admin UI (the users page lists registered users and starts impersonation). |
 | `POST /impersonate/stop` | session cookie | End an active impersonation and return to your own account. |
 | `/api/v0/*` | session cookie | JSON APIs backing the UI. |

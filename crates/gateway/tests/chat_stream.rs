@@ -80,7 +80,11 @@ async fn state_with_streaming_chat(upstream_uri: &str) -> RamaState {
         Arc::new(Resolver::empty()),
     );
     let sessions = SessionStore::new(pool, common::TEST_SECRET);
-    RamaState::new(app, sessions)
+    RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    )
 }
 
 /// Helper: spin up a fresh state + session cookie + chat session.
@@ -186,6 +190,67 @@ async fn message_send_emits_initial_bubbles_and_finalizes_signal() {
         .unwrap();
     assert_eq!(asst.turn.status, chat::TurnStatus::Completed);
     assert_eq!(asst.turn.content.as_deref(), Some("Hello"));
+}
+
+#[tokio::test]
+async fn chat_turn_records_a_usage_row_with_source_chat() {
+    use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
+    use jiff::Timestamp;
+
+    // Content deltas, then the trailing `usage` frame the driver asks for via
+    // `stream_options.include_usage`, then [DONE].
+    let upstream = MockServer::start().await;
+    let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
+         data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n\
+         data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&upstream)
+        .await;
+
+    // Opt into a live metered sink before wrapping the state in an Arc.
+    let state = state_with_streaming_chat(&upstream.uri()).await;
+    let metered = gateway::server::usage::spawn(state.db.clone(), 90);
+    let state = state.with_usage(metered);
+    let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
+    let session = chat::create_session(&state.db, "alice").await.unwrap();
+    let db = state.db.clone();
+    let state = Arc::new(state);
+    let app = router(state.clone());
+
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "hi")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{}/messages", session.id))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Draining the SSE tail blocks until the worker finalizes the turn — so
+    // by here the per-round usage record has been emitted onto the channel.
+    let _ = resp.into_body().collect().await.unwrap().to_bytes();
+
+    // Let the batched writer flush (≤ ~500ms).
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+    let now = Timestamp::now();
+    let bounds = period_bounds(Period::Today, "UTC", now);
+    let agg = aggregate(&db, bounds, &Filter::default(), 90, now, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        agg.summary.requests, 1,
+        "chat turn recorded one backend call"
+    );
+    assert_eq!(
+        agg.summary.total_tokens, 8,
+        "usage frame parsed from the stream"
+    );
+    assert_eq!(agg.by_source[0].key, "chat", "source is the chat UI");
+    assert_eq!(agg.by_model[0].key, "model-a");
 }
 
 #[tokio::test]

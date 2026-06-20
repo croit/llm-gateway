@@ -20,6 +20,7 @@ pub mod model_defaults;
 pub mod rag;
 pub mod token_tool_prefs;
 pub mod tokens;
+pub mod usage;
 pub mod user_memories;
 pub mod user_tool_prefs;
 pub mod users;

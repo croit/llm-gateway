@@ -23,6 +23,7 @@ pub mod state;
 pub mod tools;
 pub mod typst;
 pub mod upstreams;
+pub mod usage;
 
 pub use config::Config;
 pub use state::AppState;

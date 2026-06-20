@@ -337,7 +337,11 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
     );
     let app = AppState::new(Config::default(), pool.clone(), registry, tools, rbac);
     let sessions = SessionStore::new(pool, common::TEST_SECRET);
-    let state = RamaState::new(app, sessions);
+    let state = RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    );
 
     let cookie =
         seed_session_with_roles(&state, "boss", "boss@example.com", vec!["admin".into()]).await;
