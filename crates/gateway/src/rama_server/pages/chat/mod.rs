@@ -857,35 +857,25 @@ async fn spawn_assistant_worker(
     // enabled, intersected with the user's RBAC grant), so a mid-turn
     // `enable_tools` call by the model surfaces the new schemas on the next
     // round. The chat path always goes through this overlay; the proxy path
-    // uses the unfiltered per-user set.
-    let tool_ctx = crate::server::tools::ToolContext {
-        user_id: user.id.clone(),
-        roles: user.roles.clone(),
-        db: state.db.clone(),
-        s3: state
-            .config
-            .chat
-            .s3
-            .as_ref()
-            .map(|cfg| std::sync::Arc::new(cfg.clone())),
-        assistant_turn_id: Some(assistant_turn_id.to_string()),
-        session_id: Some(session_id.to_string()),
-        client_ip: req.client_ip,
-        geoip: state.geoip.clone(),
+    // uses the unfiltered per-user set. Everything but the two interactive
+    // handles below is shared with the headless scheduler via
+    // `build_tool_context`.
+    let tool_ctx = crate::openai_driver::build_tool_context(
+        state,
+        user.id.clone(),
+        user.roles.clone(),
+        session_id.to_string(),
+        assistant_turn_id.to_string(),
+        req.client_ip,
         // Chat path: hand the tool the live turn's broadcast + the
         // feedback hub so `get_user_location` can prompt the browser
         // for a precise position and wait for the reply.
-        chat_feedback: Some(crate::server::tools::ChatFeedback {
+        Some(crate::server::tools::ChatFeedback {
             broadcast: worker.broadcast.clone(),
             hub: state.location_feedback.clone(),
             secure: req.secure,
         }),
-        // Fresh per-turn set so concurrent uploaders (typst,
-        // upload_attachment) serialize their filename picks and
-        // each get a unique S3 key — see ToolContext docs.
-        attachment_reservations: Some(crate::server::chat_attachments::new_reservation_set()),
-        indexer: state.indexer.clone(),
-    };
+    );
     let driver = Box::new(crate::openai_driver::OpenAiDriver {
         state: state.clone(),
         tool_ctx,

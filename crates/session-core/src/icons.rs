@@ -58,6 +58,43 @@ pub fn sun(size: u32) -> Html {
     ))
 }
 
+/// Clock — the Scheduled-actions nav entry + schedule affordances.
+pub fn clock(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>"#,
+    ))
+}
+
+/// Pause (two bars) — pause a running schedule.
+pub fn pause(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/>"#,
+    ))
+}
+
+/// Play (triangle) — resume a paused schedule.
+pub fn play(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<path d="M7 4.5v15l13 -7.5z" fill="currentColor"/>"#,
+    ))
+}
+
+/// Pencil — edit a scheduled action.
+pub fn pencil(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>"#,
+    ))
+}
+
+/// Left chevron — "back" affordance on sub-pages.
+pub fn chevron_left(size: u32) -> Html {
+    raw(render(size, r#"<path d="m15 18-6-6 6-6"/>"#))
+}
+
 pub fn moon(size: u32) -> Html {
     raw(render(
         size,

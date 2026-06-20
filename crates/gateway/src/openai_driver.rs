@@ -90,6 +90,51 @@ pub struct OpenAiDriver {
     pub tool_ctx: ToolContext,
 }
 
+/// Build the per-turn [`ToolContext`] for a persisted chat session. This
+/// is the single home for the chat-page and headless-scheduler wirings,
+/// which agree on everything except the two interactive-only handles:
+///
+/// - `client_ip` — the caller's source IP (chat path has one; the
+///   scheduler has no request, so `None`).
+/// - `chat_feedback` — the live SSE + feedback-hub handles that let
+///   `get_user_location` prompt the browser mid-turn (chat path only;
+///   `None` headless, where nobody is watching to answer).
+///
+/// `roles` carries the user's RBAC grant, which is also the tool gate:
+/// pass the real roles to grant the user's normal tools, or an empty
+/// slice to run with no tools at all (the scheduler's "tools off").
+pub fn build_tool_context(
+    state: &Arc<RamaState>,
+    user_id: String,
+    roles: Vec<String>,
+    session_id: String,
+    assistant_turn_id: String,
+    client_ip: Option<String>,
+    chat_feedback: Option<crate::server::tools::ChatFeedback>,
+) -> ToolContext {
+    ToolContext {
+        user_id,
+        roles,
+        db: state.db.clone(),
+        s3: state
+            .config
+            .chat
+            .s3
+            .as_ref()
+            .map(|cfg| std::sync::Arc::new(cfg.clone())),
+        assistant_turn_id: Some(assistant_turn_id),
+        session_id: Some(session_id),
+        client_ip,
+        geoip: state.geoip.clone(),
+        chat_feedback,
+        // Fresh per-turn set so concurrent uploaders (typst,
+        // upload_attachment) serialize their filename picks and each get
+        // a unique S3 key — see ToolContext docs.
+        attachment_reservations: Some(crate::server::chat_attachments::new_reservation_set()),
+        indexer: state.indexer.clone(),
+    }
+}
+
 #[async_trait]
 impl SessionDriver for OpenAiDriver {
     async fn run_turn(&self, ctx: SessionContext) -> Result<(), TurnError> {

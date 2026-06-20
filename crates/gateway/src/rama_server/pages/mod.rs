@@ -51,6 +51,9 @@ enum NavItem {
     /// Per-user memory management page (`/memory`). Shown to every
     /// signed-in user.
     Memory,
+    /// Per-user scheduled-actions page (`/scheduled`). Shown to every
+    /// signed-in user; each manages their own schedules.
+    Scheduled,
     /// Admin-only pages (model defaults, future operator tooling).
     /// The sidebar entry is only rendered for users whose `roles`
     /// includes `"admin"`; non-admins never see it.
@@ -213,6 +216,7 @@ fn render_app_sidebar(
                 (sidebar_nav_link("/chat", NavItem::Chat, active, icons::message(16), "Chat"))
                 (sidebar_nav_link("/tools", NavItem::Tools, active, icons::sliders(16), "Tools"))
                 (sidebar_nav_link("/memory", NavItem::Memory, active, icons::folder(16), "Memory"))
+                (sidebar_nav_link("/scheduled", NavItem::Scheduled, active, icons::clock(16), "Scheduled"))
                 (sidebar_nav_link("/tokens", NavItem::Tokens, active, icons::key(16), "Tokens"))
                 if is_admin {
                     (sidebar_nav_link("/admin/users", NavItem::Users, active, icons::users(16), "Users"))
@@ -809,6 +813,19 @@ pub use tools::{tools_index, tools_toggle};
 // `remember` / `recall` tools (see `server::tools::memory`).
 mod memory;
 pub use memory::{memory_create, memory_delete, memory_edit, memory_index};
+
+// ---------------------------------------------------------------------------
+// Scheduled actions
+//
+// Per-user prompts that run on a cron schedule (`/scheduled` + create /
+// update / toggle / delete / preview, plus the edit sub-page). Available
+// to every signed-in user; scoped to the owner in the data layer. The
+// firing loop lives in `server::scheduled::worker`.
+mod scheduled;
+pub use scheduled::{
+    scheduled_create, scheduled_delete, scheduled_edit_form, scheduled_index, scheduled_preview,
+    scheduled_toggle, scheduled_update,
+};
 
 // ---------------------------------------------------------------------------
 // Admin (model defaults, future operator tooling). Gated on the

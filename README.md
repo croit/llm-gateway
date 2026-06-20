@@ -14,6 +14,7 @@ Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests acro
 - **Chat UI** — a server-rendered, mobile-friendly chat at `/chat` with persisted multi-conversation history, token-by-token streaming, file attachments, and resume-on-reconnect (every turn is written to SQLite as it happens).
 - **RAG** — operator-managed, indexed codebases that the chat model can search.
 - **Agent Skills** — drop a `SKILL.md` bundle (or `.skill` archive) in and the chat model loads it on demand to follow your house style, brand, or domain playbooks — progressive disclosure, no fine-tuning. Upload, view, and delete them at `/admin/skills`, live (no restart), RBAC-gated per role. See [Agent Skills](#agent-skills).
+- **Scheduled actions** — per-user prompts that run on a cron schedule (hourly / daily / weekly / monthly, or a raw cron expression), each evaluated in its own timezone. A friendly builder assembles the cron and shows the next run times live; every fire opens a fresh chat you can read back in the UI. See [Scheduled actions](#scheduled-actions).
 
 ## Tools the model can call
 
@@ -46,9 +47,17 @@ Beyond `/chat`, the gateway ships a small operator and account UI — no separat
 | ![The backends page: each upstream pool with its kind, load-balancing strategy, per-backend health, in-flight load against capacity, and the models each one currently advertises.](docs/img/backends.png) | ![The RAG page: a form to index a new collection from a git repo (embedding model, branch, include/exclude globs, chunk size) and a list of existing collections with their indexing status.](docs/img/rag.png) |
 | **Backends** (`/admin/backends`) — live health, in-flight load, and discovered models for every upstream pool. | **RAG** (`/rag`) — index a codebase from a git URL and watch it go from *pending* to *ready*. |
 
-There's also `/tokens` (mint and revoke your `gwk_…` API tokens), `/memory` (view and edit what the assistant has remembered about you), `/admin/models` (server-wide sampling defaults per model), and `/admin/users` (registered users with their resolved roles). The users page can also let an admin **impersonate** another user for debugging — every impersonation is audited and shows a persistent banner. Impersonation is **opt-in**: it's off unless you set `[gateway].allow_impersonation = true` (default `false`), in which case the Impersonate buttons appear and `POST /admin/users/impersonate` is accepted; otherwise the buttons are hidden and that endpoint returns 403.
+There's also `/tokens` (mint and revoke your `gwk_…` API tokens), `/memory` (view and edit what the assistant has remembered about you), `/scheduled` (prompts that run on a cron schedule — see [Scheduled actions](#scheduled-actions)), `/admin/models` (server-wide sampling defaults per model), and `/admin/users` (registered users with their resolved roles). The users page can also let an admin **impersonate** another user for debugging — every impersonation is audited and shows a persistent banner. Impersonation is **opt-in**: it's off unless you set `[gateway].allow_impersonation = true` (default `false`), in which case the Impersonate buttons appear and `POST /admin/users/impersonate` is accepted; otherwise the buttons are hidden and that endpoint returns 403.
 
-## Stack
+## Scheduled actions
+
+Every signed-in user can have prompts run **automatically on a schedule** at `/scheduled` — a daily standup digest, a weekly repo summary, an hourly health check. Each scheduled action is just a saved prompt plus a model, a schedule, and a timezone; when it fires, the gateway opens a **fresh chat session** driven by the same engine as the interactive `/chat` page, so the result lands as an ordinary conversation you can open and read afterward. Schedules are per-user and private (scoped by user, behind the normal session login — no admin role needed).
+
+![The /scheduled page: a builder form (name, model, prompt) with a Hourly/Daily/Weekly/Monthly/Advanced schedule selector, time and timezone fields, a live human-readable summary with the next three run times, and a tools toggle — above the list of your existing scheduled actions.](docs/img/scheduled.png)
+
+**The schedule builder.** Pick **Hourly**, **Daily**, **Weekly**, **Monthly**, or **Advanced**. The friendly modes expose just the fields they need (a minute; a time; weekday checkboxes; a day-of-month) and the gateway assembles a standard 5-field cron expression from them — non-technical users never have to see cron. **Advanced** takes a raw `minute hour day-of-month month day-of-week` expression for anything the presets can't express. Either way the expression is evaluated in the **IANA timezone** you choose (e.g. `Europe/Berlin`), and a live preview — computed server-side via `POST /scheduled/preview` so it can't drift from what the scheduler actually does — shows a plain-English summary plus the **next three run times**. Each action also has a tools toggle (web search, RAG, attachments — same set as in chat).
+
+**How runs fire.** A background worker polls every 30 seconds and runs every action whose next occurrence is due, claiming each one atomically first so a slow run or a restart can't double-fire. If the gateway was down across one or more scheduled slots, the missed occurrences **collapse into a single catch-up run** on the first poll after startup rather than replaying as a backlog. Actions can be **paused** (the worker skips them) and resumed, edited, or deleted from the same page.
 
 - **Rust** (edition 2024, toolchain pinned to 1.95 via [mise](https://mise.jdx.dev/)) — a workspace of 4 crates: `gateway`, `session-core`, `cli`, `shared`.
 - **[rama 0.3](https://ramaproxy.org/)** — HTTP server, router, middleware, and proxying.
@@ -251,7 +260,7 @@ In a clone, run it via `mise run cli -- <args>`; a release build produces a stan
 | `POST /v1/audio/transcriptions` | Bearer token | Whisper-style transcription (multipart upload). |
 | `GET /v1/models` | Bearer token | All discovered models across pools (deduplicated by id). |
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness probes. |
-| `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory` | session cookie | Web UI. |
+| `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled` | session cookie | Web UI. |
 | `/admin/users`, `/rag`, `/admin/models`, `/admin/backends`, `/admin/skills` | admin role | Admin UI (the users page lists registered users and starts impersonation). |
 | `POST /impersonate/stop` | session cookie | End an active impersonation and return to your own account. |
 | `/api/v0/*` | session cookie | JSON APIs backing the UI. |

@@ -232,7 +232,11 @@ async fn main() -> anyhow::Result<()> {
     srv::rag::worker::spawn(indexer.clone());
     state = state.with_indexer(indexer);
 
-    let state = gateway::rama_server::RamaState::new(state, sessions);
+    let state = Arc::new(gateway::rama_server::RamaState::new(state, sessions));
+
+    // Scheduled actions: start the background loop that fires due actions
+    // (the `scheduled_actions` table is created by migration 0021).
+    srv::scheduled::worker::spawn(state.clone());
 
     let ip: std::net::IpAddr = std::env::var("IP")
         .ok()
@@ -245,7 +249,7 @@ async fn main() -> anyhow::Result<()> {
     let addr = SocketAddress::new(ip, port);
     tracing::info!(%ip, port, "rama gateway starting (spike)");
 
-    gateway::rama_server::router::serve(Arc::new(state), addr).await
+    gateway::rama_server::router::serve(state, addr).await
 }
 
 /// Picks up the session HMAC secret from `$GATEWAY_SESSION_KEY` —
