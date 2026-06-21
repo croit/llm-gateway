@@ -55,6 +55,15 @@ pub struct Config {
     #[arg(long, env = "SANDBOX_MAX_CONCURRENT", default_value_t = 6)]
     pub max_concurrent: usize,
 
+    /// How often (seconds) to re-resolve the workload image's id and, if it
+    /// changed (a rebuild / re-tag), drain and rebuild the warm pool so the
+    /// next jobs run the new image — no manual `systemctl restart` needed.
+    /// `0` disables the check (pool only ever reflects the image present at
+    /// boot). The warm pool is always single-use, so this only affects which
+    /// image freshly-booted containers use.
+    #[arg(long, env = "SANDBOX_IMAGE_CHECK_SECS", default_value_t = 60)]
+    pub image_check_secs: u64,
+
     /// Default per-job wall-clock budget when the caller doesn't specify.
     #[arg(long, env = "SANDBOX_TIMEOUT_SECS", default_value_t = 60)]
     pub default_timeout_secs: u64,
@@ -138,6 +147,7 @@ mod tests {
             podman: "podman".into(),
             pool_size: 3,
             max_concurrent: 6,
+            image_check_secs: 60,
             default_timeout_secs: 60,
             max_timeout_secs: 300,
             memory: "1024m".into(),

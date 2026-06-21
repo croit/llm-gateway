@@ -35,11 +35,22 @@ pub enum RunnerError {
     NetworkUnavailable,
 }
 
+/// A pre-booted, idle container plus the workload-image id it was created
+/// from. Stamping the image lets the pool spot containers left over from a
+/// previous image after a rebuild / re-tag and recycle them.
+struct Warm {
+    id: String,
+    image: String,
+}
+
 pub struct Pool {
     backend: Arc<dyn ContainerBackend>,
     cfg: Arc<Config>,
     /// Pre-booted, default-deny containers awaiting a job.
-    ready: Mutex<VecDeque<String>>,
+    ready: Mutex<VecDeque<Warm>>,
+    /// The workload-image id the pool is currently warming to. Empty until
+    /// the first [`Self::refresh_image`]; updated when the image changes.
+    image: Mutex<String>,
     /// Caps concurrent in-flight jobs.
     sem: Semaphore,
     /// Serializes refill so we never overshoot `pool_size`.
@@ -53,6 +64,7 @@ impl Pool {
             backend,
             cfg,
             ready: Mutex::new(VecDeque::new()),
+            image: Mutex::new(String::new()),
             sem: Semaphore::new(permits),
             refill_lock: tokio::sync::Mutex::new(()),
         })
@@ -66,23 +78,79 @@ impl Pool {
         self.ready.lock().unwrap().len()
     }
 
+    /// The image ids stamped on the currently-idle warm containers.
+    #[cfg(test)]
+    pub fn ready_images(&self) -> Vec<String> {
+        self.ready
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|w| w.image.clone())
+            .collect()
+    }
+
     /// Boot containers until the ready queue reaches `pool_size`. Held
-    /// behind `refill_lock` so concurrent callers can't overshoot.
+    /// behind `refill_lock` so concurrent callers can't overshoot. Each
+    /// new container is stamped with the pool's current target image so a
+    /// later image change can tell it apart from a fresh one.
     pub async fn refill(self: &Arc<Self>) {
         let _g = self.refill_lock.lock().await;
+        let target = self.image.lock().unwrap().clone();
         loop {
             let have = self.ready.lock().unwrap().len();
             if have >= self.cfg.pool_size {
                 break;
             }
             match self.backend.create(Network::None).await {
-                Ok(id) => self.ready.lock().unwrap().push_back(id),
+                Ok(id) => self.ready.lock().unwrap().push_back(Warm {
+                    id,
+                    image: target.clone(),
+                }),
                 Err(e) => {
                     tracing::warn!(error = %e, "warm-pool refill failed; will retry later");
                     break;
                 }
             }
         }
+    }
+
+    /// Re-resolve the workload image's id and, if it changed since the pool
+    /// was last warmed (a rebuild / re-tag), destroy the now-stale idle
+    /// containers and re-warm on the new image. Seeds the target image on
+    /// the first call (boot). Best-effort: a failed id lookup leaves the
+    /// pool as-is rather than tearing it down on a transient error.
+    pub async fn refresh_image(self: &Arc<Self>) {
+        let now = match self.backend.image_id().await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(error = %e, "sandbox image-id check failed; keeping current pool");
+                return;
+            }
+        };
+        let prev = {
+            let mut g = self.image.lock().unwrap();
+            if *g == now {
+                return; // unchanged — nothing to do
+            }
+            std::mem::replace(&mut *g, now.clone())
+        };
+        if prev.is_empty() {
+            tracing::info!(image = %short(&now), "sandbox warm pool: seeding on image");
+        } else {
+            tracing::info!(
+                prev = %short(&prev),
+                new = %short(&now),
+                "sandbox workload image changed — recycling warm pool"
+            );
+            // Drop every stale idle container; in-flight jobs are single-use
+            // and torn down on completion regardless.
+            let stale: Vec<Warm> = { self.ready.lock().unwrap().drain(..).collect() };
+            for w in stale {
+                let backend = self.backend.clone();
+                tokio::spawn(async move { backend.destroy(&w.id).await });
+            }
+        }
+        self.refill().await;
     }
 
     /// Run one job. Acquires a concurrency permit, obtains a container
@@ -103,9 +171,20 @@ impl Pool {
             // Scope the std MutexGuard so it's dropped before any `.await`
             // below — holding it across a suspend point would make this
             // future non-Send (and rama handlers must be Send).
-            let pooled = { self.ready.lock().unwrap().pop_front() };
-            match pooled {
-                Some(id) => (id, true),
+            let warm = { self.ready.lock().unwrap().pop_front() };
+            let target = { self.image.lock().unwrap().clone() };
+            match warm {
+                // Defensive against the brief race where the image changed but
+                // the periodic refresh hasn't drained yet: a popped container
+                // stamped with a superseded image is destroyed, not served, and
+                // we boot a fresh one (which uses the new image).
+                Some(w) if !target.is_empty() && w.image != target => {
+                    let backend = self.backend.clone();
+                    let stale = w.id.clone();
+                    tokio::spawn(async move { backend.destroy(&stale).await });
+                    (self.backend.create(Network::None).await?, false)
+                }
+                Some(w) => (w.id, true),
                 None => (self.backend.create(Network::None).await?, false),
             }
         };
@@ -134,6 +213,16 @@ impl Pool {
         clamp_output(&mut resp, self.cfg.max_output_bytes);
         Ok(resp)
     }
+}
+
+/// First few chars of an image id, for readable logs (`sha256:abcd…`).
+fn short(id: &str) -> &str {
+    let end = id
+        .char_indices()
+        .nth(19)
+        .map(|(i, _)| i)
+        .unwrap_or(id.len());
+    &id[..end]
 }
 
 /// Clip stdout/stderr to the configured cap so a runaway job can't return
@@ -195,6 +284,7 @@ mod tests {
             podman: "podman".into(),
             pool_size,
             max_concurrent,
+            image_check_secs: 0,
             default_timeout_secs: 60,
             max_timeout_secs: 300,
             memory: "1024m".into(),
@@ -229,6 +319,21 @@ mod tests {
         );
     }
 
+    /// Wait for at least `want` destroys to land (teardown is spawned, so a
+    /// synchronous assert right after would race it).
+    async fn settle_destroyed(be: &Arc<FakeBackend>, want: usize) {
+        for _ in 0..2000 {
+            if be.destroyed.lock().unwrap().len() >= want {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!(
+            "never reached {want} destroyed (have {})",
+            be.destroyed.lock().unwrap().len()
+        );
+    }
+
     #[tokio::test]
     async fn refill_warms_to_pool_size() {
         let be = Arc::new(FakeBackend::new());
@@ -254,6 +359,66 @@ mod tests {
         assert_eq!(be.destroyed.lock().unwrap().len(), 1, "single-use teardown");
         // Created: 2 warm + 1 refill = 3; one destroyed → 2 live.
         assert_eq!(be.live_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_image_seeds_then_recycles_on_change() {
+        let be = Arc::new(FakeBackend::new()); // image "img-v1"
+        let pool = Pool::new(be.clone(), cfg(2, 4, false));
+        // First refresh seeds the image and warms the pool.
+        pool.refresh_image().await;
+        settle_ready(&pool, 2).await;
+        assert!(pool.ready_images().iter().all(|i| i == "img-v1"));
+        let created_v1 = be.created.lock().unwrap().len();
+        assert_eq!(created_v1, 2);
+
+        // Image gets rebuilt/re-tagged → next refresh drains v1 and re-warms.
+        be.set_image("img-v2");
+        pool.refresh_image().await;
+        settle_ready(&pool, 2).await;
+        assert!(
+            pool.ready_images().iter().all(|i| i == "img-v2"),
+            "pool must be re-warmed on the new image: {:?}",
+            pool.ready_images()
+        );
+        // The two v1 containers were destroyed and two v2 ones created.
+        settle_destroyed(&be, 2).await;
+        assert_eq!(be.destroyed.lock().unwrap().len(), 2);
+        assert_eq!(be.created.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn refresh_image_noop_when_unchanged() {
+        let be = Arc::new(FakeBackend::new());
+        let pool = Pool::new(be.clone(), cfg(2, 4, false));
+        pool.refresh_image().await;
+        settle_ready(&pool, 2).await;
+        let created = be.created.lock().unwrap().len();
+        // Same image → no drain, no re-create.
+        pool.refresh_image().await;
+        assert_eq!(be.created.lock().unwrap().len(), created);
+        assert_eq!(be.destroyed.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_warm_container_is_discarded_on_checkout() {
+        // Simulate the race: pool warmed on v1, image flips to v2, but the
+        // periodic drain hasn't run yet. A job must NOT be served the stale
+        // v1 container — it's destroyed and a fresh one booted.
+        let be = Arc::new(FakeBackend::new());
+        let pool = Pool::new(be.clone(), cfg(1, 4, false));
+        pool.refresh_image().await;
+        settle_ready(&pool, 1).await;
+        // Flip the pool's notion of the target image WITHOUT draining (mimic
+        // the window before refresh_image fires).
+        be.set_image("img-v2");
+        *pool.image.lock().unwrap() = "img-v2".to_string();
+        let before = be.created.lock().unwrap().len();
+        pool.run(&req()).await.unwrap();
+        // The stale v1 container was destroyed; a fresh on-demand one ran.
+        assert!(be.created.lock().unwrap().len() > before);
+        settle_destroyed(&be, 1).await;
+        assert!(!be.destroyed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -33,6 +33,10 @@ After=network-online.target
 Environment=SANDBOX_BIND=10.88.0.1:9000
 Environment=SANDBOX_RUNTIME=runsc
 Environment=SANDBOX_IMAGE=ghcr.io/croit/llm-gateway-sandbox:latest
+# How often (s) to re-resolve SANDBOX_IMAGE and recycle the warm pool if it
+# changed (rebuild / re-tag) — so a new image goes live without restarting this
+# service. Default 60; 0 disables.
+#Environment=SANDBOX_IMAGE_CHECK_SECS=60
 Environment=RUST_LOG=info,sandbox_runner=info
 # Egress (optional): uncomment / set by `setup-sandbox.sh --egress`.
 #Environment=SANDBOX_EGRESS_NETWORK=sandbox-egress

@@ -62,10 +62,28 @@ async fn main() -> anyhow::Result<()> {
     let pool = Pool::new(backend, cfg.clone());
 
     // Warm the pool in the background so we start serving immediately;
-    // the first few default-deny calls may pay cold-start until it fills.
+    // `refresh_image` seeds the target image id, then fills. The first few
+    // default-deny calls may pay cold-start until it fills.
     {
         let pool = pool.clone();
-        tokio::spawn(async move { pool.refill().await });
+        tokio::spawn(async move { pool.refresh_image().await });
+    }
+
+    // Periodically re-resolve the workload image; on a rebuild / re-tag,
+    // `refresh_image` drains the stale warm containers and re-warms on the
+    // new image, so subsequent jobs pick it up without a manual restart.
+    // `SANDBOX_IMAGE_CHECK_SECS=0` disables this.
+    if cfg.image_check_secs > 0 {
+        let pool = pool.clone();
+        let every = std::time::Duration::from_secs(cfg.image_check_secs);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.tick().await; // immediate first tick — boot already seeded
+            loop {
+                tick.tick().await;
+                pool.refresh_image().await;
+            }
+        });
     }
 
     // Verify the configured runtime actually isolates (catches a silently

@@ -62,6 +62,16 @@ pub trait ContainerBackend: Send + Sync + 'static {
     /// surfaced — a leaked container is a monitoring concern, not a
     /// request error.
     async fn destroy(&self, id: &str);
+
+    /// Content id of the configured workload image as it resolves *right
+    /// now*. The pool snapshots this and re-checks periodically; a change
+    /// means the image was rebuilt or re-tagged, so warm containers booted
+    /// from the old id are stale and get recycled. The default returns a
+    /// fixed sentinel for backends with no real image (e.g. the local dev
+    /// backend), which simply never reports a change.
+    async fn image_id(&self) -> Result<String, BackendError> {
+        Ok("static".to_string())
+    }
 }
 
 /// Drives `podman` to run each job under the configured OCI runtime
@@ -184,6 +194,26 @@ impl ContainerBackend for PodmanBackend {
         drive_agent(child, req, timeout).await
     }
 
+    async fn image_id(&self) -> Result<String, BackendError> {
+        let out = tokio::process::Command::new(&self.cfg.podman)
+            .args(["image", "inspect", &self.cfg.image, "--format", "{{.Id}}"])
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if !out.status.success() {
+            return Err(BackendError::Command {
+                op: "image inspect",
+                code: out.status.code().map(|c| c.to_string()).unwrap_or_default(),
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            });
+        }
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if id.is_empty() {
+            return Err(BackendError::Protocol("image inspect printed no id".into()));
+        }
+        Ok(id)
+    }
+
     async fn destroy(&self, id: &str) {
         // `rm -f` (no `-t`) so the same command works under both podman and
         // docker — handy for dev (SANDBOX_PODMAN=docker on macOS).
@@ -263,6 +293,7 @@ mod podman_args_tests {
             podman: "podman".into(),
             pool_size: 3,
             max_concurrent: 6,
+            image_check_secs: 0,
             default_timeout_secs: 60,
             max_timeout_secs: 300,
             memory: "1024m".into(),
@@ -389,14 +420,23 @@ pub(crate) mod fake {
         pub created: Mutex<Vec<(String, Network)>>,
         pub destroyed: Mutex<Vec<String>>,
         pub execs: AtomicUsize,
+        /// Simulated workload-image id; `set_image` mutates it so pool tests
+        /// can exercise the auto-recycle path.
+        image: Mutex<String>,
     }
 
     impl FakeBackend {
         pub fn new() -> Self {
-            Self::default()
+            let b = Self::default();
+            *b.image.lock().unwrap() = "img-v1".to_string();
+            b
         }
         pub fn live_count(&self) -> usize {
             self.created.lock().unwrap().len() - self.destroyed.lock().unwrap().len()
+        }
+        /// Swap the reported image id, simulating a rebuild / re-tag.
+        pub fn set_image(&self, id: &str) {
+            *self.image.lock().unwrap() = id.to_string();
         }
     }
 
@@ -407,6 +447,10 @@ pub(crate) mod fake {
             let id = format!("fake-{n}");
             self.created.lock().unwrap().push((id.clone(), network));
             Ok(id)
+        }
+
+        async fn image_id(&self) -> Result<String, BackendError> {
+            Ok(self.image.lock().unwrap().clone())
         }
 
         async fn exec(
