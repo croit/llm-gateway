@@ -81,6 +81,9 @@ RUN pip install --no-cache-dir \
         csvkit tabulate pyyaml xmltodict jsonschema tomli-w python-magic jc \
         # office formats (incl. legacy .xls read)
         openpyxl xlsxwriter xlrd python-docx python-pptx odfpy \
+        # Typst -> editable PowerPoint (real text/shapes/gradients, not images);
+        # pulls its own `typst` python pkg + a typst-ts-cli helper (warmed below)
+        typ2pptx \
         # PDF read/write/manipulate/render (PyMuPDF = fitz)
         pypdf pdfplumber pymupdf reportlab img2pdf weasyprint markdown \
         # images / computer vision / OCR
@@ -101,6 +104,17 @@ RUN pip install --no-cache-dir \
     && python -m playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/* \
     && chmod -R a+rX /opt/venv /opt/pw
+
+# typ2pptx fetches its `typst-ts-cli` helper on first use; the sandbox has NO
+# network at runtime, so trigger that download now (network is available during
+# build) by running a throwaway conversion. The binary lands in the package's
+# data dir under /opt/venv and is cached in this layer. `|| true`: the helper
+# download happens before any conversion quirk, so a non-zero convert exit must
+# not fail the build.
+RUN printf '= Warm up\n\nPre-fetching the typst-ts-cli helper.\n' > /tmp/warm.typ \
+    && typ2pptx /tmp/warm.typ -o /tmp/warm.pptx >/dev/null 2>&1 || true; \
+    rm -f /tmp/warm.typ /tmp/warm.pptx; \
+    chmod -R a+rX /opt/venv
 
 # --- Standalone CLI binaries (arch-aware) ----------------------------------
 # typst (pinned), DuckDB CLI (SQL over CSV/JSON/Parquet — a workhorse for

@@ -27,6 +27,7 @@ pub mod enable_tools;
 pub mod feedback;
 pub mod fetch_attachment;
 pub mod fetch_url;
+pub mod json_patch;
 pub mod location;
 pub mod lookup_ip;
 pub mod mcp;

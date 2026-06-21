@@ -98,6 +98,18 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::info!("no [geoip] config — lookup_ip tool not registered");
     }
+    // Build the sandbox client once (when `[sandbox]` is enabled) — shared by
+    // the sandbox tools below AND the typst PPTX-export path, so a deck render
+    // can ship its bundle to the same runner. `None` leaves typst rendering
+    // PDF + preview only (no `.pptx`).
+    let sandbox_client: Option<Arc<srv::tools::sandbox::SandboxClient>> =
+        match config.sandbox.as_ref() {
+            Some(c) if c.enabled => Some(srv::tools::sandbox::SandboxClient::new(
+                Arc::new(c.clone()),
+                config.gateway.public_url.clone(),
+            )),
+            _ => None,
+        };
     if let Some(typst_cfg) = config.typst.as_ref() {
         // Discover one tool per template directory. Failures here
         // are warnings, not errors: a broken templates_dir
@@ -111,10 +123,32 @@ async fn main() -> anyhow::Result<()> {
                     "discovered typst templates"
                 );
                 for t in templates {
-                    let tool_id = format!("typst_{}", t.id);
-                    tool_registry =
-                        tool_registry.with(srv::tools::typst_render::TypstRenderTool::new(t));
-                    tracing::info!(tool = %tool_id, "registered typst tool");
+                    // One render tool + one edit tool per template, sharing
+                    // the parsed manifest. `typst_<id>` renders from scratch;
+                    // `typst_<id>_edit` re-renders after a JSON Patch. Slide
+                    // templates that opt into `[pptx]` also get a standalone
+                    // `typst_<id>_pptx` export tool (sandbox required).
+                    let t = std::sync::Arc::new(t);
+                    let render_id = format!("typst_{}", t.id);
+                    let pptx = t.pptx.is_some();
+                    tool_registry = tool_registry
+                        .with(srv::tools::typst_render::TypstRenderTool::new(
+                            t.clone(),
+                            sandbox_client.clone(),
+                        ))
+                        .with(srv::tools::typst_render::TypstEditTool::new(
+                            t.clone(),
+                            sandbox_client.clone(),
+                        ));
+                    if let (true, Some(sb)) = (pptx, sandbox_client.clone()) {
+                        tool_registry = tool_registry
+                            .with(srv::tools::typst_render::TypstPptxTool::new(t.clone(), sb));
+                    }
+                    tracing::info!(
+                        render = %render_id,
+                        pptx_export = pptx && sandbox_client.is_some(),
+                        "registered typst tools"
+                    );
                 }
             }
             Err(err) => {
@@ -147,10 +181,10 @@ async fn main() -> anyhow::Result<()> {
     // reachable sandbox-runner; the three tools share one HTTP client.
     match config.sandbox.as_ref() {
         Some(sandbox_cfg) if sandbox_cfg.enabled => {
-            let client = srv::tools::sandbox::SandboxClient::new(
-                Arc::new(sandbox_cfg.clone()),
-                config.gateway.public_url.clone(),
-            );
+            // Reuse the client built above (Some whenever [sandbox] is enabled).
+            let client = sandbox_client
+                .clone()
+                .expect("sandbox_client is built when [sandbox] is enabled");
             tool_registry = tool_registry
                 .with(srv::tools::sandbox::RunInSandbox(client.clone()))
                 .with(srv::tools::sandbox::GenerateDocument(client.clone()))

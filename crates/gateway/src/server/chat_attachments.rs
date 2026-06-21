@@ -422,6 +422,21 @@ pub fn marker_line(turn_id: &str, att: &UploadOutcome) -> String {
     )
 }
 
+/// Marker for a *preview* attachment whose click-through opens a
+/// different file. `link` is the full marker `link="…"` target (a
+/// gateway proxy URL) — e.g. a typst render's PNG preview links to its
+/// PDF so clicking the inline image opens the document, not a bigger
+/// copy of the preview image.
+pub fn marker_line_linked(turn_id: &str, att: &UploadOutcome, link: &str) -> String {
+    session_core::attachments::marker_line_linked(
+        &att.filename,
+        &att.mime,
+        &proxy_url(turn_id, &att.filename),
+        att.bytes,
+        Some(link),
+    )
+}
+
 /// The gateway-relative URL the chat bubble's `<img>` / chip hrefs
 /// point at for one uploaded attachment. The handler at this path
 /// gates on the session cookie + verifies the turn belongs to the

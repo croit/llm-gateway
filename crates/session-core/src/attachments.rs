@@ -21,9 +21,13 @@ use regex::Regex;
 static MARKER_RE: LazyLock<Regex> = LazyLock::new(|| {
     // Non-greedy quoted strings + a numeric size. The
     // `gw-attachment` prefix gates the match; field order is
-    // fixed for now.
-    Regex::new(r#"\[gw-attachment file="([^"]*)" mime="([^"]*)" url="([^"]*)" size=(\d+)\]"#)
-        .expect("attachment regex compiles")
+    // fixed. The trailing ` link="…"` is optional — older markers
+    // (and every non-typst upload) omit it, so it must not be
+    // required or those stop parsing.
+    Regex::new(
+        r#"\[gw-attachment file="([^"]*)" mime="([^"]*)" url="([^"]*)" size=(\d+)(?: link="([^"]*)")?\]"#,
+    )
+    .expect("attachment regex compiles")
 });
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +36,12 @@ pub struct ParsedAttachment {
     pub mime: String,
     pub url: String,
     pub size: u64,
+    /// Optional click-through target distinct from `url`. Set when
+    /// the attachment's bytes are a *preview* of a different file —
+    /// e.g. a typst render's PNG (shown via `url`) whose click should
+    /// open the PDF (`link`). `None` for ordinary attachments, where
+    /// the click-through is `url` itself.
+    pub link: Option<String>,
 }
 
 impl ParsedAttachment {
@@ -40,12 +50,33 @@ impl ParsedAttachment {
     }
 }
 
-/// Build the canonical marker line.
+/// Build the canonical marker line (no separate click-through link).
 pub fn marker_line(filename: &str, mime: &str, url: &str, size: u64) -> String {
+    marker_line_linked(filename, mime, url, size, None)
+}
+
+/// Build a marker line whose preview (`url`) clicks through to a
+/// different `link` target. When `link` is `None` this is byte-for-byte
+/// the plain [`marker_line`] output, so unlinked attachments keep their
+/// exact prior marker text.
+pub fn marker_line_linked(
+    filename: &str,
+    mime: &str,
+    url: &str,
+    size: u64,
+    link: Option<&str>,
+) -> String {
     let filename = filename.replace('"', "");
     let mime = mime.replace('"', "");
     let url = url.replace('"', "");
-    format!("[gw-attachment file=\"{filename}\" mime=\"{mime}\" url=\"{url}\" size={size}]")
+    let mut out =
+        format!("[gw-attachment file=\"{filename}\" mime=\"{mime}\" url=\"{url}\" size={size}");
+    if let Some(link) = link {
+        let link = link.replace('"', "");
+        out.push_str(&format!(" link=\"{link}\""));
+    }
+    out.push(']');
+    out
 }
 
 /// Filenames already claimed by attachment markers in `text`. Used
@@ -146,6 +177,7 @@ pub fn parse_markers(text: &str) -> Vec<ParsedAttachment> {
                 mime: caps.get(2)?.as_str().to_string(),
                 url: caps.get(3)?.as_str().to_string(),
                 size,
+                link: caps.get(5).map(|m| m.as_str().to_string()),
             })
         })
         .collect()
@@ -183,6 +215,7 @@ pub fn split_markers(text: &str) -> Vec<Segment<'_>> {
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_default(),
             size,
+            link: caps.get(5).map(|m| m.as_str().to_string()),
         }));
         cursor = whole.end();
         // For text/* attachments the marker is followed by an
@@ -277,9 +310,27 @@ where
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_default(),
             size,
+            link: caps.get(5).map(|m| m.as_str().to_string()),
         };
         let url = new_url_for(&att).unwrap_or_else(|| att.url.clone());
-        out.push_str(&marker_line(&att.filename, &att.mime, &url, att.size));
+        // A preview's `link` is the same flavour of URL as `url` (a
+        // gateway proxy URL), so it gets the identical rewrite — else a
+        // forked deck's PNG would still click through to the source
+        // turn's PDF (a 404 after the fork remaps turn ids).
+        let link = att.link.as_ref().map(|l| {
+            let probe = ParsedAttachment {
+                url: l.clone(),
+                ..att.clone()
+            };
+            new_url_for(&probe).unwrap_or_else(|| l.clone())
+        });
+        out.push_str(&marker_line_linked(
+            &att.filename,
+            &att.mime,
+            &url,
+            att.size,
+            link.as_deref(),
+        ));
         cursor = whole.end();
     }
     out.push_str(&text[cursor..]);
@@ -477,7 +528,66 @@ mod tests {
                 mime: "image/png".into(),
                 url: "https://e/x.png".into(),
                 size: 4321,
+                link: None,
             }]
+        );
+    }
+
+    #[test]
+    fn linked_marker_round_trips_through_parse() {
+        // A preview marker carries a click-through `link` distinct from
+        // its `url`; both survive a parse.
+        let line = marker_line_linked(
+            "deck.png",
+            "image/png",
+            "/chat/attachment/t-1/deck.png",
+            99,
+            Some("/chat/attachment/t-1/deck.pdf"),
+        );
+        let parsed = parse_markers(&line);
+        assert_eq!(
+            parsed,
+            vec![ParsedAttachment {
+                filename: "deck.png".into(),
+                mime: "image/png".into(),
+                url: "/chat/attachment/t-1/deck.png".into(),
+                size: 99,
+                link: Some("/chat/attachment/t-1/deck.pdf".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn unlinked_marker_text_is_byte_identical_to_legacy() {
+        // marker_line must still emit the exact pre-`link` text so
+        // existing persisted rows and other call sites are unaffected.
+        assert_eq!(
+            marker_line("x.png", "image/png", "https://e/x.png", 7),
+            r#"[gw-attachment file="x.png" mime="image/png" url="https://e/x.png" size=7]"#
+        );
+    }
+
+    #[test]
+    fn remap_turn_ids_rewrites_link_segment_too() {
+        use std::collections::HashMap;
+        // A forked deck's PNG preview must point its click-through at the
+        // NEW turn's PDF, not the source turn's (which 404s post-fork).
+        let m = marker_line_linked(
+            "deck.png",
+            "image/png",
+            "/chat/attachment/old/deck.png",
+            5,
+            Some("/chat/attachment/old/deck.pdf"),
+        );
+        let map = HashMap::from([("old".to_string(), "new".to_string())]);
+        let out = remap_attachment_turn_ids(&m, &map);
+        assert!(
+            out.contains(r#"url="/chat/attachment/new/deck.png""#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"link="/chat/attachment/new/deck.pdf""#),
+            "{out}"
         );
     }
 

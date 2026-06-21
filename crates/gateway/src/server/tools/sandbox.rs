@@ -98,6 +98,16 @@ impl SandboxClient {
             .map_err(|e| ToolError::Failed(format!("runner response not a RunResponse: {e}")))
     }
 
+    /// Run a job and hand back the raw [`RunResponse`] (exit code,
+    /// streams, produced artifacts) without delivering anything to the
+    /// chat. Callers that want to attach a specific produced file under
+    /// their own naming/dedup — e.g. the typst tools wiring a `.pptx`
+    /// into a render's attachment cluster — use this instead of
+    /// [`Self::execute`], which auto-attaches every artifact.
+    pub async fn run_job(&self, req: RunRequest) -> Result<RunResponse, ToolError> {
+        self.call_runner(&req).await
+    }
+
     /// Run a job and shape the model-facing result, delivering any
     /// produced files appropriately for the call's context.
     async fn execute(&self, ctx: &ToolContext, req: RunRequest) -> Result<Value, ToolError> {
@@ -399,6 +409,11 @@ impl Tool for RunInSandbox {
              Python libs: pandas, numpy, scipy, scikit-learn, statsmodels, \
              sympy, polars, pyarrow, duckdb, matplotlib/seaborn, \
              openpyxl/xlsxwriter/xlrd, python-docx, python-pptx, odfpy, \
+             typ2pptx (Typst→editable .pptx: real text/shapes/gradients — \
+             compile the .typ with its fonts on TYPST_FONT_PATHS, run \
+             `typ2pptx in.typ --root <dir> --detect-paragraphs -o out.pptx`; \
+             if the deck's font comes out as Consolas, set the run typeface to \
+             the real font name in ppt/slides/*.xml), \
              pypdf/pdfplumber/pymupdf, reportlab, img2pdf, pillow, opencv, \
              pytesseract (OCR), sqlalchemy/psycopg/pymysql, scapy, lxml, \
              beautifulsoup4, requests. \
@@ -912,7 +927,7 @@ fn slice_text(
 // artifacts. Self-contained to keep the tool off a base64 dependency,
 // matching the codecs in `chat_attachments` / `upload_attachment`.
 
-mod b64 {
+pub(crate) mod b64 {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     pub fn encode(bytes: &[u8]) -> String {

@@ -49,9 +49,17 @@ fn main() {
     match gateway::server::typst::discover_templates(templates_dir) {
         Ok(templates) => {
             for t in templates {
-                registry = registry.with(
-                    gateway::server::tools::typst_render::TypstRenderTool::new(t),
-                );
+                let t = std::sync::Arc::new(t);
+                // Token-budget report only needs the schemas; pptx export
+                // (sandbox) is irrelevant here, so pass None.
+                registry = registry
+                    .with(gateway::server::tools::typst_render::TypstRenderTool::new(
+                        t.clone(),
+                        None,
+                    ))
+                    .with(gateway::server::tools::typst_render::TypstEditTool::new(
+                        t, None,
+                    ));
             }
         }
         Err(e) => eprintln!("(no typst templates discovered at {templates_dir:?}: {e})"),

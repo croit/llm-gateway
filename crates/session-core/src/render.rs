@@ -370,9 +370,16 @@ fn render_attachment(att: &crate::attachments::ParsedAttachment, owner_turn_id: 
     }
     if att.is_image() {
         let alt = filename.clone();
-        let title = format!("{filename} · {mime} · {size}");
+        // A preview image (e.g. a typst render's PNG) clicks through to
+        // its `link` (the PDF) when set; an ordinary image links to its
+        // own full-res bytes. The `<img src>` is always the image url.
+        let href = att.link.clone().unwrap_or_else(|| url.clone());
+        let title = match &att.link {
+            Some(_) => format!("Open {filename} · {mime} · {size}"),
+            None => format!("{filename} · {mime} · {size}"),
+        };
         return html! {
-            a(href: (url.clone()), target: "_blank", rel: "noopener", class: "chat-msg__attachment-image") {
+            a(href: (href), target: "_blank", rel: "noopener", class: "chat-msg__attachment-image") {
                 img(src: (url), alt: (alt), title: (title), loading: "lazy");
             }
         }
@@ -1391,6 +1398,7 @@ mod tests {
             mime: "application/pdf".into(),
             url: "/chat/attachment/turn-A/letter.pdf".into(),
             size: 19600,
+            link: None,
         };
         // Owner matches → normal chip with a working download link.
         let ok = render_attachment(&pdf, "turn-A").to_string();
@@ -1422,6 +1430,7 @@ mod tests {
             mime: "image/png".into(),
             url: "/chat/attachment/turn-A/preview.png".into(),
             size: 1000,
+            link: None,
         };
         let orphan_img = render_attachment(&png, "turn-B").to_string();
         assert!(

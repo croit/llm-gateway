@@ -69,6 +69,28 @@ pub struct Template {
     /// always `template.typ` — the manifest can override it for
     /// multi-entrypoint templates.
     pub source_file: String,
+    /// When set (manifest `[pptx]` table), the template can also be
+    /// exported to an editable PowerPoint via the code sandbox
+    /// (typ2pptx). `None` for document templates like the letter, where
+    /// a slide export makes no sense.
+    pub pptx: Option<PptxExport>,
+}
+
+/// PowerPoint-export settings for a slide template (manifest `[pptx]`).
+/// The render bundles the template + the deck data into the sandbox,
+/// runs typ2pptx, and attaches an editable `.pptx` alongside the PDF.
+#[derive(Debug, Clone)]
+pub struct PptxExport {
+    /// The field whose value holds the deck content (e.g. `deck`). Its
+    /// value is written into [`Self::data_file`] for the compile.
+    pub data_field: String,
+    /// The filename the template reads that content from by default —
+    /// the presentation's `data` input defaults to `deck.json`.
+    pub data_file: String,
+    /// Brand font to stamp onto the text runs. typ2pptx misclassifies
+    /// the deck's font as monospace (writes `Consolas`); we override it
+    /// to this. Use a Google Font so Google Slides renders it on import.
+    pub font: Option<String>,
 }
 
 /// One field the model fills in. The JSON-schema type maps to a
@@ -139,6 +161,26 @@ struct Manifest {
     source_file: String,
     #[serde(default, rename = "field")]
     fields: Vec<ManifestField>,
+    /// Optional `[pptx]` table: opt into editable PowerPoint export.
+    #[serde(default)]
+    pptx: Option<ManifestPptx>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestPptx {
+    /// Field holding the deck content (e.g. `deck`).
+    data_field: String,
+    /// File the template reads that content from (default `deck.json`).
+    #[serde(default = "default_deck_file")]
+    data_file: String,
+    /// Brand font to stamp onto text runs (typ2pptx → `Consolas` fixup).
+    #[serde(default)]
+    font: Option<String>,
+}
+
+fn default_deck_file() -> String {
+    "deck.json".to_string()
 }
 
 fn default_source_file() -> String {
@@ -267,6 +309,11 @@ fn load_template(root: &Path, manifest_path: &Path) -> Result<Template, Discover
     let output_basename = manifest
         .output_basename
         .unwrap_or_else(|| manifest.id.clone());
+    let pptx = manifest.pptx.map(|p| PptxExport {
+        data_field: p.data_field,
+        data_file: p.data_file,
+        font: p.font,
+    });
     Ok(Template {
         id: manifest.id,
         description: manifest.description,
@@ -274,6 +321,7 @@ fn load_template(root: &Path, manifest_path: &Path) -> Result<Template, Discover
         fields,
         root: root.to_path_buf(),
         source_file: manifest.source_file,
+        pptx,
     })
 }
 
@@ -480,6 +528,28 @@ description = "Stub template for tests"
             templates.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
             ["alpha", "beta"]
         );
+    }
+
+    #[test]
+    fn manifest_pptx_table_parses_into_template() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_template(
+            dir.path(),
+            "deck",
+            "[pptx]\ndata_field = \"deck\"\nfont = \"Urbanist\"\n",
+        );
+        let t = &discover_templates(dir.path()).unwrap()[0];
+        let pptx = t.pptx.as_ref().expect("pptx export configured");
+        assert_eq!(pptx.data_field, "deck");
+        assert_eq!(pptx.data_file, "deck.json"); // defaulted
+        assert_eq!(pptx.font.as_deref(), Some("Urbanist"));
+    }
+
+    #[test]
+    fn manifest_without_pptx_table_leaves_export_off() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_template(dir.path(), "letter", "");
+        assert!(discover_templates(dir.path()).unwrap()[0].pptx.is_none());
     }
 
     #[test]
