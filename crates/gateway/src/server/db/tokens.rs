@@ -136,6 +136,41 @@ pub async fn set_tools_enabled(
     Ok(result.rows_affected() > 0)
 }
 
+/// Rotate a token's secret in place: swap in a fresh `hash`, reset
+/// `created_at` / `expires_at` (the caller passes the new lifetime so the
+/// configured TTL is preserved) and clear `last_used_at`. Everything that
+/// makes this credential *configured* — its id, name, `tools_enabled`, the
+/// per-capability `token_tool_prefs` rows and the MCP `ask`-over-API policy
+/// — is untouched, so the owner keeps the same token with a new secret and
+/// the old plaintext stops authenticating immediately. Scoped by `user_id`
+/// and only rotates a token that isn't already revoked (a revoked token must
+/// be created anew, not silently resurrected). Returns `Ok(false)` if no row
+/// matched (didn't exist, wrong owner, or already revoked).
+pub async fn rotate(
+    pool: &Pool,
+    user_id: &str,
+    token_id: &str,
+    new_hash: &str,
+    created_at: Timestamp,
+    expires_at: Timestamp,
+) -> Result<bool, DbError> {
+    let result = sqlx::query(
+        r#"UPDATE tokens
+              SET hash = ?, created_at = ?, expires_at = ?, last_used_at = NULL
+            WHERE id = ?
+              AND user_id = ?
+              AND revoked_at IS NULL"#,
+    )
+    .bind(new_hash)
+    .bind(created_at.to_string())
+    .bind(expires_at.to_string())
+    .bind(token_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Look up a token by its SHA-256 hash. Returns None for missing, revoked, or
 /// expired tokens — callers don't need to recheck.
 pub async fn find_active_by_hash(pool: &Pool, hash: &str) -> Result<Option<Token>, DbError> {
@@ -455,6 +490,70 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_swaps_secret_and_keeps_config() {
+        let (pool, uid) = setup().await;
+        let now = Timestamp::now();
+        let mut t = fixture(&uid, "t-rot", "hash-old");
+        t.tools_enabled = true;
+        insert(&pool, &t).await.unwrap();
+        // The old secret authenticates; the new one doesn't exist yet.
+        assert!(
+            find_active_by_hash(&pool, "hash-old")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let new_expires = now + jiff::SignedDuration::from_hours(48);
+        assert!(
+            rotate(&pool, &uid, "t-rot", "hash-new", now, new_expires)
+                .await
+                .unwrap()
+        );
+
+        // Old secret is dead; new secret authenticates and the config
+        // (id, name, tools_enabled) survived the rotation.
+        assert!(
+            find_active_by_hash(&pool, "hash-old")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let got = find_active_by_hash(&pool, "hash-new")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.id, "t-rot");
+        assert_eq!(got.name, "token-t-rot");
+        assert!(got.tools_enabled, "tool-use flag is preserved");
+        assert!(got.last_used_at.is_none(), "rotation clears last_used_at");
+    }
+
+    #[tokio::test]
+    async fn rotate_refuses_revoked_and_cross_user() {
+        let (pool, uid) = setup().await;
+        let now = Timestamp::now();
+        let exp = now + jiff::SignedDuration::from_hours(1);
+
+        // A different user can't rotate my token.
+        let t = fixture(&uid, "t-mine", "hash-mine");
+        insert(&pool, &t).await.unwrap();
+        assert!(
+            !rotate(&pool, "other-user", "t-mine", "hash-x", now, exp)
+                .await
+                .unwrap()
+        );
+
+        // A revoked token can't be rotated back to life.
+        assert!(revoke(&pool, &uid, "t-mine").await.unwrap());
+        assert!(
+            !rotate(&pool, &uid, "t-mine", "hash-y", now, exp)
+                .await
+                .unwrap()
         );
     }
 

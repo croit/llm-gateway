@@ -868,7 +868,7 @@ pub use tool_toggles::{entries_for_roles, valid_keys};
 
 mod tokens;
 pub use tokens::{
-    tokens_create, tokens_delete, tokens_index, tokens_mcp_policy, tokens_revoke,
+    tokens_create, tokens_delete, tokens_index, tokens_mcp_policy, tokens_revoke, tokens_rotate,
     tokens_tools_master, tokens_tools_toggle,
 };
 

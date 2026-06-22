@@ -14,6 +14,7 @@
 //!   - POST /api/v0/tokens                  → mint a new token
 //!   - DELETE /api/v0/tokens/{id}           → hard-delete a revoked token
 //!   - POST /api/v0/tokens/{id}/revoke      → revoke an active token
+//!   - POST /api/v0/tokens/{id}/rotate      → re-mint an active token's secret
 //!
 //! Chat / transcription / models session mirrors will land alongside
 //! the UI port — they only matter once the rama-side UI is hitting them.
@@ -271,6 +272,78 @@ pub async fn revoke_token(
         }
     };
     json_ok(&RevokeResponse { revoked })
+}
+
+/// POST /api/v0/tokens/{id}/rotate — re-mint an active token's secret in
+/// place. The new plaintext is returned **once** (same shape as create);
+/// the token's name, tool config and the configured TTL span are preserved
+/// (the new lifetime runs the same duration from now). The old plaintext
+/// stops authenticating immediately. 404s for a missing / non-owned / already
+/// revoked token (a revoked token must be created anew, not resurrected).
+pub async fn rotate_token(
+    State(state): State<Arc<RamaState>>,
+    Path(token_id): Path<String>,
+    req: Request,
+) -> Response {
+    let session = match require_session(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let list = match tokens::list_for_user(&state.db, &session.user_id).await {
+        Ok(l) => l,
+        Err(err) => {
+            tracing::warn!(error = %err, "listing tokens");
+            return internal_error("listing tokens failed");
+        }
+    };
+    let Some(existing) = list
+        .iter()
+        .find(|t| t.id == token_id && t.revoked_at.is_none())
+    else {
+        return not_found("no active token with that id");
+    };
+
+    // Preserve the originally-configured lifetime: re-issue with the same
+    // span measured from now.
+    let ttl = existing.expires_at - existing.created_at;
+    let now = Timestamp::now();
+    let expires_at = now + ttl;
+    let (plaintext, hash) = token::mint();
+
+    match tokens::rotate(
+        &state.db,
+        &session.user_id,
+        &token_id,
+        &hash,
+        now,
+        expires_at,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => return not_found("no active token with that id"),
+        Err(err) => {
+            tracing::warn!(error = %err, %token_id, "rotate token");
+            return internal_error("rotate failed");
+        }
+    }
+
+    // Re-read so the returned summary reflects the rotated row exactly.
+    let disabled = disabled_tools_for(&state, &token_id).await;
+    let summary = match tokens::list_for_user(&state.db, &session.user_id).await {
+        Ok(l) => match l.into_iter().find(|t| t.id == token_id) {
+            Some(t) => to_summary(t, disabled),
+            None => return internal_error("rotated token vanished"),
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "listing tokens");
+            return internal_error("listing tokens failed");
+        }
+    };
+    json_ok(&CreateTokenResponse {
+        token: summary,
+        plaintext,
+    })
 }
 
 /// GET /api/v0/transcription_models — names of every `[[models]]`

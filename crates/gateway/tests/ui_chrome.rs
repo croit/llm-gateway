@@ -215,6 +215,104 @@ async fn revoke_returns_sse_with_row_swap_and_toast() {
 }
 
 #[tokio::test]
+async fn rotate_returns_sse_with_new_secret_and_row_swap() {
+    use gateway::server::auth::token;
+    use gateway::server::db::tokens;
+    use jiff::{SignedDuration, Timestamp};
+    use uuid::Uuid;
+
+    let state = common::state_with_chat_pool("http://unused.invalid").await;
+    let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
+
+    let now = Timestamp::now();
+    let (_old_plaintext, old_hash) = token::mint();
+    let token_id = Uuid::new_v4().to_string();
+    tokens::insert(
+        &state.db,
+        &tokens::Token {
+            id: token_id.clone(),
+            user_id: "alice".into(),
+            name: "ci-runner".into(),
+            hash: old_hash.clone(),
+            created_at: now,
+            last_used_at: None,
+            expires_at: now + SignedDuration::from_hours(24),
+            revoked_at: None,
+            tools_enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+    // The old secret authenticates before the rotation.
+    assert!(
+        tokens::find_active_by_hash(&state.db, &old_hash)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let db = state.db.clone();
+    let app = router(Arc::new(state));
+
+    // POST /tokens/{id}/rotate returns 200 + text/event-stream with four
+    // patch events: the in-place row swap, the minted-banner refill (the
+    // new plaintext, copy-once), a script that scrolls the banner into
+    // view, and a success toast.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/tokens/{token_id}/rotate"))
+        .header("cookie", format!("id={cookie}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get(rama::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .unwrap_or_default();
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "expected text/event-stream, got `{ct}`"
+    );
+
+    let body = String::from_utf8(common::read_body(resp).await.to_vec()).unwrap();
+    let patches = body.matches("event: datastar-patch-elements").count();
+    assert_eq!(patches, 4, "expected four patch events, body was:\n{body}");
+    assert!(
+        body.contains(&format!("data: selector #token-row-{token_id}")),
+        "expected the row to be swapped in place, got:\n{body}"
+    );
+    assert!(
+        body.contains("data: selector #token-minted-banner"),
+        "expected the minted banner to be refilled with the new secret, got:\n{body}"
+    );
+    assert!(
+        body.contains("scrollIntoView"),
+        "expected a script to scroll the new-secret banner into view, got:\n{body}"
+    );
+    assert!(
+        body.contains("Token rotated"),
+        "expected the rotate toast, got:\n{body}"
+    );
+    // The row swaps back to the active variant, not revoked.
+    assert!(
+        body.contains("badge-secondary") && !body.contains("badge-error"),
+        "rotated row should stay active, got:\n{body}"
+    );
+
+    // The old plaintext no longer authenticates; the secret really changed.
+    assert!(
+        tokens::find_active_by_hash(&db, &old_hash)
+            .await
+            .unwrap()
+            .is_none(),
+        "old secret should stop working after rotation"
+    );
+}
+
+#[tokio::test]
 async fn transcription_models_lists_discovered_models() {
     let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
     let mut pools = HashMap::new();

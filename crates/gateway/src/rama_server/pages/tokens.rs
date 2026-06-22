@@ -244,6 +244,78 @@ pub async fn tokens_revoke(
     }
 }
 
+/// POST /tokens/{id}/rotate — mint a fresh secret for an existing token
+/// without changing its name or tool config. The old plaintext stops
+/// working immediately; the configured TTL is preserved (the new
+/// lifetime spans the same duration from now). The SSE response swaps the
+/// row in place (so the metadata line updates) and patches the minted
+/// banner with the new plaintext — exactly like a create, so the owner
+/// gets the same copy-once flow.
+pub async fn tokens_rotate(
+    State(state): State<Arc<RamaState>>,
+    Path(token_id): Path<String>,
+    req: Request,
+) -> Response {
+    let (_, user) = match require_session_or_redirect(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    // Find the live token so we can preserve its name + configured TTL.
+    let list = match tokens::list_for_user(&state.db, &user.id).await {
+        Ok(l) => l,
+        Err(err) => {
+            tracing::warn!(error = %err, "listing tokens");
+            return sse_toast_response(FlashKind::Error, "Could not load token.");
+        }
+    };
+    let Some(existing) = list
+        .iter()
+        .find(|t| t.id == token_id && t.revoked_at.is_none())
+    else {
+        return sse_toast_response(FlashKind::Error, "Token not found or already revoked.");
+    };
+
+    // Preserve the originally-configured lifetime: re-issue with the same
+    // span from now, so a 90-day token stays a 90-day token.
+    let ttl = existing.expires_at - existing.created_at;
+    let now = Timestamp::now();
+    let expires_at = now + ttl;
+    let name = existing.name.clone();
+    let (plaintext, hash) = token::mint();
+
+    match tokens::rotate(&state.db, &user.id, &token_id, &hash, now, expires_at).await {
+        Ok(true) => {
+            let Some(row_html) = render_row_after_state_change(&state, &user, &token_id).await
+            else {
+                return sse_toast_response(FlashKind::Error, "Rotated token not found.");
+            };
+            let banner_html = render_minted_banner(&MintedBanner { name, plaintext }).to_string();
+            let selector = format!("#token-row-{token_id}");
+            sse_response(&[
+                sse_patch(Some(&selector), Some("outer"), &row_html),
+                sse_patch(Some("#token-minted-banner"), Some("outer"), &banner_html),
+                // Rotate can be triggered from a row far down the list, so
+                // the freshly-patched banner (the only place the new secret
+                // is shown) may be off-screen. Bring it into view so the
+                // user actually sees the value to copy.
+                sse_script(
+                    "document.getElementById('token-minted-banner')\
+                     .scrollIntoView({behavior:'smooth',block:'start'})",
+                ),
+                sse_toast(&Flash {
+                    kind: FlashKind::Success,
+                    message: "Token rotated — copy the new value.".into(),
+                }),
+            ])
+        }
+        Ok(false) => sse_toast_response(FlashKind::Error, "Token not found or already revoked."),
+        Err(err) => {
+            tracing::warn!(error = %err, %token_id, "rotate");
+            sse_toast_response(FlashKind::Error, "Rotate failed.")
+        }
+    }
+}
+
 /// POST /tokens/{id}/delete — hard-delete a revoked row. SSE response
 /// removes the `<li>` from the list (`mode remove`) + appends a toast.
 pub async fn tokens_delete(
@@ -611,6 +683,7 @@ struct TokenRowData {
     meta: String,
     revoked: bool,
     revoke_action: String,
+    rotate_action: String,
     delete_action: String,
     /// Master "tool use" switch state — drives the per-token tool panel.
     tools_enabled: bool,
@@ -632,6 +705,9 @@ impl TokenRowData {
     fn revoke_directive(&self) -> String {
         format!("@post('{}', {{contentType: 'form'}})", self.revoke_action)
     }
+    fn rotate_directive(&self) -> String {
+        format!("@post('{}', {{contentType: 'form'}})", self.rotate_action)
+    }
     fn delete_directive(&self) -> String {
         format!("@post('{}', {{contentType: 'form'}})", self.delete_action)
     }
@@ -652,6 +728,7 @@ impl From<&tokens::Token> for TokenRowData {
             meta: format!("created {created} · last used {last_used} · expires {expires}"),
             revoked,
             revoke_action: format!("/tokens/{}/revoke", t.id),
+            rotate_action: format!("/tokens/{}/rotate", t.id),
             delete_action: format!("/tokens/{}/delete", t.id),
             tools_enabled: t.tools_enabled,
             mcp_allow: false,
@@ -822,6 +899,23 @@ fn render_token_row(r: &TokenRowData, entries: &[ToolEntry], disabled: &HashSet<
                 // base-content text. "Active" is the normal state —
                 // the eye shouldn't be drawn to it.
                 span(class: "badge badge-secondary") { "active" }
+                // Rotate: re-mints the secret in place (same name + tool
+                // config), so the owner doesn't have to revoke + recreate
+                // just to roll a key. Outline variant — it's a normal
+                // maintenance action, not the loud one-way Revoke beside it.
+                // The old plaintext stops working the instant this fires.
+                form(
+                    action: (r.rotate_action.clone()),
+                    method: "post",
+                    class: "m-0",
+                    "data-on:submit__prevent": (r.rotate_directive())
+                ) {
+                    button(
+                        type: "submit",
+                        class: "btn btn-outline btn-sm",
+                        title: "Issue a new secret for this token (keeps its name and settings)"
+                    ) { "Rotate" }
+                }
                 // shadcn destructive button: filled error background,
                 // light text, hover dims to /90. Loud on purpose —
                 // revoking is one-way without an admin.

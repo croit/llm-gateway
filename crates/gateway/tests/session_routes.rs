@@ -123,6 +123,72 @@ async fn create_then_list_then_revoke_then_delete() {
 }
 
 #[tokio::test]
+async fn rotate_swaps_secret_then_refuses_revoked() {
+    let state = common::state_with_chat_pool("http://unused.invalid").await;
+    let cookie = common::seed_session(&state, "dave", "dave@example.com").await;
+    let app = common::app(state);
+
+    // Create a token, capture its first plaintext + id.
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/api/v0/tokens",
+            &cookie,
+            Some(r#"{"name":"ci","ttl_days":30}"#),
+        ))
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&common::read_body(resp).await).unwrap();
+    let token_id = parsed["token"]["id"].as_str().unwrap().to_string();
+    let first_plaintext = parsed["plaintext"].as_str().unwrap().to_string();
+
+    // Rotate → 200 with a fresh plaintext, same id + name.
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/api/v0/tokens/{token_id}/rotate"),
+            &cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_slice(&common::read_body(resp).await).unwrap();
+    let second_plaintext = parsed["plaintext"].as_str().unwrap().to_string();
+    assert!(second_plaintext.starts_with("gwk_"));
+    assert_ne!(
+        first_plaintext, second_plaintext,
+        "rotation must issue a new secret"
+    );
+    assert_eq!(parsed["token"]["id"], token_id);
+    assert_eq!(parsed["token"]["name"], "ci");
+    assert_eq!(parsed["token"]["revoked"], false);
+
+    // Revoke, then rotate again → 404 (a revoked token can't be resurrected).
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/api/v0/tokens/{token_id}/revoke"),
+            &cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/api/v0/tokens/{token_id}/rotate"),
+            &cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn cannot_delete_active_token() {
     let state = common::state_with_chat_pool("http://unused.invalid").await;
     let cookie = common::seed_session(&state, "carol", "carol@example.com").await;
