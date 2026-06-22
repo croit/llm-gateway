@@ -801,6 +801,12 @@ pub struct ComposerOpts<'a> {
     /// fresh load / reload — not just after a submit set the signal in JS.
     /// Without this, reloading mid-turn leaves no way to stop a runaway.
     pub streaming: bool,
+    /// Optional toolbar row rendered inside the composer, above the input —
+    /// the host app's per-message controls (the gateway puts its "+" tools /
+    /// integrations / skills menu here). `None` renders no row. Must contain
+    /// no `<form>` (the composer itself is a form; nested forms are invalid) —
+    /// use button-driven actions instead.
+    pub toolbar: Option<Html>,
 }
 
 pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
@@ -810,6 +816,7 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
         placeholder,
         has_voice,
         streaming,
+        toolbar,
     } = opts;
     let submit_directive = format!(
         "window.chatComposer.onSubmit(evt) && ($chatStreaming = true, \
@@ -820,6 +827,9 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
     // Seed `$chatStreaming` from the server's knowledge of whether a turn is
     // live, so Stop is present on load/reload (not only after a JS submit).
     let initial_signals = format!("{{chatStreaming: {streaming}}}");
+    // Pre-render the optional toolbar (empty fragment when absent) so it can be
+    // interpolated by value inside the macro's `Fn` closure.
+    let toolbar_html = toolbar.unwrap_or_else(|| html! { "" }.to_html());
     html! {
         form(
             id: "chat-form",
@@ -847,6 +857,10 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
                 hidden: "hidden",
                 "data-on:change": "window.chatComposer.onFilesPicked(evt)"
             );
+            // Host-app toolbar row (gateway: the "+" tools/integrations/skills
+            // menu + active chips). Rendered above the field; contains no form.
+            // Empty fragment when none was supplied.
+            (toolbar_html.clone())
             // Chip strip — populated by composer.ts as files land.
             // Empty container; CSS hides it while no children.
             div(
@@ -1115,6 +1129,7 @@ mod tests {
             placeholder: "msg",
             has_voice: false,
             streaming,
+            toolbar: None,
         })
         .to_string()
     }

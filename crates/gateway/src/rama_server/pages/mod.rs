@@ -844,9 +844,9 @@ struct LoginPageQuery {
 // doesn't have to know about the split.
 mod chat;
 pub use chat::{
-    chat_attachment, chat_cancel, chat_edit, chat_export_markdown, chat_export_pdf, chat_fork,
-    chat_index, chat_message_send, chat_retry, chat_session_create, chat_session_delete,
-    chat_session_view, chat_share_toggle, chat_tail,
+    chat_attachment, chat_cancel, chat_capabilities_toggle, chat_edit, chat_effort_set,
+    chat_export_markdown, chat_export_pdf, chat_fork, chat_index, chat_message_send, chat_retry,
+    chat_session_create, chat_session_delete, chat_session_view, chat_share_toggle, chat_tail,
 };
 
 // SSE helpers (`sse_patch`, `sse_script`, `sse_signals`,
@@ -925,7 +925,10 @@ pub use connectors::{
 // `admin` role at the handler entry; non-admins never see the
 // sidebar entry either.
 mod admin;
-pub use admin::{models_index as admin_models_index, models_save as admin_models_save};
+pub use admin::{
+    models_index as admin_models_index, models_reasoning_save as admin_models_reasoning_save,
+    models_save as admin_models_save,
+};
 
 // Admin upstream-backends status page (`/admin/backends`). Read-only;
 // same `admin`-role gate as the model-defaults page.

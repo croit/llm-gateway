@@ -25,12 +25,18 @@ pub struct ModelDefaults {
     /// re-render. May be empty (operator cleared the textarea +
     /// hit save — equivalent to deleting the row, but tolerated).
     pub defaults_toml: String,
+    /// How this model expresses its reasoning budget on the wire
+    /// (`qwen` | `openai` | `glm` | `anthropic` | `none`). `None` =
+    /// auto-detect from the model name at request time. Drives
+    /// [`crate::server::reasoning::apply_effort`].
+    pub reasoning_style: Option<String>,
     pub updated_at: Timestamp,
 }
 
 fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
     let model_name: String = row.try_get("model_name")?;
     let defaults_toml: String = row.try_get("defaults_toml")?;
+    let reasoning_style: Option<String> = row.try_get("reasoning_style")?;
     let updated_at_s: String = row.try_get("updated_at")?;
     let updated_at: Timestamp = updated_at_s
         .parse()
@@ -41,6 +47,7 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
     Ok(ModelDefaults {
         model_name,
         defaults_toml,
+        reasoning_style,
         updated_at,
     })
 }
@@ -49,7 +56,7 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
 /// through to forwarding the client body verbatim.
 pub async fn get(pool: &Pool, model_name: &str) -> Result<Option<ModelDefaults>, DbError> {
     let row = sqlx::query(
-        r#"SELECT model_name, defaults_toml, updated_at
+        r#"SELECT model_name, defaults_toml, reasoning_style, updated_at
            FROM model_defaults
            WHERE model_name = ?"#,
     )
@@ -57,6 +64,32 @@ pub async fn get(pool: &Pool, model_name: &str) -> Result<Option<ModelDefaults>,
     .fetch_optional(pool)
     .await?;
     row.as_ref().map(map_row).transpose()
+}
+
+/// Set (or clear, with `None`) the reasoning style for a model without
+/// touching its sampling defaults. Inserts a row with empty defaults if none
+/// exists yet, so an admin can configure reasoning before any sampling
+/// defaults; on conflict only `reasoning_style` is updated, preserving any
+/// stored TOML.
+pub async fn set_reasoning_style(
+    pool: &Pool,
+    model_name: &str,
+    reasoning_style: Option<&str>,
+) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    sqlx::query(
+        r#"INSERT INTO model_defaults (model_name, defaults_toml, reasoning_style, updated_at)
+           VALUES (?, '', ?, ?)
+           ON CONFLICT(model_name) DO UPDATE SET
+             reasoning_style = excluded.reasoning_style,
+             updated_at      = excluded.updated_at"#,
+    )
+    .bind(model_name)
+    .bind(reasoning_style)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Insert or replace the row for `model_name`. The caller is

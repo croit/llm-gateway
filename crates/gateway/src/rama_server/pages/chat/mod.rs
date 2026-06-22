@@ -193,6 +193,21 @@ async fn render_chat_response(
     };
     let models = list_chat_models(&state).await;
     let transcription_models = list_transcription_models(&state).await;
+    // Effort + capability menu are owner-only (a read-only viewer has no
+    // composer to attach them to): a default + empty set keeps the render
+    // cheap for that path.
+    let (effort, capabilities) = if read_only {
+        (crate::server::reasoning::Effort::Standard, Vec::new())
+    } else {
+        let effort = crate::server::reasoning::Effort::from_db(
+            crate::server::db::chat_session_settings::get_effort(&state.db, &active.id)
+                .await
+                .ok()
+                .flatten()
+                .as_deref(),
+        );
+        (effort, build_capabilities(&state, user, &active.id).await)
+    };
     let body = render::render_chat_page(render::ChatPage {
         active: &active,
         turns: &turns,
@@ -202,6 +217,8 @@ async fn render_chat_response(
         error_msg: None,
         read_only,
         shared: active.shared,
+        effort,
+        capabilities: &capabilities,
     });
     let chat_sidebar = SidebarChat {
         sessions: sessions
@@ -365,6 +382,223 @@ pub async fn chat_share_toggle(
         sse_patch(Some("#share-toggle"), Some("outer"), &control),
         toast,
     ])
+}
+
+// ---------------------------------------------------------------------------
+// POST /chat/{id}/capabilities — owner pins/unpins a tool, MCP integration, or
+// skill for this conversation (the composer's "+" menu). Writes the same
+// per-conversation overlay the model drives via `enable_tools` / `read_skill`,
+// with `source = "user"`, and re-patches the `#capabilities` region.
+
+pub async fn chat_capabilities_toggle(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    let (_session, user) = match require_session_or_redirect(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    // Owner-only: get_session is owner-scoped, so a non-owner POST finds no
+    // session and bounces with no effect.
+    if let Ok(None) | Err(_) = chat::get_session(&state.db, &user.id, &session_id).await {
+        return see_other("/chat");
+    }
+    let datastar = is_datastar_request(req.headers());
+    // The toggle button isn't inside a form (the composer is the only form on
+    // the page), so the kind+key ride in the query string, not a body.
+    let form: CapabilityForm = match serde_urlencoded::from_str(req.uri().query().unwrap_or("")) {
+        Ok(f) => f,
+        Err(err) => return internal_error_html(&user.email, &format!("malformed query: {err}")),
+    };
+    match form.kind.as_str() {
+        "skill" => {
+            // Toggle skill stickiness: load (record) ↔ unload (remove).
+            let loaded =
+                crate::server::db::chat_session_skills::loaded_for_session(&state.db, &session_id)
+                    .await
+                    .unwrap_or_default();
+            let res = if loaded.iter().any(|s| s == &form.key) {
+                crate::server::db::chat_session_skills::remove(&state.db, &session_id, &form.key)
+                    .await
+            } else {
+                crate::server::db::chat_session_skills::record(&state.db, &session_id, &form.key)
+                    .await
+            };
+            if let Err(err) = res {
+                return internal_error_html(&user.email, &err.to_string());
+            }
+        }
+        _ => {
+            // "tool" (built-in tool or MCP connector toggle key): flip its row.
+            let enabled = crate::server::db::chat_session_tools::enabled_keys_for_session(
+                &state.db,
+                &session_id,
+            )
+            .await
+            .unwrap_or_default();
+            let now_on = !enabled.contains(&form.key);
+            if let Err(err) = crate::server::db::chat_session_tools::set(
+                &state.db,
+                &session_id,
+                &form.key,
+                now_on,
+                "user",
+            )
+            .await
+            {
+                return internal_error_html(&user.email, &err.to_string());
+            }
+        }
+    }
+    if !datastar {
+        return see_other(&format!("/chat/{session_id}"));
+    }
+    let caps = build_capabilities(&state, &user, &session_id).await;
+    // Patch only the inner `#capabilities` (NOT `#cap-wrap`, whose `$capMenu`
+    // signal must persist) and render it open: the user toggled from inside the
+    // menu, so keep it up for the next pick.
+    let region = render::render_capabilities_inner(&session_id, &caps, true).to_string();
+    // Clear the search box after a pick (the patched input re-renders empty;
+    // resetting the signal keeps the filtered list in sync) and leave `capMenu`
+    // untouched so the menu stays open.
+    sse_response(&[
+        sse_patch(Some("#capabilities"), Some("outer"), &region),
+        sse_signals(r#"{"capQuery": ""}"#),
+    ])
+}
+
+#[derive(serde::Deserialize)]
+struct CapabilityForm {
+    kind: String,
+    key: String,
+}
+
+// ---------------------------------------------------------------------------
+// POST /chat/{id}/effort — owner sets the conversation's "Denkaufwand". One
+// knob driving both the reasoning budget and the tool-round cap.
+
+pub async fn chat_effort_set(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    let (_session, user) = match require_session_or_redirect(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    if let Ok(None) | Err(_) = chat::get_session(&state.db, &user.id, &session_id).await {
+        return see_other("/chat");
+    }
+    let datastar = is_datastar_request(req.headers());
+    let (_, body) = req.into_parts();
+    let bytes = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return internal_error_html(&user.email, &msg),
+    };
+    let form: EffortForm = match serde_urlencoded::from_bytes(&bytes) {
+        Ok(f) => f,
+        Err(err) => return internal_error_html(&user.email, &format!("malformed form: {err}")),
+    };
+    // Normalise through the enum so only known levels ever land in the DB.
+    let effort = crate::server::reasoning::Effort::from_db(Some(&form.effort));
+    if let Err(err) = crate::server::db::chat_session_settings::set_effort(
+        &state.db,
+        &session_id,
+        effort.as_str(),
+    )
+    .await
+    {
+        return internal_error_html(&user.email, &err.to_string());
+    }
+    if !datastar {
+        return see_other(&format!("/chat/{session_id}"));
+    }
+    sse_response(&[sse_toast(&super::Flash {
+        kind: super::FlashKind::Success,
+        message: format!("Denkaufwand: {}", effort.label()),
+    })])
+}
+
+#[derive(serde::Deserialize)]
+struct EffortForm {
+    effort: String,
+}
+
+/// Build the high-level capability list for the composer's "+" menu — connected
+/// MCP integrations + permitted skills, each tagged with whether this
+/// conversation has it on. (Built-in tools are intentionally excluded; see the
+/// body.)
+async fn build_capabilities(
+    state: &RamaState,
+    user: &User,
+    session_id: &str,
+) -> Vec<render::CapabilityRow> {
+    use render::{CapKind, CapabilityRow};
+
+    let mut out: Vec<CapabilityRow> = Vec::new();
+    let enabled =
+        crate::server::db::chat_session_tools::enabled_keys_for_session(&state.db, session_id)
+            .await
+            .unwrap_or_default();
+
+    // Integrations: the connectors the caller has connected. One row per
+    // connector, keyed `mcp__<connector>` — that single toggle governs every
+    // tool the connector bridges (`entry_key_for` collapses `mcp__x__*` to
+    // `mcp__x`), so enabling it exposes the whole integration to the model.
+    // Only catalog-enabled connectors passing the `required_role` gate appear.
+    let role_ids = state.role_ids_for(&user.roles);
+    if let Ok(connected) = crate::server::db::user_mcp::connected_keys(&state.db, &user.id).await {
+        for ck in connected {
+            let Ok(Some(c)) = crate::server::db::mcp_catalog::get(&state.db, &ck).await else {
+                continue;
+            };
+            if !c.enabled {
+                continue;
+            }
+            if let Some(req) = &c.required_role
+                && !role_ids.iter().any(|r| r == req)
+            {
+                continue;
+            }
+            let key = format!("{}{ck}", crate::server::tools::mcp::MCP_ID_PREFIX);
+            let on = enabled.contains(&key);
+            out.push(CapabilityRow {
+                key,
+                kind: CapKind::Tool,
+                label: c.name,
+                group: "Integrationen",
+                enabled: on,
+                icon: c.icon,
+            });
+        }
+    }
+
+    // Permitted skills (sticky once loaded). Label with the skill's
+    // human-readable title (frontmatter `title`, else a prettified slug)
+    // rather than the bare `name` slug.
+    let loaded = crate::server::db::chat_session_skills::loaded_for_session(&state.db, session_id)
+        .await
+        .unwrap_or_default();
+    let skill_reg = state.skills.as_ref().map(|s| s.current());
+    for name in state.allowed_skills_for(&user.roles) {
+        let on = loaded.iter().any(|s| s == &name);
+        let label = skill_reg
+            .as_ref()
+            .and_then(|r| r.get(&name))
+            .map(|s| s.title.clone())
+            .unwrap_or_else(|| name.clone());
+        out.push(CapabilityRow {
+            key: name,
+            kind: CapKind::Skill,
+            label,
+            group: "Skills",
+            enabled: on,
+            icon: None,
+        });
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------

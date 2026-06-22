@@ -66,8 +66,9 @@ fn take_safe_content(buf: &mut String) -> String {
 // Bounded tool-call rounds so a runaway model can't keep us in the loop
 // forever. Shared with the `/v1` proxy + buffered runner (one source of
 // truth). The *last* round withholds tools (see the loop) so the model is
-// forced to produce a final answer instead of ending the turn empty.
-use crate::server::tools::runner::MAX_TOOL_ROUNDS as MAX_ROUNDS;
+// forced to produce a final answer instead of ending the turn empty. The cap
+// is now per-conversation (derived from the effort level); see
+// `server::reasoning::Effort::max_rounds`.
 
 #[derive(Default)]
 struct ToolCallAcc {
@@ -162,6 +163,47 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
     // N-attachment turn matters, keeps S3 reachable only from the
     // gateway (no presigned URLs ever go to the LLM provider), and
     // collapses the "current vs past" branch in `message_for_history`.
+    // The user's connected-connector MCP tools, overlaid on the registry for
+    // this turn. Built once (cache-warm across rounds); empty + cheap when the
+    // user has nothing connected. Built up front so `build_request_context`
+    // can advertise the connectors the model could turn on (progressive
+    // disclosure — the tools themselves stay out of the request until the
+    // model, or the user via the composer, enables the connector).
+    let mcp_role_ids = d.state.role_ids_for(&d.tool_ctx.roles);
+    let user_mcp = d
+        .state
+        .mcp
+        .layer_for_user(
+            &d.tool_ctx.user_id,
+            &mcp_role_ids,
+            crate::server::tools::mcp::manager::AskContext::Chat,
+        )
+        .await;
+    let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
+        d.state.tools.as_ref(),
+        &user_mcp,
+    );
+
+    // The conversation's effort level ("Denkaufwand") and the selected model's
+    // reasoning style drive both the upstream reasoning parameter and the
+    // tool-round cap. Loaded once per turn (sticky per conversation).
+    let effort = crate::server::reasoning::Effort::from_db(
+        crate::server::db::chat_session_settings::get_effort(&d.state.db, &ctx.session_id)
+            .await
+            .ok()
+            .flatten()
+            .as_deref(),
+    );
+    let reasoning_style = {
+        let explicit = crate::server::db::model_defaults::get(&d.state.db, &ctx.model)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.reasoning_style);
+        crate::server::reasoning::ReasoningStyle::resolve(explicit.as_deref(), &ctx.model)
+    };
+    let max_rounds = effort.max_rounds();
+
     let turns = chat::list_turns(&d.state.db, &ctx.session_id)
         .await
         .map_err(upstream_err)?;
@@ -178,7 +220,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
     // get_user_location, and reflects the *true* source IP (correct in
     // production behind a load balancer, unlike an external IP-echo which
     // would report the gateway's own egress).
-    if let Some(context) = build_request_context(d).await {
+    if let Some(context) = build_request_context(d, &user_mcp).await {
         messages.insert(
             0,
             serde_json::json!({ "role": "system", "content": context }),
@@ -204,25 +246,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         String::new()
     };
 
-    // The user's connected-connector MCP tools, overlaid on the registry for
-    // this turn. Built once (cache-warm across rounds); empty + cheap when the
-    // user has nothing connected.
-    let mcp_role_ids = d.state.role_ids_for(&d.tool_ctx.roles);
-    let user_mcp = d
-        .state
-        .mcp
-        .layer_for_user(
-            &d.tool_ctx.user_id,
-            &mcp_role_ids,
-            crate::server::tools::mcp::manager::AskContext::Chat,
-        )
-        .await;
-    let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
-        d.state.tools.as_ref(),
-        &user_mcp,
-    );
-
-    for round in 0..MAX_ROUNDS {
+    for round in 0..max_rounds {
         if ctx.cancel.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -234,7 +258,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         // the turn ends with no visible answer (the "stuck after N tool
         // calls" failure). Withholding tools turns that last round into a
         // guaranteed text answer.
-        let final_round = round + 1 == MAX_ROUNDS;
+        let final_round = round + 1 == max_rounds;
 
         // Build the request. `stream: true` so we can forward
         // content deltas; tools injected if the user has any
@@ -264,12 +288,25 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             .state
             .allowed_tools_for_session(&d.tool_ctx.roles, &d.tool_ctx.user_id, &ctx.session_id)
             .await;
-        // Union the MCP ids from the SAME layer the executor uses, so an
-        // advertised tool is always dispatchable (no advertise/execute drift).
-        d.state.union_mcp_tool_ids(&mut allowed_tools, &user_mcp);
+        // Union only the per-user MCP tools whose connector this conversation
+        // has turned on (via `enable_tools` or the composer's "+" menu). Unlike
+        // the registry tools, connected MCP connectors used to be injected
+        // unconditionally; gating them behind the same per-conversation overlay
+        // makes them progressive too — the model sees the connectors it *could*
+        // enable in the system context, and only the enabled ones cost schema
+        // tokens. From the SAME layer the executor uses, so an advertised tool
+        // is always dispatchable (no advertise/execute drift).
+        let enabled_keys = crate::server::db::chat_session_tools::enabled_keys_for_session(
+            &d.state.db,
+            &ctx.session_id,
+        )
+        .await
+        .unwrap_or_default();
+        d.state
+            .union_enabled_mcp_tool_ids(&mut allowed_tools, &user_mcp, &enabled_keys);
         if final_round {
             tracing::info!(
-                max_rounds = MAX_ROUNDS,
+                max_rounds,
                 "tool-round budget reached; requesting final answer with tools withheld"
             );
         } else {
@@ -286,6 +323,10 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         {
             tracing::warn!(error = %err, model = %ctx.model, "model_defaults: skipping merge");
         }
+        // Translate the conversation's effort level into the model's
+        // backend-specific reasoning parameter (after defaults, so the
+        // client-wins contract still holds against any stored default).
+        crate::server::reasoning::apply_effort(reasoning_style, effort, &mut request_body);
         let serialized = serde_json::to_vec(&request_body).map_err(upstream_err)?;
 
         let acquired = d
@@ -669,7 +710,10 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
 /// come from the user row (one read); the IP comes from `ToolContext`
 /// (proxy header or socket peer); the coarse location reuses the same GeoIP
 /// resolver the `get_user_location` tool uses.
-async fn build_request_context(d: &OpenAiDriver) -> Option<String> {
+async fn build_request_context(
+    d: &OpenAiDriver,
+    user_mcp: &crate::server::tools::mcp::manager::UserMcpLayer,
+) -> Option<String> {
     use std::fmt::Write as _;
 
     let ip = d.tool_ctx.client_ip.as_deref();
@@ -693,12 +737,19 @@ async fn build_request_context(d: &OpenAiDriver) -> Option<String> {
     // ones re-injected with their full guidance so it persists across turns.
     let skills = build_skills_section(d).await;
 
+    // Connected MCP integrations the conversation hasn't turned on yet —
+    // advertised cheaply (name + one-liner) so the model knows it can request
+    // them via `enable_tools` without their full tool schemas costing tokens
+    // every turn (progressive disclosure for per-user MCP).
+    let integrations = build_mcp_offer_section(d, user_mcp).await;
+
     if ip.is_none()
         && geo.is_none()
         && timezone.is_none()
         && name.is_none()
         && email.is_none()
         && skills.is_none()
+        && integrations.is_none()
     {
         return None;
     }
@@ -754,7 +805,67 @@ async fn build_request_context(d: &OpenAiDriver) -> Option<String> {
     if let Some(skills) = skills {
         out.push_str(&skills);
     }
+    if let Some(integrations) = integrations {
+        out.push_str(&integrations);
+    }
     Some(out)
+}
+
+/// The integrations section of the request-context message: the user's
+/// connected MCP connectors that this conversation hasn't turned on yet, each
+/// as `mcp__<key> — <name>: <description>`. Returns `None` when the user has no
+/// connected connectors, or all of them are already enabled (nothing to
+/// advertise). The model turns one on with `enable_tools(["mcp__<key>"])`; its
+/// real tool schemas then appear from the next turn. Connector display copy
+/// comes from the admin catalog; only connectors actually present in the live
+/// `UserMcpLayer` are listed, so an advertised key is always connectable.
+async fn build_mcp_offer_section(
+    d: &OpenAiDriver,
+    user_mcp: &crate::server::tools::mcp::manager::UserMcpLayer,
+) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let connector_keys = user_mcp.connector_keys();
+    if connector_keys.is_empty() {
+        return None;
+    }
+    // Which connectors this conversation has already enabled — those need no
+    // advertising (their tools are already injected). Chat path only.
+    let enabled = match d.tool_ctx.session_id.as_deref() {
+        Some(session_id) => {
+            crate::server::db::chat_session_tools::enabled_keys_for_session(&d.state.db, session_id)
+                .await
+                .unwrap_or_default()
+        }
+        None => std::collections::HashSet::new(),
+    };
+
+    let mut rows = String::new();
+    for key in &connector_keys {
+        let toggle_key = format!("{}{key}", crate::server::tools::mcp::MCP_ID_PREFIX);
+        if enabled.contains(&toggle_key) {
+            continue;
+        }
+        // Display name + description from the admin catalog; fall back to the
+        // connector key alone if the row is gone (deleted connector still
+        // connected for this user).
+        let (name, desc) = match crate::server::db::mcp_catalog::get(&d.state.db, key).await {
+            Ok(Some(c)) => (c.name, c.description.unwrap_or_default()),
+            _ => (key.clone(), String::new()),
+        };
+        if desc.is_empty() {
+            let _ = writeln!(rows, "- {toggle_key} — {name}");
+        } else {
+            let _ = writeln!(rows, "- {toggle_key} — {name}: {desc}");
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\nIntegrations the user has connected and you can turn on with \
+         `enable_tools([\"<key>\"])` (their tools then appear next turn):\n{rows}"
+    ))
 }
 
 /// The skills section of the request-context message: every skill the
@@ -990,6 +1101,7 @@ mod tests {
     fn registry(entries: &[(&str, &str)]) -> SkillRegistry {
         SkillRegistry::new(entries.iter().map(|(n, d)| Skill {
             name: (*n).to_string(),
+            title: (*n).to_string(),
             description: (*d).to_string(),
             root: PathBuf::from("/nonexistent"),
         }))

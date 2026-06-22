@@ -557,6 +557,40 @@ impl UserMcpLayer {
         self.tools.keys().cloned().collect()
     }
 
+    /// The overlay tool ids whose connector toggle key is in `enabled_keys` —
+    /// i.e. the tools the conversation has actually turned on. This is the
+    /// progressive-disclosure gate for per-user MCP on the chat path: a
+    /// connected-but-not-enabled connector contributes nothing here (only its
+    /// system-context advertisement), and enabling `mcp__<connector>` surfaces
+    /// every tool that connector bridges (since `entry_key_for(mcp__x__*)` all
+    /// collapse to `mcp__x`).
+    pub fn enabled_tool_ids(
+        &self,
+        enabled_keys: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        use crate::server::tools::catalog::entry_key_for;
+        self.tools
+            .keys()
+            .filter(|id| enabled_keys.contains(entry_key_for(id)))
+            .cloned()
+            .collect()
+    }
+
+    /// The distinct connector keys this overlay has tools for, sorted. Used by
+    /// the chat driver to advertise connectable integrations in the system
+    /// context (progressive disclosure for per-user MCP).
+    pub fn connector_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .connector_of
+            .values()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        keys.sort();
+        keys
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
@@ -667,6 +701,57 @@ mod tests {
         assert!(!expose(ToolMode::Ask, false));
         assert!(expose(ToolMode::Always, true));
         assert!(expose(ToolMode::Always, false));
+    }
+
+    /// A fake MCP-bridged tool whose id is namespaced `mcp__demo__echo`, so its
+    /// connector toggle key collapses to `mcp__demo` (like a real connector).
+    struct FakeMcpTool;
+    impl crate::server::tools::Tool for FakeMcpTool {
+        fn id(&self) -> &str {
+            "mcp__demo__echo"
+        }
+        fn schema(&self) -> shared::api::ToolDef {
+            shared::api::ToolDef::function(
+                "mcp__demo__echo",
+                "demo",
+                serde_json::json!({"type": "object"}),
+            )
+        }
+        fn run<'a>(
+            &'a self,
+            _ctx: crate::server::tools::ToolContext,
+            _args: serde_json::Value,
+        ) -> crate::server::tools::ToolFuture<'a> {
+            Box::pin(async { Ok(serde_json::json!({})) })
+        }
+    }
+
+    #[test]
+    fn enabled_tool_ids_gates_per_user_mcp_by_session_overlay() {
+        // The core of "select an integration → its tools become available":
+        // a connected connector's tools are exposed ONLY once its toggle key is
+        // enabled in the conversation overlay.
+        use std::collections::HashSet;
+        let mut layer = UserMcpLayer::default();
+        layer.insert_for_test(Arc::new(FakeMcpTool), "demo", ToolMode::Always);
+        layer.insert_for_test(Arc::new(Echo), "demo", ToolMode::Always);
+
+        // Nothing enabled → connector tools stay hidden (progressive disclosure).
+        assert!(layer.enabled_tool_ids(&HashSet::new()).is_empty());
+
+        // Enabling `mcp__demo` (what the composer writes when you pick the
+        // integration) surfaces the connector's tool — and only it.
+        let on: HashSet<String> = ["mcp__demo".to_string()].into_iter().collect();
+        let ids = layer.enabled_tool_ids(&on);
+        assert!(ids.contains(&"mcp__demo__echo".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"company_echo".to_string()), "{ids:?}");
+
+        // A non-MCP tool keys on its own id, so `mcp__demo` doesn't pull it in.
+        let echo_on: HashSet<String> = ["company_echo".to_string()].into_iter().collect();
+        assert_eq!(
+            layer.enabled_tool_ids(&echo_on),
+            vec!["company_echo".to_string()]
+        );
     }
 
     #[test]

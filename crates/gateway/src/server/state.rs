@@ -259,6 +259,28 @@ impl AppState {
             }
         }
     }
+
+    /// Like [`Self::union_mcp_tool_ids`], but only unions the tools whose
+    /// connector toggle key is in `enabled_keys` — the per-conversation overlay
+    /// (`chat_session_tools`). This is what makes per-user MCP connectors
+    /// *progressive* on the chat path: a connected-but-not-enabled connector
+    /// contributes no tool schemas (it's advertised in the system context
+    /// instead), and only enabling it — by the model via `enable_tools` or the
+    /// user via the composer — surfaces its tools. The `/v1` path keeps the
+    /// unconditional [`Self::union_mcp_tool_ids`] (API clients manage their own
+    /// context and have no conversation overlay).
+    pub fn union_enabled_mcp_tool_ids(
+        &self,
+        allowed: &mut Vec<String>,
+        layer: &crate::server::tools::mcp::manager::UserMcpLayer,
+        enabled_keys: &std::collections::HashSet<String>,
+    ) {
+        for id in layer.enabled_tool_ids(enabled_keys) {
+            if !allowed.iter().any(|a| a == &id) {
+                allowed.push(id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +300,7 @@ mod skill_overlay_tests {
         let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
         let registry = SkillRegistry::new([Skill {
             name: "brand".into(),
+            title: "Brand".into(),
             description: "Enforce the brand.".into(),
             root: std::path::PathBuf::from("/nonexistent"),
         }]);

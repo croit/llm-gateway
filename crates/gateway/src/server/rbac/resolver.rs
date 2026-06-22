@@ -191,6 +191,7 @@ mod tests {
         use crate::server::skills::Skill;
         crate::server::skills::SkillRegistry::new(names.iter().map(|n| Skill {
             name: (*n).to_string(),
+            title: (*n).to_string(),
             description: "d".into(),
             root: std::path::PathBuf::from("/nonexistent").join(n),
         }))

@@ -102,6 +102,8 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/chat/{id}/turns/{turn_id}/edit", pages::chat_edit)
         .with_post("/chat/{id}/delete", pages::chat_session_delete)
         .with_post("/chat/{id}/share", pages::chat_share_toggle)
+        .with_post("/chat/{id}/capabilities", pages::chat_capabilities_toggle)
+        .with_post("/chat/{id}/effort", pages::chat_effort_set)
         .with_post("/chat/{id}/fork", pages::chat_fork)
         .with_get("/chat/{id}/export.md", pages::chat_export_markdown)
         .with_get("/chat/{id}/export.pdf", pages::chat_export_pdf)
@@ -111,6 +113,10 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         )
         .with_get("/admin/models", pages::admin_models_index)
         .with_post("/admin/models", pages::admin_models_save)
+        .with_post(
+            "/admin/models/reasoning",
+            pages::admin_models_reasoning_save,
+        )
         .with_get("/admin/backends", pages::admin_backends_index)
         .with_get("/admin/users", pages::admin_users_index)
         // Target id rides in the POST body (not the path) — rama lowercases

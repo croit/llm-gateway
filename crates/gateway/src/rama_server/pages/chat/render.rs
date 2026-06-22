@@ -25,6 +25,46 @@ pub(super) struct ChatModelOption {
     pub nda: bool,
 }
 
+/// One toggleable capability in the composer's "+" menu — a built-in tool, a
+/// connected MCP integration, or an operator-installed skill the caller's
+/// roles permit. Built fresh per request from RBAC + the per-conversation
+/// overlay.
+pub(super) struct CapabilityRow {
+    /// The overlay key: the MCP connector toggle key (`mcp__gitlab`, governing
+    /// the whole integration) for `CapKind::Tool`, or the skill name for
+    /// `CapKind::Skill`.
+    pub key: String,
+    pub kind: CapKind,
+    /// Human-readable label shown in the menu and on the active chip.
+    pub label: String,
+    /// Section heading the row sorts under ("Integrationen" / "Skills").
+    pub group: &'static str,
+    /// Whether this capability is currently on for the conversation.
+    pub enabled: bool,
+    /// Connector icon hint (the catalog `icon`, usually an emoji) for
+    /// integrations without a built-in brand logo. `None` for skills.
+    pub icon: Option<String>,
+}
+
+/// Which overlay a capability toggle writes to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CapKind {
+    /// `chat_session_tools` (built-in tools + MCP connectors).
+    Tool,
+    /// `chat_session_skills` (operator-installed skills).
+    Skill,
+}
+
+impl CapKind {
+    /// Wire value posted by the toggle form and parsed by the handler.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CapKind::Tool => "tool",
+            CapKind::Skill => "skill",
+        }
+    }
+}
+
 /// Inputs the chat-page handler passes through to one render call.
 /// Owns no state — the handler builds it fresh per request from
 /// `RamaState` + DB.
@@ -44,6 +84,11 @@ pub(super) struct ChatPage<'a> {
     pub read_only: bool,
     /// Current share state, for the owner's share toggle label.
     pub shared: bool,
+    /// The conversation's effort level ("Denkaufwand"), for the header picker.
+    pub effort: crate::server::reasoning::Effort,
+    /// Toggleable capabilities for the "+" menu (owner only; empty for a
+    /// read-only viewer).
+    pub capabilities: &'a [CapabilityRow],
 }
 
 /// Chat page body — header (model pickers) + conversation +
@@ -143,6 +188,7 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                         }
                     }
                 }
+                (render_effort_select(&session_id, page.effort))
                 if has_voice {
                     div(class: "flex items-center gap-1.5 text-sm") {
                         (icons::mic(14))
@@ -239,6 +285,10 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                 // A turn already in flight seeds the Stop control server-side,
                 // so a reload mid-stream still offers a way to stop it.
                 streaming: page.in_flight_turn_id.is_some(),
+                // The "+" tools/integrations/skills menu lives inside the
+                // composer (above the input), so it rides with the sticky
+                // composer instead of floating below it.
+                toolbar: Some(render_capabilities(&session_id, page.capabilities, false)),
             }))
         }
     }
@@ -287,6 +337,268 @@ fn session_label(session: &Session) -> String {
         .title
         .clone()
         .unwrap_or_else(|| "New conversation".to_string())
+}
+
+/// The conversation's effort ("Denkaufwand") picker: a one-field form whose
+/// `<select>` auto-posts on change. One knob drives both the upstream
+/// reasoning budget and the tool-round cap (see `server::reasoning`).
+fn render_effort_select(session_id: &str, effort: crate::server::reasoning::Effort) -> Html {
+    use crate::server::reasoning::Effort;
+    let action = format!("/chat/{session_id}/effort");
+    let levels = [Effort::Fast, Effort::Standard, Effort::Deep, Effort::Max];
+    let opts: Vec<Html> = levels
+        .iter()
+        .map(|e| {
+            if *e == effort {
+                html! { option(value: (e.as_str()), selected: "selected") { (e.label()) } }
+                    .to_html()
+            } else {
+                html! { option(value: (e.as_str())) { (e.label()) } }.to_html()
+            }
+        })
+        .collect();
+    html! {
+        form(
+            method: "post",
+            action: (action.clone()),
+            class: "m-0 flex items-center gap-1.5 text-sm",
+            title: "Denkaufwand: höher = gründlichere Antworten und mehr Tool-Runden, aber langsamer"
+        ) {
+            (icons::sparkles(14))
+            select(
+                name: "effort",
+                "aria-label": "Denkaufwand",
+                "data-on:change": (format!("@post('{action}', {{contentType: 'form'}})")),
+                class: "select select-bordered select-sm chat-model-select"
+            ) {
+                for o in opts.iter() {
+                    (o.clone())
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// The composer's "+" menu + active-capability chips. Rendered *inside* the
+/// composer (via `ComposerOpts::toolbar`) so it sits with the input rather than
+/// floating below the sticky composer. The toggles are plain buttons that
+/// `@post` to `/chat/{id}/capabilities?kind=…&key=…` (the composer is itself a
+/// `<form>`, so nested forms would be invalid — the key rides in the query
+/// string instead). The whole block lives under `#capabilities`, which the
+/// toggle handler re-patches; the `capMenu` open-state signal sits on the outer
+/// `#cap-wrap` so it survives a patch (the menu stays open while pinning
+/// several things). The popup opens upward (`bottom:100%`) via inline style —
+/// daisyUI's `dropdown-top` / Tailwind's `bottom-full` aren't in the purged
+/// build, so positioning is hand-rolled with styles that always ship.
+pub(super) fn render_capabilities(session_id: &str, caps: &[CapabilityRow], open: bool) -> Html {
+    // `#cap-wrap` carries the open-state signal and is NOT re-patched by the
+    // toggle handler — only its `#capabilities` child is — so `$capMenu`
+    // survives a pin (re-declaring `data-signals` would reset it to false and
+    // snap the menu shut).
+    html! {
+        div(id: "cap-wrap", "data-signals": "{capMenu: false, capQuery: ''}") {
+            (render_capabilities_inner(session_id, caps, open))
+        }
+    }
+    .to_html()
+}
+
+/// The re-patchable `#capabilities` subtree (the "+" button, the popup, and the
+/// active chips). Rendered standalone by the toggle handler so the patch
+/// replaces exactly this element — never the signal-bearing `#cap-wrap`.
+pub(super) fn render_capabilities_inner(
+    session_id: &str,
+    caps: &[CapabilityRow],
+    open: bool,
+) -> Html {
+    let base = format!("/chat/{session_id}/capabilities");
+    let chips: Vec<Html> = caps
+        .iter()
+        .filter(|c| c.enabled)
+        .map(|c| cap_chip(&base, c))
+        .collect();
+    // Menu rows, grouped (Integrations first, then Skills) under clear section
+    // headings. Only high-level entries live here — see `build_capabilities`.
+    let mut menu_items: Vec<Html> = Vec::new();
+    for g in ["Integrationen", "Skills"] {
+        let items: Vec<Html> = caps
+            .iter()
+            .filter(|c| c.group == g)
+            .map(|c| cap_menu_item(&base, c))
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+        menu_items.push(group_heading(g));
+        for it in items {
+            menu_items.push(it);
+        }
+    }
+    let has_caps = !menu_items.is_empty();
+    // A filter box once the list gets long enough to warrant it.
+    let show_search = caps.len() > 6;
+    // The floating panel: opaque card (border + bg-base-100 + shadow), opening
+    // upward, above the sticky composer (z above its z-index 20). `open` seeds
+    // the initial display so the toggle handler can re-patch the region with the
+    // menu still showing (datastar's `data-show` doesn't re-evaluate on a morph)
+    // — letting the user pin several things without the menu snapping shut.
+    let disp = if open { "block" } else { "none" };
+    let panel_style = format!(
+        "display:{disp}; position:absolute; left:0; bottom:100%; \
+         margin-bottom:8px; width:19rem; z-index:30; overflow:hidden; padding:0.25rem"
+    );
+    html! {
+        div(
+            id: "capabilities",
+            style: "display:flex; flex-wrap:wrap; align-items:center; gap:0.4rem"
+        ) {
+            div(style: "position:relative") {
+                button(
+                    type: "button",
+                    "data-on:click": "$capMenu = !$capMenu",
+                    class: "btn btn-ghost btn-sm gap-1",
+                    title: "Integrationen & Skills für diese Unterhaltung"
+                ) {
+                    (icons::plus(16))
+                    span { "Tools" }
+                }
+                if has_caps {
+                    div(
+                        class: "rounded-box border border-base-300 bg-base-100 shadow",
+                        "data-show": "$capMenu",
+                        style: (panel_style)
+                    ) {
+                        if show_search {
+                            input(
+                                type: "text",
+                                placeholder: "Suchen…",
+                                "data-on:input": "$capQuery = evt.target.value.toLowerCase()",
+                                class: "input input-sm",
+                                style: "width:100%; margin-bottom:0.25rem; \
+                                        border:1px solid color-mix(in oklch, currentColor 15%, transparent)"
+                            );
+                        }
+                        div(style: "max-height:48vh; overflow-y:auto") {
+                            for it in menu_items.iter() {
+                                (it.clone())
+                            }
+                        }
+                    }
+                } else {
+                    div(
+                        class: "rounded-box border border-base-300 bg-base-100 shadow text-sm",
+                        "data-show": "$capMenu",
+                        style: (format!("{panel_style}; padding:0.75rem"))
+                    ) {
+                        "Verbinde eine Integration unter "
+                        a(href: "/integrations", style: "text-decoration:underline") { "Integrationen" }
+                        ", um sie hier bereitzustellen."
+                    }
+                }
+            }
+            for chip in chips.iter() {
+                (chip.clone())
+            }
+        }
+    }
+    .to_html()
+}
+
+/// A clearly-set-off section heading inside the "+" menu (tinted pill, bold,
+/// uppercase). Hidden while a search filter is active (the flat result list
+/// reads better without group labels).
+fn group_heading(label: &str) -> Html {
+    html! {
+        div(
+            "data-show": "$capQuery === ''",
+            style: "margin:0.15rem 0; padding:0.3rem 0.55rem; font-size:0.66rem; \
+                    font-weight:700; letter-spacing:0.06em; text-transform:uppercase; \
+                    opacity:0.65; background:color-mix(in oklch, currentColor 7%, transparent); \
+                    border-radius:0.35rem"
+        ) { (label.to_string()) }
+    }
+    .to_html()
+}
+
+/// `@post` URL that flips one capability's state for this conversation. The
+/// kind + key ride in the query (the button isn't inside a form on this path).
+fn cap_toggle_url(base: &str, c: &CapabilityRow) -> String {
+    format!("{base}?kind={}&key={}", c.kind.as_str(), c.key)
+}
+
+/// Icon for a capability row: the connector's brand logo (or its catalog emoji,
+/// else a generic plug) for integrations; a sparkle for skills.
+fn cap_icon(c: &CapabilityRow) -> Html {
+    match c.kind {
+        CapKind::Skill => icons::sparkles(16),
+        CapKind::Tool => {
+            let connector = c.key.strip_prefix("mcp__").unwrap_or(c.key.as_str());
+            // Brand logo by connector key, then by the catalog `icon` hint
+            // (seeded connectors store a brand key like "gitlab" there, so the
+            // self-managed variant still gets the GitLab mark). Only fall back
+            // to rendering `icon` as text when it's an actual emoji
+            // (non-ASCII) — never a brand-key string — else a generic plug.
+            icons::connector_logo(connector, 16)
+                .or_else(|| c.icon.as_deref().and_then(|i| icons::connector_logo(i, 16)))
+                .unwrap_or_else(|| match c.icon.as_deref() {
+                    Some(emoji) if !emoji.is_empty() && !emoji.is_ascii() => {
+                        html! { span(style: "font-size:1rem; line-height:1") { (emoji.to_string()) } }
+                            .to_html()
+                    }
+                    _ => icons::plug(16),
+                })
+        }
+    }
+}
+
+/// One row in the "+" menu: an icon + label button that flips the capability,
+/// with a check when it's on. `data-show` filters it against the search box.
+fn cap_menu_item(base: &str, c: &CapabilityRow) -> Html {
+    let url = cap_toggle_url(base, c);
+    let label_lower =
+        serde_json::to_string(&c.label.to_lowercase()).unwrap_or_else(|_| "\"\"".to_string());
+    let show = format!("$capQuery === '' || {label_lower}.includes($capQuery)");
+    let check = if c.enabled {
+        html! { span(class: "text-success") { (icons::check(16)) } }.to_html()
+    } else {
+        html! { "" }.to_html()
+    };
+    html! {
+        button(
+            type: "button",
+            "data-on:click": (format!("@post('{url}')")),
+            "data-show": (show),
+            class: "w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-base-200 text-sm",
+            style: "text-align:left"
+        ) {
+            span(style: "display:inline-flex; width:1.15rem; justify-content:center; opacity:0.85") {
+                (cap_icon(c))
+            }
+            span(class: "flex-1 truncate") { (c.label.clone()) }
+            (check)
+        }
+    }
+    .to_html()
+}
+
+/// One active-capability chip: an icon + label button that turns it back off.
+fn cap_chip(base: &str, c: &CapabilityRow) -> Html {
+    let url = cap_toggle_url(base, c);
+    html! {
+        button(
+            type: "button",
+            "data-on:click": (format!("@post('{url}')")),
+            class: "badge badge-outline gap-1",
+            style: "cursor:pointer",
+            title: "Entfernen"
+        ) {
+            span(style: "display:inline-flex") { (cap_icon(c)) }
+            span { (c.label.clone()) }
+            span(class: "opacity-60") { "×" }
+        }
+    }
+    .to_html()
 }
 
 /// The owner's share toggle. datastar-driven: the click `@post`s to flip the
@@ -416,6 +728,8 @@ mod tests {
             error_msg: None,
             read_only,
             shared: false,
+            effort: crate::server::reasoning::Effort::Standard,
+            capabilities: &[],
         })
         .to_string()
     }
@@ -431,6 +745,8 @@ mod tests {
             error_msg: None,
             read_only,
             shared: false,
+            effort: crate::server::reasoning::Effort::Standard,
+            capabilities: &[],
         })
         .to_string()
     }
@@ -635,6 +951,132 @@ mod tests {
         assert!(
             !menu.contains("data-on"),
             "export links must not carry datastar directives: {menu}"
+        );
+    }
+
+    #[test]
+    fn effort_picker_wires_to_effort_endpoint_with_current_selected() {
+        // The composer's "Denkaufwand" picker must post to /chat/{id}/effort
+        // and pre-select the conversation's current level.
+        let body = page_body(None);
+        assert!(
+            body.contains("/chat/s1/effort"),
+            "effort picker must post to the effort endpoint: {body}"
+        );
+        for label in ["Schnell", "Standard", "Tief", "Maximal"] {
+            assert!(
+                body.contains(label),
+                "missing effort level `{label}`: {body}"
+            );
+        }
+        // page_body seeds Effort::Standard → that option is the selected one.
+        assert!(
+            body.contains("value=\"standard\" selected=\"selected\""),
+            "the current effort must be pre-selected: {body}"
+        );
+    }
+
+    #[test]
+    fn capabilities_menu_wires_toggle_and_reflects_state() {
+        // High-level entries only: connected integrations + skills (no
+        // individual built-in tools).
+        let caps = vec![
+            CapabilityRow {
+                key: "mcp__atlassian".into(),
+                kind: CapKind::Tool,
+                label: "Atlassian".into(),
+                group: "Integrationen",
+                enabled: true,
+                icon: None,
+            },
+            CapabilityRow {
+                key: "mcp__gitlab".into(),
+                kind: CapKind::Tool,
+                label: "GitLab".into(),
+                group: "Integrationen",
+                enabled: false,
+                icon: None,
+            },
+            CapabilityRow {
+                key: "brand".into(),
+                kind: CapKind::Skill,
+                label: "Brand".into(),
+                group: "Skills",
+                enabled: false,
+                icon: None,
+            },
+        ];
+        let html = render_capabilities("s1", &caps, false).to_string();
+        // Mount target the toggle handler re-patches, and the persistent
+        // open-state signal on the *outer* wrapper (survives the patch).
+        assert!(
+            html.contains("id=\"capabilities\""),
+            "mount id missing: {html}"
+        );
+        assert!(
+            html.contains("id=\"cap-wrap\""),
+            "wrapper id missing: {html}"
+        );
+        assert!(
+            html.contains("capMenu"),
+            "open-state signal missing: {html}"
+        );
+        // Group headings give clear section structure.
+        assert!(
+            html.contains("Integrationen") && html.contains("Skills"),
+            "section headings missing: {html}"
+        );
+        // Every toggle is a plain button that @posts to the capabilities
+        // endpoint with kind+key in the query (no nested <form> — the composer
+        // is the page's only form).
+        assert!(
+            !html.contains("<form"),
+            "capability toggles must not be nested forms: {html}"
+        );
+        assert!(
+            html.contains("/chat/s1/capabilities?kind=tool&amp;key=mcp__atlassian"),
+            "integration toggle must @post kind+key in the query: {html}"
+        );
+        assert!(
+            html.contains("kind=skill&amp;key=brand"),
+            "skill toggle must be wired by kind=skill: {html}"
+        );
+        assert!(
+            html.contains("kind=tool&amp;key=mcp__gitlab"),
+            "second integration toggle must be wired: {html}"
+        );
+        // The enabled capability shows as a removable chip (the `×`); a disabled
+        // one only appears in the menu.
+        assert!(html.contains("Atlassian"), "enabled label missing: {html}");
+        assert!(
+            html.contains("×"),
+            "enabled chip must carry a remove affordance: {html}"
+        );
+        // Closed by default (page load); the toggle-handler re-render passes
+        // `open: true` so the menu stays up while pinning several things.
+        assert!(
+            html.contains("display:none"),
+            "menu must start closed: {html}"
+        );
+        let open = render_capabilities("s1", &caps, true).to_string();
+        assert!(
+            open.contains("display:block"),
+            "open render must show the menu: {open}"
+        );
+    }
+
+    #[test]
+    fn read_only_view_exposes_no_capabilities_or_effort_controls() {
+        // A shared read-only viewer has no composer, so neither the effort
+        // picker nor the "+" menu (both owner-only mutations) may appear.
+        let viewer = page_body_ro(None, true);
+        assert!(
+            !viewer.contains("/chat/s1/effort"),
+            "read-only view must not expose the effort endpoint: {viewer}"
+        );
+        assert!(
+            !viewer.contains("/chat/s1/capabilities"),
+            "read-only view must not expose the capabilities endpoint: {viewer}"
         );
     }
 }

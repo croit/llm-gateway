@@ -56,6 +56,13 @@ pub struct Skill {
     /// non-empty, <= 64 chars so it's safe as a tool argument and matches
     /// cleanly against a role's `skills` list.
     pub name: String,
+    /// Human-readable display name for UI surfaces (the composer's "+" menu).
+    /// From the optional frontmatter `title`; when absent, derived by
+    /// prettifying `name` (`commit-message-helper` → "Commit Message Helper").
+    /// Not part of the model-facing advertisement — the model still keys off
+    /// `name` — so this is a pure presentation field and a safe extension of
+    /// the base skill frontmatter (`name` + `description`).
+    pub title: String,
     /// From the frontmatter `description`. Advertised verbatim to the model
     /// so it can decide when the skill is relevant.
     pub description: String,
@@ -500,11 +507,34 @@ fn load_skill(root: &Path) -> Result<Skill, LoadError> {
     if !is_valid_name(name) {
         return Err(LoadError::BadName(name.clone()));
     }
+    let title = front
+        .get("title")
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| prettify_name(name));
     Ok(Skill {
         name: name.clone(),
+        title,
         description: description.clone(),
         root: root.to_path_buf(),
     })
+}
+
+/// Derive a human-readable display name from a slug `name`: split on `-`/`_`/`.`
+/// and title-case each word (`commit-message-helper` → "Commit Message Helper").
+/// Used when a skill's frontmatter doesn't set an explicit `title`.
+fn prettify_name(slug: &str) -> String {
+    slug.split(['-', '_', '.'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A skill `name` must be safe to pass back as a tool argument and to match
@@ -678,6 +708,36 @@ mod tests {
     }
 
     #[test]
+    fn prettify_name_title_cases_slug_words() {
+        assert_eq!(
+            prettify_name("commit-message-helper"),
+            "Commit Message Helper"
+        );
+        assert_eq!(
+            prettify_name("croit_brand.guardian"),
+            "Croit Brand Guardian"
+        );
+        assert_eq!(prettify_name("simple"), "Simple");
+    }
+
+    #[test]
+    fn title_defaults_to_prettified_name_else_honours_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `title` → prettified slug.
+        let d1 = write_skill(dir.path(), "commit-message-helper", "# Body");
+        assert_eq!(load_skill(&d1).unwrap().title, "Commit Message Helper");
+        // Explicit `title` wins.
+        let d2 = dir.path().join("custom");
+        std::fs::create_dir_all(&d2).unwrap();
+        std::fs::write(
+            d2.join(MANIFEST_FILE),
+            "---\nname: custom\ntitle: My Fancy Skill\ndescription: d.\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!(load_skill(&d2).unwrap().title, "My Fancy Skill");
+    }
+
+    #[test]
     fn frontmatter_strips_surrounding_quotes_and_bom() {
         let raw = "\u{feff}---\nname: \"quoted\"\ndescription: 'single'\n---\nbody";
         let front = parse_frontmatter(raw);
@@ -811,6 +871,7 @@ mod tests {
         std::fs::write(dir.path().join("secret.txt"), "TOPSECRET").unwrap();
         let skill = Skill {
             name: "alpha".into(),
+            title: "Alpha".into(),
             description: "d".into(),
             root: root.clone(),
         };
@@ -834,11 +895,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = Skill {
             name: "dup".into(),
+            title: "Dup".into(),
             description: "first".into(),
             root: dir.path().join("a"),
         };
         let b = Skill {
             name: "dup".into(),
+            title: "Dup".into(),
             description: "second".into(),
             root: dir.path().join("b"),
         };

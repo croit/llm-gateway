@@ -106,13 +106,21 @@ impl Tool for EnableTools {
             description.push_str(&format!("- {} — {} ({})\n", t.key, t.title, t.one_liner));
         }
         if self.catalog.is_empty() {
-            description.push_str("(none — every available capability is already active)\n");
+            description
+                .push_str("(none built in — every available capability is already active)\n");
         }
-        let keys: Vec<Value> = self
-            .catalog
-            .iter()
-            .map(|t| Value::String(t.key.clone()))
-            .collect();
+        description.push_str(
+            "\nThe signed-in user may also have connected MCP integrations (keys like \
+             `mcp__github`). Those are listed in the system context message, not here — \
+             pass such a key to turn the integration on.\n",
+        );
+        // NB: deliberately *no* `enum` constraint on the items. The static
+        // catalog above can't include the user's per-account MCP connector keys
+        // (they're resolved per request), and a guided-decoding backend would
+        // reject any key outside an enum — so the model could never enable a
+        // connected integration. Validation happens at runtime in `run`
+        // instead: unknown keys are skipped, and enabling a key that surfaces
+        // no tools is harmless (the MCP layer is the authoritative gate).
         ToolDef::function(
             self.id(),
             description,
@@ -125,9 +133,10 @@ impl Tool for EnableTools {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 8,
-                        "items": { "type": "string", "enum": keys },
+                        "items": { "type": "string" },
                         "description": "Toggle keys to enable for this conversation \
-                                        — pick from the list in this tool's description."
+                                        — pick from the list in this tool's description, \
+                                        or an `mcp__*` integration key from the system context."
                     }
                 }
             }),
@@ -153,7 +162,13 @@ impl Tool for EnableTools {
             let mut enabled: Vec<String> = Vec::new();
             let mut skipped: Vec<Value> = Vec::new();
             for key in &args.keys {
-                if !known.contains(key.as_str()) {
+                // Accept the static catalog keys, plus any `mcp__*` connector
+                // key (the user's connected integrations aren't in the static
+                // snapshot — they're advertised in the system context). An
+                // `mcp__*` key that doesn't match a connected connector just
+                // surfaces no tools; the MCP layer is the real gate, so writing
+                // the row is harmless.
+                if !known.contains(key.as_str()) && !key.starts_with(MCP_ID_PREFIX) {
                     skipped.push(json!({ "key": key, "reason": "unknown key" }));
                     continue;
                 }
@@ -338,19 +353,47 @@ mod tests {
     }
 
     #[test]
-    fn schema_lists_keys_in_enum_and_description() {
+    fn schema_lists_keys_in_description_without_an_enum() {
         let reg = ToolRegistry::new().with(FetchUrl);
         let et = EnableTools::from_registry(&reg);
         let def = et.schema();
         assert!(def.function.description.contains("fetch_url"));
-        let enum_keys = &def.function.parameters["properties"]["keys"]["items"]["enum"];
+        // No `enum` constraint: a guided-decoding backend must be able to emit
+        // a per-user `mcp__*` key that isn't in the static catalog.
         assert!(
-            enum_keys
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v == "fetch_url")
+            def.function.parameters["properties"]["keys"]["items"]
+                .get("enum")
+                .is_none(),
+            "items must not constrain to an enum"
         );
+    }
+
+    #[tokio::test]
+    async fn accepts_an_mcp_connector_key_not_in_the_static_catalog() {
+        // Per-user MCP connector keys aren't in the registry snapshot, but the
+        // model must still be able to enable a connected integration.
+        let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+        seed_session(&pool, "s1").await;
+        let reg = ToolRegistry::new().with(FetchUrl);
+        let et = EnableTools::from_registry(&reg);
+        let out = et
+            .run(
+                ctx(pool.clone(), Some("s1".into())).await,
+                json!({"keys": ["mcp__gitlab"]}),
+            )
+            .await
+            .unwrap();
+        let enabled: Vec<&str> = out["enabled"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(enabled, vec!["mcp__gitlab"]);
+        let on = crate::server::db::chat_session_tools::enabled_keys_for_session(&pool, "s1")
+            .await
+            .unwrap();
+        assert!(on.contains("mcp__gitlab"));
     }
 
     #[tokio::test]

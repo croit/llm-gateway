@@ -49,16 +49,18 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     models.sort();
     let mut rows: Vec<ModelRow> = Vec::with_capacity(models.len());
     for name in &models {
-        let stored = match db::get(&state.db, name).await {
-            Ok(opt) => opt.map(|r| r.defaults_toml).unwrap_or_default(),
+        let (stored, reasoning_style) = match db::get(&state.db, name).await {
+            Ok(Some(r)) => (r.defaults_toml, r.reasoning_style),
+            Ok(None) => (String::new(), None),
             Err(err) => {
                 tracing::warn!(error = %err, model = %name, "model_defaults: get failed");
-                String::new()
+                (String::new(), None)
             }
         };
         rows.push(ModelRow {
             name: name.clone(),
             toml: stored,
+            reasoning_style: reasoning_style.unwrap_or_default(),
         });
     }
 
@@ -127,15 +129,66 @@ pub async fn models_save(State(state): State<Arc<RamaState>>, req: Request) -> R
     )
 }
 
+/// POST /admin/models/reasoning — save a model's reasoning style (how its
+/// reasoning budget is expressed on the wire). Kept separate from the TOML
+/// save so clearing the sampling defaults (which deletes the row) doesn't also
+/// reset the reasoning style, and vice versa. An empty / "auto" value clears
+/// the explicit choice and falls back to name-based auto-detection.
+pub async fn models_reasoning_save(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let form: ReasoningForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+    };
+    if form.model_name.is_empty() {
+        return toast(FlashKind::Error, "missing model_name field");
+    }
+    // Empty / "auto" → clear the explicit choice (NULL), otherwise store the
+    // canonical value. Validate against the known styles so a bad submission
+    // can't poison the row.
+    let style = match form.reasoning_style.trim() {
+        "" | "auto" => None,
+        s @ ("none" | "qwen" | "openai" | "glm" | "anthropic") => Some(s),
+        other => {
+            return toast(
+                FlashKind::Error,
+                format!("unknown reasoning style `{other}`"),
+            );
+        }
+    };
+    if let Err(err) = db::set_reasoning_style(&state.db, &form.model_name, style).await {
+        return toast(FlashKind::Error, format!("db: {err}"));
+    }
+    toast(
+        FlashKind::Success,
+        format!("saved reasoning style for `{}`", form.model_name),
+    )
+}
+
 #[derive(serde::Deserialize)]
 struct SaveForm {
     model_name: String,
     defaults_toml: String,
 }
 
+#[derive(serde::Deserialize)]
+struct ReasoningForm {
+    model_name: String,
+    reasoning_style: String,
+}
+
 struct ModelRow {
     name: String,
     toml: String,
+    /// Stored reasoning style, or empty string for "auto" (name-detected).
+    reasoning_style: String,
 }
 
 fn render_models_body(rows: &[ModelRow]) -> Html {
@@ -190,8 +243,9 @@ fn render_model_card(row: &ModelRow) -> Html {
     html! {
         article(class: "card border border-base-300 bg-base-100") {
             div(class: "card-body gap-3") {
-                header(class: "flex items-center justify-between gap-3") {
+                header(class: "flex items-center justify-between gap-3 flex-wrap") {
                     h2(class: "card-title text-base font-mono break-all") { (row.name.clone()) }
+                    (render_reasoning_select(row))
                 }
                 form(
                     method: "post",
@@ -218,6 +272,52 @@ fn render_model_card(row: &ModelRow) -> Html {
                             span { "Save" }
                         }
                     }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// The per-model "reasoning style" picker: a tiny form whose `<select>`
+/// auto-saves on change. Tells `apply_effort` how this model expects its
+/// reasoning budget on the wire; "Auto" leaves it to name detection.
+fn render_reasoning_select(row: &ModelRow) -> Html {
+    let action = "/admin/models/reasoning";
+    let options: &[(&str, &str)] = &[
+        ("", "Reasoning: Auto"),
+        ("none", "Reasoning: none"),
+        ("qwen", "Reasoning: Qwen (vLLM)"),
+        ("openai", "Reasoning: OpenAI"),
+        ("glm", "Reasoning: GLM / z.AI"),
+        ("anthropic", "Reasoning: Anthropic"),
+    ];
+    let current = row.reasoning_style.as_str();
+    let option_html: Vec<Html> = options
+        .iter()
+        .map(|(value, label)| {
+            if *value == current {
+                html! { option(value: (*value), selected: "selected") { (*label) } }.to_html()
+            } else {
+                html! { option(value: (*value)) { (*label) } }.to_html()
+            }
+        })
+        .collect();
+    html! {
+        form(
+            method: "post",
+            action: (action),
+            class: "m-0"
+        ) {
+            input(type: "hidden", name: "model_name", value: (row.name.clone()));
+            select(
+                name: "reasoning_style",
+                "aria-label": "Reasoning style",
+                "data-on:change": (format!("@post('{action}', {{contentType: 'form'}})")),
+                class: "select select-bordered select-xs"
+            ) {
+                for o in option_html.iter() {
+                    (o.clone())
                 }
             }
         }

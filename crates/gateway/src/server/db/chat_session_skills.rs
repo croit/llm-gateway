@@ -38,6 +38,19 @@ pub async fn record(pool: &Pool, session_id: &str, skill_name: &str) -> Result<(
     Ok(())
 }
 
+/// Unload `skill_name` from `session_id` (the user un-pinned it in the
+/// composer). No-op if it wasn't loaded. The model can still re-load it later
+/// via `read_skill`, and a stale row is harmless, so this is a pure
+/// user-intent toggle.
+pub async fn remove(pool: &Pool, session_id: &str, skill_name: &str) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM chat_session_skills WHERE session_id = ? AND skill_name = ?")
+        .bind(session_id)
+        .bind(skill_name)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// The skill names loaded in this conversation, oldest first (so re-injected
 /// guidance keeps a stable order across turns — easy on the prefix cache).
 pub async fn loaded_for_session(pool: &Pool, session_id: &str) -> Result<Vec<String>, DbError> {
