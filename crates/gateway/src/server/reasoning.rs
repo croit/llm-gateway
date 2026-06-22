@@ -66,13 +66,15 @@ impl Effort {
         }
     }
 
-    /// German UI label (the product is DE+EN; the composer shows this).
+    /// UI label shown in the composer's effort picker. English — the product's
+    /// chrome is English (users may chat in any language, but the UI isn't
+    /// localised).
     pub fn label(self) -> &'static str {
         match self {
-            Self::Fast => "Schnell",
+            Self::Fast => "Fast",
             Self::Standard => "Standard",
-            Self::Deep => "Tief",
-            Self::Max => "Maximal",
+            Self::Deep => "Deep",
+            Self::Max => "Max",
         }
     }
 

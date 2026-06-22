@@ -491,14 +491,11 @@ pub async fn chat_effort_set(
         return see_other("/chat");
     }
     let datastar = is_datastar_request(req.headers());
-    let (_, body) = req.into_parts();
-    let bytes = match read_body_to_bytes(body).await {
-        Ok(b) => b,
-        Err(msg) => return internal_error_html(&user.email, &msg),
-    };
-    let form: EffortForm = match serde_urlencoded::from_bytes(&bytes) {
+    // The picker isn't a form (it lives inside the composer's form), so the
+    // chosen level rides in the query string.
+    let form: EffortForm = match serde_urlencoded::from_str(req.uri().query().unwrap_or("")) {
         Ok(f) => f,
-        Err(err) => return internal_error_html(&user.email, &format!("malformed form: {err}")),
+        Err(err) => return internal_error_html(&user.email, &format!("malformed query: {err}")),
     };
     // Normalise through the enum so only known levels ever land in the DB.
     let effort = crate::server::reasoning::Effort::from_db(Some(&form.effort));
@@ -516,7 +513,7 @@ pub async fn chat_effort_set(
     }
     sse_response(&[sse_toast(&super::Flash {
         kind: super::FlashKind::Success,
-        message: format!("Denkaufwand: {}", effort.label()),
+        message: format!("Thinking effort: {}", effort.label()),
     })])
 }
 
@@ -567,7 +564,7 @@ async fn build_capabilities(
                 key,
                 kind: CapKind::Tool,
                 label: c.name,
-                group: "Integrationen",
+                group: "Integrations",
                 enabled: on,
                 icon: c.icon,
             });

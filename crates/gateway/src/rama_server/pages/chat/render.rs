@@ -188,7 +188,6 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                         }
                     }
                 }
-                (render_effort_select(&session_id, page.effort))
                 if has_voice {
                     div(class: "flex items-center gap-1.5 text-sm") {
                         (icons::mic(14))
@@ -285,10 +284,15 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                 // A turn already in flight seeds the Stop control server-side,
                 // so a reload mid-stream still offers a way to stop it.
                 streaming: page.in_flight_turn_id.is_some(),
-                // The "+" tools/integrations/skills menu lives inside the
-                // composer (above the input), so it rides with the sticky
-                // composer instead of floating below it.
-                toolbar: Some(render_capabilities(&session_id, page.capabilities, false)),
+                // The "+" tools/integrations/skills menu AND the "Denken"
+                // (effort) picker live inside the composer (above the input),
+                // so both ride with the sticky composer and sit where the user
+                // is typing — not stranded in the page header.
+                toolbar: Some(render_composer_toolbar(
+                    &session_id,
+                    page.capabilities,
+                    page.effort,
+                )),
             }))
         }
     }
@@ -342,6 +346,34 @@ fn session_label(session: &Session) -> String {
 /// The conversation's effort ("Denkaufwand") picker: a one-field form whose
 /// `<select>` auto-posts on change. One knob drives both the upstream
 /// reasoning budget and the tool-round cap (see `server::reasoning`).
+/// The composer toolbar row: the "+" capability menu and the "Denken"
+/// (effort) picker, side by side right above the input — so both controls sit
+/// where the user is typing instead of being stranded in the page header.
+fn render_composer_toolbar(
+    session_id: &str,
+    caps: &[CapabilityRow],
+    effort: crate::server::reasoning::Effort,
+) -> Html {
+    html! {
+        // Full width so the effort picker can sit hard-right: "+ Tools" (+ active
+        // chips) stay left, the thinking picker floats right. Horizontal padding
+        // matches the textarea's text inset (1.125rem) so the pills clear the
+        // composer's rounded corners and line up with the typed text.
+        div(style: "display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem; \
+                    width:100%; padding:0.5rem 1.125rem 0") {
+            (render_capabilities(session_id, caps, false))
+            div(style: "margin-left:auto") {
+                (render_effort_select(session_id, effort))
+            }
+        }
+    }
+    .to_html()
+}
+
+/// The "Denken" (effort / thinking) picker. A labelled `<select>` — NOT wrapped
+/// in a `<form>` (it lives inside the composer's form; nested forms are
+/// invalid), so it posts the chosen level in the query string on change. The
+/// visible "Denken:" label + sparkle make it findable next to the "+" button.
 fn render_effort_select(session_id: &str, effort: crate::server::reasoning::Effort) -> Html {
     use crate::server::reasoning::Effort;
     let action = format!("/chat/{session_id}/effort");
@@ -358,18 +390,25 @@ fn render_effort_select(session_id: &str, effort: crate::server::reasoning::Effo
         })
         .collect();
     html! {
-        form(
-            method: "post",
-            action: (action.clone()),
-            class: "m-0 flex items-center gap-1.5 text-sm",
-            title: "Denkaufwand: höher = gründlichere Antworten und mehr Tool-Runden, aber langsamer"
+        span(
+            class: "text-sm",
+            style: "display:inline-flex; align-items:center; gap:0.35rem",
+            title: "Thinking effort: higher = more reasoning and more tool rounds, but slower"
         ) {
-            (icons::sparkles(14))
+            (icons::sparkles(16))
+            span(class: "opacity-70 hidden sm:inline") { "Thinking:" }
+            // `name` deliberately omitted so the surrounding composer form
+            // doesn't serialise this select on send; the value rides in the
+            // `@post` query instead.
             select(
-                name: "effort",
-                "aria-label": "Denkaufwand",
-                "data-on:change": (format!("@post('{action}', {{contentType: 'form'}})")),
-                class: "select select-bordered select-sm chat-model-select"
+                "aria-label": "Thinking effort",
+                "data-on:change": (format!("@post('{action}?effort=' + evt.target.value)")),
+                class: "select select-sm",
+                // `padding-right` clears daisyUI's dropdown arrow (~20px in)
+                // so the label can't run under it; pill radius matches the
+                // rounded "+ Tools" button.
+                style: "border:1px solid color-mix(in oklch, currentColor 15%, transparent); \
+                        border-radius:9999px; padding-right:2rem; min-width:6rem"
             ) {
                 for o in opts.iter() {
                     (o.clone())
@@ -397,7 +436,14 @@ pub(super) fn render_capabilities(session_id: &str, caps: &[CapabilityRow], open
     // survives a pin (re-declaring `data-signals` would reset it to false and
     // snap the menu shut).
     html! {
-        div(id: "cap-wrap", "data-signals": "{capMenu: false, capQuery: ''}") {
+        div(
+            id: "cap-wrap",
+            "data-signals": "{capMenu: false, capQuery: ''}",
+            // Click anywhere outside this wrapper (button + popup) closes the
+            // menu. Scoped to `#cap-wrap` so clicking the toggle button itself
+            // — which lives inside — isn't treated as an outside click.
+            "data-on:click__outside": "$capMenu = false"
+        ) {
             (render_capabilities_inner(session_id, caps, open))
         }
     }
@@ -421,7 +467,7 @@ pub(super) fn render_capabilities_inner(
     // Menu rows, grouped (Integrations first, then Skills) under clear section
     // headings. Only high-level entries live here — see `build_capabilities`.
     let mut menu_items: Vec<Html> = Vec::new();
-    for g in ["Integrationen", "Skills"] {
+    for g in ["Integrations", "Skills"] {
         let items: Vec<Html> = caps
             .iter()
             .filter(|c| c.group == g)
@@ -458,7 +504,10 @@ pub(super) fn render_capabilities_inner(
                     type: "button",
                     "data-on:click": "$capMenu = !$capMenu",
                     class: "btn btn-ghost btn-sm gap-1",
-                    title: "Integrationen & Skills für diese Unterhaltung"
+                    // Pill so the hover/active highlight is fully rounded — the
+                    // default 6px reads square next to the rounded composer.
+                    style: "border-radius:9999px",
+                    title: "Integrations & skills for this conversation"
                 ) {
                     (icons::plus(16))
                     span { "Tools" }
@@ -472,7 +521,7 @@ pub(super) fn render_capabilities_inner(
                         if show_search {
                             input(
                                 type: "text",
-                                placeholder: "Suchen…",
+                                placeholder: "Search…",
                                 "data-on:input": "$capQuery = evt.target.value.toLowerCase()",
                                 class: "input input-sm",
                                 style: "width:100%; margin-bottom:0.25rem; \
@@ -491,9 +540,9 @@ pub(super) fn render_capabilities_inner(
                         "data-show": "$capMenu",
                         style: (format!("{panel_style}; padding:0.75rem"))
                     ) {
-                        "Verbinde eine Integration unter "
-                        a(href: "/integrations", style: "text-decoration:underline") { "Integrationen" }
-                        ", um sie hier bereitzustellen."
+                        "Connect an integration under "
+                        a(href: "/integrations", style: "text-decoration:underline") { "Integrations" }
+                        " to make it available here."
                     }
                 }
             }
@@ -591,7 +640,7 @@ fn cap_chip(base: &str, c: &CapabilityRow) -> Html {
             "data-on:click": (format!("@post('{url}')")),
             class: "badge badge-outline gap-1",
             style: "cursor:pointer",
-            title: "Entfernen"
+            title: "Remove"
         ) {
             span(style: "display:inline-flex") { (cap_icon(c)) }
             span { (c.label.clone()) }
@@ -963,7 +1012,7 @@ mod tests {
             body.contains("/chat/s1/effort"),
             "effort picker must post to the effort endpoint: {body}"
         );
-        for label in ["Schnell", "Standard", "Tief", "Maximal"] {
+        for label in ["Fast", "Standard", "Deep", "Max"] {
             assert!(
                 body.contains(label),
                 "missing effort level `{label}`: {body}"
@@ -985,7 +1034,7 @@ mod tests {
                 key: "mcp__atlassian".into(),
                 kind: CapKind::Tool,
                 label: "Atlassian".into(),
-                group: "Integrationen",
+                group: "Integrations",
                 enabled: true,
                 icon: None,
             },
@@ -993,7 +1042,7 @@ mod tests {
                 key: "mcp__gitlab".into(),
                 kind: CapKind::Tool,
                 label: "GitLab".into(),
-                group: "Integrationen",
+                group: "Integrations",
                 enabled: false,
                 icon: None,
             },
@@ -1023,7 +1072,7 @@ mod tests {
         );
         // Group headings give clear section structure.
         assert!(
-            html.contains("Integrationen") && html.contains("Skills"),
+            html.contains("Integrations") && html.contains("Skills"),
             "section headings missing: {html}"
         );
         // Every toggle is a plain button that @posts to the capabilities
