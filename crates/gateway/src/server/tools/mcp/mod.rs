@@ -38,6 +38,9 @@ use shared::api::ToolDef;
 use super::{Tool, ToolContext, ToolError, ToolFuture, ToolResult, tool_content_parts};
 use crate::server::config::{McpConfig, McpServerConfig};
 
+pub mod manager;
+pub mod worker;
+
 /// Prefix every bridged tool id carries, so the catalog can group them and
 /// the registry can't confuse them with a built-in. Matches the parsing in
 /// `catalog::entry_key_for`.
@@ -56,7 +59,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(25);
 /// A live session to one MCP server. The `Arc` each [`McpTool`] holds keeps
 /// it (and its background transport task) alive for the life of the registry
 /// — i.e. the process. Dropping the last reference closes the connection.
-struct McpConnection {
+pub(crate) struct McpConnection {
     name: String,
     service: RunningService<RoleClient, ()>,
 }
@@ -69,6 +72,36 @@ pub struct McpTool {
     remote_name: String,
     schema: ToolDef,
     conn: Arc<McpConnection>,
+    /// MCP `readOnlyHint` annotation, when the server provided one. Drives the
+    /// default permission tier in the per-user connector store.
+    read_only: bool,
+    /// MCP `destructiveHint` annotation. Together with `read_only` it sets the
+    /// default tier: destructive (and not read-only) → `ask`, everything else
+    /// → `always` (so a connected connector's read/query tools work in chat
+    /// without the user pre-authorizing each one).
+    destructive: bool,
+}
+
+impl McpTool {
+    /// The server's own (un-namespaced) tool name.
+    pub fn remote_name(&self) -> &str {
+        &self.remote_name
+    }
+
+    /// The model-facing definition.
+    pub fn def(&self) -> &ToolDef {
+        &self.schema
+    }
+
+    /// Whether the server marked this tool read-only.
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Whether the server marked this tool destructive.
+    pub fn destructive(&self) -> bool {
+        self.destructive
+    }
 }
 
 impl Tool for McpTool {
@@ -164,18 +197,56 @@ async fn connect_and_list(server: &McpServerConfig) -> Result<Vec<McpTool>, Stri
         .await
         .map_err(|e| format!("tools/list failed: {e}"))?;
 
+    let out = build_tools(&server.name, &conn, remote_tools, Some(server));
+    tracing::info!(server = %server.name, tools = out.len(), "connected MCP server");
+    Ok(out)
+}
+
+/// Build [`McpTool`]s from a connection's listed tools. `server` (when set)
+/// supplies the description fallback for the boot/config path; per-user
+/// connections pass `None` and fall back to a generic line.
+fn build_tools(
+    name: &str,
+    conn: &Arc<McpConnection>,
+    remote_tools: Vec<rmcp::model::Tool>,
+    server: Option<&McpServerConfig>,
+) -> Vec<McpTool> {
     let mut out = Vec::with_capacity(remote_tools.len());
     let mut seen = HashSet::new();
     for t in remote_tools {
-        let registry_id = sanitize_tool_id(&server.name, &t.name);
+        let registry_id = sanitize_tool_id(name, &t.name);
         if !seen.insert(registry_id.clone()) {
             tracing::warn!(
-                server = %server.name, tool = %t.name, id = %registry_id,
+                server = %name, tool = %t.name, id = %registry_id,
                 "MCP tool id collides after sanitization — skipping"
             );
             continue;
         }
-        let description = tool_description(server, &t);
+        let description = match server {
+            Some(s) => tool_description(s, &t),
+            None => t
+                .description
+                .as_deref()
+                .filter(|d| !d.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    t.title
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| format!("`{}` tool from the `{name}` MCP server.", t.name)),
+        };
+        let read_only = t
+            .annotations
+            .as_ref()
+            .and_then(|a| a.read_only_hint)
+            .unwrap_or(false);
+        let destructive = t
+            .annotations
+            .as_ref()
+            .and_then(|a| a.destructive_hint)
+            .unwrap_or(false);
         let parameters = Value::Object((*t.input_schema).clone());
         let schema = ToolDef::function(registry_id.clone(), description, parameters);
         out.push(McpTool {
@@ -183,10 +254,47 @@ async fn connect_and_list(server: &McpServerConfig) -> Result<Vec<McpTool>, Stri
             remote_name: t.name.to_string(),
             schema,
             conn: conn.clone(),
+            read_only,
+            destructive,
         });
     }
-    tracing::info!(server = %server.name, tools = out.len(), "connected MCP server");
-    Ok(out)
+    out
+}
+
+/// A live per-user connection to a remote (HTTP) MCP server, plus its tools.
+pub(crate) struct ConnectedServer {
+    pub conn: Arc<McpConnection>,
+    pub tools: Vec<McpTool>,
+}
+
+/// Connect to a remote streamable-HTTP MCP server with an optional bearer
+/// token (the user's OAuth access token), and list its tools. Used by the
+/// per-user [`manager::McpConnectionManager`]; the bearer is the only thing
+/// that differs from the operator/boot path.
+pub(crate) async fn connect_http_server(
+    name: &str,
+    url: &str,
+    bearer: Option<&str>,
+) -> Result<ConnectedServer, String> {
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+    if let Some(token) = bearer {
+        config = config.auth_header(token.to_string());
+    }
+    let transport = StreamableHttpClientTransport::from_config(config);
+    let service = tokio::time::timeout(CONNECT_TIMEOUT, serve_client((), transport))
+        .await
+        .map_err(|_| format!("MCP handshake to `{name}` timed out"))?
+        .map_err(|e| format!("MCP handshake to `{name}` failed: {e}"))?;
+    let conn = Arc::new(McpConnection {
+        name: name.to_string(),
+        service,
+    });
+    let remote_tools = tokio::time::timeout(CONNECT_TIMEOUT, conn.service.list_all_tools())
+        .await
+        .map_err(|_| format!("tools/list on `{name}` timed out"))?
+        .map_err(|e| format!("tools/list on `{name}` failed: {e}"))?;
+    let tools = build_tools(name, &conn, remote_tools, None);
+    Ok(ConnectedServer { conn, tools })
 }
 
 /// Open the transport the config asks for and run the MCP handshake. Exactly

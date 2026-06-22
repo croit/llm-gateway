@@ -1,0 +1,54 @@
+# systemd-podman Quadlet for the self-managed GitLab MCP bridge
+# (zereight/gitlab-mcp). Backs the "GitLab (self-managed / CE)" connector.
+#
+# GitLab's *native* MCP server (/api/v4/mcp) is a GitLab Duo feature that needs
+# Premium/Ultimate, so Community Edition can't use it. This community bridge runs
+# in streamable-HTTP + remote-authorization mode: each MCP request carries the
+# caller's own GitLab personal access token, which the bridge forwards to GitLab
+# — so every user gets their own permissions. It needs NO public URL and NO
+# OAuth (unlike the Google Workspace MCP); the gateway reaches it internally.
+#
+# Install:
+#   sudo cp deploy/quadlet/gitlab-mcp.container /etc/containers/systemd/
+#   sudo install -m 0644 deploy/quadlet/gitlab-mcp.example.env /etc/gateway/gitlab-mcp.env
+#   sudo $EDITOR /etc/gateway/gitlab-mcp.env          # set GITLAB_API_URL
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now gitlab-mcp.service
+#
+# Then in the gateway: /admin/connectors → "GitLab (self-managed / CE)" → set the
+# MCP server URL to http://<this-host>:3333/mcp → Save → Enable. Each user pastes
+# their GitLab PAT (scope `api`, or `read_api` for read-only) at /integrations.
+
+[Unit]
+Description=GitLab self-managed/CE MCP bridge (per-user PAT)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=gitlab-mcp
+Image=docker.io/zereight050/gitlab-mcp:latest
+
+# Loopback only — internal service, reached by the gateway. Never expose it
+# publicly. (Container listens on 3002.)
+PublishPort=127.0.0.1:3333:3002
+
+# GITLAB_API_URL=https://<your-gitlab>/api/v4
+EnvironmentFile=/etc/gateway/gitlab-mcp.env
+
+Environment=HOST=0.0.0.0
+# Streamable-HTTP at /mcp; required for remote-authorization (per-request token).
+Environment=STREAMABLE_HTTP=true
+# Each request's bearer is used as that user's GitLab token (no fixed PAT).
+Environment=REMOTE_AUTHORIZATION=true
+# Read-only by default; set false to allow writes (create MR/issue/comment/…).
+Environment=GITLAB_READ_ONLY_MODE=true
+
+NoNewPrivileges=true
+DropCapability=ALL
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target default.target

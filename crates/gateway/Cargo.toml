@@ -66,6 +66,11 @@ rmcp = { version = "1.7", default-features = false, features = [
     "client",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
+    # rmcp pulls its OWN reqwest (0.13, separate from the workspace's 0.12), so
+    # Cargo feature-unification does NOT give it a TLS backend. Without this the
+    # transport's reqwest can't speak https → every remote MCP connection fails
+    # with hyper's "invalid URL, scheme is not http". This enables rustls on it.
+    "reqwest",
 ] }
 
 # Async + I/O. `net` is enabled for the `tls_cert` tool's raw TCP connect
@@ -94,6 +99,10 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
+# AES-256-GCM at-rest encryption for per-user MCP OAuth tokens + admin-stored
+# connector client secrets (see `server::crypto`). Key from $GATEWAY_MCP_KEY,
+# else derived from the session secret.
+aes-gcm = "0.10"
 # typst compile scratch dirs (one per render); tiny, no native deps.
 tempfile = "3"
 

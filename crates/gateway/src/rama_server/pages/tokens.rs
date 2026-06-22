@@ -82,7 +82,10 @@ pub async fn tokens_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         let disabled = token_tool_prefs::disabled_for_token(&state.db, &t.id)
             .await
             .unwrap_or_default();
-        rows.push((TokenRowData::from(t), disabled));
+        rows.push((
+            row_with_policy(&state.db, TokenRowData::from(t)).await,
+            disabled,
+        ));
     }
     let body = render_tokens_body(&rows, &entries, None, &account);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
@@ -202,7 +205,8 @@ async fn render_row_after_state_change(
     let disabled = token_tool_prefs::disabled_for_token(&state.db, token_id)
         .await
         .unwrap_or_default();
-    Some(render_token_row(&TokenRowData::from(token), &entries, &disabled).to_string())
+    let row = row_with_policy(&state.db, TokenRowData::from(token)).await;
+    Some(render_token_row(&row, &entries, &disabled).to_string())
 }
 
 /// POST /tokens/{id}/revoke — form action from the row's Revoke
@@ -332,6 +336,60 @@ pub async fn tokens_tools_master(
         sse_toast(&Flash {
             kind: FlashKind::Success,
             message: format!("Tool use {verb} for this token."),
+        }),
+    ])
+}
+
+/// POST /tokens/{id}/mcp-policy — set whether this token may use `ask`-mode
+/// MCP connector tools over the API (the `'*'` default policy). Ownership is
+/// verified before the write; the row is re-rendered so the toggle reflects
+/// the stored state.
+pub async fn tokens_mcp_policy(
+    State(state): State<Arc<RamaState>>,
+    Path(token_id): Path<String>,
+    req: Request,
+) -> Response {
+    use crate::server::db::user_mcp::{AskOverApi, set_token_policy};
+    let (_, user) = match require_session_or_redirect(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let (_, body) = req.into_parts();
+    let form: MasterForm = match read_form(body).await {
+        Ok(f) => f,
+        Err(resp) => return resp,
+    };
+    // Verify the token belongs to the caller before touching its policy.
+    let owns = tokens::list_for_user(&state.db, &user.id)
+        .await
+        .map(|list| list.iter().any(|t| t.id == token_id))
+        .unwrap_or(false);
+    if !owns {
+        return sse_toast_response(FlashKind::Error, "Token not found.");
+    }
+    let policy = if form.enabled.is_some() {
+        AskOverApi::Allow
+    } else {
+        AskOverApi::Block
+    };
+    if let Err(err) = set_token_policy(&state.db, &token_id, "*", policy).await {
+        tracing::warn!(error = %err, %token_id, "set token mcp policy");
+        return sse_toast_response(FlashKind::Error, "Could not update token.");
+    }
+    let Some(row_html) = render_row_after_state_change(&state, &user, &token_id).await else {
+        return sse_toast_response(FlashKind::Error, "Token not found.");
+    };
+    let selector = format!("#token-row-{token_id}");
+    let verb = if matches!(policy, AskOverApi::Allow) {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    sse_response(&[
+        sse_patch(Some(&selector), Some("outer"), &row_html),
+        sse_toast(&Flash {
+            kind: FlashKind::Success,
+            message: format!("Ask-mode MCP tools over API {verb} for this token."),
         }),
     ])
 }
@@ -556,6 +614,9 @@ struct TokenRowData {
     delete_action: String,
     /// Master "tool use" switch state — drives the per-token tool panel.
     tools_enabled: bool,
+    /// Whether this token allows `ask`-mode MCP connector tools over the API
+    /// (the `'*'` default policy). Defaults false; set via `row_with_policy`.
+    mcp_allow: bool,
 }
 
 impl TokenRowData {
@@ -593,8 +654,19 @@ impl From<&tokens::Token> for TokenRowData {
             revoke_action: format!("/tokens/{}/revoke", t.id),
             delete_action: format!("/tokens/{}/delete", t.id),
             tools_enabled: t.tools_enabled,
+            mcp_allow: false,
         }
     }
+}
+
+/// Populate the per-token MCP `ask`-over-API policy (the `'*'` default) on a
+/// freshly-built row. Separate from `From` because it needs an async DB read.
+async fn row_with_policy(db: &crate::server::db::Pool, mut row: TokenRowData) -> TokenRowData {
+    row.mcp_allow = matches!(
+        crate::server::db::user_mcp::token_ask_policy(db, &row.id, "*").await,
+        Ok(crate::server::db::user_mcp::AskOverApi::Allow)
+    );
+    row
 }
 
 /// Datastar directive for the master "tool use" switch form.
@@ -609,6 +681,7 @@ fn master_directive(token_id: &str) -> String {
 fn render_token_tools_panel(
     token_id: &str,
     tools_enabled: bool,
+    mcp_allow: bool,
     entries: &[ToolEntry],
     disabled: &HashSet<String>,
 ) -> Html {
@@ -662,6 +735,41 @@ fn render_token_tools_panel(
                     div(class: "mt-2") { (sections) }
                 }
             }
+            if tools_enabled {
+                (render_token_mcp_policy(token_id, mcp_allow))
+            }
+        }
+    }
+    .to_html()
+}
+
+/// Per-token control for how `ask`-mode MCP connector tools behave over the
+/// API. The API can't pause for interactive approval, so `ask` tools are
+/// hidden by default; flipping this exposes them (treating `ask` as `always`)
+/// for this token. Connected-connector read tools (`always`) are unaffected.
+fn render_token_mcp_policy(token_id: &str, allow: bool) -> Html {
+    let action = format!("/tokens/{token_id}/mcp-policy");
+    let directive = format!("@post('{action}', {{contentType: 'form'}})");
+    html! {
+        form(
+            action: (action),
+            method: "post",
+            class: "m-0 mt-2 flex items-center gap-3",
+            "data-on:change__prevent": (directive)
+        ) {
+            if allow {
+                input(type: "checkbox", name: "enabled", value: "true",
+                      class: "toggle toggle-warning toggle-sm", checked: "checked",
+                      "aria-label": "Allow ask-mode MCP tools over API");
+            } else {
+                input(type: "checkbox", name: "enabled", value: "true",
+                      class: "toggle toggle-warning toggle-sm",
+                      "aria-label": "Allow ask-mode MCP tools over API");
+            }
+            span(class: "text-sm font-medium text-base-content") { "Allow “ask” MCP tools over API" }
+            span(class: "text-xs text-base-content/60") {
+                "Approval-required connector tools can't prompt over the API; enabling runs them without asking."
+            }
         }
     }
     .to_html()
@@ -676,8 +784,8 @@ fn render_token_row(r: &TokenRowData, entries: &[ToolEntry], disabled: &HashSet<
     let dom_id = r.dom_id();
     // A revoked token can't authenticate, so its tool config is moot — no
     // panel there.
-    let panel =
-        (!r.revoked).then(|| render_token_tools_panel(&r.id, r.tools_enabled, entries, disabled));
+    let panel = (!r.revoked)
+        .then(|| render_token_tools_panel(&r.id, r.tools_enabled, r.mcp_allow, entries, disabled));
     html! {
         li(id: (dom_id), class: "py-3") {
         div(class: "flex items-center gap-4") {

@@ -8,24 +8,40 @@
 # in — so the image needs no Rust toolchain (and we avoid pulling clang/
 # libclang for a transitive bindgen dep).
 #
-# NOTE: the runner is NOT run as a container in production — it runs as a host
-# systemd service (deploy/sandbox/sandbox-runner.service) so it can drive LOCAL
-# podman and select the gVisor runtime (remote podman over the socket can't
-# pass --runtime). This image is the delivery vehicle: setup-sandbox.sh extracts
-# /usr/local/bin/sandbox-runner from it. It still ships a podman client so the
-# binary can also be exercised in-container for testing.
+# Two supported deployments:
+#
+#  1. Host service on a PODMAN host (production, recommended) — the runner is
+#     NOT a container here; it runs as a host systemd service
+#     (deploy/sandbox/sandbox-runner.service) so it can drive LOCAL podman and
+#     select the gVisor runtime. Remote podman over a socket can't pass
+#     `--runtime`. This image is just the delivery vehicle: setup-sandbox.sh
+#     extracts /usr/local/bin/sandbox-runner from it.
+#
+#  2. Container on a DOCKER host (compose) — unlike remote podman, the Docker
+#     daemon DOES honor `--runtime` passed over its socket, so a containerised
+#     runner can select gVisor (runsc) and still get real isolation. For that
+#     path the image ships the `docker` CLI; run it with the Docker socket
+#     mounted and SANDBOX_PODMAN=docker, SANDBOX_RUNTIME=runsc (gVisor must be
+#     registered as a Docker runtime on the host). See docs/sandbox.md and
+#     compose.example.yml. The runner's boot isolation self-check fails loudly
+#     if the runtime didn't actually apply.
 #
 # Build (from the repo root, after building the binary):
 #   cargo build --release -p sandbox-runner
 #   docker build -f deploy/sandbox-runner/Containerfile -t llm-gateway-sandbox-runner .
 
+# Official client-only Docker CLI (static, multi-arch) for the compose path.
+FROM docker:cli AS dockercli
+
 FROM debian:trixie-slim
 
-# `podman` here is used as a REMOTE client against the host socket
-# (CONTAINER_HOST), so it only needs the CLI, not a full container stack.
+# `podman` is the REMOTE client for the host-podman path; the `docker` CLI
+# (copied below) drives the host Docker socket for the compose path. Both are
+# thin clients — no daemon/container stack in this image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         podman ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 
 COPY target/release/sandbox-runner /usr/local/bin/sandbox-runner
 

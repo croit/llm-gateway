@@ -32,6 +32,7 @@ use crate::rama_server::vad;
 use crate::server::auth::UserCtx;
 use crate::server::db::usage::{self, UsageKind, UsageRecord, UsageSource};
 use crate::server::tools::ToolContext;
+use crate::server::tools::ToolSource;
 use crate::server::tools::runner::{self, LoopError};
 use crate::server::upstreams::registry::{Acquired, RouteError};
 use crate::server::upstreams::{AcquireError, PoolKind};
@@ -155,7 +156,30 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     // this token's disabled capabilities, gated behind the token's master
     // "tool use" switch (off by default → empty → byte-dumb passthrough
     // below). One call covers buffered, streaming, and passthrough.
-    let allowed_tools = state.allowed_tools_for_token(&user).await;
+    let mut allowed_tools = state.allowed_tools_for_token(&user).await;
+
+    // Build the caller's connected-connector MCP overlay ONCE for this request
+    // and union its ids into the advertised set, so the tools we advertise are
+    // exactly the tools the `CompositeToolSource` below can dispatch (no
+    // advertise/execute drift). Empty + cheap when nothing is connected. Only
+    // when the token's master tool switch is on (else the per-token resolution
+    // already returned empty and we keep the byte-dumb path).
+    let user_mcp = if user.tools_enabled {
+        let role_ids = state.role_ids_for(&user.roles);
+        state
+            .mcp
+            .layer_for_user(
+                &user.user_id,
+                &role_ids,
+                crate::server::tools::mcp::manager::AskContext::Api {
+                    token_id: &user.token_id,
+                },
+            )
+            .await
+    } else {
+        crate::server::tools::mcp::manager::UserMcpLayer::default()
+    };
+    state.union_mcp_tool_ids(&mut allowed_tools, &user_mcp);
 
     // Apply admin-configured sampling defaults for the named model
     // before either branch consumes the body. Client keys win
@@ -230,6 +254,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
             client_ip.clone(),
             request_body,
             allowed_tools,
+            user_mcp,
         )
         .await;
     }
@@ -263,8 +288,14 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     // with backend/status/latency/tokens inside the loop closure.
     let rec = RecordParams::v1(&user, UsageKind::Chat, model.clone());
 
+    // Reuse the layer built once above (same ids we advertised) for dispatch.
+    let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
+        state.tools.as_ref(),
+        &user_mcp,
+    );
+
     let outcome = runner::run_with_tools(
-        &state.tools,
+        &tool_source,
         &allowed_tools,
         &tool_ctx,
         request_body,
@@ -1116,6 +1147,7 @@ async fn forward_streaming(
 /// Errors mid-stream surface as a `data: {"error": …}` chunk
 /// followed by `[DONE]` — we can't change the response status after
 /// the headers have shipped.
+#[allow(clippy::too_many_arguments)]
 async fn forward_streaming_with_tools(
     state: Arc<RamaState>,
     user: UserCtx,
@@ -1124,10 +1156,17 @@ async fn forward_streaming_with_tools(
     client_ip: Option<String>,
     mut request_body: Value,
     allowed_tools: Vec<String>,
+    user_mcp: crate::server::tools::mcp::manager::UserMcpLayer,
 ) -> Response {
+    // Use the layer built once by the caller (same ids it advertised) for
+    // injection here and for dispatch inside the loop.
+    let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
+        state.tools.as_ref(),
+        &user_mcp,
+    );
     // Inject gateway tools, force stream:true. `stream_options` can
     // stay (vLLM accepts it with stream:true).
-    if let Err(err) = runner::inject_tools(&mut request_body, &state.tools, &allowed_tools) {
+    if let Err(err) = runner::inject_tools(&mut request_body, &tool_source, &allowed_tools) {
         return loop_error_response(err);
     }
     if let Some(obj) = request_body.as_object_mut() {
@@ -1172,6 +1211,7 @@ async fn forward_streaming_with_tools(
             client_headers,
             tool_ctx,
             rec,
+            user_mcp,
             &mut tx,
         )
         .await
@@ -1299,9 +1339,17 @@ async fn drive_streaming_tool_loop(
     client_headers: HeaderMap,
     tool_ctx: ToolContext,
     rec: RecordParams,
+    user_mcp: super::super::server::tools::mcp::manager::UserMcpLayer,
     tx: &mut mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
     use rama::futures::StreamExt;
+
+    // The caller's connected-connector MCP tools, unioned onto the registry so
+    // the ownership split + dispatch below recognise + run them too.
+    let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
+        state.tools.as_ref(),
+        &user_mcp,
+    );
 
     for _round in 0..STREAM_TOOL_LOOP_MAX_ROUNDS {
         let acquired = state
@@ -1492,7 +1540,7 @@ async fn drive_streaming_tool_loop(
         // turn, then end the stream (the caller appends `[DONE]`).
         let has_client_owned = tool_acc
             .values()
-            .any(|acc| !acc.name.is_empty() && !state.tools.contains(&acc.name));
+            .any(|acc| !acc.name.is_empty() && !tool_source.contains(&acc.name));
         if has_client_owned {
             for chunk in synth_client_tool_call_chunks(&chunk_meta, &tool_acc) {
                 tx.unbounded_send(Ok(chunk))
@@ -1503,7 +1551,7 @@ async fn drive_streaming_tool_loop(
 
         let gateway_owned: Vec<runner::ToolCallRef> = tool_acc
             .values()
-            .filter(|acc| state.tools.contains(&acc.name))
+            .filter(|acc| tool_source.contains(&acc.name))
             .map(|acc| runner::ToolCallRef {
                 id: acc.id.clone(),
                 name: acc.name.clone(),
@@ -1518,7 +1566,7 @@ async fn drive_streaming_tool_loop(
             return Ok(());
         }
 
-        let results = runner::execute_tool_calls(&state.tools, &tool_ctx, &gateway_owned).await;
+        let results = runner::execute_tool_calls(&tool_source, &tool_ctx, &gateway_owned).await;
 
         // No client-owned calls here (handled above), so every accumulated
         // call is gateway-owned — build the assistant turn straight off

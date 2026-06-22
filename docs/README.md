@@ -13,6 +13,7 @@ This directory holds the design docs for the LLM gateway. The agent-facing entry
 | [`gateway-api.md`](gateway-api.md) | OpenAI-compatible HTTP API, streaming, transcription |
 | [`upstreams.md`](upstreams.md) | Provider config, model→backend routing, load balancing, health |
 | [`tools-rbac.md`](tools-rbac.md) | Tool registry, role→tool mapping, server-side execution loop |
+| [`connectors.md`](connectors.md) | Per-user MCP connector catalog — operator setup for Google/GitHub/Atlassian/GitLab + troubleshooting |
 | [`cli.md`](cli.md) | `gw` CLI commands, UX, on-disk config |
 | [`ui.md`](ui.md) | Server-rendered HTML with plait + daisyUI + datastar (SSE-patch CRUD pattern) |
 | [`testing.md`](testing.md) | Test layers, mocking strategy, coverage targets |

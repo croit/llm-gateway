@@ -10,6 +10,7 @@
 pub mod auth;
 pub mod chat_attachments;
 pub mod config;
+pub mod crypto;
 pub mod db;
 pub mod embeddings;
 pub mod geoip;

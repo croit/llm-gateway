@@ -82,6 +82,42 @@ The default `PublishPort=127.0.0.1:8080:8080` only binds loopback — put a TLS-
 
 The OIDC callback URL the gateway advertises is `<public_url>/auth/callback` from `[gateway].public_url` in `config.toml`. That URL must be reachable from your IdP and registered as an allowed redirect URI on the OIDC client.
 
+## Google Workspace MCP server (optional sidecar)
+
+The single **Google Workspace** connector (Gmail, Calendar, Drive, Docs, …) is
+backed by a self-hosted [`taylorwilsdon/google_workspace_mcp`](https://github.com/taylorwilsdon/google_workspace_mcp)
+server — Google's *hosted* MCP endpoints are gated behind a developer preview
+and don't scale to per-user use (see [`docs/connectors.md`](../../docs/connectors.md)).
+Ship it as a second Quadlet next to the gateway:
+
+```bash
+sudo cp deploy/quadlet/google-workspace-mcp.container /etc/containers/systemd/
+sudo install -m 0600 deploy/quadlet/google-workspace-mcp.example.env \
+     /etc/gateway/google-workspace-mcp.env
+sudo $EDITOR /etc/gateway/google-workspace-mcp.env     # OAuth client + URLs
+sudo systemctl daemon-reload
+sudo systemctl enable --now google-workspace-mcp.service
+```
+
+**This is not a purely internal sidecar.** The OAuth consent runs in the user's
+browser (gateway → this server's `/authorize` → Google → this server's
+`/oauth2callback` → back to the gateway), so the server's HTTP endpoint must be
+**publicly reachable over TLS**. Give it its own vhost on the same reverse proxy,
+e.g. Caddy:
+
+```caddy
+gworkspace-mcp.example.com {
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
+Then set `WORKSPACE_EXTERNAL_URL=https://gworkspace-mcp.example.com` in the env
+file, add `https://gworkspace-mcp.example.com/oauth2callback` as the redirect URI
+on the Google OAuth client, and in the gateway's `/admin/connectors` point the
+**Google Workspace** connector's URL at `https://gworkspace-mcp.example.com/mcp/`
+(DCR — no client id/secret in the gateway). The gateway reaches it over the same
+public hostname, so no extra internal networking is needed.
+
 ## Hardening
 
 The unit already runs read-only, drops every capability, and sets `NoNewPrivileges=true`. The image runs as the unprivileged `gateway` (uid 1000). Anything writable is either the named volume (`/var/lib/gateway`) or a tmpfs (`/tmp`). If you add features that need to write elsewhere, add another `Tmpfs=` or `Volume=` rather than peeling back the `ReadOnly=true`.

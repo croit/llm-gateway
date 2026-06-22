@@ -282,6 +282,52 @@ Quadlet. (`/dev/kvm` is not required — gVisor runs entirely in userspace.)
    `[chat.s3]` configured. Then `sudo systemctl daemon-reload && sudo systemctl
    restart gateway.service`.
 
+## Docker / Compose deployment (gVisor via the Docker socket)
+
+The podman path above runs the runner as a **host service** because remote
+podman can't pass `--runtime` over its socket. **Docker is different** — the
+Docker daemon honors `--runtime` passed over its socket, so on a Docker host the
+runner *can* run as a container and still get **real gVisor isolation**. That's
+the `sandbox-runner` service in [`compose.example.yml`](../deploy/compose.example.yml)
+(it drives the host Docker socket with `SANDBOX_PODMAN=docker`,
+`SANDBOX_RUNTIME=runsc`, spawning each job as a single-use sibling container).
+
+One-time host setup:
+
+1. Install gVisor and register `runsc` as a **Docker** runtime:
+   ```sh
+   # install runsc (see "Installing a sandbox runtime" above), then:
+   sudo runsc install            # adds the runsc runtime to /etc/docker/daemon.json
+   sudo systemctl restart docker
+   docker run --rm --runtime=runsc docker.io/library/alpine uname -r  # kernel ≠ host
+   ```
+   Under Docker no `--network=host` wrapper is needed — that shim is a rootful-
+   podman quirk; `runsc install` is the Docker-native equivalent.
+
+2. Bring up the sandbox profile and point the gateway at the runner:
+   ```sh
+   docker compose -f deploy/compose.example.yml --profile sandbox up -d
+   ```
+   ```toml
+   # gateway.toml
+   [sandbox]
+   runner_url = "http://sandbox-runner:9000"
+   ```
+
+The boot self-check still guards this: the runner logs `isolation confirmed` or
+a loud `SANDBOX IS NOT ISOLATED` — the latter means `runsc` isn't actually
+registered/applied. Fix it before granting the tools.
+
+> **Docker Desktop / macOS:** gVisor isn't available, so there is **no isolated
+> Docker path locally**. For dev only, set `SANDBOX_RUNTIME=local-unsafe` on the
+> runner (runs code with NO isolation) or use the native `cargo run` path below.
+> Never run `local-unsafe` in a deployment.
+
+> **Security:** mounting `docker.sock` is host-root-equivalent, and this service
+> runs untrusted code. The compose file never publishes its port; keep it off
+> any public interface, front cross-host hops with mTLS, and grant the sandbox
+> tools per-role/-token deliberately.
+
 ## Verify it works
 
 1. **Isolation is real.** Check the runner's startup log:

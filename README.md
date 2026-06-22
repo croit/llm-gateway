@@ -15,6 +15,7 @@ Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests acro
 - **RAG** — operator-managed, indexed codebases that the chat model can search.
 - **Agent Skills** — drop a `SKILL.md` bundle (or `.skill` archive) in and the chat model loads it on demand to follow your house style, brand, or domain playbooks — progressive disclosure, no fine-tuning. Upload, view, and delete them at `/admin/skills`, live (no restart), RBAC-gated per role. See [Agent Skills](#agent-skills).
 - **Scheduled actions** — per-user prompts that run on a cron schedule (hourly / daily / weekly / monthly, or a raw cron expression), each evaluated in its own timezone. A friendly builder assembles the cron and shows the next run times live; every fire opens a fresh chat you can read back in the UI. See [Scheduled actions](#scheduled-actions).
+- **Integrations (per-user MCP connectors)** — an admin-curated catalog of [MCP](https://modelcontextprotocol.io/) servers (Google Workspace, GitHub, Atlassian, GitLab, …) that each user connects to with *their own* account at `/integrations`. OAuth (with dynamic client registration where supported) or a user-supplied token; tokens are encrypted at rest and refreshed in the background. The connected servers' tools then become available to the model, scoped to that user's own permissions. See [Integrations](#integrations-per-user-mcp-connectors).
 
 ## Tools the model can call
 
@@ -67,6 +68,20 @@ Every signed-in user can have prompts run **automatically on a schedule** at `/s
 - **sqlx + SQLite** — persistent state (users, tokens, sessions, chat history, RAG collection registry). Bulk RAG content — chunk text, lexical index, vectors — lives in per-collection stores under `[rag].data_dir`, not in the main DB.
 
 The CSS bundle and `datastar.js` are baked into the binary via `include_bytes!`, so the runtime image needs no asset directory.
+
+## Integrations (per-user MCP connectors)
+
+Each signed-in user can connect their **own** accounts — Gmail/Calendar/Drive, GitHub, Atlassian (Jira/Confluence), GitLab, and any other [MCP](https://modelcontextprotocol.io/) server — at `/integrations`, so the model can act on their behalf with **their** permissions. It's a self-hosted, per-user connector store comparable to the connectors in desktop AI apps.
+
+![The /integrations page: a list of connectable accounts — Atlassian, GitHub, GitLab (SaaS and self-managed), Google Workspace — each with a short description and a Connect button; the self-managed GitLab card shows a personal-access-token field.](docs/img/integrations.png)
+
+An admin curates which servers the catalog offers at `/admin/connectors`; users just click **Connect**. Three auth models are supported, chosen per connector:
+
+- **OAuth 2.1 + dynamic client registration** — nothing to configure beyond a URL (e.g. Atlassian, GitLab.com, a self-hosted Google Workspace server).
+- **OAuth 2.1 with a manual client** — the admin registers one OAuth app once (e.g. GitHub).
+- **User-supplied token** — each user pastes their own API token / PAT (e.g. self-managed GitLab CE).
+
+Per-user OAuth tokens are **encrypted at rest** (AES-256-GCM) and **refreshed in the background** so connections don't silently expire. Each connected server's tools are namespaced (`mcp__<server>__*`) and obey the same per-tool always/ask/off controls as the built-in tools. Provider and deployment setup — including the self-hosted Google Workspace and GitLab CE bridges — is in [`deploy/README.md`](deploy/README.md) and [`docs/connectors.md`](docs/connectors.md).
 
 ## Quick start (local development)
 
@@ -138,7 +153,10 @@ The environment variables that config refers to:
 ```bash
 export GATEWAY_SESSION_KEY=$(openssl rand -hex 32)   # 32 random bytes, hex-encoded
 export GATEWAY_OIDC_CLIENT_SECRET=…                  # from your OIDC provider
+export GATEWAY_MCP_KEY=$(openssl rand -hex 32)       # optional: 32-byte key encrypting per-user MCP connector OAuth tokens at rest
 ```
+
+`GATEWAY_MCP_KEY` is optional: it's the AES-256-GCM key under which each user's MCP-connector OAuth tokens (and admin-stored connector client secrets) are encrypted in the database. If unset, the gateway derives a stable key from `GATEWAY_SESSION_KEY`; if *that's* also unset (dev), an ephemeral key is used and stored connections won't survive a restart (users simply reconnect). Set it explicitly if you want connector encryption decoupled from session-cookie signing.
 
 Optional blocks, each documented inline in `gateway.example.toml`:
 
@@ -261,8 +279,8 @@ In a clone, run it via `mise run cli -- <args>`; a release build produces a stan
 | `GET /v1/models` | Bearer token | All discovered models across pools (deduplicated by id). |
 | `GET /v1/sandbox/files/{run}/{filename}` | Bearer token | Download a file a sandbox run produced for the caller (scoped to your user). |
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness probes. |
-| `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled`, `/usage` | session cookie | Web UI (`/usage` shows your own request/token usage; admins get an in-page "All users" toggle). |
-| `/admin/users`, `/rag`, `/admin/models`, `/admin/backends`, `/admin/skills` | admin role | Admin UI (the users page lists registered users and starts impersonation). |
+| `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled`, `/integrations`, `/usage` | session cookie | Web UI (`/integrations` is the per-user MCP connector store; `/usage` shows your own request/token usage; admins get an in-page "All users" toggle). |
+| `/admin/users`, `/rag`, `/admin/models`, `/admin/backends`, `/admin/skills`, `/admin/connectors` | admin role | Admin UI (the users page lists registered users and starts impersonation; connectors curates the MCP catalog — see [`docs/connectors.md`](docs/connectors.md) for provider setup). |
 | `POST /impersonate/stop` | session cookie | End an active impersonation and return to your own account. |
 | `/api/v0/*` | session cookie | JSON APIs backing the UI. |
 
@@ -295,6 +313,12 @@ Operational notes:
 - **TLS:** the unit binds `127.0.0.1:8080` — terminate HTTPS with a reverse proxy (Caddy / Traefik / nginx) in front. Set `[gateway].public_url` to the external HTTPS URL so the OIDC callback is correct, and register `<public_url>/auth/callback` as a redirect URI on your OIDC client.
 - **State:** the SQLite DB + session store live in a Podman-managed named volume and survive image swaps. Point `[db].path` (and `[rag].data_dir`, if used) at that volume.
 - **Updates:** Quadlet treats `Image=` as the source of truth and won't re-pull `:latest` on restart — pin a digest or a `:<git-sha>` tag in production.
+
+### Docker Compose
+
+For hosts running Docker rather than podman, [`deploy/compose.example.yml`](deploy/compose.example.yml) is the equivalent stack (gateway + self-hosted **Google Workspace** MCP server, plus the sandbox runner and egress proxy under the `sandbox` profile).
+
+All deployment-relevant docs — both methods, every component, the full Google Workspace connector setup — live in **[`deploy/README.md`](deploy/README.md)**.
 
 ## Documentation
 

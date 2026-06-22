@@ -1,0 +1,204 @@
+# Docker Compose for the LLM gateway stack.
+#
+# A Docker-native alternative to the systemd-podman Quadlets in
+# `deploy/quadlet/` — same images, same config, for hosts that run Docker /
+# Docker Desktop rather than rootful podman.
+#
+# Services:
+#   gateway               the gateway itself (OpenAI-compatible proxy + UI)
+#   google-workspace-mcp  per-user Gmail/Calendar/Drive/… (backs the "Google
+#                         Workspace" connector); see docs/connectors.md
+#   sandbox-runner        code-execution runner (profile: sandbox)
+#   egress-proxy          allowlisting squid for networked sandbox runs
+#                         (profile: sandbox)
+#
+# SANDBOX ISOLATION: the runner spawns each job as a sibling container via the
+# host Docker socket with `--runtime=runsc` (gVisor). Unlike remote *podman*,
+# the Docker daemon honors `--runtime` over its socket, so this is REAL
+# isolation — but only if gVisor (runsc) is registered as a Docker runtime on
+# the host (see docs/sandbox.md). The runner self-checks at boot and logs
+# `SANDBOX IS NOT ISOLATED` if the runtime didn't apply. On Docker Desktop /
+# macOS, where gVisor isn't available, you can set SANDBOX_RUNTIME=local-unsafe
+# for dev only (NO isolation) — never in a deployment.
+#
+# Full setup walkthrough: deploy/README.md. Relative paths below resolve against
+# this file's directory (deploy/), so env/config files live in deploy/.
+#
+# ── Setup (from the repo root) ──────────────────────────────────────────────
+#   cp deploy/quadlet/gateway.example.env               deploy/gateway.env
+#   cp deploy/quadlet/google-workspace-mcp.example.env  deploy/google-workspace-mcp.env
+#   cp gateway.example.toml                             deploy/gateway.toml
+#   $EDITOR deploy/gateway.env deploy/google-workspace-mcp.env deploy/gateway.toml
+#
+# ── Local testing on Docker Desktop (recommended) ──────────────────────────
+# Run ONLY the Workspace MCP here and keep the gateway native (`mise run dev`).
+# That avoids a split-horizon URL problem: the browser AND a native gateway both
+# reach the MCP at http://localhost:8000, so WORKSPACE_EXTERNAL_URL can simply be
+# http://localhost:8000 (set it in google-workspace-mcp.env).
+#
+#   docker compose -f deploy/compose.example.yml up google-workspace-mcp
+#
+# Then in the (native) gateway: /admin/connectors → Google Workspace → URL
+# http://localhost:8000/mcp (no trailing slash) → Save → Enable, then
+# /integrations → Connect.
+#
+# ── Full stack (Linux server, behind a TLS reverse proxy) ──────────────────
+# Put a reverse proxy in front (it terminates TLS for both the gateway and the
+# MCP server on their own hostnames). Set WORKSPACE_EXTERNAL_URL to the MCP's
+# PUBLIC https URL — there the browser and the gateway resolve it to the same
+# place, so no split-horizon. Then:
+#
+#   docker compose -f deploy/compose.example.yml up -d                  # gateway + mcp
+#   docker compose -f deploy/compose.example.yml --profile sandbox up -d  # + egress proxy
+
+name: llm-gateway
+
+services:
+  gateway:
+    image: ghcr.io/croit/llm-gateway:latest
+    restart: unless-stopped
+    # Loopback only — front with a TLS-terminating reverse proxy in production.
+    ports:
+      - "127.0.0.1:8080:8080"
+    # GATEWAY_SESSION_KEY, GATEWAY_OIDC_CLIENT_SECRET, GATEWAY_MCP_KEY, and any
+    # per-upstream <POOL>_API_KEY referenced from gateway.toml.
+    env_file:
+      - gateway.env
+    environment:
+      GATEWAY_CONFIG: /etc/gateway/config.toml
+      RUST_LOG: info,gateway=info
+    volumes:
+      # Mind [db].path = /var/lib/gateway/gateway.sqlite and, on Docker Desktop,
+      # point model upstreams in gateway.toml at host.docker.internal.
+      - ./gateway.toml:/etc/gateway/config.toml:ro
+      - gateway-data:/var/lib/gateway
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+
+  google-workspace-mcp:
+    image: ghcr.io/taylorwilsdon/google_workspace_mcp:latest
+    restart: unless-stopped
+    # No `command:` override — the image's default CMD already runs
+    # `uv run main.py --transport streamable-http` (its ENTRYPOINT is
+    # `/bin/sh -c`, so overriding command breaks arg parsing). The CMD wrapper
+    # appends `--tool-tier`/`--tools` from the TOOL_TIER / TOOLS env vars below.
+    # Loopback only — for the full stack, expose it publicly via the reverse
+    # proxy (the OAuth consent redirects through it in the user's browser).
+    ports:
+      - "127.0.0.1:8000:8000"
+    # GOOGLE_OAUTH_CLIENT_ID/SECRET, WORKSPACE_EXTERNAL_URL,
+    # WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS.
+    env_file:
+      - google-workspace-mcp.env
+    environment:
+      MCP_ENABLE_OAUTH21: "true"
+      WORKSPACE_MCP_STATELESS_MODE: "true"
+      WORKSPACE_MCP_PORT: "8000"
+      TOOL_TIER: core # core | extended | complete (consumed by the image CMD)
+      # Keep the rootfs read-only: redirect uv's cache/home onto the /tmp tmpfs
+      # (the entrypoint runs `uv run`, which needs a writable cache dir).
+      UV_CACHE_DIR: /tmp/uv-cache
+      XDG_CACHE_HOME: /tmp
+    # NOTE: no `read_only: true` here — this image's entrypoint runs `uv run`,
+    # which builds an editable install under /app at startup and needs a
+    # writable rootfs. The other hardening (non-root app user, stateless
+    # sessions, no-new-privileges, loopback-only) still applies.
+    tmpfs:
+      - /tmp
+    security_opt:
+      - "no-new-privileges:true"
+
+  # GitLab (self-managed / Community Edition) bridge — backs the "GitLab
+  # (self-managed / CE)" connector. GitLab's native MCP is a Duo/Premium feature,
+  # so CE uses this community bridge (zereight/gitlab-mcp) in streamable-HTTP +
+  # remote-authorization mode: each request carries the user's own GitLab token,
+  # which the bridge forwards to GitLab — so it needs NO public URL and NO OAuth
+  # (unlike the Google MCP). Profile: gitlab.
+  gitlab-mcp:
+    image: zereight050/gitlab-mcp:latest
+    profiles:
+      - gitlab
+    restart: unless-stopped
+    # Loopback publish is only for a native (mise run dev) gateway to reach it at
+    # http://localhost:3333/mcp; the full-stack gateway uses http://gitlab-mcp:3002/mcp.
+    ports:
+      - "127.0.0.1:3333:3002"
+    # GITLAB_API_URL=https://<your-gitlab>/api/v4   (deployment-specific)
+    env_file:
+      - gitlab-mcp.env
+    environment:
+      HOST: "0.0.0.0"
+      STREAMABLE_HTTP: "true" # serves /mcp; required for remote-authorization
+      REMOTE_AUTHORIZATION: "true" # per-request token: each user's PAT, not a fixed one
+      GITLAB_READ_ONLY_MODE: "true" # flip to false to allow writes (create MR/issue/…)
+    security_opt:
+      - "no-new-privileges:true"
+
+  # Code-execution sandbox runner (run_in_sandbox / generate_document /
+  # capture_webpage). Spawns each job as a single-use sibling container via the
+  # host Docker socket under gVisor (runsc) — real isolation, provided runsc is
+  # registered as a Docker runtime on the host (docs/sandbox.md → "Installing a
+  # sandbox runtime"). The boot self-check logs `isolation confirmed` or a loud
+  # `SANDBOX IS NOT ISOLATED`; treat the latter as a hard stop.
+  #
+  # SECURITY: mounting docker.sock is host-root-equivalent, and this service
+  # runs arbitrary model-generated code — keep it on an internal network, never
+  # expose port 9000, and only grant the sandbox tools deliberately (RBAC).
+  sandbox-runner:
+    image: ghcr.io/croit/llm-gateway-sandbox-runner:latest
+    profiles:
+      - sandbox
+    restart: unless-stopped
+    # Reachable by the gateway over the compose network as http://sandbox-runner:9000.
+    # Set this in gateway.toml:  [sandbox]\n  runner_url = "http://sandbox-runner:9000"
+    # NOT published to the host — it executes untrusted code.
+    expose:
+      - "9000"
+    volumes:
+      # Drives the host Docker daemon to spawn the gVisor sandboxes (siblings).
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      SANDBOX_BIND: "0.0.0.0:9000"
+      SANDBOX_PODMAN: docker # drive the Docker CLI (image ships it), not podman
+      SANDBOX_RUNTIME: runsc # gVisor; must be a registered Docker runtime on the host
+      SANDBOX_IMAGE: ghcr.io/croit/llm-gateway-sandbox:latest
+      RUST_LOG: info,sandbox_runner=info
+      # Egress for networked runs (pip / capture_webpage). The runner attaches
+      # sandboxes to this network — use the *Docker* network name, which compose
+      # prefixes with the project: "<project>_sandbox-egress" (project = name:).
+      SANDBOX_EGRESS_NETWORK: llm-gateway_sandbox-egress
+      SANDBOX_EGRESS_PROXY: http://egress-proxy:3128
+    networks:
+      - default # to pull images / be reached by the gateway
+    depends_on:
+      - egress-proxy
+
+  # Allowlisting egress proxy for networked sandbox runs. The runner attaches
+  # networked sandboxes to `sandbox-egress` (internal, no direct internet); their
+  # only way out is this proxy, which forwards only to hosts in allowlist.txt.
+  egress-proxy:
+    image: docker.io/ubuntu/squid:latest
+    profiles:
+      - sandbox
+    restart: unless-stopped
+    volumes:
+      - ./quadlet/squid.conf:/etc/squid/squid.conf:ro
+      - ./quadlet/allowlist.txt:/etc/squid/allowlist.txt:ro
+    networks:
+      - default
+      - sandbox-egress
+
+networks:
+  # `internal: true` is the point — sandboxes attached here have no direct route
+  # out; their only path is the egress proxy (which also sits on the default
+  # network). Default-deny egress.
+  sandbox-egress:
+    internal: true
+
+volumes:
+  gateway-data:

@@ -233,12 +233,22 @@ async fn main() -> anyhow::Result<()> {
     let session_secret = load_session_secret(&state_session_key())?;
     let sessions = SessionStore::new(db.clone(), session_secret);
 
+    // Seed the built-in MCP connector catalog (all disabled) so an admin only
+    // has to flip a switch. Idempotent — existing rows (incl. admin edits +
+    // the enabled flag) are never overwritten. Non-fatal: a failure here just
+    // means the store starts empty until an admin adds connectors manually.
+    if let Err(err) = srv::db::mcp_catalog::seed_defaults(&db).await {
+        tracing::warn!(error = %err, "seeding default MCP connectors failed");
+    }
+    // At-rest key for per-user MCP OAuth tokens + connector client secrets.
+    let mcp_crypto = std::sync::Arc::new(srv::crypto::Crypto::from_env_or_session(&session_secret));
+
     // Retry OIDC discovery so transient failures don't crash the
     // gateway. After exhaustion we boot
     // anyway with `state.oidc = None`; /auth/* returns a clean 500 then.
     let oidc = build_oidc_with_retry(&config).await;
 
-    let mut state = AppState::new(config, db, upstreams, tools, rbac);
+    let mut state = AppState::new(config, db, upstreams, tools, rbac).with_mcp_crypto(mcp_crypto);
     if let Some(client) = oidc {
         state = state.with_oidc(client);
     }
@@ -299,6 +309,11 @@ async fn main() -> anyhow::Result<()> {
     // Scheduled actions: start the background loop that fires due actions
     // (the `scheduled_actions` table is created by migration 0021).
     srv::scheduled::worker::spawn(state.clone());
+
+    // Per-user MCP connections: proactively refresh OAuth tokens before they
+    // expire (and exercise idle refresh tokens) so connectors stay alive
+    // without the user re-authenticating; also sweeps stale pending auths.
+    srv::tools::mcp::worker::spawn(state.clone());
 
     let ip: std::net::IpAddr = std::env::var("IP")
         .ok()

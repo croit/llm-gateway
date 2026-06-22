@@ -54,6 +54,9 @@ enum NavItem {
     /// Per-user scheduled-actions page (`/scheduled`). Shown to every
     /// signed-in user; each manages their own schedules.
     Scheduled,
+    /// Per-user MCP connector store (`/integrations`). Shown to every
+    /// signed-in user; each connects their own accounts (Google, GitHub, …).
+    Integrations,
     /// Usage statistics (`/usage`). Shown to every signed-in user (scoped
     /// to their own requests); admins get an in-page "All users" toggle.
     Usage,
@@ -73,6 +76,9 @@ enum NavItem {
     /// Admin-only installed-skills overview (`/admin/skills`). Same
     /// `admin`-role gate as the other operator pages.
     Skills,
+    /// Admin-only MCP connector catalog management (`/admin/connectors`).
+    /// Same `admin`-role gate as the other operator pages.
+    Connectors,
 }
 
 /// Datastar directive that intercepts the click and triggers an
@@ -227,6 +233,7 @@ fn render_app_sidebar(
                 (nav_group("workspace", "Workspace", html! {
                     (sidebar_nav_link("/memory", NavItem::Memory, active, icons::folder(16), "Memory"))
                     (sidebar_nav_link("/scheduled", NavItem::Scheduled, active, icons::clock(16), "Scheduled"))
+                    (sidebar_nav_link("/integrations", NavItem::Integrations, active, icons::plug(16), "Integrations"))
                     (sidebar_nav_link("/tools", NavItem::Tools, active, icons::sliders(16), "Tools"))
                 }.to_html()))
                 (nav_group("account", "Account", html! {
@@ -240,6 +247,7 @@ fn render_app_sidebar(
                         (sidebar_nav_link("/admin/backends", NavItem::Backends, active, icons::cube(16), "Backends"))
                         (sidebar_nav_link("/rag", NavItem::Rag, active, icons::database(16), "RAG"))
                         (sidebar_nav_link("/admin/skills", NavItem::Skills, active, icons::sparkles(16), "Skills"))
+                        (sidebar_nav_link("/admin/connectors", NavItem::Connectors, active, icons::plug(16), "Connectors"))
                     }.to_html()))
                 }
             }
@@ -860,8 +868,8 @@ pub use tool_toggles::{entries_for_roles, valid_keys};
 
 mod tokens;
 pub use tokens::{
-    tokens_create, tokens_delete, tokens_index, tokens_revoke, tokens_tools_master,
-    tokens_tools_toggle,
+    tokens_create, tokens_delete, tokens_index, tokens_mcp_policy, tokens_revoke,
+    tokens_tools_master, tokens_tools_toggle,
 };
 
 // ---------------------------------------------------------------------------
@@ -893,6 +901,23 @@ mod scheduled;
 pub use scheduled::{
     scheduled_create, scheduled_delete, scheduled_edit_form, scheduled_index, scheduled_preview,
     scheduled_toggle, scheduled_update,
+};
+
+// Per-user MCP connector store (`/integrations`). OAuth connect/callback +
+// per-tool permissions. The admin-managed catalog lives in `connectors`.
+mod integrations;
+pub use integrations::{
+    integrations_callback, integrations_connect, integrations_connect_token,
+    integrations_disconnect, integrations_index, integrations_retry, integrations_tool_mode,
+    integrations_tools_all,
+};
+
+// Admin-managed MCP connector catalog (`/admin/connectors`).
+mod connectors;
+pub use connectors::{
+    connectors_delete as admin_connectors_delete, connectors_index as admin_connectors_index,
+    connectors_restore as admin_connectors_restore, connectors_save as admin_connectors_save,
+    connectors_toggle as admin_connectors_toggle,
 };
 
 // ---------------------------------------------------------------------------

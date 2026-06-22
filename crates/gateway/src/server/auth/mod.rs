@@ -7,6 +7,7 @@
 //! Session cookies + bearer middleware are framework-specific and live in
 //! `crate::rama_server::session` + `crate::rama_server::auth`.
 
+pub mod mcp_oauth;
 pub mod oidc;
 pub mod token;
 

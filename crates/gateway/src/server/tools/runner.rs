@@ -34,7 +34,7 @@ use std::sync::Arc;
 use rama::bytes::Bytes;
 use serde_json::{Value, json};
 
-use crate::server::tools::{Tool, ToolContext, ToolError, ToolRegistry};
+use crate::server::tools::{Tool, ToolContext, ToolError, ToolSource};
 
 /// Hard cap on tool-call rounds per turn — the single source of truth shared
 /// by every tool loop (this buffered runner, the chat-UI driver, and the `/v1`
@@ -85,7 +85,7 @@ pub struct LoopOutput {
 /// model string so the caller can rotate backends per round via the
 /// `UpstreamRegistry`.
 pub async fn run_with_tools<F, Fut>(
-    registry: &ToolRegistry,
+    tools: &dyn ToolSource,
     allowed_tools: &[String],
     ctx: &ToolContext,
     mut request_body: Value,
@@ -95,7 +95,7 @@ where
     F: Fn(Value) -> Fut,
     Fut: std::future::Future<Output = Result<(u16, Bytes), LoopError>>,
 {
-    inject_tools(&mut request_body, registry, allowed_tools)?;
+    inject_tools(&mut request_body, tools, allowed_tools)?;
     // Tool-call inspection requires the full response body — force
     // non-streaming on the wire even if the client asked for
     // stream:true. `stream_options` only makes sense with stream:true
@@ -129,7 +129,7 @@ where
         // Split the response's tool_calls into "owned by us" vs "owned by the
         // client". Only the first choice is considered — multi-choice with
         // tools is vanishingly rare and complicates the loop pointlessly.
-        let split = split_tool_calls(&response, registry);
+        let split = split_tool_calls(&response, tools);
 
         // Stop the loop when there's nothing of ours to run, OR when the
         // turn also calls client-supplied tools. The client owns the
@@ -158,7 +158,7 @@ where
         }
 
         // Execute gateway-owned tool calls concurrently.
-        let tool_results = execute_tool_calls(registry, ctx, &split.gateway_owned).await;
+        let tool_results = execute_tool_calls(tools, ctx, &split.gateway_owned).await;
 
         // Append the assistant's tool-call message + the tool results to the
         // request's messages for the next round.
@@ -185,13 +185,13 @@ where
 
 pub(crate) fn inject_tools(
     body: &mut Value,
-    registry: &ToolRegistry,
+    tools: &dyn ToolSource,
     allowed_tools: &[String],
 ) -> Result<(), LoopError> {
     if allowed_tools.is_empty() {
         return Ok(());
     }
-    let defs = registry.defs_for(allowed_tools);
+    let defs = tools.defs_for(allowed_tools);
     if defs.is_empty() {
         return Ok(());
     }
@@ -260,7 +260,7 @@ pub(crate) struct ToolCallRef {
     pub arguments_raw: String,
 }
 
-fn split_tool_calls(response: &Value, registry: &ToolRegistry) -> ToolCallSplit {
+fn split_tool_calls(response: &Value, tools: &dyn ToolSource) -> ToolCallSplit {
     let mut gateway_owned = Vec::new();
     let mut has_client_tool_calls = false;
     let assistant_message = response
@@ -282,7 +282,7 @@ fn split_tool_calls(response: &Value, registry: &ToolRegistry) -> ToolCallSplit 
             let Some(name) = function.get("name").and_then(|n| n.as_str()) else {
                 continue;
             };
-            if !registry.contains(name) {
+            if !tools.contains(name) {
                 // A tool_call we don't own. On the proxy merge path this is
                 // the client's own tool (it brought a `tools` array we
                 // unioned ours into); flag it so the loop yields the turn
@@ -296,7 +296,7 @@ fn split_tool_calls(response: &Value, registry: &ToolRegistry) -> ToolCallSplit 
                 has_client_tool_calls = true;
                 tracing::debug!(
                     wire_name = %name,
-                    known = ?registry.ids().collect::<Vec<_>>(),
+                    known = ?tools.ids(),
                     "upstream emitted tool_call we don't own; yielding turn to client"
                 );
                 continue;
@@ -334,7 +334,7 @@ fn split_tool_calls(response: &Value, registry: &ToolRegistry) -> ToolCallSplit 
 }
 
 pub(crate) async fn execute_tool_calls(
-    registry: &ToolRegistry,
+    tools: &dyn ToolSource,
     ctx: &ToolContext,
     calls: &[ToolCallRef],
 ) -> Vec<ToolResultRecord> {
@@ -342,7 +342,7 @@ pub(crate) async fn execute_tool_calls(
     let futs = calls.iter().map(|call| {
         let sem = sem.clone();
         let call = call.clone();
-        let tool: Option<Arc<dyn Tool>> = registry.get(&call.name).cloned();
+        let tool: Option<Arc<dyn Tool>> = tools.get(&call.name);
         let ctx = ctx.clone();
         async move {
             let _permit = sem.acquire().await.expect("semaphore not closed");
@@ -579,6 +579,7 @@ fn output_ref_hint(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::tools::ToolRegistry;
     use crate::server::tools::echo::Echo;
     use crate::server::tools::time::CurrentTimestamp;
 

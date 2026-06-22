@@ -44,7 +44,7 @@ pub mod typst_render;
 pub mod upload_attachment;
 pub mod wikipedia;
 
-pub use registry::ToolRegistry;
+pub use registry::{ToolRegistry, ToolSource};
 
 /// Carried into each `Tool::run` invocation. Lets a tool read the
 /// caller's identity + roles and reach the gateway's datastore

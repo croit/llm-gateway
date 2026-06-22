@@ -57,6 +57,7 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/tokens/{id}/delete", pages::tokens_delete)
         .with_post("/tokens/{id}/tools/master", pages::tokens_tools_master)
         .with_post("/tokens/{id}/tools/toggle", pages::tokens_tools_toggle)
+        .with_post("/tokens/{id}/mcp-policy", pages::tokens_mcp_policy)
         .with_get("/tools", pages::tools_index)
         .with_post("/tools/toggle", pages::tools_toggle)
         .with_get("/memory", pages::memory_index)
@@ -71,6 +72,26 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/scheduled/{id}", pages::scheduled_update)
         .with_post("/scheduled/{id}/toggle", pages::scheduled_toggle)
         .with_post("/scheduled/{id}/delete", pages::scheduled_delete)
+        .with_get("/integrations", pages::integrations_index)
+        .with_get("/integrations/callback", pages::integrations_callback)
+        .with_post("/integrations/{key}/connect", pages::integrations_connect)
+        .with_post(
+            "/integrations/{key}/token",
+            pages::integrations_connect_token,
+        )
+        .with_post("/integrations/{key}/retry", pages::integrations_retry)
+        .with_post(
+            "/integrations/{key}/disconnect",
+            pages::integrations_disconnect,
+        )
+        .with_post(
+            "/integrations/{key}/tools/mode",
+            pages::integrations_tool_mode,
+        )
+        .with_post(
+            "/integrations/{key}/tools/all",
+            pages::integrations_tools_all,
+        )
         .with_get("/chat", pages::chat_index)
         .with_get("/chat/{id}", pages::chat_session_view)
         .with_post("/chat/sessions", pages::chat_session_create)
@@ -96,6 +117,20 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         // path segments, which would mangle case-sensitive OIDC subjects.
         .with_post("/admin/users/impersonate", pages::users_impersonate)
         .with_post("/impersonate/stop", pages::impersonate_stop)
+        .with_get("/admin/connectors", pages::admin_connectors_index)
+        .with_post("/admin/connectors", pages::admin_connectors_save)
+        .with_post(
+            "/admin/connectors/restore-defaults",
+            pages::admin_connectors_restore,
+        )
+        .with_post(
+            "/admin/connectors/{key}/toggle",
+            pages::admin_connectors_toggle,
+        )
+        .with_post(
+            "/admin/connectors/{key}/delete",
+            pages::admin_connectors_delete,
+        )
         .with_get("/admin/skills", pages::admin_skills_index)
         .with_get("/admin/skills/download", pages::admin_skills_download)
         .with_post("/admin/skills/upload", pages::admin_skills_upload)

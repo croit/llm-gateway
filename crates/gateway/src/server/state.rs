@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::server::auth::oidc::OidcClient;
 use crate::server::config::Config;
+use crate::server::crypto::Crypto;
 use crate::server::db::Pool;
 use crate::server::geoip::GeoIp;
 use crate::server::rag::worker::Indexer;
@@ -40,6 +41,16 @@ pub struct AppState {
     /// restart). RBAC narrows which skills each caller sees (see
     /// [`Self::allowed_skills_for`]).
     pub skills: Option<Arc<SkillStore>>,
+    /// At-rest encryption for per-user MCP OAuth tokens + admin-stored
+    /// connector client secrets. `new()` installs an ephemeral key; production
+    /// overrides it via [`Self::with_mcp_crypto`] with a key derived from
+    /// `$GATEWAY_MCP_KEY` / the session secret.
+    pub mcp_crypto: Arc<Crypto>,
+    /// Per-user MCP connection manager: live connections to each user's
+    /// connected connectors + the per-request tool overlay. `new()` installs
+    /// one bound to the same pool + ephemeral crypto; production overrides via
+    /// [`Self::with_mcp`].
+    pub mcp: Arc<crate::server::tools::mcp::manager::McpConnectionManager>,
 }
 
 impl AppState {
@@ -50,6 +61,11 @@ impl AppState {
         tools: Arc<ToolRegistry>,
         rbac: Arc<Resolver>,
     ) -> Self {
+        let mcp_crypto = Arc::new(Crypto::ephemeral());
+        let mcp = crate::server::tools::mcp::manager::McpConnectionManager::new(
+            db.clone(),
+            mcp_crypto.clone(),
+        );
         Self {
             http: reqwest::Client::new(),
             config: Arc::new(config),
@@ -61,6 +77,8 @@ impl AppState {
             geoip: None,
             indexer: None,
             skills: None,
+            mcp_crypto,
+            mcp,
         }
     }
 
@@ -121,6 +139,9 @@ impl AppState {
                 .await
                 .unwrap_or_default();
         crate::server::tools::catalog::retain_enabled(&mut allowed, &disabled);
+        // NB: per-user MCP connector tool ids are unioned in by the caller from
+        // a once-per-request `UserMcpLayer` (see `union_mcp_tool_ids`), so the
+        // advertised set and the executing `CompositeToolSource` never diverge.
         allowed
     }
 
@@ -178,6 +199,10 @@ impl AppState {
                 .then_with(|| entry_key_for(a).cmp(entry_key_for(b)))
                 .then_with(|| a.as_str().cmp(b.as_str()))
         });
+        // NB: per-user MCP connector tool ids are account-level and unioned in
+        // by the caller from a once-per-request `UserMcpLayer` (after this
+        // per-conversation narrowing), so the advertised set matches what the
+        // `CompositeToolSource` can actually execute.
         allowed
     }
 
@@ -199,6 +224,40 @@ impl AppState {
     pub fn with_skills(mut self, skills: Arc<SkillStore>) -> Self {
         self.skills = Some(skills);
         self
+    }
+
+    /// Install the production MCP encryption key, rebuilding the connection
+    /// manager so it seals/opens tokens under the same key.
+    pub fn with_mcp_crypto(mut self, crypto: Arc<Crypto>) -> Self {
+        self.mcp = crate::server::tools::mcp::manager::McpConnectionManager::new(
+            self.db.clone(),
+            crypto.clone(),
+        );
+        self.mcp_crypto = crypto;
+        self
+    }
+
+    /// Resolved internal role ids for a caller's raw OIDC group claims. Used
+    /// when building the per-request MCP layer so the connector `required_role`
+    /// gate is enforced at tool-exposure time.
+    pub fn role_ids_for(&self, roles: &[String]) -> Vec<String> {
+        self.rbac.role_ids_for(roles)
+    }
+
+    /// Union a once-per-request [`UserMcpLayer`]'s tool ids into an
+    /// already-resolved registry `allowed` set. Keeping the layer the *single*
+    /// source of both the advertised ids and the executing
+    /// `CompositeToolSource` is what guarantees they can't diverge.
+    pub fn union_mcp_tool_ids(
+        &self,
+        allowed: &mut Vec<String>,
+        layer: &crate::server::tools::mcp::manager::UserMcpLayer,
+    ) {
+        for id in layer.tool_ids() {
+            if !allowed.iter().any(|a| a == &id) {
+                allowed.push(id);
+            }
+        }
     }
 }
 

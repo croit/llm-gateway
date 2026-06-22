@@ -11,6 +11,10 @@ Cargo.lock.bak
 .env.*
 !.env.example
 
+# Real deployment secrets/config (only the *.example.* templates are committed)
+deploy/*.env
+deploy/gateway.toml
+
 # Editor/OS
 .idea
 .vscode

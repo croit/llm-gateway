@@ -1,0 +1,67 @@
+# systemd-podman Quadlet for the self-hosted Google Workspace MCP server
+# (taylorwilsdon/google_workspace_mcp). Runs alongside the gateway and backs
+# the single "Google Workspace" connector (Gmail, Calendar, Drive, Docs, …).
+#
+# Why self-hosted: Google's *hosted* MCP endpoints (gmailmcp/calendarmcp/
+# drivemcp.googleapis.com) are gated behind the Workspace Developer Preview
+# Program. This server uses the GA Google REST APIs instead — no preview, works
+# today, one OAuth sign-in per user. See docs/connectors.md.
+#
+# Install:
+#   sudo cp deploy/quadlet/google-workspace-mcp.container /etc/containers/systemd/
+#   sudo install -m 0600 deploy/quadlet/google-workspace-mcp.example.env \
+#        /etc/gateway/google-workspace-mcp.env
+#   sudo $EDITOR /etc/gateway/google-workspace-mcp.env   # client id/secret + URLs
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now google-workspace-mcp.service
+#
+# IMPORTANT — this server is NOT a purely internal sidecar. The OAuth consent
+# runs in the *user's browser*: gateway → this server's /authorize → Google →
+# this server's /oauth2callback → back to the gateway. So its HTTP endpoint must
+# be reachable from the browser over a public hostname + TLS. Publish it on your
+# reverse proxy (e.g. https://gworkspace-mcp.example.com → 127.0.0.1:8000) and
+# set WORKSPACE_EXTERNAL_URL to that public URL (in the env file).
+
+[Unit]
+Description=Google Workspace MCP server (per-user Gmail/Calendar/Drive for the gateway)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=google-workspace-mcp
+
+# Pin to a digest / content tag in production; :latest won't be re-pulled on
+# restart (same caveat as gateway.container).
+Image=ghcr.io/taylorwilsdon/google_workspace_mcp:latest
+
+# Loopback only — the reverse proxy terminates TLS and exposes it publicly.
+PublishPort=127.0.0.1:8000:8000
+
+# Secrets + deployment URLs: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET,
+# WORKSPACE_EXTERNAL_URL, WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS.
+EnvironmentFile=/etc/gateway/google-workspace-mcp.env
+
+# Non-secret runtime config. The image's ENTRYPOINT is `/bin/sh -c` and its
+# default CMD already runs `uv run main.py --transport streamable-http` — do NOT
+# add an `Exec=` override (it would be parsed as `sh -c --transport …` → error).
+# Tool surface is selected via TOOL_TIER (core|extended|complete), consumed by
+# that CMD. uv builds an editable install under /app at startup, so the rootfs
+# must stay writable (no ReadOnly=); redirect uv's cache onto the /tmp tmpfs.
+Environment=MCP_ENABLE_OAUTH21=true
+Environment=WORKSPACE_MCP_STATELESS_MODE=true
+Environment=WORKSPACE_MCP_PORT=8000
+Environment=TOOL_TIER=core
+Environment=UV_CACHE_DIR=/tmp/uv-cache
+Environment=XDG_CACHE_HOME=/tmp
+
+# Secrets + deployment URLs come from the env file above.
+NoNewPrivileges=true
+DropCapability=ALL
+Tmpfs=/tmp
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target default.target

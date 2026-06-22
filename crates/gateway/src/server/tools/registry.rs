@@ -104,6 +104,48 @@ impl ToolRegistry {
     }
 }
 
+/// A source of tool definitions and implementations the tool-call runner can
+/// resolve against. Implemented by the static [`ToolRegistry`] and — once
+/// per-user MCP connectors land — by per-request composites that overlay a
+/// user's connected-connector tools on top of the registry. The runner
+/// ([`super::runner`]) takes `&dyn ToolSource` so the buffered `/v1`,
+/// streaming `/v1`, and chat-UI loops all gain per-user tools at one seam.
+pub trait ToolSource: Send + Sync {
+    /// Resolve a tool by id, returning an owned handle. The registry holds
+    /// `Arc`s; an overlay may mint them per request.
+    fn get(&self, id: &str) -> Option<Arc<dyn Tool>>;
+
+    /// OpenAI-shaped definitions for every id in `allowed` this source knows,
+    /// in `allowed` order.
+    fn defs_for(&self, allowed: &[String]) -> Vec<ToolDef>;
+
+    /// Every tool id known to this source. Used for diagnostics only.
+    fn ids(&self) -> Vec<String>;
+
+    /// Whether `id` resolves in this source.
+    fn contains(&self, id: &str) -> bool {
+        self.get(id).is_some()
+    }
+}
+
+impl ToolSource for ToolRegistry {
+    fn get(&self, id: &str) -> Option<Arc<dyn Tool>> {
+        ToolRegistry::get(self, id).cloned()
+    }
+
+    fn defs_for(&self, allowed: &[String]) -> Vec<ToolDef> {
+        ToolRegistry::defs_for(self, allowed)
+    }
+
+    fn ids(&self) -> Vec<String> {
+        ToolRegistry::ids(self).map(str::to_owned).collect()
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        ToolRegistry::contains(self, id)
+    }
+}
+
 /// The character class OpenAI allows in a function name (and thus a tool
 /// id): ASCII alphanumerics, `_`, `-`. Shared with the MCP id sanitizer
 /// (`tools::mcp::sanitize_tool_id`) so a sanitized id can never fail the

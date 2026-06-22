@@ -428,5 +428,37 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
         rag::swap_ref_index(&state.db, r.id, &uuid::Uuid::new_v4().to_string(), commit).await?;
     }
 
+    // --- MCP connector catalog (for the /admin/connectors + /integrations
+    // screenshots). Seed the built-in set, give the deployment-specific
+    // connectors generic example.com URLs + a demo client id, then enable them
+    // so both the admin store and the user connect surface render populated.
+    // No real endpoints, credentials, or connections — nothing user-specific.
+    use gateway::server::db::mcp_catalog;
+    mcp_catalog::seed_defaults(&state.db).await?;
+    sqlx::query("UPDATE mcp_catalog_connectors SET url = ? WHERE key = ?")
+        .bind("https://gworkspace-mcp.example.com/mcp")
+        .bind("google_workspace")
+        .execute(&state.db)
+        .await?;
+    sqlx::query("UPDATE mcp_catalog_connectors SET url = ? WHERE key = ?")
+        .bind("https://gitlab-mcp.example.com/mcp")
+        .bind("gitlab_selfmanaged")
+        .execute(&state.db)
+        .await?;
+    sqlx::query(
+        "UPDATE mcp_catalog_connectors SET client_id = 'demo-client-id' WHERE key = 'github'",
+    )
+    .execute(&state.db)
+    .await?;
+    for key in [
+        "atlassian",
+        "github",
+        "gitlab",
+        "gitlab_selfmanaged",
+        "google_workspace",
+    ] {
+        mcp_catalog::set_enabled(&state.db, key, true).await?;
+    }
+
     Ok(())
 }

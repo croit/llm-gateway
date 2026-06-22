@@ -204,6 +204,24 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         String::new()
     };
 
+    // The user's connected-connector MCP tools, overlaid on the registry for
+    // this turn. Built once (cache-warm across rounds); empty + cheap when the
+    // user has nothing connected.
+    let mcp_role_ids = d.state.role_ids_for(&d.tool_ctx.roles);
+    let user_mcp = d
+        .state
+        .mcp
+        .layer_for_user(
+            &d.tool_ctx.user_id,
+            &mcp_role_ids,
+            crate::server::tools::mcp::manager::AskContext::Chat,
+        )
+        .await;
+    let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
+        d.state.tools.as_ref(),
+        &user_mcp,
+    );
+
     for round in 0..MAX_ROUNDS {
         if ctx.cancel.load(Ordering::SeqCst) {
             return Ok(());
@@ -242,17 +260,20 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         // mid-turn `enable_tools` call surfaces the newly-enabled schemas
         // on the next round. Cheap (sub-ms SQLite hit) and the only way
         // to make the model-driven enablement loop work.
-        let allowed_tools = d
+        let mut allowed_tools = d
             .state
             .allowed_tools_for_session(&d.tool_ctx.roles, &d.tool_ctx.user_id, &ctx.session_id)
             .await;
+        // Union the MCP ids from the SAME layer the executor uses, so an
+        // advertised tool is always dispatchable (no advertise/execute drift).
+        d.state.union_mcp_tool_ids(&mut allowed_tools, &user_mcp);
         if final_round {
             tracing::info!(
                 max_rounds = MAX_ROUNDS,
                 "tool-round budget reached; requesting final answer with tools withheld"
             );
         } else {
-            runner::inject_tools(&mut request_body, &d.state.tools, &allowed_tools)
+            runner::inject_tools(&mut request_body, &tool_source, &allowed_tools)
                 .map_err(upstream_err)?;
         }
         // Fill in admin-configured sampling defaults (temperature,
@@ -548,7 +569,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                     "arguments": acc.arguments.clone(),
                 }
             }));
-            if d.state.tools.contains(&acc.name) {
+            if crate::server::tools::ToolSource::contains(&tool_source, &acc.name) {
                 // Implicit miss-recovery: the model called a tool whose
                 // schema wasn't in this round's tools array — it's
                 // guessing from training (`fetch_url(url=...)` is the
@@ -599,7 +620,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             return Ok(());
         }
 
-        let results = runner::execute_tool_calls(&d.state.tools, &d.tool_ctx, &call_refs).await;
+        let results = runner::execute_tool_calls(&tool_source, &d.tool_ctx, &call_refs).await;
         messages.push(serde_json::json!({
             "role": "assistant",
             "content": serde_json::Value::Null,
