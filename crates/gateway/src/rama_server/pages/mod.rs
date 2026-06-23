@@ -653,6 +653,14 @@ fn layout_authed(
                         main(class: (main_class)) {
                             (body)
                         }
+                        // Feedback widget. Siblings of `main` (like the
+                        // impersonation banner) so they survive Datastar SPA
+                        // navigation — rendered once on full load, persist
+                        // across in-page nav patches. The FAB starts hidden;
+                        // `feedback.ts` reveals it once `/feedback/config`
+                        // confirms the feature is configured.
+                        (feedback::render_fab())
+                        (feedback::render_dialog())
                     }
                     div(class: "drawer-side z-40") {
                         label(
@@ -957,6 +965,13 @@ pub use admin_users::{impersonate_stop, users_impersonate, users_index as admin_
 // requests), with an admin-only in-page "All users" toggle (`?scope=all`).
 mod usage;
 pub use usage::usage_index;
+
+// Feedback widget: a floating button on every authed page that files a
+// GitHub issue (with optional voice-to-fields + a viewport screenshot). The
+// FAB + dialog are static chrome mounted in `layout_authed`; the three JSON
+// endpoints are re-exported for the router.
+mod feedback;
+pub use feedback::{feedback_config, feedback_extract, feedback_submit};
 
 fn internal_error_html(user_email: &str, message: &str) -> Response {
     let body = html! {

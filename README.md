@@ -4,6 +4,27 @@ Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests acro
 
 ![The built-in chat UI answering a question by calling the web-search tool mid-completion — the reasoning step, the tool calls, and the final markdown answer all render inline.](docs/img/chat.png)
 
+## Contents
+
+- [What it does](#what-it-does)
+- [Tools the model can call](#tools-the-model-can-call)
+- [The built-in web UI](#the-built-in-web-ui)
+- [Scheduled actions](#scheduled-actions)
+- [Integrations (per-user MCP connectors)](#integrations-per-user-mcp-connectors)
+- [Quick start (local development)](#quick-start-local-development)
+- [Configuration](#configuration)
+  - [Chat attachments (S3)](#chat-attachments-s3)
+  - [RAG (codebase search)](#rag-codebase-search)
+  - [Agent Skills](#agent-skills)
+- [Using the gateway](#using-the-gateway)
+  - [CLI (`gw`)](#cli-gw)
+  - [HTTP endpoints](#http-endpoints)
+- [Production deployment (container + systemd)](#production-deployment-container--systemd)
+  - [Docker Compose](#docker-compose)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## What it does
 
 - **OpenAI-compatible API** — `POST /v1/chat/completions` (streaming + non-streaming), `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, and `GET /v1/models`. Point any OpenAI SDK at it.
@@ -282,6 +303,7 @@ In a clone, run it via `mise run cli -- <args>`; a release build produces a stan
 | `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled`, `/integrations`, `/usage` | session cookie | Web UI (`/integrations` is the per-user MCP connector store; `/usage` shows your own request/token usage; admins get an in-page "All users" toggle). |
 | `/admin/users`, `/rag`, `/admin/models`, `/admin/backends`, `/admin/skills`, `/admin/connectors` | admin role | Admin UI (the users page lists registered users and starts impersonation; connectors curates the MCP catalog — see [`docs/connectors.md`](docs/connectors.md) for provider setup). |
 | `POST /impersonate/stop` | session cookie | End an active impersonation and return to your own account. |
+| `/feedback`, `/feedback/extract`, `/feedback/config` | session cookie | Feedback widget: file a GitHub issue, turn a voice transcript into structured fields, and report whether the feature is configured. Enabled by the `[feedback]` config block. |
 | `/api/v0/*` | session cookie | JSON APIs backing the UI. |
 
 The `/v1/*` endpoints require `Authorization: Bearer gwk_…`. Client `Authorization` headers are dropped at the proxy and the configured upstream key (if any) is injected; hop-by-hop headers are filtered both ways; upstream 4xx/5xx are relayed verbatim. The UI pages use the signed session cookie minted at OIDC login.

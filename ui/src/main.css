@@ -842,6 +842,144 @@
         cursor: pointer;
     }
 
+    /* Feedback widget.
+     *
+     * A floating action button pinned bottom-right on every authed page
+     * (a sibling of <main>, so it persists across Datastar SPA nav), plus
+     * the native <dialog> it opens. Starts hidden via the `hidden`
+     * attribute; `feedback.ts` reveals it once `/feedback/config` confirms
+     * the feature is configured. `z-index` sits above page content but the
+     * dialog's own top-layer (`showModal()`) always wins over it. */
+    .feedback-fab {
+        position: fixed;
+        right: 1rem;
+        bottom: 1rem;
+        z-index: 50;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.25rem;
+        height: 2.25rem;
+        border-radius: 9999px;
+        background: var(--color-primary);
+        color: var(--color-primary-content);
+        border: none;
+        cursor: pointer;
+        box-shadow:
+            0 4px 12px color-mix(in oklch, var(--color-base-content) 22%, transparent),
+            0 1px 3px color-mix(in oklch, var(--color-base-content) 18%, transparent);
+        transition: transform 0.12s ease, box-shadow 0.12s ease;
+    }
+    .feedback-fab:hover {
+        transform: translateY(-1px);
+        box-shadow:
+            0 6px 18px color-mix(in oklch, var(--color-base-content) 28%, transparent),
+            0 2px 4px color-mix(in oklch, var(--color-base-content) 20%, transparent);
+    }
+    .feedback-fab[hidden] {
+        display: none;
+    }
+
+    .feedback-dialog {
+        width: 92vw;
+        max-width: 48rem;
+        max-height: 90dvh;
+        background: var(--color-base-100);
+        color: var(--color-base-content);
+        overflow: hidden;
+    }
+    .feedback-dialog::backdrop {
+        background: color-mix(in oklch, black 45%, transparent);
+    }
+    /* The form is a flex column; the body scrolls between sticky header
+     * and footer when the fields overflow a short viewport. */
+    .feedback-dialog > form {
+        max-height: 90dvh;
+    }
+    .feedback-dialog .overflow-y-auto {
+        max-height: 60dvh;
+    }
+    /* Screenshot + annotation. The canvas holds the full-resolution capture
+     * and is CSS-scaled to fit the dialog; the toolbar drives the annotator. */
+    .feedback-shot {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+    .feedback-annot-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.375rem 0.5rem;
+        border-radius: 0.5rem;
+        background: color-mix(in oklch, var(--color-base-content) 6%, transparent);
+    }
+    .feedback-tool-group {
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+    }
+    .feedback-tool-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 1.75rem;
+        height: 1.75rem;
+        border-radius: 0.375rem;
+        border: 1px solid transparent;
+        background: transparent;
+        color: var(--color-base-content);
+        font-size: 0.95rem;
+        line-height: 1;
+        cursor: pointer;
+    }
+    .feedback-tool-btn:hover {
+        background: color-mix(in oklch, var(--color-base-content) 10%, transparent);
+    }
+    .feedback-tool-btn--active {
+        background: var(--color-primary);
+        color: var(--color-primary-content);
+    }
+    .feedback-color-btn {
+        width: 1.25rem;
+        height: 1.25rem;
+        border-radius: 9999px;
+        border: 2px solid transparent;
+        cursor: pointer;
+        padding: 0;
+    }
+    .feedback-color-btn--active {
+        border-color: var(--color-base-content);
+        box-shadow: 0 0 0 2px var(--color-base-100);
+    }
+    .feedback-shot-wrap {
+        max-height: 42dvh;
+        overflow: auto;
+        border-radius: 0.5rem;
+        border: 1px solid var(--color-base-300);
+        background: color-mix(in oklch, var(--color-base-content) 4%, transparent);
+    }
+    .feedback-shot-canvas {
+        display: block;
+        width: 100%;
+        height: auto;
+        cursor: crosshair;
+        touch-action: none;
+    }
+    /* Voice button: pulse the mic while recording. */
+    #feedback-voice-btn[data-state="recording"] {
+        border-color: var(--color-error);
+        color: var(--color-error);
+    }
+    #feedback-voice-btn[data-state="recording"] .feedback-voice-icon {
+        animation: feedback-pulse 1.1s ease-in-out infinite;
+    }
+    @keyframes feedback-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.4; }
+    }
+
     /* Tokens page — the empty-state paragraph below the list. Hidden
      * while the `<ul>` has children; the moment SSE patches remove
      * the last row, the `:has(li)` test flips and the empty paragraph

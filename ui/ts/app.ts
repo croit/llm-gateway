@@ -26,6 +26,12 @@ import './chat/mic.js';
 import './chat/actions.js';
 import './clipboard.js';
 import './geo.js';
+import './feedback.js';
+import { initFeedbackCapture } from './feedback-capture.js';
+
+// Start console + network capture as early as possible so a feedback report
+// carries the diagnostics that led up to it. Cheap, bounded, best-effort.
+initFeedbackCapture();
 
 // ---- Toasts -----------------------------------------------------------
 //

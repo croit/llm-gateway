@@ -16,5 +16,8 @@
     "esbuild": "^0.25.0",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@zumer/snapdom": "^2.12.9"
   }
 }

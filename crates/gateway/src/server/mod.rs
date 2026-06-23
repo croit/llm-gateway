@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod db;
 pub mod embeddings;
 pub mod geoip;
+pub mod github;
 pub mod model_defaults;
 pub mod pdf;
 pub mod rag;

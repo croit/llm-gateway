@@ -66,6 +66,10 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/memory/{id}/edit", pages::memory_edit)
         .with_post("/memory/{id}/delete", pages::memory_delete)
         .with_get("/usage", pages::usage_index)
+        // Feedback widget (JSON endpoints; the FAB + dialog are chrome).
+        .with_get("/feedback/config", pages::feedback_config)
+        .with_post("/feedback/extract", pages::feedback_extract)
+        .with_post("/feedback", pages::feedback_submit)
         .with_get("/scheduled", pages::scheduled_index)
         .with_post("/scheduled", pages::scheduled_create)
         .with_post("/scheduled/preview", pages::scheduled_preview)

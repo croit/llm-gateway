@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gateway::rama_server::{RamaState, SessionStore, router};
-use gateway::server::config::SkillsConfig;
+use gateway::server::config::{FeedbackConfig, SkillsConfig};
 use gateway::server::rbac::RoleConfig;
 use gateway::server::rbac::{Resolver, config::RbacConfig};
 use gateway::server::skills::SkillStore;
@@ -73,7 +73,35 @@ async fn main() -> anyhow::Result<()> {
         .and(path("/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "object": "list",
-            "data": [{ "id": "demo-model", "object": "model" }],
+            // Two chat models so the feedback widget's "Text model" picker has
+            // a real choice to render.
+            "data": [
+                { "id": "demo-model", "object": "model" },
+                { "id": "demo-model-pro", "object": "model" },
+            ],
+        })))
+        .mount(&chat_mock)
+        .await;
+    // Feedback field-extraction: matched before the generic non-streaming
+    // mock (first-mounted wins on ties) via the unique system-prompt phrase,
+    // so the voice→fields flow returns a valid structured JSON object the
+    // dialog can drop into its fields.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains(
+            "structured bug/feature report",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "demo-extract",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"title\":\"Save button does nothing on the settings page\",\"description\":\"Clicking Save on the settings page shows no feedback and the change is lost after reload.\",\"business_value\":\"Users cannot persist their preferences, leading to repeated support tickets.\",\"acceptance_criteria\":\"- Clicking Save persists the change\\n- A success toast confirms the save\\n- The value survives a reload\",\"priority\":\"high\"}",
+                },
+                "finish_reason": "stop",
+            }],
         })))
         .mount(&chat_mock)
         .await;
@@ -116,7 +144,12 @@ async fn main() -> anyhow::Result<()> {
         .and(path("/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "object": "list",
-            "data": [{ "id": "demo-whisper", "object": "model" }],
+            // Two transcription models so the feedback widget's "Voice model"
+            // picker has a real choice to render.
+            "data": [
+                { "id": "demo-whisper", "object": "model" },
+                { "id": "demo-whisper-large", "object": "model" },
+            ],
         })))
         .mount(&voice_mock)
         .await;
@@ -200,6 +233,26 @@ async fn main() -> anyhow::Result<()> {
             dir: skills_dir.clone(),
         }),
         roles: roles.clone(),
+        // Seed a feedback config so the floating feedback button + dialog
+        // render in local UI debugging. The token is a dummy — recording,
+        // transcription, model pickers, and field extraction all work against
+        // the wiremock backend; only the final GitHub issue POST would fail
+        // (which is fine for UI work). `extraction_model` left empty so the
+        // picker defaults to the first chat model.
+        feedback: Some(FeedbackConfig {
+            github_owner: "demo-owner".into(),
+            github_repo: "demo-repo".into(),
+            github_token: Some("dev-ui-dummy-token".into()),
+            github_token_env: None,
+            labels: vec!["feedback".into()],
+            assets_branch: "feedback-assets".into(),
+            // Operator-chosen models (the form has no picker). Empty would also
+            // work (first available); set them explicitly for a deterministic
+            // demo against the wiremock pools.
+            extraction_model: Some("demo-model".into()),
+            voice_model: Some("demo-whisper".into()),
+            github_api_base: "https://api.github.com".into(),
+        }),
         ..Config::default()
     };
     let rbac = Arc::new(

@@ -116,6 +116,98 @@ pub struct Config {
     /// talks HTTP to it. See `server::tools::sandbox`.
     #[serde(default)]
     pub sandbox: Option<SandboxConfig>,
+    /// Feedback widget. Optional — with no `[feedback]` block the floating
+    /// feedback button stays hidden (the `/feedback/config` endpoint reports
+    /// it unconfigured, so the client never reveals the FAB). When set,
+    /// every signed-in user gets a floating button that opens a form — with
+    /// optional voice-to-fields dictation — and files the submission as a
+    /// GitHub issue. See `server::github` + `rama_server::pages::feedback`.
+    #[serde(default)]
+    pub feedback: Option<FeedbackConfig>,
+}
+
+/// Feedback-widget settings: where issues are filed and how the voice
+/// transcript is turned into structured fields.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeedbackConfig {
+    /// GitHub repository owner (user or org) that receives the issues,
+    /// e.g. `croit`.
+    pub github_owner: String,
+    /// GitHub repository name, e.g. `llm-gateway`.
+    pub github_repo: String,
+    /// GitHub API token (classic PAT or fine-grained) able to open issues
+    /// (`issues:write`) and — when screenshots are attached — commit asset
+    /// files (`contents:write`). Per request this may live directly in the
+    /// config file. If you'd rather keep it in the environment, leave this
+    /// unset and use `github_token_env`; the direct value wins when both
+    /// are present.
+    #[serde(default)]
+    pub github_token: Option<String>,
+    /// Alternative to `github_token`: the NAME of an env var holding the
+    /// token (same `*_env` convention as the rest of the config). Consulted
+    /// only when `github_token` is unset/empty.
+    #[serde(default)]
+    pub github_token_env: Option<String>,
+    /// Labels applied to every created issue, in addition to the automatic
+    /// `priority:<p>`. Default `["feedback"]`.
+    #[serde(default = "default_feedback_labels")]
+    pub labels: Vec<String>,
+    /// Orphan branch holding embedded screenshot assets: each screenshot is
+    /// committed as a file and linked into the issue body via its raw URL.
+    /// Created off the default branch on first use if missing. Default
+    /// `feedback-assets`.
+    #[serde(default = "default_feedback_assets_branch")]
+    pub assets_branch: String,
+    /// Chat model id used to turn a voice transcript into the structured
+    /// form fields ("text model"). Unset/empty → the gateway picks the first
+    /// available chat model at request time. This is an operator choice, not
+    /// the end user's — the form never exposes a model picker.
+    #[serde(default)]
+    pub extraction_model: Option<String>,
+    /// Transcription model id used to turn the voice recording into text
+    /// ("voice model"). Unset/empty → the gateway picks the first available
+    /// transcription model at request time. Operator choice, not the user's.
+    #[serde(default)]
+    pub voice_model: Option<String>,
+    /// GitHub REST API base URL. Default `https://api.github.com`; override
+    /// for GitHub Enterprise (`https://github.example.com/api/v3`).
+    #[serde(default = "default_github_api_base")]
+    pub github_api_base: String,
+}
+
+fn default_feedback_labels() -> Vec<String> {
+    vec!["feedback".to_string()]
+}
+
+fn default_feedback_assets_branch() -> String {
+    "feedback-assets".to_string()
+}
+
+fn default_github_api_base() -> String {
+    "https://api.github.com".to_string()
+}
+
+impl FeedbackConfig {
+    /// Resolve the GitHub token: the inline `github_token` first, then the
+    /// env var named by `github_token_env`. Empty strings count as unset.
+    pub fn github_token(&self) -> Option<String> {
+        if let Some(tok) = self.github_token.as_ref().filter(|v| !v.is_empty()) {
+            return Some(tok.clone());
+        }
+        self.github_token_env
+            .as_ref()
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// True when enough is configured to actually open an issue: owner,
+    /// repo, and a resolvable token.
+    pub fn is_configured(&self) -> bool {
+        !self.github_owner.is_empty()
+            && !self.github_repo.is_empty()
+            && self.github_token().is_some()
+    }
 }
 
 /// Sandbox tool settings. The heavy lifting (isolation, warm pool, egress
@@ -594,5 +686,43 @@ mod tests {
         "#;
         let err = toml::from_str::<Config>(toml).unwrap_err();
         assert!(err.to_string().contains("mystery_field"), "{err}");
+    }
+
+    #[test]
+    fn feedback_block_parses_with_inline_token_and_defaults() {
+        let toml = r#"
+            [feedback]
+            github_owner = "croit"
+            github_repo  = "llm-gateway"
+            github_token = "ghp_inline"
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        let f = c.feedback.expect("feedback block");
+        assert!(f.is_configured());
+        assert_eq!(f.github_token().as_deref(), Some("ghp_inline"));
+        // Defaults applied.
+        assert_eq!(f.labels, vec!["feedback"]);
+        assert_eq!(f.assets_branch, "feedback-assets");
+        assert_eq!(f.github_api_base, "https://api.github.com");
+    }
+
+    #[test]
+    fn feedback_without_token_is_not_configured() {
+        let toml = r#"
+            [feedback]
+            github_owner = "croit"
+            github_repo  = "llm-gateway"
+        "#;
+        let c: Config = toml::from_str(toml).unwrap();
+        let f = c.feedback.expect("feedback block");
+        // No inline token and no env var named → not configured.
+        assert!(f.github_token().is_none());
+        assert!(!f.is_configured());
+    }
+
+    #[test]
+    fn no_feedback_block_means_disabled() {
+        let c: Config = toml::from_str("").unwrap();
+        assert!(c.feedback.is_none());
     }
 }
