@@ -34,7 +34,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use super::catalog::{BOOTSTRAP_TOOL_ID, entry_key_for};
+use super::catalog::{BOOTSTRAP_TOOL_ID, entry_key_for, is_hidden};
 use super::mcp::MCP_ID_PREFIX;
 use super::{Tool, ToolContext, ToolError, ToolFuture, ToolRegistry};
 
@@ -61,6 +61,12 @@ impl EnableTools {
         let mut catalog: Vec<EnableTarget> = registry
             .ids()
             .filter_map(|id| {
+                // Smoke-test / internal-plumbing tools (e.g. `company_echo`)
+                // stay granted via RBAC but are never advertised — same gate
+                // the `/tools` page uses, so the two surfaces agree.
+                if is_hidden(id) {
+                    return None;
+                }
                 let key = entry_key_for(id).to_string();
                 // enable_tools itself is the bootstrap — it's already on, so
                 // never advertise it as something to turn on (defence in depth:
@@ -208,6 +214,12 @@ fn target_for_key(key: &str) -> EnableTarget {
     // The Web/Network/Documents/etc routing groups in the old embedding
     // router collapse here into one row per *toggle* key (so e.g. `fetch_url`
     // and `search_web` are two separate keys the model can pick from).
+    // Copy is written for a capable model: the *key* already names the
+    // concept (the model knows what DNS or a TLS cert is), so each one-liner
+    // states the tool's specific affordance — what action, on what subject —
+    // rather than re-teaching the concept. Product-specific tools (RAG,
+    // attachments, sandbox) get fuller copy because the name alone doesn't
+    // convey what's behind it.
     let (title, one_liner) = match key {
         "memory" => (
             "Memory",
@@ -215,12 +227,12 @@ fn target_for_key(key: &str) -> EnableTarget {
         ),
         "get_current_timestamp" => (
             "Current date & time",
-            "the user's local date and time (use only if the system context isn't enough)",
+            "the user's current local date and time (the system context carries none)",
         ),
         "get_user_location" => (
             "Precise user location",
-            "prompt the browser for a precise GPS position (the coarse IP-based location \
-             is already in the system context)",
+            "prompt the browser for a precise GPS fix (coarse IP location is already in \
+             the system context)",
         ),
         "search_web" => (
             "Web search",
@@ -232,40 +244,61 @@ fn target_for_key(key: &str) -> EnableTarget {
         ),
         "wikipedia" => (
             "Wikipedia lookup",
-            "look up an encyclopedia article for who/what/where questions",
+            "fetch the summary of a Wikipedia article",
         ),
         "typst" => (
             "Document rendering",
-            "render a PDF document from a corporate template (letter, invoice, report)",
+            "render a PDF from a corporate template (letter, invoice, report)",
         ),
         "fetch_attachment" => (
             "Read an attachment",
-            "open a file the user attached to this chat and read its contents \
-             (text, images, and PDFs — including scanned PDFs as page images)",
+            "read a file the user attached to this chat (text, images, PDFs incl. scanned)",
         ),
         "upload_attachment" => (
             "Attach a file to your reply",
-            "attach a generated file (PDF/PNG/text) to your answer so the user can download it",
+            "attach a generated file (PDF/PNG/text) for the user to download",
         ),
-        "dns_lookup" => (
-            "DNS lookup",
-            "resolve DNS records (A/AAAA/MX/TXT/…) for a hostname",
+        "rag_search" => (
+            "Knowledge-base search",
+            "semantic search over this gateway's indexed repositories & documents — \
+             use it for questions about the user's own codebase, docs, or data",
         ),
+        "rag_list_collections" => (
+            "List knowledge bases",
+            "list the indexed collections available to rag_search (call this first)",
+        ),
+        "run_in_sandbox" => (
+            "Code sandbox",
+            "run Python or shell in an isolated, throwaway sandbox",
+        ),
+        "generate_document" => (
+            "Document generation",
+            "turn Markdown into a downloadable PDF, Word, or PowerPoint file",
+        ),
+        "capture_webpage" => (
+            "Web page capture",
+            "screenshot, PDF, or extract the text of a web page via a headless browser",
+        ),
+        "read_sandbox_output" => (
+            "Read large sandbox output",
+            "grep or page through a previous sandbox run's large output",
+        ),
+        "dns_lookup" => ("DNS lookup", "resolve a hostname's A/AAAA/MX/TXT records"),
         "whois_lookup" => (
             "Domain WHOIS",
-            "look up a domain's registration details via RDAP",
+            "a domain's registration owner, dates & status (RDAP)",
         ),
         "tls_cert" => (
             "TLS certificate check",
-            "inspect a site's TLS certificate, issuer, and expiry",
+            "inspect a remote site's TLS certificate: issuer & expiry",
         ),
         "lookup_ip" => (
             "IP / host location",
-            "look up an IP or hostname's country/region/city via offline GeoIP",
+            "geolocate an IP or hostname via offline GeoIP",
         ),
         "convert_currency" => (
             "Currency conversion",
-            "convert money between currencies using daily ECB reference rates",
+            "convert between currencies at daily ECB rates",
         ),
         _ if key.starts_with(MCP_ID_PREFIX) => {
             let server = key.strip_prefix(MCP_ID_PREFIX).unwrap_or(key);
@@ -340,6 +373,43 @@ mod tests {
         assert!(keys.contains(&"get_current_timestamp"));
         assert!(keys.contains(&"fetch_url"));
         assert!(keys.contains(&"search_web"));
+    }
+
+    #[test]
+    fn hidden_tools_are_not_advertised() {
+        // `company_echo` is a smoke-test tool listed in `catalog::HIDDEN`; it
+        // stays granted via RBAC but must never appear as an enableable key
+        // (same gate the `/tools` page applies).
+        use crate::server::tools::echo::Echo;
+        let reg = ToolRegistry::new().with(Echo).with(FetchUrl);
+        let et = EnableTools::from_registry(&reg);
+        let keys: Vec<&str> = et.catalog.iter().map(|t| t.key.as_str()).collect();
+        assert!(keys.contains(&"fetch_url"));
+        assert!(
+            !keys.contains(&"company_echo"),
+            "hidden smoke-test tool must not be advertised: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn rag_tools_get_real_copy_not_the_fallback() {
+        // Regression: rag_* used to fall through to the "see your /tools page"
+        // default one-liner, so the model couldn't tell it could search the
+        // indexed codebase/docs.
+        use crate::server::tools::rag::{RagListCollections, RagSearch};
+        let reg = ToolRegistry::new().with(RagListCollections).with(RagSearch);
+        let et = EnableTools::from_registry(&reg);
+        let rag = et
+            .catalog
+            .iter()
+            .find(|t| t.key == "rag_search")
+            .expect("rag_search should be advertised");
+        assert!(
+            !rag.one_liner.contains("see your /tools page"),
+            "rag_search fell through to the default copy: {:?}",
+            rag.one_liner
+        );
+        assert!(rag.one_liner.to_lowercase().contains("search"));
     }
 
     #[test]

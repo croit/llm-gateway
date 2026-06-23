@@ -43,6 +43,9 @@ const HIDDEN: &[&str] = &["company_echo"];
 pub enum Category {
     Web,
     Documents,
+    /// Semantic search over operator-indexed knowledge bases (`rag_*`) —
+    /// the user's own repositories and documents.
+    Knowledge,
     /// Sandboxed code execution (`run_in_sandbox` + its presets).
     Code,
     Memory,
@@ -57,6 +60,7 @@ impl Category {
         match self {
             Category::Web => "Web & Network",
             Category::Documents => "Attachments & Documents",
+            Category::Knowledge => "Knowledge base",
             Category::Code => "Code & Sandbox",
             Category::Memory => "Memory",
             Category::Integrations => "Integrations",
@@ -69,10 +73,11 @@ impl Category {
         match self {
             Category::Web => 0,
             Category::Documents => 1,
-            Category::Code => 2,
-            Category::Memory => 3,
-            Category::Integrations => 4,
-            Category::Utility => 5,
+            Category::Knowledge => 2,
+            Category::Code => 3,
+            Category::Memory => 4,
+            Category::Integrations => 5,
+            Category::Utility => 6,
         }
     }
 }
@@ -114,6 +119,15 @@ pub fn entry_key_for(tool_id: &str) -> &str {
     }
 }
 
+/// Whether a tool id is hidden from every user-facing surface — both the
+/// `/tools` settings page and the model-facing `enable_tools` catalog.
+/// Smoke-test / internal-plumbing tools stay granted via RBAC; they're just
+/// never advertised as a toggle. Single source of truth so the page and the
+/// bootstrap tool can't drift on what counts as hidden.
+pub fn is_hidden(tool_id: &str) -> bool {
+    HIDDEN.contains(&tool_id)
+}
+
 /// `mcp__<server>__<tool>` → `mcp__<server>` (the per-server toggle key).
 /// Falls back to the whole id if the shape is unexpected.
 fn mcp_server_key(tool_id: &str) -> &str {
@@ -133,6 +147,7 @@ fn category_for(tool_id: &str) -> Category {
         "search_web" | "fetch_url" | "lookup_ip" | "dns_lookup" | "whois_lookup" | "tls_cert"
         | "wikipedia" => Category::Web,
         "fetch_attachment" | "upload_attachment" | "read_skill" => Category::Documents,
+        "rag_search" | "rag_list_collections" => Category::Knowledge,
         "run_in_sandbox" | "generate_document" | "capture_webpage" | "read_sandbox_output" => {
             Category::Code
         }
@@ -227,6 +242,17 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Converts an amount between currencies using daily ECB reference rates, so the \
              assistant gives a real figure instead of guessing the exchange rate.",
         ),
+        "rag_search" => (
+            "Knowledge-base search",
+            "Lets the assistant semantically search the repositories and documents indexed \
+             into this gateway — your own codebase, docs, or data — and quote the matching \
+             passages, instead of guessing or searching the public web.",
+        ),
+        "rag_list_collections" => (
+            "List knowledge bases",
+            "Lets the assistant discover which indexed collections exist before searching \
+             them, so it queries the right repository or document set.",
+        ),
         "read_skill" => (
             "Skills",
             "Lets the assistant load an operator-installed skill — brand guidelines, house \
@@ -259,6 +285,36 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
     Some(meta)
 }
 
+/// The distinct high-level capability *areas* the registry actually offers,
+/// as user-facing category labels in display order. Drives the one-line
+/// "here's what you can turn on" hint in the model's system context: domains,
+/// not individual tools, so it stays cheap and the model still calls
+/// `enable_tools` for the exact keys. Derived from the live registry, so a
+/// deployment without (say) a sandbox or an indexer never advertises that
+/// area. MCP integrations are excluded — they're listed per-user in the
+/// system context already; hidden, bootstrap, and the skill loader don't
+/// count toward an area on their own.
+pub fn capability_domains(registry: &ToolRegistry) -> Vec<&'static str> {
+    let mut seen: Vec<Category> = Vec::new();
+    for id in registry.ids() {
+        if is_hidden(id) || id == BOOTSTRAP_TOOL_ID || id == "read_skill" {
+            continue;
+        }
+        if id.starts_with(crate::server::tools::mcp::MCP_ID_PREFIX) {
+            continue;
+        }
+        let cat = category_for(id);
+        if cat == Category::Integrations {
+            continue;
+        }
+        if !seen.contains(&cat) {
+            seen.push(cat);
+        }
+    }
+    seen.sort_by_key(|c| c.order());
+    seen.into_iter().map(Category::label).collect()
+}
+
 /// Build the grouped, de-noised toggle list from the tool ids the
 /// user's roles grant. Hidden tools are dropped; the `typst_<id>`
 /// family is folded into a single entry. Sorted by category then key
@@ -270,7 +326,7 @@ pub fn entries(registry: &ToolRegistry, allowed: &[String]) -> Vec<ToolEntry> {
     let mut mcp_servers_seen: HashSet<String> = HashSet::new();
 
     for id in allowed {
-        if HIDDEN.contains(&id.as_str()) {
+        if is_hidden(id) {
             continue;
         }
         if MEMORY_IDS.contains(&id.as_str()) {
@@ -375,6 +431,32 @@ mod tests {
         assert_eq!(entry_key_for("typst_invoice"), "typst");
         assert_eq!(entry_key_for("typst_report"), "typst");
         assert_eq!(entry_key_for("search_web"), "search_web");
+    }
+
+    #[test]
+    fn capability_domains_derive_from_registry_and_skip_hidden() {
+        use crate::server::tools::rag::RagSearch;
+        let reg = ToolRegistry::new()
+            .with(SearchWeb)
+            .with(RagSearch)
+            .with(Echo);
+        // Echo (`company_echo`) is hidden → its area never shows. Order is by
+        // Category::order: Web before Knowledge.
+        assert_eq!(
+            capability_domains(&reg),
+            vec!["Web & Network", "Knowledge base"]
+        );
+    }
+
+    #[test]
+    fn rag_search_gets_a_curated_entry_in_the_knowledge_area() {
+        use crate::server::tools::rag::RagSearch;
+        let reg = ToolRegistry::new().with(RagSearch);
+        let entries = entries(&reg, &["rag_search".to_string()]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].category, Category::Knowledge);
+        // Curated title from `display_meta`, not the raw schema function name.
+        assert_eq!(entries[0].title, "Knowledge-base search");
     }
 
     #[test]

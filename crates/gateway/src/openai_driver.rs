@@ -754,7 +754,22 @@ async fn build_request_context(
         return None;
     }
 
-    let mut out = String::from(
+    // High-level capability areas this deployment actually offers, derived
+    // from the live registry (so we never advertise an absent sandbox/indexer)
+    // — domains, not tools, to keep the hint cheap. The model still calls
+    // `enable_tools` for the exact keys; connected MCP integrations and skills
+    // are listed separately below, so they're excluded here.
+    let domains = crate::server::tools::catalog::capability_domains(d.state.tools.as_ref());
+    let domains_line = if domains.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Built-in capability areas you can turn on: {}. ",
+            domains.join(", ")
+        )
+    };
+
+    let mut out = format!(
         "Automatically provided context about the signed-in user making this request. \
          When they ask you to act on their behalf — e.g. as the sender/signature of a \
          letter or document — use their name and email below; do not invent a name or \
@@ -763,12 +778,12 @@ async fn build_request_context(
          external services or search the web for these.\n\
          \n\
          Your `tools` list is intentionally minimal: only `enable_tools` is on by \
-         default; every other capability (memory, web fetch, document rendering, \
-         network diagnostics, MCP integrations, attachments, …) starts off and must be \
-         turned on. Call `enable_tools(keys)` FIRST whenever the user's request needs a \
+         default; every other capability starts off and must be turned on. \
+         {domains_line}Call `enable_tools(keys)` FIRST whenever the user's request needs a \
          capability that isn't already in your tools list — its description lists every \
-         available key. Enablement is sticky for this conversation, so you only pay the \
-         turn-on cost once per capability.\n",
+         available key (and any connected integrations or skills are noted below). \
+         Enablement is sticky for this conversation, so you only pay the turn-on cost \
+         once per capability.\n",
     );
     if let Some(name) = &name {
         let _ = writeln!(out, "- Name: {name}");
