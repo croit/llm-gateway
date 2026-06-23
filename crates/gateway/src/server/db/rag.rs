@@ -667,15 +667,22 @@ pub async fn swap_ref_index(
 }
 
 /// Indexer-only: a failed run. Status → `error` (message stored), but only
-/// `WHERE status='indexing'` so it can't clobber a re-index that re-queued
-/// the ref. The ref keeps its prior `data_uuid` + commit, so a previously
-/// completed index stays searchable. Returns rows affected.
+/// while the ref is in a mid-build state (`cloning` or `indexing`) so it
+/// can't clobber a re-index that re-queued the ref (→ `pending`). The ref
+/// keeps its prior `data_uuid` + commit, so a previously completed index
+/// stays searchable. Returns rows affected.
+///
+/// Both build phases are covered deliberately: a bad git ref (e.g. a branch
+/// that doesn't exist) fails during `cloning`, *before* the `indexing`
+/// transition. Guarding on `indexing` alone silently dropped those failures
+/// — the ref stayed stuck on `cloning` with an empty `last_error` and the
+/// admin had no way to see why nothing happened.
 pub async fn mark_ref_failed(pool: &Pool, ref_id: i64, message: &str) -> Result<u64, DbError> {
     let now = Timestamp::now().to_string();
     let affected = sqlx::query(
         r#"UPDATE rag_collection_refs
            SET status = 'error', last_error = ?, updated_at = ?
-           WHERE id = ? AND status = 'indexing'"#,
+           WHERE id = ? AND status IN ('cloning', 'indexing')"#,
     )
     .bind(message)
     .bind(&now)
@@ -752,6 +759,158 @@ pub async fn all_ref_data_uuids(pool: &Pool) -> Result<Vec<String>, DbError> {
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+// ---- per-ref indexing log -------------------------------------------------
+//
+// One row per notable indexing event for a ref, so the admin UI can show a
+// timeline ("cloning…", "indexed 312 files", "branch not found") instead of
+// the single overwritten `last_error`. Lives in the central DB next to the
+// refs themselves. Append-only from the worker; pruned per ref to cap growth.
+
+/// Severity of a log entry — drives the colour the admin UI renders it in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        }
+    }
+
+    /// Lenient parse — an unknown value lands in `Info` so one odd row can't
+    /// break the log render.
+    fn from_db(s: &str) -> Self {
+        match s {
+            "warn" => Self::Warn,
+            "error" => Self::Error,
+            _ => Self::Info,
+        }
+    }
+}
+
+/// One recorded indexing event for a ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexLogEntry {
+    pub id: i64,
+    pub ref_id: i64,
+    pub collection_id: i64,
+    pub created_at: Timestamp,
+    pub level: LogLevel,
+    /// Build phase the event belongs to: `queued` | `cloning` | `indexing`
+    /// | `ready` | `error`. A free string (not an enum) so a future phase
+    /// doesn't need a schema change.
+    pub phase: String,
+    pub message: String,
+    pub commit_sha: Option<String>,
+    pub files: Option<i64>,
+    pub chunks: Option<i64>,
+    pub duration_ms: Option<i64>,
+}
+
+/// A log event awaiting insertion. The worker fills one of these at each
+/// notable point in a build and calls [`insert_log_entry`].
+#[derive(Debug, Clone)]
+pub struct NewLogEntry {
+    pub ref_id: i64,
+    pub collection_id: i64,
+    pub level: LogLevel,
+    pub phase: String,
+    pub message: String,
+    pub commit_sha: Option<String>,
+    pub files: Option<i64>,
+    pub chunks: Option<i64>,
+    pub duration_ms: Option<i64>,
+}
+
+fn map_log_row(row: &SqliteRow) -> Result<IndexLogEntry, DbError> {
+    let created_at_s: String = row.try_get("created_at")?;
+    let level_s: String = row.try_get("level")?;
+    Ok(IndexLogEntry {
+        id: row.try_get("id")?,
+        ref_id: row.try_get("ref_id")?,
+        collection_id: row.try_get("collection_id")?,
+        created_at: parse_ts(&created_at_s, "created_at")?,
+        level: LogLevel::from_db(&level_s),
+        phase: row.try_get("phase")?,
+        message: row.try_get("message")?,
+        commit_sha: row.try_get("commit_sha")?,
+        files: row.try_get("files")?,
+        chunks: row.try_get("chunks")?,
+        duration_ms: row.try_get("duration_ms")?,
+    })
+}
+
+const LOG_COLUMNS: &str = "id, ref_id, collection_id, created_at, level, phase, message, \
+     commit_sha, files, chunks, duration_ms";
+
+/// Append one event to a ref's indexing log. Returns the new row id.
+pub async fn insert_log_entry(pool: &Pool, entry: &NewLogEntry) -> Result<i64, DbError> {
+    let now = Timestamp::now().to_string();
+    let id: i64 = sqlx::query_scalar(
+        r#"INSERT INTO rag_index_log
+           (ref_id, collection_id, created_at, level, phase, message,
+            commit_sha, files, chunks, duration_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           RETURNING id"#,
+    )
+    .bind(entry.ref_id)
+    .bind(entry.collection_id)
+    .bind(&now)
+    .bind(entry.level.as_str())
+    .bind(&entry.phase)
+    .bind(&entry.message)
+    .bind(&entry.commit_sha)
+    .bind(entry.files)
+    .bind(entry.chunks)
+    .bind(entry.duration_ms)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+/// A ref's most recent log entries, newest first, capped at `limit`.
+pub async fn list_log_entries(
+    pool: &Pool,
+    ref_id: i64,
+    limit: i64,
+) -> Result<Vec<IndexLogEntry>, DbError> {
+    let q = format!(
+        "SELECT {LOG_COLUMNS} FROM rag_index_log WHERE ref_id = ? ORDER BY id DESC LIMIT ?"
+    );
+    let rows = sqlx::query(&q)
+        .bind(ref_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    rows.iter().map(map_log_row).collect()
+}
+
+/// Trim a ref's log to its newest `keep` rows. Called after each insert so
+/// a long-lived, frequently-reindexed ref doesn't grow its log unbounded.
+/// Returns how many rows were pruned.
+pub async fn prune_log_entries(pool: &Pool, ref_id: i64, keep: i64) -> Result<u64, DbError> {
+    let affected = sqlx::query(
+        r#"DELETE FROM rag_index_log
+           WHERE ref_id = ?
+             AND id NOT IN (
+                 SELECT id FROM rag_index_log WHERE ref_id = ? ORDER BY id DESC LIMIT ?
+             )"#,
+    )
+    .bind(ref_id)
+    .bind(ref_id)
+    .bind(keep)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected)
 }
 
 // ---- file-side metadata ---------------------------------------------------
@@ -1443,6 +1602,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mark_ref_failed_records_during_cloning_phase() {
+        // Regression: a branch that doesn't exist fails while the ref is in
+        // `cloning` (before the `indexing` transition). The failure must be
+        // recorded — previously the `WHERE status='indexing'` guard dropped
+        // it, leaving the ref stuck on `cloning` with an empty `last_error`
+        // and the admin blind to the cause.
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let r = add_ref(&pool, c.id, "no-such-branch", None, true)
+            .await
+            .unwrap();
+
+        set_ref_status(&pool, r.id, CollectionStatus::Cloning)
+            .await
+            .unwrap();
+        let affected = mark_ref_failed(&pool, r.id, "branch not found")
+            .await
+            .unwrap();
+        assert_eq!(affected, 1, "clone-phase failure must be recorded");
+
+        let after = find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
+        assert_eq!(after.status, CollectionStatus::Error);
+        assert_eq!(after.last_error.as_deref(), Some("branch not found"));
+    }
+
+    #[tokio::test]
+    async fn mark_ref_failed_does_not_clobber_a_requeue() {
+        // A re-queue flips the ref to `pending`; a late-arriving failure from
+        // the superseded build must NOT overwrite that (the new build owns
+        // the ref now).
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let r = add_ref(&pool, c.id, "main", None, true).await.unwrap();
+
+        request_ref_reindex(&pool, r.id).await.unwrap(); // → pending
+        let affected = mark_ref_failed(&pool, r.id, "stale failure").await.unwrap();
+        assert_eq!(affected, 0, "must not clobber a pending re-queue");
+        let after = find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
+        assert_eq!(after.status, CollectionStatus::Pending);
+        assert!(after.last_error.is_none());
+    }
+
+    #[tokio::test]
     async fn reset_stalled_refs_requeues_orphans() {
         let pool = fresh().await;
         let c = create_collection(&pool, &sample_new()).await.unwrap();
@@ -1455,6 +1657,89 @@ mod tests {
             find_ref_by_id(&pool, r.id).await.unwrap().unwrap().status,
             CollectionStatus::Pending
         );
+    }
+
+    #[tokio::test]
+    async fn index_log_inserts_lists_newest_first_and_prunes() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let r = add_ref(&pool, c.id, "main", None, true).await.unwrap();
+
+        // A small spread of events.
+        insert_log_entry(
+            &pool,
+            &NewLogEntry {
+                ref_id: r.id,
+                collection_id: c.id,
+                level: LogLevel::Info,
+                phase: "cloning".into(),
+                message: "cloning main".into(),
+                commit_sha: None,
+                files: None,
+                chunks: None,
+                duration_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        insert_log_entry(
+            &pool,
+            &NewLogEntry {
+                ref_id: r.id,
+                collection_id: c.id,
+                level: LogLevel::Error,
+                phase: "error".into(),
+                message: "branch not found".into(),
+                commit_sha: None,
+                files: None,
+                chunks: None,
+                duration_ms: Some(1234),
+            },
+        )
+        .await
+        .unwrap();
+
+        let entries = list_log_entries(&pool, r.id, 10).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        // Newest first.
+        assert_eq!(entries[0].message, "branch not found");
+        assert_eq!(entries[0].level, LogLevel::Error);
+        assert_eq!(entries[0].duration_ms, Some(1234));
+        assert_eq!(entries[1].message, "cloning main");
+
+        // Prune to the newest 1 → the cloning entry goes.
+        let pruned = prune_log_entries(&pool, r.id, 1).await.unwrap();
+        assert_eq!(pruned, 1);
+        let after = list_log_entries(&pool, r.id, 10).await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].message, "branch not found");
+    }
+
+    #[tokio::test]
+    async fn index_log_cascades_on_ref_delete() {
+        // Deleting a ref must take its log rows with it (FK ON DELETE CASCADE),
+        // so a removed source leaves no orphaned log behind.
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let r = add_ref(&pool, c.id, "main", None, true).await.unwrap();
+        insert_log_entry(
+            &pool,
+            &NewLogEntry {
+                ref_id: r.id,
+                collection_id: c.id,
+                level: LogLevel::Info,
+                phase: "queued".into(),
+                message: "queued".into(),
+                commit_sha: None,
+                files: None,
+                chunks: None,
+                duration_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        delete_ref(&pool, r.id).await.unwrap();
+        assert!(list_log_entries(&pool, r.id, 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -9,12 +9,15 @@
 //! without a full reload. Admin-gated (`require_admin_or_403`); the
 //! sidebar entry is only rendered for admins, matching `/admin/*`.
 //!
-//! V1 has no live status pump: the indexer flips collection rows
-//! between `pending` / `cloning` / `indexing` / `ready` / `error` in
-//! its background poll, and the page shows whatever the DB says on
-//! the next request. Re-index POST replies with a freshly-rendered
-//! row, so the status badge does update immediately after the click.
-//! True push-from-indexer-to-browser is a Phase 5 concern.
+//! Live status: while the page is open it polls `GET /rag/status` on a
+//! datastar interval and morphs each ref's `#rag-ref-{id}` status row, so
+//! the background indexer's progress (`pending` → `cloning` → `indexing`
+//! → `ready`/`error`) — and especially *failures* like a branch that
+//! doesn't exist — show up without a manual reload. Each ref also has a
+//! "Log" button (`GET /rag/refs/{ref_id}/log`) that opens its full
+//! indexing timeline; the ref itself only carries the latest `last_error`,
+//! the log keeps the history. The poll deliberately re-patches only the
+//! status rows, leaving the add-source inputs and any open log untouched.
 
 use std::sync::Arc;
 
@@ -520,6 +523,56 @@ pub async fn rag_ref_delete(
     .await
 }
 
+/// GET /rag/refs/{ref_id}/log — open a ref's indexing timeline. Fills the
+/// `#rag-reflog-{ref_id}` container with the recorded events (newest first):
+/// every build's clone/ready/error and any advisory. This is the "why did it
+/// fail" surface — the ref carries only the latest `last_error`; the log keeps
+/// the history.
+pub async fn rag_ref_log(
+    State(state): State<Arc<RamaState>>,
+    Path(ref_id): Path<i64>,
+    req: Request,
+) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let entries = match rag_db::list_log_entries(&state.db, ref_id, 30).await {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(error = %err, %ref_id, "rag: load ref log");
+            return toast(FlashKind::Error, "could not load log");
+        }
+    };
+    let selector = format!("#rag-reflog-{ref_id}");
+    let html = render_ref_log(ref_id, &entries).to_string();
+    sse_response(&[sse_patch(Some(&selector), Some("inner"), &html)])
+}
+
+/// GET /rag/status — live-status poll target. Re-patches each ref's status
+/// row (`#rag-ref-{id}`) with its current badge, last-indexed provenance, and
+/// any error/advisory, so the admin sees the background indexer's progress
+/// without reloading. Deliberately patches *only* the `#rag-ref-*` rows (not
+/// whole collection rows) so the add-source inputs and an open log are left
+/// alone. Cheap: a couple of indexed reads + a small render per ref.
+pub async fn rag_status(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let collections = rag_db::list_collections(&state.db)
+        .await
+        .unwrap_or_default();
+    let mut events: Vec<rama::bytes::Bytes> = Vec::new();
+    for c in &collections {
+        let refs = rag_db::list_refs(&state.db, c.id).await.unwrap_or_default();
+        for r in &refs {
+            let selector = format!("#rag-ref-{}", r.id);
+            let html = render_ref(c, r).to_string();
+            events.push(sse_patch(Some(&selector), Some("outer"), &html));
+        }
+    }
+    sse_response(&events)
+}
+
 /// POST /rag/{id}/edit-form — SSE-swap the row to an editable form.
 /// Pre-fills every field from the stored row and resolves the embedding
 /// model against the live pool list so the select pre-selects the right
@@ -918,6 +971,10 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
             div(class: "mt-1 pl-3 border-l border-base-300 flex flex-col gap-1.5") {
                 for r in refs.iter() {
                     (render_ref(c, r))
+                    // Empty container the "Log" button fills in on demand. Kept
+                    // OUTSIDE `render_ref` so the status poll (which re-patches
+                    // `#rag-ref-{id}`) doesn't wipe an opened log.
+                    div(id: (format!("rag-reflog-{}", r.id))) {}
                 }
                 // Add-source form. Aggregate collections take a repo URL plus
                 // an optional ref; versioned ones just a ref of the one repo.
@@ -992,9 +1049,19 @@ fn render_ref(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Html {
     let reindex_action = format!("/rag/refs/{}/reindex", r.id);
     let delete_action = format!("/rag/refs/{}/delete", r.id);
     let primary_action = format!("/rag/refs/{}/primary", r.id);
+    let log_action = format!("/rag/refs/{}/log", r.id);
     let reindex_directive = format!("@post('{reindex_action}', {{contentType: 'form'}})");
     let delete_directive = format!("@post('{delete_action}', {{contentType: 'form'}})");
     let primary_directive = format!("@post('{primary_action}', {{contentType: 'form'}})");
+    // Toggle: if the log container already holds content, clear it (close);
+    // otherwise fetch + fill it (open). The container always exists (rendered
+    // as a sibling in `render_row`), so the bare `.innerHTML` assignment is
+    // safe — no optional chaining needed (and `a?.b = c` is invalid JS anyway).
+    let reflog_id = format!("rag-reflog-{}", r.id);
+    let log_directive = format!(
+        "document.getElementById('{reflog_id}').innerHTML ? \
+         document.getElementById('{reflog_id}').innerHTML = '' : @get('{log_action}')"
+    );
     let last_indexed = r
         .last_indexed_at
         .map(|t| t.strftime("%Y-%m-%d %H:%M UTC").to_string())
@@ -1027,9 +1094,22 @@ fn render_ref(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Html {
                 "indexed " (last_indexed) " · " (last_commit)
             }
             if let Some(err) = r.last_error.as_ref() {
-                span(class: "text-xs text-error break-all") { "error: " (err.clone()) }
+                // Headline the most recent error/advisory; the Log button
+                // opens the full timeline below.
+                span(
+                    class: (if r.status == rag_db::CollectionStatus::Error {
+                        "text-xs text-error break-all"
+                    } else {
+                        "text-xs text-warning break-all"
+                    })
+                ) { (err.clone()) }
             }
             div(class: "flex items-center gap-1 ml-auto") {
+                button(
+                    type: "button",
+                    class: "btn btn-xs btn-ghost",
+                    "data-on:click": (log_directive)
+                ) { "Log" }
                 form(action: (reindex_action), method: "post", class: "m-0", "data-on:submit__prevent": (reindex_directive)) {
                     button(type: "submit", class: "btn btn-xs") { "Re-index" }
                 }
@@ -1040,6 +1120,53 @@ fn render_ref(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Html {
                 }
                 form(action: (delete_action), method: "post", class: "m-0", "data-on:submit__prevent": (delete_directive)) {
                     button(type: "submit", class: "btn btn-xs btn-ghost btn-error") { "Remove" }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// A small coloured badge for a log entry's severity. `shrink-0` +
+/// `whitespace-nowrap` keep it on one line — without them the row's
+/// `break-all` on the message would wrap the short label letter-by-letter
+/// ("e/r/r/o/r" stacked).
+fn log_level_badge(level: rag_db::LogLevel) -> Html {
+    let (cls, label) = match level {
+        rag_db::LogLevel::Info => ("badge badge-xs badge-ghost shrink-0", "info"),
+        rag_db::LogLevel::Warn => ("badge badge-xs badge-warning shrink-0", "warn"),
+        rag_db::LogLevel::Error => ("badge badge-xs badge-error shrink-0", "error"),
+    };
+    html! { span(class: (cls)) { (label) } }.to_html()
+}
+
+/// Render a ref's indexing timeline into its `#rag-reflog-{ref_id}` container.
+/// Newest first; each row shows time, severity, phase, and message. Closing is
+/// the "Log" button's job (it toggles the container), so there's no Hide here.
+fn render_ref_log(_ref_id: i64, entries: &[rag_db::IndexLogEntry]) -> Html {
+    html! {
+        div(class: "mt-1 mb-1 rounded border border-base-300 bg-base-200/40 p-2 text-xs") {
+            div(class: "mb-1") {
+                span(class: "font-medium text-base-content/70") { "Indexing log" }
+            }
+            if entries.is_empty() {
+                p(class: "text-base-content/60") {
+                    "No indexing events recorded yet. The first run logs here once the indexer picks this ref up."
+                }
+            } else {
+                ul(class: "flex flex-col gap-1") {
+                    for e in entries.iter() {
+                        // Only the message wraps (break-words); the fixed-width
+                        // columns stay on one line via shrink-0.
+                        li(class: "flex items-start gap-2 font-mono") {
+                            span(class: "text-base-content/50 shrink-0 whitespace-nowrap") {
+                                (e.created_at.strftime("%Y-%m-%d %H:%M:%S").to_string())
+                            }
+                            (log_level_badge(e.level))
+                            span(class: "text-base-content/50 shrink-0 w-14") { (e.phase.clone()) }
+                            span(class: "min-w-0 break-words") { (e.message.clone()) }
+                        }
+                    }
                 }
             }
         }
@@ -1448,9 +1575,22 @@ fn render_body(
             section(class: "card border border-base-300") {
                 div(class: "card-body") {
                     h2(class: "card-title") { "Configured collections" }
+                    // Live status: while on the page, poll `/rag/status` and
+                    // morph each ref's status row. Catches transitions driven
+                    // by the background indexer (cloning → ready/error) without
+                    // a manual reload — and indexing failures the operator
+                    // would otherwise never see. Only the `#rag-ref-*` status
+                    // rows are re-patched, so the add-source inputs and any
+                    // opened log are left untouched. Gated on a non-empty list
+                    // so an empty page doesn't poll for nothing.
                     ul(
                         id: "rag-list",
-                        class: "flex flex-col divide-y divide-base-300"
+                        class: "flex flex-col divide-y divide-base-300",
+                        // `on-interval` is its own datastar plugin (key denied),
+                        // so the attribute is hyphen-form `data-on-interval`, NOT
+                        // `data-on:interval` (which the generic `on` plugin would
+                        // read as an event named "interval" that never fires).
+                        "data-on-interval__duration.4s": (if list.is_empty() { "" } else { "@get('/rag/status')" })
                     ) {
                         for (c, refs) in list.iter() {
                             (render_row(c, refs))
@@ -1466,4 +1606,116 @@ fn render_body(
         }
     }
     .to_html()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jiff::Timestamp;
+
+    fn collection() -> rag_db::Collection {
+        let now = Timestamp::now();
+        rag_db::Collection {
+            id: 7,
+            data_uuid: Some("u".into()),
+            name: "ceph".into(),
+            description: None,
+            git_url: "https://example.invalid/ceph.git".into(),
+            git_ref: "main".into(),
+            pat: None,
+            embedding_model: "embed".into(),
+            include_globs: vec!["**/*".into()],
+            exclude_globs: vec![],
+            chunk_size: 800,
+            chunk_overlap: 100,
+            search_mode: rag_db::SearchMode::Versioned,
+            status: rag_db::CollectionStatus::Ready,
+            last_indexed_at: None,
+            last_indexed_commit: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn cref(id: i64, status: rag_db::CollectionStatus, err: Option<&str>) -> rag_db::CollectionRef {
+        let now = Timestamp::now();
+        rag_db::CollectionRef {
+            id,
+            collection_id: 7,
+            git_ref: "reef".into(),
+            git_url: None,
+            is_primary: true,
+            data_uuid: "u".into(),
+            status,
+            last_indexed_at: None,
+            last_indexed_commit: None,
+            last_error: err.map(|s| s.into()),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The "Log" control on a ref must call the matching log endpoint, and the
+    /// status row must carry the stable `#rag-ref-{id}` id the poller patches.
+    #[test]
+    fn render_ref_wires_log_button_to_endpoint() {
+        let c = collection();
+        let r = cref(
+            42,
+            rag_db::CollectionStatus::Error,
+            Some("Branch 'x' does not exist"),
+        );
+        let html = render_ref(&c, &r).to_string();
+        // (plait HTML-escapes attribute values, so match escaping-safe
+        // substrings — the stable id and the endpoint path.)
+        assert!(html.contains("rag-ref-42"), "{html}");
+        assert!(html.contains("/rag/refs/42/log"), "{html}");
+        // The latest error is headlined on the row itself.
+        assert!(html.contains("does not exist"), "{html}");
+    }
+
+    /// Initial page render (not just an event) must arm the status poll and
+    /// emit a log container per ref — otherwise the admin never sees live
+    /// transitions or can't open the log. Guards the on-load wiring.
+    #[test]
+    fn render_body_arms_status_poll_and_log_container() {
+        let c = collection();
+        let refs = vec![cref(42, rag_db::CollectionStatus::Cloning, None)];
+        let html = render_body(&[(c, refs)], &["embed".into()]).to_string();
+        assert!(html.contains("data-on-interval__duration.4s"), "{html}");
+        assert!(html.contains("/rag/status"), "{html}");
+        assert!(html.contains("rag-reflog-42"), "{html}");
+    }
+
+    /// An empty list must NOT arm the poll (nothing to watch → no traffic).
+    #[test]
+    fn render_body_empty_list_does_not_poll() {
+        let html = render_body(&[], &["embed".into()]).to_string();
+        assert!(!html.contains("/rag/status"), "{html}");
+    }
+
+    #[test]
+    fn render_ref_log_shows_entries_and_empty_state() {
+        let now = Timestamp::now();
+        let entries = vec![rag_db::IndexLogEntry {
+            id: 1,
+            ref_id: 42,
+            collection_id: 7,
+            created_at: now,
+            level: rag_db::LogLevel::Error,
+            phase: "cloning".into(),
+            message: "Branch 'x' does not exist in the repository".into(),
+            commit_sha: None,
+            files: None,
+            chunks: None,
+            duration_ms: Some(12),
+        }];
+        let html = render_ref_log(42, &entries).to_string();
+        assert!(html.contains("does not exist in the repository"), "{html}");
+        assert!(html.contains("error"), "{html}");
+
+        let empty = render_ref_log(42, &[]).to_string();
+        assert!(empty.contains("No indexing events recorded yet"), "{empty}");
+    }
 }

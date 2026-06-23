@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -84,6 +84,121 @@ pub enum WorkerError {
     Io(#[from] std::io::Error),
     #[error("collection {id} not found")]
     NotFound { id: i64 },
+}
+
+/// The build phase a failure belongs to — recorded on the log entry so the
+/// admin sees *where* it broke. Derived from the error variant: git failures
+/// happen while cloning, everything else while indexing.
+fn failure_phase(err: &WorkerError) -> &'static str {
+    match err {
+        WorkerError::Git(_) => "cloning",
+        _ => "indexing",
+    }
+}
+
+/// Translate a raw indexing error into an actionable, admin-facing message.
+///
+/// The raw error is precise but cryptic — e.g. `git clone exited with status
+/// 128: fatal: Remote branch foo not found in upstream origin`. This maps the
+/// common failure modes (bad ref, auth, missing repo, unreachable host,
+/// embedding model) to a plain explanation plus a hint, and appends the raw
+/// `git`/upstream detail in brackets so nothing is lost for deeper debugging.
+/// Messages are English to match the rest of the admin UI.
+fn friendly_error(
+    err: &WorkerError,
+    rref: &rag_db::CollectionRef,
+    collection: &rag_db::Collection,
+) -> String {
+    let url = rref.effective_git_url(collection);
+    match err {
+        WorkerError::Git(GitError::NonZero { stderr, .. }) => {
+            let lower = stderr.to_lowercase();
+            // Order matters: "remote branch X not found" also contains the
+            // substring "not found", so the ref check must precede the
+            // generic repository-not-found check.
+            if (lower.contains("remote branch") && lower.contains("not found"))
+                || lower.contains("couldn't find remote ref")
+                || lower.contains("could not find remote ref")
+            {
+                format!(
+                    "Branch/tag/commit '{}' does not exist in the repository {url}. \
+                     Check the ref name — branches and tags are case-sensitive. [git: {stderr}]",
+                    rref.git_ref
+                )
+            } else if lower.contains("authentication failed")
+                || lower.contains("could not read username")
+                || lower.contains("invalid username or password")
+                || lower.contains("terminal prompts disabled")
+                || lower.contains("permission denied")
+                || lower.contains("403")
+            {
+                format!(
+                    "Authentication failed for {url}. If the repository is private, set a valid \
+                     access token (PAT) on the collection and make sure it can read this repo. \
+                     [git: {stderr}]"
+                )
+            } else if lower.contains("repository not found")
+                || lower.contains("does not appear to be a git repository")
+                || lower.contains("not found")
+            {
+                format!(
+                    "Repository not found at {url}. Check the URL is correct and the token can \
+                     see it. [git: {stderr}]"
+                )
+            } else if lower.contains("could not resolve host")
+                || lower.contains("unable to access")
+                || lower.contains("connection")
+                || lower.contains("timed out")
+                || lower.contains("network")
+            {
+                format!(
+                    "Could not reach the repository host for {url}. Check network/DNS access from \
+                     the gateway. [git: {stderr}]"
+                )
+            } else {
+                format!("Git error fetching {url}: {stderr}")
+            }
+        }
+        WorkerError::Git(GitError::Spawn { .. }) => format!(
+            "Could not run `git` on the gateway host — is git installed and on PATH? [{err}]"
+        ),
+        WorkerError::Git(GitError::Mkdir { path, .. }) => format!(
+            "Could not prepare the clone-cache directory {} — check filesystem permissions and \
+             free space. [{err}]",
+            path.display()
+        ),
+        WorkerError::Git(GitError::BadUrl { .. }) => {
+            format!("Invalid git URL for this source: {err}. Fix the repository URL.")
+        }
+        WorkerError::Git(GitError::BadOutput { .. }) => format!("Unexpected git output: {err}"),
+        WorkerError::Embed(_) => format!(
+            "Embedding failed using model '{}'. Check that this embedding model is configured and \
+             reachable from the gateway. [{err}]",
+            collection.embedding_model
+        ),
+        WorkerError::Index(_) => format!(
+            "Vector index error: {err}. This usually means the embedding model's vector size \
+             changed — remove and re-add the ref to rebuild from scratch."
+        ),
+        WorkerError::Io(_) => format!(
+            "Filesystem error during indexing: {err}. Check the gateway's RAG data directory \
+             permissions and free space."
+        ),
+        WorkerError::Db(_) => format!("Database error during indexing: {err}"),
+        WorkerError::NotFound { .. } => err.to_string(),
+    }
+}
+
+/// Result of a `build_ref` run. `Swapped` carries the stats the log records;
+/// `Superseded` means a re-queue/delete won the race and the build was thrown
+/// away with the live index untouched.
+enum BuildOutcome {
+    Swapped {
+        files: usize,
+        chunks: usize,
+        commit: String,
+    },
+    Superseded,
 }
 
 /// Shared indexer state. Cheap to clone (everything is `Arc`-shared).
@@ -385,17 +500,44 @@ impl Indexer {
         }
     }
 
+    /// Append one entry to a ref's indexing log, then prune the log to its
+    /// newest [`Self::LOG_KEEP`] rows. Best-effort: a logging failure must
+    /// never fail or abort an index, so errors are swallowed (and logged to
+    /// tracing). The log is a diagnostic aid, not part of the build's
+    /// correctness.
+    async fn log_event(&self, entry: rag_db::NewLogEntry) {
+        let ref_id = entry.ref_id;
+        if let Err(err) = rag_db::insert_log_entry(&self.inner.db, &entry).await {
+            tracing::warn!(ref_id, error = %err, "rag: could not write index-log entry");
+            return;
+        }
+        if let Err(err) = rag_db::prune_log_entries(&self.inner.db, ref_id, Self::LOG_KEEP).await {
+            tracing::warn!(ref_id, error = %err, "rag: could not prune index log");
+        }
+    }
+
+    /// How many log entries to keep per ref. Enough to see the last several
+    /// builds (each build writes ~2-3 entries) without growing unbounded.
+    const LOG_KEEP: i64 = 50;
+
     /// (Re-)index one ref. Builds the whole index fresh into a new store
     /// folder and atomically swaps the ref onto it — zero-downtime, since
     /// the ref keeps serving its previous index until the swap. Failures
     /// are recorded against the ref (guarded so a concurrent re-queue isn't
-    /// clobbered).
+    /// clobbered) and appended to the ref's indexing log.
     pub async fn index_ref(&self, ref_id: i64) -> Result<(), WorkerError> {
         match self.index_ref_inner(ref_id).await {
             Ok(()) => Ok(()),
             Err(err) => {
+                // `index_ref_inner` already recorded a context-aware failure
+                // (friendly message + log entry) when it had the ref loaded.
+                // This is the fallback for errors raised *before* that point
+                // (e.g. the central DB is unreadable): the guarded
+                // `mark_ref_failed` is a no-op if the inner path already
+                // flipped the ref to `error`, so there's no double-write.
                 let msg = err.to_string();
                 let _ = rag_db::mark_ref_failed(&self.inner.db, ref_id, &msg).await;
+                tracing::warn!(ref_id, error = %err, "rag: indexing ref failed");
                 Err(err)
             }
         }
@@ -423,44 +565,117 @@ impl Indexer {
         // searches until we atomically swap onto the new one.
         let build_uuid = uuid::Uuid::new_v4().to_string();
 
+        let started = Instant::now();
         match self.build_ref(&collection, &rref, &build_uuid).await {
             // Swapped: drop cached handles so searches reopen the new folder,
             // then reap the old store.
-            Ok(true) => {
+            Ok(BuildOutcome::Swapped {
+                files,
+                chunks,
+                commit,
+            }) => {
                 self.evict_ref_caches(ref_id);
                 if old_uuid != build_uuid {
                     self.discard_dir(&old_uuid);
                 }
+                let dur = started.elapsed().as_millis() as i64;
+                self.log_event(rag_db::NewLogEntry {
+                    ref_id,
+                    collection_id: collection.id,
+                    level: rag_db::LogLevel::Info,
+                    phase: "ready".into(),
+                    message: format!(
+                        "Indexed {files} file(s), {chunks} chunk(s) at {} in {dur} ms",
+                        commit.chars().take(8).collect::<String>()
+                    ),
+                    commit_sha: Some(commit),
+                    files: Some(files as i64),
+                    chunks: Some(chunks as i64),
+                    duration_ms: Some(dur),
+                })
+                .await;
                 Ok(())
             }
             // Superseded by a re-queue / delete — throw the build away; the
-            // live index is untouched.
-            Ok(false) => {
+            // live index is untouched. Record it so the timeline explains why
+            // a build "vanished" without a ready/error outcome.
+            Ok(BuildOutcome::Superseded) => {
                 self.discard_dir(&build_uuid);
+                self.log_event(rag_db::NewLogEntry {
+                    ref_id,
+                    collection_id: collection.id,
+                    level: rag_db::LogLevel::Info,
+                    phase: "queued".into(),
+                    message: "Build superseded by a newer re-index request; discarded.".into(),
+                    commit_sha: None,
+                    files: None,
+                    chunks: None,
+                    duration_ms: None,
+                })
+                .await;
                 Ok(())
             }
             Err(err) => {
                 self.discard_dir(&build_uuid);
+                let msg = friendly_error(&err, &rref, &collection);
+                let phase = failure_phase(&err);
+                // Record the failure against the ref (guarded) and on its log.
+                let _ = rag_db::mark_ref_failed(&self.inner.db, ref_id, &msg).await;
+                self.log_event(rag_db::NewLogEntry {
+                    ref_id,
+                    collection_id: collection.id,
+                    level: rag_db::LogLevel::Error,
+                    phase: phase.into(),
+                    message: msg,
+                    commit_sha: None,
+                    files: None,
+                    chunks: None,
+                    duration_ms: Some(started.elapsed().as_millis() as i64),
+                })
+                .await;
                 Err(err)
             }
         }
     }
 
     /// Clone → chunk → embed into `build_uuid`'s fresh store, then
-    /// atomically swap the ref onto it. `Ok(true)` = swapped (now live);
-    /// `Ok(false)` = the build was superseded (re-queued / deleted) and the
-    /// caller should discard it. The build uses *local* store + index
-    /// handles, never the cached (live) ones, so concurrent searches keep
-    /// hitting the old index until the swap.
+    /// atomically swap the ref onto it. [`BuildOutcome::Swapped`] = now live
+    /// (carries the file/chunk counts for the log); [`BuildOutcome::Superseded`]
+    /// = the build was superseded (re-queued / deleted) and the caller should
+    /// discard it. The build uses *local* store + index handles, never the
+    /// cached (live) ones, so concurrent searches keep hitting the old index
+    /// until the swap.
     async fn build_ref(
         &self,
         collection: &rag_db::Collection,
         rref: &rag_db::CollectionRef,
         build_uuid: &str,
-    ) -> Result<bool, WorkerError> {
+    ) -> Result<BuildOutcome, WorkerError> {
         let ref_id = rref.id;
 
         rag_db::set_ref_status(&self.inner.db, ref_id, rag_db::CollectionStatus::Cloning).await?;
+        // Timeline entry so the admin sees the build started even while it's
+        // still cloning (the status badge also flips to "cloning").
+        self.log_event(rag_db::NewLogEntry {
+            ref_id,
+            collection_id: collection.id,
+            level: rag_db::LogLevel::Info,
+            phase: "cloning".into(),
+            message: if collection.search_mode == rag_db::SearchMode::Aggregate {
+                "Cloning sources…".to_string()
+            } else {
+                format!(
+                    "Cloning '{}' from {}…",
+                    rref.git_ref,
+                    rref.effective_git_url(collection)
+                )
+            },
+            commit_sha: None,
+            files: None,
+            chunks: None,
+            duration_ms: None,
+        })
+        .await;
         let clone_dir = self.clone_path(build_uuid);
         let filter = Filter::new(
             &collection.include_globs,
@@ -492,7 +707,7 @@ impl Indexer {
                 .await?;
                 commits.push(format!("{label}:{sha}"));
                 if self.superseded(ref_id).await? {
-                    return Ok(false);
+                    return Ok(BuildOutcome::Superseded);
                 }
                 for mut wf in walk::walk(&sub, &filter)? {
                     wf.rel_path = format!("{label}/{}", wf.rel_path);
@@ -512,7 +727,7 @@ impl Indexer {
             )
             .await?;
             if self.superseded(ref_id).await? {
-                return Ok(false);
+                return Ok(BuildOutcome::Superseded);
             }
             (walk::walk(&clone_dir, &filter)?, sha)
         };
@@ -527,6 +742,7 @@ impl Indexer {
         let index_path = self.index_path(build_uuid);
 
         let mut next_vector_id = 1i64;
+        let mut indexed_files = 0usize;
         let mut dimensions: Option<usize> = None;
         let mut index: Option<CollectionIndex> = None;
 
@@ -548,12 +764,13 @@ impl Indexer {
             }
             let hash = sha256_hex(&content);
             let file_id = rag_db::upsert_file(&store, collection.id, &file.rel_path, &hash).await?;
+            indexed_files += 1;
 
             for batch in pieces.chunks(self.inner.config.embed_batch_size) {
                 // Abort early if a re-queue / delete superseded this build,
                 // so we don't burn embedding calls on a doomed run.
                 if self.superseded(ref_id).await? {
-                    return Ok(false);
+                    return Ok(BuildOutcome::Superseded);
                 }
                 let inputs: Vec<String> = batch.iter().map(|p| p.content.clone()).collect();
                 let vectors = embeddings::embed(
@@ -611,25 +828,45 @@ impl Indexer {
         // the ref to `pending` while we built, this affects 0 rows and we
         // report "superseded" so the caller discards the build.
         let swapped = rag_db::swap_ref_index(&self.inner.db, ref_id, build_uuid, &head).await? == 1;
+        if !swapped {
+            // Lost the race: a re-queue flipped the ref away from `indexing`
+            // while we built. Discard quietly; the live index is untouched.
+            return Ok(BuildOutcome::Superseded);
+        }
+        let chunks = (next_vector_id - 1) as usize;
         // `next_vector_id` starts at 1 and increments per indexed chunk, so it
         // is still 1 iff nothing was indexed. An empty index that's silently
         // "ready" almost always means the include globs matched no files —
         // surface that instead of letting it look healthy.
-        if swapped && next_vector_id == 1 {
+        if chunks == 0 {
             tracing::warn!(
                 ref_id,
                 files = walked.len(),
                 "ref indexed 0 chunks — include globs likely match nothing"
             );
-            let _ = rag_db::set_ref_warning(
-                &self.inner.db,
+            let warning = "Indexed 0 files — nothing matched the collection's include globs. \
+                 Check the include patterns (e.g. add *.pm, *.js, *.adoc for non-Rust repos).";
+            // Keep the advisory on `last_error` (shown as the ref's headline)
+            // AND on the timeline.
+            let _ = rag_db::set_ref_warning(&self.inner.db, ref_id, warning).await;
+            self.log_event(rag_db::NewLogEntry {
                 ref_id,
-                "Indexed 0 files — nothing matched the collection's include globs. \
-                 Check the include patterns (e.g. add *.pm, *.js, *.adoc for non-Rust repos).",
-            )
+                collection_id: collection.id,
+                level: rag_db::LogLevel::Warn,
+                phase: "ready".into(),
+                message: warning.to_string(),
+                commit_sha: Some(head.clone()),
+                files: Some(0),
+                chunks: Some(0),
+                duration_ms: None,
+            })
             .await;
         }
-        Ok(swapped)
+        Ok(BuildOutcome::Swapped {
+            files: indexed_files,
+            chunks,
+            commit: head,
+        })
     }
 }
 
@@ -814,5 +1051,227 @@ mod tests {
         // a `None` dim hint now that the file exists.
         let c = indexer.open_index(1, "uuid-1", None).unwrap();
         assert_eq!(c.dimensions(), 4);
+    }
+
+    // --- friendly_error mapping + end-to-end failure surfacing ---------------
+
+    /// Build a `Collection` + primary `CollectionRef` in a fresh in-memory DB
+    /// and an `Indexer` over a scratch data dir. Returns everything the
+    /// failure-path tests need.
+    async fn indexer_with_ref(
+        git_url: &str,
+        git_ref: &str,
+        include_globs: Vec<String>,
+    ) -> (
+        Indexer,
+        Pool,
+        rag_db::Collection,
+        rag_db::CollectionRef,
+        tempfile::TempDir,
+    ) {
+        use crate::server::upstreams::UpstreamRegistry;
+        use std::collections::HashMap;
+
+        let db = crate::server::db::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut new = rag_db::NewCollection {
+            name: "fix".into(),
+            description: None,
+            git_url: git_url.into(),
+            git_ref: git_ref.into(),
+            pat: None,
+            embedding_model: "embed-model".into(),
+            include_globs,
+            exclude_globs: vec![],
+            chunk_size: 800,
+            chunk_overlap: 100,
+            search_mode: rag_db::SearchMode::Versioned,
+        };
+        new.search_mode = rag_db::SearchMode::Versioned;
+        let collection = rag_db::create_collection(&db, &new).await.unwrap();
+        let rref = rag_db::add_ref(&db, collection.id, git_ref, None, true)
+            .await
+            .unwrap();
+        let upstreams = UpstreamRegistry::new(&HashMap::new()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let indexer = Indexer::new(
+            db.clone(),
+            upstreams,
+            reqwest::Client::new(),
+            IndexerConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..IndexerConfig::default()
+            },
+        );
+        (indexer, db, collection, rref, dir)
+    }
+
+    /// A throwaway git repo with one commit on `main`. `None` if `git` isn't
+    /// on PATH (CI without git → test skips rather than fails).
+    fn fixture_repo() -> Option<tempfile::TempDir> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+        };
+        let init = run(&["init", "-q", "-b", "main", "."]).ok()?;
+        if !init.status.success() {
+            return None;
+        }
+        for args in [
+            ["config", "user.email", "t@example.invalid"],
+            ["config", "user.name", "t"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            run(&args).ok()?;
+        }
+        std::fs::write(path.join("README.md"), b"hello world\n").unwrap();
+        run(&["add", "."]).ok()?;
+        let commit = run(&["commit", "-q", "-m", "init"]).ok()?;
+        commit.status.success().then_some(dir)
+    }
+
+    #[test]
+    fn friendly_error_maps_missing_branch_to_actionable_text() {
+        // Hand-built ref/collection (no DB needed for the pure mapping fn).
+        let collection = sample_collection("https://example.invalid/repo.git");
+        let rref = sample_ref(&collection, "release-99");
+        let err = WorkerError::Git(GitError::NonZero {
+            command: "clone",
+            status: 128,
+            stderr: "fatal: Remote branch release-99 not found in upstream origin".into(),
+        });
+        let msg = friendly_error(&err, &rref, &collection);
+        assert!(msg.contains("release-99"), "{msg}");
+        assert!(msg.contains("does not exist"), "{msg}");
+        assert!(msg.contains("example.invalid/repo.git"), "{msg}");
+        assert_eq!(failure_phase(&err), "cloning");
+    }
+
+    #[test]
+    fn friendly_error_maps_auth_failure() {
+        let collection = sample_collection("https://example.invalid/private.git");
+        let rref = sample_ref(&collection, "main");
+        let err = WorkerError::Git(GitError::NonZero {
+            command: "clone",
+            status: 128,
+            stderr: "fatal: Authentication failed for 'https://example.invalid/private.git/'"
+                .into(),
+        });
+        let msg = friendly_error(&err, &rref, &collection);
+        assert!(
+            msg.to_lowercase().contains("authentication failed"),
+            "{msg}"
+        );
+        assert!(msg.contains("access token") || msg.contains("PAT"), "{msg}");
+    }
+
+    fn sample_collection(git_url: &str) -> rag_db::Collection {
+        let now = jiff::Timestamp::now();
+        rag_db::Collection {
+            id: 1,
+            data_uuid: Some("u".into()),
+            name: "c".into(),
+            description: None,
+            git_url: git_url.into(),
+            git_ref: "main".into(),
+            pat: None,
+            embedding_model: "embed-model".into(),
+            include_globs: vec!["**/*".into()],
+            exclude_globs: vec![],
+            chunk_size: 800,
+            chunk_overlap: 100,
+            search_mode: rag_db::SearchMode::Versioned,
+            status: rag_db::CollectionStatus::Pending,
+            last_indexed_at: None,
+            last_indexed_commit: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn sample_ref(collection: &rag_db::Collection, git_ref: &str) -> rag_db::CollectionRef {
+        let now = jiff::Timestamp::now();
+        rag_db::CollectionRef {
+            id: 1,
+            collection_id: collection.id,
+            git_ref: git_ref.into(),
+            git_url: None,
+            is_primary: true,
+            data_uuid: "u".into(),
+            status: rag_db::CollectionStatus::Pending,
+            last_indexed_at: None,
+            last_indexed_commit: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_branch_marks_ref_error_and_logs() {
+        let Some(src) = fixture_repo() else {
+            eprintln!("git not on PATH — skipping");
+            return;
+        };
+        let url = src.path().to_string_lossy().to_string();
+        let (indexer, db, _c, rref, _dir) =
+            indexer_with_ref(&url, "no-such-branch", vec!["**/*".into()]).await;
+
+        // The clone fails on the missing branch. index_ref returns Err, but
+        // the failure must be RECORDED — that's the whole point of the fix.
+        let res = indexer.index_ref(rref.id).await;
+        assert!(res.is_err(), "indexing a missing branch should error");
+
+        let after = rag_db::find_ref_by_id(&db, rref.id).await.unwrap().unwrap();
+        assert_eq!(after.status, rag_db::CollectionStatus::Error);
+        let err = after.last_error.expect("last_error must be set");
+        assert!(err.contains("no-such-branch"), "{err}");
+        assert!(err.contains("does not exist"), "{err}");
+
+        // And it lands on the timeline as an error in the cloning phase.
+        let log = rag_db::list_log_entries(&db, rref.id, 10).await.unwrap();
+        assert!(
+            log.iter()
+                .any(|e| e.level == rag_db::LogLevel::Error && e.phase == "cloning"),
+            "expected an error log entry, got {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_glob_match_indexes_zero_and_warns() {
+        let Some(src) = fixture_repo() else {
+            eprintln!("git not on PATH — skipping");
+            return;
+        };
+        let url = src.path().to_string_lossy().to_string();
+        // Globs that match nothing in the fixture → 0 chunks, no embedding
+        // calls, swap succeeds, advisory recorded.
+        let (indexer, db, _c, rref, _dir) =
+            indexer_with_ref(&url, "main", vec!["*.nomatch".into()]).await;
+
+        indexer.index_ref(rref.id).await.unwrap();
+
+        let after = rag_db::find_ref_by_id(&db, rref.id).await.unwrap().unwrap();
+        assert_eq!(after.status, rag_db::CollectionStatus::Ready);
+        assert!(
+            after
+                .last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Indexed 0 files"),
+            "expected 0-files advisory, got {:?}",
+            after.last_error
+        );
+        let log = rag_db::list_log_entries(&db, rref.id, 10).await.unwrap();
+        assert!(
+            log.iter().any(|e| e.level == rag_db::LogLevel::Warn),
+            "expected a warn log entry, got {log:?}"
+        );
     }
 }
