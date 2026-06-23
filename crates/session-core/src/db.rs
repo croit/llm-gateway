@@ -570,13 +570,18 @@ pub async fn fork_session(
         .await?;
 
         for tc in &tw.tool_calls {
+            // Mint a fresh id: `chat_tool_calls.id` is a global PRIMARY KEY
+            // (it's the model's tool_call_id), so reusing the source row's id
+            // would collide with the original — and with any prior fork of the
+            // same shared chat. The id is only a row/DOM handle once persisted,
+            // so a new UUID is safe.
             sqlx::query(
                 r#"INSERT INTO chat_tool_calls
                       (id, turn_id, seq, name, arguments_json, output_json,
                        status, created_at, completed_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
-            .bind(&tc.id)
+            .bind(Uuid::new_v4().to_string())
             .bind(new_turn_id)
             .bind(tc.seq)
             .bind(&tc.name)
@@ -1837,5 +1842,43 @@ mod tests {
         // The copied assistant turn is errored (never a hung spinner).
         assert_eq!(copy[1].turn.status, TurnStatus::Errored);
         assert!(copy[1].turn.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn fork_session_remints_tool_call_ids() {
+        // `chat_tool_calls.id` is a global PRIMARY KEY (the model's
+        // tool_call_id). Forking a conversation that made tool calls must
+        // mint fresh ids — reusing the source ids collides with the originals
+        // (and with any prior fork of the same shared chat), which used to
+        // surface as a 500 on POST /chat/{id}/fork.
+        let pool = pool().await;
+        seed_user(&pool, "u2").await;
+        let src = create_session(&pool, "u1").await.unwrap();
+        let a = create_assistant_turn_in_progress(&pool, &src.id, "t0", "gpt")
+            .await
+            .unwrap();
+        insert_running_tool_call(&pool, &a.id, "call_1", "web_search", "{}")
+            .await
+            .unwrap();
+        finalize_turn(&pool, &a.id, TurnStatus::Completed, None)
+            .await
+            .unwrap();
+
+        let src = get_session(&pool, "u1", &src.id).await.unwrap().unwrap();
+
+        // First fork succeeds and the copied tool call has a fresh id.
+        let (fork1, _) = fork_session(&pool, &src, "u2").await.unwrap();
+        let copy1 = list_turns(&pool, &fork1.id).await.unwrap();
+        assert_eq!(copy1[0].tool_calls.len(), 1);
+        assert_ne!(
+            copy1[0].tool_calls[0].id, "call_1",
+            "tool-call id must be re-minted, not reused"
+        );
+        assert_eq!(copy1[0].tool_calls[0].name, "web_search");
+
+        // Forking the same shared chat again must not collide on the PK.
+        let (fork2, _) = fork_session(&pool, &src, "u2").await.unwrap();
+        let copy2 = list_turns(&pool, &fork2.id).await.unwrap();
+        assert_ne!(copy1[0].tool_calls[0].id, copy2[0].tool_calls[0].id);
     }
 }
