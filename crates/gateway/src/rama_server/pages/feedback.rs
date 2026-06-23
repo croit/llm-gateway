@@ -664,6 +664,60 @@ pub(super) fn render_dialog() -> Html {
     .to_html()
 }
 
+/// The "Are you sure?" confirmation dialog. A second native `<dialog>` stacked
+/// on top of the feedback dialog (modal dialogs share the top layer, so it
+/// overlays cleanly without z-index juggling). `feedback.ts` opens it on submit
+/// — "No" leaves the feedback form open for editing, "Yes" fires the POST. It
+/// warns that the issue tracker is public so no personal/private data leaks
+/// into the screenshot or submitted fields. Excluded from any screenshot by
+/// `data-feedback-dialog`.
+pub(super) fn render_confirm() -> Html {
+    html! {
+        dialog(
+            id: "feedback-confirm",
+            class: "feedback-confirm rounded-xl border border-base-300 p-0",
+            "data-feedback-dialog": ""
+        ) {
+            div(class: "flex flex-col") {
+                // Header
+                div(class: "flex items-center gap-2 px-5 py-3 border-b border-base-300") {
+                    span(class: "text-warning inline-flex") { (icons::alert(18)) }
+                    h2(class: "font-semibold flex-1") { "Are you sure?" }
+                }
+
+                // Body — the public-tracker / no-private-data warning.
+                div(class: "px-5 py-4 flex flex-col gap-3 text-sm") {
+                    p {
+                        "This feedback opens a ticket in our "
+                        strong { "public" }
+                        " issue tracker. Anyone can read it."
+                    }
+                    p {
+                        "Please make sure your screenshot and the submitted data contain "
+                        strong { "no personal or private information" }
+                        " (names, emails, tokens, customer data, …)."
+                    }
+                }
+
+                // Footer — "No" returns to the form, "Yes" sends.
+                div(class: "flex items-center justify-end gap-2 px-5 py-3 border-t border-base-300") {
+                    button(
+                        id: "feedback-confirm-cancel",
+                        type: "button",
+                        class: "btn btn-ghost btn-sm"
+                    ) { "No, let me edit" }
+                    button(
+                        id: "feedback-confirm-ok",
+                        type: "button",
+                        class: "btn btn-primary btn-sm"
+                    ) { "Yes, send" }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,5 +817,27 @@ mod tests {
         // Priority options the extraction + client share.
         assert!(html.contains("value=\"low\""));
         assert!(html.contains("value=\"high\""));
+    }
+
+    // The confirm dialog is opened on submit; `feedback.ts` resolves its
+    // controls by id. Pin the wiring + the public-tracker warning copy.
+    #[test]
+    fn confirm_dialog_exposes_ids_and_warning() {
+        let html = render_confirm().to_string();
+        // Excluded from the screenshot like the main dialog.
+        assert!(html.contains("data-feedback-dialog"));
+        for id in [
+            "feedback-confirm",
+            "feedback-confirm-cancel",
+            "feedback-confirm-ok",
+        ] {
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "confirm dialog missing id {id}"
+            );
+        }
+        // The warning must name the public tracker and the no-private-data ask.
+        assert!(html.contains("public"));
+        assert!(html.contains("no personal or private information"));
     }
 }

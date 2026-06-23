@@ -661,6 +661,7 @@ fn layout_authed(
                         // confirms the feature is configured.
                         (feedback::render_fab())
                         (feedback::render_dialog())
+                        (feedback::render_confirm())
                     }
                     div(class: "drawer-side z-40") {
                         label(

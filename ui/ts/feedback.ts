@@ -56,6 +56,8 @@ const init = (): void => {
     const form = $<HTMLFormElement>('feedback-form');
     if (!fab || !dialog || !form) return; // not an authed page with the widget
 
+    const confirmDialog = $<HTMLDialogElement>('feedback-confirm');
+
     const titleEl = $<HTMLInputElement>('feedback-title');
     const descEl = $<HTMLTextAreaElement>('feedback-description');
     const businessEl = $<HTMLTextAreaElement>('feedback-business');
@@ -475,13 +477,23 @@ const init = (): void => {
         showShotStatus('No screenshot');
     };
 
-    form.addEventListener('submit', async (ev) => {
-        ev.preventDefault();
+    const closeConfirm = (): void => {
+        if (!confirmDialog) return;
+        if (typeof confirmDialog.close === 'function') confirmDialog.close();
+        else confirmDialog.removeAttribute('open');
+    };
+    const showConfirm = (): void => {
+        if (!confirmDialog) return;
+        if (typeof confirmDialog.showModal === 'function') confirmDialog.showModal();
+        else confirmDialog.setAttribute('open', '');
+    };
+
+    // The actual POST. Reached only after the user confirms the public-tracker
+    // warning (or immediately, if the confirm dialog isn't present).
+    const doSubmit = async (): Promise<void> => {
         if (!titleEl || !descEl) return;
         const title = titleEl.value.trim();
         const description = descEl.value.trim();
-        if (title.length < 4) { window.pushToast('error', 'Please add a short title.'); return; }
-        if (!description) { window.pushToast('error', 'Please describe the feedback.'); return; }
 
         if (submitBtn) submitBtn.disabled = true;
         const shotDataUrl = annotator?.hasImage() ? annotator.toDataUrl() : null;
@@ -516,6 +528,31 @@ const init = (): void => {
         } finally {
             if (submitBtn) submitBtn.disabled = false;
         }
+    };
+
+    // Submit gate: validate first (so the user isn't asked to confirm only to
+    // hit a validation error), then show the public-tracker warning. The form
+    // is NOT sent here — only after the user confirms.
+    form.addEventListener('submit', (ev) => {
+        ev.preventDefault();
+        if (!titleEl || !descEl) return;
+        const title = titleEl.value.trim();
+        const description = descEl.value.trim();
+        if (title.length < 4) { window.pushToast('error', 'Please add a short title.'); return; }
+        if (!description) { window.pushToast('error', 'Please describe the feedback.'); return; }
+        // No confirm dialog rendered → send directly (graceful fallback).
+        if (!confirmDialog) { void doSubmit(); return; }
+        showConfirm();
+    });
+
+    // "No, let me edit" / Esc / backdrop: dismiss the warning, leave the
+    // feedback dialog open so the user can edit the ticket.
+    $('feedback-confirm-cancel')?.addEventListener('click', closeConfirm);
+    confirmDialog?.addEventListener('cancel', () => closeConfirm());
+    // "Yes, send": close the warning and fire the POST.
+    $('feedback-confirm-ok')?.addEventListener('click', () => {
+        closeConfirm();
+        void doSubmit();
     });
 
     syncToolbar();
