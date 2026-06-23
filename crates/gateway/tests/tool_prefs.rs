@@ -81,6 +81,7 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
     };
     let admin_role = RoleConfig {
         id: "admin".into(),
+        admin: true,
         models: vec!["*".into()],
         tools: vec!["*".into()],
         skills: vec![],

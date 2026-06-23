@@ -148,6 +148,11 @@ weight = 1
 #
 # [[roles]]
 # id = "admin"
+# # `admin = true` is what unlocks the admin UI (`/admin/*`) and admin-only
+# # actions — the gate keys off this flag, NOT the role name, so you can call
+# # the role whatever you like and even flag more than one. Defaults to false;
+# # a role without it never grants admin, even if named "admin".
+# admin = true
 # models = ["*"]
 # tools = ["*"]
 # skills = ["*"]

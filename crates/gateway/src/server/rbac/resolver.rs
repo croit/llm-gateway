@@ -2,17 +2,27 @@
 // Copyright (C) 2026 croit GmbH
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use thiserror::Error;
 
 use super::config::{RbacConfig, RoleConfig};
 use crate::server::tools::ToolRegistry;
 
-/// Runtime view of `[rbac]` + `[[roles]]`. Built once at startup.
+/// Runtime view of `[rbac]` + `[[roles]]`. The static config (`rbac`,
+/// `roles`) is built once at startup; the skill-grant overlay is mutable so
+/// admin edits on `/admin/skills` take effect live.
 #[derive(Debug, Clone)]
 pub struct Resolver {
     rbac: RbacConfig,
     roles: HashMap<String, RoleConfig>,
+    /// UI-managed skill→role grants, layered *on top of* each role's static
+    /// `skills` config (see `server::db::skill_grants`). Keyed by skill name →
+    /// the role ids granted it. Interior mutability behind an `Arc` so the one
+    /// resolver shared by `AppState` and the `read_skill` tool can be updated
+    /// without a rebuild; seeded from the DB at startup and replaced wholesale
+    /// after each edit.
+    skill_overlay: Arc<RwLock<HashMap<String, Vec<String>>>>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -46,14 +56,47 @@ impl Resolver {
             }
         }
 
-        Ok(Self { rbac, roles: map })
+        Ok(Self {
+            rbac,
+            roles: map,
+            skill_overlay: Arc::new(RwLock::new(HashMap::new())),
+        })
     }
 
     pub fn empty() -> Self {
         Self {
             rbac: RbacConfig::default(),
             roles: HashMap::new(),
+            skill_overlay: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Replace the dynamic skill-grant overlay from flat `(skill, role)` pairs
+    /// (the shape stored in `skill_role_grants`). Called once at startup and
+    /// after every admin edit. The map is tiny, so a full rebuild + swap is
+    /// simpler — and races no reader — than an incremental update.
+    pub fn set_skill_grant_overlay(&self, grants: Vec<(String, String)>) {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (skill, role) in grants {
+            let roles = map.entry(skill).or_default();
+            if !roles.iter().any(|r| r == &role) {
+                roles.push(role);
+            }
+        }
+        if let Ok(mut guard) = self.skill_overlay.write() {
+            *guard = map;
+        }
+    }
+
+    /// Overlay role ids granting `skill` (UI grants only — config grants live
+    /// in `[[roles]].skills`). Powers the admin page's "Granted to" display and
+    /// pre-checks the grant dialog.
+    pub fn overlay_roles_for_skill(&self, skill: &str) -> Vec<String> {
+        self.skill_overlay
+            .read()
+            .ok()
+            .and_then(|g| g.get(skill).cloned())
+            .unwrap_or_default()
     }
 
     /// Resolves a user's raw OIDC claim values (the strings stored on
@@ -76,6 +119,16 @@ impl Resolver {
             }
         }
         out
+    }
+
+    /// True if any of the given role IDs is flagged `admin = true` in config.
+    /// The single source of truth for admin-UI / admin-action gating; replaces
+    /// the former check that matched a role literally named `"admin"`. Unknown
+    /// role IDs are ignored.
+    pub fn is_admin(&self, role_ids: &[String]) -> bool {
+        role_ids
+            .iter()
+            .any(|id| self.roles.get(id).is_some_and(|r| r.admin))
     }
 
     /// Union of tool IDs granted by any of the user's roles, filtered to
@@ -129,6 +182,22 @@ impl Resolver {
                 }
             }
         }
+        // UI-managed overlay grants, additive on top of config. Same rules: the
+        // skill must be loaded, and we dedupe against what config already
+        // granted above.
+        if let Ok(overlay) = self.skill_overlay.read() {
+            for (skill, granted_roles) in overlay.iter() {
+                if registry.get(skill).is_none() || out.iter().any(|s| s == skill) {
+                    continue;
+                }
+                if granted_roles
+                    .iter()
+                    .any(|gr| role_ids.iter().any(|rid| rid == gr))
+                {
+                    out.push(skill.clone());
+                }
+            }
+        }
         out
     }
 
@@ -170,8 +239,19 @@ mod tests {
     fn role(id: &str, tools: &[&str], models: &[&str]) -> RoleConfig {
         RoleConfig {
             id: id.into(),
+            admin: false,
             tools: tools.iter().map(|s| (*s).to_string()).collect(),
             models: models.iter().map(|s| (*s).to_string()).collect(),
+            skills: Vec::new(),
+        }
+    }
+
+    fn admin_role(id: &str) -> RoleConfig {
+        RoleConfig {
+            id: id.into(),
+            admin: true,
+            tools: Vec::new(),
+            models: Vec::new(),
             skills: Vec::new(),
         }
     }
@@ -179,6 +259,7 @@ mod tests {
     fn role_with_skills(id: &str, skills: &[&str]) -> RoleConfig {
         RoleConfig {
             id: id.into(),
+            admin: false,
             tools: Vec::new(),
             models: Vec::new(),
             skills: skills.iter().map(|s| (*s).to_string()).collect(),
@@ -285,6 +366,36 @@ mod tests {
     }
 
     #[test]
+    fn is_admin_true_only_for_flagged_roles() {
+        let r = Resolver::build(
+            RbacConfig::default(),
+            vec![role("user", &[], &[]), admin_role("platform-admin")],
+        )
+        .unwrap();
+        // The capability rides on the flag, not the role name: a role named
+        // "platform-admin" grants admin, while "user" does not.
+        assert!(r.is_admin(&["platform-admin".into()]));
+        assert!(r.is_admin(&["user".into(), "platform-admin".into()]));
+        assert!(!r.is_admin(&["user".into()]));
+    }
+
+    #[test]
+    fn is_admin_false_for_unflagged_role_named_admin() {
+        // The old code keyed off the literal name "admin"; now a role *named*
+        // admin but without the flag must NOT grant admin access.
+        let r =
+            Resolver::build(RbacConfig::default(), vec![role("admin", &["*"], &["*"])]).unwrap();
+        assert!(!r.is_admin(&["admin".into()]));
+    }
+
+    #[test]
+    fn is_admin_ignores_unknown_role_ids() {
+        let r = Resolver::build(RbacConfig::default(), vec![admin_role("ops")]).unwrap();
+        assert!(!r.is_admin(&["ghost".into()]));
+        assert!(!r.is_admin(&[]));
+    }
+
+    #[test]
     fn allowed_tools_unions_across_roles() {
         let reg = ToolRegistry::new().with(Echo).with(CurrentTimestamp);
         let r = Resolver::build(
@@ -369,6 +480,75 @@ mod tests {
         assert_eq!(skills.len(), 2);
         assert!(skills.contains(&"brand".to_string()));
         assert!(skills.contains(&"legal".to_string()));
+    }
+
+    #[test]
+    fn allowed_skills_overlay_unions_with_config() {
+        // Config grants `brand` to `user`; the UI overlay additionally grants
+        // `legal` to `user`. The caller sees both.
+        let reg = skill_registry(&["brand", "legal"]);
+        let r = Resolver::build(
+            RbacConfig::default(),
+            vec![role_with_skills("user", &["brand"])],
+        )
+        .unwrap();
+        r.set_skill_grant_overlay(vec![("legal".into(), "user".into())]);
+        let skills = r.allowed_skills(&["user".into()], &reg);
+        assert!(skills.contains(&"brand".to_string()));
+        assert!(skills.contains(&"legal".to_string()));
+        assert_eq!(skills.len(), 2);
+    }
+
+    #[test]
+    fn allowed_skills_overlay_grants_to_a_role_with_no_config_skills() {
+        // A role that grants no skills in config still sees a skill the UI
+        // overlay grants it — this is the whole point of the editable grant.
+        let reg = skill_registry(&["brand"]);
+        let r = Resolver::build(RbacConfig::default(), vec![role("user", &[], &[])]).unwrap();
+        assert!(r.allowed_skills(&["user".into()], &reg).is_empty());
+        r.set_skill_grant_overlay(vec![("brand".into(), "user".into())]);
+        assert_eq!(
+            r.allowed_skills(&["user".into()], &reg),
+            vec!["brand".to_string()]
+        );
+    }
+
+    #[test]
+    fn allowed_skills_overlay_filters_to_loaded_and_role() {
+        let reg = skill_registry(&["brand"]);
+        let r = Resolver::build(RbacConfig::default(), vec![role("user", &[], &[])]).unwrap();
+        // `ghost` isn't loaded → filtered; `brand` granted to `eng`, not `user`.
+        r.set_skill_grant_overlay(vec![
+            ("ghost".into(), "user".into()),
+            ("brand".into(), "eng".into()),
+        ]);
+        assert!(r.allowed_skills(&["user".into()], &reg).is_empty());
+        assert_eq!(
+            r.allowed_skills(&["eng".into()], &reg),
+            vec!["brand".to_string()]
+        );
+    }
+
+    #[test]
+    fn overlay_roles_for_skill_reports_grants_and_dedupes() {
+        let r = Resolver::empty();
+        r.set_skill_grant_overlay(vec![
+            ("brand".into(), "eng".into()),
+            ("brand".into(), "eng".into()),
+            ("brand".into(), "qa".into()),
+        ]);
+        let mut roles = r.overlay_roles_for_skill("brand");
+        roles.sort();
+        assert_eq!(roles, vec!["eng".to_string(), "qa".to_string()]);
+        assert!(r.overlay_roles_for_skill("missing").is_empty());
+    }
+
+    #[test]
+    fn set_skill_grant_overlay_replaces_wholesale() {
+        let r = Resolver::empty();
+        r.set_skill_grant_overlay(vec![("brand".into(), "eng".into())]);
+        r.set_skill_grant_overlay(vec![("brand".into(), "qa".into())]);
+        assert_eq!(r.overlay_roles_for_skill("brand"), vec!["qa".to_string()]);
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod cli_logins;
 pub mod mcp_catalog;
 pub mod model_defaults;
 pub mod rag;
+pub mod skill_grants;
 pub mod token_tool_prefs;
 pub mod tokens;
 pub mod usage;

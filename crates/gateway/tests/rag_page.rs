@@ -328,6 +328,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
             },
             vec![RoleConfig {
                 id: "admin".into(),
+                admin: true,
                 models: vec!["*".into()],
                 tools: vec!["*".into()],
                 skills: vec![],

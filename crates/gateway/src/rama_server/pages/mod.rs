@@ -155,21 +155,17 @@ pub(super) async fn fetch_sidebar_chat(
 /// (one selector, one render call) at the cost of re-emitting the
 /// full conversation list per nav, which is acceptable for the small
 /// per-user counts we expect.
-/// True when the resolver maps the user's OIDC groups to the
-/// internal `admin` role. Used to gate `/admin/*` routes and
-/// conditionally render the Admin sidebar entry.
+/// True when the user holds any role flagged `admin = true` in config.
+/// Used to gate `/admin/*` routes and conditionally render the Admin
+/// sidebar entry.
 ///
 /// `user.roles` holds the raw OIDC group claims (e.g. `"engineering"`,
-/// `"platform-admins"`). We have to translate through the RBAC
-/// resolver to get the internal role IDs (e.g. `"admin"`) — the same
-/// resolver the /tokens Account section uses to display the granted
-/// roles, so the sidebar entry shows iff that section lists "admin".
+/// `"platform-admins"`). We translate through the RBAC resolver to the
+/// internal role IDs, then ask the resolver whether any of them carries
+/// the admin capability — the role name is irrelevant.
 pub(super) fn is_admin(state: &RamaState, user: &users::User) -> bool {
-    state
-        .rbac
-        .role_ids_for(&user.roles)
-        .iter()
-        .any(|r| r == "admin")
+    let role_ids = state.rbac.role_ids_for(&user.roles);
+    state.rbac.is_admin(&role_ids)
 }
 
 /// SSE response that fires a single toast. Shared feedback path for the
@@ -935,11 +931,13 @@ pub use admin::{
 mod backends;
 pub use backends::backends_index as admin_backends_index;
 
-// Admin skills viewer + manager (`/admin/skills`, upload, delete). Same admin gate.
+// Admin skills viewer + manager (`/admin/skills`, upload, delete, grants).
+// Same admin gate.
 mod skills;
 pub use skills::{
     skills_delete as admin_skills_delete, skills_download as admin_skills_download,
-    skills_index as admin_skills_index, skills_upload as admin_skills_upload,
+    skills_grants_save as admin_skills_grants_save, skills_index as admin_skills_index,
+    skills_upload as admin_skills_upload,
 };
 
 // Admin RAG-collections CRUD (`/rag`). Same admin gate.

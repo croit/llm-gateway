@@ -488,6 +488,7 @@ mod tests {
             },
             roles: vec![RoleConfig {
                 id: "user".into(),
+                admin: false,
                 tools: vec!["*".into()],
                 models: vec!["*".into()],
                 skills: vec![],

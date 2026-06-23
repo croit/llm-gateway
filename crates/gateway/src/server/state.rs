@@ -315,6 +315,7 @@ mod skill_overlay_tests {
             },
             roles: vec![RoleConfig {
                 id: "user".into(),
+                admin: false,
                 tools: vec!["*".into()],
                 models: vec!["*".into()],
                 skills: skill_grant.iter().map(|s| (*s).to_string()).collect(),
@@ -382,6 +383,7 @@ mod tests {
         let tools = Arc::new(ToolRegistry::new().with(SearchWeb).with(CurrentTimestamp));
         let role = RoleConfig {
             id: "all".into(),
+            admin: false,
             models: vec!["*".into()],
             tools: vec!["*".into()],
             skills: vec![],

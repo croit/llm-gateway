@@ -221,6 +221,7 @@ async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool
     };
     let admin_role = RoleConfig {
         id: "admin".into(),
+        admin: true,
         models: vec!["*".into()],
         tools: vec!["*".into()],
         skills: vec![],

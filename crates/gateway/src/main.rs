@@ -64,6 +64,17 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("building RBAC resolver: {e}"))?;
     let rbac = Arc::new(rbac);
 
+    // Seed the dynamic skill-grant overlay (the UI-managed grants on top of the
+    // static `[[roles]].skills` config) from the DB so admin grants survive a
+    // restart. A DB hiccup here just leaves the overlay empty — config grants
+    // still apply — rather than failing startup.
+    match srv::db::skill_grants::all(&db).await {
+        Ok(grants) => rbac.set_skill_grant_overlay(grants),
+        Err(e) => {
+            tracing::warn!(error = %e, "loading skill-grant overlay; UI grants disabled until next edit")
+        }
+    }
+
     let mut tool_registry = srv::tools::ToolRegistry::new()
         .with(srv::tools::echo::Echo)
         .with(srv::tools::time::CurrentTimestamp)

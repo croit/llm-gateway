@@ -142,6 +142,7 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_get("/admin/skills/download", pages::admin_skills_download)
         .with_post("/admin/skills/upload", pages::admin_skills_upload)
         .with_post("/admin/skills/delete", pages::admin_skills_delete)
+        .with_post("/admin/skills/grants", pages::admin_skills_grants_save)
         .with_get("/rag", pages::rag_index)
         .with_post("/rag", pages::rag_create)
         .with_post("/rag/{id}/reindex", pages::rag_reindex)

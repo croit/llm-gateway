@@ -471,6 +471,22 @@
 /* App-specific rules that aren't covered by daisyUI components. */
 @layer components {
 
+    /* Native <dialog> modals (e.g. the /admin/skills grant editor).
+     *
+     * A `dialog[open]` opened via `showModal()` is centred by the UA with
+     * `position: fixed; inset: 0; margin: auto`. Tailwind v4's preflight
+     * resets `margin: 0` on every element, which kills that centring and
+     * pins the modal to the top-left. Restore `margin: auto` so it centres
+     * again, and tint the backdrop so the page behind reads as inert.
+     *
+     * Scoped to `[open]` so the closed (`display: none`) state is untouched. */
+    dialog[open] {
+        margin: auto;
+    }
+    dialog::backdrop {
+        background: oklch(0% 0 0 / 0.45);
+    }
+
     /* Mic-button state. The button renders three inline spans
      * (`.mic-idle`, `.mic-recording`, `.mic-transcribing`); CSS picks
      * which is visible based on `data-recording` / `data-transcribing`

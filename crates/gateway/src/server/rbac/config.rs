@@ -32,6 +32,13 @@ pub struct RoleMapping {
 #[serde(deny_unknown_fields)]
 pub struct RoleConfig {
     pub id: String,
+    /// When true, holding this role grants access to the admin UI (`/admin/*`)
+    /// and admin-only actions. Replaces the former hardcoded "role literally
+    /// named `admin`" check — name roles freely and flag whichever ones are
+    /// privileged; more than one may carry it. Defaults to false, so adding a
+    /// role never silently grants admin.
+    #[serde(default)]
+    pub admin: bool,
     /// Model patterns this role can route to. Each entry is either an exact
     /// model name or `"*"` (everything). `"name*"` prefix matches are also
     /// supported.

@@ -68,6 +68,7 @@ pub async fn skills_download(State(state): State<Arc<RamaState>>, req: Request) 
 }
 
 use crate::rama_server::state::RamaState;
+use crate::server::db::skill_grants;
 use crate::server::db::users::User;
 
 /// One loaded skill, flattened for rendering.
@@ -76,8 +77,12 @@ struct SkillView {
     description: String,
     /// Bundle-relative file paths (excludes `SKILL.md`), sorted.
     files: Vec<String>,
-    /// Role ids whose `skills` grant covers this skill.
-    roles: Vec<String>,
+    /// Role ids granted this skill in the static `[[roles]].skills` config
+    /// (incl. via `"*"`). Read-only in the UI — managed in `gateway.toml`.
+    config_roles: Vec<String>,
+    /// Role ids granted this skill via the UI overlay (`skill_role_grants`).
+    /// These are what the grant dialog edits.
+    granted_roles: Vec<String>,
     /// `SKILL.md` body (frontmatter stripped) rendered from GFM to HTML.
     body_html: String,
 }
@@ -252,7 +257,16 @@ pub async fn skills_delete(State(state): State<Arc<RamaState>>, req: Request) ->
         }
     };
     match store.remove(&form.name) {
-        Ok(_) => see_other("/admin/skills"),
+        Ok(_) => {
+            // Drop the skill's overlay grants too, so re-uploading a skill of
+            // the same name later starts with a clean slate rather than
+            // silently inheriting the old access.
+            if let Err(e) = skill_grants::delete_skill(&state.db, &form.name).await {
+                tracing::warn!(skill = %form.name, error = %e, "clearing grants on skill delete");
+            }
+            reload_skill_overlay(&state).await;
+            see_other("/admin/skills")
+        }
         Err(err) => {
             let msg = format!("Could not delete skill: {err}");
             render_page(
@@ -273,6 +287,91 @@ pub async fn skills_delete(State(state): State<Arc<RamaState>>, req: Request) ->
 #[derive(serde::Deserialize)]
 struct DeleteForm {
     name: String,
+}
+
+/// POST /admin/skills/grants — set which roles may use a skill (the editable
+/// overlay on top of the static `[[roles]].skills` config). Body is a plain
+/// form: `skill=<name>` plus one `role=<id>` per checked, editable role.
+/// Persists to `skill_role_grants`, refreshes the live resolver overlay, and
+/// redirects back to the skill. Admin-gated like the rest of the page.
+pub async fn skills_grants_save(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    // Skills must be configured to grant them — mirrors the other mutations.
+    if state.skills.is_none() {
+        return see_other("/admin/skills");
+    }
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(_) => return see_other("/admin/skills"),
+    };
+    let (skill, submitted) = parse_grant_form(&body);
+    let Some(skill) = skill.filter(|s| !s.is_empty()) else {
+        return see_other("/admin/skills");
+    };
+
+    // Only persist roles that (a) actually exist in config and (b) aren't
+    // already granted by config — the config-granted checkboxes render
+    // disabled, so they shouldn't post, but we filter defensively so a
+    // hand-crafted request can't write a redundant or bogus row.
+    let config_granted: Vec<&str> = state
+        .config
+        .roles
+        .iter()
+        .filter(|r| r.skills.iter().any(|g| g == "*" || g == &skill))
+        .map(|r| r.id.as_str())
+        .collect();
+    let roles: Vec<String> = submitted
+        .into_iter()
+        .filter(|role| {
+            state.config.roles.iter().any(|r| &r.id == role)
+                && !config_granted.iter().any(|c| c == role)
+        })
+        .collect();
+
+    if let Err(e) = skill_grants::set_for_skill(&state.db, &skill, &roles).await {
+        tracing::warn!(skill = %skill, error = %e, "saving skill grants");
+    }
+    reload_skill_overlay(&state).await;
+    see_other(&format!("/admin/skills?skill={skill}"))
+}
+
+/// Parse the grant form body: the single `skill` field and every `role` value
+/// (repeated keys → a list, which `serde_urlencoded` can't express). Empty
+/// `role` values are dropped. Reuses [`percent_decode`] for `%XX`/`+`.
+fn parse_grant_form(body: &[u8]) -> (Option<String>, Vec<String>) {
+    let text = String::from_utf8_lossy(body);
+    let mut skill = None;
+    let mut roles = Vec::new();
+    for pair in text.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        match k {
+            "skill" => skill = Some(percent_decode(v)),
+            "role" => {
+                let v = percent_decode(v);
+                if !v.is_empty() {
+                    roles.push(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    (skill, roles)
+}
+
+/// Re-seed the resolver's skill-grant overlay from the DB. Called after any
+/// mutation (a grant edit, or a delete that cleaned up grants) so the live
+/// authorization view matches what's persisted. A DB hiccup leaves the
+/// previous overlay in place rather than blanking grants.
+async fn reload_skill_overlay(state: &RamaState) {
+    match skill_grants::all(&state.db).await {
+        Ok(grants) => state.rbac.set_skill_grant_overlay(grants),
+        Err(e) => tracing::warn!(error = %e, "reloading skill-grant overlay"),
+    }
 }
 
 /// Pull the first `skill` multipart field's bytes out of the request body.
@@ -358,7 +457,8 @@ async fn render_page(
         Some(v) => format!("/admin/skills?skill={}", v.name),
         None => "/admin/skills".to_string(),
     };
-    let body = render_body(&views, selected, dir.as_deref(), error);
+    let roles = all_role_ids(state);
+    let body = render_body(&views, selected, dir.as_deref(), &roles, error);
     let chat = fetch_sidebar_chat(state, &user.id, None).await;
     nav_or_html_page(
         datastar,
@@ -375,10 +475,11 @@ async fn render_page(
     )
 }
 
-/// Flatten the loaded registry into render rows, pairing each skill with the
-/// role ids whose `skills` grant covers it (`"*"` or an exact name match) —
-/// the same rule [`crate::server::rbac::Resolver::allowed_skills`] enforces —
-/// and rendering its `SKILL.md` body to HTML.
+/// Flatten the loaded registry into render rows. Each skill is paired with the
+/// role ids that grant it, split by source: `config_roles` from the static
+/// `[[roles]].skills` config (`"*"` or an exact name match — the same rule
+/// [`crate::server::rbac::Resolver::allowed_skills`] enforces) and
+/// `granted_roles` from the live UI overlay. Also renders its `SKILL.md` body.
 fn skill_views(state: &RamaState) -> Vec<SkillView> {
     let Some(store) = state.skills.as_ref() else {
         return Vec::new();
@@ -387,13 +488,14 @@ fn skill_views(state: &RamaState) -> Vec<SkillView> {
     registry
         .iter()
         .map(|skill| {
-            let roles = state
+            let config_roles = state
                 .config
                 .roles
                 .iter()
                 .filter(|r| r.skills.iter().any(|g| g == "*" || g == &skill.name))
                 .map(|r| r.id.clone())
                 .collect();
+            let granted_roles = state.rbac.overlay_roles_for_skill(&skill.name);
             let body_html = match skill.body() {
                 Ok(body) => session_core::render::render_markdown(&body),
                 Err(err) => format!("<p><em>Could not read SKILL.md: {err}</em></p>"),
@@ -402,11 +504,18 @@ fn skill_views(state: &RamaState) -> Vec<SkillView> {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
                 files: skill.files(),
-                roles,
+                config_roles,
+                granted_roles,
                 body_html,
             }
         })
         .collect()
+}
+
+/// Every role id defined in the gateway config, in declaration order — the
+/// universe of checkboxes the grant dialog offers.
+fn all_role_ids(state: &RamaState) -> Vec<String> {
+    state.config.roles.iter().map(|r| r.id.clone()).collect()
 }
 
 /// Show the skills directory relative to the gateway's working directory when
@@ -424,6 +533,7 @@ fn render_body(
     skills: &[SkillView],
     selected: usize,
     dir: Option<&str>,
+    all_roles: &[String],
     error: Option<&str>,
 ) -> Html {
     html! {
@@ -456,7 +566,7 @@ fn render_body(
                         }
                     }
                 } else {
-                    (render_detail(&skills[selected]))
+                    (render_detail(&skills[selected], all_roles))
                 }
             }
         }
@@ -571,9 +681,17 @@ fn render_file_tree(s: &SkillView) -> Html {
     .to_html()
 }
 
-/// Right pane: metadata header (+ delete) and the rendered SKILL.md.
-fn render_detail(s: &SkillView) -> Html {
+/// DOM id of the per-detail grant dialog. Only the selected skill's detail is
+/// rendered, so a single fixed id is unique on the page; the open/close
+/// buttons reference it.
+const GRANT_DIALOG_ID: &str = "skill-grant-dialog";
+
+/// Right pane: metadata header (+ delete), the editable "Granted to" control,
+/// and the rendered SKILL.md.
+fn render_detail(s: &SkillView, all_roles: &[String]) -> Html {
     let body_html = s.body_html.as_str();
+    let no_grants = s.config_roles.is_empty() && s.granted_roles.is_empty();
+    let open_dialog = format!("document.getElementById('{GRANT_DIALOG_ID}').showModal()");
     html! {
         section(class: "flex-1 min-w-0") {
             div(class: "flex items-start justify-between gap-3") {
@@ -607,13 +725,35 @@ fn render_detail(s: &SkillView) -> Html {
                     div(class: "text-xs uppercase tracking-wide text-base-content/50 mb-1") {
                         "Granted to"
                     }
-                    div(class: "flex flex-wrap gap-1") {
-                        for role in s.roles.iter() {
-                            span(class: "badge badge-sm badge-outline") { (role) }
+                    div(class: "flex flex-wrap items-center gap-1") {
+                        // Config grants — read-only here (managed in gateway.toml).
+                        for role in s.config_roles.iter() {
+                            span(
+                                class: "badge badge-sm badge-outline",
+                                title: "Granted in the gateway config ([[roles]].skills)"
+                            ) { (role) }
                         }
-                        if s.roles.is_empty() {
-                            span(class: "badge badge-sm badge-warning badge-outline") {
-                                "no role grants this"
+                        // UI overlay grants — what the dialog edits.
+                        for role in s.granted_roles.iter() {
+                            span(class: "badge badge-sm badge-secondary") { (role) }
+                        }
+                        if no_grants {
+                            button(
+                                type: "button",
+                                class: "badge badge-sm badge-warning badge-outline cursor-pointer",
+                                title: "Choose which roles can use this skill",
+                                "data-on:click": (open_dialog.clone())
+                            ) {
+                                "no role grants this — set access"
+                            }
+                        } else {
+                            button(
+                                type: "button",
+                                class: "btn btn-xs btn-ghost gap-1",
+                                title: "Edit which roles can use this skill",
+                                "data-on:click": (open_dialog.clone())
+                            ) {
+                                (icons::sliders(12)) "Edit access"
                             }
                         }
                     }
@@ -641,7 +781,221 @@ fn render_detail(s: &SkillView) -> Html {
                     #(body_html)
                 }
             }
+
+            (render_grant_dialog(s, all_roles))
         }
     }
     .to_html()
+}
+
+/// The "who can use this skill" modal. A native `<dialog>` (the browser draws
+/// the backdrop + centring) holding a plain POST form — submitting redirects
+/// back, so it works the same way as the upload/delete forms. Each configured
+/// role is a checkbox; roles granted by config show checked-and-disabled (they
+/// can't be edited here), the rest reflect the live overlay grant.
+fn render_grant_dialog(s: &SkillView, all_roles: &[String]) -> Html {
+    let close = format!("document.getElementById('{GRANT_DIALOG_ID}').close()");
+    html! {
+        dialog(
+            id: (GRANT_DIALOG_ID),
+            class: "rounded-xl border border-base-300",
+            // Inline style: the native <dialog> needs explicit sizing and a
+            // surface colour, and these knobs aren't worth a utility class.
+            style: "padding:0; width:92vw; max-width:30rem; \
+                    background:var(--color-base-100); color:var(--color-base-content);"
+        ) {
+            form(method: "post", action: "/admin/skills/grants") {
+                input(type: "hidden", name: "skill", value: (&s.name));
+                div(class: "p-4 flex flex-col gap-3") {
+                    div {
+                        h3(class: "text-base font-semibold m-0") { "Who can use this skill?" }
+                        p(class: "text-xs text-base-content/60 mt-1 mb-0") {
+                            "Pick the roles allowed to load "
+                            span(class: "font-mono") { (&s.name) }
+                            ". Everyone with a selected role gets it."
+                        }
+                    }
+                    div(class: "flex flex-col") {
+                        if all_roles.is_empty() {
+                            p(class: "text-sm text-base-content/60 m-0") {
+                                "No roles are defined in the gateway config. Add "
+                                code(class: "font-mono text-xs") { "[[roles]]" }
+                                " entries before you can grant access."
+                            }
+                        }
+                        for role in all_roles.iter() {
+                            (render_role_row(
+                                role,
+                                s.config_roles.iter().any(|r| r == role),
+                                s.granted_roles.iter().any(|r| r == role),
+                            ))
+                        }
+                    }
+                    div(class: "flex items-center justify-end gap-2 pt-1") {
+                        button(
+                            type: "button",
+                            class: "btn btn-sm btn-ghost",
+                            "data-on:click": (close)
+                        ) { "Cancel" }
+                        button(type: "submit", class: "btn btn-sm btn-primary") { "Save access" }
+                    }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// One role checkbox in the grant dialog. Config-granted roles render
+/// checked-and-disabled with a "config" marker (so they're visible but can't be
+/// toggled — they're authoritative and live in TOML); editable roles carry
+/// `name="role"` so they post back, pre-checked when the overlay already grants
+/// them.
+fn render_role_row(role: &str, from_config: bool, granted: bool) -> Html {
+    html! {
+        label(class: "flex items-center gap-2 py-1.5 cursor-pointer") {
+            if from_config {
+                input(
+                    type: "checkbox",
+                    class: "checkbox checkbox-sm",
+                    checked: "checked",
+                    disabled: "disabled"
+                );
+            } else {
+                (role_checkbox(role, granted))
+            }
+            span(class: "text-sm font-mono") { (role) }
+            if from_config {
+                span(class: "badge badge-sm badge-outline ml-auto") { "from config" }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// The editable checkbox half of [`render_role_row`] — split out because the
+/// `checked` attribute is present-or-absent, not a boolean value.
+fn role_checkbox(role: &str, checked: bool) -> Html {
+    if checked {
+        html! {
+            input(
+                type: "checkbox",
+                name: "role",
+                value: (role),
+                class: "checkbox checkbox-sm",
+                checked: "checked"
+            );
+        }
+        .to_html()
+    } else {
+        html! {
+            input(
+                type: "checkbox",
+                name: "role",
+                value: (role),
+                class: "checkbox checkbox-sm"
+            );
+        }
+        .to_html()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view(config_roles: &[&str], granted_roles: &[&str]) -> SkillView {
+        SkillView {
+            name: "brand".into(),
+            description: "house style".into(),
+            files: vec![],
+            config_roles: config_roles.iter().map(|s| (*s).to_string()).collect(),
+            granted_roles: granted_roles.iter().map(|s| (*s).to_string()).collect(),
+            body_html: String::new(),
+        }
+    }
+
+    // ---- parse_grant_form ----
+
+    #[test]
+    fn parse_grant_form_collects_skill_and_repeated_roles() {
+        let (skill, roles) = parse_grant_form(b"skill=brand&role=eng&role=qa");
+        assert_eq!(skill.as_deref(), Some("brand"));
+        assert_eq!(roles, vec!["eng".to_string(), "qa".to_string()]);
+    }
+
+    #[test]
+    fn parse_grant_form_percent_decodes_and_drops_empty_roles() {
+        // `+` → space, `%2D` → `-`, and an empty `role=` is ignored (the form
+        // sends no value for unchecked boxes, but a stray one mustn't become "").
+        let (skill, roles) = parse_grant_form(b"skill=my+skill&role=eng%2Dteam&role=");
+        assert_eq!(skill.as_deref(), Some("my skill"));
+        assert_eq!(roles, vec!["eng-team".to_string()]);
+    }
+
+    #[test]
+    fn parse_grant_form_no_roles_clears() {
+        let (skill, roles) = parse_grant_form(b"skill=brand");
+        assert_eq!(skill.as_deref(), Some("brand"));
+        assert!(roles.is_empty());
+    }
+
+    // ---- render wiring ----
+
+    /// The open button, the dialog, and the close button must all reference
+    /// the same element id, and the form must POST to the route the router
+    /// registers (`/admin/skills/grants`). This pins the UI-directive↔endpoint
+    /// contract so a rename can't silently break the dialog.
+    #[test]
+    fn detail_wires_dialog_open_to_the_grant_form_endpoint() {
+        let html = render_detail(&view(&[], &[]), &["eng".into(), "admin".into()]).to_string();
+        // The dialog exists with the canonical id.
+        assert!(html.contains(&format!("id=\"{GRANT_DIALOG_ID}\"")));
+        // The id appears three times — on the dialog, in the open directive,
+        // and in the close directive — so all three reference the same element.
+        // (Attribute values are HTML-escaped, so we count the id rather than
+        // matching the full `getElementById('…')` expression verbatim.)
+        assert_eq!(
+            html.matches(GRANT_DIALOG_ID).count(),
+            3,
+            "dialog id should be wired to exactly the open + close directives"
+        );
+        assert!(html.contains("showModal()"));
+        assert!(html.contains("close()"));
+        // The form posts to the route the router registers.
+        assert!(html.contains("action=\"/admin/skills/grants\""));
+        // The skill name rides along as a hidden field.
+        assert!(html.contains("name=\"skill\""));
+    }
+
+    #[test]
+    fn detail_with_no_grants_shows_the_clickable_warning() {
+        let html = render_detail(&view(&[], &[]), &["eng".into()]).to_string();
+        assert!(html.contains("no role grants this"));
+        // Both checkboxes for editable roles carry name="role".
+        assert!(html.contains("name=\"role\""));
+    }
+
+    #[test]
+    fn detail_marks_config_roles_readonly_and_overlay_roles_editable() {
+        // `admin` is granted in config (read-only), `eng` via the overlay
+        // (editable, pre-checked), `qa` ungranted (editable, unchecked).
+        let html = render_detail(
+            &view(&["admin"], &["eng"]),
+            &["admin", "eng", "qa"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .to_string();
+        // Config role shows the read-only marker and a disabled checkbox.
+        assert!(html.contains("from config"));
+        assert!(html.contains("disabled"));
+        // The "Edit access" affordance replaces the warning once something is granted.
+        assert!(html.contains("Edit access"));
+        assert!(!html.contains("no role grants this"));
+        // The granted overlay role renders a pre-checked editable box.
+        assert!(html.contains("value=\"eng\""));
+        assert!(html.contains("value=\"qa\""));
+    }
 }

@@ -201,6 +201,7 @@ mod tests {
     fn rbac_granting(skills: &[&str]) -> Arc<Resolver> {
         let role = RoleConfig {
             id: "user".into(),
+            admin: false,
             models: vec![],
             tools: vec![],
             skills: skills.iter().map(|s| (*s).to_string()).collect(),

@@ -186,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
     // for playwright / local-browser debugging.
     let roles = vec![RoleConfig {
         id: "admin".into(),
+        admin: true,
         models: vec!["*".into()],
         tools: vec!["*".into()],
         skills: vec!["*".into()],
