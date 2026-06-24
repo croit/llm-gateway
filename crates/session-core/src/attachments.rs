@@ -337,6 +337,58 @@ where
     out
 }
 
+/// Rebuild `text` with every attachment marker for which `remove`
+/// returns `true` dropped (along with the single newline that followed
+/// it, so removing a chip doesn't leave a widening run of blank lines),
+/// while leaving prose and the surviving markers byte-for-byte intact.
+/// Used to supersede an earlier same-turn render's chips when a
+/// re-render replaces them, so a chat turn shows only the latest
+/// deliverable rather than every intermediate variant.
+pub fn remove_markers_where<F>(text: &str, mut remove: F) -> String
+where
+    F: FnMut(&ParsedAttachment) -> bool,
+{
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for caps in MARKER_RE.captures_iter(text) {
+        let whole = caps.get(0).unwrap();
+        let size = caps
+            .get(4)
+            .and_then(|m| m.as_str().parse::<u64>().ok())
+            .unwrap_or(0);
+        let att = ParsedAttachment {
+            filename: caps
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default(),
+            mime: caps
+                .get(2)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default(),
+            url: caps
+                .get(3)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default(),
+            size,
+            link: caps.get(5).map(|m| m.as_str().to_string()),
+        };
+        // Prose preceding this marker is always preserved.
+        out.push_str(&text[cursor..whole.start()]);
+        cursor = whole.end();
+        if remove(&att) {
+            // Swallow one trailing newline so the gap left behind doesn't
+            // grow each time a chip is superseded.
+            if text[cursor..].starts_with('\n') {
+                cursor += 1;
+            }
+        } else {
+            out.push_str(whole.as_str());
+        }
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
 /// Pull the `<turn_id>` segment out of a gateway attachment proxy URL
 /// of the form `/chat/attachment/<turn_id>/<filename>`. Returns `None`
 /// for any other URL shape (legacy presigned links, external URLs) so
@@ -555,6 +607,53 @@ mod tests {
                 link: Some("/chat/attachment/t-1/deck.pdf".into()),
             }]
         );
+    }
+
+    #[test]
+    fn remove_markers_where_drops_only_matching_chips() {
+        // Two renders' chips in one turn (the second supersedes the
+        // first): stripping the `-` (first) PDF+PNG leaves the prose and
+        // the latest render's chips intact, with no widening blank gap.
+        let pdf1 = marker_line(
+            "deck.pdf",
+            "application/pdf",
+            "/chat/attachment/t/deck.pdf",
+            10,
+        );
+        let png1 = marker_line_linked(
+            "deck.png",
+            "image/png",
+            "/chat/attachment/t/deck.png",
+            5,
+            Some("/chat/attachment/t/deck.pdf"),
+        );
+        let pdf2 = marker_line(
+            "deck-2.pdf",
+            "application/pdf",
+            "/chat/attachment/t/deck-2.pdf",
+            12,
+        );
+        let text = format!("Here you go:\n\n{pdf1}\n{png1}\n\nFixed it:\n\n{pdf2}\n\n");
+        let drop = ["deck.pdf", "deck.png"];
+        let out = remove_markers_where(&text, |a| drop.contains(&a.filename.as_str()));
+        // The superseded chips are gone; the latest one and all prose stay.
+        assert!(!out.contains("deck.pdf\""), "old pdf chip survived: {out}");
+        assert!(!out.contains("deck.png\""), "old png chip survived: {out}");
+        assert!(out.contains("deck-2.pdf"), "latest chip dropped: {out}");
+        assert!(out.contains("Here you go:"));
+        assert!(out.contains("Fixed it:"));
+        // Removal must not pile up blank lines where the chips were.
+        assert!(
+            !out.contains("\n\n\n\n"),
+            "blank-line run accumulated: {out:?}"
+        );
+    }
+
+    #[test]
+    fn remove_markers_where_keeps_everything_when_predicate_never_matches() {
+        let line = marker_line("a.pdf", "application/pdf", "/chat/attachment/t/a.pdf", 1);
+        let text = format!("prose\n\n{line}\n\n");
+        assert_eq!(remove_markers_where(&text, |_| false), text);
     }
 
     #[test]

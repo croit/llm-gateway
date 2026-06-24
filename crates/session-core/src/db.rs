@@ -779,6 +779,26 @@ pub async fn append_content(pool: &Pool, turn_id: &str, chunk: &str) -> Result<(
     Ok(())
 }
 
+/// Overwrite an in-progress assistant turn's `content` wholesale.
+/// Unlike [`append_content`], this *replaces* the column — used when a
+/// tool needs to rewrite prior markers rather than only add to them
+/// (e.g. a typst re-render superseding the earlier render's chip within
+/// the same turn). The live view re-renders full turn content from the
+/// DB on every tick, so the rewrite is reflected without a delta-accrual
+/// mismatch. Pairs with [`get_content`].
+pub async fn set_content(pool: &Pool, turn_id: &str, content: &str) -> Result<(), DbError> {
+    sqlx::query(
+        r#"UPDATE chat_turns
+           SET content = ?
+           WHERE id = ?"#,
+    )
+    .bind(content)
+    .bind(turn_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Read the current `content` of a turn — used by tools that need
 /// to inspect already-spliced attachment markers (e.g. to pick a
 /// non-colliding filename for a same-turn re-upload). Returns `None`

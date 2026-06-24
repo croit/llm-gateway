@@ -359,23 +359,22 @@ pub enum CompileError {
 /// Returns the three byte blobs we upload to S3. Stdout is
 /// discarded; on non-zero exit the captured stderr is returned to
 /// the caller so the model can see syntax errors and iterate.
+///
+/// `preview_page` (1-based) is the PDF page rendered as the model-facing
+/// PNG preview. The cover (page 1) is the default; an editor changing a
+/// deep slide can ask for that slide's page so it can actually *see* its
+/// change instead of staring at the unchanged cover. An out-of-range
+/// request falls back to page 1 — the PDF deliverable already compiled,
+/// so a bad preview page must never sink the whole render.
 pub async fn compile(
     template: &Template,
     inputs: &[(String, String)],
+    preview_page: u32,
 ) -> Result<Rendered, CompileError> {
     let workdir = tempfile::tempdir()?;
     let pdf_path = workdir
         .path()
         .join(format!("{}.pdf", template.output_basename));
-    // Page-templated PNG path because typst emits one file per page
-    // for PNG output. We pin `--pages 1` so only the cover page is
-    // rendered for the preview — the full PDF carries everything.
-    let png_path = workdir
-        .path()
-        .join(format!("{}-page-{{p}}.png", template.output_basename));
-    let png_first = workdir
-        .path()
-        .join(format!("{}-page-1.png", template.output_basename));
 
     let source_path = template.root.join(&template.source_file);
     // A template may bundle its own fonts in a `fonts/` subdir (the corporate
@@ -397,11 +396,65 @@ pub async fn compile(
     }
     run_typst(pdf_cmd).await?;
 
-    // PNG pass (first page only) for the model preview.
+    // PNG preview pass (single page). Try the requested page; if that
+    // page doesn't exist (out of range) and it wasn't the cover, fall
+    // back to page 1 so the model still gets *a* preview.
+    let want = preview_page.max(1);
+    let png = match render_preview_png(
+        workdir.path(),
+        &template.root,
+        &source_path,
+        has_fonts.then_some(&font_dir),
+        inputs,
+        &template.output_basename,
+        want,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(_) if want != 1 => {
+            render_preview_png(
+                workdir.path(),
+                &template.root,
+                &source_path,
+                has_fonts.then_some(&font_dir),
+                inputs,
+                &template.output_basename,
+                1,
+            )
+            .await?
+        }
+        Err(e) => return Err(e),
+    };
+
+    let pdf = tokio::fs::read(&pdf_path).await?;
+    if pdf.len() > MAX_PDF_BYTES {
+        return Err(CompileError::TooLarge(pdf.len()));
+    }
+    let source = tokio::fs::read(&source_path).await?;
+    Ok(Rendered { pdf, png, source })
+}
+
+/// Render a single `page` (1-based) of the template to PNG and return
+/// its bytes. typst emits one file per page using the `{p}` placeholder
+/// in the output path, so we point it at `<base>-page-{p}.png` and read
+/// back the concrete `<base>-page-<page>.png`.
+#[allow(clippy::too_many_arguments)]
+async fn render_preview_png(
+    workdir: &Path,
+    root: &Path,
+    source_path: &Path,
+    font_dir: Option<&PathBuf>,
+    inputs: &[(String, String)],
+    basename: &str,
+    page: u32,
+) -> Result<Vec<u8>, CompileError> {
+    let png_tmpl = workdir.join(format!("{basename}-page-{{p}}.png"));
+    let png_file = workdir.join(format!("{basename}-page-{page}.png"));
     let mut png_cmd = Command::new("typst");
-    png_cmd.arg("compile").arg("--root").arg(&template.root);
-    if has_fonts {
-        png_cmd.arg("--font-path").arg(&font_dir);
+    png_cmd.arg("compile").arg("--root").arg(root);
+    if let Some(dir) = font_dir {
+        png_cmd.arg("--font-path").arg(dir);
     }
     png_cmd
         .arg("--format")
@@ -409,21 +462,14 @@ pub async fn compile(
         .arg("--ppi")
         .arg(PNG_PPI.to_string())
         .arg("--pages")
-        .arg("1")
-        .arg(&source_path)
-        .arg(&png_path);
+        .arg(page.to_string())
+        .arg(source_path)
+        .arg(&png_tmpl);
     for (k, v) in inputs {
         png_cmd.arg("--input").arg(format!("{k}={v}"));
     }
     run_typst(png_cmd).await?;
-
-    let pdf = tokio::fs::read(&pdf_path).await?;
-    if pdf.len() > MAX_PDF_BYTES {
-        return Err(CompileError::TooLarge(pdf.len()));
-    }
-    let png = tokio::fs::read(&png_first).await?;
-    let source = tokio::fs::read(&source_path).await?;
-    Ok(Rendered { pdf, png, source })
+    Ok(tokio::fs::read(&png_file).await?)
 }
 
 /// Spawn `cmd` with stderr captured, enforce [`COMPILE_TIMEOUT`],

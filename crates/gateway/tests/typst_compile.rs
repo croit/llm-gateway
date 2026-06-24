@@ -59,7 +59,9 @@ async fn compiles_example_letter_template() {
         ),
         ("sender_name".to_string(), "Jane Doe".to_string()),
     ];
-    let rendered = gw_typst::compile(letter, &inputs).await.expect("compile");
+    let rendered = gw_typst::compile(letter, &inputs, 1)
+        .await
+        .expect("compile");
     // PDF magic: "%PDF-"
     assert!(
         rendered.pdf.starts_with(b"%PDF-"),
@@ -111,7 +113,7 @@ async fn compile_surfaces_typst_error_on_bad_input() {
         ("sender_name".to_string(), "x".to_string()),
         ("recipient_address".to_string(), "x".to_string()),
     ];
-    let err = gw_typst::compile(letter, &inputs).await.unwrap_err();
+    let err = gw_typst::compile(letter, &inputs, 1).await.unwrap_err();
     match err {
         gw_typst::CompileError::Failed(msg) => {
             assert!(

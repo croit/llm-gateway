@@ -85,6 +85,19 @@ impl Tool for TypstRenderTool {
                 required.push(Value::String(f.name.clone()));
             }
         }
+        // A non-field control: which page to show as the inline preview.
+        props.insert(
+            "preview_page".to_string(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional. Which PDF page (1-based) to render as \
+                                the inline PNG preview. Defaults to 1 (the cover/\
+                                first page). For a multi-page document or deck, set \
+                                this to preview the page you actually changed rather \
+                                than always the cover.",
+            }),
+        );
         let mut properties = Value::Object(props);
         // Stable iteration order so generated schemas are reproducible
         // across rebuilds — useful for caching the tool list upstream.
@@ -101,13 +114,16 @@ impl Tool for TypstRenderTool {
             self.id(),
             format!(
                 "{descr} Splices two things into your reply: `{base}.pdf` \
-                 (the final document — the deliverable) and a page-1 PNG \
-                 preview you can visually inspect (clicking it opens the \
-                 PDF). The tool result also returns a `data_id` referencing \
-                 the exact field values you supplied. To make a SMALL change \
-                 afterwards — fix one headline, tweak one bullet — do NOT \
-                 resend the whole input: call `{id}_edit` with that `data_id` \
-                 and a tiny JSON Patch describing only what changes.",
+                 (the final document — the deliverable) and a PNG preview of \
+                 one page you can visually inspect (clicking it opens the \
+                 PDF; defaults to the first page, override with \
+                 `preview_page`). The tool result also returns a `data_id` \
+                 referencing the exact field values you supplied. To change \
+                 something afterwards, do NOT resend the whole input and do \
+                 NOT re-render repeatedly to hunt for what to change: call \
+                 `{id}_read` with the `data_id` to see the stored content and \
+                 locate the exact text/field, then `{id}_edit` with that \
+                 `data_id` and either a small JSON Patch or a find/replace.",
                 descr = t.description,
                 base = t.output_basename,
                 id = self.id(),
@@ -156,6 +172,10 @@ impl Tool for TypstRenderTool {
                     ));
                 }
             };
+            // Pull the non-field `preview_page` control out before field
+            // validation (which rejects anything not declared in the
+            // manifest).
+            let preview_page = take_preview_page(&mut arg_map)?;
             if wants_identity(&template, &arg_map) {
                 match crate::server::db::users::find_by_id(&ctx.db, &ctx.user_id).await {
                     Ok(Some(u)) => apply_identity_defaults(
@@ -189,6 +209,7 @@ impl Tool for TypstRenderTool {
                 inputs,
                 &data,
                 self.sandbox.as_ref(),
+                preview_page,
             )
             .await
         })
@@ -210,19 +231,22 @@ async fn render_and_attach(
     inputs: Vec<(String, String)>,
     data: &Value,
     sandbox: Option<&Arc<SandboxClient>>,
+    preview_page: u32,
 ) -> ToolResult {
-    let rendered = typst::compile(template, &inputs).await.map_err(|e| {
-        // Compile errors become InvalidArgs so the model is nudged to
-        // fix its input — typst's stderr usually names the offending
-        // line / variable.
-        use typst::CompileError;
-        match e {
-            CompileError::Failed(msg) => {
-                ToolError::InvalidArgs(format!("typst compile failed:\n{msg}"))
+    let rendered = typst::compile(template, &inputs, preview_page)
+        .await
+        .map_err(|e| {
+            // Compile errors become InvalidArgs so the model is nudged to
+            // fix its input — typst's stderr usually names the offending
+            // line / variable.
+            use typst::CompileError;
+            match e {
+                CompileError::Failed(msg) => {
+                    ToolError::InvalidArgs(format!("typst compile failed:\n{msg}"))
+                }
+                other => ToolError::Failed(other.to_string()),
             }
-            other => ToolError::Failed(other.to_string()),
-        }
-    })?;
+        })?;
 
     // Same-turn dedup, race-safe across concurrent tool calls: a second
     // typst call (or a sibling `upload_attachment` claiming e.g.
@@ -304,9 +328,30 @@ async fn render_and_attach(
         chunk.push_str(&chat_attachments::marker_line(turn_id, p));
     }
     chunk.push_str("\n\n");
-    chat::append_content(&ctx.db, turn_id, &chunk)
-        .await
-        .map_err(|e| ToolError::Failed(format!("persist markers: {e}")))?;
+
+    // Per-turn supersede: a chat turn should show only the LATEST render
+    // of this template, not every intermediate variant produced while the
+    // model iterates. So before splicing the new chips, strip this
+    // template's earlier chips (pdf/png/pptx of the same basename family)
+    // from the current turn's content. Previous *turns'* deliverables are
+    // untouched — the conversation's version history stays intact — and
+    // the S3 objects + the `.json` edit base are never deleted, so an
+    // `_edit` chain still resolves. Done under the reservation mutex so
+    // two concurrent same-turn renders can't lose each other's write.
+    {
+        let _guard = reservations.lock().await;
+        let existing = chat::get_content(&ctx.db, turn_id)
+            .await
+            .map_err(|e| ToolError::Failed(format!("read turn content: {e}")))?
+            .unwrap_or_default();
+        let stripped = session_core::attachments::remove_markers_where(&existing, |a| {
+            is_template_typst_chip(template, &a.filename)
+        });
+        let new_content = format!("{stripped}{chunk}");
+        chat::set_content(&ctx.db, turn_id, &new_content)
+            .await
+            .map_err(|e| ToolError::Failed(format!("persist markers: {e}")))?;
+    }
 
     let data_id = format!("{turn_id}/{}", json_out.filename);
     let mut result = json!({
@@ -546,23 +591,28 @@ impl Tool for TypstEditTool {
         ToolDef::function(
             self.id(),
             format!(
-                "Make a SMALL change to a document previously rendered by \
+                "Make a change to a document previously rendered by \
                  `{render_id}` and re-render it — WITHOUT resending the whole \
                  input. Give `base` (the `data_id` the render returned) and \
-                 `patch` (an RFC 6902 JSON Patch array applied to the stored \
-                 field values). Example — change the third slide's title: \
+                 EITHER `find`+`replace` OR `patch`. \
+                 `find`/`replace`: swap an exact run of text for another \
+                 wherever it appears — best for fixing wording (a sentence, a \
+                 headline, a quote) when you don't know the field path. \
+                 `patch`: an RFC 6902 JSON Patch for structural edits — \
+                 e.g. change the third slide's title \
                  [{{\"op\":\"replace\",\"path\":\"/deck/slides/2/title\",\
-                 \"value\":\"New headline\"}}]. Add an item with \
+                 \"value\":\"New headline\"}}], add a slide \
                  {{\"op\":\"add\",\"path\":\"/deck/slides/-\",\"value\":{{…}}}}, \
-                 remove with {{\"op\":\"remove\",\"path\":\"/deck/slides/1\"}}. \
-                 Returns a fresh PDF + preview and a new `data_id` you can \
-                 patch again. Prefer this over re-calling `{render_id}` \
-                 whenever most of the content is unchanged.",
+                 or remove one {{\"op\":\"remove\",\"path\":\"/deck/slides/1\"}}. \
+                 If you don't know the exact current text or the right path, \
+                 call `{render_id}_read` FIRST to see the stored content — do \
+                 NOT re-render repeatedly to hunt for it. Returns a fresh PDF \
+                 + preview and a new `data_id` you can edit again.",
             ),
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["base", "patch"],
+                "required": ["base"],
                 "properties": {
                     "base": {
                         "type": "string",
@@ -570,13 +620,30 @@ impl Tool for TypstEditTool {
                                         render/edit of this template, of the \
                                         form `<turn_id>/<file>.json`."
                     },
+                    "find": {
+                        "type": "string",
+                        "description": "Exact text to search for across the \
+                                        stored content. Every occurrence is \
+                                        replaced with `replace`. Requires \
+                                        `replace`. The edit FAILS if the text \
+                                        isn't found (so you learn the text was \
+                                        wrong instead of silently re-rendering \
+                                        unchanged) — call the `_read` tool to \
+                                        get the exact current text."
+                    },
+                    "replace": {
+                        "type": "string",
+                        "description": "The replacement text for `find`. Use an \
+                                        empty string to delete the matched text."
+                    },
                     "patch": {
                         "type": "array",
                         "description": "RFC 6902 JSON Patch: an array of \
                                         operations applied in order. Paths are \
                                         JSON Pointers into the stored field \
                                         values (the `deck` object is addressable \
-                                        as `/deck/...`).",
+                                        as `/deck/...`). Applied before \
+                                        `find`/`replace` when both are given.",
                         "items": {
                             "type": "object",
                             "required": ["op", "path"],
@@ -590,6 +657,15 @@ impl Tool for TypstEditTool {
                                 "value": {}
                             }
                         }
+                    },
+                    "preview_page": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional. Which PDF page (1-based) to \
+                                        render as the inline PNG preview so you \
+                                        can verify the change. Defaults to 1 \
+                                        (the cover); set it to the page you \
+                                        edited for a multi-page document/deck."
                     }
                 }
             }),
@@ -614,19 +690,40 @@ impl Tool for TypstEditTool {
                 )
             })?;
 
-            let obj = args
-                .as_object()
-                .ok_or_else(|| ToolError::InvalidArgs("expected an object {base, patch}".into()))?;
+            let obj = args.as_object().ok_or_else(|| {
+                ToolError::InvalidArgs("expected an object {base, patch|find/replace}".into())
+            })?;
             let base = obj.get("base").and_then(Value::as_str).ok_or_else(|| {
                 ToolError::InvalidArgs(
                     "`base` (the data_id from the previous render) is required".into(),
                 )
             })?;
-            let patch = obj.get("patch").and_then(Value::as_array).ok_or_else(|| {
-                ToolError::InvalidArgs("`patch` (an RFC 6902 JSON Patch array) is required".into())
-            })?;
+            let patch = obj.get("patch").and_then(Value::as_array);
+            let find = obj.get("find").and_then(Value::as_str);
+            let replace = obj.get("replace").and_then(Value::as_str);
+            let mut preview_page_map = Map::new();
+            if let Some(p) = obj.get("preview_page") {
+                preview_page_map.insert("preview_page".to_string(), p.clone());
+            }
+            let preview_page = take_preview_page(&mut preview_page_map)?;
 
-            // Fetch the prior render's data document (the patch base). It
+            // Require exactly one editing mode's worth of input: a patch, a
+            // find/replace, or both — but not neither (that would just
+            // re-render the same bytes and spam another chip).
+            if patch.is_none() && find.is_none() {
+                return Err(ToolError::InvalidArgs(
+                    "give either `find`+`replace` or a `patch` (or both) — \
+                     nothing to change otherwise"
+                        .into(),
+                ));
+            }
+            if find.is_some() != replace.is_some() {
+                return Err(ToolError::InvalidArgs(
+                    "`find` and `replace` must be given together".into(),
+                ));
+            }
+
+            // Fetch the prior render's data document (the edit base). It
             // lives at <turn>/<file>.json under whichever turn produced it
             // — typically an earlier turn in this same conversation.
             let (base_turn, base_file) = split_attachment_id(base)?;
@@ -640,10 +737,25 @@ impl Tool for TypstEditTool {
                 ))
             })?;
 
-            super::json_patch::apply(&mut data, patch)
-                .map_err(|e| ToolError::InvalidArgs(format!("could not apply patch: {e}")))?;
+            // Structural patch first (if any), then the text find/replace.
+            if let Some(patch) = patch {
+                super::json_patch::apply(&mut data, patch)
+                    .map_err(|e| ToolError::InvalidArgs(format!("could not apply patch: {e}")))?;
+            }
+            if let (Some(find), Some(replace)) = (find, replace) {
+                let n = replace_in_strings(&mut data, find, replace);
+                if n == 0 {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "`find` text was not present in the document, so nothing \
+                         changed. Call `typst_{}_read` with this `base` to see \
+                         the exact current text, then retry with text that \
+                         matches verbatim.",
+                        template.id
+                    )));
+                }
+            }
 
-            // Re-validate + re-stringify the patched data, then render and
+            // Re-validate + re-stringify the edited data, then render and
             // attach to the CURRENT turn exactly like a fresh render.
             let inputs = inputs_from_data(&template, &data)?;
             render_and_attach(
@@ -654,8 +766,96 @@ impl Tool for TypstEditTool {
                 inputs,
                 &data,
                 self.sandbox.as_ref(),
+                preview_page,
             )
             .await
+        })
+    }
+}
+
+/// Companion read tool `typst_<id>_read`: returns the stored field
+/// values / deck structure of a previously-rendered document so the
+/// model can locate the exact slide index, JSON-Pointer path, or current
+/// wording to target with `_edit` — instead of re-rendering over and
+/// over to find where something lives. Read-only: no compile, nothing
+/// attached to the reply. Registered per-template alongside render/edit.
+pub struct TypstReadTool {
+    /// Leaked `Box<str>` (`typst_<id>_read`), same rationale as
+    /// [`TypstRenderTool::id`].
+    id: &'static str,
+}
+
+impl TypstReadTool {
+    pub fn new(template: Arc<Template>) -> Self {
+        let id: &'static str = Box::leak(format!("typst_{}_read", template.id).into_boxed_str());
+        Self { id }
+    }
+}
+
+impl Tool for TypstReadTool {
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    fn schema(&self) -> ToolDef {
+        // `id` is `typst_<tid>_read`; the render/edit siblings drop `_read`.
+        let render_id = self.id.strip_suffix("_read").unwrap_or(self.id);
+        ToolDef::function(
+            self.id(),
+            format!(
+                "Inspect the stored content of a document previously rendered \
+                 by `{render_id}` — its field values, and for a deck the full \
+                 slide structure as JSON. Give `base`, the `data_id` that \
+                 render/edit returned. Use this to find the exact slide index, \
+                 JSON-Pointer path, or current wording you want to change \
+                 BEFORE calling `{render_id}_edit`, so you never re-render \
+                 repeatedly just to discover where something lives. Read-only: \
+                 it attaches nothing to your reply."
+            ),
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["base"],
+                "properties": {
+                    "base": {
+                        "type": "string",
+                        "description": "The `data_id` from a previous render/edit \
+                                        of this template (`<turn_id>/<file>.json`)."
+                    }
+                }
+            }),
+        )
+    }
+
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let s3 = ctx.s3.as_ref().ok_or_else(|| {
+                ToolError::Failed("chat attachments are not configured on this gateway".into())
+            })?;
+            let base = args
+                .as_object()
+                .and_then(|o| o.get("base"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::InvalidArgs("`base` (the data_id) is required".into()))?;
+            let (base_turn, base_file) = split_attachment_id(base)?;
+            let fetched = chat_attachments::fetch(s3, base_turn, base_file)
+                .await
+                .map_err(|e| ToolError::Failed(format!("could not read base `{base}`: {e}")))?;
+            let data: Value = serde_json::from_slice(&fetched.bytes).map_err(|e| {
+                ToolError::InvalidArgs(format!(
+                    "base `{base}` is not a JSON data document ({e}); pass the \
+                     `data_id` from a render/edit result, not the PDF/PNG id"
+                ))
+            })?;
+            Ok(json!({
+                "data": data,
+                "note": "These are the stored field values backing the document \
+                         (a deck's slides are under the deck field). To change \
+                         something, call this template's `_edit` tool with the \
+                         SAME `base` and either `find`/`replace` (for wording) \
+                         or a JSON Patch (for structure such as slide order) — \
+                         do not re-render from scratch.",
+            }))
         })
     }
 }
@@ -795,6 +995,52 @@ fn split_attachment_id(id: &str) -> Result<(&str, &str), ToolError> {
         )));
     }
     Ok((turn_id, filename))
+}
+
+/// Extract the optional non-field `preview_page` control from a tool's
+/// argument map, removing it so it isn't mistaken for a template field.
+/// Defaults to 1 (the cover/first page); must be a positive integer.
+fn take_preview_page(map: &mut Map<String, Value>) -> Result<u32, ToolError> {
+    match map.remove("preview_page") {
+        None | Some(Value::Null) => Ok(1),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .filter(|p| *p >= 1)
+            .and_then(|p| u32::try_from(p).ok())
+            .ok_or_else(|| {
+                ToolError::InvalidArgs(
+                    "`preview_page` must be a positive integer (1-based PDF page)".into(),
+                )
+            }),
+        Some(_) => Err(ToolError::InvalidArgs(
+            "`preview_page` must be an integer".into(),
+        )),
+    }
+}
+
+/// Recursively replace every exact occurrence of `find` with `replace`
+/// in the string *values* of a JSON document (object values and array
+/// elements; object keys are left alone). Returns the number of
+/// occurrences replaced. Lets the edit tool do "swap this sentence for
+/// that one" without the model needing to know a JSON Pointer path.
+fn replace_in_strings(v: &mut Value, find: &str, replace: &str) -> usize {
+    match v {
+        Value::String(s) if s.contains(find) => {
+            let n = s.matches(find).count();
+            *s = s.replace(find, replace);
+            n
+        }
+        Value::String(_) => 0,
+        Value::Array(a) => a
+            .iter_mut()
+            .map(|x| replace_in_strings(x, find, replace))
+            .sum(),
+        Value::Object(m) => m
+            .values_mut()
+            .map(|x| replace_in_strings(x, find, replace))
+            .sum(),
+        _ => 0,
+    }
 }
 
 /// Walk the manifest's declared fields, pull each one out of `args`,
@@ -1020,6 +1266,29 @@ fn apply_identity_defaults(t: &Template, args: &mut Map<String, Value>, id: &Ide
 /// fonts/assets, so it only adds clutter.
 const TYPST_EXTS: &[&str] = &["pdf", "png", "json", "pptx"];
 
+/// Whether `filename` is one of this template's visible typst chips
+/// (`<base>.pdf` / `.png` / `.pptx`, including the `-2`, `-3`, … dedup
+/// suffixes) — i.e. a deliverable an *earlier* same-turn render spliced
+/// in. Used by the per-turn supersede in [`render_and_attach`] so a turn
+/// shows only the latest render. The hidden `.json` edit base is
+/// deliberately excluded (it carries no chip and must survive as a patch
+/// target), as is any unrelated upload.
+fn is_template_typst_chip(template: &Template, filename: &str) -> bool {
+    let base = template.output_basename.as_str();
+    let stem = match filename.rsplit_once('.') {
+        Some((stem, "pdf" | "png" | "pptx")) => stem,
+        _ => return false,
+    };
+    if stem == base {
+        return true;
+    }
+    // `<base>-<n>` from the dedup suffix (n a positive integer).
+    match stem.strip_prefix(base).and_then(|r| r.strip_prefix('-')) {
+        Some(n) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
 fn stringify_one(name: &str, ty: FieldType, v: &Value) -> Result<String, ToolError> {
     match (ty, v) {
         (FieldType::String, Value::String(s)) => Ok(s.clone()),
@@ -1210,12 +1479,95 @@ mod tests {
     fn edit_tool_id_suffixes_render_id() {
         let tool = TypstEditTool::new(std::sync::Arc::new(stub_template()), None);
         assert_eq!(tool.id(), "typst_stub_edit");
-        // Schema requires base + patch and points at the render tool.
+        // Only `base` is required now — `patch` and `find`/`replace` are
+        // alternative editing modes the run() validates. The schema still
+        // points at the render tool and offers all three controls.
         let def = tool.schema();
         let params = serde_json::to_value(&def.function.parameters).unwrap();
         let required = params["required"].as_array().unwrap();
-        assert!(required.contains(&json!("base")) && required.contains(&json!("patch")));
+        assert_eq!(required, &[json!("base")]);
+        let props = &params["properties"];
+        for key in ["base", "patch", "find", "replace", "preview_page"] {
+            assert!(props.get(key).is_some(), "missing property `{key}`");
+        }
         assert!(def.function.description.contains("typst_stub"));
+    }
+
+    #[test]
+    fn read_tool_id_suffixes_render_id() {
+        let tool = TypstReadTool::new(std::sync::Arc::new(stub_template()));
+        assert_eq!(tool.id(), "typst_stub_read");
+        let def = tool.schema();
+        let params = serde_json::to_value(&def.function.parameters).unwrap();
+        assert_eq!(params["required"].as_array().unwrap(), &[json!("base")]);
+        // Description points back at the render/edit siblings.
+        assert!(def.function.description.contains("typst_stub"));
+        assert!(def.function.description.contains("typst_stub_edit"));
+    }
+
+    #[test]
+    fn render_schema_offers_preview_page() {
+        let tool = TypstRenderTool::new(std::sync::Arc::new(stub_template()), None);
+        let params = serde_json::to_value(&tool.schema().function.parameters).unwrap();
+        assert!(params["properties"]["preview_page"].is_object());
+        // preview_page is a control, never a required field.
+        let required = params["required"].as_array().unwrap();
+        assert!(!required.contains(&json!("preview_page")));
+    }
+
+    #[test]
+    fn replace_in_strings_counts_and_rewrites_nested_values() {
+        let mut v = json!({
+            "deck": {
+                "slides": [
+                    {"quote": "The AI is a co-pilot — not a replacement."},
+                    {"title": "co-pilot duties"},
+                ]
+            },
+            "theme": "dark",
+        });
+        let n = replace_in_strings(&mut v, "co-pilot", "tool");
+        assert_eq!(n, 2);
+        assert_eq!(
+            v["deck"]["slides"][0]["quote"],
+            "The AI is a tool — not a replacement."
+        );
+        assert_eq!(v["deck"]["slides"][1]["title"], "tool duties");
+        assert_eq!(v["theme"], "dark");
+        // No match → zero, unchanged.
+        assert_eq!(replace_in_strings(&mut v, "nope", "x"), 0);
+    }
+
+    #[test]
+    fn is_template_typst_chip_matches_only_this_groups_visuals() {
+        let t = deck_template(); // output_basename = "deck"
+        assert!(is_template_typst_chip(&t, "deck.pdf"));
+        assert!(is_template_typst_chip(&t, "deck.png"));
+        assert!(is_template_typst_chip(&t, "deck.pptx"));
+        assert!(is_template_typst_chip(&t, "deck-2.pdf"));
+        assert!(is_template_typst_chip(&t, "deck-17.png"));
+        // The hidden edit base must survive a supersede.
+        assert!(!is_template_typst_chip(&t, "deck.json"));
+        assert!(!is_template_typst_chip(&t, "deck-2.json"));
+        // Unrelated uploads and other templates' files stay.
+        assert!(!is_template_typst_chip(&t, "report.pdf"));
+        assert!(!is_template_typst_chip(&t, "deckster.pdf"));
+        assert!(!is_template_typst_chip(&t, "deck-.pdf"));
+        assert!(!is_template_typst_chip(&t, "deck-x.pdf"));
+    }
+
+    #[test]
+    fn take_preview_page_defaults_and_validates() {
+        let mut empty = Map::new();
+        assert_eq!(take_preview_page(&mut empty).unwrap(), 1);
+        let mut five = json!({"preview_page": 5}).as_object().unwrap().clone();
+        assert_eq!(take_preview_page(&mut five).unwrap(), 5);
+        // Removed so it isn't later mistaken for a template field.
+        assert!(!five.contains_key("preview_page"));
+        let mut zero = json!({"preview_page": 0}).as_object().unwrap().clone();
+        assert!(take_preview_page(&mut zero).is_err());
+        let mut bad = json!({"preview_page": "two"}).as_object().unwrap().clone();
+        assert!(take_preview_page(&mut bad).is_err());
     }
 
     #[test]
