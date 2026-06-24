@@ -443,6 +443,7 @@ mod tests {
             created_at: ts,
             updated_at: ts,
             shared: false,
+            pinned: false,
         }
     }
 

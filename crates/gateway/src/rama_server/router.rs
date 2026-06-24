@@ -108,6 +108,7 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/chat/{id}/turns/{turn_id}/edit", pages::chat_edit)
         .with_post("/chat/{id}/delete", pages::chat_session_delete)
         .with_post("/chat/{id}/share", pages::chat_share_toggle)
+        .with_post("/chat/{id}/pin", pages::chat_session_pin)
         .with_post("/chat/{id}/capabilities", pages::chat_capabilities_toggle)
         .with_post("/chat/{id}/effort", pages::chat_effort_set)
         .with_post("/chat/{id}/fork", pages::chat_fork)

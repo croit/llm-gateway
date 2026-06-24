@@ -235,6 +235,7 @@ async fn render_chat_response(
             .map(|s| SidebarSession {
                 id: s.id,
                 title: s.title,
+                pinned: s.pinned,
             })
             .collect(),
         active_session_id: Some(active.id.clone()),
@@ -389,6 +390,78 @@ pub async fn chat_share_toggle(
     };
     sse_response(&[
         sse_patch(Some("#share-toggle"), Some("outer"), &control),
+        toast,
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// POST /chat/{id}/pin — owner toggles the conversation's pinned flag. Pinned
+// conversations float to the top of the sidebar list. Pure UI affordance —
+// pinning never changes who can read the session.
+
+#[derive(serde::Deserialize)]
+struct PinForm {
+    /// The id of the currently-open conversation (the active sidebar row),
+    /// forwarded so the re-rendered list can keep its highlight. Empty when
+    /// the user pinned from a page with no open chat.
+    #[serde(default)]
+    active: String,
+}
+
+pub async fn chat_session_pin(
+    Path(session_id): Path<String>,
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    let (_session, user) = match require_session_or_redirect(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let datastar = is_datastar_request(req.headers());
+    // Owner-only on both reads and writes: get_session is owner-scoped, and
+    // set_pinned's UPDATE is `WHERE id = ? AND user_id = ?`. A non-owner POST
+    // finds no session and is redirected away with no effect.
+    let current = match chat::get_session(&state.db, &user.id, &session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return see_other("/chat"),
+        Err(err) => return internal_error_html(&user.email, &err.to_string()),
+    };
+    let now_pinned = !current.pinned;
+    if let Err(err) = chat::set_pinned(&state.db, &user.id, &session_id, now_pinned).await {
+        return internal_error_html(&user.email, &err.to_string());
+    }
+    let form: PinForm = match super::read_form(req.into_body()).await {
+        Ok(f) => f,
+        Err(resp) => return resp,
+    };
+    let active = (!form.active.is_empty()).then_some(form.active);
+    if !datastar {
+        // No-JS fallback: full-page redirect back to the open chat (or the
+        // index when pinning from elsewhere).
+        return match &active {
+            Some(id) => see_other(&format!("/chat/{id}")),
+            None => see_other("/chat"),
+        };
+    }
+    // datastar: re-render the whole conversation list. Pinning re-sorts it
+    // (pinned rows float to the top), so a single-row patch wouldn't reflect
+    // the move — patch the full `#session-list`.
+    let sidebar = super::fetch_sidebar_chat(&state, &user.id, active).await;
+    let list = super::render_session_list(&sidebar.sessions, sidebar.active_session_id.as_deref())
+        .to_string();
+    let toast = if now_pinned {
+        sse_toast(&super::Flash {
+            kind: super::FlashKind::Success,
+            message: "Pinned — this conversation now stays at the top.".into(),
+        })
+    } else {
+        sse_toast(&super::Flash {
+            kind: super::FlashKind::Info,
+            message: "Unpinned.".into(),
+        })
+    };
+    sse_response(&[
+        sse_patch(Some("#session-list"), Some("outer"), &list),
         toast,
     ])
 }
@@ -1323,6 +1396,7 @@ fn gateway_sidebar_emitter(
             let sidebar = SidebarSession {
                 id: session.id.clone(),
                 title: session.title,
+                pinned: session.pinned,
             };
             let html = super::render_sidebar_session(&sidebar, Some(&session.id)).to_string();
             let selector = format!("#session-row-{session_id}");

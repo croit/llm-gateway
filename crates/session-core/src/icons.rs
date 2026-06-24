@@ -291,6 +291,23 @@ pub fn trash(size: u32) -> Html {
     ))
 }
 
+/// Star (outline) — the "pin/favorite" affordance on an unpinned chat row.
+pub fn star(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>"#,
+    ))
+}
+
+/// Star (filled) — a pinned chat row. Same outline, flooded with
+/// `currentColor` so the pinned state reads at a glance.
+pub fn star_filled(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" fill="currentColor"/>"#,
+    ))
+}
+
 /// Folder.
 pub fn folder(size: u32) -> Html {
     raw(render(

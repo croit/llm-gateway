@@ -108,6 +108,9 @@ fn sidebar_nav_directive(href: &str) -> String {
 pub(super) struct SidebarSession {
     pub id: String,
     pub title: Option<String>,
+    /// Pinned conversations render with a filled star and sort to the top
+    /// of the list (the DB query in `list_sessions` does the ordering).
+    pub pinned: bool,
 }
 
 /// Everything the sidebar needs to render its lower half.
@@ -137,6 +140,7 @@ pub(super) async fn fetch_sidebar_chat(
         .map(|s| SidebarSession {
             id: s.id,
             title: s.title,
+            pinned: s.pinned,
         })
         .collect();
     SidebarChat {
@@ -203,6 +207,7 @@ fn render_app_sidebar(
         .map(|s| SidebarSession {
             id: s.id.clone(),
             title: s.title.clone(),
+            pinned: s.pinned,
         })
         .collect();
     let active_sess = chat.active_session_id.clone();
@@ -267,11 +272,7 @@ fn render_app_sidebar(
                         }
                     }
                 }
-                ul(id: "session-list", class: "app-sidebar__sessions") {
-                    for s in sessions.iter() {
-                        (render_sidebar_session(s, active_sess.as_deref()))
-                    }
-                }
+                (render_session_list(&sessions, active_sess.as_deref()))
             }
             div(class: "app-sidebar__user") {
                 span(class: "app-sidebar__email") { (user_email) }
@@ -372,15 +373,32 @@ fn nav_group(key: &str, label: &str, items: Html) -> Html {
     .to_html()
 }
 
-/// One conversation row in the sidebar. Hover reveals the delete
-/// button; active row gets a soft tinted background.
+/// The `<ul>` of conversation rows. Pulled out of `render_app_sidebar` so
+/// the pin toggle can re-patch just `#session-list` (the pin re-sorts the
+/// list — pinned rows float to the top — so a single-row patch won't do).
+fn render_session_list(sessions: &[SidebarSession], active_id: Option<&str>) -> Html {
+    html! {
+        ul(id: "session-list", class: "app-sidebar__sessions") {
+            for s in sessions.iter() {
+                (render_sidebar_session(s, active_id))
+            }
+        }
+    }
+    .to_html()
+}
+
+/// One conversation row in the sidebar. Hover reveals the pin + delete
+/// buttons (a pinned row keeps its star lit); active row gets a soft
+/// tinted background.
 fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>) -> Html {
     let id = s.id.clone();
     let row_id = format!("session-row-{id}");
     let href = format!("/chat/{id}");
     let delete_url = format!("/chat/{id}/delete");
+    let pin_url = format!("/chat/{id}/pin");
     let directive = sidebar_nav_directive(&href);
     let delete_directive = format!("@post('{delete_url}', {{contentType: 'form'}})");
+    let pin_directive = format!("@post('{pin_url}', {{contentType: 'form'}})");
     let title = s
         .title
         .clone()
@@ -391,19 +409,50 @@ fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>) -> Html {
     } else {
         "session-row"
     };
+    // Carry the *currently active* session id in the pin form so the
+    // handler — which re-renders the whole `#session-list` — can preserve
+    // the active-row highlight (the pin POST itself doesn't navigate). The
+    // sidebar is global, so this is empty on non-chat pages (no active row).
+    let active_field = active_id.unwrap_or("").to_string();
+    let pin_class = if s.pinned {
+        "session-row__pin session-row__pin--active"
+    } else {
+        "session-row__pin"
+    };
+    let (pin_label, pin_icon) = if s.pinned {
+        ("Unpin conversation", icons::star_filled(12))
+    } else {
+        ("Pin conversation", icons::star(12))
+    };
     html! {
         li(id: (row_id), class: "session-row__item") {
             // The whole row is the clickable target so a sloppy
             // mobile tap on the padding doesn't fall through. The
-            // delete form sits as a sibling, absolutely positioned
-            // over the right edge — clicks on the trash button
-            // don't bubble through the link.
+            // pin + delete forms sit as siblings, absolutely positioned
+            // over the right edge — clicks on those buttons don't bubble
+            // through the link.
             a(
                 href: (href),
                 class: (row_class),
                 "data-on:click__prevent": (directive)
             ) {
                 span(class: "session-row__title") { (title) }
+            }
+            form(
+                method: "post",
+                action: (pin_url),
+                "data-on:submit__prevent": (pin_directive),
+                class: "m-0 session-row__pin-form"
+            ) {
+                input(type: "hidden", name: "active", value: (active_field));
+                button(
+                    type: "submit",
+                    class: (pin_class),
+                    "aria-label": (pin_label),
+                    title: (pin_label)
+                ) {
+                    (pin_icon)
+                }
             }
             form(
                 method: "post",
@@ -853,8 +902,8 @@ mod chat;
 pub use chat::{
     chat_attachment, chat_cancel, chat_capabilities_toggle, chat_document_view, chat_edit,
     chat_effort_set, chat_export_markdown, chat_export_pdf, chat_fork, chat_index,
-    chat_message_send, chat_retry, chat_session_create, chat_session_delete, chat_session_view,
-    chat_share_toggle, chat_tail,
+    chat_message_send, chat_retry, chat_session_create, chat_session_delete, chat_session_pin,
+    chat_session_view, chat_share_toggle, chat_tail,
 };
 
 // SSE helpers (`sse_patch`, `sse_script`, `sse_signals`,

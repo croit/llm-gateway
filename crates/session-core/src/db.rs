@@ -73,6 +73,11 @@ pub struct Session {
     /// *read* it (the UUID is the capability). Mutations stay owner-only
     /// regardless. Toggled by the owner via `set_shared`.
     pub shared: bool,
+    /// When true, the conversation is "pinned" — `list_sessions` floats
+    /// it above the recency order so it stays reachable in the sidebar.
+    /// Pure UI affordance; never affects readability. Toggled by the
+    /// owner via `set_pinned`.
+    pub pinned: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +233,7 @@ fn map_session(row: &SqliteRow) -> Result<Session, DbError> {
         created_at: parse_ts(row.try_get("created_at")?, "created_at")?,
         updated_at: parse_ts(row.try_get("updated_at")?, "updated_at")?,
         shared: row.try_get::<i64, _>("shared")? != 0,
+        pinned: row.try_get::<i64, _>("pinned")? != 0,
     })
 }
 
@@ -280,6 +286,7 @@ pub async fn create_session(pool: &Pool, user_id: &str) -> Result<Session, DbErr
         created_at: now,
         updated_at: now,
         shared: false,
+        pinned: false,
     };
     sqlx::query(
         r#"INSERT INTO chat_sessions (id, user_id, title, created_at, updated_at)
@@ -295,13 +302,14 @@ pub async fn create_session(pool: &Pool, user_id: &str) -> Result<Session, DbErr
     Ok(s)
 }
 
-/// All conversations for a user, most-recent first.
+/// All conversations for a user. Pinned conversations float to the top
+/// (in their own recency order); the rest follow, also most-recent first.
 pub async fn list_sessions(pool: &Pool, user_id: &str) -> Result<Vec<Session>, DbError> {
     let rows = sqlx::query(
-        r#"SELECT id, user_id, title, created_at, updated_at, shared
+        r#"SELECT id, user_id, title, created_at, updated_at, shared, pinned
            FROM chat_sessions
            WHERE user_id = ?
-           ORDER BY updated_at DESC, id ASC"#,
+           ORDER BY pinned DESC, updated_at DESC, id ASC"#,
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -317,7 +325,7 @@ pub async fn get_session(
     session_id: &str,
 ) -> Result<Option<Session>, DbError> {
     let row = sqlx::query(
-        r#"SELECT id, user_id, title, created_at, updated_at, shared
+        r#"SELECT id, user_id, title, created_at, updated_at, shared, pinned
            FROM chat_sessions
            WHERE id = ? AND user_id = ?"#,
     )
@@ -357,7 +365,7 @@ pub async fn get_session_readable(
     session_id: &str,
 ) -> Result<Option<Session>, DbError> {
     let row = sqlx::query(
-        r#"SELECT id, user_id, title, created_at, updated_at, shared
+        r#"SELECT id, user_id, title, created_at, updated_at, shared, pinned
            FROM chat_sessions
            WHERE id = ? AND (user_id = ? OR shared = 1)"#,
     )
@@ -379,6 +387,25 @@ pub async fn set_shared(
 ) -> Result<bool, DbError> {
     let res = sqlx::query(r#"UPDATE chat_sessions SET shared = ? WHERE id = ? AND user_id = ?"#)
         .bind(shared as i64)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Set (or clear) a session's pinned flag — owner-only. Returns true when a
+/// row was updated (the caller owns it); false otherwise, so a non-owner's
+/// attempt is a silent no-op rather than leaking existence via an error.
+/// Same owner-scoping guarantee as [`set_shared`].
+pub async fn set_pinned(
+    pool: &Pool,
+    user_id: &str,
+    session_id: &str,
+    pinned: bool,
+) -> Result<bool, DbError> {
+    let res = sqlx::query(r#"UPDATE chat_sessions SET pinned = ? WHERE id = ? AND user_id = ?"#)
+        .bind(pinned as i64)
         .bind(session_id)
         .bind(user_id)
         .execute(pool)
@@ -412,7 +439,7 @@ pub async fn turn_session_readable(
 /// by `GET /chat` to decide where to redirect.
 pub async fn latest_session(pool: &Pool, user_id: &str) -> Result<Option<Session>, DbError> {
     let row = sqlx::query(
-        r#"SELECT id, user_id, title, created_at, updated_at, shared
+        r#"SELECT id, user_id, title, created_at, updated_at, shared, pinned
            FROM chat_sessions
            WHERE user_id = ?
            ORDER BY updated_at DESC, id ASC
@@ -488,6 +515,9 @@ pub async fn fork_session(
         created_at: now,
         updated_at: now,
         shared: false,
+        // A fork starts unpinned — pinning, like re-sharing, is the new
+        // owner's decision.
+        pinned: false,
     };
 
     // Collect the blob copies as we go, deduped on (source turn, file):
@@ -1227,6 +1257,7 @@ mod tests {
                 created_at  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL,
                 shared      INTEGER NOT NULL DEFAULT 0,
+                pinned      INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )"#,
             r#"CREATE TABLE chat_turns (
@@ -1385,6 +1416,61 @@ mod tests {
                 .unwrap()
                 .shared
         );
+    }
+
+    #[tokio::test]
+    async fn set_pinned_is_owner_only() {
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        // A freshly created session is unpinned.
+        assert!(!s.pinned);
+        // A non-owner's attempt updates nothing and reports false.
+        assert!(!set_pinned(&pool, "u2", &s.id, true).await.unwrap());
+        assert!(
+            !get_session(&pool, "u1", &s.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pinned
+        );
+        // The owner can set it, and clear it again.
+        assert!(set_pinned(&pool, "u1", &s.id, true).await.unwrap());
+        assert!(
+            get_session(&pool, "u1", &s.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pinned
+        );
+        assert!(set_pinned(&pool, "u1", &s.id, false).await.unwrap());
+        assert!(
+            !get_session(&pool, "u1", &s.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pinned
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_floats_pinned_above_recency() {
+        let pool = pool().await;
+        let old = create_session(&pool, "u1").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let recent = create_session(&pool, "u1").await.unwrap();
+
+        // By default `recent` sorts first (most-recent).
+        let listed = list_sessions(&pool, "u1").await.unwrap();
+        assert_eq!(listed[0].id, recent.id);
+        assert_eq!(listed[1].id, old.id);
+
+        // Pinning the older one floats it to the top despite being staler.
+        assert!(set_pinned(&pool, "u1", &old.id, true).await.unwrap());
+        let listed = list_sessions(&pool, "u1").await.unwrap();
+        assert_eq!(listed[0].id, old.id, "pinned must come first");
+        assert!(listed[0].pinned);
+        assert_eq!(listed[1].id, recent.id);
+        assert!(!listed[1].pinned);
     }
 
     #[tokio::test]

@@ -823,6 +823,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             shared: false,
+            pinned: false,
         }
     }
 
