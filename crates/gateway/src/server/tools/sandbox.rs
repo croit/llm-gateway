@@ -653,7 +653,9 @@ impl Tool for RunInSandbox {
              CLI tools: ripgrep (rg), jq, yq, jc, awk/sed, duckdb + sqlite3 \
              (SQL over CSV/JSON/Parquet/large logs), ffmpeg, imagemagick, vips, \
              tesseract (OCR), tshark/tcpdump (read .pcap), graphviz (dot), \
-             LibreOffice (`soffice --headless` for office↔pdf), pandoc, typst, \
+             LibreOffice (`soffice --headless` for office↔pdf), pandoc, typst \
+             (with the offline `@preview/gribouille` ggplot-style charts \
+             package), excalirender (`.excalidraw` scene → svg/png/pdf), \
              ghostscript/qpdf, poppler-utils (pdftotext/pdftoppm), \
              gzip/zstd/xz/bzip2/7z, git, curl/wget, dig/rsync, file/xxd, lnav, \
              and a C toolchain (gcc/make). Headless chromium is available too. \
@@ -1457,6 +1459,334 @@ impl Tool for EditPresentation {
                 obj.insert("edited".into(), json!({"id": att.id}));
             }
             Ok(out)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// render_excalidraw — Excalidraw scene -> svg/png/pdf via excalirender
+//
+// Two sources, one recipe: the model can pass a `.excalidraw` scene it
+// authored inline (Excalidraw's JSON is well within an LLM's reach), or
+// point at an `.excalidraw`/`.json` file the user uploaded. Either way the
+// bytes land in `/work/diagram.excalidraw` and excalirender (a self-contained
+// binary baked into the image, no network/fonts needed) renders them. SVG is
+// the default — vector output stays crisp on slides and can be embedded into
+// a Typst document with `render_typst`.
+
+#[derive(Deserialize)]
+struct ExcalidrawArgs {
+    /// Inline `.excalidraw` scene JSON authored by the model. Wins over
+    /// `attachment_id` when both are given.
+    #[serde(default)]
+    scene: Option<String>,
+    /// `<turn>/<file>` id of an uploaded `.excalidraw`/`.json` scene to
+    /// convert instead of authoring one inline.
+    #[serde(default)]
+    attachment_id: Option<String>,
+    #[serde(default = "default_excalidraw_format")]
+    format: ImageFormat,
+    #[serde(default)]
+    filename: Option<String>,
+}
+
+fn default_excalidraw_format() -> ImageFormat {
+    ImageFormat::Svg
+}
+
+/// Output formats excalirender (and `render_typst`) can emit. The
+/// extension is inferred by the tool from `-o <name>.<ext>`.
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum ImageFormat {
+    Svg,
+    Png,
+    Pdf,
+}
+
+impl ImageFormat {
+    fn ext(self) -> &'static str {
+        match self {
+            ImageFormat::Svg => "svg",
+            ImageFormat::Png => "png",
+            ImageFormat::Pdf => "pdf",
+        }
+    }
+}
+
+/// An uploaded file we'll treat as an Excalidraw scene: the `.excalidraw`
+/// extension, or a `.json`/json-mime file (Excalidraw scenes are JSON).
+fn is_excalidraw(a: &AttachmentRef) -> bool {
+    let n = a.filename.to_ascii_lowercase();
+    n.ends_with(".excalidraw") || n.ends_with(".json") || a.mime.contains("json")
+}
+
+pub struct RenderExcalidraw(pub Arc<SandboxClient>);
+
+impl Tool for RenderExcalidraw {
+    fn id(&self) -> &str {
+        "render_excalidraw"
+    }
+
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        Some(self.0.loop_timeout())
+    }
+
+    fn schema(&self) -> ToolDef {
+        ToolDef::function(
+            self.id(),
+            "Render an Excalidraw diagram to an image and return it to the \
+             user. Pass `scene` with the `.excalidraw` JSON you authored \
+             (boxes, arrows, text, the hand-drawn sketch style) to GENERATE a \
+             diagram, or `attachment_id` to CONVERT an `.excalidraw`/`.json` \
+             scene the user uploaded. Output `format` is `svg` (default — \
+             vector, best for slides and for embedding into a Typst document \
+             via `render_typst`), `png`, or `pdf`. The rendered file is \
+             attached to your reply. Rendering uses the real Excalidraw \
+             fonts/look and needs no network.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "scene": {
+                        "type": "string",
+                        "description": "The Excalidraw scene as `.excalidraw` JSON \
+                                        (the `{\"type\":\"excalidraw\",\"elements\":[…]}` \
+                                        document). Provide this to generate a diagram. \
+                                        Takes precedence over `attachment_id`."
+                    },
+                    "attachment_id": {
+                        "type": "string",
+                        "description": "`<turn>/<file>` id of an uploaded \
+                                        `.excalidraw`/`.json` scene to convert. \
+                                        Used only when `scene` is omitted."
+                    },
+                    "format": {
+                        "type": "string", "enum": ["svg", "png", "pdf"],
+                        "description": "Output format. Default svg."
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional output filename (extension is set from `format`)."
+                    }
+                }
+            }),
+        )
+    }
+
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let args: ExcalidrawArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::InvalidArgs(format!(
+                    "expected {{scene?, attachment_id?, format?, filename?}}: {e}"
+                ))
+            })?;
+
+            // Resolve the scene bytes from whichever source was given. Inline
+            // `scene` wins; otherwise convert an uploaded file. A model can
+            // produce malformed JSON, so validate before shipping it to the
+            // renderer — a clear InvalidArgs nudges it to fix the scene rather
+            // than puzzling over excalirender's parser error.
+            let (scene_bytes, source): (Vec<u8>, Value) = match args
+                .scene
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(scene) => {
+                    serde_json::from_str::<Value>(scene).map_err(|e| {
+                        ToolError::InvalidArgs(format!(
+                            "`scene` is not valid JSON ({e}); pass a complete .excalidraw document"
+                        ))
+                    })?;
+                    (scene.as_bytes().to_vec(), json!({"from": "scene"}))
+                }
+                None => {
+                    let (att, bytes) = resolve_one_attachment(
+                        &ctx,
+                        args.attachment_id.as_deref(),
+                        "Excalidraw (.excalidraw/.json) scene",
+                        is_excalidraw,
+                    )
+                    .await?;
+                    (bytes, json!({"from": "attachment", "id": att.id}))
+                }
+            };
+
+            let ext = args.format.ext();
+            let stem = filename_stem(args.filename.as_deref(), "diagram");
+            let out = format!("{stem}.{ext}");
+            // The scene rides in as a fixed-name input file (never interpolated
+            // into the command), so its content can't break out into the shell;
+            // only the sanitized output name is templated.
+            let code = format!("set -e\nexcalirender diagram.excalidraw -o {out:?}\n");
+            let req = RunRequest {
+                language: Language::Bash,
+                code,
+                files: vec![InputFile {
+                    name: "diagram.excalidraw".into(),
+                    content_b64: b64::encode(&scene_bytes),
+                }],
+                timeout_secs: None,
+                network: false,
+            };
+            let mut out_val = self.0.execute(&ctx, req).await?;
+            if let Some(obj) = out_val.as_object_mut() {
+                obj.insert("source".into(), source);
+            }
+            Ok(out_val)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// render_typst — compile model-authored Typst (charts, diagrams, decks)
+//
+// The free-form companion to the fixed `typst_<id>` template tools: the model
+// writes the Typst source itself. Two things make this the home for "turn
+// data into a chart" and "put this diagram into a presentation":
+//   - `@preview/gribouille` (a ggplot2-style Grammar-of-Graphics package) is
+//     pre-cached in the image, so the source can `#import` it offline; and
+//   - `attachments` are staged into `/work` first, so the source can
+//     `image("diagram.svg")` a figure produced earlier (e.g. by
+//     `render_excalidraw`) and bake it into the document.
+
+#[derive(Deserialize)]
+struct TypstArgs {
+    /// The Typst document source. May `#import "@preview/gribouille:0.3.0": *`
+    /// for charts and `image("<staged-name>")` any staged attachment.
+    source: String,
+    /// Figures/data to drop into `/work` before compiling, so `source` can
+    /// reference them by name. Use the `name` override to control the
+    /// filename the source must match (e.g. `image("diagram.svg")`).
+    #[serde(default)]
+    attachments: Vec<AttachmentArg>,
+    #[serde(default = "default_typst_format")]
+    format: ImageFormat,
+    #[serde(default)]
+    filename: Option<String>,
+}
+
+fn default_typst_format() -> ImageFormat {
+    ImageFormat::Pdf
+}
+
+pub struct RenderTypst(pub Arc<SandboxClient>);
+
+impl Tool for RenderTypst {
+    fn id(&self) -> &str {
+        "render_typst"
+    }
+
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        Some(self.0.loop_timeout())
+    }
+
+    fn schema(&self) -> ToolDef {
+        ToolDef::function(
+            self.id(),
+            "Compile a Typst document you write and return it to the user — \
+             for charts, diagrams, and slide decks where you control the \
+             layout. Two extras beyond plain Typst: (1) the \
+             `@preview/gribouille` package is available offline for \
+             ggplot2-style Grammar-of-Graphics charts. Its API is \
+             grammar-of-graphics, NOT keyword args — use exactly this shape: \
+             `#import \"@preview/gribouille:0.3.0\": *` then \
+             `#plot(data: <table-or-builtin>, mapping: aes(x: \"col\", y: \"col\"), \
+             layers: (geom-point(),))` (layers is a TUPLE; other geoms: \
+             geom-line, geom-bar, geom-col; `penguins` is a built-in dataset; \
+             read CSV with `csv(\"file.csv\")`). Do NOT write `plot(x: …, geom: …)`. \
+             And (2) files listed in `attachments` are placed in the \
+             working directory first, so your source can `image(\"diagram.svg\")` \
+             a figure produced earlier — e.g. an `.svg` from `render_excalidraw` — \
+             to embed it into a presentation. `format` is `pdf` (default, for \
+             multi-page documents/decks), `png`, or `svg` (single page; use \
+             `pdf` if the document has multiple pages). The result is attached \
+             to your reply. For the company-branded letter/deck templates, use \
+             the dedicated `typst_<template>` tools instead. No network is used.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["source"],
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "The Typst document source to compile."
+                    },
+                    "attachments": {
+                        "type": "array",
+                        "description": "Figures/data to stage into the working directory \
+                                        before compiling, so the source can reference them \
+                                        by name (e.g. an .svg/.png to `image(\"…\")`, or a \
+                                        .csv a gribouille chart reads).",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["id"],
+                            "properties": {
+                                "id": {"type": "string", "description": "Attachment id \
+                                       `<turn>/<file>`."},
+                                "name": {"type": "string", "description": "Filename to give \
+                                         the file in the working directory — match what the \
+                                         source references, e.g. `diagram.svg`."}
+                            }
+                        }
+                    },
+                    "format": {
+                        "type": "string", "enum": ["pdf", "png", "svg"],
+                        "description": "Output format. Default pdf."
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional output filename (extension is set from `format`)."
+                    }
+                }
+            }),
+        )
+    }
+
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let args: TypstArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::InvalidArgs(format!(
+                    "expected {{source, attachments?, format?, filename?}}: {e}"
+                ))
+            })?;
+            if args.source.trim().is_empty() {
+                return Err(ToolError::InvalidArgs("source must be non-empty".into()));
+            }
+
+            // Stage any referenced figures/data into /work first, then add the
+            // source as in.typ (so an explicit attachment named `in.typ` can't
+            // clobber the program — the source is appended last and wins).
+            let Staged {
+                files: staged_files,
+                staged,
+                available,
+                notes,
+            } = stage_attachments(&ctx, &args.attachments).await?;
+            let mut files = staged_files;
+            files.push(InputFile {
+                name: "in.typ".into(),
+                content_b64: b64::encode(args.source.as_bytes()),
+            });
+
+            let ext = args.format.ext();
+            let stem = filename_stem(args.filename.as_deref(), "document");
+            let out = format!("{stem}.{ext}");
+            // Only the sanitized output name is templated; the Typst source
+            // rides in as a file, never interpolated into the command.
+            let code = format!("set -e\ntypst compile in.typ {out:?}\n");
+            let req = RunRequest {
+                language: Language::Bash,
+                code,
+                files,
+                timeout_secs: None,
+                network: false,
+            };
+            let mut out_val = self.0.execute(&ctx, req).await?;
+            augment_with_staging(&mut out_val, staged, available, notes);
+            Ok(out_val)
         })
     }
 }
@@ -2311,5 +2641,129 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(e2, ToolError::InvalidArgs(_)));
+    }
+
+    // --- render_excalidraw / render_typst ---------------------------------
+
+    #[test]
+    fn image_format_ext_maps() {
+        assert_eq!(ImageFormat::Svg.ext(), "svg");
+        assert_eq!(ImageFormat::Png.ext(), "png");
+        assert_eq!(ImageFormat::Pdf.ext(), "pdf");
+    }
+
+    #[test]
+    fn render_excalidraw_schema_defaults_svg_and_needs_no_required() {
+        let tool = RenderExcalidraw(client("http://unused".into()));
+        assert_eq!(tool.id(), "render_excalidraw");
+        let def = tool.schema();
+        let params = serde_json::to_value(&def.function.parameters).unwrap();
+        // Neither source is mandatory (scene OR attachment OR round upload).
+        assert!(params.get("required").is_none() || params["required"] == json!([]));
+        assert_eq!(
+            params["properties"]["format"]["enum"],
+            json!(["svg", "png", "pdf"])
+        );
+        for k in ["scene", "attachment_id", "format", "filename"] {
+            assert!(params["properties"].get(k).is_some(), "missing prop {k}");
+        }
+    }
+
+    #[tokio::test]
+    async fn render_excalidraw_rejects_malformed_scene_before_any_runner_call() {
+        // Invalid JSON must fail fast as InvalidArgs — note the runner URL is
+        // unreachable, so a passing test also proves no HTTP call was made.
+        let tool = RenderExcalidraw(client("http://127.0.0.1:1".into()));
+        let err = tool
+            .run(ctx().await, json!({"scene": "{not json", "format": "png"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(ref m) if m.contains("not valid JSON")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_excalidraw_ships_scene_through_excalirender() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            // The recipe must invoke excalirender on the staged scene and
+            // honour the requested format + filename.
+            .and(wiremock::matchers::body_string_contains(
+                "excalirender diagram.excalidraw",
+            ))
+            .and(wiremock::matchers::body_string_contains("flow.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "exit_code": 0, "stdout": "", "stderr": "",
+                "artifacts": [], "duration_ms": 5, "timed_out": false
+            })))
+            .mount(&server)
+            .await;
+        let tool = RenderExcalidraw(client(server.uri()));
+        let out = tool
+            .run(
+                ctx().await,
+                json!({
+                    "scene": "{\"type\":\"excalidraw\",\"elements\":[]}",
+                    "format": "png",
+                    "filename": "flow"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["exit_code"], 0);
+        assert_eq!(out["source"], json!({"from": "scene"}));
+    }
+
+    #[test]
+    fn render_typst_schema_requires_source_and_lists_formats() {
+        let tool = RenderTypst(client("http://unused".into()));
+        assert_eq!(tool.id(), "render_typst");
+        let def = tool.schema();
+        let params = serde_json::to_value(&def.function.parameters).unwrap();
+        assert_eq!(params["required"], json!(["source"]));
+        assert_eq!(
+            params["properties"]["format"]["enum"],
+            json!(["pdf", "png", "svg"])
+        );
+        assert!(params["properties"].get("attachments").is_some());
+    }
+
+    #[tokio::test]
+    async fn render_typst_rejects_empty_source() {
+        let tool = RenderTypst(client("http://127.0.0.1:1".into()));
+        let err = tool
+            .run(ctx().await, json!({"source": "   "}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn render_typst_compiles_source_to_requested_format() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .and(wiremock::matchers::body_string_contains(
+                "typst compile in.typ",
+            ))
+            .and(wiremock::matchers::body_string_contains("document.svg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "exit_code": 0, "stdout": "", "stderr": "",
+                "artifacts": [], "duration_ms": 7, "timed_out": false
+            })))
+            .mount(&server)
+            .await;
+        let tool = RenderTypst(client(server.uri()));
+        let out = tool
+            .run(
+                ctx().await,
+                json!({"source": "#set page(width: auto)\n= Hi", "format": "svg"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["exit_code"], 0);
     }
 }

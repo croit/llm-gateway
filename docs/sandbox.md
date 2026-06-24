@@ -12,6 +12,8 @@ conversation. It's exposed as these tools:
 | `capture_webpage` | Headless-chromium screenshot / PDF / text of a URL (needs egress). |
 | `convert_document` | Convert an uploaded file (pptx/docx/xlsx/odf/pdf) to PDF / DOCX / TXT / HTML / per-slide images via LibreOffice. |
 | `edit_presentation` | Modify an uploaded `.pptx` with python-pptx (`input.pptx` → `output.pptx`). |
+| `render_excalidraw` | Render an Excalidraw scene (model-authored or uploaded `.excalidraw`/`.json`) to SVG / PNG / PDF via excalirender. |
+| `render_typst` | Compile model-authored Typst (ggplot-style charts via `@preview/gribouille`; can `image()` a staged figure to embed it) to PDF / PNG / SVG. |
 
 ### Working on uploaded files
 
@@ -101,8 +103,10 @@ handle office files, and convert formats without runtime network:
   reportlab, img2pdf.
 - **Images/OCR/media:** ffmpeg, imagemagick (PDF/PS coders enabled), libvips,
   pillow, opencv, **tesseract OCR** (eng+deu) via pytesseract.
-- **Docs/diagrams:** pandoc, typst, weasyprint, markdown, **graphviz**; Latin +
-  CJK + emoji fonts.
+- **Docs/diagrams:** pandoc, typst (0.15, with the offline-cached
+  `@preview/gribouille` ggplot-style charts package + its cetz backend),
+  **excalirender** (`.excalidraw` → svg/png/pdf, bundles its own fonts),
+  weasyprint, markdown, **graphviz**; Latin + CJK + emoji fonts.
 - **Networking:** **tshark/tcpdump** + scapy/dpkt to read `.pcap`/`.pcapng`;
   curl/wget, dig, rsync, openssl, netcat, iproute2 (egress gated by the proxy
   allowlist).
@@ -141,7 +145,7 @@ reachable (it's arbitrary-code-execution as a service).
 | Path | What |
 |---|---|
 | `crates/sandbox-runner/` | The runner service (warm pool, podman + OCI-runtime orchestration, `/run` API). |
-| `crates/gateway/src/server/tools/sandbox.rs` | The three gateway tools. |
+| `crates/gateway/src/server/tools/sandbox.rs` | The gateway sandbox tools. |
 | `crates/shared/src/sandbox.rs` | The runner↔gateway wire contract. |
 | `sandbox-image/` | The gold workload image (`Containerfile` + `sandbox-agent`). |
 | `deploy/sandbox-runner/Containerfile` | The runner image — built by CI; the host runner binary is extracted from it. |
@@ -438,8 +442,8 @@ Everything is file-tunable; nothing is hardcoded.
 
 Per-tool and per-user/-token control is the **existing** mechanism: each tool
 (`run_in_sandbox`, `generate_document`, `capture_webpage`, `convert_document`,
-`edit_presentation`) is RBAC-granted per role and toggleable per user/token on
-the `/tools` page — default-off.
+`edit_presentation`, `render_excalidraw`, `render_typst`) is RBAC-granted per
+role and toggleable per user/token on the `/tools` page — default-off.
 
 **Runner** — environment variables (set as `Environment=` lines in
 `deploy/sandbox/sandbox-runner.service`; see `crates/sandbox-runner/src/config.rs`):

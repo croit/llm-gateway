@@ -22,7 +22,7 @@ node = "24"
 # mise's registry (aqua → GitHub releases), so platform detection
 # is mise's problem. `mise run fetch-typst-cli` then copies the
 # installed binary into target/release/typst for the runtime image.
-typst = "0.14.2"
+typst = "0.15.0"
 
 [env]
 RUST_BACKTRACE = "1"

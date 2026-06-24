@@ -165,9 +165,12 @@ fn category_for(tool_id: &str) -> Category {
         | "wikipedia" => Category::Web,
         "fetch_attachment" | "upload_attachment" | "read_skill" => Category::Documents,
         "rag_search" | "rag_list_collections" => Category::Knowledge,
-        "run_in_sandbox" | "generate_document" | "capture_webpage" | "read_sandbox_output" => {
-            Category::Code
-        }
+        "run_in_sandbox"
+        | "generate_document"
+        | "capture_webpage"
+        | "read_sandbox_output"
+        | "render_excalidraw"
+        | "render_typst" => Category::Code,
         _ if tool_id.starts_with(TYPST_PREFIX) => Category::Documents,
         _ if DOCUMENT_IDS.contains(&tool_id) => Category::Documents,
         "remember" | "recall" => Category::Memory,
@@ -297,6 +300,17 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Read large sandbox output",
             "Lets the assistant grep or page through a large result a previous sandbox \
              run produced, without pulling the whole thing back into the conversation.",
+        ),
+        "render_excalidraw" => (
+            "Diagram rendering",
+            "Lets the assistant turn an Excalidraw diagram — one it draws, or one you \
+             upload — into an SVG, PNG, or PDF you can download or drop into slides.",
+        ),
+        "render_typst" => (
+            "Charts & Typst documents",
+            "Lets the assistant write a Typst document — ggplot-style charts, diagrams, or \
+             slide decks, and embed images it made earlier — and hand you the finished \
+             PDF, PNG, or SVG.",
         ),
         _ => return None,
     };

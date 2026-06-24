@@ -158,7 +158,8 @@ async fn main() -> anyhow::Result<()> {
                         .with(srv::tools::typst_render::TypstEditTool::new(
                             t.clone(),
                             sandbox_client.clone(),
-                        ));
+                        ))
+                        .with(srv::tools::typst_render::TypstReadTool::new(t.clone()));
                     if let (true, Some(sb)) = (pptx, sandbox_client.clone()) {
                         tool_registry = tool_registry
                             .with(srv::tools::typst_render::TypstPptxTool::new(t.clone(), sb));
@@ -210,7 +211,9 @@ async fn main() -> anyhow::Result<()> {
                 .with(srv::tools::sandbox::ExportDocument(client.clone()))
                 .with(srv::tools::sandbox::CaptureWebpage(client.clone()))
                 .with(srv::tools::sandbox::ConvertDocument(client.clone()))
-                .with(srv::tools::sandbox::EditPresentation(client))
+                .with(srv::tools::sandbox::EditPresentation(client.clone()))
+                .with(srv::tools::sandbox::RenderExcalidraw(client.clone()))
+                .with(srv::tools::sandbox::RenderTypst(client))
                 .with(srv::tools::sandbox::ReadSandboxOutput);
             tracing::info!(runner = %sandbox_cfg.runner_url, "registered sandbox tools");
         }

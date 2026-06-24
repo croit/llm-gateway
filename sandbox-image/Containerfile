@@ -5,7 +5,8 @@
 #
 # Goal: a batteries-included environment so the model can act like a
 # capable system engineer — debug large (and compressed) log files, work
-# with office documents, and convert between the common file formats —
+# with office documents, convert between the common file formats, and
+# generate diagrams (excalirender) and charts (Typst + gribouille) —
 # without needing network access at runtime. The isolation is the OCI
 # runtime it runs under (gVisor/runsc in production); the SAME image runs
 # unchanged under any OCI runtime (runsc/crun/runc). The `sandbox-runner`
@@ -24,7 +25,13 @@ FROM debian:trixie-slim
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/pw
+    PLAYWRIGHT_BROWSERS_PATH=/opt/pw \
+    # Pin the Typst package cache to a shared, world-readable path so the
+    # build (running as root) downloads packages into the SAME directory the
+    # runtime (the unprivileged `sandbox` user) reads them from. This is what
+    # makes the pre-warmed `@preview/gribouille` (+ its cetz backend) resolve
+    # with NO network at runtime — see the diagram/chart layer below.
+    TYPST_PACKAGE_CACHE_PATH=/opt/typst-packages
 
 # --- System packages -------------------------------------------------------
 # Grouped by purpose; --no-install-recommends keeps the (already large)
@@ -122,7 +129,7 @@ RUN printf '= Warm up\n\nPre-fetching the typst-ts-cli helper.\n' > /tmp/warm.ty
 # BuildKit (amd64 / arm64), so the image builds natively on both. duckdb/yq
 # track latest; pin the URLs if you need fully reproducible builds.
 ARG TARGETARCH
-ARG TYPST_VERSION=v0.13.1
+ARG TYPST_VERSION=v0.15.0
 RUN set -eux; \
     case "${TARGETARCH:-amd64}" in \
         amd64) typst_arch=x86_64;  dl_arch=amd64 ;; \
@@ -138,6 +145,35 @@ RUN set -eux; \
     rm /tmp/duckdb.zip; \
     curl -fsSL -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${dl_arch}"; \
     chmod 0755 /usr/local/bin/yq
+
+# --- Diagram + chart rendering (offline-capable) ---------------------------
+# Two additions for "generate a diagram/chart and hand it back, or embed it
+# in a Typst document":
+#
+#   * excalirender — converts an `.excalidraw` scene (which the model is good
+#     at authoring) to SVG/PNG/PDF. A self-contained binary that bundles its
+#     own libraries AND the hand-drawn Excalifont, so it needs no system deps
+#     or network at runtime. `PREFIX=/usr/local` lands the launcher at
+#     /usr/local/bin/excalirender (on the sandbox user's PATH).
+#
+#   * gribouille — a Grammar-of-Graphics (ggplot2-style) chart package for
+#     Typst. Typst caches a package on first import and never re-downloads it,
+#     so we render a real plot HERE (network available at build) to pull the
+#     whole closure — gribouille + its cetz backend — into
+#     $TYPST_PACKAGE_CACHE_PATH. At runtime the sandbox is offline; reading an
+#     already-cached package needs no network. Same trick as the typ2pptx
+#     helper warm-up above. The compile is intentionally NOT `|| true`: a
+#     broken warm-up must fail the BUILD loudly rather than leave gribouille
+#     unresolvable at runtime.
+RUN set -eux; \
+    curl -fsSL https://raw.githubusercontent.com/JonRC/excalirender/main/install.sh \
+        | PREFIX=/usr/local sh; \
+    excalirender --version; \
+    printf '#import "@preview/gribouille:0.3.0": *\n#plot(\n  data: penguins,\n  mapping: aes(x: "flipper-len", y: "body-mass"),\n  layers: (geom-point(),),\n)\n' \
+        > /tmp/warm-chart.typ; \
+    typst compile /tmp/warm-chart.typ /tmp/warm-chart.pdf; \
+    rm -f /tmp/warm-chart.typ /tmp/warm-chart.pdf; \
+    chmod -R a+rX /opt/typst-packages /usr/local/lib/excalirender
 
 # --- Agent + runtime user --------------------------------------------------
 # The job marshaller the runner pipes RunRequest/RunResponse through.
