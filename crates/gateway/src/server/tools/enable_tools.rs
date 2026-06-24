@@ -279,6 +279,15 @@ fn target_for_key(key: &str) -> EnableTarget {
             "Web page capture",
             "screenshot, PDF, or extract the text of a web page via a headless browser",
         ),
+        "convert_document" => (
+            "Convert uploaded file",
+            "convert an uploaded file (PowerPoint/Word/Excel/PDF) to PDF, Word, text, \
+             HTML, or per-slide images",
+        ),
+        "edit_presentation" => (
+            "Edit PowerPoint",
+            "modify an uploaded PowerPoint (.pptx) deck with python-pptx",
+        ),
         "read_sandbox_output" => (
             "Read large sandbox output",
             "grep or page through a previous sandbox run's large output",

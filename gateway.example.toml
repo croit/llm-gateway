@@ -254,9 +254,14 @@ weight = 1
 # update_token_env = "IP2LOCATION_TOKEN"
 
 # ---- Code-execution sandbox ------------------------------------------------
-# Registers the `run_in_sandbox`, `generate_document`, and `capture_webpage`
-# tools, which let the model run Python/shell, build documents, and capture
-# web pages inside a single-use, strongly-isolated sandbox. The heavy lifting
+# Registers the `run_in_sandbox`, `generate_document`, `capture_webpage`,
+# `convert_document`, and `edit_presentation` tools, which let the model run
+# Python/shell, build documents, capture web pages, and work on files the user
+# uploaded (convert a deck to PDF/images, edit a .pptx via python-pptx) inside a
+# single-use, strongly-isolated sandbox. Uploaded files reach the sandbox
+# server-side: the current turn's uploads are staged into the working directory
+# automatically, and the model can pull in files from earlier in the
+# conversation by attachment id (needs `[chat.s3]`). The heavy lifting
 # (gVisor isolation, warm pool, default-deny egress allowlist) lives in
 # the separate `sandbox-runner` service — see docs/sandbox.md for the full
 # setup (gVisor install, Quadlets, egress proxy). With no `[sandbox]` block the

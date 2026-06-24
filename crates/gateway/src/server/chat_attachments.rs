@@ -206,6 +206,134 @@ pub async fn fetch(
     })
 }
 
+/// One attachment discovered in a session's turns, addressed by the
+/// same opaque `<turn_id>/<filename>` id the model sees in replay
+/// stubs. Produced by [`list_session_attachments`] / [`round_attachments`]
+/// so the sandbox tools can stage uploaded files into `/work` and
+/// advertise what else is reachable by id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentRef {
+    /// `<turn_id>/<filename>` — the id the model passes to pull this file.
+    pub id: String,
+    pub turn_id: String,
+    pub filename: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+/// The opaque `<turn_id>/<filename>` id for a marker. Files are keyed
+/// in S3 under the turn whose row carries the marker, so the id is the
+/// owning turn id plus the marker's (raw, un-encoded) filename — the
+/// same shape `fetch_attachment` splits back apart.
+fn marker_id(turn_id: &str, att: &ParsedAttachment) -> String {
+    format!("{turn_id}/{}", att.filename)
+}
+
+/// Parse the markers in one column into [`AttachmentRef`]s under
+/// `turn_id`, appending to `out` and skipping ids already present (a
+/// preview marker and the file it links to can both appear).
+fn collect_markers(out: &mut Vec<AttachmentRef>, turn_id: &str, text: &str) {
+    for att in parse_markers(text) {
+        let id = marker_id(turn_id, &att);
+        if out.iter().any(|r: &AttachmentRef| r.id == id) {
+            continue;
+        }
+        out.push(AttachmentRef {
+            id,
+            turn_id: turn_id.to_string(),
+            filename: att.filename,
+            mime: att.mime,
+            size: att.size,
+        });
+    }
+}
+
+/// All attachments referenced anywhere in `turns`, addressed by opaque
+/// id. Walks both marker-bearing columns: user uploads land in a user
+/// turn's `user_content`, tool-produced files (typst, sandbox, …) land
+/// in an assistant turn's `content`.
+fn collect_all(turns: &[chat_db::TurnWithTools]) -> Vec<AttachmentRef> {
+    let mut out = Vec::new();
+    for t in turns {
+        for text in [t.turn.user_content.as_deref(), t.turn.content.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            collect_markers(&mut out, &t.turn.id, text);
+        }
+    }
+    out
+}
+
+/// The current round's uploads: the most recent `user`-role turn's
+/// `user_content` markers (empty if it carried none).
+fn collect_round(turns: &[chat_db::TurnWithTools]) -> Vec<AttachmentRef> {
+    let Some(t) = turns
+        .iter()
+        .rev()
+        .find(|t| t.turn.role == chat_db::TurnRole::User)
+    else {
+        return Vec::new();
+    };
+    let Some(text) = t.turn.user_content.as_deref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_markers(&mut out, &t.turn.id, text);
+    out
+}
+
+async fn session_turns(
+    db: &chat_db::Pool,
+    session_id: &str,
+) -> Result<Vec<chat_db::TurnWithTools>, AttachmentError> {
+    chat_db::list_turns(db, session_id)
+        .await
+        .map_err(|e| AttachmentError::Client(S3Error::Io(std::io::Error::other(e.to_string()))))
+}
+
+/// Every attachment referenced anywhere in a session's turns. The
+/// returned ids are session-scoped by construction — only this
+/// session's turns are read — so callers can treat presence in this
+/// list as proof a given id belongs to the session.
+pub async fn list_session_attachments(
+    db: &chat_db::Pool,
+    session_id: &str,
+) -> Result<Vec<AttachmentRef>, AttachmentError> {
+    Ok(collect_all(&session_turns(db, session_id).await?))
+}
+
+/// The current round's uploaded files: the attachments on the most
+/// recent `user`-role turn. This is what a just-sent message carried —
+/// the files the user most likely wants the model to work on — and it's
+/// the same target whether the turn was a fresh send, a retry, or an
+/// edit (all leave the relevant user turn as the latest one).
+pub async fn round_attachments(
+    db: &chat_db::Pool,
+    session_id: &str,
+) -> Result<Vec<AttachmentRef>, AttachmentError> {
+    Ok(collect_round(&session_turns(db, session_id).await?))
+}
+
+/// Both views in one query: every session attachment plus the current
+/// round's subset. The hot `run_in_sandbox` staging path needs both, so
+/// this avoids walking the session's turns twice.
+pub async fn session_and_round_attachments(
+    db: &chat_db::Pool,
+    session_id: &str,
+) -> Result<(Vec<AttachmentRef>, Vec<AttachmentRef>), AttachmentError> {
+    let turns = session_turns(db, session_id).await?;
+    Ok((collect_all(&turns), collect_round(&turns)))
+}
+
+/// Whether `id` names an attachment present in the enumerated session
+/// set. The session enumeration only reads this session's turns, so a
+/// hit proves the id belongs to the caller's conversation — the gate
+/// the sandbox tools apply before fetching a model-supplied id.
+pub fn attachment_in_session(session: &[AttachmentRef], id: &str) -> bool {
+    session.iter().any(|a| a.id == id)
+}
+
 /// Three-way classification of bytes-with-a-mime, shared between
 /// `fetch_attachment` and `fetch_url`. The model sees one of three
 /// shapes regardless of which tool produced the bytes:
@@ -590,6 +718,115 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    /// Seed one turn with explicit role/seq and column contents.
+    /// `user_content` carries user-upload markers; `content` carries
+    /// tool-produced markers — the same split the live code uses.
+    async fn seed_turn_full(
+        pool: &chat_db::Pool,
+        turn_id: &str,
+        seq: i64,
+        role: &str,
+        user_content: Option<&str>,
+        content: Option<&str>,
+    ) {
+        sqlx::query(
+            r#"INSERT INTO users (id, email, created_at, updated_at)
+               VALUES ('u1', 'u1@example.com', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+               ON CONFLICT(id) DO NOTHING"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO chat_sessions (id, user_id, created_at, updated_at)
+               VALUES ('s1', 'u1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+               ON CONFLICT(id) DO NOTHING"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO chat_turns
+                 (id, session_id, seq, role, user_content, content, status, created_at)
+               VALUES (?, 's1', ?, ?, ?, ?, 'completed', '2026-01-01T00:00:00Z')"#,
+        )
+        .bind(turn_id)
+        .bind(seq)
+        .bind(role)
+        .bind(user_content)
+        .bind(content)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn marker_for(turn_id: &str, filename: &str, mime: &str, size: u64) -> String {
+        marker_line(
+            turn_id,
+            &UploadOutcome {
+                filename: filename.into(),
+                mime: mime.into(),
+                bytes: size,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn list_session_attachments_reads_both_columns_and_dedupes() {
+        let pool = crate::server::db::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        // User turn: an upload in `user_content`.
+        let user_marker = marker_for("t-user", "deck.pptx", "application/vnd.ms-powerpoint", 1234);
+        seed_turn_full(&pool, "t-user", 0, "user", Some(&user_marker), None).await;
+        // Assistant turn: a produced file in `content`, listed twice
+        // (a dupe id must collapse to one entry).
+        let prod = marker_for("t-asst", "chart.png", "image/png", 99);
+        let content = format!("{prod}\n\n{prod}");
+        seed_turn_full(&pool, "t-asst", 1, "assistant", None, Some(&content)).await;
+
+        let atts = list_session_attachments(&pool, "s1").await.unwrap();
+        let ids: Vec<&str> = atts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["t-user/deck.pptx", "t-asst/chart.png"],
+            "{atts:?}"
+        );
+        let deck = atts.iter().find(|a| a.filename == "deck.pptx").unwrap();
+        assert_eq!(deck.turn_id, "t-user");
+        assert_eq!(deck.size, 1234);
+        assert!(attachment_in_session(&atts, "t-user/deck.pptx"));
+        assert!(!attachment_in_session(&atts, "t-other/secret.pptx"));
+    }
+
+    #[tokio::test]
+    async fn round_attachments_picks_latest_user_turn() {
+        let pool = crate::server::db::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        // An older user turn with a file, then a newer user turn with a
+        // different file. The round = the newest user turn's uploads.
+        let old = marker_for("t-u1", "old.pptx", "application/vnd.ms-powerpoint", 1);
+        seed_turn_full(&pool, "t-u1", 0, "user", Some(&old), None).await;
+        seed_turn_full(&pool, "t-a1", 1, "assistant", None, None).await;
+        let new = marker_for("t-u2", "new.pptx", "application/vnd.ms-powerpoint", 2);
+        seed_turn_full(&pool, "t-u2", 2, "user", Some(&new), None).await;
+
+        let round = round_attachments(&pool, "s1").await.unwrap();
+        let ids: Vec<&str> = round.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["t-u2/new.pptx"], "{round:?}");
+    }
+
+    #[tokio::test]
+    async fn round_attachments_empty_when_latest_user_turn_has_no_files() {
+        let pool = crate::server::db::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        seed_turn_full(&pool, "t-u1", 0, "user", Some("just text, no files"), None).await;
+        let round = round_attachments(&pool, "s1").await.unwrap();
+        assert!(round.is_empty(), "{round:?}");
     }
 
     #[tokio::test]

@@ -3,13 +3,31 @@
 The gateway can let the chat model **run code** — Python, shell, document
 generation, headless-browser capture — inside a strongly isolated, single-use
 gVisor sandbox, and return the results (stdout/stderr + produced files) into the
-conversation. It's exposed as three tools:
+conversation. It's exposed as these tools:
 
 | Tool | What it does |
 |---|---|
 | `run_in_sandbox` | Run arbitrary Python or shell; returns stdout/stderr + any files written. |
 | `generate_document` | Markdown → PDF / DOCX / PPTX via pandoc (a safe preset). |
 | `capture_webpage` | Headless-chromium screenshot / PDF / text of a URL (needs egress). |
+| `convert_document` | Convert an uploaded file (pptx/docx/xlsx/odf/pdf) to PDF / DOCX / TXT / HTML / per-slide images via LibreOffice. |
+| `edit_presentation` | Modify an uploaded `.pptx` with python-pptx (`input.pptx` → `output.pptx`). |
+
+### Working on uploaded files
+
+`convert_document` / `edit_presentation` — and `run_in_sandbox` itself — can
+operate on files the user uploaded. The model never holds the bytes, so the
+gateway bridges them in server-side: the **current turn's uploads are staged
+into the sandbox working directory automatically** (under their original
+names), and the model can pull in a file from **earlier in the conversation**
+by passing its attachment id (`<turn>/<file>`, from an `[attached …]` stub) —
+`run_in_sandbox` takes an `attachments: [{id}]` array, the presets take an
+`attachment_id`. Resolution is scoped to the caller's own chat session, and a
+per-run input budget (50 MiB) bounds what gets staged. Because each run is
+single-use (no `/work` persistence between calls), multi-file work must happen
+in **one** call — the staging assembles every needed input up front. On the
+`/v1` API path there's no session and no S3-backed upload, so staging is a
+no-op there and the tools fall back to inline text inputs.
 
 ## Why two services
 
@@ -419,8 +437,9 @@ Everything is file-tunable; nothing is hardcoded.
 | `max_artifact_bytes` | `26214400` (25 MiB) | Largest produced file accepted back; larger ones are reported as dropped. |
 
 Per-tool and per-user/-token control is the **existing** mechanism: each tool
-(`run_in_sandbox`, `generate_document`, `capture_webpage`) is RBAC-granted per
-role and toggleable per user/token on the `/tools` page — default-off.
+(`run_in_sandbox`, `generate_document`, `capture_webpage`, `convert_document`,
+`edit_presentation`) is RBAC-granted per role and toggleable per user/token on
+the `/tools` page — default-off.
 
 **Runner** — environment variables (set as `Environment=` lines in
 `deploy/sandbox/sandbox-runner.service`; see `crates/sandbox-runner/src/config.rs`):

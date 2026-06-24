@@ -199,7 +199,9 @@ async fn main() -> anyhow::Result<()> {
             tool_registry = tool_registry
                 .with(srv::tools::sandbox::RunInSandbox(client.clone()))
                 .with(srv::tools::sandbox::GenerateDocument(client.clone()))
-                .with(srv::tools::sandbox::CaptureWebpage(client))
+                .with(srv::tools::sandbox::CaptureWebpage(client.clone()))
+                .with(srv::tools::sandbox::ConvertDocument(client.clone()))
+                .with(srv::tools::sandbox::EditPresentation(client))
                 .with(srv::tools::sandbox::ReadSandboxOutput);
             tracing::info!(runner = %sandbox_cfg.runner_url, "registered sandbox tools");
         }

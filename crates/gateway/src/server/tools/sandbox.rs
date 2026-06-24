@@ -34,7 +34,7 @@ use shared::api::ToolDef;
 use shared::sandbox::{Artifact, InputFile, Language, RunError, RunRequest, RunResponse};
 
 use super::{Tool, ToolContext, ToolError, ToolFuture};
-use crate::server::chat_attachments;
+use crate::server::chat_attachments::{self, AttachmentRef};
 use crate::server::config::SandboxConfig;
 
 /// Shared HTTP client + config for the sandbox tool family. Held behind an
@@ -356,6 +356,215 @@ fn urlencode_segment(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Attachment staging: pull uploaded chat files into a run's /work.
+//
+// The model never holds an uploaded file's bytes, so it can't base64
+// them into a tool call. Instead the gateway resolves attachment ids
+// server-side (scoped to the caller's session) and materializes the
+// bytes as binary `InputFile`s. Two sources combine:
+//   - the current round's uploads, staged automatically (the common
+//     "here's a deck, do X" case); and
+//   - any other session attachment the model names by id.
+// Chat-path only — the proxy/`/v1` path has no session and no S3-backed
+// uploads, so staging is a no-op there (the tool still runs with any
+// inline text files).
+
+/// Total bytes of staged attachments allowed into one run's `/work`.
+/// Bounds the (base64-inflated) request payload and the runner's disk;
+/// files past the budget are skipped with a note rather than silently
+/// dropping the model's inputs.
+const STAGE_TOTAL_MAX_BYTES: usize = 50 * 1024 * 1024;
+
+/// A file the model asked to pull into the run by attachment id.
+#[derive(Deserialize)]
+struct AttachmentArg {
+    /// `<turn_id>/<filename>` from an attachment replay stub.
+    id: String,
+    /// Optional override for the name the file gets in `/work`
+    /// (defaults to the attachment's own filename).
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// One resolved file ready to drop into `/work`: its desired name, the
+/// id it came from, and the raw bytes. The unit [`assemble_inputs`]
+/// consumes — kept separate from the S3 fetch so the dedup/budget
+/// logic is pure and unit-testable.
+struct StageItem {
+    name: String,
+    id: String,
+    bytes: Vec<u8>,
+}
+
+/// Everything staging produced for one run.
+struct Staged {
+    /// Binary inputs to prepend to the run's `files`.
+    files: Vec<InputFile>,
+    /// `[{name, id, size}]` — what actually landed in `/work`.
+    staged: Vec<Value>,
+    /// `[{id, filename, mime, size}]` — other session attachments the
+    /// model can pull in by id on a follow-up run.
+    available: Vec<Value>,
+    /// Human-readable notes (skips, renames) surfaced to the model.
+    notes: Vec<String>,
+}
+
+/// Pure assembler: dedup names against `/work`, enforce the byte budget,
+/// base64 each kept file. Skips (budget) and renames (collision) become
+/// notes. No I/O — the caller fetches bytes first.
+fn assemble_inputs(
+    items: Vec<StageItem>,
+    budget: usize,
+) -> (Vec<InputFile>, Vec<Value>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut staged = Vec::new();
+    let mut notes = Vec::new();
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut total: usize = 0;
+    for item in items {
+        let size = item.bytes.len();
+        if total.saturating_add(size) > budget {
+            notes.push(format!(
+                "Skipped staging `{}` ({size} bytes): the {budget}-byte input budget for this \
+                 run would be exceeded. Work on fewer/smaller files per run.",
+                item.name,
+            ));
+            continue;
+        }
+        let name = session_core::attachments::dedupe_filename_against(&used, &item.name);
+        if name != item.name {
+            notes.push(format!(
+                "Staged `{}` as `{name}` to avoid a filename collision in /work.",
+                item.name,
+            ));
+        }
+        used.insert(name.clone());
+        total += size;
+        files.push(InputFile {
+            name: name.clone(),
+            content_b64: b64::encode(&item.bytes),
+        });
+        staged.push(json!({"name": name, "id": item.id, "size": size}));
+    }
+    (files, staged, notes)
+}
+
+/// Resolve + fetch the round's uploads (always) plus any model-named ids
+/// (validated against the session), and assemble them for `/work`.
+/// Returns an empty [`Staged`] on paths without a session (`/v1`).
+async fn stage_attachments(
+    ctx: &ToolContext,
+    explicit: &[AttachmentArg],
+) -> Result<Staged, ToolError> {
+    let empty = || Staged {
+        files: vec![],
+        staged: vec![],
+        available: vec![],
+        notes: vec![],
+    };
+    let (Some(session_id), Some(s3)) = (ctx.session_id.as_deref(), ctx.s3.as_ref()) else {
+        // No session (proxy/`/v1`) or no attachment storage configured:
+        // nothing to stage. If the model named ids anyway, say why they
+        // were ignored rather than failing the whole run.
+        if explicit.is_empty() {
+            return Ok(empty());
+        }
+        let mut s = empty();
+        s.notes.push(
+            "Attachments can't be staged on this path (no chat session / attachment storage). \
+             Ran without them."
+                .into(),
+        );
+        return Ok(s);
+    };
+
+    let (session_atts, round) =
+        chat_attachments::session_and_round_attachments(&ctx.db, session_id)
+            .await
+            .map_err(|e| ToolError::Failed(format!("listing session attachments: {e}")))?;
+
+    // Build the to-stage list: round uploads first, then explicit ids.
+    // De-dupe by id so a file named explicitly *and* in the round is
+    // staged once. `desired` is the explicit `name` override or the
+    // attachment's own filename.
+    let mut want: Vec<(String, Option<String>)> = Vec::new(); // (id, name-override)
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for a in &round {
+        if seen_ids.insert(a.id.clone()) {
+            want.push((a.id.clone(), None));
+        }
+    }
+    let mut notes: Vec<String> = Vec::new();
+    for arg in explicit {
+        if !chat_attachments::attachment_in_session(&session_atts, &arg.id) {
+            notes.push(format!(
+                "Ignored attachment id `{}`: not found in this conversation.",
+                arg.id,
+            ));
+            continue;
+        }
+        if seen_ids.insert(arg.id.clone()) {
+            want.push((arg.id.clone(), arg.name.clone()));
+        } else if let Some(n) = &arg.name {
+            // Already queued (it's a round file); honor a rename request.
+            if let Some(slot) = want.iter_mut().find(|(id, _)| id == &arg.id) {
+                slot.1 = Some(n.clone());
+            }
+        }
+    }
+
+    // Fetch bytes for each wanted id and turn into StageItems.
+    let mut items: Vec<StageItem> = Vec::new();
+    for (id, name_override) in &want {
+        let meta = session_atts.iter().find(|a| &a.id == id);
+        let desired = match name_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(n) => sanitize_filename(n).ok_or_else(|| {
+                ToolError::InvalidArgs(format!("attachment name `{n}` is not a valid filename"))
+            })?,
+            None => meta
+                .map(|a| a.filename.clone())
+                .unwrap_or_else(|| id.rsplit('/').next().unwrap_or("file").to_string()),
+        };
+        // `id` is `<turn>/<filename>`; fetch by those parts.
+        let (turn, filename) = id
+            .split_once('/')
+            .ok_or_else(|| ToolError::Failed(format!("malformed attachment id `{id}`")))?;
+        match chat_attachments::fetch(s3, turn, filename).await {
+            Ok(f) => items.push(StageItem {
+                name: desired,
+                id: id.clone(),
+                bytes: f.bytes,
+            }),
+            Err(e) => notes.push(format!("Could not fetch attachment `{id}`: {e}")),
+        }
+    }
+
+    let (files, staged, mut asm_notes) = assemble_inputs(items, STAGE_TOTAL_MAX_BYTES);
+    notes.append(&mut asm_notes);
+
+    // Advertise session files that weren't staged this run, so the model
+    // knows what else it can pull by id.
+    let staged_ids: std::collections::HashSet<&str> =
+        staged.iter().filter_map(|s| s["id"].as_str()).collect();
+    let available: Vec<Value> = session_atts
+        .iter()
+        .filter(|a| !staged_ids.contains(a.id.as_str()))
+        .map(|a| json!({"id": a.id, "filename": a.filename, "mime": a.mime, "size": a.size}))
+        .collect();
+
+    Ok(Staged {
+        files,
+        staged,
+        available,
+        notes,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Generic tool: run_in_sandbox
 
 #[derive(Deserialize)]
@@ -365,7 +574,31 @@ struct RunArgs {
     #[serde(default)]
     files: Vec<TextFile>,
     #[serde(default)]
+    attachments: Vec<AttachmentArg>,
+    #[serde(default)]
     network: bool,
+}
+
+/// Splice staging metadata into a sandbox result so the model knows
+/// what files landed in `/work` and what else it can pull by id.
+fn augment_with_staging(
+    out: &mut Value,
+    staged: Vec<Value>,
+    available: Vec<Value>,
+    notes: Vec<String>,
+) {
+    let Some(obj) = out.as_object_mut() else {
+        return;
+    };
+    if !staged.is_empty() {
+        obj.insert("staged_files".into(), json!(staged));
+    }
+    if !available.is_empty() {
+        obj.insert("available_attachments".into(), json!(available));
+    }
+    if !notes.is_empty() {
+        obj.insert("attachment_notes".into(), json!(notes));
+    }
 }
 
 /// A small UTF-8 text input file the model wants in `/work` (e.g. a CSV
@@ -424,7 +657,17 @@ impl Tool for RunInSandbox {
              ghostscript/qpdf, poppler-utils (pdftotext/pdftoppm), \
              gzip/zstd/xz/bzip2/7z, git, curl/wget, dig/rsync, file/xxd, lnav, \
              and a C toolchain (gcc/make). Headless chromium is available too. \
-             Each call starts clean — nothing persists between calls. Network \
+             Each call starts clean — nothing persists between calls, so do \
+             all the work for one job (combine/compare several files, \
+             multi-step pipelines) in a SINGLE call rather than spreading it \
+             across calls. Files a user uploaded this turn are ALREADY waiting \
+             in the working directory under their original names — just open \
+             them. To also work on a file from earlier in the conversation, \
+             pass its id (from an `[attached … id=\"<turn>/<file>\"]` stub) in \
+             `attachments`; it gets fetched into the working directory too. \
+             The result's `staged_files` lists what's in the directory and \
+             `available_attachments` lists other files you can pull in by id. \
+             Network \
              is OFF unless you set `network: true` (and the operator enabled \
              egress); without it pip install and web access fail. Write files \
              to the current working directory to return them to the user. \
@@ -462,6 +705,27 @@ impl Tool for RunInSandbox {
                             }
                         }
                     },
+                    "attachments": {
+                        "type": "array",
+                        "description": "Optional chat attachments to fetch into the working \
+                                        directory (binary-safe — use this for uploaded \
+                                        .pptx/.xlsx/.pdf/images/zip you want to process). \
+                                        The current turn's uploads are staged automatically; \
+                                        list ids here only to pull in files from EARLIER in \
+                                        the conversation (see `available_attachments` in a \
+                                        prior result).",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["id"],
+                            "properties": {
+                                "id": {"type": "string", "description": "Attachment id \
+                                       `<turn>/<file>` from an attachment stub."},
+                                "name": {"type": "string", "description": "Optional filename \
+                                         to give the file in the working directory."}
+                            }
+                        }
+                    },
                     "network": {
                         "type": "boolean",
                         "description": "Request network egress for this run (pip / web). \
@@ -477,20 +741,33 @@ impl Tool for RunInSandbox {
         Box::pin(async move {
             let args: RunArgs = serde_json::from_value(args).map_err(|e| {
                 ToolError::InvalidArgs(format!(
-                    "expected {{language, code, files?, network?}}: {e}"
+                    "expected {{language, code, files?, attachments?, network?}}: {e}"
                 ))
             })?;
             if args.code.trim().is_empty() {
                 return Err(ToolError::InvalidArgs("code must be non-empty".into()));
             }
+            // Stage the round's uploads + any named attachments first, then
+            // append the model's inline text files (so an explicit text file
+            // wins over a same-named staged file).
+            let Staged {
+                files: staged_files,
+                staged,
+                available,
+                notes,
+            } = stage_attachments(&ctx, &args.attachments).await?;
+            let mut files = staged_files;
+            files.extend(args.files.into_iter().map(TextFile::into_input));
             let req = RunRequest {
                 language: args.language,
                 code: args.code,
-                files: args.files.into_iter().map(TextFile::into_input).collect(),
+                files,
                 timeout_secs: None,
                 network: args.network,
             };
-            self.0.execute(&ctx, req).await
+            let mut out = self.0.execute(&ctx, req).await?;
+            augment_with_staging(&mut out, staged, available, notes);
+            Ok(out)
         })
     }
 }
@@ -717,6 +994,363 @@ impl Tool for CaptureWebpage {
                 network: true,
             };
             self.0.execute(&ctx, req).await
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Document presets over uploaded files: convert_document + edit_presentation.
+//
+// Both resolve a single uploaded attachment (the round's file by default,
+// or one named by id), fetch it server-side, stage it into `/work`, and
+// run a fixed recipe in the sandbox — the file-in / file-out cousins of
+// `generate_document`. The generic escape hatch is `run_in_sandbox`.
+
+/// A safe `/work` filename stem from an attachment's name: keep only
+/// `[A-Za-z0-9_-]`, drop the extension, fall back to `document`. Used so
+/// staged input + produced output names can be interpolated into the
+/// recipe without any shell-meta risk.
+fn safe_stem(filename: &str) -> String {
+    let stem = filename
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(filename);
+    let s: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let s = s.trim_matches('_').to_string();
+    if s.is_empty() {
+        "document".to_string()
+    } else {
+        s
+    }
+}
+
+/// Lowercase alphanumeric extension of `filename`, if it has a clean one.
+fn safe_ext(filename: &str) -> Option<String> {
+    filename
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+/// Does this attachment look like a PowerPoint deck?
+fn is_pptx(a: &AttachmentRef) -> bool {
+    a.filename.to_ascii_lowercase().ends_with(".pptx")
+        || a.mime.contains("presentation")
+        || a.mime.contains("powerpoint")
+}
+
+/// Resolve exactly one uploaded attachment for a preset, then fetch its
+/// bytes. Picks the round's file when `explicit_id` is `None` (erroring
+/// clearly on none / several so the model chooses), validates a
+/// model-named id against the session, and enforces `want` (the file
+/// kind the tool handles). Chat-path only — needs a session + storage.
+async fn resolve_one_attachment(
+    ctx: &ToolContext,
+    explicit_id: Option<&str>,
+    kind: &str,
+    want: impl Fn(&AttachmentRef) -> bool,
+) -> Result<(AttachmentRef, Vec<u8>), ToolError> {
+    let (Some(session_id), Some(s3)) = (ctx.session_id.as_deref(), ctx.s3.as_ref()) else {
+        return Err(ToolError::Failed(
+            "this tool works on uploaded chat files and needs the chat path with attachment \
+             storage configured ([chat.s3]); it isn't available here."
+                .into(),
+        ));
+    };
+    let (session_atts, round) =
+        chat_attachments::session_and_round_attachments(&ctx.db, session_id)
+            .await
+            .map_err(|e| ToolError::Failed(format!("listing session attachments: {e}")))?;
+
+    let chosen: AttachmentRef = match explicit_id {
+        Some(id) => {
+            let a = session_atts
+                .iter()
+                .find(|a| a.id == id)
+                .ok_or_else(|| {
+                    ToolError::InvalidArgs(format!(
+                        "attachment id `{id}` is not in this conversation"
+                    ))
+                })?
+                .clone();
+            if !want(&a) {
+                return Err(ToolError::InvalidArgs(format!(
+                    "attachment `{}` is not a {kind}",
+                    a.filename
+                )));
+            }
+            a
+        }
+        None => {
+            let mut candidates: Vec<AttachmentRef> = round.into_iter().filter(&want).collect();
+            match candidates.len() {
+                1 => candidates.pop().unwrap(),
+                0 => {
+                    let avail: Vec<&str> = session_atts
+                        .iter()
+                        .filter(|a| want(a))
+                        .map(|a| a.id.as_str())
+                        .collect();
+                    let hint = if avail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Earlier {kind}s you can pass as attachment_id: {avail:?}.")
+                    };
+                    return Err(ToolError::InvalidArgs(format!(
+                        "no {kind} was uploaded in this message; upload one or pass \
+                         attachment_id.{hint}"
+                    )));
+                }
+                _ => {
+                    let ids: Vec<&str> = candidates.iter().map(|a| a.id.as_str()).collect();
+                    return Err(ToolError::InvalidArgs(format!(
+                        "several {kind}s were uploaded this message — pass attachment_id to \
+                         choose one of: {ids:?}"
+                    )));
+                }
+            }
+        }
+    };
+
+    let (turn, filename) = chosen
+        .id
+        .split_once('/')
+        .ok_or_else(|| ToolError::Failed(format!("malformed attachment id `{}`", chosen.id)))?;
+    let fetched = chat_attachments::fetch(s3, turn, filename)
+        .await
+        .map_err(|e| ToolError::Failed(format!("fetching `{}`: {e}", chosen.id)))?;
+    Ok((chosen, fetched.bytes))
+}
+
+// ---------------------------------------------------------------------------
+// convert_document — uploaded office/pdf file -> pdf/docx/txt/html/images
+
+#[derive(Deserialize)]
+struct ConvertArgs {
+    #[serde(default)]
+    attachment_id: Option<String>,
+    target: ConvertTarget,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum ConvertTarget {
+    Pdf,
+    Docx,
+    Txt,
+    Html,
+    /// One PNG per page/slide (via pdf, rendered at 150 dpi).
+    Images,
+}
+
+impl ConvertTarget {
+    fn as_str(self) -> &'static str {
+        match self {
+            ConvertTarget::Pdf => "pdf",
+            ConvertTarget::Docx => "docx",
+            ConvertTarget::Txt => "txt",
+            ConvertTarget::Html => "html",
+            ConvertTarget::Images => "images",
+        }
+    }
+}
+
+pub struct ConvertDocument(pub Arc<SandboxClient>);
+
+impl ConvertDocument {
+    /// The sandbox recipe. `stem`/`ext` are pre-sanitized (safe charset),
+    /// so interpolating them carries no shell-meta risk.
+    fn script(target: ConvertTarget, stem: &str, ext: &str) -> String {
+        let infile = format!("{stem}.{ext}");
+        match target {
+            ConvertTarget::Images => format!(
+                "set -e\n\
+                 soffice --headless --convert-to pdf --outdir . {infile}\n\
+                 pdftoppm -png -r 150 {stem}.pdf {stem}-slide\n\
+                 rm -f {stem}.pdf\n"
+            ),
+            other => {
+                let t = other.as_str();
+                format!("set -e\nsoffice --headless --convert-to {t} --outdir . {infile}\n")
+            }
+        }
+    }
+}
+
+impl Tool for ConvertDocument {
+    fn id(&self) -> &str {
+        "convert_document"
+    }
+
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        Some(self.0.loop_timeout())
+    }
+
+    fn schema(&self) -> ToolDef {
+        ToolDef::function(
+            self.id(),
+            "Convert a file the user uploaded (PowerPoint, Word, Excel, \
+             ODF, PDF, …) to another format and return the result. Targets: \
+             `pdf`, `docx`, `txt`, `html`, or `images` (one PNG per \
+             page/slide). By default it converts the file uploaded in the \
+             current message; pass `attachment_id` (from an attachment stub) \
+             to convert a file from earlier in the conversation. Conversion \
+             runs through LibreOffice. For edits or anything custom, use \
+             `edit_presentation` or `run_in_sandbox`.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["target"],
+                "properties": {
+                    "attachment_id": {
+                        "type": "string",
+                        "description": "Optional `<turn>/<file>` id of the file to convert. \
+                                        Defaults to the file uploaded in the current message."
+                    },
+                    "target": {
+                        "type": "string",
+                        "enum": ["pdf", "docx", "txt", "html", "images"],
+                        "description": "Output format. `images` returns one PNG per page/slide."
+                    }
+                }
+            }),
+        )
+    }
+
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let args: ConvertArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::InvalidArgs(format!("expected {{attachment_id?, target}}: {e}"))
+            })?;
+            let (att, bytes) =
+                resolve_one_attachment(&ctx, args.attachment_id.as_deref(), "file", |_| true)
+                    .await?;
+            let stem = safe_stem(&att.filename);
+            let ext = safe_ext(&att.filename).ok_or_else(|| {
+                ToolError::InvalidArgs(format!(
+                    "`{}` has no file extension, so its type can't be determined",
+                    att.filename
+                ))
+            })?;
+            let infile = format!("{stem}.{ext}");
+            let code = Self::script(args.target, &stem, &ext);
+            let req = RunRequest {
+                language: Language::Bash,
+                code,
+                files: vec![InputFile {
+                    name: infile,
+                    content_b64: b64::encode(&bytes),
+                }],
+                timeout_secs: None,
+                network: false,
+            };
+            let mut out = self.0.execute(&ctx, req).await?;
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert(
+                    "converted".into(),
+                    json!({"id": att.id, "target": args.target.as_str()}),
+                );
+            }
+            Ok(out)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// edit_presentation — run python-pptx against an uploaded .pptx
+
+#[derive(Deserialize)]
+struct EditPptxArgs {
+    #[serde(default)]
+    attachment_id: Option<String>,
+    code: String,
+}
+
+pub struct EditPresentation(pub Arc<SandboxClient>);
+
+impl Tool for EditPresentation {
+    fn id(&self) -> &str {
+        "edit_presentation"
+    }
+
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        Some(self.0.loop_timeout())
+    }
+
+    fn schema(&self) -> ToolDef {
+        ToolDef::function(
+            self.id(),
+            "Modify a PowerPoint (.pptx) the user uploaded, using python-pptx. \
+             Your `code` runs in the sandbox with the deck already saved as \
+             `input.pptx` in the working directory; load it, make your \
+             changes, and save the result as `output.pptx` — it's returned to \
+             the user. By default it edits the .pptx uploaded in the current \
+             message; pass `attachment_id` to edit one from earlier in the \
+             conversation. Example: `from pptx import Presentation; p = \
+             Presentation('input.pptx'); p.slides[0].shapes.title.text = 'Hi'; \
+             p.save('output.pptx')`. For other file types or free-form work, \
+             use `run_in_sandbox`.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["code"],
+                "properties": {
+                    "attachment_id": {
+                        "type": "string",
+                        "description": "Optional `<turn>/<file>` id of the .pptx to edit. \
+                                        Defaults to the deck uploaded in the current message."
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "Python (python-pptx) that reads `input.pptx` and writes \
+                                        `output.pptx` in the working directory."
+                    }
+                }
+            }),
+        )
+    }
+
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let args: EditPptxArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::InvalidArgs(format!("expected {{attachment_id?, code}}: {e}"))
+            })?;
+            if args.code.trim().is_empty() {
+                return Err(ToolError::InvalidArgs("code must be non-empty".into()));
+            }
+            let (att, bytes) = resolve_one_attachment(
+                &ctx,
+                args.attachment_id.as_deref(),
+                "PowerPoint (.pptx) file",
+                is_pptx,
+            )
+            .await?;
+            // The deck rides in as a fixed-name binary input; the model's
+            // code (which references `input.pptx`) is the program.
+            let req = RunRequest {
+                language: Language::Python,
+                code: args.code,
+                files: vec![InputFile {
+                    name: "input.pptx".into(),
+                    content_b64: b64::encode(&bytes),
+                }],
+                timeout_secs: None,
+                network: false,
+            };
+            let mut out = self.0.execute(&ctx, req).await?;
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("edited".into(), json!({"id": att.id}));
+            }
+            Ok(out)
         })
     }
 }
@@ -1035,6 +1669,268 @@ mod tests {
         )
     }
 
+    /// An S3 config whose credential env vars are unset, so `open_bucket`
+    /// fails fast with `MissingCredential` before any network — lets us
+    /// drive the staging orchestrator deterministically (a fetch attempt
+    /// turns into a clean "could not fetch" note) without a live bucket.
+    fn dead_s3() -> std::sync::Arc<crate::server::config::S3Config> {
+        std::sync::Arc::new(crate::server::config::S3Config {
+            endpoint: "http://127.0.0.1:1".into(),
+            region: "us-east-1".into(),
+            bucket: "b".into(),
+            access_key_env: "SANDBOX_STAGE_TEST_UNSET".into(),
+            secret_key_env: "SANDBOX_STAGE_TEST_UNSET".into(),
+            key_prefix: "chat-attachments".into(),
+        })
+    }
+
+    async fn seed_session_with_upload(pool: &db::Pool, turn_id: &str, marker: &str) {
+        for q in [
+            "INSERT INTO users (id, email, created_at, updated_at) VALUES \
+             ('u', 'u@e', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z') ON CONFLICT(id) DO NOTHING",
+            "INSERT INTO chat_sessions (id, user_id, created_at, updated_at) VALUES \
+             ('s1', 'u', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z') ON CONFLICT(id) DO NOTHING",
+        ] {
+            sqlx::query(q).execute(pool).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO chat_turns (id, session_id, seq, role, user_content, status, created_at) \
+             VALUES (?, 's1', 0, 'user', ?, 'completed', '2026-01-01T00:00:00Z')",
+        )
+        .bind(turn_id)
+        .bind(marker)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stage_attachments_noop_without_session() {
+        // Proxy/`/v1` path: no session → nothing staged, even if ids given.
+        let c = ctx().await; // session_id None, s3 None
+        let s = stage_attachments(&c, &[]).await.unwrap();
+        assert!(s.files.is_empty() && s.staged.is_empty() && s.notes.is_empty());
+        // Explicit ids on a session-less path get a note, not a hard error.
+        let s = stage_attachments(
+            &c,
+            &[AttachmentArg {
+                id: "t/x.pptx".into(),
+                name: None,
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(s.files.is_empty());
+        assert_eq!(s.notes.len(), 1);
+        assert!(s.notes[0].contains("can't be staged"), "{:?}", s.notes);
+    }
+
+    #[tokio::test]
+    async fn stage_attachments_auto_stages_round_and_reports_fetch_failure() {
+        let mut c = ctx().await;
+        let marker = chat_attachments::marker_line(
+            "t-u1",
+            &chat_attachments::UploadOutcome {
+                filename: "deck.pptx".into(),
+                mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                    .into(),
+                bytes: 10,
+            },
+        );
+        seed_session_with_upload(&c.db, "t-u1", &marker).await;
+        c.session_id = Some("s1".into());
+        c.s3 = Some(dead_s3());
+
+        // No explicit attachments: the round's upload must still be picked
+        // up automatically. The fetch fails (no creds) → a clean note, and
+        // the file stays in `available_attachments` since it wasn't staged.
+        let s = stage_attachments(&c, &[]).await.unwrap();
+        assert!(s.files.is_empty(), "fetch failed, so nothing staged");
+        assert!(
+            s.notes
+                .iter()
+                .any(|n| n.contains("deck.pptx") && n.contains("Could not fetch")),
+            "round upload should be discovered and a fetch attempted: {:?}",
+            s.notes
+        );
+        assert!(
+            s.available.iter().any(|a| a["id"] == "t-u1/deck.pptx"),
+            "unstaged session file should be advertised: {:?}",
+            s.available
+        );
+    }
+
+    #[test]
+    fn safe_stem_and_ext_sanitize() {
+        assert_eq!(safe_stem("My Deck (final).pptx"), "My_Deck__final");
+        assert_eq!(safe_stem("..weird.."), "weird");
+        assert_eq!(safe_stem(""), "document");
+        assert_eq!(safe_ext("a.PPTX").as_deref(), Some("pptx"));
+        assert_eq!(safe_ext("noext"), None);
+        assert_eq!(safe_ext("bad.ex t"), None);
+    }
+
+    #[test]
+    fn is_pptx_matches_name_or_mime() {
+        let r = |f: &str, m: &str| AttachmentRef {
+            id: format!("t/{f}"),
+            turn_id: "t".into(),
+            filename: f.into(),
+            mime: m.into(),
+            size: 1,
+        };
+        assert!(is_pptx(&r("a.pptx", "application/octet-stream")));
+        assert!(is_pptx(&r("a.bin", "application/vnd.ms-powerpoint")));
+        assert!(!is_pptx(&r("a.csv", "text/csv")));
+    }
+
+    #[test]
+    fn convert_script_uses_safe_names_and_renders_images() {
+        let pdf = ConvertDocument::script(ConvertTarget::Pdf, "deck", "pptx");
+        assert!(pdf.contains("--convert-to pdf"));
+        assert!(pdf.contains("deck.pptx"));
+        let imgs = ConvertDocument::script(ConvertTarget::Images, "deck", "pptx");
+        assert!(imgs.contains("--convert-to pdf"), "images go via pdf");
+        assert!(imgs.contains("pdftoppm -png"));
+        assert!(imgs.contains("deck-slide"));
+    }
+
+    #[tokio::test]
+    async fn presets_need_chat_path() {
+        // No session → both presets fail with a clear message, never panic.
+        let c = ctx().await;
+        let err = resolve_one_attachment(&c, None, "file", |_| true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed(ref m) if m.contains("chat path")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_one_attachment_default_resolution_cases() {
+        // Two pptx uploaded this round → edit_presentation can't guess.
+        let mut c = ctx().await;
+        let m1 = chat_attachments::marker_line(
+            "t-u1",
+            &chat_attachments::UploadOutcome {
+                filename: "a.pptx".into(),
+                mime: "application/vnd.ms-powerpoint".into(),
+                bytes: 1,
+            },
+        );
+        let m2 = chat_attachments::marker_line(
+            "t-u1",
+            &chat_attachments::UploadOutcome {
+                filename: "b.pptx".into(),
+                mime: "application/vnd.ms-powerpoint".into(),
+                bytes: 1,
+            },
+        );
+        seed_session_with_upload(&c.db, "t-u1", &format!("{m1}\n{m2}")).await;
+        c.session_id = Some("s1".into());
+        c.s3 = Some(dead_s3());
+
+        let err = resolve_one_attachment(&c, None, "PowerPoint (.pptx) file", is_pptx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(ref m) if m.contains("several") && m.contains("a.pptx")),
+            "{err:?}"
+        );
+
+        // An explicit id outside the session is rejected.
+        let err =
+            resolve_one_attachment(&c, Some("t-x/c.pptx"), "PowerPoint (.pptx) file", is_pptx)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(ref m) if m.contains("not in this conversation")),
+            "{err:?}"
+        );
+
+        // An explicit id that exists but is the wrong kind is rejected.
+        let csv = chat_attachments::marker_line(
+            "t-u2",
+            &chat_attachments::UploadOutcome {
+                filename: "data.csv".into(),
+                mime: "text/csv".into(),
+                bytes: 1,
+            },
+        );
+        sqlx::query(
+            "INSERT INTO chat_turns (id, session_id, seq, role, user_content, status, created_at) \
+             VALUES ('t-u2', 's1', 2, 'user', ?, 'completed', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&csv)
+        .execute(&c.db)
+        .await
+        .unwrap();
+        let err = resolve_one_attachment(
+            &c,
+            Some("t-u2/data.csv"),
+            "PowerPoint (.pptx) file",
+            is_pptx,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(ref m) if m.contains("not a PowerPoint")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_one_attachment_none_uploaded_errors_with_hint() {
+        // Latest user turn carried only a non-pptx → edit can't default,
+        // and there's no earlier pptx to hint at.
+        let mut c = ctx().await;
+        let csv = chat_attachments::marker_line(
+            "t-u1",
+            &chat_attachments::UploadOutcome {
+                filename: "data.csv".into(),
+                mime: "text/csv".into(),
+                bytes: 1,
+            },
+        );
+        seed_session_with_upload(&c.db, "t-u1", &csv).await;
+        c.session_id = Some("s1".into());
+        c.s3 = Some(dead_s3());
+        let err = resolve_one_attachment(&c, None, "PowerPoint (.pptx) file", is_pptx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(ref m) if m.contains("no PowerPoint")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_attachments_ignores_ids_outside_session() {
+        let mut c = ctx().await;
+        seed_session_with_upload(&c.db, "t-u1", "no files here").await;
+        c.session_id = Some("s1".into());
+        c.s3 = Some(dead_s3());
+        let s = stage_attachments(
+            &c,
+            &[AttachmentArg {
+                id: "t-other/secret.pptx".into(),
+                name: None,
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(s.files.is_empty());
+        assert!(
+            s.notes
+                .iter()
+                .any(|n| n.contains("not found in this conversation")),
+            "{:?}",
+            s.notes
+        );
+    }
+
     #[test]
     fn b64_round_trips() {
         assert_eq!(b64::encode(b"foobar"), "Zm9vYmFy");
@@ -1050,7 +1946,17 @@ mod tests {
             RunInSandbox(c.clone()).schema().function.name
         );
         assert_eq!(GenerateDocument(c.clone()).id(), "generate_document");
-        assert_eq!(CaptureWebpage(c).id(), "capture_webpage");
+        assert_eq!(CaptureWebpage(c.clone()).id(), "capture_webpage");
+        assert_eq!(
+            ConvertDocument(c.clone()).id(),
+            ConvertDocument(c.clone()).schema().function.name
+        );
+        assert_eq!(ConvertDocument(c.clone()).id(), "convert_document");
+        assert_eq!(
+            EditPresentation(c.clone()).id(),
+            EditPresentation(c.clone()).schema().function.name
+        );
+        assert_eq!(EditPresentation(c).id(), "edit_presentation");
         assert_eq!(ReadSandboxOutput.id(), "read_sandbox_output");
         assert_eq!(
             ReadSandboxOutput.id(),
@@ -1136,6 +2042,77 @@ mod tests {
             "https://gw.example".into(),
         );
         assert!(RunInSandbox(real).max_duration().unwrap() > std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn assemble_inputs_stages_within_budget() {
+        let items = vec![
+            StageItem {
+                name: "deck.pptx".into(),
+                id: "t/deck.pptx".into(),
+                bytes: vec![1, 2, 3],
+            },
+            StageItem {
+                name: "data.csv".into(),
+                id: "t/data.csv".into(),
+                bytes: vec![4, 5],
+            },
+        ];
+        let (files, staged, notes) = assemble_inputs(items, 1024);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "deck.pptx");
+        assert_eq!(b64::decode(&files[0].content_b64).unwrap(), vec![1, 2, 3]);
+        assert_eq!(staged[0]["id"], "t/deck.pptx");
+        assert_eq!(staged[0]["size"], 3);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn assemble_inputs_skips_over_budget_with_note() {
+        let items = vec![
+            StageItem {
+                name: "small.bin".into(),
+                id: "t/small.bin".into(),
+                bytes: vec![0; 10],
+            },
+            StageItem {
+                name: "big.bin".into(),
+                id: "t/big.bin".into(),
+                bytes: vec![0; 100],
+            },
+        ];
+        // Budget fits the first file but not the second.
+        let (files, staged, notes) = assemble_inputs(items, 50);
+        assert_eq!(files.len(), 1, "only the in-budget file is staged");
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0]["name"], "small.bin");
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("big.bin") && notes[0].contains("budget"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn assemble_inputs_dedupes_colliding_names_with_note() {
+        let items = vec![
+            StageItem {
+                name: "deck.pptx".into(),
+                id: "t1/deck.pptx".into(),
+                bytes: vec![1],
+            },
+            StageItem {
+                name: "deck.pptx".into(),
+                id: "t2/deck.pptx".into(),
+                bytes: vec![2],
+            },
+        ];
+        let (files, staged, notes) = assemble_inputs(items, 1024);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "deck.pptx");
+        assert_eq!(files[1].name, "deck-2.pptx", "second collides → suffixed");
+        assert_eq!(staged[1]["name"], "deck-2.pptx");
+        assert!(notes.iter().any(|n| n.contains("deck-2.pptx")), "{notes:?}");
     }
 
     #[test]
