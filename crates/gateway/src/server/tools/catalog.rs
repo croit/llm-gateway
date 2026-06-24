@@ -32,6 +32,21 @@ const TYPST_KEY: &str = "typst";
 const MEMORY_IDS: &[&str] = &["remember", "recall"];
 const MEMORY_KEY: &str = "memory";
 
+/// The document-canvas tools are one capability — building up and editing
+/// a long document across turns — so they collapse to a single "document"
+/// toggle. An explicit id list (rather than a substring match) so the
+/// sandbox's `generate_document` / `convert_document` stay in their own
+/// "Code & Sandbox" group.
+const DOCUMENT_IDS: &[&str] = &[
+    "create_document",
+    "edit_document",
+    "read_document",
+    "list_documents",
+    "export_document",
+    "edit_document_section",
+];
+const DOCUMENT_KEY: &str = "document";
+
 /// Tools that exist for smoke tests / internal plumbing and shouldn't
 /// clutter a user's tool list. They stay granted via RBAC; they're just
 /// not presented as a toggle.
@@ -110,6 +125,8 @@ pub fn entry_key_for(tool_id: &str) -> &str {
         TYPST_KEY
     } else if MEMORY_IDS.contains(&tool_id) {
         MEMORY_KEY
+    } else if DOCUMENT_IDS.contains(&tool_id) {
+        DOCUMENT_KEY
     } else if tool_id.starts_with(crate::server::tools::mcp::MCP_ID_PREFIX) {
         // All of one MCP server's tools collapse to a single toggle, so a
         // user enables/disables the whole integration at once.
@@ -152,6 +169,7 @@ fn category_for(tool_id: &str) -> Category {
             Category::Code
         }
         _ if tool_id.starts_with(TYPST_PREFIX) => Category::Documents,
+        _ if DOCUMENT_IDS.contains(&tool_id) => Category::Documents,
         "remember" | "recall" => Category::Memory,
         _ if tool_id.starts_with(crate::server::tools::mcp::MCP_ID_PREFIX) => {
             Category::Integrations
@@ -323,10 +341,27 @@ pub fn entries(registry: &ToolRegistry, allowed: &[String]) -> Vec<ToolEntry> {
     let mut out: Vec<ToolEntry> = Vec::new();
     let mut typst_seen = false;
     let mut memory_seen = false;
+    let mut document_seen = false;
     let mut mcp_servers_seen: HashSet<String> = HashSet::new();
 
     for id in allowed {
         if is_hidden(id) {
+            continue;
+        }
+        if DOCUMENT_IDS.contains(&id.as_str()) {
+            if !document_seen {
+                document_seen = true;
+                out.push(ToolEntry {
+                    key: DOCUMENT_KEY.to_string(),
+                    title: "Document canvas".to_string(),
+                    tech: "create/edit/read/list_document".to_string(),
+                    description: "Lets the assistant build up a long document (a guide, spec, or \
+                                  config) in a live side panel and edit it one passage at a time \
+                                  across turns — instead of rewriting the whole thing each reply."
+                        .to_string(),
+                    category: Category::Documents,
+                });
+            }
             continue;
         }
         if MEMORY_IDS.contains(&id.as_str()) {
@@ -520,6 +555,59 @@ mod tests {
             "fetch_url".to_string(),
         ];
         let disabled: HashSet<String> = ["memory".to_string()].into_iter().collect();
+        retain_enabled(&mut allowed, &disabled);
+        assert_eq!(allowed, vec!["fetch_url"]);
+    }
+
+    #[test]
+    fn document_tools_collapse_to_one_document_entry() {
+        use crate::server::tools::document::{
+            CreateDocument, EditDocument, ListDocuments, ReadDocument,
+        };
+        let reg = ToolRegistry::new()
+            .with(CreateDocument)
+            .with(EditDocument)
+            .with(ReadDocument)
+            .with(ListDocuments);
+        let allowed = vec![
+            "create_document".to_string(),
+            "edit_document".to_string(),
+            "read_document".to_string(),
+            "list_documents".to_string(),
+        ];
+        let entries = entries(&reg, &allowed);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "document");
+        assert_eq!(entries[0].category, Category::Documents);
+    }
+
+    #[test]
+    fn all_document_ids_map_to_the_document_key() {
+        for id in [
+            "create_document",
+            "edit_document",
+            "read_document",
+            "list_documents",
+            "export_document",
+            "edit_document_section",
+        ] {
+            assert_eq!(entry_key_for(id), "document", "{id}");
+        }
+        // The sandbox document tools must NOT collapse into this key.
+        assert_eq!(entry_key_for("generate_document"), "generate_document");
+        assert_eq!(entry_key_for("convert_document"), "convert_document");
+    }
+
+    #[test]
+    fn disabling_document_key_drops_all_canvas_tools() {
+        let mut allowed = vec![
+            "create_document".to_string(),
+            "edit_document".to_string(),
+            "read_document".to_string(),
+            "list_documents".to_string(),
+            "fetch_url".to_string(),
+        ];
+        let disabled: HashSet<String> = ["document".to_string()].into_iter().collect();
         retain_enabled(&mut allowed, &disabled);
         assert_eq!(allowed, vec!["fetch_url"]);
     }

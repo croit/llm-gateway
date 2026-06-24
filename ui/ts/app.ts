@@ -25,6 +25,7 @@ import '../../crates/session-core/ui/ts/scroll.js';
 import './chat/mic.js';
 import './chat/actions.js';
 import './clipboard.js';
+import './canvas.js';
 import './geo.js';
 import './feedback.js';
 import { initFeedbackCapture } from './feedback-capture.js';

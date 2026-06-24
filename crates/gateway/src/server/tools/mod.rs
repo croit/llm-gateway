@@ -22,6 +22,7 @@ use thiserror::Error;
 
 pub mod catalog;
 pub mod currency;
+pub mod document;
 pub mod echo;
 pub mod enable_tools;
 pub mod feedback;
@@ -39,6 +40,7 @@ pub mod registry;
 pub mod runner;
 pub mod sandbox;
 pub mod search_web;
+pub mod text_edit;
 pub mod time;
 pub mod typst_render;
 pub mod upload_attachment;

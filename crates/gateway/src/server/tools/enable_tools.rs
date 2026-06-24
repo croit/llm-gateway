@@ -250,6 +250,11 @@ fn target_for_key(key: &str) -> EnableTarget {
             "Document rendering",
             "render a PDF from a corporate template (letter, invoice, report)",
         ),
+        "document" => (
+            "Document canvas",
+            "build up a long document (guide, spec, config) in a live side panel and edit it \
+             one passage at a time across turns — without rewriting the whole thing",
+        ),
         "fetch_attachment" => (
             "Read an attachment",
             "read a file the user attached to this chat (text, images, PDFs incl. scanned)",

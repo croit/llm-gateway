@@ -208,6 +208,14 @@ async fn render_chat_response(
         );
         (effort, build_capabilities(&state, user, &active.id).await)
     };
+    // The session's document canvas (active = most-recently-updated
+    // document), pre-rendered to HTML for the always-present slot. `None`
+    // when the conversation has no documents.
+    let document_canvas_html =
+        crate::server::tools::document::render_canvas_html(&state.db, &active.id, None, None)
+            .await
+            .ok()
+            .flatten();
     let body = render::render_chat_page(render::ChatPage {
         active: &active,
         turns: &turns,
@@ -219,6 +227,7 @@ async fn render_chat_response(
         shared: active.shared,
         effort,
         capabilities: &capabilities,
+        document_canvas_html: document_canvas_html.as_deref(),
     });
     let chat_sidebar = SidebarChat {
         sessions: sessions
@@ -924,6 +933,56 @@ pub async fn chat_tail(
         gateway_sidebar_emitter(state.clone(), user.id.clone(), session_id),
         Some("/chat".to_string()),
     )
+}
+
+// ---------------------------------------------------------------------------
+// GET /chat/{id}/document/{doc_id} — render a document (optionally an older
+// `?version=N`) into the canvas slot. This is the datastar `@get` target for
+// the panel's document- and version-switchers: it returns a single SSE patch
+// replacing `#document-canvas-slot`'s contents. Readable-gated like the tail
+// (owner or a shared viewer); a missing doc/version closes with no change.
+
+pub async fn chat_document_view(
+    Path((session_id, doc_id)): Path<(String, String)>,
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    let (_session, user) = match require_session_or_redirect(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    match chat::get_session_readable(&state.db, &user.id, &session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return empty_sse_response(),
+        Err(err) => return sse_error_response(&err.to_string()),
+    };
+    let version = req.uri().query().and_then(parse_version_query);
+    let html = match crate::server::tools::document::render_canvas_html(
+        &state.db,
+        &session_id,
+        Some(&doc_id),
+        version,
+    )
+    .await
+    {
+        Ok(Some(h)) => h,
+        // No such document/version in this session, or a read error — leave
+        // the panel as-is.
+        _ => return empty_sse_response(),
+    };
+    sse_response(&[sse_patch(
+        Some("#document-canvas-slot"),
+        Some("inner"),
+        &html,
+    )])
+}
+
+/// Pull `version=N` out of a raw query string (`a=b&version=3`). `None`
+/// when absent or unparseable, which the caller reads as "latest".
+fn parse_version_query(q: &str) -> Option<i64> {
+    q.split('&')
+        .find_map(|kv| kv.strip_prefix("version="))
+        .and_then(|v| v.parse().ok())
 }
 
 // ---------------------------------------------------------------------------

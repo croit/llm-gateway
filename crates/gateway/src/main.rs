@@ -96,7 +96,15 @@ async fn main() -> anyhow::Result<()> {
         // AppState; registering them unconditionally keeps RBAC config
         // stable across deployments where `[rag]` is only sometimes set.
         .with(srv::tools::rag::RagListCollections)
-        .with(srv::tools::rag::RagSearch);
+        .with(srv::tools::rag::RagSearch)
+        // Document canvas — build up and incrementally edit long documents
+        // across turns. Content lives in the `documents` store, not S3, so
+        // these need no extra config; off the chat path they error cleanly.
+        .with(srv::tools::document::CreateDocument)
+        .with(srv::tools::document::EditDocument)
+        .with(srv::tools::document::ReadDocument)
+        .with(srv::tools::document::ListDocuments)
+        .with(srv::tools::document::EditDocumentSection);
     // `lookup_ip` is GeoIP-only — unlike `get_user_location` (which also has
     // the browser-GPS path), it can do nothing without a database. Register
     // it only when `[geoip]` is configured, so the model is never offered a
@@ -199,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
             tool_registry = tool_registry
                 .with(srv::tools::sandbox::RunInSandbox(client.clone()))
                 .with(srv::tools::sandbox::GenerateDocument(client.clone()))
+                .with(srv::tools::sandbox::ExportDocument(client.clone()))
                 .with(srv::tools::sandbox::CaptureWebpage(client.clone()))
                 .with(srv::tools::sandbox::ConvertDocument(client.clone()))
                 .with(srv::tools::sandbox::EditPresentation(client))

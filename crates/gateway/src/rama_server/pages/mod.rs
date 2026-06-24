@@ -495,10 +495,13 @@ fn nav_or_html_page(
 /// scrollable-block-with-vertical-padding layout.
 fn main_class_for(active: Option<NavItem>) -> &'static str {
     match active {
-        // `max-w-5xl mx-auto` matches the other authed pages
-        // (dashboard, tokens) so the chat lines up with the same
-        // reading-column on desktop. Empty page-bg gutters on
-        // either side at wide viewports.
+        // Full-width: the chat + docked canvas (`.chat-shell`) span the whole
+        // content area so a pulled-out canvas — and the chat beside it — use
+        // all the horizontal space instead of being boxed into a centered
+        // reading column with dead gutters. The conversation keeps its own
+        // readable max-width *inside* `.chat-col` (see main.css), so with the
+        // canvas closed it still centers like before; with the canvas open the
+        // column simply fills the space the gutters used to waste.
         //
         // No bottom padding at any size: the composer floats
         // absolutely over the conversation (see main.css), so any
@@ -508,8 +511,7 @@ fn main_class_for(active: Option<NavItem>) -> &'static str {
         // floating elements is moved into `#conversation`'s own
         // padding so messages don't sit permanently behind them.
         Some(NavItem::Chat) => {
-            "chat-main relative flex-1 min-h-0 flex flex-col w-full max-w-5xl \
-             mx-auto px-4 sm:px-6 sm:pt-4"
+            "chat-main relative flex-1 min-h-0 flex flex-col w-full px-4 sm:px-6 sm:pt-4"
         }
         _ => "flex-1 min-h-0 overflow-y-auto",
     }
@@ -849,9 +851,10 @@ struct LoginPageQuery {
 // doesn't have to know about the split.
 mod chat;
 pub use chat::{
-    chat_attachment, chat_cancel, chat_capabilities_toggle, chat_edit, chat_effort_set,
-    chat_export_markdown, chat_export_pdf, chat_fork, chat_index, chat_message_send, chat_retry,
-    chat_session_create, chat_session_delete, chat_session_view, chat_share_toggle, chat_tail,
+    chat_attachment, chat_cancel, chat_capabilities_toggle, chat_document_view, chat_edit,
+    chat_effort_set, chat_export_markdown, chat_export_pdf, chat_fork, chat_index,
+    chat_message_send, chat_retry, chat_session_create, chat_session_delete, chat_session_view,
+    chat_share_toggle, chat_tail,
 };
 
 // SSE helpers (`sse_patch`, `sse_script`, `sse_signals`,

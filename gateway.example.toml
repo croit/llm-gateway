@@ -140,7 +140,8 @@ weight = 1
 # models = ["*"]
 # # Grant `enable_tools` (always-on core) so the model can turn on extra
 # # tool groups mid-conversation — see docs/tool-context-optimization.md.
-# tools = ["enable_tools", "get_current_timestamp", "get_user_location", "remember", "recall"]
+# tools = ["enable_tools", "get_current_timestamp", "get_user_location", "remember", "recall",
+#          "create_document", "edit_document", "read_document", "list_documents"]
 # # Skill names this role may load (see [skills] below). "*" = all loaded
 # # skills; omit/empty to grant none. Requires the `read_skill` tool too,
 # # which `tools = ["*"]` covers.

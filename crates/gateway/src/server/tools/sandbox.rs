@@ -874,6 +874,112 @@ impl Tool for GenerateDocument {
 }
 
 // ---------------------------------------------------------------------------
+// Wrapper: export_document — render a canvas document to a downloadable file
+
+#[derive(Deserialize)]
+struct ExportArgs {
+    document_id: String,
+    format: DocFormat,
+    #[serde(default)]
+    filename: Option<String>,
+}
+
+/// Bridge the document canvas to the sandbox's pandoc path: take a
+/// document the model built with `create_document`/`edit_document` and
+/// render its current content to a downloadable PDF/DOCX/PPTX. Reuses the
+/// exact `generate_document` recipe — the only difference is the Markdown
+/// comes from the `documents` store rather than the tool args.
+pub struct ExportDocument(pub Arc<SandboxClient>);
+
+impl Tool for ExportDocument {
+    fn id(&self) -> &str {
+        "export_document"
+    }
+
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        Some(self.0.loop_timeout())
+    }
+
+    fn schema(&self) -> ToolDef {
+        ToolDef::function(
+            self.id(),
+            "Export a document from the canvas (one you created with \
+             `create_document`) to a finished PDF, Word (.docx), or PowerPoint \
+             (.pptx) file and attach it for the user to download. Give the \
+             `document_id` and a `format`. Markdown and text documents only. \
+             For one-off Markdown you haven't put in the canvas, use \
+             `generate_document` instead.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["document_id", "format"],
+                "properties": {
+                    "document_id": {"type": "string", "description": "The id from `create_document`."},
+                    "format": {
+                        "type": "string", "enum": ["pdf", "docx", "pptx"],
+                        "description": "Output format."
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional output filename (extension is set from `format`)."
+                    }
+                }
+            }),
+        )
+    }
+
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            use crate::server::db::documents::{self, DocumentFormat};
+            let session_id = ctx.session_id.as_deref().ok_or_else(|| {
+                ToolError::Failed("export_document is only available inside a chat session".into())
+            })?;
+            let args: ExportArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::InvalidArgs(format!("expected {{document_id, format, filename?}}: {e}"))
+            })?;
+            let (doc, ver) = documents::get_version(&ctx.db, session_id, &args.document_id, None)
+                .await
+                .map_err(|e| ToolError::Failed(format!("reading document: {e}")))?
+                .ok_or_else(|| {
+                    ToolError::InvalidArgs(format!(
+                        "no document `{}` in this conversation",
+                        args.document_id
+                    ))
+                })?;
+            // Pandoc reads the content as Markdown; only prose formats export
+            // sensibly. Structured/HTML docs would come out garbled.
+            if !matches!(doc.format, DocumentFormat::Markdown | DocumentFormat::Text) {
+                return Err(ToolError::InvalidArgs(format!(
+                    "only markdown or text documents can be exported; `{}` is {}",
+                    args.document_id,
+                    doc.format.as_str()
+                )));
+            }
+            let ext = args.format.ext();
+            let stem = filename_stem(args.filename.as_deref(), "document");
+            let out = format!("{stem}.{ext}");
+            let pdf_engine = if matches!(args.format, DocFormat::Pdf) {
+                " --pdf-engine=weasyprint"
+            } else {
+                ""
+            };
+            let code = format!("set -e\npandoc input.md -o {out:?}{pdf_engine}\n");
+            let req = RunRequest {
+                language: Language::Bash,
+                code,
+                files: vec![InputFile {
+                    name: "input.md".into(),
+                    content_b64: b64::encode(ver.content.as_bytes()),
+                }],
+                timeout_secs: None,
+                network: false,
+            };
+            self.0.execute(&ctx, req).await
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Wrapper: capture_webpage (headless chromium)
 
 #[derive(Deserialize)]

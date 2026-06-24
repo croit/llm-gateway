@@ -89,6 +89,11 @@ pub(super) struct ChatPage<'a> {
     /// Toggleable capabilities for the "+" menu (owner only; empty for a
     /// read-only viewer).
     pub capabilities: &'a [CapabilityRow],
+    /// Pre-rendered document-canvas panel (the active document for this
+    /// session), or `None` when the conversation has no documents yet. The
+    /// always-present `#document-canvas-slot` wraps it so a later
+    /// `create_document` has a live morph target even on a doc-less load.
+    pub document_canvas_html: Option<&'a str>,
 }
 
 /// Chat page body — header (model pickers) + conversation +
@@ -122,6 +127,14 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
         .in_flight_turn_id
         .map(|_| format!("/chat/{session_id}/tail"));
     let error_owned = page.error_msg.map(|s| s.to_string());
+    let document_canvas_html = page.document_canvas_html.map(|s| s.to_string());
+    // Canvas docks as a right-hand column. `hasCanvas` reveals the header
+    // toggle once a document exists (set live on the first create); `canvasOpen`
+    // shows/hides the column. `canvasOpen` seeds false and a `data-init` opens
+    // it on mount only on a wide viewport — so a doc-bearing chat opens docked
+    // on desktop but never auto-covers the chat on mobile (button-only there).
+    let has_canvas = document_canvas_html.is_some();
+    let canvas_signals = format!("{{\"hasCanvas\": {has_canvas}, \"canvasOpen\": false}}");
 
     let post_url = format!("/chat/{session_id}/messages");
     let cancel_url = format!("/chat/{session_id}/cancel");
@@ -129,6 +142,22 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
     let read_only = page.read_only;
 
     html! {
+      // Two-column shell: the chat (header/conversation/composer) on the left,
+      // the document canvas docked on the right. A draggable splitter sits
+      // between them (desktop); on mobile the canvas is a button-toggled
+      // overlay. The signal store drives both the header toggle and the column.
+      div(
+          class: "chat-shell",
+          "data-signals": (canvas_signals),
+          // Open docked on mount, desktop only. Live edits re-open via the
+          // `gwcanvasopen` window event (also desktop-gated, in the tool).
+          "data-init": "$canvasOpen = $hasCanvas && window.innerWidth >= 768",
+          "data-on:gwcanvasopen__window": "$canvasOpen = true",
+          // Full width ONLY while the canvas is docked; otherwise the chat
+          // falls back to the centered reading column (see main.css).
+          "data-class": "{'canvas-open': $canvasOpen}"
+      ) {
+        div(class: "chat-col") {
         // Header row: title (left) + model/voice pickers and the share toggle
         // (right) — all ONE row. The header is always rendered so the share
         // toggle is reachable on mobile; on phones the title + pickers hide
@@ -151,6 +180,18 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
             // Export is available to anyone who can read the chat (owner or a
             // shared viewer), so it lives outside the owner-only block below.
             (render_export_control(&session_id))
+            // Document-canvas toggle. Hidden until a document exists (the live
+            // create flips `$hasCanvas`); click shows/hides the docked panel.
+            button(
+                type: "button",
+                class: "btn btn-ghost btn-sm gap-1",
+                title: "Show / hide the document canvas",
+                "data-show": "$hasCanvas",
+                "data-on:click": "$canvasOpen = !$canvasOpen"
+            ) {
+                (icons::pencil(16))
+                span(class: "hidden sm:inline") { "Document" }
+            }
             // A read-only viewer (recipient of a shared chat) gets the inverse
             // of the owner controls: a "fork into my chats" button instead of
             // the model pickers + share toggle.
@@ -295,6 +336,29 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                 )),
             }))
         }
+        } // .chat-col
+        // Draggable splitter between chat and canvas. Desktop only (CSS hides
+        // it on narrow screens, where the canvas is a full overlay). The drag
+        // handler in app.js resizes the canvas column and remembers the width.
+        div(
+            id: "canvas-splitter",
+            class: "canvas-splitter",
+            "data-show": "$canvasOpen",
+            "aria-hidden": "true"
+        ) {}
+        // Right-docked canvas column. Always in the DOM (even empty) so it is a
+        // stable morph target for the first `create_document`; shown when the
+        // panel is open.
+        aside(
+            id: "document-canvas-slot",
+            class: "canvas-col",
+            "data-show": "$canvasOpen"
+        ) {
+            if let Some(html) = document_canvas_html.as_ref() {
+                #(html.clone())
+            }
+        }
+      } // .chat-shell
     }
     .to_html()
 }
@@ -779,6 +843,7 @@ mod tests {
             shared: false,
             effort: crate::server::reasoning::Effort::Standard,
             capabilities: &[],
+            document_canvas_html: None,
         })
         .to_string()
     }
@@ -796,6 +861,7 @@ mod tests {
             shared: false,
             effort: crate::server::reasoning::Effort::Standard,
             capabilities: &[],
+            document_canvas_html: None,
         })
         .to_string()
     }
