@@ -615,8 +615,25 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         // then execute concurrently. Each result flips its row to
         // 'completed' / 'errored'.
         let collected: Vec<ToolCallAcc> = tool_acc.into_values().collect();
+        // Tool groups the user explicitly switched **off** for this
+        // conversation. The model never sees their schemas (they're not in
+        // `allowed_tools`), but it can still hallucinate a direct call from
+        // training priors — refuse those without executing, so an Off toggle
+        // is a hard block, not a soft default. A DB hiccup degrades open.
+        let disabled_keys = match d.tool_ctx.session_id.as_deref() {
+            Some(sid) => {
+                crate::server::db::chat_session_tools::disabled_keys_for_session(&d.state.db, sid)
+                    .await
+                    .unwrap_or_default()
+            }
+            None => Default::default(),
+        };
         let mut assistant_tool_calls: Vec<serde_json::Value> = Vec::new();
         let mut call_refs: Vec<runner::ToolCallRef> = Vec::new();
+        // Calls refused because the tool is user-disabled: (id, reason). Each
+        // still needs a `tool` message so the assistant turn's tool_calls all
+        // resolve — appended after the assistant message below.
+        let mut refused: Vec<(String, String)> = Vec::new();
         for acc in &collected {
             chat::insert_running_tool_call(
                 &d.state.db,
@@ -638,6 +655,27 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                 }
             }));
             if crate::server::tools::ToolSource::contains(&tool_source, &acc.name) {
+                let key = crate::server::tools::catalog::entry_key_for(&acc.name);
+                // Hard block: the user switched this tool off for the
+                // conversation. Don't run it, don't auto-enable it — answer
+                // the call with a refusal the model can read and adapt to.
+                if disabled_keys.contains(key) {
+                    let reason = "This tool is disabled by the user for this conversation; it cannot be \
+                         used here.";
+                    if let Err(err) = chat::complete_tool_call(
+                        &d.state.db,
+                        &acc.id,
+                        reason,
+                        ToolCallStatus::Errored,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %err, tool = %acc.name, "recording refused tool call");
+                    }
+                    let _ = ctx.broadcast.send(TurnUpdate::Tick);
+                    refused.push((acc.id.clone(), reason.to_string()));
+                    continue;
+                }
                 // Implicit miss-recovery: the model called a tool whose
                 // schema wasn't in this round's tools array — it's
                 // guessing from training (`fetch_url(url=...)` is the
@@ -651,7 +689,6 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                 if !allowed_tools.contains(&acc.name)
                     && let Some(session_id) = d.tool_ctx.session_id.as_deref()
                 {
-                    let key = crate::server::tools::catalog::entry_key_for(&acc.name);
                     if let Err(err) = crate::server::db::chat_session_tools::set(
                         &d.state.db,
                         session_id,
@@ -684,7 +721,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                 );
             }
         }
-        if call_refs.is_empty() {
+        if call_refs.is_empty() && refused.is_empty() {
             return Ok(());
         }
 
@@ -694,6 +731,16 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             "content": serde_json::Value::Null,
             "tool_calls": assistant_tool_calls,
         }));
+        // Refused (user-disabled) calls still need a `tool` response so the
+        // assistant turn's tool_calls all resolve — emit them as errors the
+        // model can read.
+        for (id, reason) in &refused {
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": serde_json::Value::String(reason.clone()),
+            }));
+        }
         for (call, result) in call_refs.iter().zip(results.iter()) {
             // For the operator UI / DB log we always store a
             // pretty-printed JSON snapshot — even when the tool returned

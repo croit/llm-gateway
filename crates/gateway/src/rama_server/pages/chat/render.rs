@@ -25,31 +25,88 @@ pub(super) struct ChatModelOption {
     pub nda: bool,
 }
 
-/// One toggleable capability in the composer's "+" menu — a built-in tool, a
-/// connected MCP integration, or an operator-installed skill the caller's
-/// roles permit. Built fresh per request from RBAC + the per-conversation
-/// overlay.
+/// One toggleable capability in the composer's "+" menu — a built-in tool
+/// group, a connected MCP integration, or an operator-installed skill the
+/// caller's roles permit. Built fresh per request from RBAC + the
+/// per-conversation overlay.
 pub(super) struct CapabilityRow {
-    /// The overlay key: the MCP connector toggle key (`mcp__gitlab`, governing
-    /// the whole integration) for `CapKind::Tool`, or the skill name for
-    /// `CapKind::Skill`.
+    /// The overlay key: the catalog toggle key (`web`, `typst`, `mcp__gitlab`,
+    /// … — one key governs a whole group) for `CapKind::Tool`, or the skill
+    /// name for `CapKind::Skill`.
     pub key: String,
     pub kind: CapKind,
     /// Human-readable label shown in the menu and on the active chip.
     pub label: String,
-    /// Section heading the row sorts under ("Integrationen" / "Skills").
+    /// Plain-language "what this does / when it helps", shown under the label.
+    pub description: String,
+    /// Section heading the row sorts under — a `Category::label()` for tools
+    /// ("Web & Network", …) or "Skills".
     pub group: &'static str,
-    /// Whether this capability is currently on for the conversation.
-    pub enabled: bool,
+    /// Sort/group order. Built-in categories use `Category::order()`; skills
+    /// trail everything via [`SKILL_ORDER`].
+    pub order: u8,
+    /// Tri-state for this conversation: On (force-exposed), Auto (model may
+    /// enable), Off (blocked). Skills only ever use On / Auto.
+    pub state: ToolState,
     /// Connector icon hint (the catalog `icon`, usually an emoji) for
-    /// integrations without a built-in brand logo. `None` for skills.
+    /// integrations without a built-in brand logo. `None` otherwise.
     pub icon: Option<String>,
+}
+
+impl CapabilityRow {
+    /// Whether this capability is force-enabled (shows as an active chip).
+    pub fn is_on(&self) -> bool {
+        self.state == ToolState::On
+    }
+}
+
+/// Skills sort after every built-in category (`Category::order()` tops out at
+/// 6) so the "Skills" group is always last in the menu.
+pub(super) const SKILL_ORDER: u8 = 250;
+
+/// Shared horizontal padding for every menu row (master, category heading,
+/// tool row). Keeping it identical — combined with one scroll box that
+/// reserves a stable scrollbar gutter — is what lines the trailing segmented
+/// pills up at the exact same distance from the panel border.
+const ROW_PAD_X: &str = "0.5rem";
+
+/// The per-conversation enablement tier of one capability. Built-in tools use
+/// all three; skills use only `On` (loaded) / `Auto` (not loaded).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ToolState {
+    /// Force-exposed to the model every turn (`chat_session_tools.enabled=1`).
+    On,
+    /// Lazy — no row; the model may turn it on via `enable_tools`.
+    Auto,
+    /// Blocked — `chat_session_tools.enabled=0`; hidden and un-enableable.
+    Off,
+}
+
+impl ToolState {
+    /// Wire value posted by a segment button and parsed by the handler.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToolState::On => "on",
+            ToolState::Auto => "auto",
+            ToolState::Off => "off",
+        }
+    }
+
+    /// Map a `chat_session_tools` row (present → its `enabled` flag; absent →
+    /// `None`) to a tier.
+    pub fn from_row(row: Option<bool>) -> Self {
+        match row {
+            Some(true) => ToolState::On,
+            Some(false) => ToolState::Off,
+            None => ToolState::Auto,
+        }
+    }
 }
 
 /// Which overlay a capability toggle writes to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CapKind {
-    /// `chat_session_tools` (built-in tools + MCP connectors).
+    /// `chat_session_tools` (built-in tool groups + MCP connectors).
     Tool,
     /// `chat_session_skills` (operator-installed skills).
     Skill,
@@ -425,7 +482,7 @@ fn render_composer_toolbar(
         // composer's rounded corners and line up with the typed text.
         div(style: "display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem; \
                     width:100%; padding:0.5rem 1.125rem 0") {
-            (render_capabilities(session_id, caps, false))
+            (render_capabilities(session_id, caps))
             div(style: "margin-left:auto") {
                 (render_effort_select(session_id, effort))
             }
@@ -494,70 +551,46 @@ fn render_effort_select(session_id: &str, effort: crate::server::reasoning::Effo
 /// several things). The popup opens upward (`bottom:100%`) via inline style —
 /// daisyUI's `dropdown-top` / Tailwind's `bottom-full` aren't in the purged
 /// build, so positioning is hand-rolled with styles that always ship.
-pub(super) fn render_capabilities(session_id: &str, caps: &[CapabilityRow], open: bool) -> Html {
-    // `#cap-wrap` carries the open-state signal and is NOT re-patched by the
-    // toggle handler — only its `#capabilities` child is — so `$capMenu`
-    // survives a pin (re-declaring `data-signals` would reset it to false and
-    // snap the menu shut).
+pub(super) fn render_capabilities(session_id: &str, caps: &[CapabilityRow]) -> Html {
+    // `#cap-wrap` carries the menu's signals and is never re-patched, so they
+    // survive the targeted patches the toggle handler emits:
+    //   * `capMenu`  — popup open/closed
+    //   * `capQuery` — the search filter
+    //   * `openCats` — which category sections are expanded (a map of
+    //                  group-slug → bool; absent ⇒ collapsed)
+    // On a toggle the handler patches only the small `#cap-seg-*` controls,
+    // the `#cap-grp-*` / `#cap-all` aggregate pills, and `#cap-chips` — never
+    // the section containers — so collapse + search state can't be clobbered
+    // by the morph (datastar's `data-show` doesn't re-evaluate on a morph, so
+    // we keep the signal-bearing structure off the patch path entirely).
+    let base = format!("/chat/{session_id}/capabilities");
     html! {
         div(
             id: "cap-wrap",
-            "data-signals": "{capMenu: false, capQuery: ''}",
+            "data-signals": "{capMenu: false, capQuery: '', openCats: {}}",
             // Click anywhere outside this wrapper (button + popup) closes the
             // menu. Scoped to `#cap-wrap` so clicking the toggle button itself
             // — which lives inside — isn't treated as an outside click.
             "data-on:click__outside": "$capMenu = false"
         ) {
-            (render_capabilities_inner(session_id, caps, open))
+            (render_capabilities_inner(&base, caps))
         }
     }
     .to_html()
 }
 
-/// The re-patchable `#capabilities` subtree (the "+" button, the popup, and the
-/// active chips). Rendered standalone by the toggle handler so the patch
-/// replaces exactly this element — never the signal-bearing `#cap-wrap`.
-pub(super) fn render_capabilities_inner(
-    session_id: &str,
-    caps: &[CapabilityRow],
-    open: bool,
-) -> Html {
-    let base = format!("/chat/{session_id}/capabilities");
-    let chips: Vec<Html> = caps
-        .iter()
-        .filter(|c| c.enabled)
-        .map(|c| cap_chip(&base, c))
-        .collect();
-    // Menu rows, grouped (Integrations first, then Skills) under clear section
-    // headings. Only high-level entries live here — see `build_capabilities`.
-    let mut menu_items: Vec<Html> = Vec::new();
-    for g in ["Integrations", "Skills"] {
-        let items: Vec<Html> = caps
-            .iter()
-            .filter(|c| c.group == g)
-            .map(|c| cap_menu_item(&base, c))
-            .collect();
-        if items.is_empty() {
-            continue;
-        }
-        menu_items.push(group_heading(g));
-        for it in items {
-            menu_items.push(it);
-        }
-    }
-    let has_caps = !menu_items.is_empty();
-    // A filter box once the list gets long enough to warrant it.
+/// The `#capabilities` subtree: the "+" button, the popup tree, and the active
+/// chips. Rendered once at page load and left in place — the handler patches
+/// only its volatile leaves.
+fn render_capabilities_inner(base: &str, caps: &[CapabilityRow]) -> Html {
+    let has_caps = !caps.is_empty();
+    // Full catalog ⇒ a search box is always worthwhile.
     let show_search = caps.len() > 6;
-    // The floating panel: opaque card (border + bg-base-100 + shadow), opening
-    // upward, above the sticky composer (z above its z-index 20). `open` seeds
-    // the initial display so the toggle handler can re-patch the region with the
-    // menu still showing (datastar's `data-show` doesn't re-evaluate on a morph)
-    // — letting the user pin several things without the menu snapping shut.
-    let disp = if open { "block" } else { "none" };
-    let panel_style = format!(
-        "display:{disp}; position:absolute; left:0; bottom:100%; \
-         margin-bottom:8px; width:19rem; z-index:30; overflow:hidden; padding:0.25rem"
-    );
+    // Opaque card, opening upward above the sticky composer (z above its 20).
+    // Seeded closed; `data-show:$capMenu` governs it thereafter (never
+    // re-patched, so the binding keeps working).
+    let panel_style = "display:none; position:absolute; left:0; bottom:100%; \
+         margin-bottom:8px; width:27rem; z-index:30; overflow:hidden; padding:0.25rem";
     html! {
         div(
             id: "capabilities",
@@ -568,10 +601,8 @@ pub(super) fn render_capabilities_inner(
                     type: "button",
                     "data-on:click": "$capMenu = !$capMenu",
                     class: "btn btn-ghost btn-sm gap-1",
-                    // Pill so the hover/active highlight is fully rounded — the
-                    // default 6px reads square next to the rounded composer.
                     style: "border-radius:9999px",
-                    title: "Integrations & skills for this conversation"
+                    title: "Tools, integrations & skills for this conversation"
                 ) {
                     (icons::plus(16))
                     span { "Tools" }
@@ -585,17 +616,39 @@ pub(super) fn render_capabilities_inner(
                         if show_search {
                             input(
                                 type: "text",
-                                placeholder: "Search…",
+                                placeholder: "Search tools…",
                                 "data-on:input": "$capQuery = evt.target.value.toLowerCase()",
                                 class: "input input-sm",
                                 style: "width:100%; margin-bottom:0.25rem; \
                                         border:1px solid color-mix(in oklch, currentColor 15%, transparent)"
                             );
                         }
-                        div(style: "max-height:48vh; overflow-y:auto") {
-                            for it in menu_items.iter() {
-                                (it.clone())
+                        // One scroll box holds the master row *and* the
+                        // groups so they share an identical right inset:
+                        // `scrollbar-gutter:stable` reserves the scrollbar
+                        // gutter whether or not it shows, and every row uses
+                        // the same `ROW_PAD_X` padding, so all the segmented
+                        // pills line up at the exact same distance from the
+                        // border. The master row sticks to the top so it stays
+                        // visible while the list scrolls.
+                        div(style: "max-height:52vh; overflow-y:auto; scrollbar-gutter:stable") {
+                            div(
+                                "data-show": "$capQuery === ''",
+                                class: "bg-base-100",
+                                style: (format!(
+                                    "position:sticky; top:0; z-index:1; display:flex; \
+                                     align-items:center; gap:0.5rem; padding:0.35rem {ROW_PAD_X}; \
+                                     margin-bottom:0.15rem; \
+                                     border-bottom:1px solid color-mix(in oklch, currentColor 10%, transparent)"
+                                ))
+                            ) {
+                                span(style: "flex:1; font-size:0.78rem; font-weight:700; \
+                                             text-transform:uppercase; letter-spacing:0.05em; opacity:0.7") {
+                                    "All tools"
+                                }
+                                (render_master_pill(base, caps))
                             }
+                            (render_cap_groups(base, caps))
                         }
                     }
                 } else {
@@ -604,40 +657,354 @@ pub(super) fn render_capabilities_inner(
                         "data-show": "$capMenu",
                         style: (format!("{panel_style}; padding:0.75rem"))
                     ) {
-                        "Connect an integration under "
+                        "No tools are available to your account yet. Connect an integration under "
                         a(href: "/integrations", style: "text-decoration:underline") { "Integrations" }
-                        " to make it available here."
+                        "."
                     }
                 }
             }
-            for chip in chips.iter() {
-                (chip.clone())
+            (render_cap_chips(base, caps))
+        }
+    }
+    .to_html()
+}
+
+/// The `(selector, html)` patches the toggle handler emits after a change:
+/// every per-row segmented control, every group-aggregate pill, the master
+/// pill, and the chips. Deliberately *only* the volatile leaves — never the
+/// section containers, the search box, or `#cap-wrap` — so the morph can't
+/// reset the open/collapse or search signals. Patching an unchanged control is
+/// a harmless no-op morph, so the same set covers single-row, group, and "All"
+/// toggles uniformly.
+pub(super) fn render_capability_patches(
+    session_id: &str,
+    caps: &[CapabilityRow],
+) -> Vec<(String, String)> {
+    let base = format!("/chat/{session_id}/capabilities");
+    let mut patches: Vec<(String, String)> = Vec::new();
+    // Contiguous group runs (caps arrive pre-sorted by order).
+    let mut groups: Vec<(&'static str, Vec<&CapabilityRow>)> = Vec::new();
+    for c in caps {
+        match groups.last_mut() {
+            Some((g, rows)) if *g == c.group => rows.push(c),
+            _ => groups.push((c.group, vec![c])),
+        }
+    }
+    for (group, rows) in groups.iter() {
+        patches.push((
+            format!("#cap-grp-{}", group_slug(group)),
+            render_group_pill(&base, group, rows).to_string(),
+        ));
+        for c in rows.iter() {
+            patches.push((
+                format!("#{}", cap_seg_id(c)),
+                render_cap_segment(&base, c).to_string(),
+            ));
+        }
+    }
+    patches.push((
+        "#cap-all".to_string(),
+        render_master_pill(&base, caps).to_string(),
+    ));
+    patches.push((
+        "#cap-chips".to_string(),
+        render_cap_chips(&base, caps).to_string(),
+    ));
+    patches
+}
+
+/// The grouped section tree: one collapsible `<section>` per group, in
+/// [`CapabilityRow::order`] order. Each heading toggles `$openCats[slug]`; the
+/// body shows when expanded *or* while a search is active (so matches surface
+/// regardless of collapse). Section containers are never re-patched, so their
+/// `data-show` bindings stay live.
+fn render_cap_groups(base: &str, caps: &[CapabilityRow]) -> Html {
+    // Stable, order-respecting grouping (caps arrive pre-sorted by order).
+    let mut groups: Vec<(&'static str, Vec<&CapabilityRow>)> = Vec::new();
+    for c in caps {
+        match groups.last_mut() {
+            Some((g, rows)) if *g == c.group => rows.push(c),
+            _ => groups.push((c.group, vec![c])),
+        }
+    }
+    html! {
+        for (group, rows) in groups.iter() {
+            (render_cap_section(base, group, rows))
+        }
+    }
+    .to_html()
+}
+
+/// One collapsible category section: a clickable heading (chevron + label +
+/// count) with the group-aggregate pill beside it, over a body of rows.
+fn render_cap_section(base: &str, group: &'static str, rows: &[&CapabilityRow]) -> Html {
+    let slug = group_slug(group);
+    let open_expr = format!("$openCats['{slug}']");
+    // Body visible when this section is expanded, or whenever a search is
+    // active (then headings hide and matching rows filter themselves in).
+    let body_show = format!("{open_expr} || $capQuery !== ''");
+    let count = rows.len();
+    let count_label = if count == 1 {
+        "1 tool".to_string()
+    } else {
+        format!("{count} tools")
+    };
+    html! {
+        section(style: "margin-bottom:0.1rem") {
+            // Heading row: a collapse button on the left, the aggregate pill on
+            // the right (a sibling, so its clicks don't trip the collapse).
+            div(
+                "data-show": "$capQuery === ''",
+                style: (format!("display:flex; align-items:center; gap:0.4rem; padding:0.1rem {ROW_PAD_X} 0.1rem 0.2rem"))
+            ) {
+                button(
+                    type: "button",
+                    "data-on:click": (format!("{open_expr} = !{open_expr}")),
+                    class: "flex-1 flex items-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-base-200",
+                    style: "text-align:left; min-width:0"
+                ) {
+                    span(
+                        style: "display:inline-flex; transition:transform .12s; transform:rotate(-90deg)",
+                        // Points right when collapsed, rotates down when open.
+                        "data-attr-style": (format!(
+                            "'display:inline-flex; transition:transform .12s; transform:rotate(' + ({open_expr} ? '0' : '-90') + 'deg)'"
+                        ))
+                    ) { (icons::chevron_down(14)) }
+                    span(style: "flex:1; font-size:0.7rem; font-weight:700; letter-spacing:0.05em; \
+                                 text-transform:uppercase; opacity:0.7; min-width:0") {
+                        (group.to_string())
+                    }
+                    span(style: "font-size:0.65rem; opacity:0.45") { (count_label) }
+                }
+                (render_group_pill(base, group, rows))
+            }
+            div("data-show": (body_show)) {
+                for c in rows.iter() {
+                    (render_cap_row(base, c))
+                }
             }
         }
     }
     .to_html()
 }
 
-/// A clearly-set-off section heading inside the "+" menu (tinted pill, bold,
-/// uppercase). Hidden while a search filter is active (the flat result list
-/// reads better without group labels).
-fn group_heading(label: &str) -> Html {
+/// One capability row: a header line (icon + label + the tri-state segmented
+/// control on the right), with the plain-language description as a full-width
+/// block *below* — so it flows under the control too and uses fewer lines,
+/// instead of being boxed into a narrow left column. The row wrapper carries
+/// the search-filter `data-show` and is never re-patched, so the filter
+/// survives a toggle; only the inner `#cap-seg-*` control is patched.
+fn render_cap_row(base: &str, c: &CapabilityRow) -> Html {
+    let label_lower =
+        serde_json::to_string(&c.label.to_lowercase()).unwrap_or_else(|_| "\"\"".to_string());
+    let desc_lower =
+        serde_json::to_string(&c.description.to_lowercase()).unwrap_or_else(|_| "\"\"".to_string());
+    // Match the label or the description, so searching "domain" finds DNS/WHOIS.
+    let show = format!(
+        "$capQuery === '' || {label_lower}.includes($capQuery) || {desc_lower}.includes($capQuery)"
+    );
+    let has_desc = !c.description.is_empty();
     html! {
         div(
-            "data-show": "$capQuery === ''",
-            style: "margin:0.15rem 0; padding:0.3rem 0.55rem; font-size:0.66rem; \
-                    font-weight:700; letter-spacing:0.06em; text-transform:uppercase; \
-                    opacity:0.65; background:color-mix(in oklch, currentColor 7%, transparent); \
-                    border-radius:0.35rem"
-        ) { (label.to_string()) }
+            id: (cap_row_id(c)),
+            "data-show": (show),
+            style: (format!("padding:0.4rem {ROW_PAD_X}; border-radius:0.5rem"))
+        ) {
+            div(style: "display:flex; align-items:center; gap:0.5rem") {
+                span(style: "display:inline-flex; width:1.1rem; justify-content:center; opacity:0.85; flex:none") {
+                    (cap_icon(c))
+                }
+                span(style: "flex:1; min-width:0; font-size:0.82rem; font-weight:500") {
+                    (c.label.clone())
+                }
+                (render_cap_segment(base, c))
+            }
+            if has_desc {
+                // Full-width: spans under the icon *and* the control.
+                div(style: "font-size:0.72rem; opacity:0.6; margin-top:0.15rem; line-height:1.35") {
+                    (c.description.clone())
+                }
+            }
+        }
     }
     .to_html()
 }
 
-/// `@post` URL that flips one capability's state for this conversation. The
-/// kind + key ride in the query (the button isn't inside a form on this path).
-fn cap_toggle_url(base: &str, c: &CapabilityRow) -> String {
-    format!("{base}?kind={}&key={}", c.kind.as_str(), c.key)
+/// Active-capability chips below the "+" button: the force-**On** tools and
+/// loaded skills. Clicking a chip returns it to Auto (un-pin). `#cap-chips` is
+/// patched whenever the On set changes.
+fn render_cap_chips(base: &str, caps: &[CapabilityRow]) -> Html {
+    html! {
+        div(id: "cap-chips", style: "display:contents") {
+            for c in caps.iter().filter(|c| c.is_on()) {
+                button(
+                    type: "button",
+                    // Un-pin → Auto (model may still enable on demand).
+                    "data-on:click": (format!(
+                        "@post('{base}?kind={}&key={}&state=auto')", c.kind.as_str(), c.key
+                    )),
+                    class: "badge badge-outline gap-1",
+                    style: "cursor:pointer",
+                    title: "Unpin (back to automatic)"
+                ) {
+                    span(style: "display:inline-flex") { (cap_icon(c)) }
+                    span { (c.label.clone()) }
+                    span(class: "opacity-60") { "×" }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// The per-row tri-state segmented control (`#cap-seg-<kind>-<key>`). Tools get
+/// all three segments; skills get only Auto / On (a skill can't be "blocked").
+fn render_cap_segment(base: &str, c: &CapabilityRow) -> Html {
+    let include_off = c.kind == CapKind::Tool;
+    segmented(
+        &cap_seg_id(c),
+        base,
+        c.kind.as_str(),
+        &c.key,
+        Some(c.state),
+        include_off,
+    )
+}
+
+/// The group-aggregate pill (`#cap-grp-<slug>`): a segmented control that sets
+/// every row in the group at once. Its active segment reflects the aggregate —
+/// none highlighted when the rows disagree (mixed).
+fn render_group_pill(base: &str, group: &'static str, rows: &[&CapabilityRow]) -> Html {
+    let include_off = group != "Skills";
+    segmented(
+        &format!("cap-grp-{}", group_slug(group)),
+        base,
+        "group",
+        &group_slug(group),
+        aggregate_state(rows),
+        include_off,
+    )
+}
+
+/// The master pill (`#cap-all`): sets every capability at once. Three segments
+/// (applying Off to a skill is treated as Auto by the handler).
+fn render_master_pill(base: &str, caps: &[CapabilityRow]) -> Html {
+    let rows: Vec<&CapabilityRow> = caps.iter().collect();
+    segmented("cap-all", base, "all", "*", aggregate_state(&rows), true)
+}
+
+/// Render a segmented Off/Auto/On (or Auto/On) control. `current` is the active
+/// tier, or `None` for a mixed aggregate (nothing highlighted). Each segment
+/// `@post`s `?kind=&key=&state=` — the same endpoint for rows, groups, and All.
+fn segmented(
+    id: &str,
+    base: &str,
+    kind: &str,
+    key: &str,
+    current: Option<ToolState>,
+    include_off: bool,
+) -> Html {
+    let mut segs: Vec<ToolState> = Vec::new();
+    if include_off {
+        segs.push(ToolState::Off);
+    }
+    segs.push(ToolState::Auto);
+    segs.push(ToolState::On);
+    html! {
+        span(
+            id: (id),
+            style: "display:inline-flex; flex:none; border-radius:9999px; overflow:hidden; \
+                    border:1px solid color-mix(in oklch, currentColor 18%, transparent)"
+        ) {
+            for st in segs.iter() {
+                (seg_button(base, kind, key, *st, current == Some(*st)))
+            }
+        }
+    }
+    .to_html()
+}
+
+/// One segment button within a [`segmented`] control.
+fn seg_button(base: &str, kind: &str, key: &str, st: ToolState, active: bool) -> Html {
+    let (glyph, tip, active_color) = match st {
+        ToolState::Off => (
+            "⊘",
+            "Off — blocked; hidden from the assistant",
+            "var(--color-error, #dc2626)",
+        ),
+        ToolState::Auto => (
+            "◐",
+            "Auto — the assistant turns it on when a request needs it",
+            "currentColor",
+        ),
+        ToolState::On => (
+            "✓",
+            "On — always available to the assistant",
+            "var(--color-success, #16a34a)",
+        ),
+    };
+    let base_style = "padding:0.05rem 0.45rem; font-size:0.8rem; line-height:1.5; \
+                      background:transparent; border:0; cursor:pointer";
+    let style = if active {
+        format!(
+            "{base_style}; background:color-mix(in oklch, currentColor 16%, transparent); \
+             font-weight:700; color:{active_color}"
+        )
+    } else {
+        format!("{base_style}; opacity:0.5")
+    };
+    html! {
+        button(
+            type: "button",
+            title: (tip),
+            "aria-label": (tip),
+            "data-on:click": (format!("@post('{base}?kind={kind}&key={key}&state={}')", st.as_str())),
+            style: (style)
+        ) { (glyph) }
+    }
+    .to_html()
+}
+
+/// The aggregate tier of a group: `Some(state)` when every row agrees, else
+/// `None` (mixed). An empty group reads as Auto.
+fn aggregate_state(rows: &[&CapabilityRow]) -> Option<ToolState> {
+    let mut it = rows.iter();
+    let first = match it.next() {
+        Some(c) => c.state,
+        None => return Some(ToolState::Auto),
+    };
+    if it.all(|c| c.state == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+/// DOM id for a row's segmented control. Patched in place on a toggle.
+fn cap_seg_id(c: &CapabilityRow) -> String {
+    format!("cap-seg-{}-{}", c.kind.as_str(), c.key)
+}
+
+/// DOM id for a row wrapper (structural — never re-patched).
+fn cap_row_id(c: &CapabilityRow) -> String {
+    format!("cap-row-{}-{}", c.kind.as_str(), c.key)
+}
+
+/// URL-safe slug for a group label (`"Web & Network"` → `"web-network"`), used
+/// both as the `$openCats` key and the group pill's wire `key`.
+pub(super) fn group_slug(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    let mut prev_dash = false;
+    for ch in label.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_string()
 }
 
 /// Icon for a capability row: the connector's brand logo (or its catalog emoji,
@@ -663,55 +1030,6 @@ fn cap_icon(c: &CapabilityRow) -> Html {
                 })
         }
     }
-}
-
-/// One row in the "+" menu: an icon + label button that flips the capability,
-/// with a check when it's on. `data-show` filters it against the search box.
-fn cap_menu_item(base: &str, c: &CapabilityRow) -> Html {
-    let url = cap_toggle_url(base, c);
-    let label_lower =
-        serde_json::to_string(&c.label.to_lowercase()).unwrap_or_else(|_| "\"\"".to_string());
-    let show = format!("$capQuery === '' || {label_lower}.includes($capQuery)");
-    let check = if c.enabled {
-        html! { span(class: "text-success") { (icons::check(16)) } }.to_html()
-    } else {
-        html! { "" }.to_html()
-    };
-    html! {
-        button(
-            type: "button",
-            "data-on:click": (format!("@post('{url}')")),
-            "data-show": (show),
-            class: "w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-base-200 text-sm",
-            style: "text-align:left"
-        ) {
-            span(style: "display:inline-flex; width:1.15rem; justify-content:center; opacity:0.85") {
-                (cap_icon(c))
-            }
-            span(class: "flex-1 truncate") { (c.label.clone()) }
-            (check)
-        }
-    }
-    .to_html()
-}
-
-/// One active-capability chip: an icon + label button that turns it back off.
-fn cap_chip(base: &str, c: &CapabilityRow) -> Html {
-    let url = cap_toggle_url(base, c);
-    html! {
-        button(
-            type: "button",
-            "data-on:click": (format!("@post('{url}')")),
-            class: "badge badge-outline gap-1",
-            style: "cursor:pointer",
-            title: "Remove"
-        ) {
-            span(style: "display:inline-flex") { (cap_icon(c)) }
-            span { (c.label.clone()) }
-            span(class: "opacity-60") { "×" }
-        }
-    }
-    .to_html()
 }
 
 /// The owner's share toggle. datastar-driven: the click `@post`s to flip the
@@ -1092,93 +1410,199 @@ mod tests {
         );
     }
 
+    fn cap(
+        key: &str,
+        kind: CapKind,
+        label: &str,
+        group: &'static str,
+        order: u8,
+        state: ToolState,
+    ) -> CapabilityRow {
+        CapabilityRow {
+            key: key.into(),
+            kind,
+            label: label.into(),
+            description: format!("what {label} does"),
+            group,
+            order,
+            state,
+            icon: None,
+        }
+    }
+
+    fn sample_caps() -> Vec<CapabilityRow> {
+        vec![
+            cap(
+                "dns_lookup",
+                CapKind::Tool,
+                "DNS lookup",
+                "Web & Network",
+                0,
+                ToolState::On,
+            ),
+            cap(
+                "fetch_url",
+                CapKind::Tool,
+                "Fetch a web page",
+                "Web & Network",
+                0,
+                ToolState::Auto,
+            ),
+            cap(
+                "mcp__gitlab",
+                CapKind::Tool,
+                "GitLab",
+                "Integrations",
+                5,
+                ToolState::Off,
+            ),
+            cap(
+                "brand",
+                CapKind::Skill,
+                "Brand",
+                "Skills",
+                SKILL_ORDER,
+                ToolState::Auto,
+            ),
+        ]
+    }
+
     #[test]
-    fn capabilities_menu_wires_toggle_and_reflects_state() {
-        // High-level entries only: connected integrations + skills (no
-        // individual built-in tools).
-        let caps = vec![
-            CapabilityRow {
-                key: "mcp__atlassian".into(),
-                kind: CapKind::Tool,
-                label: "Atlassian".into(),
-                group: "Integrations",
-                enabled: true,
-                icon: None,
-            },
-            CapabilityRow {
-                key: "mcp__gitlab".into(),
-                kind: CapKind::Tool,
-                label: "GitLab".into(),
-                group: "Integrations",
-                enabled: false,
-                icon: None,
-            },
-            CapabilityRow {
-                key: "brand".into(),
-                kind: CapKind::Skill,
-                label: "Brand".into(),
-                group: "Skills",
-                enabled: false,
-                icon: None,
-            },
-        ];
-        let html = render_capabilities("s1", &caps, false).to_string();
-        // Mount target the toggle handler re-patches, and the persistent
-        // open-state signal on the *outer* wrapper (survives the patch).
-        assert!(
-            html.contains("id=\"capabilities\""),
-            "mount id missing: {html}"
-        );
+    fn capabilities_menu_wires_tristate_and_reflects_state() {
+        let caps = sample_caps();
+        let html = render_capabilities("s1", &caps).to_string();
+
+        // Wrapper carries the persistent signals (open / search / collapse).
         assert!(
             html.contains("id=\"cap-wrap\""),
             "wrapper id missing: {html}"
         );
         assert!(
-            html.contains("capMenu"),
-            "open-state signal missing: {html}"
+            html.contains("id=\"capabilities\""),
+            "mount id missing: {html}"
         );
-        // Group headings give clear section structure.
         assert!(
-            html.contains("Integrations") && html.contains("Skills"),
-            "section headings missing: {html}"
+            html.contains("capMenu") && html.contains("openCats"),
+            "signals missing: {html}"
         );
-        // Every toggle is a plain button that @posts to the capabilities
-        // endpoint with kind+key in the query (no nested <form> — the composer
-        // is the page's only form).
+
+        // No nested <form> — the composer is the page's only form.
         assert!(
             !html.contains("<form"),
-            "capability toggles must not be nested forms: {html}"
+            "capability controls must not be nested forms: {html}"
+        );
+
+        // Category section headings present.
+        assert!(
+            html.contains("Web &amp; Network"),
+            "category heading missing: {html}"
+        );
+        assert!(html.contains("Skills"), "skills heading missing: {html}");
+
+        // Per-row segmented controls carry their stable ids and all three
+        // states wire to the same endpoint with kind=tool&key&state.
+        assert!(
+            html.contains("id=\"cap-seg-tool-dns_lookup\""),
+            "row seg id missing: {html}"
         );
         assert!(
-            html.contains("/chat/s1/capabilities?kind=tool&amp;key=mcp__atlassian"),
-            "integration toggle must @post kind+key in the query: {html}"
+            html.contains("kind=tool&amp;key=dns_lookup&amp;state=on"),
+            "On segment must wire kind+key+state: {html}"
         );
         assert!(
-            html.contains("kind=skill&amp;key=brand"),
-            "skill toggle must be wired by kind=skill: {html}"
+            html.contains("kind=tool&amp;key=dns_lookup&amp;state=off"),
+            "Off segment must wire state=off: {html}"
         );
         assert!(
-            html.contains("kind=tool&amp;key=mcp__gitlab"),
-            "second integration toggle must be wired: {html}"
+            html.contains("kind=tool&amp;key=dns_lookup&amp;state=auto"),
+            "Auto segment must wire state=auto: {html}"
         );
-        // The enabled capability shows as a removable chip (the `×`); a disabled
-        // one only appears in the menu.
-        assert!(html.contains("Atlassian"), "enabled label missing: {html}");
+
+        // Group + master aggregate pills exist and wire kind=group / kind=all.
         assert!(
-            html.contains("×"),
-            "enabled chip must carry a remove affordance: {html}"
+            html.contains("id=\"cap-grp-web-network\""),
+            "group pill id missing: {html}"
         );
-        // Closed by default (page load); the toggle-handler re-render passes
-        // `open: true` so the menu stays up while pinning several things.
+        assert!(
+            html.contains("id=\"cap-all\""),
+            "master pill missing: {html}"
+        );
+        assert!(
+            html.contains("kind=group&amp;key=web-network&amp;state=on"),
+            "group pill must wire kind=group with slug: {html}"
+        );
+        assert!(
+            html.contains("kind=all&amp;key=*&amp;state=on"),
+            "master pill must wire kind=all: {html}"
+        );
+
+        // Skills get a 2-state control: no Off segment for the skill row.
+        assert!(
+            !html.contains("kind=skill&amp;key=brand&amp;state=off"),
+            "skills must not expose an Off segment: {html}"
+        );
+        assert!(
+            html.contains("kind=skill&amp;key=brand&amp;state=on"),
+            "skill On segment must wire: {html}"
+        );
+
+        // The On tool surfaces as a removable chip that un-pins back to Auto.
+        assert!(
+            html.contains("id=\"cap-chips\""),
+            "chips region missing: {html}"
+        );
+        assert!(
+            html.contains("kind=tool&amp;key=dns_lookup&amp;state=auto"),
+            "On chip must un-pin to Auto: {html}"
+        );
+
+        // Closed by default on page load.
         assert!(
             html.contains("display:none"),
             "menu must start closed: {html}"
         );
-        let open = render_capabilities("s1", &caps, true).to_string();
+    }
+
+    #[test]
+    fn capability_patches_target_only_volatile_leaves() {
+        let caps = sample_caps();
+        let patches = render_capability_patches("s1", &caps);
+        let selectors: Vec<&str> = patches.iter().map(|(s, _)| s.as_str()).collect();
+
+        // Every row's seg control, every group pill, the master, and chips.
+        assert!(selectors.contains(&"#cap-seg-tool-dns_lookup"));
+        assert!(selectors.contains(&"#cap-seg-skill-brand"));
+        assert!(selectors.contains(&"#cap-grp-web-network"));
+        assert!(selectors.contains(&"#cap-all"));
+        assert!(selectors.contains(&"#cap-chips"));
+
+        // Crucially: never the signal-bearing structure, so the morph can't
+        // reset open/collapse or search.
         assert!(
-            open.contains("display:block"),
-            "open render must show the menu: {open}"
+            !selectors
+                .iter()
+                .any(|s| *s == "#cap-wrap" || *s == "#capabilities"),
+            "patches must not touch the signal-bearing containers: {selectors:?}"
         );
+    }
+
+    #[test]
+    fn group_slug_is_url_safe() {
+        assert_eq!(group_slug("Web & Network"), "web-network");
+        assert_eq!(
+            group_slug("Attachments & Documents"),
+            "attachments-documents"
+        );
+        assert_eq!(group_slug("Skills"), "skills");
+    }
+
+    #[test]
+    fn aggregate_state_detects_mixed() {
+        let on = cap("a", CapKind::Tool, "A", "G", 0, ToolState::On);
+        let off = cap("b", CapKind::Tool, "B", "G", 0, ToolState::Off);
+        assert_eq!(aggregate_state(&[&on, &on]), Some(ToolState::On));
+        assert_eq!(aggregate_state(&[&on, &off]), None);
+        assert_eq!(aggregate_state(&[]), Some(ToolState::Auto));
     }
 
     #[test]

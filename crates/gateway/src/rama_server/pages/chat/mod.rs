@@ -493,67 +493,104 @@ pub async fn chat_capabilities_toggle(
         Ok(f) => f,
         Err(err) => return internal_error_html(&user.email, &format!("malformed query: {err}")),
     };
-    match form.kind.as_str() {
-        "skill" => {
-            // Toggle skill stickiness: load (record) ↔ unload (remove).
-            let loaded =
-                crate::server::db::chat_session_skills::loaded_for_session(&state.db, &session_id)
-                    .await
-                    .unwrap_or_default();
-            let res = if loaded.iter().any(|s| s == &form.key) {
-                crate::server::db::chat_session_skills::remove(&state.db, &session_id, &form.key)
-                    .await
-            } else {
-                crate::server::db::chat_session_skills::record(&state.db, &session_id, &form.key)
-                    .await
-            };
-            if let Err(err) = res {
-                return internal_error_html(&user.email, &err.to_string());
-            }
+    // Normalise the requested tier; bail on anything unexpected.
+    let target = match form.state.as_deref() {
+        Some("on") => render::ToolState::On,
+        Some("off") => render::ToolState::Off,
+        Some("auto") => render::ToolState::Auto,
+        other => {
+            return internal_error_html(
+                &user.email,
+                &format!("unknown capability state: {other:?}"),
+            );
         }
-        _ => {
-            // "tool" (built-in tool or MCP connector toggle key): flip its row.
-            let enabled = crate::server::db::chat_session_tools::enabled_keys_for_session(
-                &state.db,
-                &session_id,
-            )
-            .await
-            .unwrap_or_default();
-            let now_on = !enabled.contains(&form.key);
-            if let Err(err) = crate::server::db::chat_session_tools::set(
-                &state.db,
-                &session_id,
-                &form.key,
-                now_on,
-                "user",
-            )
-            .await
-            {
-                return internal_error_html(&user.email, &err.to_string());
-            }
+    };
+
+    // `group`/`all` fan a single click out across the affected rows; `tool`/
+    // `skill` apply to one. Resolve the set from the *current* capability list
+    // so a group's membership matches exactly what's on screen.
+    let caps_before = build_capabilities(&state, &user, &session_id).await;
+    let targets: Vec<(render::CapKind, String)> = match form.kind.as_str() {
+        "all" => caps_before
+            .iter()
+            .map(|c| (c.kind, c.key.clone()))
+            .collect(),
+        "group" => caps_before
+            .iter()
+            .filter(|c| render::group_slug(c.group) == form.key)
+            .map(|c| (c.kind, c.key.clone()))
+            .collect(),
+        "skill" => vec![(render::CapKind::Skill, form.key.clone())],
+        // "tool" (built-in group or MCP connector toggle key).
+        _ => vec![(render::CapKind::Tool, form.key.clone())],
+    };
+
+    for (kind, key) in &targets {
+        if let Err(err) = apply_capability_state(&state, &session_id, *kind, key, target).await {
+            return internal_error_html(&user.email, &err.to_string());
         }
     }
+
     if !datastar {
         return see_other(&format!("/chat/{session_id}"));
     }
-    let caps = build_capabilities(&state, &user, &session_id).await;
-    // Patch only the inner `#capabilities` (NOT `#cap-wrap`, whose `$capMenu`
-    // signal must persist) and render it open: the user toggled from inside the
-    // menu, so keep it up for the next pick.
-    let region = render::render_capabilities_inner(&session_id, &caps, true).to_string();
-    // Clear the search box after a pick (the patched input re-renders empty;
-    // resetting the signal keeps the filtered list in sync) and leave `capMenu`
-    // untouched so the menu stays open.
-    sse_response(&[
-        sse_patch(Some("#capabilities"), Some("outer"), &region),
-        sse_signals(r#"{"capQuery": ""}"#),
-    ])
+    // Patch only the volatile leaves — the segmented controls, the aggregate
+    // pills, and the chips — never the section containers or the search box, so
+    // the open/collapse and search signals on `#cap-wrap` survive untouched.
+    let caps_after = build_capabilities(&state, &user, &session_id).await;
+    let patches = render::render_capability_patches(&session_id, &caps_after);
+    let events: Vec<_> = patches
+        .iter()
+        .map(|(sel, html)| sse_patch(Some(sel), Some("outer"), html))
+        .collect();
+    sse_response(&events)
+}
+
+/// Apply one tier to one capability, routing to the right overlay. Tools use
+/// the tri-state `chat_session_tools` rows (On=`set(true)`, Off=`set(false)`,
+/// Auto=`clear`); skills are two-state in `chat_session_skills` (On=record,
+/// anything else=remove), so applying Off/Auto to a skill simply unloads it.
+async fn apply_capability_state(
+    state: &RamaState,
+    session_id: &str,
+    kind: render::CapKind,
+    key: &str,
+    target: render::ToolState,
+) -> Result<(), crate::server::db::DbError> {
+    use render::{CapKind, ToolState};
+    match kind {
+        CapKind::Skill => {
+            if target == ToolState::On {
+                crate::server::db::chat_session_skills::record(&state.db, session_id, key).await
+            } else {
+                crate::server::db::chat_session_skills::remove(&state.db, session_id, key).await
+            }
+        }
+        CapKind::Tool => match target {
+            ToolState::On => {
+                crate::server::db::chat_session_tools::set(&state.db, session_id, key, true, "user")
+                    .await
+            }
+            ToolState::Off => {
+                crate::server::db::chat_session_tools::set(
+                    &state.db, session_id, key, false, "user",
+                )
+                .await
+            }
+            ToolState::Auto => {
+                crate::server::db::chat_session_tools::clear(&state.db, session_id, key).await
+            }
+        },
+    }
 }
 
 #[derive(serde::Deserialize)]
 struct CapabilityForm {
     kind: String,
+    /// Toggle key for `tool`/`skill`, group slug for `group`, `"*"` for `all`.
     key: String,
+    /// Requested tier: `on` | `off` | `auto`.
+    state: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -613,13 +650,37 @@ async fn build_capabilities(
     user: &User,
     session_id: &str,
 ) -> Vec<render::CapabilityRow> {
-    use render::{CapKind, CapabilityRow};
+    use crate::server::tools::catalog::Category;
+    use render::{CapKind, CapabilityRow, SKILL_ORDER, ToolState};
 
     let mut out: Vec<CapabilityRow> = Vec::new();
-    let enabled =
-        crate::server::db::chat_session_tools::enabled_keys_for_session(&state.db, session_id)
-            .await
-            .unwrap_or_default();
+    // Per-conversation tri-state for every recorded tool key (present → on/off;
+    // absent → Auto). One query covers On, Off, and Auto.
+    let states = crate::server::db::chat_session_tools::states_for_session(&state.db, session_id)
+        .await
+        .unwrap_or_default();
+
+    // Built-in tool groups the user's roles grant — the same grouped, de-noised
+    // catalog the `/tools` page renders, carrying each group's plain-language
+    // description. MCP connectors are dropped here (the `Integrations` rows
+    // would be generic); the user's actual connected connectors are added below
+    // with their real names + brand icons.
+    for entry in crate::rama_server::pages::entries_for_roles(state, &user.roles) {
+        if entry.category == Category::Integrations {
+            continue;
+        }
+        let state_tier = ToolState::from_row(states.get(&entry.key).copied());
+        out.push(CapabilityRow {
+            key: entry.key,
+            kind: CapKind::Tool,
+            label: entry.title,
+            description: entry.description,
+            group: entry.category.label(),
+            order: entry.category.order(),
+            state: state_tier,
+            icon: None,
+        });
+    }
 
     // Integrations: the connectors the caller has connected. One row per
     // connector, keyed `mcp__<connector>` — that single toggle governs every
@@ -641,42 +702,53 @@ async fn build_capabilities(
                 continue;
             }
             let key = format!("{}{ck}", crate::server::tools::mcp::MCP_ID_PREFIX);
-            let on = enabled.contains(&key);
+            let state_tier = ToolState::from_row(states.get(&key).copied());
+            let description = c
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("Tools bridged from the \"{}\" integration.", c.name));
             out.push(CapabilityRow {
                 key,
                 kind: CapKind::Tool,
                 label: c.name,
-                group: "Integrations",
-                enabled: on,
+                description,
+                group: Category::Integrations.label(),
+                order: Category::Integrations.order(),
+                state: state_tier,
                 icon: c.icon,
             });
         }
     }
 
-    // Permitted skills (sticky once loaded). Label with the skill's
-    // human-readable title (frontmatter `title`, else a prettified slug)
-    // rather than the bare `name` slug.
+    // Permitted skills (sticky once loaded). Two-state: On (loaded) / Auto (the
+    // model may load it on demand). Label with the skill's human-readable title
+    // (frontmatter `title`, else a prettified slug) rather than the bare slug.
     let loaded = crate::server::db::chat_session_skills::loaded_for_session(&state.db, session_id)
         .await
         .unwrap_or_default();
     let skill_reg = state.skills.as_ref().map(|s| s.current());
     for name in state.allowed_skills_for(&user.roles) {
         let on = loaded.iter().any(|s| s == &name);
-        let label = skill_reg
+        let (label, description) = skill_reg
             .as_ref()
             .and_then(|r| r.get(&name))
-            .map(|s| s.title.clone())
-            .unwrap_or_else(|| name.clone());
+            .map(|s| (s.title.clone(), s.description.clone()))
+            .unwrap_or_else(|| (name.clone(), String::new()));
         out.push(CapabilityRow {
             key: name,
             kind: CapKind::Skill,
             label,
+            description,
             group: "Skills",
-            enabled: on,
+            order: SKILL_ORDER,
+            state: if on { ToolState::On } else { ToolState::Auto },
             icon: None,
         });
     }
 
+    // Stable order: by group order, then label, so sections render
+    // deterministically and the grouping pass sees contiguous runs.
+    out.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.label.cmp(&b.label)));
     out
 }
 

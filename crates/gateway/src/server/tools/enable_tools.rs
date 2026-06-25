@@ -164,10 +164,28 @@ impl Tool for EnableTools {
             // writing rows.
             let known: std::collections::HashSet<&str> =
                 self.catalog.iter().map(|t| t.key.as_str()).collect();
+            // Keys the user explicitly switched **off** in the composer menu.
+            // The user's choice is authoritative: refuse to re-enable these,
+            // so an Off toggle genuinely hides the tool from the model rather
+            // than being a default it can override. A DB hiccup degrades open
+            // (empty set) — refusing a turn over a transient read would be
+            // worse than letting an enable through.
+            let disabled = crate::server::db::chat_session_tools::disabled_keys_for_session(
+                &ctx.db, session_id,
+            )
+            .await
+            .unwrap_or_default();
 
             let mut enabled: Vec<String> = Vec::new();
             let mut skipped: Vec<Value> = Vec::new();
             for key in &args.keys {
+                if disabled.contains(key) {
+                    skipped.push(json!({
+                        "key": key,
+                        "reason": "the user has disabled this tool for this conversation",
+                    }));
+                    continue;
+                }
                 // Accept the static catalog keys, plus any `mcp__*` connector
                 // key (the user's connected integrations aren't in the static
                 // snapshot — they're advertised in the system context). An
@@ -500,6 +518,49 @@ mod tests {
             .unwrap();
         assert!(on.contains("fetch_url"));
         assert!(on.contains("search_web"));
+    }
+
+    #[tokio::test]
+    async fn run_refuses_a_key_the_user_disabled() {
+        // The user switched `fetch_url` off for the conversation (an
+        // `enabled = 0` row). The model must not be able to re-enable it: it
+        // lands in `skipped`, not `enabled`, and no on-row is written.
+        let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+        seed_session(&pool, "s1").await;
+        crate::server::db::chat_session_tools::set(&pool, "s1", "fetch_url", false, "user")
+            .await
+            .unwrap();
+        let reg = ToolRegistry::new().with(FetchUrl).with(SearchWeb);
+        let et = EnableTools::from_registry(&reg);
+        let out = et
+            .run(
+                ctx(pool.clone(), Some("s1".into())).await,
+                json!({"keys": ["fetch_url", "search_web"]}),
+            )
+            .await
+            .unwrap();
+        let enabled: Vec<&str> = out["enabled"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        // Only the un-blocked key goes through.
+        assert_eq!(enabled, vec!["search_web"]);
+        let skipped = out["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["key"], "fetch_url");
+        // The block stands — still off, never flipped on.
+        let on = crate::server::db::chat_session_tools::enabled_keys_for_session(&pool, "s1")
+            .await
+            .unwrap();
+        assert!(!on.contains("fetch_url"));
+        assert!(
+            crate::server::db::chat_session_tools::disabled_keys_for_session(&pool, "s1")
+                .await
+                .unwrap()
+                .contains("fetch_url")
+        );
     }
 
     #[tokio::test]

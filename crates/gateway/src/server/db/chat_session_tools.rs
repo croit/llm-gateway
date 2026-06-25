@@ -14,9 +14,26 @@
 //! by the chat driver auto-enabling on a direct call (`source =
 //! "auto-call"`).
 //!
+//! ## Three states, no schema change
+//!
+//! The composer's "+" menu exposes a *tri-state* per tool — On / Auto / Off
+//! — which the existing `enabled` column already encodes:
+//!
+//! | UI state | row              | meaning                                   |
+//! |----------|------------------|-------------------------------------------|
+//! | **On**   | `enabled = 1`    | force-exposed to the model every turn     |
+//! | **Auto** | *no row*         | lazy — the model may `enable_tools` it    |
+//! | **Off**  | `enabled = 0`    | blocked — hidden *and* `enable_tools` refused |
+//!
+//! Historically an `enabled = 0` row read identically to an absent one (both
+//! just stay out of [`enabled_keys_for_session`]). The Off state gives the
+//! explicit-disable row teeth: [`disabled_keys_for_session`] surfaces it so
+//! `enable_tools` (and the auto-call path) can refuse to turn it back on.
+//! Returning a tool to Auto means *deleting* its row — see [`clear`].
+//!
 //! Schema lives in `migrations/0012_chat_session_tools.sql`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
 use sqlx::Row;
@@ -71,6 +88,63 @@ pub async fn enabled_keys_for_session(
     rows.iter()
         .map(|r| r.try_get::<String, _>("tool_key").map_err(DbError::from))
         .collect()
+}
+
+/// The set of tool-group keys explicitly turned **off** (`enabled = 0`) for
+/// this conversation — the "blocked" tier. `enable_tools` and the chat
+/// driver's auto-call path consult this to refuse re-enabling a tool the
+/// user has switched off, so an Off choice in the composer menu actually
+/// hides the tool from the model rather than being a momentary default.
+pub async fn disabled_keys_for_session(
+    pool: &Pool,
+    session_id: &str,
+) -> Result<HashSet<String>, DbError> {
+    let rows = sqlx::query(
+        r#"SELECT tool_key FROM chat_session_tools
+           WHERE session_id = ? AND enabled = 0"#,
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| r.try_get::<String, _>("tool_key").map_err(DbError::from))
+        .collect()
+}
+
+/// Every recorded toggle key → its on/off flag for this conversation. A key
+/// **absent** from the map is in the Auto tier (no row). Lets the composer
+/// menu render all three tiers from a single query.
+pub async fn states_for_session(
+    pool: &Pool,
+    session_id: &str,
+) -> Result<HashMap<String, bool>, DbError> {
+    let rows = sqlx::query(
+        r#"SELECT tool_key, enabled FROM chat_session_tools
+           WHERE session_id = ?"#,
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            let key = r.try_get::<String, _>("tool_key")?;
+            let enabled = r.try_get::<i64, _>("enabled")? != 0;
+            Ok((key, enabled))
+        })
+        .collect::<Result<HashMap<_, _>, sqlx::Error>>()
+        .map_err(DbError::from)
+}
+
+/// Drop the row governing `tool_key`, returning it to the Auto tier (the
+/// model may enable it again via `enable_tools`). Idempotent — clearing a
+/// key with no row is a no-op.
+pub async fn clear(pool: &Pool, session_id: &str, tool_key: &str) -> Result<(), DbError> {
+    sqlx::query(r#"DELETE FROM chat_session_tools WHERE session_id = ? AND tool_key = ?"#)
+        .bind(session_id)
+        .bind(tool_key)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -152,5 +226,93 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn tristate_on_off_auto_round_trip() {
+        let pool = fresh().await;
+        seed_session(&pool, "s1").await;
+
+        // Auto (no row): in neither the enabled nor the disabled set.
+        assert!(
+            !enabled_keys_for_session(&pool, "s1")
+                .await
+                .unwrap()
+                .contains("web")
+        );
+        assert!(
+            !disabled_keys_for_session(&pool, "s1")
+                .await
+                .unwrap()
+                .contains("web")
+        );
+        assert_eq!(
+            states_for_session(&pool, "s1").await.unwrap().get("web"),
+            None
+        );
+
+        // On.
+        set(&pool, "s1", "web", true, "user").await.unwrap();
+        assert!(
+            enabled_keys_for_session(&pool, "s1")
+                .await
+                .unwrap()
+                .contains("web")
+        );
+        assert!(
+            !disabled_keys_for_session(&pool, "s1")
+                .await
+                .unwrap()
+                .contains("web")
+        );
+        assert_eq!(
+            states_for_session(&pool, "s1").await.unwrap().get("web"),
+            Some(&true)
+        );
+
+        // Off — explicitly blocked, distinct from Auto.
+        set(&pool, "s1", "web", false, "user").await.unwrap();
+        assert!(
+            !enabled_keys_for_session(&pool, "s1")
+                .await
+                .unwrap()
+                .contains("web")
+        );
+        assert!(
+            disabled_keys_for_session(&pool, "s1")
+                .await
+                .unwrap()
+                .contains("web")
+        );
+        assert_eq!(
+            states_for_session(&pool, "s1").await.unwrap().get("web"),
+            Some(&false)
+        );
+
+        // Back to Auto — clearing drops the row entirely.
+        clear(&pool, "s1", "web").await.unwrap();
+        assert!(
+            !enabled_keys_for_session(&pool, "s1")
+                .await
+                .unwrap()
+                .contains("web")
+        );
+        assert!(
+            !disabled_keys_for_session(&pool, "s1")
+                .await
+                .unwrap()
+                .contains("web")
+        );
+        assert_eq!(
+            states_for_session(&pool, "s1").await.unwrap().get("web"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_is_idempotent_on_missing_row() {
+        let pool = fresh().await;
+        seed_session(&pool, "s1").await;
+        clear(&pool, "s1", "nope").await.unwrap();
     }
 }
