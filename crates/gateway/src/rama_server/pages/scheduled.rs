@@ -117,8 +117,25 @@ struct CreateForm {
     model: String,
     timezone: String,
     tools: Option<String>,
+    /// Present (checkbox ticked) = reuse the previous run's chat session.
+    reuse: Option<String>,
+    /// Recent rounds of history to replay when reusing. Absent/invalid falls
+    /// back to the default in [`reuse_rounds_or_default`].
+    reuse_rounds: Option<String>,
     #[serde(flatten)]
     schedule: ScheduleFields,
+}
+
+/// Default replay window when reuse is on but no (valid) count was submitted.
+const DEFAULT_REUSE_ROUNDS: i64 = 5;
+
+/// Clamp the form's reuse-rounds field to a sane 1..=50 window, defaulting
+/// when absent or unparseable. The cap keeps a reused conversation's replayed
+/// history bounded regardless of what the form posts.
+fn reuse_rounds_or_default(raw: Option<&str>) -> i64 {
+    raw.and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|n| n.clamp(1, 50))
+        .unwrap_or(DEFAULT_REUSE_ROUNDS)
 }
 
 /// Preview payload: just enough to compute the summary + next runs.
@@ -216,6 +233,8 @@ pub async fn scheduled_create(State(state): State<Arc<RamaState>>, req: Request)
         cron: prepared.cron,
         timezone: prepared.timezone,
         tools_enabled: form.tools.is_some(),
+        reuse_conversation: form.reuse.is_some(),
+        reuse_rounds: reuse_rounds_or_default(form.reuse_rounds.as_deref()),
         next_run_at: prepared.next_run_at,
     };
     let created = match scheduled::create(&state.db, new).await {
@@ -232,10 +251,14 @@ pub async fn scheduled_create(State(state): State<Arc<RamaState>>, req: Request)
     // so without this the panel + preview would stay on the just-submitted
     // mode. Dispatching `change` on the now-checked radio re-runs its
     // handler ($mode = … + preview refresh), snapping everything back to the
-    // default.
+    // default. The reuse checkbox carries the same wrinkle — `f.reset()`
+    // unchecks it but leaves `$reuse` true, stranding the "send last N
+    // rounds" field visible — so re-dispatch its `change` too.
     let reset_script = "const f = document.getElementById('sched-create-form'); \
          f.reset(); \
          f.querySelector('input[name=mode]:checked')\
+         ?.dispatchEvent(new Event('change', {bubbles: true})); \
+         f.querySelector('input[name=reuse]')\
          ?.dispatchEvent(new Event('change', {bubbles: true}));";
     sse_response(&[
         sse_patch(Some("#sched-list"), Some("append"), &row_html),
@@ -319,6 +342,8 @@ pub async fn scheduled_update(
         cron: prepared.cron,
         timezone: prepared.timezone,
         tools_enabled: form.tools.is_some(),
+        reuse_conversation: form.reuse.is_some(),
+        reuse_rounds: reuse_rounds_or_default(form.reuse_rounds.as_deref()),
         // Keep a paused action paused: only recompute the next fire when
         // it's currently enabled. We re-read to decide.
         next_run_at: prepared.next_run_at,
@@ -736,6 +761,11 @@ fn render_form(
     let name_val = action.map(|a| a.name.clone()).unwrap_or_default();
     let prompt_val = action.map(|a| a.prompt.clone()).unwrap_or_default();
     let tools_on = action.map(|a| a.tools_enabled).unwrap_or(true);
+    let reuse_on = action.map(|a| a.reuse_conversation).unwrap_or(false);
+    let reuse_rounds_val = action
+        .map(|a| a.reuse_rounds)
+        .unwrap_or(DEFAULT_REUSE_ROUNDS)
+        .to_string();
     let submit_directive = format!("@post('{post_url}', {{contentType: 'form'}})");
     let model_opts: Vec<(String, String, bool)> = models
         .iter()
@@ -868,6 +898,44 @@ fn render_form(
                     }
                     span(class: "label-text") {
                         "Allow tools (web search, RAG, attachments) — same as in chat"
+                    }
+                }
+
+                // --- Conversation reuse toggle ---
+                // `$reuse` drives whether the rounds input is enabled, seeded
+                // from the checkbox's initial checked state on mount.
+                div("data-signals": (format!("{{reuse: {reuse_on}}}")), style: "display:none") {}
+                div(class: "flex flex-wrap items-center gap-3") {
+                    label(class: "label cursor-pointer justify-start gap-3") {
+                        if reuse_on {
+                            input(
+                                type: "checkbox", name: "reuse", checked: "checked",
+                                "data-on:change": "$reuse = evt.target.checked",
+                                class: "checkbox checkbox-sm"
+                            );
+                        } else {
+                            input(
+                                type: "checkbox", name: "reuse",
+                                "data-on:change": "$reuse = evt.target.checked",
+                                class: "checkbox checkbox-sm"
+                            );
+                        }
+                        span(class: "label-text") {
+                            "Reuse the previous run's chat — each run continues the same conversation"
+                        }
+                    }
+                    label(class: "flex items-center gap-2 text-sm", "data-show": "$reuse") {
+                        span(class: "label-text opacity-70") { "send last" }
+                        input(
+                            name: "reuse_rounds",
+                            type: "number",
+                            min: "1",
+                            max: "50",
+                            value: (reuse_rounds_val),
+                            "aria-label": "Rounds of history to replay",
+                            class: "input input-bordered input-sm w-20"
+                        );
+                        span(class: "label-text opacity-70") { "rounds" }
                     }
                 }
 

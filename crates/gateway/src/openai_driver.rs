@@ -94,6 +94,11 @@ pub struct OpenAiDriver {
     /// `Chat` for the interactive UI, `Scheduled` for a cron-fired run.
     /// (`/v1` callers go through `rama_server::proxy`, not this driver.)
     pub source: UsageSource,
+    /// Cap on how many prior turns to replay as history. `None` = replay the
+    /// whole session (interactive /chat, and fresh-session scheduled runs).
+    /// `Some(n)` keeps only the most recent `n` turns — used by reuse-mode
+    /// scheduled runs to bound a long-lived conversation's context.
+    pub history_limit: Option<usize>,
 }
 
 /// Build the per-turn [`ToolContext`] for a persisted chat session. This
@@ -207,9 +212,19 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
     let turns = chat::list_turns(&d.state.db, &ctx.session_id)
         .await
         .map_err(upstream_err)?;
-    let mut messages: Vec<serde_json::Value> = turns
+    // Prior turns, oldest-first, minus the in-progress assistant turn.
+    let prior: Vec<_> = turns
         .iter()
         .filter(|t| t.turn.id != ctx.assistant_turn_id)
+        .collect();
+    // `history_limit` keeps only the most recent N turns (reuse-mode
+    // scheduled runs); `None` replays them all.
+    let kept = match d.history_limit {
+        Some(n) => &prior[prior.len().saturating_sub(n)..],
+        None => &prior[..],
+    };
+    let mut messages: Vec<serde_json::Value> = kept
+        .iter()
         .filter_map(|t| message_for_history(&t.turn))
         .collect();
 

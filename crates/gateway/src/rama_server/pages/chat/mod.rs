@@ -1340,6 +1340,7 @@ async fn spawn_assistant_worker(
         state: state.clone(),
         tool_ctx,
         source: crate::server::db::usage::UsageSource::Chat,
+        history_limit: None,
     });
     let driver_ctx = session_core::driver::SessionContext {
         user_id: Some(user.id.clone()),

@@ -263,3 +263,45 @@ async fn create_accepts_full_form_with_all_panel_fields() {
     // mode=weekly with Mon+Wed at 08:30.
     assert_eq!(actions[0].cron, "30 8 * * 1,3");
 }
+
+/// The reuse-conversation toggle + rounds count must round-trip from the
+/// create form into the stored row. Without the checkbox the action defaults
+/// to off (each run opens a fresh session — the pre-existing behaviour).
+#[tokio::test]
+async fn create_round_trips_reuse_fields() {
+    let state = common::state_with_chat_pool("http://unused.invalid").await;
+    let pool = state.db.clone();
+    let cookie = common::seed_session(&state, "frank", "frank@example.com").await;
+    let app = common::app(state);
+
+    // Reuse on, three rounds of history.
+    let with_reuse = "name=Tracker&prompt=Track+it&model=qwen&timezone=Europe%2FBerlin\
+                      &mode=daily&hour=9&minute=0&tools=on&reuse=on&reuse_rounds=3";
+    let resp = app
+        .serve(form_req(Method::POST, "/scheduled", &cookie, with_reuse))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let actions = scheduled::list_for_user(&pool, "frank").await.unwrap();
+    assert_eq!(actions.len(), 1);
+    assert!(
+        actions[0].reuse_conversation,
+        "checkbox should enable reuse"
+    );
+    assert_eq!(actions[0].reuse_rounds, 3);
+
+    // The default form (no reuse field) leaves it off.
+    let resp = app
+        .serve(form_req(Method::POST, "/scheduled", &cookie, DAILY_FORM))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let off = scheduled::list_for_user(&pool, "frank")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.name == "Daily digest")
+        .unwrap();
+    assert!(!off.reuse_conversation, "absent checkbox = reuse off");
+}

@@ -37,6 +37,14 @@ pub struct ScheduledAction {
     /// IANA timezone the cron expression is evaluated in.
     pub timezone: String,
     pub tools_enabled: bool,
+    /// `true` = each fire reuses the previous run's chat session
+    /// (`last_session_id`) so the model sees prior runs as history; `false`
+    /// = each fire opens a fresh session. First run (or a deleted prior
+    /// session) falls back to a fresh session regardless.
+    pub reuse_conversation: bool,
+    /// When reusing, how many recent rounds (one round = the run's prompt +
+    /// reply = 2 turns) of history to replay — caps unbounded growth.
+    pub reuse_rounds: i64,
     /// `false` = paused; the worker ignores it and `next_run_at` is NULL.
     pub enabled: bool,
     /// Precomputed next fire time (UTC). NULL when paused or when the
@@ -62,6 +70,8 @@ pub struct NewAction {
     pub cron: String,
     pub timezone: String,
     pub tools_enabled: bool,
+    pub reuse_conversation: bool,
+    pub reuse_rounds: i64,
     pub next_run_at: Option<Timestamp>,
 }
 
@@ -74,6 +84,8 @@ pub struct EditAction {
     pub cron: String,
     pub timezone: String,
     pub tools_enabled: bool,
+    pub reuse_conversation: bool,
+    pub reuse_rounds: i64,
     pub next_run_at: Option<Timestamp>,
 }
 
@@ -98,6 +110,8 @@ fn map_row(row: &SqliteRow) -> Result<ScheduledAction, DbError> {
         cron: row.try_get("cron")?,
         timezone: row.try_get("timezone")?,
         tools_enabled: row.try_get::<i64, _>("tools_enabled")? != 0,
+        reuse_conversation: row.try_get::<i64, _>("reuse_conversation")? != 0,
+        reuse_rounds: row.try_get("reuse_rounds")?,
         enabled: row.try_get::<i64, _>("enabled")? != 0,
         next_run_at: parse_opt_ts(row.try_get("next_run_at")?, "next_run_at")?,
         last_run_at: parse_opt_ts(row.try_get("last_run_at")?, "last_run_at")?,
@@ -110,8 +124,8 @@ fn map_row(row: &SqliteRow) -> Result<ScheduledAction, DbError> {
 }
 
 const COLS: &str = "id, user_id, name, prompt, model, cron, timezone, tools_enabled, \
-     enabled, next_run_at, last_run_at, last_status, last_session_id, last_error, \
-     created_at, updated_at";
+     reuse_conversation, reuse_rounds, enabled, next_run_at, last_run_at, last_status, \
+     last_session_id, last_error, created_at, updated_at";
 
 /// Insert a new action. Returns the stored row.
 pub async fn create(pool: &Pool, new: NewAction) -> Result<ScheduledAction, DbError> {
@@ -125,6 +139,8 @@ pub async fn create(pool: &Pool, new: NewAction) -> Result<ScheduledAction, DbEr
         cron: new.cron,
         timezone: new.timezone,
         tools_enabled: new.tools_enabled,
+        reuse_conversation: new.reuse_conversation,
+        reuse_rounds: new.reuse_rounds,
         enabled: true,
         next_run_at: new.next_run_at,
         last_run_at: None,
@@ -137,8 +153,8 @@ pub async fn create(pool: &Pool, new: NewAction) -> Result<ScheduledAction, DbEr
     sqlx::query(
         r#"INSERT INTO scheduled_actions
               (id, user_id, name, prompt, model, cron, timezone, tools_enabled,
-               enabled, next_run_at, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)"#,
+               reuse_conversation, reuse_rounds, enabled, next_run_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)"#,
     )
     .bind(&row.id)
     .bind(&row.user_id)
@@ -148,6 +164,8 @@ pub async fn create(pool: &Pool, new: NewAction) -> Result<ScheduledAction, DbEr
     .bind(&row.cron)
     .bind(&row.timezone)
     .bind(row.tools_enabled as i64)
+    .bind(row.reuse_conversation as i64)
+    .bind(row.reuse_rounds)
     .bind(row.next_run_at.map(|t| t.to_string()))
     .bind(row.created_at.to_string())
     .bind(row.updated_at.to_string())
@@ -187,7 +205,8 @@ pub async fn update(
     let affected = sqlx::query(
         r#"UPDATE scheduled_actions
            SET name = ?, prompt = ?, model = ?, cron = ?, timezone = ?,
-               tools_enabled = ?, next_run_at = ?, updated_at = ?
+               tools_enabled = ?, reuse_conversation = ?, reuse_rounds = ?,
+               next_run_at = ?, updated_at = ?
            WHERE id = ? AND user_id = ?"#,
     )
     .bind(&edit.name)
@@ -196,6 +215,8 @@ pub async fn update(
     .bind(&edit.cron)
     .bind(&edit.timezone)
     .bind(edit.tools_enabled as i64)
+    .bind(edit.reuse_conversation as i64)
+    .bind(edit.reuse_rounds)
     .bind(edit.next_run_at.map(|t| t.to_string()))
     .bind(Timestamp::now().to_string())
     .bind(id)
@@ -346,6 +367,8 @@ mod tests {
             cron: "0 9 * * *".to_string(),
             timezone: "Europe/Berlin".to_string(),
             tools_enabled: true,
+            reuse_conversation: false,
+            reuse_rounds: 5,
             next_run_at: next,
         }
     }

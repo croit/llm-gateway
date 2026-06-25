@@ -435,6 +435,8 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
                 cron: cron.into(),
                 timezone: "Europe/Berlin".into(),
                 tools_enabled: true,
+                reuse_conversation: false,
+                reuse_rounds: 5,
                 next_run_at: Some(next.parse()?),
             },
         )
