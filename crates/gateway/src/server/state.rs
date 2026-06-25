@@ -51,6 +51,11 @@ pub struct AppState {
     /// one bound to the same pool + ephemeral crypto; production overrides via
     /// [`Self::with_mcp`].
     pub mcp: Arc<crate::server::tools::mcp::manager::McpConnectionManager>,
+    /// Display metadata for the discovered typst templates (manifest title +
+    /// description), snapshotted at startup. The catalog needs it to render a
+    /// per-template toggle row — the human title isn't in the tool schema.
+    /// Empty when `[typst]` isn't configured.
+    pub typst_templates: Arc<Vec<crate::server::tools::catalog::TemplateMeta>>,
 }
 
 impl AppState {
@@ -79,7 +84,18 @@ impl AppState {
             skills: None,
             mcp_crypto,
             mcp,
+            typst_templates: Arc::new(Vec::new()),
         }
+    }
+
+    /// Install the discovered typst templates' display metadata (for the
+    /// per-template toggle rows in the tool menu / `/tools` page).
+    pub fn with_typst_templates(
+        mut self,
+        templates: Vec<crate::server::tools::catalog::TemplateMeta>,
+    ) -> Self {
+        self.typst_templates = Arc::new(templates);
+        self
     }
 
     /// Skill names this caller's roles permit, intersected with what's

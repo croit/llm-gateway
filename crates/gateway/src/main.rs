@@ -129,6 +129,10 @@ async fn main() -> anyhow::Result<()> {
             )),
             _ => None,
         };
+    // Display metadata for the discovered templates, for the per-template
+    // toggle rows in the tool menu / `/tools` page (the human title isn't in
+    // the tool schema). Stays empty when `[typst]` isn't configured.
+    let mut typst_metas: Vec<srv::tools::catalog::TemplateMeta> = Vec::new();
     if let Some(typst_cfg) = config.typst.as_ref() {
         // Discover one tool per template directory. Failures here
         // are warnings, not errors: a broken templates_dir
@@ -150,6 +154,13 @@ async fn main() -> anyhow::Result<()> {
                     let t = std::sync::Arc::new(t);
                     let render_id = format!("typst_{}", t.id);
                     let pptx = t.pptx.is_some();
+                    // The render id is the per-template toggle key (see
+                    // `catalog::entry_key_for`); snapshot the display copy.
+                    typst_metas.push(srv::tools::catalog::TemplateMeta {
+                        key: render_id.clone(),
+                        title: t.title.clone(),
+                        description: t.description.clone(),
+                    });
                     tool_registry = tool_registry
                         .with(srv::tools::typst_render::TypstRenderTool::new(
                             t.clone(),
@@ -273,7 +284,9 @@ async fn main() -> anyhow::Result<()> {
     // anyway with `state.oidc = None`; /auth/* returns a clean 500 then.
     let oidc = build_oidc_with_retry(&config).await;
 
-    let mut state = AppState::new(config, db, upstreams, tools, rbac).with_mcp_crypto(mcp_crypto);
+    let mut state = AppState::new(config, db, upstreams, tools, rbac)
+        .with_mcp_crypto(mcp_crypto)
+        .with_typst_templates(typst_metas);
     if let Some(client) = oidc {
         state = state.with_oidc(client);
     }

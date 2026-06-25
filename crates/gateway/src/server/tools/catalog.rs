@@ -19,12 +19,17 @@ use std::collections::HashSet;
 
 use super::ToolRegistry;
 
-/// All `typst_<id>` tools share this single toggle key — one switch
-/// governs the whole document-rendering family rather than one per
-/// template (templates come and go; the capability is what the user
-/// reasons about).
-const TYPST_PREFIX: &str = "typst_";
-const TYPST_KEY: &str = "typst";
+/// Prefix shared by every per-template typst tool (`typst_<id>` and its
+/// `_edit`/`_read`/`_pptx` variants). Each *template* is its own toggle now —
+/// `entry_key_for` maps a template's render tool + variants to one key
+/// (`typst_<id>`) so a single switch governs that whole template's family,
+/// while different templates stay independently selectable.
+pub const TYPST_PREFIX: &str = "typst_";
+
+/// Tool-id suffixes of the per-template variant tools. `entry_key_for` strips
+/// these to recover the template's render id (its toggle key); discovery
+/// rejects template ids ending in any of them so the strip is unambiguous.
+const TYPST_VARIANT_SUFFIXES: &[&str] = &["_edit", "_read", "_pptx"];
 
 /// The `remember` + `recall` tools are two halves of one capability, so
 /// they collapse to a single "memory" toggle — one switch turns
@@ -58,6 +63,9 @@ const HIDDEN: &[&str] = &["company_echo"];
 pub enum Category {
     Web,
     Documents,
+    /// Per-template typst document tools (`typst_<id>`) — one row per
+    /// operator-installed template, individually selectable.
+    Templates,
     /// Semantic search over operator-indexed knowledge bases (`rag_*`) —
     /// the user's own repositories and documents.
     Knowledge,
@@ -75,6 +83,7 @@ impl Category {
         match self {
             Category::Web => "Web & Network",
             Category::Documents => "Attachments & Documents",
+            Category::Templates => "Document templates",
             Category::Knowledge => "Knowledge base",
             Category::Code => "Code & Sandbox",
             Category::Memory => "Memory",
@@ -88,11 +97,12 @@ impl Category {
         match self {
             Category::Web => 0,
             Category::Documents => 1,
-            Category::Knowledge => 2,
-            Category::Code => 3,
-            Category::Memory => 4,
-            Category::Integrations => 5,
-            Category::Utility => 6,
+            Category::Templates => 2,
+            Category::Knowledge => 3,
+            Category::Code => 4,
+            Category::Memory => 5,
+            Category::Integrations => 6,
+            Category::Utility => 7,
         }
     }
 }
@@ -110,6 +120,28 @@ pub struct ToolEntry {
     pub category: Category,
 }
 
+/// Display metadata for one discovered typst template, snapshotted at startup
+/// (the human `title` lives in the manifest, not the tool schema, so the
+/// catalog can't recover it from the registry alone). `key` is the
+/// per-template toggle key — the render id `typst_<id>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateMeta {
+    pub key: String,
+    pub title: String,
+    pub description: String,
+}
+
+/// Turn a slug into a human label: `quarterly_report` → "Quarterly report".
+/// Used as the fallback template name when a manifest declares no `title`.
+pub fn prettify(slug: &str) -> String {
+    let spaced = slug.replace(['_', '-'], " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Tool id of the lone always-on bootstrap. It can't itself be enabled
 /// via the per-conversation overlay (chicken-and-egg), so it's the one
 /// exception baked into [`allowed_tools_for_session`]. Every other tool —
@@ -117,12 +149,20 @@ pub struct ToolEntry {
 /// model calling this one with the relevant key.
 pub const BOOTSTRAP_TOOL_ID: &str = "enable_tools";
 
-/// The toggle key that governs a registered tool id. `typst_<id>` all
-/// collapse to `typst`; every other tool is its own key. Pure + cheap
-/// so the request path can call it per id without touching the DB.
+/// The toggle key that governs a registered tool id. Each typst *template*
+/// is its own key: `typst_<id>` plus its `_edit`/`_read`/`_pptx` variants all
+/// collapse to `typst_<id>` (the render id), so one switch governs that
+/// template's whole family while different templates stay independent. Every
+/// other tool is its own key. Pure + cheap so the request path can call it per
+/// id without touching the DB.
 pub fn entry_key_for(tool_id: &str) -> &str {
     if tool_id.starts_with(TYPST_PREFIX) {
-        TYPST_KEY
+        // Strip a variant suffix to recover the template's render id. Template
+        // ids can't end in these (rejected at discovery), so this is exact.
+        TYPST_VARIANT_SUFFIXES
+            .iter()
+            .find_map(|s| tool_id.strip_suffix(s))
+            .unwrap_or(tool_id)
     } else if MEMORY_IDS.contains(&tool_id) {
         MEMORY_KEY
     } else if DOCUMENT_IDS.contains(&tool_id) {
@@ -171,7 +211,7 @@ fn category_for(tool_id: &str) -> Category {
         | "read_sandbox_output"
         | "render_excalidraw"
         | "render_typst" => Category::Code,
-        _ if tool_id.starts_with(TYPST_PREFIX) => Category::Documents,
+        _ if tool_id.starts_with(TYPST_PREFIX) => Category::Templates,
         _ if DOCUMENT_IDS.contains(&tool_id) => Category::Documents,
         "remember" | "recall" => Category::Memory,
         _ if tool_id.starts_with(crate::server::tools::mcp::MCP_ID_PREFIX) => {
@@ -348,12 +388,17 @@ pub fn capability_domains(registry: &ToolRegistry) -> Vec<&'static str> {
 }
 
 /// Build the grouped, de-noised toggle list from the tool ids the
-/// user's roles grant. Hidden tools are dropped; the `typst_<id>`
-/// family is folded into a single entry. Sorted by category then key
-/// so the page is stable across requests.
-pub fn entries(registry: &ToolRegistry, allowed: &[String]) -> Vec<ToolEntry> {
+/// user's roles grant. Hidden tools are dropped; each typst *template* gets
+/// its own row (its render + variant tools fold into one), labelled from
+/// `templates` (the startup snapshot of manifest titles/descriptions).
+/// Sorted by category then key so the page is stable across requests.
+pub fn entries(
+    registry: &ToolRegistry,
+    allowed: &[String],
+    templates: &[TemplateMeta],
+) -> Vec<ToolEntry> {
     let mut out: Vec<ToolEntry> = Vec::new();
-    let mut typst_seen = false;
+    let mut typst_seen: HashSet<String> = HashSet::new();
     let mut memory_seen = false;
     let mut document_seen = false;
     let mut mcp_servers_seen: HashSet<String> = HashSet::new();
@@ -395,16 +440,27 @@ pub fn entries(registry: &ToolRegistry, allowed: &[String]) -> Vec<ToolEntry> {
             continue;
         }
         if id.starts_with(TYPST_PREFIX) {
-            if !typst_seen {
-                typst_seen = true;
+            // One row per template: the render id + its variants share a key.
+            let key = entry_key_for(id);
+            if typst_seen.insert(key.to_string()) {
+                let (title, description) = templates
+                    .iter()
+                    .find(|m| m.key == key)
+                    .map(|m| (m.title.clone(), short_description(&m.description)))
+                    .unwrap_or_else(|| {
+                        (
+                            prettify(key.strip_prefix(TYPST_PREFIX).unwrap_or(key)),
+                            "Fills this document template and returns a finished PDF and PNG \
+                             to download."
+                                .to_string(),
+                        )
+                    });
                 out.push(ToolEntry {
-                    key: TYPST_KEY.to_string(),
-                    title: "Document rendering".to_string(),
-                    tech: format!("{TYPST_PREFIX}*"),
-                    description: "Fills a Typst document template (e.g. invoice, letter, report) \
-                                  and returns a finished PDF and PNG to download."
-                        .to_string(),
-                    category: Category::Documents,
+                    key: key.to_string(),
+                    title,
+                    tech: key.to_string(),
+                    description,
+                    category: Category::Templates,
                 });
             }
             continue;
@@ -462,8 +518,8 @@ pub fn entries(registry: &ToolRegistry, allowed: &[String]) -> Vec<ToolEntry> {
 }
 
 /// Drop every granted tool id whose toggle key the user disabled.
-/// Honours the `typst` collapse: disabling `typst` removes all
-/// `typst_<id>` ids at once.
+/// Honours the per-template typst collapse: disabling `typst_<id>` removes
+/// that template's render + `_edit`/`_read`/`_pptx` ids at once.
 pub fn retain_enabled(allowed: &mut Vec<String>, disabled_keys: &HashSet<String>) {
     allowed.retain(|id| !disabled_keys.contains(entry_key_for(id)));
 }
@@ -476,10 +532,51 @@ mod tests {
     use crate::server::tools::time::CurrentTimestamp;
 
     #[test]
-    fn typst_ids_share_one_key_others_are_one_to_one() {
-        assert_eq!(entry_key_for("typst_invoice"), "typst");
-        assert_eq!(entry_key_for("typst_report"), "typst");
+    fn each_typst_template_is_its_own_key_variants_collapse_to_it() {
+        // Different templates → different keys (independently selectable).
+        assert_eq!(entry_key_for("typst_invoice"), "typst_invoice");
+        assert_eq!(entry_key_for("typst_report"), "typst_report");
+        // A template's render + edit/read/pptx variants all collapse to its
+        // render id, so one toggle governs that template's whole family.
+        assert_eq!(entry_key_for("typst_invoice_edit"), "typst_invoice");
+        assert_eq!(entry_key_for("typst_invoice_read"), "typst_invoice");
+        assert_eq!(entry_key_for("typst_invoice_pptx"), "typst_invoice");
         assert_eq!(entry_key_for("search_web"), "search_web");
+    }
+
+    #[test]
+    fn entries_emit_one_row_per_template_with_manifest_title() {
+        let reg = ToolRegistry::new();
+        // Render + variants of two templates, all RBAC-granted.
+        let allowed = vec![
+            "typst_letter".to_string(),
+            "typst_letter_edit".to_string(),
+            "typst_letter_read".to_string(),
+            "typst_invoice".to_string(),
+        ];
+        let metas = vec![TemplateMeta {
+            key: "typst_letter".to_string(),
+            title: "Formal letter".to_string(),
+            description: "A business letter. Renders to PDF.".to_string(),
+        }];
+        let rows = entries(&reg, &allowed, &metas);
+        // One row per template (variants folded), both under Templates.
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|e| e.category == Category::Templates));
+        let letter = rows.iter().find(|e| e.key == "typst_letter").unwrap();
+        // Manifest title + first sentence of its description.
+        assert_eq!(letter.title, "Formal letter");
+        assert_eq!(letter.description, "A business letter.");
+        // No manifest meta → prettified id fallback.
+        let invoice = rows.iter().find(|e| e.key == "typst_invoice").unwrap();
+        assert_eq!(invoice.title, "Invoice");
+    }
+
+    #[test]
+    fn prettify_humanises_slugs() {
+        assert_eq!(prettify("quarterly_report"), "Quarterly report");
+        assert_eq!(prettify("letter"), "Letter");
+        assert_eq!(prettify("a-b-c"), "A b c");
     }
 
     #[test]
@@ -501,7 +598,7 @@ mod tests {
     fn rag_search_gets_a_curated_entry_in_the_knowledge_area() {
         use crate::server::tools::rag::RagSearch;
         let reg = ToolRegistry::new().with(RagSearch);
-        let entries = entries(&reg, &["rag_search".to_string()]);
+        let entries = entries(&reg, &["rag_search".to_string()], &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].category, Category::Knowledge);
         // Curated title from `display_meta`, not the raw schema function name.
@@ -512,7 +609,7 @@ mod tests {
     fn entries_hide_smoke_test_tools() {
         let reg = ToolRegistry::new().with(Echo).with(SearchWeb);
         let allowed = vec!["company_echo".to_string(), "search_web".to_string()];
-        let entries = entries(&reg, &allowed);
+        let entries = entries(&reg, &allowed, &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "search_web");
         assert_eq!(entries[0].category, Category::Web);
@@ -525,7 +622,7 @@ mod tests {
             "get_current_timestamp".to_string(),
             "search_web".to_string(),
         ];
-        let entries = entries(&reg, &allowed);
+        let entries = entries(&reg, &allowed, &[]);
         // Web (search_web) sorts before Utility (get_current_timestamp).
         assert_eq!(entries[0].key, "search_web");
         assert_eq!(entries[1].key, "get_current_timestamp");
@@ -549,7 +646,7 @@ mod tests {
         use crate::server::tools::memory::{Recall, Remember};
         let reg = ToolRegistry::new().with(Remember).with(Recall);
         let allowed = vec!["remember".to_string(), "recall".to_string()];
-        let entries = entries(&reg, &allowed);
+        let entries = entries(&reg, &allowed, &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "memory");
         assert_eq!(entries[0].category, Category::Memory);
@@ -589,7 +686,7 @@ mod tests {
             "read_document".to_string(),
             "list_documents".to_string(),
         ];
-        let entries = entries(&reg, &allowed);
+        let entries = entries(&reg, &allowed, &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "document");
         assert_eq!(entries[0].category, Category::Documents);
@@ -627,15 +724,19 @@ mod tests {
     }
 
     #[test]
-    fn disabling_typst_key_drops_all_templates() {
+    fn disabling_one_template_drops_its_family_but_not_other_templates() {
         let mut allowed = vec![
             "typst_invoice".to_string(),
+            "typst_invoice_edit".to_string(),
+            "typst_invoice_read".to_string(),
             "typst_report".to_string(),
             "fetch_url".to_string(),
         ];
-        let disabled: HashSet<String> = ["typst".to_string()].into_iter().collect();
+        // Disabling one template's key drops its render + every variant…
+        let disabled: HashSet<String> = ["typst_invoice".to_string()].into_iter().collect();
         retain_enabled(&mut allowed, &disabled);
-        assert_eq!(allowed, vec!["fetch_url"]);
+        // …but leaves a different template (and unrelated tools) intact.
+        assert_eq!(allowed, vec!["typst_report", "fetch_url"]);
     }
 
     #[test]
@@ -648,7 +749,7 @@ mod tests {
             "mcp__demo__get-sum".to_string(),
             "mcp__other__ping".to_string(),
         ];
-        let mcp: Vec<_> = entries(&reg, &allowed)
+        let mcp: Vec<_> = entries(&reg, &allowed, &[])
             .into_iter()
             .filter(|e| e.category == Category::Integrations)
             .collect();

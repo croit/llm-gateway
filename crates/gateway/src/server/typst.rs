@@ -53,6 +53,10 @@ const MAX_PDF_BYTES: usize = 25 * 1024 * 1024;
 pub struct Template {
     /// Stable id; becomes the tool name `typst_<id>`.
     pub id: String,
+    /// Human-readable name for the tool menu (manifest `title`, else the
+    /// prettified id). Unlike `description` (written for the model), this
+    /// is the short label a user sees next to the toggle.
+    pub title: String,
     /// What this template produces, in plain English. Goes into the
     /// tool schema's `description` so the model picks the right one.
     pub description: String,
@@ -154,6 +158,10 @@ impl FieldType {
 #[serde(deny_unknown_fields)]
 struct Manifest {
     id: String,
+    /// Optional human-readable name shown in the tool menu. Defaults to the
+    /// prettified id (`quarterly_report` → "Quarterly report").
+    #[serde(default)]
+    title: Option<String>,
     description: String,
     #[serde(default)]
     output_basename: Option<String>,
@@ -232,6 +240,11 @@ pub enum DiscoverError {
     MissingSource { path: PathBuf, file: String },
     #[error("template id `{0}` is not a valid identifier (alnum + underscore only)")]
     BadId(String),
+    #[error(
+        "template id `{0}` ends in a reserved suffix (`_edit`/`_read`/`_pptx`); these name the \
+         per-template variant tools, so a template id can't use them"
+    )]
+    ReservedSuffix(String),
 }
 
 /// Walk `dir` and return one [`Template`] per subdirectory that
@@ -314,8 +327,13 @@ fn load_template(root: &Path, manifest_path: &Path) -> Result<Template, Discover
         data_file: p.data_file,
         font: p.font,
     });
+    let title = manifest
+        .title
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| crate::server::tools::catalog::prettify(&manifest.id));
     Ok(Template {
         id: manifest.id,
+        title,
         description: manifest.description,
         output_basename,
         fields,
@@ -328,6 +346,12 @@ fn load_template(root: &Path, manifest_path: &Path) -> Result<Template, Discover
 fn validate_id(id: &str) -> Result<(), DiscoverError> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(DiscoverError::BadId(id.to_string()));
+    }
+    // The per-template variant tools are named `typst_<id>_edit` / `_read` /
+    // `_pptx`, and the toggle-key resolver strips those suffixes to recover the
+    // template. An id ending in one would make that strip ambiguous, so reject.
+    if ["_edit", "_read", "_pptx"].iter().any(|s| id.ends_with(s)) {
+        return Err(DiscoverError::ReservedSuffix(id.to_string()));
     }
     Ok(())
 }
@@ -596,6 +620,33 @@ description = "Stub template for tests"
         let dir = tempfile::tempdir().unwrap();
         write_stub_template(dir.path(), "letter", "");
         assert!(discover_templates(dir.path()).unwrap()[0].pptx.is_none());
+    }
+
+    #[test]
+    fn title_defaults_to_prettified_id_or_takes_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_template(dir.path(), "quarterly_report", "");
+        write_stub_template(dir.path(), "letter", "title = \"Formal letter\"\n");
+        let mut ts = discover_templates(dir.path()).unwrap();
+        ts.sort_by(|a, b| a.id.cmp(&b.id));
+        // letter: explicit manifest title wins.
+        assert_eq!(ts[0].id, "letter");
+        assert_eq!(ts[0].title, "Formal letter");
+        // quarterly_report: no title → prettified id.
+        assert_eq!(ts[1].id, "quarterly_report");
+        assert_eq!(ts[1].title, "Quarterly report");
+    }
+
+    #[test]
+    fn template_ids_ending_in_reserved_variant_suffixes_are_rejected() {
+        for bad in ["foo_edit", "foo_read", "deck_pptx"] {
+            assert!(
+                matches!(validate_id(bad), Err(DiscoverError::ReservedSuffix(_))),
+                "{bad} should be rejected"
+            );
+        }
+        assert!(validate_id("letter").is_ok());
+        assert!(validate_id("quarterly_report").is_ok());
     }
 
     #[test]

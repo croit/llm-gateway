@@ -46,7 +46,7 @@ impl ToggleCtx {
 pub fn entries_for_roles(state: &RamaState, roles: &[String]) -> Vec<ToolEntry> {
     let role_ids = state.rbac.role_ids_for(roles);
     let allowed = state.rbac.allowed_tools(&role_ids, &state.tools);
-    catalog::entries(&state.tools, &allowed)
+    catalog::entries(&state.tools, &allowed, &state.typst_templates)
 }
 
 /// The set of valid toggle keys for these entries — used to reject bogus

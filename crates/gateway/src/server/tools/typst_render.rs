@@ -1323,6 +1323,7 @@ mod tests {
     fn stub_template() -> Template {
         Template {
             id: "stub".into(),
+            title: "Stub".into(),
             description: "stub".into(),
             output_basename: "stub".into(),
             fields: vec![
@@ -1585,6 +1586,7 @@ mod tests {
     fn deck_template() -> Template {
         Template {
             id: "deck".into(),
+            title: "Deck".into(),
             description: "deck".into(),
             output_basename: "deck".into(),
             fields: vec![
@@ -1614,6 +1616,7 @@ mod tests {
     fn identity_template() -> Template {
         Template {
             id: "id".into(),
+            title: "Id".into(),
             description: "id".into(),
             output_basename: "id".into(),
             fields: vec![

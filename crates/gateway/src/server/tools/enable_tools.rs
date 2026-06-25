@@ -34,7 +34,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use super::catalog::{BOOTSTRAP_TOOL_ID, entry_key_for, is_hidden};
+use super::catalog::{BOOTSTRAP_TOOL_ID, TYPST_PREFIX, entry_key_for, is_hidden, prettify};
 use super::mcp::MCP_ID_PREFIX;
 use super::{Tool, ToolContext, ToolError, ToolFuture, ToolRegistry};
 
@@ -338,6 +338,19 @@ fn target_for_key(key: &str) -> EnableTarget {
                 key: key.to_string(),
                 title: format!("{server} (MCP)"),
                 one_liner: format!("bridged tools from the '{server}' MCP server"),
+            };
+        }
+        _ if key.starts_with(TYPST_PREFIX) => {
+            // One key per template (render + its edit/read/pptx variants).
+            // The manifest title isn't reachable here, so prettify the id.
+            let name = prettify(key.strip_prefix(TYPST_PREFIX).unwrap_or(key));
+            return EnableTarget {
+                key: key.to_string(),
+                title: format!("{name} (document template)"),
+                one_liner: format!(
+                    "fill the “{name}” document template and render a finished PDF/PNG \
+                     (and editable PowerPoint where the template supports it)"
+                ),
             };
         }
         _ => ("Tool group", "see your /tools page for details"),
