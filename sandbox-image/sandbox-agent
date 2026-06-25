@@ -34,6 +34,13 @@ DEFAULT_TIMEOUT = 60
 # so a runaway job can't OOM the agent building a giant string.
 MAX_STREAM = 4 * 1024 * 1024
 MAX_ARTIFACT = 64 * 1024 * 1024
+# `podman exec` stdout under gVisor (runsc) is hard-capped at 64 KiB — bytes
+# past that are silently dropped, which would truncate a RunResponse carrying a
+# sizeable artifact mid-JSON. So a response larger than this spills to a temp
+# file; the runner reads it back in sub-cap chunks (see backend.rs
+# `read_spill`). Smaller responses go inline on stdout as before — which also
+# keeps the wire compatible with a runner that predates the spill protocol.
+SPILL_THRESHOLD = 60 * 1024
 # Above this, the full stream is also saved as a downloadable artifact, so the
 # gateway can return a small preview + a `full_output_ref` (pointers-as-context)
 # and the model reads the rest on demand. Kept modest so moderately-large output
@@ -74,8 +81,27 @@ def safe_name(name):
     return name and name not in (".", "..") and "/" not in name and "\\" not in name
 
 
+def emit(resp):
+    """Return a RunResponse to the runner. Small payloads go inline on stdout;
+    larger ones spill to a temp file (named in a tiny stdout header) because
+    gVisor truncates `podman exec` stdout at 64 KiB. mkstemp gives a unique
+    path so concurrent jobs sharing /tmp (the dev local backend) never clash."""
+    data = json.dumps(resp).encode("utf-8")
+    if len(data) <= SPILL_THRESHOLD:
+        sys.stdout.buffer.write(data)
+        return
+    fd, path = tempfile.mkstemp(prefix="sandbox-response-", suffix=".json")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    sys.stdout.buffer.write(
+        json.dumps(
+            {"sandbox_response_file": path, "sandbox_response_bytes": len(data)}
+        ).encode("utf-8")
+    )
+
+
 def fail(msg, code=2):
-    json.dump(
+    emit(
         {
             "exit_code": code,
             "stdout": "",
@@ -84,8 +110,7 @@ def fail(msg, code=2):
             "duration_ms": 0,
             "timed_out": False,
             "output_truncated": False,
-        },
-        sys.stdout,
+        }
     )
     sys.exit(0)
 
@@ -203,7 +228,7 @@ def main():
             }
         )
 
-    json.dump(
+    emit(
         {
             "exit_code": exit_code,
             "stdout": stdout,
@@ -212,8 +237,7 @@ def main():
             "duration_ms": duration_ms,
             "timed_out": timed_out,
             "output_truncated": truncated,
-        },
-        sys.stdout,
+        }
     )
 
 

@@ -191,7 +191,7 @@ impl ContainerBackend for PodmanBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        drive_agent(child, req, timeout).await
+        drive_agent(child, id, req, timeout, self).await
     }
 
     async fn image_id(&self) -> Result<String, BackendError> {
@@ -234,13 +234,128 @@ impl ContainerBackend for PodmanBackend {
     }
 }
 
+#[async_trait::async_trait]
+impl SpillReader for PodmanBackend {
+    /// Read the spilled file back in sub-cap chunks: one `dd` block per
+    /// `podman exec`, each ≤ `CHUNK` bytes so it clears gVisor's 64 KiB
+    /// exec-stdout cap intact. The container is still alive (it ran `sleep
+    /// infinity` and we only exec'd the agent into it), so these follow-up
+    /// execs land before the pool destroys it.
+    async fn read_spill(
+        &self,
+        container: &str,
+        path: &str,
+        len: u64,
+    ) -> Result<Vec<u8>, BackendError> {
+        const CHUNK: u64 = 60 * 1024;
+        let len = len as usize;
+        let mut buf: Vec<u8> = Vec::with_capacity(len);
+        let mut block: u64 = 0;
+        while buf.len() < len {
+            let out = tokio::process::Command::new(&self.cfg.podman)
+                .arg("exec")
+                .arg(container)
+                .arg("dd")
+                .arg(format!("if={path}"))
+                .arg(format!("bs={CHUNK}"))
+                .arg(format!("skip={block}"))
+                .arg("count=1")
+                .arg("status=none")
+                .stdin(Stdio::null())
+                .output()
+                .await?;
+            if !out.status.success() {
+                return Err(BackendError::Command {
+                    op: "exec dd",
+                    code: out.status.code().map(|c| c.to_string()).unwrap_or_default(),
+                    stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                });
+            }
+            if out.stdout.is_empty() {
+                break; // unexpected early EOF; the length check below catches it
+            }
+            buf.extend_from_slice(&out.stdout);
+            block += 1;
+        }
+        if buf.len() != len {
+            return Err(BackendError::Protocol(format!(
+                "spilled response short read: got {} of {len} bytes from {path}",
+                buf.len()
+            )));
+        }
+        Ok(buf)
+    }
+}
+
+/// Header the agent prints on stdout INSTEAD of an inline RunResponse when the
+/// response is too large for the gVisor-capped `podman exec` stdout (>64 KiB):
+/// it names a temp file the agent spilled the full RunResponse JSON to, which
+/// [`SpillReader`] reads back. See `sandbox-image/sandbox-agent`.
+#[derive(serde::Deserialize)]
+struct SpillHeader {
+    sandbox_response_file: String,
+    sandbox_response_bytes: u64,
+}
+
+/// Reads a spilled response file back out of a sandbox. Container backends pull
+/// it through `podman exec` in sub-64 KiB chunks (gVisor silently truncates a
+/// single exec's stdout at exactly 64 KiB); the dev [`LocalBackend`] reads the
+/// host file directly. Kept off [`ContainerBackend`] since only [`drive_agent`]
+/// needs it.
+#[async_trait::async_trait]
+trait SpillReader: Send + Sync {
+    async fn read_spill(
+        &self,
+        container: &str,
+        path: &str,
+        len: u64,
+    ) -> Result<Vec<u8>, BackendError>;
+}
+
+/// Decode the agent's stdout into a [`RunResponse`]. A small response arrives
+/// inline (this also stays compatible with an agent predating the spill
+/// protocol); a large one arrives as a [`SpillHeader`] naming a file we read
+/// back via `spill`.
+async fn decode_agent_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    container: &str,
+    spill: &dyn SpillReader,
+) -> Result<RunResponse, BackendError> {
+    // Inline RunResponse first — a header lacks RunResponse's required fields
+    // (and vice versa), so the two shapes never collide.
+    let inline_err = match serde_json::from_slice::<RunResponse>(stdout) {
+        Ok(resp) => return Ok(resp),
+        Err(e) => e,
+    };
+    if let Ok(hdr) = serde_json::from_slice::<SpillHeader>(stdout) {
+        let bytes = spill
+            .read_spill(
+                container,
+                &hdr.sandbox_response_file,
+                hdr.sandbox_response_bytes,
+            )
+            .await?;
+        return serde_json::from_slice::<RunResponse>(&bytes).map_err(|e| {
+            BackendError::Protocol(format!("spilled response not a RunResponse: {e}"))
+        });
+    }
+    Err(BackendError::Protocol(format!(
+        "agent output not a RunResponse: {inline_err}; stderr={}",
+        String::from_utf8_lossy(stderr).trim()
+    )))
+}
+
 /// Pipe a job to a spawned `sandbox-agent` process, enforce the wall-clock
 /// timeout, and decode its RunResponse. Shared by every backend so the
-/// agent protocol lives in exactly one place.
+/// agent protocol lives in exactly one place. `container` is the id `spill`
+/// reads a large (spilled) response from; ignored for small inline responses.
 async fn drive_agent(
     mut child: tokio::process::Child,
+    container: &str,
     req: &RunRequest,
     timeout: Duration,
+    spill: &dyn SpillReader,
 ) -> Result<RunResponse, BackendError> {
     let job =
         serde_json::to_vec(req).map_err(|e| BackendError::Protocol(format!("encode job: {e}")))?;
@@ -259,12 +374,7 @@ async fn drive_agent(
                     stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
                 });
             }
-            serde_json::from_slice::<RunResponse>(&out.stdout).map_err(|e| {
-                BackendError::Protocol(format!(
-                    "agent output not a RunResponse: {e}; stderr={}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ))
-            })
+            decode_agent_output(&out.stdout, &out.stderr, container, spill).await
         }
         // Outer timeout: report it; the caller destroys the sandbox, which
         // kills the in-flight process.
@@ -395,11 +505,33 @@ impl ContainerBackend for LocalBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        drive_agent(child, req, timeout).await
+        drive_agent(child, id, req, timeout, self).await
     }
 
     async fn destroy(&self, id: &str) {
         let _ = tokio::fs::remove_dir_all(id).await;
+    }
+}
+
+#[async_trait::async_trait]
+impl SpillReader for LocalBackend {
+    /// Runs on the host (no gVisor cap), so read the whole spill file directly
+    /// and then remove it — unlike the container case, nothing else reaps it.
+    async fn read_spill(
+        &self,
+        _container: &str,
+        path: &str,
+        len: u64,
+    ) -> Result<Vec<u8>, BackendError> {
+        let bytes = tokio::fs::read(path).await?;
+        let _ = tokio::fs::remove_file(path).await;
+        if bytes.len() as u64 != len {
+            return Err(BackendError::Protocol(format!(
+                "spilled response size mismatch: file has {} bytes, header said {len}",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
     }
 }
 
@@ -573,5 +705,40 @@ mod local_tests {
             resp.stderr,
         );
         assert!(art.unwrap().size >= 300_000, "preserved full stream");
+    }
+
+    #[tokio::test]
+    async fn large_artifact_round_trips_via_spill() {
+        if !python3_available() {
+            eprintln!("skipping local_backend test: python3 not on PATH");
+            return;
+        }
+        let be = LocalBackend::new().unwrap();
+        let id = be.create(Network::None).await.unwrap();
+        // A ~500 KB artifact makes the RunResponse far exceed the agent's
+        // 60 KB inline cap, so it is spilled to a file and read back via
+        // `SpillReader` rather than arriving inline on stdout — exercising the
+        // whole spill path (the gVisor exec-stdout truncation it works around
+        // can only be hit with a real runsc container, verified separately).
+        let req = RunRequest {
+            language: Language::Python,
+            code: "open('big.bin','wb').write(b'Z'*500000)".into(),
+            files: vec![],
+            timeout_secs: None,
+            network: false,
+        };
+        let resp = be.exec(&id, &req, Duration::from_secs(30)).await.unwrap();
+        be.destroy(&id).await;
+
+        assert_eq!(resp.exit_code, 0, "stderr={}", resp.stderr);
+        let art = resp
+            .artifacts
+            .iter()
+            .find(|a| a.name == "big.bin")
+            .expect("big.bin artifact");
+        assert_eq!(art.size, 500_000);
+        // Standard base64 of 500_000 bytes is ceil(500000/3)*4 chars; an exact
+        // match proves the payload survived the spill+reassembly uncorrupted.
+        assert_eq!(art.content_b64.len(), 500_000usize.div_ceil(3) * 4);
     }
 }
