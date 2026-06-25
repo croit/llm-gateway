@@ -1013,6 +1013,7 @@ pub async fn delete_turns_from_seq(
 /// Returns the number of rows actually touched (useful for a one-shot
 /// log line and for the startup test). Idempotent on a clean DB.
 pub async fn sweep_in_progress_at_startup(pool: &Pool) -> Result<u64, DbError> {
+    let now = Timestamp::now().to_string();
     let affected = sqlx::query(
         r#"UPDATE chat_turns
            SET status = 'errored',
@@ -1021,10 +1022,25 @@ pub async fn sweep_in_progress_at_startup(pool: &Pool) -> Result<u64, DbError> {
                completed_at = ?
            WHERE status = 'in_progress' AND role = 'assistant'"#,
     )
-    .bind(Timestamp::now().to_string())
+    .bind(&now)
     .execute(pool)
     .await?
     .rows_affected();
+    // The turn sweep above doesn't touch `chat_tool_calls`. A row left at
+    // 'running' renders as "Calling" forever even once its turn is errored —
+    // the orphaned-tool-call bug. At startup no worker can come back to finish
+    // any of them, so flip every still-running row to errored too.
+    sqlx::query(
+        r#"UPDATE chat_tool_calls
+           SET status = 'errored',
+               output_json = COALESCE(output_json,
+                                      'Tool call interrupted — the server restarted before it finished.'),
+               completed_at = ?
+           WHERE status = 'running'"#,
+    )
+    .bind(&now)
+    .execute(pool)
+    .await?;
     Ok(affected)
 }
 
@@ -1077,6 +1093,48 @@ pub async fn mark_orphaned_in_progress_as_errored(
         .await?
         .rows_affected()
     };
+    // Flip running tool-call rows belonging to the turns we just errored —
+    // otherwise they render as "Calling" forever (same orphaned-tool-call bug
+    // the startup sweep fixes, but scoped to this session). The live worker's
+    // own turn (`exempt`) is preserved so a genuinely in-flight call keeps
+    // showing "Calling".
+    let tool_msg = "Tool call interrupted — no worker is producing this response.";
+    if let Some(exempt) = exempt_turn_id {
+        sqlx::query(
+            r#"UPDATE chat_tool_calls
+               SET status = 'errored',
+                   output_json = COALESCE(output_json, ?),
+                   completed_at = ?
+               WHERE status = 'running'
+                 AND turn_id IN (
+                     SELECT id FROM chat_turns
+                     WHERE session_id = ? AND role = 'assistant' AND id != ?
+                 )"#,
+        )
+        .bind(tool_msg)
+        .bind(&now)
+        .bind(session_id)
+        .bind(exempt)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            r#"UPDATE chat_tool_calls
+               SET status = 'errored',
+                   output_json = COALESCE(output_json, ?),
+                   completed_at = ?
+               WHERE status = 'running'
+                 AND turn_id IN (
+                     SELECT id FROM chat_turns
+                     WHERE session_id = ? AND role = 'assistant'
+                 )"#,
+        )
+        .bind(tool_msg)
+        .bind(&now)
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    }
     Ok(affected)
 }
 
@@ -1840,6 +1898,89 @@ mod tests {
                 .unwrap();
             assert_eq!(row, "errored");
         }
+    }
+
+    #[tokio::test]
+    async fn sweep_in_progress_at_startup_also_errors_running_tool_calls() {
+        // The orphaned-tool-call fix: a row left 'running' when the server
+        // restarts must be swept too, or it renders "Calling" forever.
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        let t = create_assistant_turn_in_progress(&pool, &s.id, "asst-x", "m")
+            .await
+            .unwrap();
+        insert_running_tool_call(&pool, &t.id, "running_call", "tool_a", "{}")
+            .await
+            .unwrap();
+        insert_running_tool_call(&pool, &t.id, "done_call", "tool_b", "{}")
+            .await
+            .unwrap();
+        complete_tool_call(
+            &pool,
+            "done_call",
+            r#"{"ok":true}"#,
+            ToolCallStatus::Completed,
+        )
+        .await
+        .unwrap();
+
+        sweep_in_progress_at_startup(&pool).await.unwrap();
+
+        let calls = list_turns(&pool, &s.id).await.unwrap()[0]
+            .tool_calls
+            .clone();
+        let running = calls.iter().find(|c| c.id == "running_call").unwrap();
+        assert_eq!(running.status, ToolCallStatus::Errored);
+        assert!(
+            running
+                .output_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("interrupted")
+        );
+        // An already-settled call is left exactly as it was.
+        let done = calls.iter().find(|c| c.id == "done_call").unwrap();
+        assert_eq!(done.status, ToolCallStatus::Completed);
+        assert_eq!(done.output_json.as_deref(), Some(r#"{"ok":true}"#));
+    }
+
+    #[tokio::test]
+    async fn mark_orphaned_in_progress_preserves_the_live_turns_tool_calls() {
+        // The per-render sweep must error orphaned tool calls but never the
+        // live worker's own in-flight call (its turn is exempt).
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        let live = create_assistant_turn_in_progress(&pool, &s.id, "asst-live", "m")
+            .await
+            .unwrap();
+        let orphan = create_assistant_turn_in_progress(&pool, &s.id, "asst-orphan", "m")
+            .await
+            .unwrap();
+        insert_running_tool_call(&pool, &live.id, "live_call", "tool_a", "{}")
+            .await
+            .unwrap();
+        insert_running_tool_call(&pool, &orphan.id, "orphan_call", "tool_b", "{}")
+            .await
+            .unwrap();
+
+        mark_orphaned_in_progress_as_errored(&pool, &s.id, Some(&live.id))
+            .await
+            .unwrap();
+
+        let live_status: String =
+            sqlx::query_scalar("SELECT status FROM chat_tool_calls WHERE id = ?")
+                .bind("live_call")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(live_status, "running"); // exempt — still legitimately "Calling"
+        let orphan_status: String =
+            sqlx::query_scalar("SELECT status FROM chat_tool_calls WHERE id = ?")
+                .bind("orphan_call")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(orphan_status, "errored");
     }
 
     async fn seed_user(pool: &Pool, id: &str) {

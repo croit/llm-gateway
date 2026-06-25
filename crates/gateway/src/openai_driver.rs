@@ -36,6 +36,15 @@ use crate::server::tools::{ToolContext, runner};
 /// the rendered answer.
 const THINK_TAGS: [&str; 2] = ["<think>", "</think>"];
 
+/// Max gap between upstream SSE chunks before we treat the stream as wedged
+/// and finalize the turn as errored. Without it, a provider that opens the
+/// response then goes silent (network black-hole, hung worker) leaves the
+/// turn `in_progress` forever — the 24h "stuck" turns. It's an *idle* timeout,
+/// reset on every chunk, so a long-but-progressing stream (deep reasoning,
+/// many tool rounds) is never cut — only a truly silent one. Generous enough
+/// to cover queueing + slow time-to-first-token on a loaded backend.
+const UPSTREAM_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Pull the safe-to-emit prefix out of `buf`, removing any complete
 /// `<think>`/`</think>` tags and holding back a trailing run that could be the
 /// start of one (so a tag split across stream deltas is still removed). The
@@ -419,7 +428,32 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         let mut round_tokens: (Option<i64>, Option<i64>, Option<i64>) = (None, None, None);
         let mut upstream_stream = upstream.bytes_stream();
 
-        'chunks: while let Some(chunk) = upstream_stream.next().await {
+        'chunks: loop {
+            // Bound the wait for each chunk so a silently-wedged upstream
+            // can't pin the turn `in_progress` forever; a real stall finalizes
+            // as errored instead. The timer resets per chunk (see the const).
+            let chunk =
+                match tokio::time::timeout(UPSTREAM_STALL_TIMEOUT, upstream_stream.next()).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break 'chunks,
+                    Err(_) => {
+                        emit_usage(
+                            d,
+                            &user_email,
+                            &ctx.model,
+                            &backend_name,
+                            status_code,
+                            started,
+                            round_tokens,
+                        );
+                        return Err(TurnError::Transport {
+                            message: format!(
+                                "upstream stalled — no data received for {}s",
+                                UPSTREAM_STALL_TIMEOUT.as_secs()
+                            ),
+                        });
+                    }
+                };
             if ctx.cancel.load(Ordering::SeqCst) {
                 drop(acquired);
                 return Ok(());
@@ -730,10 +764,34 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                     arguments_raw: acc.arguments.clone(),
                 });
             } else {
+                // The model called a tool we don't own — almost always a name
+                // it invented (the common case is an MCP capability id called
+                // as if it were a tool, instead of through the connector's
+                // `invoke_capability`). Left alone, the 'running' row we just
+                // inserted renders as "Calling" forever and the call goes
+                // unanswered. Complete it as errored and reply with a message
+                // the model can recover from — exactly like the user-disabled
+                // path above (so the assistant turn's tool_calls all resolve
+                // and a single unknown call no longer dead-ends the turn).
+                let reason = format!(
+                    "No tool named `{}` is available in this conversation. Only call tools that \
+                     were provided to you. If you meant to use an MCP capability, call the \
+                     connector's invocation tool (e.g. `invoke_capability`) with the capability \
+                     id as an argument — do not call the capability id as if it were its own tool.",
+                    acc.name
+                );
+                if let Err(err) =
+                    chat::complete_tool_call(&d.state.db, &acc.id, &reason, ToolCallStatus::Errored)
+                        .await
+                {
+                    tracing::warn!(error = %err, tool = %acc.name, "recording unknown tool call");
+                }
+                let _ = ctx.broadcast.send(TurnUpdate::Tick);
                 tracing::debug!(
                     wire_name = %acc.name,
-                    "chat-stream got tool_call for a tool we don't own; ignoring"
+                    "chat-stream got tool_call for a tool we don't own; answered with an error"
                 );
+                refused.push((acc.id.clone(), reason));
             }
         }
         if call_refs.is_empty() && refused.is_empty() {

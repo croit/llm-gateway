@@ -435,6 +435,99 @@ async fn reasoning_timer_advances_while_reasoning_streams() {
     );
 }
 
+/// Round 0 streams a `tool_call` to a name the gateway doesn't own — an MCP
+/// capability id the model invented instead of going through
+/// `invoke_capability` (the croit-ERP failure that left a call stuck
+/// "Calling" for 24h). Round 1 streams a normal reply.
+#[derive(Default)]
+struct UnknownToolResponder {
+    counter: std::sync::atomic::AtomicU32,
+}
+
+impl wiremock::Respond for UnknownToolResponder {
+    fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+        // The auto-title generator also POSTs here (non-streaming); answer it
+        // trivially so it doesn't consume one of the turn's streamed rounds.
+        let body = std::str::from_utf8(&req.body).unwrap_or("");
+        if !body.contains("\"stream\":true") {
+            return ResponseTemplate::new(200).set_body_raw(
+                r#"{"choices":[{"message":{"role":"assistant","content":"Erp"}}]}"#,
+                "application/json",
+            );
+        }
+        let round = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sse = if round == 0 {
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"mcp__croit_erp__taskBoards.list\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+             data: [DONE]\n\n"
+        } else {
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n\
+             data: [DONE]\n\n"
+        };
+        ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream")
+    }
+}
+
+#[tokio::test]
+async fn unknown_tool_call_is_errored_not_left_calling() {
+    // Regression for the "Calling forever" bug: when the model emits a
+    // tool_call for a tool the gateway doesn't own, the inserted row must be
+    // completed as errored (never left 'running', which renders as a
+    // permanent spinner) AND answered so the model can recover — here it
+    // produces a final reply on round 2.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(UnknownToolResponder::default())
+        .mount(&upstream)
+        .await;
+
+    let (state, cookie, session_id) = setup(&upstream.uri()).await;
+    let app = router(state.clone());
+
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "use the erp")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{session_id}/messages"))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Draining the SSE tail blocks until the worker finalizes the turn.
+    let _ = resp.into_body().collect().await.unwrap().to_bytes();
+
+    let turns = chat::list_turns(&state.db, &session_id).await.unwrap();
+    let asst = turns
+        .iter()
+        .find(|t| t.turn.role == chat::TurnRole::Assistant)
+        .unwrap();
+    let call = asst
+        .tool_calls
+        .iter()
+        .find(|c| c.name == "mcp__croit_erp__taskBoards.list")
+        .expect("the unknown tool call was recorded");
+    assert_eq!(
+        call.status,
+        chat::ToolCallStatus::Errored,
+        "an unknown tool call must be errored, not left 'running' (the stuck-Calling bug)"
+    );
+    assert!(
+        call.output_json
+            .as_deref()
+            .unwrap_or_default()
+            .contains("invoke_capability"),
+        "the error should steer the model toward invoke_capability, got: {:?}",
+        call.output_json
+    );
+    // The call was answered, so the model recovered and the turn completed.
+    assert_eq!(asst.turn.status, chat::TurnStatus::Completed);
+    assert_eq!(asst.turn.content.as_deref(), Some("done"));
+}
+
 #[tokio::test]
 async fn message_send_rejects_anonymous() {
     let state = state_with_streaming_chat("http://unused.invalid").await;
