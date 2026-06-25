@@ -178,9 +178,15 @@ RUN set -eux; \
 #     broken warm-up must fail the BUILD loudly rather than leave gribouille
 #     unresolvable at runtime.
 COPY noiou.c /tmp/noiou.c
+# Pin the excalirender release. Without VERSION the installer resolves the
+# "latest" tag via an unauthenticated api.github.com call, which is rate-limited
+# on shared CI runner IPs and intermittently fails the build with "no releases
+# found"; a pinned VERSION skips that lookup (the asset download needs no API)
+# and makes the image reproducible. Bump deliberately.
+ARG EXCALIRENDER_VERSION=v1.10.5
 RUN set -eux; \
     curl -fsSL https://raw.githubusercontent.com/JonRC/excalirender/main/install.sh \
-        | PREFIX=/usr/local sh; \
+        | VERSION="${EXCALIRENDER_VERSION}" PREFIX=/usr/local sh; \
     excalirender --version; \
     # Build the seccomp launcher (build-essential is installed in the base
     # layer) and route the on-PATH `excalirender` through it. install.sh drops
