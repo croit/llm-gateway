@@ -1521,6 +1521,32 @@ fn is_excalidraw(a: &AttachmentRef) -> bool {
     n.ends_with(".excalidraw") || n.ends_with(".json") || a.mime.contains("json")
 }
 
+/// Excalidraw `line`/`arrow` elements carry their geometry in `points`, which
+/// must be an array of `[x, y]` pairs (`[[0,0],[0,90]]`). Models routinely emit
+/// a *flat* number list (`[0,0,0,90]`) instead; excalirender then dies on the
+/// whole scene with the opaque `Error: number is not iterable`. Reshape any
+/// flat, even-length, all-numeric `points` array into pairs. A no-op on
+/// already-nested points and on anything that isn't a flat number array, so
+/// correct scenes (including real Excalidraw exports) pass through untouched.
+fn normalize_excalidraw_points(scene: &mut Value) {
+    let Some(elements) = scene.get_mut("elements").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for el in elements {
+        let Some(points) = el.get_mut("points").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        if points.len() < 2 || points.len() % 2 != 0 || !points.iter().all(Value::is_number) {
+            continue;
+        }
+        let paired: Vec<Value> = points
+            .chunks_exact(2)
+            .map(|pair| Value::Array(pair.to_vec()))
+            .collect();
+        *points = paired;
+    }
+}
+
 pub struct RenderExcalidraw(pub Arc<SandboxClient>);
 
 impl Tool for RenderExcalidraw {
@@ -1553,7 +1579,10 @@ impl Tool for RenderExcalidraw {
                         "description": "The Excalidraw scene as `.excalidraw` JSON \
                                         (the `{\"type\":\"excalidraw\",\"elements\":[…]}` \
                                         document). Provide this to generate a diagram. \
-                                        Takes precedence over `attachment_id`."
+                                        For `arrow`/`line` elements, `points` must be an \
+                                        array of `[x,y]` pairs (e.g. `[[0,0],[0,90]]`), \
+                                        NOT a flat number list. Takes precedence over \
+                                        `attachment_id`."
                     },
                     "attachment_id": {
                         "type": "string",
@@ -1594,12 +1623,18 @@ impl Tool for RenderExcalidraw {
                 .filter(|s| !s.is_empty())
             {
                 Some(scene) => {
-                    serde_json::from_str::<Value>(scene).map_err(|e| {
+                    let mut v = serde_json::from_str::<Value>(scene).map_err(|e| {
                         ToolError::InvalidArgs(format!(
                             "`scene` is not valid JSON ({e}); pass a complete .excalidraw document"
                         ))
                     })?;
-                    (scene.as_bytes().to_vec(), json!({"from": "scene"}))
+                    normalize_excalidraw_points(&mut v);
+                    // Re-serialize the (possibly fixed) scene. Falls back to the
+                    // original bytes only if serialization somehow fails — which
+                    // can't happen for a value we just parsed.
+                    let bytes =
+                        serde_json::to_vec(&v).unwrap_or_else(|_| scene.as_bytes().to_vec());
+                    (bytes, json!({"from": "scene"}))
                 }
                 None => {
                     let (att, bytes) = resolve_one_attachment(
@@ -1609,6 +1644,18 @@ impl Tool for RenderExcalidraw {
                         is_excalidraw,
                     )
                     .await?;
+                    // Uploaded scenes come from real Excalidraw and are normally
+                    // well-formed, but normalize defensively when they parse as
+                    // JSON; ship the original bytes verbatim if they don't (the
+                    // renderer reports the error in that case).
+                    let bytes = serde_json::from_slice::<Value>(&bytes)
+                        .ok()
+                        .map(|mut v| {
+                            normalize_excalidraw_points(&mut v);
+                            v
+                        })
+                        .and_then(|v| serde_json::to_vec(&v).ok())
+                        .unwrap_or(bytes);
                     (bytes, json!({"from": "attachment", "id": att.id}))
                 }
             };
@@ -2715,6 +2762,65 @@ mod tests {
             .unwrap();
         assert_eq!(out["exit_code"], 0);
         assert_eq!(out["source"], json!({"from": "scene"}));
+    }
+
+    #[test]
+    fn normalize_excalidraw_points_reshapes_flat_arrays() {
+        let mut v = json!({"type": "excalidraw", "elements": [
+            {"type": "arrow", "points": [0, 0, 0, 90]},      // flat -> pairs
+            {"type": "line", "points": [[1, 2], [3, 4]]},    // already nested
+            {"type": "arrow", "points": [1, 2, 3]},          // odd length: left as-is
+            {"type": "rectangle", "x": 0}                    // no points
+        ]});
+        normalize_excalidraw_points(&mut v);
+        let els = v["elements"].as_array().unwrap();
+        assert_eq!(els[0]["points"], json!([[0, 0], [0, 90]]));
+        assert_eq!(els[1]["points"], json!([[1, 2], [3, 4]]));
+        assert_eq!(els[2]["points"], json!([1, 2, 3]));
+        assert_eq!(els[3].get("points"), None);
+    }
+
+    #[test]
+    fn normalize_excalidraw_points_tolerates_odd_shapes() {
+        // Missing / non-array `elements` must not panic.
+        let mut a = json!({"type": "excalidraw"});
+        normalize_excalidraw_points(&mut a);
+        let mut b = json!({"elements": "nope"});
+        normalize_excalidraw_points(&mut b);
+    }
+
+    #[tokio::test]
+    async fn render_excalidraw_ships_normalized_points() {
+        // Pin the wiring: a scene with a FLAT `points` array must reach the
+        // renderer reshaped into `[x,y]` pairs (the fix for the opaque
+        // "number is not iterable" excalirender error).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "exit_code": 0, "stdout": "", "stderr": "",
+                "artifacts": [], "duration_ms": 5, "timed_out": false
+            })))
+            .mount(&server)
+            .await;
+        let tool = RenderExcalidraw(client(server.uri()));
+        tool.run(
+            ctx().await,
+            json!({
+                "scene": "{\"type\":\"excalidraw\",\"elements\":[\
+                    {\"type\":\"arrow\",\"points\":[0,0,0,90]}]}",
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Decode the scene the runner received and assert it carries nested pairs.
+        let reqs = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let scene_b64 = body["files"][0]["content_b64"].as_str().unwrap();
+        let scene_bytes = b64::decode(scene_b64).unwrap();
+        let scene: Value = serde_json::from_slice(&scene_bytes).unwrap();
+        assert_eq!(scene["elements"][0]["points"], json!([[0, 0], [0, 90]]));
     }
 
     #[test]

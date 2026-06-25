@@ -156,6 +156,18 @@ RUN set -eux; \
 #     or network at runtime. `PREFIX=/usr/local` lands the launcher at
 #     /usr/local/bin/excalirender (on the sandbox user's PATH).
 #
+#     excalirender is compiled with Bun, and Bun's event loop hangs forever
+#     under gVisor (runsc, our production runtime): it probes io_uring /
+#     pidfd_open, gVisor half-emulates them (setup succeeds but no events ever
+#     arrive), and Bun never falls back to epoll — every render then dies on
+#     the sandbox timeout (oven-sh/bun#16063, google/gvisor#11331). The fix is
+#     the `noiou` launcher (noiou.c): it installs a seccomp filter forcing
+#     those syscalls to a CLEAN ENOSYS — which makes Bun take its working epoll
+#     fallback — then execs the real binary. The on-PATH `excalirender` is
+#     re-pointed through it, so every call is covered. seccomp only removes
+#     capability (never grants it) and lives wholly inside this image, so the
+#     gVisor boundary and the OCI runtime are untouched.
+#
 #   * gribouille — a Grammar-of-Graphics (ggplot2-style) chart package for
 #     Typst. Typst caches a package on first import and never re-downloads it,
 #     so we render a real plot HERE (network available at build) to pull the
@@ -165,15 +177,37 @@ RUN set -eux; \
 #     helper warm-up above. The compile is intentionally NOT `|| true`: a
 #     broken warm-up must fail the BUILD loudly rather than leave gribouille
 #     unresolvable at runtime.
+COPY noiou.c /tmp/noiou.c
 RUN set -eux; \
     curl -fsSL https://raw.githubusercontent.com/JonRC/excalirender/main/install.sh \
         | PREFIX=/usr/local sh; \
     excalirender --version; \
+    # Build the seccomp launcher (build-essential is installed in the base
+    # layer) and route the on-PATH `excalirender` through it. install.sh drops
+    # a symlink at /usr/local/bin/excalirender -> the lib launcher; we replace
+    # that symlink with a thin wrapper, leaving the upstream launcher (which
+    # sets LD_LIBRARY_PATH/FONTCONFIG) pristine, so every invocation self-applies
+    # the io_uring/pidfd ENOSYS filter before the Bun binary runs.
+    gcc -O2 -o /usr/local/bin/noiou /tmp/noiou.c; \
+    rm -f /tmp/noiou.c; \
+    test -L /usr/local/bin/excalirender; \
+    rm /usr/local/bin/excalirender; \
+    printf '#!/bin/sh\nexec /usr/local/bin/noiou /usr/local/lib/excalirender/bin/excalirender "$@"\n' \
+        > /usr/local/bin/excalirender; \
+    chmod 0755 /usr/local/bin/excalirender; \
+    # Smoke test: render a trivial scene THROUGH the wrapper. Proves noiou's
+    # filter is accepted by the kernel and excalirender still emits output;
+    # fails the BUILD loudly otherwise (same philosophy as the warm-up below).
+    printf '{"type":"excalidraw","version":2,"source":"x","elements":[{"type":"rectangle","id":"a","x":0,"y":0,"width":80,"height":40,"strokeColor":"#1e1e1e","backgroundColor":"transparent","fillStyle":"solid","strokeWidth":2,"strokeStyle":"solid","roughness":1,"opacity":100}]}' \
+        > /tmp/smoke.excalidraw; \
+    excalirender /tmp/smoke.excalidraw -o /tmp/smoke.svg; \
+    test -s /tmp/smoke.svg; \
+    rm -f /tmp/smoke.excalidraw /tmp/smoke.svg; \
     printf '#import "@preview/gribouille:0.3.0": *\n#plot(\n  data: penguins,\n  mapping: aes(x: "flipper-len", y: "body-mass"),\n  layers: (geom-point(),),\n)\n' \
         > /tmp/warm-chart.typ; \
     typst compile /tmp/warm-chart.typ /tmp/warm-chart.pdf; \
     rm -f /tmp/warm-chart.typ /tmp/warm-chart.pdf; \
-    chmod -R a+rX /opt/typst-packages /usr/local/lib/excalirender
+    chmod -R a+rX /opt/typst-packages /usr/local/lib/excalirender /usr/local/bin/noiou /usr/local/bin/excalirender
 
 # --- Agent + runtime user --------------------------------------------------
 # The job marshaller the runner pipes RunRequest/RunResponse through.
