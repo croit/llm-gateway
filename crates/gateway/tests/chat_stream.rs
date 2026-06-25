@@ -305,6 +305,136 @@ async fn message_send_renders_markdown_even_when_upstream_omits_done() {
     assert_eq!(asst.turn.content.as_deref(), Some("# Hi\n\nbody"));
 }
 
+/// The largest in-progress "Thinking… (X.Ys)" value the stream ever
+/// rendered. Returns -1.0 if no in-progress thinking label appeared.
+/// Deliberately ignores the finalized "Thought for …" label — the bug
+/// was that the *live* timer never moved off 0.0s while reasoning
+/// streamed, even though the final stamped value was correct.
+fn max_in_progress_thinking_secs(body: &str) -> f64 {
+    let marker = "Thinking… (";
+    let mut max = -1.0_f64;
+    let mut rest = body;
+    while let Some(i) = rest.find(marker) {
+        rest = &rest[i + marker.len()..];
+        if let Some(end) = rest.find("s)")
+            && let Ok(v) = rest[..end].parse::<f64>()
+        {
+            max = max.max(v);
+        }
+    }
+    max
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_timer_advances_while_reasoning_streams() {
+    // Regression: while the model streams reasoning (and before any
+    // content arrives), the "Thinking… (Xs)" timer must tick up. It
+    // used to freeze at 0.0s because `reasoning_elapsed_ms` was only
+    // stamped on the first *content* delta / at finalization, so every
+    // in-progress re-render rendered the NULL → 0.0s default.
+    //
+    // wiremock delivers the whole body in one shot (elapsed ≈ 0 for
+    // every chunk), so we hand-roll a raw upstream that puts real
+    // wall-clock gaps between reasoning chunks.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // Serve every connection the client opens (pool warm-ups /
+        // retries may make more than one); each gets the same delayed
+        // reasoning stream.
+        while let Ok((sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut rd, mut wr) = sock.into_split();
+                // Keep draining the request side for the whole
+                // connection so the client's body write never hits a
+                // half-closed socket ("error sending request").
+                tokio::spawn(async move {
+                    let mut b = [0u8; 1024];
+                    while let Ok(n) = rd.read(&mut b).await {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                });
+                if wr
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Content-Type: text/event-stream\r\n\
+                          Transfer-Encoding: chunked\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                // Reasoning-only stream: no content delta ever lands, so
+                // the bubble stays "Thinking…" the whole way and the
+                // timer is driven purely by the reasoning path under test.
+                let chunks = [
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" think\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" hard\"}}]}\n\n",
+                    "data: [DONE]\n\n",
+                ];
+                for (i, c) in chunks.iter().enumerate() {
+                    if i > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    let frame = format!("{:x}\r\n{c}\r\n", c.len());
+                    if wr.write_all(frame.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = wr.flush().await;
+                }
+                let _ = wr.write_all(b"0\r\n\r\n").await;
+                let _ = wr.flush().await;
+            });
+        }
+    });
+
+    let base = format!("http://{addr}");
+    let (state, cookie, session_id) = setup(&base).await;
+    let app = router(state.clone());
+
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "hi")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{session_id}/messages"))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&body).unwrap();
+
+    // The live timer must have advanced past zero *while reasoning was
+    // still streaming* (two 200ms gaps before [DONE] → ≥ 0.2s). Before
+    // the fix this was always 0.0s.
+    let max_live = max_in_progress_thinking_secs(body);
+    assert!(
+        max_live >= 0.1,
+        "expected an in-progress 'Thinking… (Xs)' label > 0.0s while reasoning streamed, \
+         got max {max_live}; body was:\n{body}"
+    );
+
+    // And the persisted value is the reasoning duration, not NULL.
+    let turns = chat::list_turns(&state.db, &session_id).await.unwrap();
+    let asst = turns
+        .iter()
+        .find(|t| t.turn.role == chat::TurnRole::Assistant)
+        .unwrap();
+    assert_eq!(asst.turn.status, chat::TurnStatus::Completed);
+    assert!(
+        asst.turn.reasoning_elapsed_ms.unwrap_or(0) > 0,
+        "reasoning_elapsed_ms should be stamped from the reasoning stream"
+    );
+}
+
 #[tokio::test]
 async fn message_send_rejects_anonymous() {
     let state = state_with_streaming_chat("http://unused.invalid").await;

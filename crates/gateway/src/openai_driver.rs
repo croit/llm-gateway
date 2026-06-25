@@ -229,6 +229,13 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
 
     let mut started_reasoning: Option<std::time::Instant> = None;
     let mut frozen_reasoning_elapsed = false;
+    // Last `reasoning_elapsed_ms` we persisted, in 100ms buckets. The
+    // live "Thinking… (Xs)" timer is server-driven: it only moves when
+    // the DB value changes and the bubble re-renders. We bump it on
+    // every reasoning chunk, but throttle the write to the 0.1s the
+    // label actually displays so a fast token stream doesn't issue a
+    // redundant UPDATE per delta. `-1` so the first chunk always writes.
+    let mut last_timer_decis: i64 = -1;
 
     // Email for the usage row, looked up once (best-effort; the user_id is
     // always present even if this read fails). The chat/scheduler paths
@@ -459,6 +466,26 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                         chat::append_reasoning(&d.state.db, &ctx.assistant_turn_id, reasoning)
                             .await
                             .map_err(upstream_err)?;
+                        // Advance the live thinking timer as reasoning
+                        // streams, so the label ticks up instead of
+                        // freezing until the first content delta. Frozen
+                        // once content arrives (or never, for a
+                        // reasoning-only turn — the last bump stands).
+                        if let Some(start) = started_reasoning
+                            && !frozen_reasoning_elapsed
+                        {
+                            let elapsed_ms = start.elapsed().as_millis() as i64;
+                            if elapsed_ms / 100 != last_timer_decis {
+                                last_timer_decis = elapsed_ms / 100;
+                                chat::set_reasoning_elapsed(
+                                    &d.state.db,
+                                    &ctx.assistant_turn_id,
+                                    elapsed_ms,
+                                )
+                                .await
+                                .map_err(upstream_err)?;
+                            }
+                        }
                         let _ = ctx.broadcast.send(TurnUpdate::Tick);
                         if reasoning_guard.push(reasoning) {
                             // Drop the upstream stream (closes the
