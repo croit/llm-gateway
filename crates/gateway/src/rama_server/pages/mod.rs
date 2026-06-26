@@ -983,8 +983,9 @@ pub use connectors::{
 // sidebar entry either.
 mod admin;
 pub use admin::{
-    models_index as admin_models_index, models_reasoning_save as admin_models_reasoning_save,
-    models_save as admin_models_save,
+    models_index as admin_models_index,
+    models_reasoning_budget_save as admin_models_reasoning_budget_save,
+    models_reasoning_save as admin_models_reasoning_save, models_save as admin_models_save,
 };
 
 // Admin upstream-backends status page (`/admin/backends`). Read-only;

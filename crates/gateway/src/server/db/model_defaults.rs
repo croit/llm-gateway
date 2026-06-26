@@ -30,6 +30,17 @@ pub struct ModelDefaults {
     /// auto-detect from the model name at request time. Drives
     /// [`crate::server::reasoning::apply_effort`].
     pub reasoning_style: Option<String>,
+    /// Per-effort token budgets for token-budget styles (Qwen, Anthropic).
+    /// `None` = use the built-in default for that level. Stored as SQLite
+    /// INTEGER; see migration 0030.
+    pub thinking_budget_standard: Option<i64>,
+    pub thinking_budget_deep: Option<i64>,
+    pub thinking_budget_max: Option<i64>,
+    /// Per-effort `reasoning_effort` levels for effort-level styles (OpenAI,
+    /// GLM). `None` = use the built-in default for that level.
+    pub reasoning_effort_standard: Option<String>,
+    pub reasoning_effort_deep: Option<String>,
+    pub reasoning_effort_max: Option<String>,
     pub updated_at: Timestamp,
 }
 
@@ -37,6 +48,12 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
     let model_name: String = row.try_get("model_name")?;
     let defaults_toml: String = row.try_get("defaults_toml")?;
     let reasoning_style: Option<String> = row.try_get("reasoning_style")?;
+    let thinking_budget_standard: Option<i64> = row.try_get("thinking_budget_standard")?;
+    let thinking_budget_deep: Option<i64> = row.try_get("thinking_budget_deep")?;
+    let thinking_budget_max: Option<i64> = row.try_get("thinking_budget_max")?;
+    let reasoning_effort_standard: Option<String> = row.try_get("reasoning_effort_standard")?;
+    let reasoning_effort_deep: Option<String> = row.try_get("reasoning_effort_deep")?;
+    let reasoning_effort_max: Option<String> = row.try_get("reasoning_effort_max")?;
     let updated_at_s: String = row.try_get("updated_at")?;
     let updated_at: Timestamp = updated_at_s
         .parse()
@@ -48,6 +65,12 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
         model_name,
         defaults_toml,
         reasoning_style,
+        thinking_budget_standard,
+        thinking_budget_deep,
+        thinking_budget_max,
+        reasoning_effort_standard,
+        reasoning_effort_deep,
+        reasoning_effort_max,
         updated_at,
     })
 }
@@ -56,7 +79,10 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
 /// through to forwarding the client body verbatim.
 pub async fn get(pool: &Pool, model_name: &str) -> Result<Option<ModelDefaults>, DbError> {
     let row = sqlx::query(
-        r#"SELECT model_name, defaults_toml, reasoning_style, updated_at
+        r#"SELECT model_name, defaults_toml, reasoning_style,
+                  thinking_budget_standard, thinking_budget_deep, thinking_budget_max,
+                  reasoning_effort_standard, reasoning_effort_deep, reasoning_effort_max,
+                  updated_at
            FROM model_defaults
            WHERE model_name = ?"#,
     )
@@ -86,6 +112,58 @@ pub async fn set_reasoning_style(
     )
     .bind(model_name)
     .bind(reasoning_style)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The six per-effort override columns, grouped so the setter signature stays
+/// small. `None` in any field clears that level (falls back to the built-in
+/// default). Budgets are token counts; efforts are `reasoning_effort` levels.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReasoningOverrideCols {
+    pub budget_standard: Option<i64>,
+    pub budget_deep: Option<i64>,
+    pub budget_max: Option<i64>,
+    pub effort_standard: Option<String>,
+    pub effort_deep: Option<String>,
+    pub effort_max: Option<String>,
+}
+
+/// Set the per-effort reasoning overrides for a model without touching its
+/// sampling defaults or reasoning style. Inserts a row with empty defaults if
+/// none exists yet; on conflict only the six override columns are updated, so
+/// it composes with [`upsert`] and [`set_reasoning_style`] in either order.
+pub async fn set_reasoning_overrides(
+    pool: &Pool,
+    model_name: &str,
+    cols: &ReasoningOverrideCols,
+) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    sqlx::query(
+        r#"INSERT INTO model_defaults
+             (model_name, defaults_toml,
+              thinking_budget_standard, thinking_budget_deep, thinking_budget_max,
+              reasoning_effort_standard, reasoning_effort_deep, reasoning_effort_max,
+              updated_at)
+           VALUES (?, '', ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(model_name) DO UPDATE SET
+             thinking_budget_standard  = excluded.thinking_budget_standard,
+             thinking_budget_deep      = excluded.thinking_budget_deep,
+             thinking_budget_max       = excluded.thinking_budget_max,
+             reasoning_effort_standard = excluded.reasoning_effort_standard,
+             reasoning_effort_deep     = excluded.reasoning_effort_deep,
+             reasoning_effort_max      = excluded.reasoning_effort_max,
+             updated_at                = excluded.updated_at"#,
+    )
+    .bind(model_name)
+    .bind(cols.budget_standard)
+    .bind(cols.budget_deep)
+    .bind(cols.budget_max)
+    .bind(cols.effort_standard.as_deref())
+    .bind(cols.effort_deep.as_deref())
+    .bind(cols.effort_max.as_deref())
     .bind(now)
     .execute(pool)
     .await?;
@@ -166,5 +244,44 @@ mod tests {
         upsert(&pool, "m", "x = 1").await.unwrap();
         delete(&pool, "m").await.unwrap();
         assert!(get(&pool, "m").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reasoning_overrides_round_trip() {
+        let pool = fresh().await;
+        let cols = ReasoningOverrideCols {
+            budget_standard: Some(1_024),
+            budget_deep: Some(4_096),
+            budget_max: None,
+            effort_standard: Some("medium".into()),
+            effort_deep: None,
+            effort_max: Some("max".into()),
+        };
+        set_reasoning_overrides(&pool, "m", &cols).await.unwrap();
+        let row = get(&pool, "m").await.unwrap().unwrap();
+        assert_eq!(row.thinking_budget_standard, Some(1_024));
+        assert_eq!(row.thinking_budget_deep, Some(4_096));
+        assert_eq!(row.thinking_budget_max, None);
+        assert_eq!(row.reasoning_effort_standard.as_deref(), Some("medium"));
+        assert_eq!(row.reasoning_effort_deep, None);
+        assert_eq!(row.reasoning_effort_max.as_deref(), Some("max"));
+    }
+
+    /// The three setters touch disjoint columns and compose in any order.
+    #[tokio::test]
+    async fn overrides_style_and_toml_are_independent() {
+        let pool = fresh().await;
+        let cols = ReasoningOverrideCols {
+            budget_deep: Some(8_192),
+            ..Default::default()
+        };
+        set_reasoning_overrides(&pool, "m", &cols).await.unwrap();
+        set_reasoning_style(&pool, "m", Some("qwen")).await.unwrap();
+        upsert(&pool, "m", "temperature = 0.5").await.unwrap();
+
+        let row = get(&pool, "m").await.unwrap().unwrap();
+        assert_eq!(row.thinking_budget_deep, Some(8_192));
+        assert_eq!(row.reasoning_style.as_deref(), Some("qwen"));
+        assert_eq!(row.defaults_toml, "temperature = 0.5");
     }
 }

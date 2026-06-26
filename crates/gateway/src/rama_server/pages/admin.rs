@@ -49,18 +49,38 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     models.sort();
     let mut rows: Vec<ModelRow> = Vec::with_capacity(models.len());
     for name in &models {
-        let (stored, reasoning_style) = match db::get(&state.db, name).await {
-            Ok(Some(r)) => (r.defaults_toml, r.reasoning_style),
-            Ok(None) => (String::new(), None),
+        let row = match db::get(&state.db, name).await {
+            Ok(r) => r,
             Err(err) => {
                 tracing::warn!(error = %err, model = %name, "model_defaults: get failed");
-                (String::new(), None)
+                None
             }
         };
         rows.push(ModelRow {
             name: name.clone(),
-            toml: stored,
-            reasoning_style: reasoning_style.unwrap_or_default(),
+            toml: row
+                .as_ref()
+                .map(|r| r.defaults_toml.clone())
+                .unwrap_or_default(),
+            reasoning_style: row
+                .as_ref()
+                .and_then(|r| r.reasoning_style.clone())
+                .unwrap_or_default(),
+            budget_standard: row.as_ref().and_then(|r| r.thinking_budget_standard),
+            budget_deep: row.as_ref().and_then(|r| r.thinking_budget_deep),
+            budget_max: row.as_ref().and_then(|r| r.thinking_budget_max),
+            effort_standard: row
+                .as_ref()
+                .and_then(|r| r.reasoning_effort_standard.clone())
+                .unwrap_or_default(),
+            effort_deep: row
+                .as_ref()
+                .and_then(|r| r.reasoning_effort_deep.clone())
+                .unwrap_or_default(),
+            effort_max: row
+                .as_ref()
+                .and_then(|r| r.reasoning_effort_max.clone())
+                .unwrap_or_default(),
         });
     }
 
@@ -172,6 +192,80 @@ pub async fn models_reasoning_save(State(state): State<Arc<RamaState>>, req: Req
     )
 }
 
+/// POST /admin/models/reasoning-budget — save a model's per-effort reasoning
+/// overrides (token budgets for Qwen/Anthropic, `reasoning_effort` levels for
+/// OpenAI/GLM). Like the reasoning-style save, this touches only its own
+/// columns so it composes with the TOML save and the style save. Empty fields
+/// clear that level back to the built-in default.
+pub async fn models_reasoning_budget_save(
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let form: ReasoningBudgetForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+    };
+    if form.model_name.is_empty() {
+        return toast(FlashKind::Error, "missing model_name field");
+    }
+    // Parse + validate each field; an empty string clears the level.
+    let budget = |s: &str| -> Result<Option<i64>, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        match s.parse::<i64>() {
+            Ok(n) if n >= 1 => Ok(Some(n)),
+            _ => Err(format!("budget `{s}` must be a positive integer")),
+        }
+    };
+    let effort = |s: &str| -> Result<Option<String>, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        // Validate against the full intensity scale (the GLM superset); the
+        // dropdown only offers per-style-valid values anyway.
+        if crate::server::reasoning::ReasoningStyle::Glm
+            .effort_levels()
+            .contains(&s)
+        {
+            Ok(Some(s.to_string()))
+        } else {
+            Err(format!("unknown reasoning effort `{s}`"))
+        }
+    };
+    let build = || -> Result<db::ReasoningOverrideCols, String> {
+        Ok(db::ReasoningOverrideCols {
+            budget_standard: budget(&form.budget_standard)?,
+            budget_deep: budget(&form.budget_deep)?,
+            budget_max: budget(&form.budget_max)?,
+            effort_standard: effort(&form.effort_standard)?,
+            effort_deep: effort(&form.effort_deep)?,
+            effort_max: effort(&form.effort_max)?,
+        })
+    };
+    let cols = match build() {
+        Ok(c) => c,
+        Err(e) => return toast(FlashKind::Error, e),
+    };
+    if let Err(err) = db::set_reasoning_overrides(&state.db, &form.model_name, &cols).await {
+        return toast(FlashKind::Error, format!("db: {err}"));
+    }
+    toast(
+        FlashKind::Success,
+        format!("saved reasoning budget for `{}`", form.model_name),
+    )
+}
+
 #[derive(serde::Deserialize)]
 struct SaveForm {
     model_name: String,
@@ -184,11 +278,41 @@ struct ReasoningForm {
     reasoning_style: String,
 }
 
+/// Per-effort reasoning overrides form. All fields optional / empty = "clear
+/// this level" (fall back to the built-in default). For token-budget styles the
+/// `budget_*` fields are filled; for effort-level styles the `effort_*` fields.
+/// The form only renders the relevant set, but we accept and store all six so a
+/// later style switch can clear stale values.
+#[derive(Default, serde::Deserialize)]
+struct ReasoningBudgetForm {
+    model_name: String,
+    #[serde(default)]
+    budget_standard: String,
+    #[serde(default)]
+    budget_deep: String,
+    #[serde(default)]
+    budget_max: String,
+    #[serde(default)]
+    effort_standard: String,
+    #[serde(default)]
+    effort_deep: String,
+    #[serde(default)]
+    effort_max: String,
+}
+
 struct ModelRow {
     name: String,
     toml: String,
     /// Stored reasoning style, or empty string for "auto" (name-detected).
     reasoning_style: String,
+    /// Per-effort token budgets (token-budget styles); `None` = built-in default.
+    budget_standard: Option<i64>,
+    budget_deep: Option<i64>,
+    budget_max: Option<i64>,
+    /// Per-effort `reasoning_effort` levels (effort-level styles); empty = default.
+    effort_standard: String,
+    effort_deep: String,
+    effort_max: String,
 }
 
 fn render_models_body(rows: &[ModelRow]) -> Html {
@@ -247,6 +371,7 @@ fn render_model_card(row: &ModelRow) -> Html {
                     h2(class: "card-title text-base font-mono break-all") { (row.name.clone()) }
                     (render_reasoning_select(row))
                 }
+                (render_reasoning_budget(row))
                 form(
                     method: "post",
                     action: (action),
@@ -318,6 +443,107 @@ fn render_reasoning_select(row: &ModelRow) -> Html {
             ) {
                 for o in option_html.iter() {
                     (o.clone())
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// Adaptive per-effort reasoning controls, shown below the style picker. Token-
+/// budget styles (Qwen, Anthropic) get integer token fields; effort-level styles
+/// (OpenAI, GLM) get `reasoning_effort` dropdowns; styles without reasoning
+/// render nothing. The effective style is resolved the same way the request path
+/// does (explicit choice, else name detection), so the right controls appear
+/// even when the style is left on "Auto".
+fn render_reasoning_budget(row: &ModelRow) -> Html {
+    use crate::server::reasoning::ReasoningStyle;
+    let explicit = (!row.reasoning_style.is_empty()).then_some(row.reasoning_style.as_str());
+    let style = ReasoningStyle::resolve(explicit, &row.name);
+    let action = "/admin/models/reasoning-budget";
+
+    let (controls, hint) = if style.uses_token_budget() {
+        let num = |name: &str, label: &str, val: &Option<i64>| {
+            let v = val.map(|n| n.to_string()).unwrap_or_default();
+            html! {
+                label(class: "form-control") {
+                    span(class: "label-text text-xs") { (label) }
+                    input(
+                        type: "number", name: (name), value: (v), min: "1",
+                        placeholder: "default",
+                        class: "input input-bordered input-xs w-28"
+                    );
+                }
+            }
+            .to_html()
+        };
+        let controls = html! {
+            (num("budget_standard", "Standard", &row.budget_standard))
+            (num("budget_deep", "Deep", &row.budget_deep))
+            (num("budget_max", "Max", &row.budget_max))
+        }
+        .to_html();
+        (
+            controls,
+            "Max thinking tokens per effort level. Blank = backend default \
+             (uncapped). Fast disables thinking.",
+        )
+    } else if style.uses_effort_level() {
+        let levels = style.effort_levels();
+        let sel = |name: &str, label: &str, current: &str| {
+            let mut opts: Vec<Html> = Vec::new();
+            opts.push(if current.is_empty() {
+                html! { option(value: "", selected: "selected") { "(default)" } }.to_html()
+            } else {
+                html! { option(value: "") { "(default)" } }.to_html()
+            });
+            for lvl in levels {
+                opts.push(if *lvl == current {
+                    html! { option(value: (*lvl), selected: "selected") { (*lvl) } }.to_html()
+                } else {
+                    html! { option(value: (*lvl)) { (*lvl) } }.to_html()
+                });
+            }
+            html! {
+                label(class: "form-control") {
+                    span(class: "label-text text-xs") { (label) }
+                    select(name: (name), class: "select select-bordered select-xs") {
+                        for o in opts.iter() { (o.clone()) }
+                    }
+                }
+            }
+            .to_html()
+        };
+        let controls = html! {
+            (sel("effort_standard", "Standard", &row.effort_standard))
+            (sel("effort_deep", "Deep", &row.effort_deep))
+            (sel("effort_max", "Max", &row.effort_max))
+        }
+        .to_html();
+        (
+            controls,
+            "Reasoning effort per level. Blank = built-in default. Fast disables thinking.",
+        )
+    } else {
+        // No reasoning support → no controls.
+        return html! { (String::new()) }.to_html();
+    };
+
+    html! {
+        form(
+            method: "post",
+            action: (action),
+            "data-on:submit__prevent":
+                (format!("@post('{action}', {{contentType: 'form'}})")),
+            class: "flex flex-col gap-2 m-0 border-t border-base-300 pt-3"
+        ) {
+            input(type: "hidden", name: "model_name", value: (row.name.clone()));
+            span(class: "text-xs text-base-content/60") { (hint) }
+            div(class: "flex flex-wrap items-end gap-3") {
+                (controls)
+                button(type: "submit", class: "btn btn-ghost btn-xs ml-auto self-end") {
+                    (icons::check(12))
+                    span { "Save reasoning budget" }
                 }
             }
         }

@@ -124,6 +124,10 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
             "/admin/models/reasoning",
             pages::admin_models_reasoning_save,
         )
+        .with_post(
+            "/admin/models/reasoning-budget",
+            pages::admin_models_reasoning_budget_save,
+        )
         .with_get("/admin/backends", pages::admin_backends_index)
         .with_get("/admin/users", pages::admin_users_index)
         // Target id rides in the POST body (not the path) — rama lowercases

@@ -9,11 +9,13 @@
 //!
 //!   - a backend-specific reasoning parameter ([`apply_effort`]), because the
 //!     five backends we target express "think harder" differently:
-//!       * vLLM + Qwen      → `chat_template_kwargs.enable_thinking` (bool)
-//!       * OpenAI           → `reasoning_effort` ("low"|"medium"|"high")
-//!       * z.AI / GLM       → `thinking.type` ("enabled"|"disabled")
-//!       * Anthropic        → `thinking.{type,budget_tokens}`
-//!       * everything else  → nothing (no reasoning support)
+//!     `Qwen` → `chat_template_kwargs.enable_thinking` (bool) + optional
+//!     `thinking_token_budget` (token cap); `OpenAI` → `reasoning_effort`
+//!     ("low"|"medium"|"high"); `GLM`/z.AI → `thinking.type`
+//!     ("enabled"|"disabled") + `reasoning_effort` ("none"…"max") intensity;
+//!     `Anthropic` → `thinking.{type,budget_tokens}`; everything else →
+//!     nothing. The per-effort budgets/levels have built-in defaults but can
+//!     be tuned per model on `/admin/models` via [`ReasoningOverrides`].
 //!   - a tool-round cap ([`Effort::max_rounds`]), so an agentic task that
 //!     needs many tool calls can be given more headroom without a second knob.
 //!
@@ -170,6 +172,33 @@ impl ReasoningStyle {
     pub fn supports_reasoning(self) -> bool {
         !matches!(self, Self::None)
     }
+
+    /// Whether this style is tuned by a numeric *token budget* per effort
+    /// (`thinking_token_budget` / `thinking.budget_tokens`). The admin UI shows
+    /// integer token fields for these.
+    pub fn uses_token_budget(self) -> bool {
+        matches!(self, Self::Qwen | Self::Anthropic)
+    }
+
+    /// Whether this style is tuned by a categorical `reasoning_effort` level
+    /// per effort (OpenAI, GLM/z.AI — neither exposes a token cap). The admin
+    /// UI shows a level dropdown for these.
+    pub fn uses_effort_level(self) -> bool {
+        matches!(self, Self::OpenAi | Self::Glm)
+    }
+
+    /// Allowed `reasoning_effort` values for this style, most→least thinking.
+    /// Empty for token-budget / no-reasoning styles. Single source of truth for
+    /// both the admin dropdown and save-time validation.
+    pub fn effort_levels(self) -> &'static [&'static str] {
+        match self {
+            // OpenAI reasoning models accept only these three.
+            Self::OpenAi => &["high", "medium", "low"],
+            // z.AI / GLM accepts the full intensity scale.
+            Self::Glm => &["max", "xhigh", "high", "medium", "low", "minimal", "none"],
+            _ => &[],
+        }
+    }
 }
 
 /// Anthropic thinking-token budgets per level. Standard/Deep/Max only; Fast
@@ -194,10 +223,76 @@ fn openai_effort(effort: Effort) -> &'static str {
     }
 }
 
+/// GLM / z.AI `reasoning_effort` value per *thinking* level. Fast disables
+/// thinking entirely (handled separately), so it has no level here. z.AI's
+/// own default is `"max"` (the model always thinks hard); mapping Standard to
+/// a lower intensity is what makes the effort knob actually rein GLM in.
+fn glm_effort(effort: Effort) -> &'static str {
+    match effort {
+        // Unused (Fast → thinking disabled), kept total for exhaustiveness.
+        Effort::Fast => "low",
+        Effort::Standard => "medium",
+        Effort::Deep => "high",
+        Effort::Max => "max",
+    }
+}
+
+/// Per-model, per-effort overrides for the reasoning budget, configured on
+/// `/admin/models` and stored in `model_defaults`. Two parallel
+/// representations because backends differ (see [`ReasoningStyle`]):
+///
+///   * `budget_*` — integer token caps, used by token-budget styles
+///     ([`ReasoningStyle::uses_token_budget`]).
+///   * `effort_*` — categorical `reasoning_effort` levels, used by
+///     effort-level styles ([`ReasoningStyle::uses_effort_level`]).
+///
+/// A `None` field means "use the built-in default for that style+level", so an
+/// all-default value reproduces the pre-override behaviour exactly. There is no
+/// Fast field: Fast means reasoning-off / minimal and keeps its built-in
+/// behaviour.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReasoningOverrides {
+    pub budget_standard: Option<u32>,
+    pub budget_deep: Option<u32>,
+    pub budget_max: Option<u32>,
+    pub effort_standard: Option<String>,
+    pub effort_deep: Option<String>,
+    pub effort_max: Option<String>,
+}
+
+impl ReasoningOverrides {
+    /// The token-budget override for `effort`, if any. Fast never has one.
+    fn budget(&self, effort: Effort) -> Option<u32> {
+        match effort {
+            Effort::Fast => None,
+            Effort::Standard => self.budget_standard,
+            Effort::Deep => self.budget_deep,
+            Effort::Max => self.budget_max,
+        }
+    }
+
+    /// The `reasoning_effort` override for `effort`, if any. Fast never has one.
+    fn effort_level(&self, effort: Effort) -> Option<&str> {
+        match effort {
+            Effort::Fast => None,
+            Effort::Standard => self.effort_standard.as_deref(),
+            Effort::Deep => self.effort_deep.as_deref(),
+            Effort::Max => self.effort_max.as_deref(),
+        }
+    }
+}
+
 /// Translate `effort` into the backend-specific reasoning parameter for
-/// `style` and merge it into `body`. Client-wins: a key the request already set
-/// is left untouched. No-op for [`ReasoningStyle::None`].
-pub fn apply_effort(style: ReasoningStyle, effort: Effort, body: &mut Value) {
+/// `style` and merge it into `body`. `overrides` carries the per-model,
+/// per-effort tuning from `/admin/models`; pass [`ReasoningOverrides::default`]
+/// for the built-in behaviour. Client-wins: a key the request already set is
+/// left untouched. No-op for [`ReasoningStyle::None`].
+pub fn apply_effort(
+    style: ReasoningStyle,
+    effort: Effort,
+    overrides: &ReasoningOverrides,
+    body: &mut Value,
+) {
     let Some(obj) = body.as_object_mut() else {
         return;
     };
@@ -214,13 +309,21 @@ pub fn apply_effort(style: ReasoningStyle, effort: Effort, body: &mut Value) {
             {
                 k.insert("enable_thinking".into(), Value::Bool(effort.reasoning_on()));
             }
+            // vLLM caps reasoning at `thinking_token_budget` tokens (forces the
+            // reasoning-end token once hit). Only meaningful when thinking is on.
+            if effort.reasoning_on()
+                && let Some(budget) = overrides.budget(effort)
+                && !obj.contains_key("thinking_token_budget")
+            {
+                obj.insert("thinking_token_budget".into(), json!(budget));
+            }
         }
         ReasoningStyle::OpenAi => {
             if !obj.contains_key("reasoning_effort") {
-                obj.insert(
-                    "reasoning_effort".into(),
-                    Value::String(openai_effort(effort).into()),
-                );
+                let level = overrides
+                    .effort_level(effort)
+                    .unwrap_or(openai_effort(effort));
+                obj.insert("reasoning_effort".into(), Value::String(level.into()));
             }
         }
         ReasoningStyle::Glm => {
@@ -232,10 +335,21 @@ pub fn apply_effort(style: ReasoningStyle, effort: Effort, body: &mut Value) {
                 };
                 obj.insert("thinking".into(), json!({ "type": kind }));
             }
+            // z.AI has no token cap; intensity is `reasoning_effort` and only
+            // takes effect while thinking is enabled. Its native default is
+            // "max", so mapping the effort knob here is what limits GLM.
+            if effort.reasoning_on() && !obj.contains_key("reasoning_effort") {
+                let level = overrides.effort_level(effort).unwrap_or(glm_effort(effort));
+                obj.insert("reasoning_effort".into(), Value::String(level.into()));
+            }
         }
         ReasoningStyle::Anthropic => {
             if !obj.contains_key("thinking") {
-                match anthropic_budget(effort) {
+                // An explicit per-model budget wins over the built-in default.
+                match overrides
+                    .budget(effort)
+                    .or_else(|| anthropic_budget(effort))
+                {
                     Some(budget) => {
                         obj.insert(
                             "thinking".into(),
@@ -328,28 +442,48 @@ mod tests {
     #[test]
     fn none_style_is_a_noop() {
         let mut body = json!({"model": "x", "messages": []});
-        apply_effort(ReasoningStyle::None, Effort::Max, &mut body);
+        apply_effort(
+            ReasoningStyle::None,
+            Effort::Max,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(body, json!({"model": "x", "messages": []}));
     }
 
     #[test]
     fn qwen_toggles_enable_thinking() {
         let mut body = json!({"model": "Qwen3"});
-        apply_effort(ReasoningStyle::Qwen, Effort::Fast, &mut body);
+        apply_effort(
+            ReasoningStyle::Qwen,
+            Effort::Fast,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(
             body["chat_template_kwargs"]["enable_thinking"],
             json!(false)
         );
 
         let mut body = json!({"model": "Qwen3"});
-        apply_effort(ReasoningStyle::Qwen, Effort::Deep, &mut body);
+        apply_effort(
+            ReasoningStyle::Qwen,
+            Effort::Deep,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
     }
 
     #[test]
     fn qwen_preserves_other_chat_template_kwargs() {
         let mut body = json!({"chat_template_kwargs": {"foo": 1}});
-        apply_effort(ReasoningStyle::Qwen, Effort::Standard, &mut body);
+        apply_effort(
+            ReasoningStyle::Qwen,
+            Effort::Standard,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(body["chat_template_kwargs"]["foo"], json!(1));
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
     }
@@ -357,33 +491,72 @@ mod tests {
     #[test]
     fn openai_sets_reasoning_effort() {
         let mut body = json!({});
-        apply_effort(ReasoningStyle::OpenAi, Effort::Fast, &mut body);
+        apply_effort(
+            ReasoningStyle::OpenAi,
+            Effort::Fast,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(body["reasoning_effort"], json!("low"));
         let mut body = json!({});
-        apply_effort(ReasoningStyle::OpenAi, Effort::Standard, &mut body);
+        apply_effort(
+            ReasoningStyle::OpenAi,
+            Effort::Standard,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(body["reasoning_effort"], json!("medium"));
         let mut body = json!({});
-        apply_effort(ReasoningStyle::OpenAi, Effort::Max, &mut body);
+        apply_effort(
+            ReasoningStyle::OpenAi,
+            Effort::Max,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(body["reasoning_effort"], json!("high"));
     }
 
     #[test]
-    fn glm_sets_thinking_type() {
+    fn glm_sets_thinking_type_and_effort() {
+        // Fast → thinking off, no reasoning_effort.
         let mut body = json!({});
-        apply_effort(ReasoningStyle::Glm, Effort::Fast, &mut body);
+        apply_effort(
+            ReasoningStyle::Glm,
+            Effort::Fast,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(body["thinking"]["type"], json!("disabled"));
+        assert!(body.get("reasoning_effort").is_none());
+        // Deep → thinking on + the default intensity for the level.
         let mut body = json!({});
-        apply_effort(ReasoningStyle::Glm, Effort::Deep, &mut body);
+        apply_effort(
+            ReasoningStyle::Glm,
+            Effort::Deep,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(body["thinking"]["type"], json!("enabled"));
+        assert_eq!(body["reasoning_effort"], json!("high"));
     }
 
     #[test]
     fn anthropic_sets_budget() {
         let mut body = json!({});
-        apply_effort(ReasoningStyle::Anthropic, Effort::Fast, &mut body);
+        apply_effort(
+            ReasoningStyle::Anthropic,
+            Effort::Fast,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(body["thinking"]["type"], json!("disabled"));
         let mut body = json!({});
-        apply_effort(ReasoningStyle::Anthropic, Effort::Max, &mut body);
+        apply_effort(
+            ReasoningStyle::Anthropic,
+            Effort::Max,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(body["thinking"]["type"], json!("enabled"));
         assert_eq!(body["thinking"]["budget_tokens"], json!(32_768));
     }
@@ -392,11 +565,100 @@ mod tests {
     fn client_value_wins() {
         // A pre-set reasoning param is never overwritten.
         let mut body = json!({"reasoning_effort": "high"});
-        apply_effort(ReasoningStyle::OpenAi, Effort::Fast, &mut body);
+        apply_effort(
+            ReasoningStyle::OpenAi,
+            Effort::Fast,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(body["reasoning_effort"], json!("high"));
 
         let mut body = json!({"thinking": {"type": "disabled"}});
-        apply_effort(ReasoningStyle::Anthropic, Effort::Max, &mut body);
+        apply_effort(
+            ReasoningStyle::Anthropic,
+            Effort::Max,
+            &ReasoningOverrides::default(),
+            &mut body,
+        );
         assert_eq!(body["thinking"], json!({"type": "disabled"}));
+    }
+
+    /// A per-model token budget caps Qwen thinking on the thinking levels and
+    /// is omitted on Fast (thinking off).
+    #[test]
+    fn qwen_token_budget_override() {
+        let ov = ReasoningOverrides {
+            budget_standard: Some(1_024),
+            budget_deep: Some(4_096),
+            ..Default::default()
+        };
+        let mut body = json!({"model": "Qwen3"});
+        apply_effort(ReasoningStyle::Qwen, Effort::Deep, &ov, &mut body);
+        assert_eq!(body["thinking_token_budget"], json!(4_096));
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
+
+        // Fast → thinking off → no budget even if one is configured.
+        let mut body = json!({"model": "Qwen3"});
+        apply_effort(ReasoningStyle::Qwen, Effort::Fast, &ov, &mut body);
+        assert!(body.get("thinking_token_budget").is_none());
+
+        // A level with no override stays uncapped (backend default).
+        let mut body = json!({"model": "Qwen3"});
+        apply_effort(ReasoningStyle::Qwen, Effort::Max, &ov, &mut body);
+        assert!(body.get("thinking_token_budget").is_none());
+    }
+
+    /// A client-supplied budget is never overwritten.
+    #[test]
+    fn qwen_token_budget_client_wins() {
+        let ov = ReasoningOverrides {
+            budget_deep: Some(4_096),
+            ..Default::default()
+        };
+        let mut body = json!({"thinking_token_budget": 99});
+        apply_effort(ReasoningStyle::Qwen, Effort::Deep, &ov, &mut body);
+        assert_eq!(body["thinking_token_budget"], json!(99));
+    }
+
+    /// OpenAI / GLM effort-level overrides replace the built-in mapping.
+    #[test]
+    fn effort_level_overrides() {
+        let ov = ReasoningOverrides {
+            effort_standard: Some("high".into()),
+            effort_deep: Some("minimal".into()),
+            ..Default::default()
+        };
+        let mut body = json!({});
+        apply_effort(ReasoningStyle::OpenAi, Effort::Standard, &ov, &mut body);
+        assert_eq!(body["reasoning_effort"], json!("high"));
+
+        let mut body = json!({});
+        apply_effort(ReasoningStyle::Glm, Effort::Deep, &ov, &mut body);
+        assert_eq!(body["reasoning_effort"], json!("minimal"));
+        assert_eq!(body["thinking"]["type"], json!("enabled"));
+    }
+
+    /// A per-model Anthropic budget overrides the built-in default.
+    #[test]
+    fn anthropic_budget_override() {
+        let ov = ReasoningOverrides {
+            budget_max: Some(50_000),
+            ..Default::default()
+        };
+        let mut body = json!({});
+        apply_effort(ReasoningStyle::Anthropic, Effort::Max, &ov, &mut body);
+        assert_eq!(body["thinking"]["budget_tokens"], json!(50_000));
+    }
+
+    #[test]
+    fn effort_levels_and_kind_per_style() {
+        assert!(ReasoningStyle::Qwen.uses_token_budget());
+        assert!(ReasoningStyle::Anthropic.uses_token_budget());
+        assert!(ReasoningStyle::OpenAi.uses_effort_level());
+        assert!(ReasoningStyle::Glm.uses_effort_level());
+        assert_eq!(ReasoningStyle::OpenAi.effort_levels().len(), 3);
+        assert_eq!(ReasoningStyle::Glm.effort_levels().len(), 7);
+        assert!(ReasoningStyle::Qwen.effort_levels().is_empty());
+        assert!(ReasoningStyle::None.effort_levels().is_empty());
     }
 }

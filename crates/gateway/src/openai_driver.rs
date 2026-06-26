@@ -208,13 +208,18 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             .flatten()
             .as_deref(),
     );
-    let reasoning_style = {
-        let explicit = crate::server::db::model_defaults::get(&d.state.db, &ctx.model)
+    let (reasoning_style, reasoning_overrides) = {
+        let row = crate::server::db::model_defaults::get(&d.state.db, &ctx.model)
             .await
             .ok()
-            .flatten()
-            .and_then(|r| r.reasoning_style);
-        crate::server::reasoning::ReasoningStyle::resolve(explicit.as_deref(), &ctx.model)
+            .flatten();
+        let explicit = row.as_ref().and_then(|r| r.reasoning_style.as_deref());
+        let style = crate::server::reasoning::ReasoningStyle::resolve(explicit, &ctx.model);
+        let overrides = row
+            .as_ref()
+            .map(reasoning_overrides_from_row)
+            .unwrap_or_default();
+        (style, overrides)
     };
     let max_rounds = effort.max_rounds();
 
@@ -357,7 +362,12 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         // Translate the conversation's effort level into the model's
         // backend-specific reasoning parameter (after defaults, so the
         // client-wins contract still holds against any stored default).
-        crate::server::reasoning::apply_effort(reasoning_style, effort, &mut request_body);
+        crate::server::reasoning::apply_effort(
+            reasoning_style,
+            effort,
+            &reasoning_overrides,
+            &mut request_body,
+        );
         let serialized = serde_json::to_vec(&request_body).map_err(upstream_err)?;
 
         let acquired = d
@@ -1211,6 +1221,24 @@ fn upstream_err<E: std::fmt::Display>(e: E) -> TurnError {
 fn transport_err<E: std::fmt::Display>(e: E) -> TurnError {
     TurnError::Transport {
         message: e.to_string(),
+    }
+}
+
+/// Project a stored `model_defaults` row onto the pure per-effort overrides
+/// `apply_effort` consumes. Budgets are SQLite INTEGERs; a negative / oversized
+/// value can't be a token count, so it degrades to `None` (built-in default)
+/// rather than poisoning the request.
+fn reasoning_overrides_from_row(
+    row: &crate::server::db::model_defaults::ModelDefaults,
+) -> crate::server::reasoning::ReasoningOverrides {
+    let budget = |v: Option<i64>| v.and_then(|n| u32::try_from(n).ok());
+    crate::server::reasoning::ReasoningOverrides {
+        budget_standard: budget(row.thinking_budget_standard),
+        budget_deep: budget(row.thinking_budget_deep),
+        budget_max: budget(row.thinking_budget_max),
+        effort_standard: row.reasoning_effort_standard.clone(),
+        effort_deep: row.reasoning_effort_deep.clone(),
+        effort_max: row.reasoning_effort_max.clone(),
     }
 }
 
