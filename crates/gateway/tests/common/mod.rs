@@ -41,6 +41,7 @@ pub const TEST_SECRET: [u8; 32] = [7u8; 32];
 /// uri, or `http://unused.invalid` when no request should be forwarded).
 fn mock_backend(name: &str, base_url: &str) -> BackendConfig {
     BackendConfig {
+        alias: None,
         name: name.into(),
         base_url: base_url.into(),
         api_key_env: None,
@@ -81,6 +82,7 @@ pub async fn state_with_pool(upstream_url: &str, kind: PoolKind, model_name: &st
     pools.insert(
         "pool".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind,
             strategy: PickerStrategy::RoundRobin,
@@ -107,6 +109,7 @@ pub async fn state_with_chat_and_config_transcription(
     pools.insert(
         "chat".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
@@ -120,6 +123,7 @@ pub async fn state_with_chat_and_config_transcription(
     pools.insert(
         "voice".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Transcription,
             strategy: PickerStrategy::RoundRobin,
@@ -146,6 +150,7 @@ pub async fn state_with_chat_and_embed(chat_model: &str, embed_model: &str) -> R
     pools.insert(
         "chat".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
@@ -156,6 +161,7 @@ pub async fn state_with_chat_and_embed(chat_model: &str, embed_model: &str) -> R
     pools.insert(
         "embed".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Embedding,
             strategy: PickerStrategy::RoundRobin,
@@ -192,11 +198,13 @@ async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool
     pools.insert(
         "pool".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
             backend: vec![BackendConfig {
+                alias: None,
                 name: "mock".into(),
                 base_url: upstream_url.into(),
                 api_key_env: None,

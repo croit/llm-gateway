@@ -44,6 +44,11 @@ retention_days = 90
 [upstream_pools.local_chat]
 kind = "chat"
 strategy = "least_inflight"
+# Backup model if a model THIS pool knows has no healthy backend right now
+# (every replica down). The request re-resolves to this instead of 503 —
+# typically a different tier. Single hop; may itself be an alias. See the
+# "Model aliases + fallback" note below and docs/upstreams.md.
+# fallback_offline = "glm-4.6"
 
 [[upstream_pools.local_chat.backend]]
 name = "gpu-01"
@@ -51,12 +56,17 @@ base_url = "http://gpu-01.internal:8000/v1"
 # api_key_env = "GPU01_KEY"   # uncomment if the backend needs a bearer
 max_inflight = 16
 weight = 1
+# Client-facing aliases this backend also answers to (see the note below).
+# Bare list form: each binds to the one model this backend serves.
+# alias = ["qwen", "fast"]
 
 [[upstream_pools.local_chat.backend]]
 name = "gpu-02"
 base_url = "http://gpu-02.internal:8000/v1"
 max_inflight = 16
 weight = 1
+# Same alias on a second backend → "qwen" load-balances across both (a group).
+# alias = ["qwen"]
 
 # Optional data-handling flags for every model this pool serves. Both default
 # to true (compliant) — omit the block entirely and nothing changes. Set a flag
@@ -102,6 +112,29 @@ weight = 1
 #
 # /v1/models lists EVERY model across ALL pools/kinds (chat + transcription +
 # embedding), de-duplicated by id — OpenAI parity; clients select by id.
+
+# ---- Model aliases + fallback ---------------------------------------------
+# Aliases (the per-backend `alias` key above) give clients a STABLE name that
+# routes to whatever real model is loaded — swap the model, keep the alias, and
+# connected clients never reconfigure. Two forms, pick one per backend:
+#   alias = ["qwen", "fast"]                 # bare list → the backend's sole model
+#   alias = { smart = "glm-4.6", cheap = "glm-4.5-air" }   # map → explicit targets
+# (use the map on a multi-model backend, e.g. a cloud provider). Both the alias
+# and the real id are routable and both appear in /v1/models. The forwarded
+# request's `model` is rewritten to the real id; the response carries
+# `X-Gateway-Resolved-Model`. Boot fails on an alias that shadows a real id or a
+# map target not in the backend's `models`; a bare alias on a backend serving
+# >1 model is disabled at runtime with a logged ERROR.
+#
+# Two optional fallbacks (unset ⇒ today's 404 / 503):
+#   - `[fallback]` (below): UNKNOWN model name → a per-kind default.
+#   - `fallback_offline` (per pool, above): a KNOWN model with all replicas down
+#     → a backup model. Not applied to RAG embeddings (a different embedding
+#     model would corrupt the index).
+# [fallback]
+# chat = "qwen"                       # unknown chat model → route to "qwen"
+# embedding = "text-embedding-3-small"
+# # transcription unset → stays 404
 
 # ---- OIDC ------------------------------------------------------------------
 # Required for /auth/login and `gw auth login` to work.

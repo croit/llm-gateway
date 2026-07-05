@@ -560,11 +560,13 @@ async fn state_with_backend_api_key(
     pools.insert(
         "pool".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
             backend: vec![BackendConfig {
+                alias: None,
                 name: "mock".into(),
                 base_url: upstream_url.into(),
                 api_key_env: Some(ENV_KEY.into()),
@@ -586,4 +588,98 @@ async fn state_with_backend_api_key(
         sessions,
         gateway::server::usage::UsageHandle::disabled(),
     )
+}
+
+/// A chat pool whose single backend answers to the bare alias `qwen` and
+/// serves the real id `model-a`.
+async fn state_with_alias_pool(upstream_url: &str) -> gateway::rama_server::RamaState {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use gateway::rama_server::{RamaState, SessionStore};
+    use gateway::server::rbac::Resolver;
+    use gateway::server::tools::ToolRegistry;
+    use gateway::server::upstreams::{
+        self,
+        config::{AliasSpec, BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
+    };
+    use gateway::server::{AppState, Config, db};
+
+    let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool".to_string(),
+        UpstreamPoolConfig {
+            fallback_offline: None,
+            compliance: Default::default(),
+            kind: PoolKind::Chat,
+            strategy: PickerStrategy::RoundRobin,
+            models: Vec::new(),
+            backend: vec![BackendConfig {
+                alias: Some(AliasSpec::Names(vec!["qwen".into()])),
+                name: "mock".into(),
+                base_url: upstream_url.into(),
+                api_key_env: None,
+                weight: 1,
+                max_inflight: 16,
+                health_path: "/models".into(),
+                models: Vec::new(),
+            }],
+        },
+    );
+    let registry = upstreams::UpstreamRegistry::new(&pools).unwrap();
+    common::seed_pool_models(&registry, "pool", 0, &["model-a"]);
+    let tools = Arc::new(ToolRegistry::new());
+    let rbac = Arc::new(Resolver::empty());
+    let app = AppState::new(Config::default(), pool.clone(), registry, tools, rbac);
+    let sessions = SessionStore::new(pool, common::TEST_SECRET);
+    RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    )
+}
+
+#[tokio::test]
+async fn v1_chat_alias_rewrites_model_and_sets_resolved_header() {
+    let upstream = MockServer::start().await;
+    // Matches ONLY when the forwarded body carries the real id. If the gateway
+    // forwarded the alias `qwen` unchanged, this mock wouldn't match and the
+    // request would 404 — so the 200 assertion below proves the body rewrite.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_partial_json(
+            json!({"model": "model-a"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        })))
+        .mount(&upstream)
+        .await;
+
+    let state = state_with_alias_pool(&upstream.uri()).await;
+    let bearer = common::seed_user_with_token(&state, "alice").await;
+    let app = common::app(state);
+
+    let body = json!({"model": "qwen", "messages": []}).to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "alias must rewrite model→model-a so the upstream mock matches"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-gateway-resolved-model")
+            .and_then(|v| v.to_str().ok()),
+        Some("model-a"),
+        "response must advertise the resolved real model id"
+    );
 }

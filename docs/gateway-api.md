@@ -10,13 +10,15 @@ The gateway exposes an OpenAI-compatible API so any standard SDK works against i
 | POST | `/v1/audio/transcriptions` | Phase 4 | multipart/form-data, Whisper-compatible |
 | POST | `/v1/audio/translations`   | Not implemented | No route registered yet |
 | POST | `/v1/embeddings`           | Implemented | Single + batch; byte-dumb relay to the `embedding` pool, non-streaming |
-| GET  | `/v1/models`               | Phase 2 | Lists every model across all pools (chat, transcription, embedding); clients select by id |
+| GET  | `/v1/models`               | Phase 2 | Lists every model across all pools (chat, transcription, embedding) **plus configured aliases**; clients select by id or alias |
 | GET  | `/healthz`                 | Phase 1 | Liveness; no auth |
 | GET  | `/readyz`                  | Phase 1 | Readiness — checks DB + at least one upstream healthy |
 
 ## Schema
 
 We mirror the OpenAI schema exactly for compatibility. Types live in `crates/shared/src/openai/*.rs`. We do **not** invent new request/response fields; gateway-specific extensions go in headers (e.g. `X-Gateway-Tool-Calls: 3`) or in a separate diagnostic endpoint, never in the body.
+
+The `model` field may be a real model id **or an alias** (see [`upstreams.md`](upstreams.md#model-aliases)). When an alias or a fallback resolves to a different real model, the gateway rewrites the forwarded body's `model` to the real id and echoes the real id in the response, with an `X-Gateway-Resolved-Model: <real-id>` response header recording the resolution (present only when it differs from what the client sent).
 
 For evolution: when OpenAI adds fields, we accept them with `#[serde(other)]` / `#[serde(flatten)]` patterns and pass them through to upstreams unmodified. Our handlers only need to read the fields they care about (`model`, `stream`, `messages`, `tools`).
 

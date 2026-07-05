@@ -83,11 +83,13 @@ fn registry_pointed_at(upstream_url: &str) -> Arc<UpstreamRegistry> {
     pools.insert(
         "embed".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Embedding,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
             backend: vec![BackendConfig {
+                alias: None,
                 name: "mock".into(),
                 base_url: upstream_url.into(),
                 api_key_env: None,

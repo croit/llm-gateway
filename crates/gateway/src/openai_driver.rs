@@ -316,6 +316,19 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                 serde_json::json!({"include_usage": true}),
             );
         }
+        // The chat model may be an alias (the picker lists them). Resolve it to
+        // the real id up front so admin defaults + reasoning key on the real
+        // model, and the upstream receives an id it knows. Falls through to the
+        // requested name when it isn't an alias (or isn't currently served —
+        // `route` below then maps the error).
+        let real_model = d
+            .state
+            .upstreams
+            .resolve_model(&ctx.model, crate::server::upstreams::PoolKind::Chat)
+            .unwrap_or_else(|| ctx.model.clone());
+        if let Some(obj) = request_body.as_object_mut() {
+            obj.insert("model".into(), serde_json::json!(real_model));
+        }
         // Re-resolve the per-conversation tool overlay each round so a
         // mid-turn `enable_tools` call surfaces the newly-enabled schemas
         // on the next round. Cheap (sub-ms SQLite hit) and the only way
@@ -373,7 +386,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         let acquired = d
             .state
             .upstreams
-            .acquire_for(&ctx.model, crate::server::upstreams::PoolKind::Chat)
+            .route(&real_model, crate::server::upstreams::PoolKind::Chat)
             .map_err(upstream_err)?;
         let backend = acquired.backend();
         let backend_name = backend.name.clone();

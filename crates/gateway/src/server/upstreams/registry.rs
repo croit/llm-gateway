@@ -27,7 +27,22 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::RwLock;
 use thiserror::Error;
 
-use super::config::{BackendConfig, Compliance, PickerStrategy, PoolKind, UpstreamPoolConfig};
+use super::config::{
+    BackendConfig, Compliance, FallbackConfig, PickerStrategy, PoolKind, UpstreamPoolConfig,
+};
+
+/// A configured alias and its current state, for the read-only admin view.
+#[derive(Debug, Clone)]
+pub struct AliasStatus {
+    /// The client-facing name.
+    pub name: String,
+    /// Explicit target real id (map form), or `None` for a bare list alias
+    /// that binds to the backend's sole model.
+    pub target: Option<String>,
+    /// True when a bare alias is currently disabled because the backend serves
+    /// more than one model (ambiguous) — see [`Backend::reevaluate_aliases`].
+    pub disabled: bool,
+}
 
 /// A single upstream backend with the runtime state we need to schedule it.
 pub struct Backend {
@@ -51,6 +66,17 @@ pub struct Backend {
     /// Lets a backend without a working `/models` endpoint (e.g. Voxtral
     /// realtime) still be routable and advertised.
     config_models: HashSet<String>,
+    /// Client-facing aliases this backend answers to, from config: alias name →
+    /// optional explicit target real id. `Some(id)` (map form) pins a specific
+    /// model; `None` (bare list form) resolves to the backend's sole model at
+    /// request time. Static — aliases never come from the probe.
+    aliases: HashMap<String, Option<String>>,
+    /// Bare aliases currently disabled because the backend serves ≠1 model, so
+    /// "the sole model" is ambiguous. Recomputed by [`Backend::reevaluate_aliases`]
+    /// whenever the effective model set changes (probe update or construction);
+    /// a disabled alias stops resolving until the ambiguity clears. Map-form
+    /// aliases are never disabled (they name their target explicitly).
+    disabled_aliases: RwLock<HashSet<String>>,
 }
 
 impl Backend {
@@ -64,7 +90,8 @@ impl Backend {
         };
         let config_models: HashSet<String> =
             fallback.iter().filter(|s| !s.is_empty()).cloned().collect();
-        Self {
+        let aliases = cfg.alias.as_ref().map(|a| a.into_map()).unwrap_or_default();
+        let backend = Self {
             name: cfg.name.clone(),
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             api_key: cfg.api_key(),
@@ -75,7 +102,14 @@ impl Backend {
             healthy: AtomicBool::new(true),
             models: RwLock::new(HashSet::new()),
             config_models,
-        }
+            aliases,
+            disabled_aliases: RwLock::new(HashSet::new()),
+        };
+        // Evaluate against the config-model set now, so a bare alias declared
+        // alongside multiple static models is disabled (and logged) from the
+        // start; the first probe re-evaluates against the live set.
+        backend.reevaluate_aliases();
+        backend
     }
 
     pub fn is_healthy(&self) -> bool {
@@ -103,21 +137,81 @@ impl Backend {
         f(&self.config_models)
     }
 
-    /// Returns true if this backend currently serves `model` — i.e. its
-    /// most recent probe reported it, or (while the probe set is empty) it's
-    /// a configured fallback id. Cheap read-lock, called on the request hot
-    /// path. Health is *not* considered here; callers gate on `is_healthy`.
-    pub fn serves_model(&self, model: &str) -> bool {
+    /// Real-model membership only (no aliases): the backend's effective set
+    /// (live probe, else config fallback) contains `model`. Cheap read-lock.
+    fn serves_real(&self, model: &str) -> bool {
         self.with_effective_models(|set| set.contains(model))
+    }
+
+    /// The backend's sole effective model, if it serves exactly one. Backs
+    /// bare (list-form) alias resolution — an alias with no explicit target
+    /// binds to this. `None` when the backend serves zero or several models.
+    fn sole_model(&self) -> Option<String> {
+        self.with_effective_models(|set| {
+            if set.len() == 1 {
+                set.iter().next().cloned()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// True if a bare alias is currently disabled (the backend serves ≠1
+    /// model, so "the sole model" is ambiguous — see `reevaluate_aliases`).
+    fn alias_disabled(&self, name: &str) -> bool {
+        self.disabled_aliases
+            .read()
+            .map(|g| g.contains(name))
+            .unwrap_or(false)
+    }
+
+    /// Resolve a requested name to the **real model id** this backend would
+    /// forward to the upstream, or `None` if it doesn't serve it. A real id
+    /// always wins over an alias of the same spelling (identity). A map-form
+    /// alias resolves to its target only while that target is actually served;
+    /// a bare alias resolves to the backend's sole model while it isn't
+    /// disabled. Health is not considered here; callers gate on `is_healthy`.
+    pub fn resolve(&self, requested: &str) -> Option<String> {
+        if self.serves_real(requested) {
+            return Some(requested.to_string());
+        }
+        match self.aliases.get(requested) {
+            Some(Some(target)) => self.serves_real(target).then(|| target.clone()),
+            Some(None) => {
+                if self.alias_disabled(requested) {
+                    None
+                } else {
+                    self.sole_model()
+                }
+            }
+            None => None,
+        }
+    }
+
+    /// Returns true if this backend currently serves `model` — as a real
+    /// advertised id, or as a resolvable alias. Health is *not* considered
+    /// here; callers gate on `is_healthy`. Cheap on the common real-id path
+    /// (no allocation); only an alias hit does the extra lookup.
+    pub fn serves_model(&self, model: &str) -> bool {
+        if self.serves_real(model) {
+            return true;
+        }
+        match self.aliases.get(model) {
+            Some(Some(target)) => self.serves_real(target),
+            Some(None) => !self.alias_disabled(model) && self.sole_model().is_some(),
+            None => false,
+        }
     }
 
     /// Replace the advertised-model set wholesale. Probe-only path —
     /// called from `health.rs` after a successful `/models` parse so the
-    /// next routing lookup reflects the upstream's current loadout.
+    /// next routing lookup reflects the upstream's current loadout. Also
+    /// re-evaluates bare-alias ambiguity against the new set.
     pub fn set_models(&self, models: HashSet<String>) {
         if let Ok(mut guard) = self.models.write() {
             *guard = models;
         }
+        self.reevaluate_aliases();
     }
 
     /// Effective advertised-model set: the live probe set if it reported
@@ -128,11 +222,88 @@ impl Backend {
         self.with_effective_models(|set| set.clone())
     }
 
+    /// Names a listing surface should advertise: the effective real set plus
+    /// every alias that currently resolves (so clients can pick either the
+    /// real id or the alias). An alias that can't route right now — disabled,
+    /// or a map target that isn't loaded — is omitted so the list never
+    /// advertises a name that would 404/503.
+    pub fn listed_models(&self) -> HashSet<String> {
+        let mut set = self.models_snapshot();
+        for name in self.aliases.keys() {
+            if self.resolve(name).is_some() {
+                set.insert(name.clone());
+            }
+        }
+        set
+    }
+
+    /// Recompute which bare (list-form) aliases are ambiguous — the backend
+    /// serves more than one model, so "the sole model" is undefined — and
+    /// disable them. Called at construction and after every probe update. Logs
+    /// only on the transition (disable / re-enable), so a steady state stays
+    /// silent. Map-form aliases are never disabled: they name their target.
+    fn reevaluate_aliases(&self) {
+        // A bare alias needs exactly one model to bind to. Only >1 is the
+        // genuinely-ambiguous case worth an ERROR; with 0 models the backend
+        // serves nothing, so the alias just doesn't resolve (not "ambiguous").
+        let effective_len = self.with_effective_models(|set| set.len());
+        let mut now_disabled: HashSet<String> = HashSet::new();
+        if effective_len > 1 {
+            for (name, target) in &self.aliases {
+                if target.is_none() {
+                    now_disabled.insert(name.clone());
+                }
+            }
+        }
+        let Ok(mut guard) = self.disabled_aliases.write() else {
+            return;
+        };
+        for name in now_disabled.difference(&guard) {
+            tracing::error!(
+                backend = %self.name,
+                alias = %name,
+                models = effective_len,
+                "bare alias `{name}` is ambiguous — this backend now serves multiple models, \
+                 so it can't pick one; disabling it. Give it an explicit target with the map \
+                 form, e.g. `alias = {{ \"{name}\" = \"<real-model-id>\" }}`."
+            );
+        }
+        for name in guard.difference(&now_disabled) {
+            tracing::info!(
+                backend = %self.name,
+                alias = %name,
+                "bare alias `{name}` is no longer ambiguous — re-enabled"
+            );
+        }
+        *guard = now_disabled;
+    }
+
     /// Raw probe-reported set only (no config fallback). For `health.rs`'s
     /// change-detection so the "advertised models updated" diff reflects
     /// what the upstream actually reported, not the static fallback.
     pub fn probe_models(&self) -> HashSet<String> {
         self.models.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Configured aliases and their current state, sorted by name. For the
+    /// read-only `/admin/backends` view.
+    pub fn alias_status(&self) -> Vec<AliasStatus> {
+        let disabled = self
+            .disabled_aliases
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let mut out: Vec<AliasStatus> = self
+            .aliases
+            .iter()
+            .map(|(name, target)| AliasStatus {
+                name: name.clone(),
+                target: target.clone(),
+                disabled: disabled.contains(name),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 }
 
@@ -145,6 +316,10 @@ pub struct Pool {
     /// Data-handling attributes for every model this pool serves (default
     /// all-clear). Drives advisory chat-UI warnings; never affects routing.
     pub compliance: Compliance,
+    /// Backup model when a model this pool *knows* has no healthy backend
+    /// (every replica down). `UpstreamRegistry::route` re-resolves the request
+    /// to this instead of returning `503`. See [`UpstreamPoolConfig::fallback_offline`].
+    fallback_offline: Option<String>,
     /// Cursor for round-robin.
     rr_cursor: AtomicUsize,
 }
@@ -170,6 +345,7 @@ impl Pool {
             strategy: cfg.strategy,
             backends,
             compliance: cfg.compliance,
+            fallback_offline: cfg.fallback_offline.clone(),
             rr_cursor: AtomicUsize::new(0),
         }
     }
@@ -187,6 +363,20 @@ impl Pool {
     /// replica is down" (→ 503) from "no backend serves it at all" (→ 404).
     pub fn knows_model(&self, model: &str) -> bool {
         self.backends.iter().any(|b| b.serves_model(model))
+    }
+
+    /// The pool's configured offline backup model, if any. Read-only admin view.
+    pub fn fallback_offline(&self) -> Option<&str> {
+        self.fallback_offline.as_deref()
+    }
+
+    /// The real id the first healthy backend resolves `model` to, if any.
+    /// Backs the registry's non-acquiring `resolve_model`.
+    fn resolve_healthy(&self, model: &str) -> Option<String> {
+        self.backends
+            .iter()
+            .filter(|b| b.is_healthy())
+            .find_map(|b| b.resolve(model))
     }
 
     /// Picks a healthy backend that advertises `model`, atomically claims an
@@ -212,8 +402,14 @@ impl Pool {
 
         for backend in ordered {
             if try_acquire_slot(backend) {
+                // The real model id to forward: `model` itself for a real id,
+                // or the alias's target on *this* backend. Candidates were
+                // filtered by `serves_model`, so `resolve` is normally `Some`;
+                // fall back to the requested string on a probe-update race.
+                let resolved_model = backend.resolve(model).unwrap_or_else(|| model.to_string());
                 return Ok(Acquired {
                     backend: Arc::clone(backend),
+                    resolved_model,
                 });
             }
         }
@@ -264,17 +460,31 @@ fn try_acquire_slot(backend: &Backend) -> bool {
 /// pipeline so the slot is held for the full streaming response.
 pub struct Acquired {
     backend: Arc<Backend>,
+    /// The real model id the request resolved to on this backend — the id to
+    /// write into the forwarded body's `model` field. Equal to the requested
+    /// model for a direct hit; the alias's target when routed via an alias.
+    resolved_model: String,
 }
 
 impl std::fmt::Debug for Acquired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Acquired({})", self.backend.name)
+        write!(
+            f,
+            "Acquired({}, model={})",
+            self.backend.name, self.resolved_model
+        )
     }
 }
 
 impl Acquired {
     pub fn backend(&self) -> &Backend {
         &self.backend
+    }
+
+    /// The real model id to forward upstream (see the field docs). Callers
+    /// rewrite the request body's `model` to this and key usage/defaults on it.
+    pub fn resolved_model(&self) -> &str {
+        &self.resolved_model
     }
 }
 
@@ -288,6 +498,9 @@ impl Drop for Acquired {
 /// backend's advertised-model set; no compiled route table.
 pub struct UpstreamRegistry {
     pools: HashMap<String, Arc<Pool>>,
+    /// Unknown-model fallback per kind (`[fallback]`). Applied by `route` when
+    /// a requested name is neither a real id nor an alias.
+    fallback: FallbackConfig,
 }
 
 impl std::fmt::Debug for UpstreamRegistry {
@@ -302,12 +515,49 @@ impl std::fmt::Debug for UpstreamRegistry {
 pub enum BuildError {
     #[error("duplicate pool name `{0}`")]
     DuplicatePool(String),
+    #[error(
+        "alias `{alias}` on backend `{backend}` in pool `{pool}` collides with a real model id declared in config — an alias must not shadow a model name"
+    )]
+    AliasCollidesWithModel {
+        alias: String,
+        pool: String,
+        backend: String,
+    },
+    #[error(
+        "alias `{alias}` on backend `{backend}` in pool `{pool}` targets `{target}`, which isn't in that backend's configured `models` {declared:?} — fix the target or add it to `models`"
+    )]
+    AliasTargetUnknown {
+        alias: String,
+        target: String,
+        pool: String,
+        backend: String,
+        declared: Vec<String>,
+    },
 }
 
 impl UpstreamRegistry {
+    /// Build with no unknown-model fallback. Used by tests and any caller that
+    /// doesn't route `[fallback]` (RAG embeddings, etc.).
     pub fn new(
         pool_configs: &HashMap<String, UpstreamPoolConfig>,
     ) -> Result<Arc<Self>, BuildError> {
+        Self::build(pool_configs, FallbackConfig::default())
+    }
+
+    /// Build with the `[fallback]` map wired in, so `route` can substitute an
+    /// unknown requested model with a configured per-kind default.
+    pub fn with_fallback(
+        pool_configs: &HashMap<String, UpstreamPoolConfig>,
+        fallback: FallbackConfig,
+    ) -> Result<Arc<Self>, BuildError> {
+        Self::build(pool_configs, fallback)
+    }
+
+    fn build(
+        pool_configs: &HashMap<String, UpstreamPoolConfig>,
+        fallback: FallbackConfig,
+    ) -> Result<Arc<Self>, BuildError> {
+        validate_aliases(pool_configs)?;
         let mut pools: HashMap<String, Arc<Pool>> = HashMap::new();
         for (name, cfg) in pool_configs {
             if pools.contains_key(name) {
@@ -315,7 +565,7 @@ impl UpstreamRegistry {
             }
             pools.insert(name.clone(), Arc::new(Pool::new(name.clone(), cfg)));
         }
-        Ok(Arc::new(Self { pools }))
+        Ok(Arc::new(Self { pools, fallback }))
     }
 
     pub fn pools(&self) -> impl Iterator<Item = &Arc<Pool>> {
@@ -323,13 +573,14 @@ impl UpstreamRegistry {
     }
 
     /// Sorted, de-duplicated union of the effective model sets of every
-    /// backend in the pools matching `pred`. Shared by `models_for_kind` and
-    /// `all_models`.
+    /// backend in the pools matching `pred`, **including resolvable aliases**
+    /// (so `/v1/models` and the pickers advertise alias names too). Shared by
+    /// `models_for_kind` and `all_models`.
     fn collect_models(&self, pred: impl Fn(&Pool) -> bool) -> Vec<String> {
         let mut all: HashSet<String> = HashSet::new();
         for pool in self.pools.values().filter(|p| pred(p)) {
             for backend in &pool.backends {
-                all.extend(backend.models_snapshot());
+                all.extend(backend.listed_models());
             }
         }
         let mut out: Vec<String> = all.into_iter().collect();
@@ -362,7 +613,9 @@ impl UpstreamRegistry {
         let mut merged: HashMap<String, Compliance> = HashMap::new();
         for pool in self.pools.values().filter(|p| p.kind == kind) {
             for backend in &pool.backends {
-                for id in backend.models_snapshot() {
+                // Alias names inherit the pool's compliance flags, same as the
+                // real ids — clients pick either, so both must carry the warning.
+                for id in backend.listed_models() {
                     let entry = merged.entry(id).or_default();
                     // AND the flags: clear only where every serving pool is clear.
                     entry.gdpr &= pool.compliance.gdpr;
@@ -425,6 +678,122 @@ impl UpstreamRegistry {
         }
         Err(RouteError::UnknownModel(model.to_string()))
     }
+
+    /// Resolve + acquire with the two fallbacks layered on top of
+    /// [`acquire_for`] (§ Fallback models in `docs/upstreams.md`):
+    ///   - **unknown model** (`UnknownModel`) → retry with `[fallback].<kind>`;
+    ///   - **known but all replicas down** (`NoHealthyBackend`) → retry with
+    ///     that pool's `fallback_offline`;
+    ///   - **saturated** (all healthy backends at `max_inflight`) → *no*
+    ///     fallback, return `503` (don't silently downgrade under load).
+    ///
+    /// Fallback is a **single hop**: the retry calls `acquire_for` (not
+    /// `route`), so a fallback target can't itself trigger another fallback —
+    /// if it's also unavailable, the *original* error is returned. This is the
+    /// method the dispatch paths call; the returned [`Acquired::resolved_model`]
+    /// is the real id to forward (after alias/fallback resolution).
+    pub fn route(&self, model: &str, kind: PoolKind) -> Result<Acquired, RouteError> {
+        match self.acquire_for(model, kind) {
+            Ok(acquired) => Ok(acquired),
+            Err(RouteError::UnknownModel(orig)) => match self.fallback.for_kind(kind) {
+                Some(fallback) => self.acquire_for(fallback, kind).map_err(|_| {
+                    // Keep the client-facing error about the model they asked for.
+                    RouteError::UnknownModel(orig)
+                }),
+                None => Err(RouteError::UnknownModel(orig)),
+            },
+            Err(RouteError::Acquire(AcquireError::NoHealthyBackend { pool })) => {
+                match self.pool_fallback_offline(&pool) {
+                    Some(fallback) => self
+                        .acquire_for(&fallback, kind)
+                        .map_err(|_| RouteError::Acquire(AcquireError::NoHealthyBackend { pool })),
+                    None => Err(RouteError::Acquire(AcquireError::NoHealthyBackend { pool })),
+                }
+            }
+            // Saturated (or any other) → surface as-is; no fallback under load.
+            Err(other) => Err(other),
+        }
+    }
+
+    /// The `fallback_offline` model configured on the named pool, if any.
+    fn pool_fallback_offline(&self, pool_name: &str) -> Option<String> {
+        self.pools
+            .get(pool_name)
+            .and_then(|p| p.fallback_offline.clone())
+    }
+
+    /// The configured unknown-model fallback for `kind` (`[fallback]`), if any.
+    /// Read-only admin view.
+    pub fn fallback_model(&self, kind: PoolKind) -> Option<&str> {
+        self.fallback.for_kind(kind)
+    }
+
+    /// Resolve a requested name to the real model id a healthy backend of
+    /// `kind` would serve it as, **without acquiring a slot**. Alias-aware;
+    /// `None` when no healthy backend of that kind currently serves it. For
+    /// callers that must rewrite a request body's `model` before a slot is
+    /// taken (the chat-UI driver serialises before acquiring). Does not apply
+    /// fallback — that's `route`'s job at acquire time.
+    pub fn resolve_model(&self, model: &str, kind: PoolKind) -> Option<String> {
+        self.pools
+            .values()
+            .filter(|p| p.kind == kind)
+            .find_map(|p| p.resolve_healthy(model))
+    }
+}
+
+/// Boot-time alias validation (§ Alias validation in `docs/upstreams.md`).
+/// Only conflicts knowable from *config* are checked here — the runtime,
+/// probe-discovered kind (a bare alias on a multi-model backend) is handled by
+/// [`Backend::reevaluate_aliases`]. Two failures refuse startup:
+///   - an alias name that shadows a real model id declared in config;
+///   - a map-form target that isn't in that backend's configured `models`
+///     (only checkable when the backend declares `models`; otherwise deferred
+///     — the alias just won't resolve until the probe reports the target).
+fn validate_aliases(pool_configs: &HashMap<String, UpstreamPoolConfig>) -> Result<(), BuildError> {
+    // Every real model id config actually names. Probe-discovered ids aren't
+    // known at build time, so a collision with one of those can't be caught
+    // here — but a real id wins over an alias at resolve time regardless.
+    let mut config_ids: HashSet<&str> = HashSet::new();
+    for cfg in pool_configs.values() {
+        config_ids.extend(cfg.models.iter().map(String::as_str));
+        for b in &cfg.backend {
+            config_ids.extend(b.models.iter().map(String::as_str));
+        }
+    }
+    for (pool_name, cfg) in pool_configs {
+        for b in &cfg.backend {
+            let Some(spec) = &b.alias else { continue };
+            // This backend's effective config models (backend wins over pool).
+            let declared: &[String] = if b.models.is_empty() {
+                &cfg.models
+            } else {
+                &b.models
+            };
+            for (alias, target) in spec.into_map() {
+                if config_ids.contains(alias.as_str()) {
+                    return Err(BuildError::AliasCollidesWithModel {
+                        alias,
+                        pool: pool_name.clone(),
+                        backend: b.name.clone(),
+                    });
+                }
+                if let Some(target) = target
+                    && !declared.is_empty()
+                    && !declared.contains(&target)
+                {
+                    return Err(BuildError::AliasTargetUnknown {
+                        alias,
+                        target,
+                        pool: pool_name.clone(),
+                        backend: b.name.clone(),
+                        declared: declared.to_vec(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -441,7 +810,7 @@ pub enum RouteError {
 mod tests {
     use super::*;
     use crate::server::upstreams::config::{
-        BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig,
+        AliasSpec, BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig,
     };
 
     fn backend(name: &str, max_inflight: u32) -> BackendConfig {
@@ -453,6 +822,7 @@ mod tests {
             max_inflight,
             health_path: "/models".into(),
             models: Vec::new(),
+            alias: None,
         }
     }
 
@@ -474,6 +844,7 @@ mod tests {
             kind,
             strategy,
             models: Vec::new(),
+            fallback_offline: None,
             backend: backends,
         }
     }
@@ -489,6 +860,7 @@ mod tests {
             kind,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
+            fallback_offline: None,
             backend: backends,
         }
     }
@@ -504,6 +876,7 @@ mod tests {
             kind,
             strategy: PickerStrategy::RoundRobin,
             models: models.iter().map(|s| (*s).to_string()).collect(),
+            fallback_offline: None,
             backend: backends,
         }
     }
@@ -978,5 +1351,386 @@ mod tests {
         )]);
         assert!(reg.knows_any("whisper-1"));
         assert!(!reg.knows_any("unknown"));
+    }
+
+    // ------- aliases + fallback -------
+
+    fn backend_alias(name: &str, spec: AliasSpec) -> BackendConfig {
+        BackendConfig {
+            alias: Some(spec),
+            ..backend(name, 16)
+        }
+    }
+
+    fn names(v: &[&str]) -> AliasSpec {
+        AliasSpec::Names(v.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    fn targets(pairs: &[(&str, &str)]) -> AliasSpec {
+        AliasSpec::Targets(
+            pairs
+                .iter()
+                .map(|(k, t)| ((*k).to_string(), (*t).to_string()))
+                .collect(),
+        )
+    }
+
+    fn pool_offline(
+        kind: PoolKind,
+        offline: &str,
+        backends: Vec<BackendConfig>,
+    ) -> UpstreamPoolConfig {
+        UpstreamPoolConfig {
+            compliance: Default::default(),
+            kind,
+            strategy: PickerStrategy::RoundRobin,
+            models: Vec::new(),
+            fallback_offline: Some(offline.to_string()),
+            backend: backends,
+        }
+    }
+
+    fn build_with_fallback(
+        pools: Vec<(&str, UpstreamPoolConfig)>,
+        fallback: FallbackConfig,
+    ) -> Arc<UpstreamRegistry> {
+        let map: HashMap<String, UpstreamPoolConfig> =
+            pools.into_iter().map(|(k, v)| (k.into(), v)).collect();
+        UpstreamRegistry::with_fallback(&map, fallback).unwrap()
+    }
+
+    fn try_build(
+        pools: Vec<(&str, UpstreamPoolConfig)>,
+    ) -> Result<Arc<UpstreamRegistry>, BuildError> {
+        let map: HashMap<String, UpstreamPoolConfig> =
+            pools.into_iter().map(|(k, v)| (k.into(), v)).collect();
+        UpstreamRegistry::new(&map)
+    }
+
+    fn set_health(reg: &UpstreamRegistry, pool: &str, idx: usize, healthy: bool) {
+        reg.pools.get(pool).unwrap().backends[idx].set_healthy(healthy);
+    }
+
+    #[test]
+    fn bare_alias_resolves_to_backends_sole_model() {
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![backend_alias("a", names(&["qwen", "fast"]))],
+            ),
+        )]);
+        seed_models(&reg, "chat", 0, &["Qwen/Qwen3-235B"]);
+
+        // Both alias names route, and resolve to the backend's real id.
+        let g = reg.route("qwen", PoolKind::Chat).unwrap();
+        assert_eq!(g.backend().name, "a");
+        assert_eq!(g.resolved_model(), "Qwen/Qwen3-235B");
+        assert_eq!(
+            reg.route("fast", PoolKind::Chat).unwrap().resolved_model(),
+            "Qwen/Qwen3-235B"
+        );
+        // The real id still routes and resolves to itself.
+        assert_eq!(
+            reg.route("Qwen/Qwen3-235B", PoolKind::Chat)
+                .unwrap()
+                .resolved_model(),
+            "Qwen/Qwen3-235B"
+        );
+        // Both the alias and the real id are listed.
+        let listed = reg.all_models();
+        assert!(listed.contains(&"qwen".to_string()));
+        assert!(listed.contains(&"fast".to_string()));
+        assert!(listed.contains(&"Qwen/Qwen3-235B".to_string()));
+    }
+
+    #[test]
+    fn shared_alias_forms_a_group_resolving_to_each_backends_real_id() {
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![
+                    backend_alias("a", names(&["qwen"])),
+                    backend_alias("b", names(&["qwen"])),
+                ],
+            ),
+        )]);
+        seed_models(&reg, "chat", 0, &["Qwen/Qwen2.5-72B"]);
+        seed_models(&reg, "chat", 1, &["Qwen/Qwen3-30B-A3B"]);
+
+        // Round-robin across the group; each hop rewrites to that backend's id.
+        let g1 = reg.route("qwen", PoolKind::Chat).unwrap();
+        let g2 = reg.route("qwen", PoolKind::Chat).unwrap();
+        let mut resolved = [
+            g1.resolved_model().to_string(),
+            g2.resolved_model().to_string(),
+        ];
+        resolved.sort();
+        assert_eq!(resolved, ["Qwen/Qwen2.5-72B", "Qwen/Qwen3-30B-A3B"]);
+        // Pinning a real id hits exactly that backend.
+        assert_eq!(
+            reg.route("Qwen/Qwen3-30B-A3B", PoolKind::Chat)
+                .unwrap()
+                .backend()
+                .name,
+            "b"
+        );
+    }
+
+    #[test]
+    fn bare_alias_disabled_when_backend_serves_multiple_models() {
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![backend_alias("a", names(&["qwen"]))],
+            ),
+        )]);
+        // Two models → "the sole model" is ambiguous → alias disabled + logged.
+        seed_models(&reg, "chat", 0, &["m-1", "m-2"]);
+        assert!(matches!(
+            reg.route("qwen", PoolKind::Chat).unwrap_err(),
+            RouteError::UnknownModel(_)
+        ));
+        assert!(!reg.all_models().contains(&"qwen".to_string()));
+        // The backend's real ids still route fine.
+        assert!(reg.route("m-1", PoolKind::Chat).is_ok());
+        // Drop back to one model → alias re-enables.
+        seed_models(&reg, "chat", 0, &["m-1"]);
+        assert_eq!(
+            reg.route("qwen", PoolKind::Chat).unwrap().resolved_model(),
+            "m-1"
+        );
+    }
+
+    #[test]
+    fn map_alias_targets_specific_model_even_on_multi_model_backend() {
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![backend_alias(
+                    "zai",
+                    targets(&[("smart", "glm-4.6"), ("cheap", "glm-4.5-air")]),
+                )],
+            ),
+        )]);
+        seed_models(&reg, "chat", 0, &["glm-4.6", "glm-4.5-air"]);
+        assert_eq!(
+            reg.route("smart", PoolKind::Chat).unwrap().resolved_model(),
+            "glm-4.6"
+        );
+        assert_eq!(
+            reg.route("cheap", PoolKind::Chat).unwrap().resolved_model(),
+            "glm-4.5-air"
+        );
+    }
+
+    #[test]
+    fn map_alias_does_not_resolve_while_target_unserved() {
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![backend_alias("zai", targets(&[("smart", "glm-4.6")]))],
+            ),
+        )]);
+        seed_models(&reg, "chat", 0, &["something-else"]);
+        assert!(matches!(
+            reg.route("smart", PoolKind::Chat).unwrap_err(),
+            RouteError::UnknownModel(_)
+        ));
+    }
+
+    #[test]
+    fn alias_colliding_with_config_model_refuses_build() {
+        // Backend statically declares model "qwen" AND an alias "qwen".
+        let mut b = backend_alias("a", names(&["qwen"]));
+        b.models = vec!["qwen".into()];
+        let err = try_build(vec![(
+            "chat",
+            pool_config(PoolKind::Chat, PickerStrategy::RoundRobin, vec![b]),
+        )])
+        .unwrap_err();
+        assert!(
+            matches!(err, BuildError::AliasCollidesWithModel { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn map_target_not_in_declared_models_refuses_build() {
+        let mut b = backend_alias("a", targets(&[("smart", "not-served")]));
+        b.models = vec!["glm-4.6".into()];
+        let err = try_build(vec![(
+            "chat",
+            pool_config(PoolKind::Chat, PickerStrategy::RoundRobin, vec![b]),
+        )])
+        .unwrap_err();
+        assert!(
+            matches!(err, BuildError::AliasTargetUnknown { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn fallback_offline_fires_only_when_whole_group_is_down() {
+        let reg = build(vec![
+            (
+                "local",
+                pool_offline(
+                    PoolKind::Chat,
+                    "cloud-model",
+                    vec![backend("a", 16), backend("b", 16)],
+                ),
+            ),
+            (
+                "cloud",
+                pool_config(
+                    PoolKind::Chat,
+                    PickerStrategy::RoundRobin,
+                    vec![backend("c", 16)],
+                ),
+            ),
+        ]);
+        seed_models(&reg, "local", 0, &["m"]);
+        seed_models(&reg, "local", 1, &["m"]);
+        seed_models(&reg, "cloud", 0, &["cloud-model"]);
+
+        // One replica down → still served by the other, NOT the offline backup.
+        set_health(&reg, "local", 0, false);
+        let g = reg.route("m", PoolKind::Chat).unwrap();
+        assert_eq!(g.resolved_model(), "m");
+        assert_eq!(g.backend().name, "b");
+
+        // Whole group down → spill to fallback_offline.
+        set_health(&reg, "local", 1, false);
+        let g = reg.route("m", PoolKind::Chat).unwrap();
+        assert_eq!(g.resolved_model(), "cloud-model");
+        assert_eq!(g.backend().name, "c");
+    }
+
+    #[test]
+    fn fallback_offline_single_hop_returns_original_503_when_backup_also_down() {
+        let reg = build(vec![(
+            "local",
+            pool_offline(PoolKind::Chat, "cloud-model", vec![backend("a", 16)]),
+        )]);
+        seed_models(&reg, "local", 0, &["m"]);
+        set_health(&reg, "local", 0, false); // known but down; backup "cloud-model" served by nobody
+        assert!(matches!(
+            reg.route("m", PoolKind::Chat).unwrap_err(),
+            RouteError::Acquire(AcquireError::NoHealthyBackend { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_model_falls_back_per_kind() {
+        let reg = build_with_fallback(
+            vec![(
+                "chat",
+                pool_config(
+                    PoolKind::Chat,
+                    PickerStrategy::RoundRobin,
+                    vec![backend("a", 16)],
+                ),
+            )],
+            FallbackConfig {
+                chat: Some("house-model".into()),
+                ..Default::default()
+            },
+        );
+        seed_models(&reg, "chat", 0, &["house-model"]);
+        // Never-heard-of model → substitute the house model.
+        let g = reg.route("gpt-4-turbo", PoolKind::Chat).unwrap();
+        assert_eq!(g.resolved_model(), "house-model");
+        // Unset kind isn't rescued by the chat fallback.
+        assert!(matches!(
+            reg.route("gpt-4-turbo", PoolKind::Embedding).unwrap_err(),
+            RouteError::UnknownModel(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_fallback_is_single_hop_and_404_without_config() {
+        // No fallback configured → plain 404.
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![backend("a", 16)],
+            ),
+        )]);
+        seed_models(&reg, "chat", 0, &["m"]);
+        assert!(matches!(
+            reg.route("nope", PoolKind::Chat).unwrap_err(),
+            RouteError::UnknownModel(_)
+        ));
+
+        // Fallback points at a model nobody serves → original 404, no loop.
+        let reg = build_with_fallback(
+            vec![(
+                "chat",
+                pool_config(
+                    PoolKind::Chat,
+                    PickerStrategy::RoundRobin,
+                    vec![backend("a", 16)],
+                ),
+            )],
+            FallbackConfig {
+                chat: Some("also-missing".into()),
+                ..Default::default()
+            },
+        );
+        seed_models(&reg, "chat", 0, &["m"]);
+        assert!(matches!(
+            reg.route("nope", PoolKind::Chat).unwrap_err(),
+            RouteError::UnknownModel(_)
+        ));
+    }
+
+    #[test]
+    fn saturation_does_not_fall_back() {
+        let reg = build(vec![(
+            "local",
+            pool_offline(PoolKind::Chat, "cloud-model", vec![backend("a", 1)]),
+        )]);
+        seed_models(&reg, "local", 0, &["m"]);
+        // Take the only slot; the model is loaded+healthy but saturated.
+        let _held = reg.route("m", PoolKind::Chat).unwrap();
+        assert!(
+            matches!(
+                reg.route("m", PoolKind::Chat).unwrap_err(),
+                RouteError::Acquire(AcquireError::Saturated { .. })
+            ),
+            "saturation must 503, never spill to fallback_offline"
+        );
+    }
+
+    #[test]
+    fn resolve_model_is_alias_aware_and_takes_no_slot() {
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![backend_alias("a", names(&["qwen"]))],
+            ),
+        )]);
+        seed_models(&reg, "chat", 0, &["Qwen/Qwen3-235B"]);
+        assert_eq!(
+            reg.resolve_model("qwen", PoolKind::Chat).as_deref(),
+            Some("Qwen/Qwen3-235B")
+        );
+        assert_eq!(reg.resolve_model("nope", PoolKind::Chat), None);
+        // No inflight slot consumed — the backend is still at 0.
+        assert_eq!(reg.pools.get("chat").unwrap().backends[0].inflight(), 0);
     }
 }

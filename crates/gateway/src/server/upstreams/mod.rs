@@ -28,5 +28,10 @@ pub mod config;
 pub mod health;
 pub mod registry;
 
-pub use config::{BackendConfig, Compliance, PickerStrategy, PoolKind, UpstreamPoolConfig};
-pub use registry::{AcquireError, Acquired, Backend, Pool, RouteError, UpstreamRegistry};
+pub use config::{
+    AliasSpec, BackendConfig, Compliance, FallbackConfig, PickerStrategy, PoolKind,
+    UpstreamPoolConfig,
+};
+pub use registry::{
+    AcquireError, Acquired, AliasStatus, Backend, Pool, RouteError, UpstreamRegistry,
+};

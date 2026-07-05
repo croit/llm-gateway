@@ -55,11 +55,13 @@ async fn state_with_streaming_chat(upstream_uri: &str) -> RamaState {
     pools.insert(
         "pool".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
             backend: vec![BackendConfig {
+                alias: None,
                 name: "mock".into(),
                 base_url: upstream_uri.into(),
                 api_key_env: None,

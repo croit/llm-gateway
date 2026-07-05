@@ -72,13 +72,17 @@ pub async fn embed(
     if inputs.is_empty() {
         return Ok(Vec::new());
     }
+    // `acquire_for`, not `route`: an alias resolves to its real id (fine), but
+    // we must NOT fall back to a *different* embedding model — vectors from
+    // different models aren't comparable and would corrupt the index.
     let acquired = upstreams
         .acquire_for(model, PoolKind::Embedding)
         .map_err(|source| EmbedError::Route {
             model: model.into(),
             source,
         })?;
-    let result = post(http, &acquired, model, inputs).await;
+    let real_model = acquired.resolved_model().to_string();
+    let result = post(http, &acquired, &real_model, inputs).await;
     drop(acquired);
     result
 }
@@ -152,6 +156,7 @@ mod tests {
                 kind: PoolKind::Embedding,
                 strategy: PickerStrategy::RoundRobin,
                 models: Vec::new(),
+                fallback_offline: None,
                 backend: vec![BackendConfig {
                     name: "mock".into(),
                     base_url: upstream_url.into(),
@@ -160,6 +165,7 @@ mod tests {
                     max_inflight: 16,
                     health_path: "/models".into(),
                     models: Vec::new(),
+                    alias: None,
                 }],
             },
         );

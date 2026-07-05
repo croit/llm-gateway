@@ -29,6 +29,7 @@ Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests acro
 
 - **OpenAI-compatible API** — `POST /v1/chat/completions` (streaming + non-streaming), `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, and `GET /v1/models`. Point any OpenAI SDK at it.
 - **Multi-backend routing** — named upstream pools (`chat` / `transcription` / `embedding` kinds). Each pool load-balances across its backends (round-robin or least-in-flight) with per-backend health probes. Models are discovered live from each backend's `/models` endpoint, so loading a model on a backend makes it routable with no config change.
+- **Model aliases + fallback** — give clients a stable name (`alias = ["qwen"]` on a backend) that routes to whatever real model is loaded, so swapping the model needs no client change; the same alias on several backends is a load-balanced group. Optional fallbacks cover an unknown model name (`[fallback].<kind>`) or a known model whose backends are all down (`fallback_offline`). See [`docs/upstreams.md`](docs/upstreams.md#model-aliases).
 - **OIDC login** — browser sign-in against your identity provider; the gateway then issues its own `gwk_…` API tokens. Provider secrets come only from the environment.
 - **Per-user tokens + RBAC** — tokens are SHA-256-hashed at rest and revocable. Roles (mapped from OIDC claims) gate which models and server-side tools each user may use.
 - **Server-side tools** — the gateway runs tools *mid-completion* (web search, fetch-URL, document rendering, RAG, network lookups, and more); the client just sees a normal completion. Full list in [Tools the model can call](#tools-the-model-can-call).
@@ -159,6 +160,7 @@ strategy = "least_inflight"                        # or "round_robin"
 name     = "gpu-01"
 base_url = "http://gpu-01.internal:8000/v1"
 # api_key_env = "GPU01_KEY"                         # if the backend itself needs a bearer token
+# alias    = ["qwen", "fast"]                       # stable client-facing names → this backend's model
 
 # Needed for sign-in + token minting. Without it, /auth/login and `gw auth login` don't work.
 [oidc]

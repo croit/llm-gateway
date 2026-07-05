@@ -181,14 +181,6 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     };
     state.union_mcp_tool_ids(&mut allowed_tools, &user_mcp);
 
-    // Apply admin-configured sampling defaults for the named model
-    // before either branch consumes the body. Client keys win
-    // (`apply_defaults` only fills in *missing* top-level fields);
-    // bad stored TOML / DB hiccups log + pass the original bytes
-    // through. Cheap when no row exists (one indexed lookup).
-    let body =
-        crate::server::model_defaults::apply_defaults_to_bytes(&state.db, &model, body).await;
-
     // Byte-dumb proxy: only when the user has no gateway tool grants.
     // There's nothing to inject, so route bytes 1:1 and leave any
     // client-driven tool loop untouched. When the user *does* have
@@ -197,15 +189,25 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     // and the loop runs gateway-owned calls while passing client-owned
     // ones through.
     if allowed_tools.is_empty() {
-        // `acquire_for` returns a structured `RouteError`, so `route_error_
-        // response` maps an unknown model straight to 404 `model_not_found`
-        // (and known-but-down to 503) — no pre-check needed on this path.
-        let acquired = match state.upstreams.acquire_for(&model, PoolKind::Chat) {
+        // `route` resolves aliases + the two fallbacks and returns a structured
+        // `RouteError`, so `route_error_response` maps an unknown model straight
+        // to 404 `model_not_found` (and known-but-down to 503). Acquires the
+        // slot up front so the resolved real id is known before we touch the body.
+        let acquired = match state.upstreams.route(&model, PoolKind::Chat) {
             Ok(a) => a,
             Err(e) => return route_error_response(e),
         };
-        let rec = RecordParams::v1(&user, UsageKind::Chat, model.clone());
-        return forward_streaming(
+        let real_model = acquired.resolved_model().to_string();
+        // Admin sampling/reasoning defaults key on the *real* model id (so an
+        // alias inherits the target's defaults). Client keys still win —
+        // `apply_defaults` only fills missing top-level fields. Then rewrite the
+        // outgoing `model` to the real id (upstreams don't know the alias).
+        let body =
+            crate::server::model_defaults::apply_defaults_to_bytes(&state.db, &real_model, body)
+                .await;
+        let body = rewrite_model_in_bytes(body, &real_model);
+        let rec = RecordParams::v1(&user, UsageKind::Chat, real_model.clone());
+        let resp = forward_streaming(
             &state,
             acquired,
             Method::POST,
@@ -215,22 +217,26 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
             rec,
         )
         .await;
+        return with_resolved_model_header(resp, &model, &real_model);
     }
 
-    // Gateway-tool path. Unlike the byte-dumb path above, the tool loops
-    // flatten an `acquire_for` error into `LoopError::Upstream` (→ 503), so
-    // they can't tell an unknown model from a transient outage. Pre-check
-    // here so they return the OpenAI 404 too. Health-agnostic: a *known*
-    // model whose replicas are all down still falls through to 503 at
-    // `acquire_for` inside the loop.
-    if !state.upstreams.knows_model(&model, PoolKind::Chat) {
-        return model_not_found_response(&model);
-    }
+    // Gateway-tool path. Resolve aliases + fallback once, up front: the tool
+    // loops acquire per round (flattening errors into `LoopError::Upstream` →
+    // 503, so they can't distinguish an unknown model), and every round must
+    // dispatch the *same* resolved real id. `route` here both maps the OpenAI
+    // 404/503 before streaming starts and yields the real id to forward.
+    let real_model = match state.upstreams.route(&model, PoolKind::Chat) {
+        Ok(a) => a.resolved_model().to_string(),
+        Err(e) => return route_error_response(e),
+    };
+
+    // Defaults key on the resolved real id, same as the byte-dumb path.
+    let body =
+        crate::server::model_defaults::apply_defaults_to_bytes(&state.db, &real_model, body).await;
 
     // Gateway-tool path: inject definitions, then run either the
-    // streaming intercept or the buffered runner. Defaults are
-    // already merged into `body` above.
-    let request_body: Value = match serde_json::from_slice(&body) {
+    // streaming intercept or the buffered runner.
+    let mut request_body: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(err) => {
             return error_response(
@@ -240,16 +246,19 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
             );
         }
     };
+    // Rewrite the body's `model` to the real id so every upstream round in the
+    // loop (which serialises `request_body`) targets the resolved model.
+    set_model_in_value(&mut request_body, &real_model);
 
     let wants_streaming = request_body
         .get("stream")
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
     if wants_streaming {
-        return forward_streaming_with_tools(
+        let resp = forward_streaming_with_tools(
             state.clone(),
             user.clone(),
-            model.clone(),
+            real_model.clone(),
             parts.headers.clone(),
             client_ip.clone(),
             request_body,
@@ -257,6 +266,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
             user_mcp,
         )
         .await;
+        return with_resolved_model_header(resp, &model, &real_model);
     }
     let tool_ctx = ToolContext {
         user_id: user.user_id.clone(),
@@ -282,11 +292,11 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
         indexer: state.indexer.clone(),
     };
     let state_clone = state.clone();
-    let model_clone = model.clone();
+    let model_clone = real_model.clone();
     let headers_clone = parts.headers.clone();
     // One usage row per upstream round — built per request, finished off
     // with backend/status/latency/tokens inside the loop closure.
-    let rec = RecordParams::v1(&user, UsageKind::Chat, model.clone());
+    let rec = RecordParams::v1(&user, UsageKind::Chat, real_model.clone());
 
     // Reuse the layer built once above (same ids we advertised) for dispatch.
     let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
@@ -375,7 +385,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
         Err(err) => return loop_error_response(err),
     };
 
-    Response::builder()
+    let resp = Response::builder()
         .status(StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::OK))
         .header(rama::http::header::CONTENT_TYPE, "application/json")
         .header("x-gateway-tool-rounds", outcome.rounds.to_string())
@@ -386,7 +396,8 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
                 "internal_error",
                 &format!("building response: {err}"),
             )
-        })
+        });
+    with_resolved_model_header(resp, &model, &real_model)
 }
 
 fn loop_error_response(err: LoopError) -> Response {
@@ -512,7 +523,21 @@ async fn handle_transcription(
         );
     };
 
-    let trimmed_fields = trim_audio_field(fields);
+    let mut trimmed_fields = trim_audio_field(fields);
+
+    // Resolve aliases + fallback before rebuilding the multipart body, so the
+    // `model` part we forward carries the real id the upstream knows. The slot
+    // is held across the (in-memory) VAD check + rebuild below.
+    let acquired = match state.upstreams.route(&model, PoolKind::Transcription) {
+        Ok(a) => a,
+        Err(e) => return route_error_response(e),
+    };
+    let real_model = acquired.resolved_model().to_string();
+    if real_model != model
+        && let Some(field) = trimmed_fields.iter_mut().find(|f| f.name == "model")
+    {
+        field.bytes = Bytes::from(real_model.clone());
+    }
 
     // Sub-threshold recording guard. Voxtral (and the other
     // realtime audio LLMs we serve) embed audio at ~25 tokens/s,
@@ -556,12 +581,8 @@ async fn handle_transcription(
         headers.insert(rama::http::header::CONTENT_TYPE, val);
     }
 
-    let acquired = match state.upstreams.acquire_for(&model, PoolKind::Transcription) {
-        Ok(a) => a,
-        Err(e) => return route_error_response(e),
-    };
-    rec.model = model;
-    forward(
+    rec.model = real_model.clone();
+    let resp = forward(
         &state,
         acquired,
         Method::POST,
@@ -570,7 +591,8 @@ async fn handle_transcription(
         new_body,
         rec,
     )
-    .await
+    .await;
+    with_resolved_model_header(resp, &model, &real_model)
 }
 
 /// A single parsed multipart field. We hold everything in memory — the
@@ -734,14 +756,16 @@ pub async fn embeddings(State(state): State<Arc<RamaState>>, req: Request) -> Re
             "request body is missing a string `model` field",
         );
     };
-    // `acquire_for` maps an unknown model → 404 `model_not_found` and a
-    // known-but-all-down pool → 503, via `route_error_response`.
-    let acquired = match state.upstreams.acquire_for(&model, PoolKind::Embedding) {
+    // `route` resolves aliases + fallback and maps an unknown model → 404
+    // `model_not_found` / all-down → 503 via `route_error_response`.
+    let acquired = match state.upstreams.route(&model, PoolKind::Embedding) {
         Ok(a) => a,
         Err(e) => return route_error_response(e),
     };
-    let rec = RecordParams::v1(&user, UsageKind::Embedding, model);
-    forward(
+    let real_model = acquired.resolved_model().to_string();
+    let body = rewrite_model_in_bytes(body, &real_model);
+    let rec = RecordParams::v1(&user, UsageKind::Embedding, real_model.clone());
+    let resp = forward(
         &state,
         acquired,
         Method::POST,
@@ -750,7 +774,8 @@ pub async fn embeddings(State(state): State<Arc<RamaState>>, req: Request) -> Re
         body,
         rec,
     )
-    .await
+    .await;
+    with_resolved_model_header(resp, &model, &real_model)
 }
 
 /// `GET /v1/models` — lists *every* model served by any healthy backend in
@@ -1645,6 +1670,49 @@ fn strip_stream_options_when_not_streaming(body: Bytes) -> Bytes {
 fn parse_model_field(body: &Bytes) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     v.get("model")?.as_str().map(str::to_owned)
+}
+
+/// Rewrite a JSON request body's `model` field to `real_model` — the real id an
+/// alias/fallback resolved to — so the upstream (which only knows its own model
+/// ids) accepts the request. A no-op when `real_model` already matches. On a
+/// JSON parse failure the original bytes pass through unchanged (the upstream
+/// then reports the error), mirroring `apply_defaults_to_bytes`.
+fn rewrite_model_in_bytes(body: Bytes, real_model: &str) -> Bytes {
+    let Ok(mut v) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    match v.get("model").and_then(|m| m.as_str()) {
+        Some(current) if current == real_model => body,
+        _ => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("model".into(), json!(real_model));
+            }
+            serde_json::to_vec(&v).map(Bytes::from).unwrap_or(body)
+        }
+    }
+}
+
+/// Set the `model` field of a parsed JSON body to `real_model` (the tool-loop
+/// paths carry the body as a `Value`, so no re-parse is needed).
+fn set_model_in_value(body: &mut Value, real_model: &str) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("model".into(), json!(real_model));
+    }
+}
+
+/// Advertise which real model actually served the request via the
+/// `X-Gateway-Resolved-Model` response header — but only when it differs from
+/// what the client asked for (i.e. an alias or a fallback fired). Set on the
+/// `Response` before it's returned, so it lands in the header block ahead of
+/// any streamed body. A non-ASCII model id (never the case for real ids) is
+/// silently skipped rather than failing the response.
+fn with_resolved_model_header(mut resp: Response, requested: &str, resolved: &str) -> Response {
+    if requested != resolved
+        && let Ok(val) = rama::http::HeaderValue::from_str(resolved)
+    {
+        resp.headers_mut().insert("x-gateway-resolved-model", val);
+    }
+    resp
 }
 
 fn route_error_response(err: RouteError) -> Response {

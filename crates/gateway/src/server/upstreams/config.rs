@@ -3,6 +3,8 @@
 
 //! TOML configuration shape for the multi-provider routing layer.
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -11,6 +13,17 @@ pub struct UpstreamPoolConfig {
     pub kind: PoolKind,
     #[serde(default)]
     pub strategy: PickerStrategy,
+    /// Backup model for this pool when a model it *knows* has no healthy
+    /// backend right now (every replica down). On that `503`-shaped outage
+    /// the router re-resolves the request to this model instead — typically a
+    /// different tier (e.g. local GPUs down → a cloud model). Re-resolved
+    /// through the normal path (so it may itself be an alias/group) and only a
+    /// **single hop**: if the backup is also unavailable the original `503` is
+    /// returned. Absent ⇒ the outage surfaces as `503`, as before. Distinct
+    /// from [`crate::server::config::Config`]'s `[fallback]`, which handles a
+    /// wholly *unknown* model name.
+    #[serde(default)]
+    pub fallback_offline: Option<String>,
     /// Pool-level fallback model IDs. Used to advertise/route a model when a
     /// backend in this pool doesn't report it via its `/models` probe (e.g.
     /// a Voxtral realtime server that has no `/models` endpoint). This is the
@@ -110,6 +123,81 @@ pub struct BackendConfig {
     /// that don't self-report, not a supplement to a live probe.
     #[serde(default)]
     pub models: Vec<String>,
+    /// Client-facing aliases this backend also answers to. An alias decouples
+    /// the name clients send from the real model that's loaded: point clients
+    /// at `qwen`, swap the loaded model, keep the alias, and nothing downstream
+    /// changes. The same alias on several backends forms a load-balanced
+    /// **group**. Both forms combine across backends into one group.
+    ///
+    /// Two forms (pick one per backend):
+    ///   - **list** — `alias = ["qwen", "fast"]`. Each name binds to the one
+    ///     model this backend serves; use on single-model backends (the GPU norm).
+    ///   - **map** — `alias = { smart = "glm-4.6" }`. Each name targets a
+    ///     specific real id; required on multi-model backends (e.g. a cloud
+    ///     provider serving many models behind one `base_url`), where a bare
+    ///     name couldn't tell which model it means.
+    ///
+    /// See [`AliasSpec`] and `docs/upstreams.md`.
+    #[serde(default)]
+    pub alias: Option<AliasSpec>,
+}
+
+/// How a backend's [`alias`](BackendConfig::alias) is written in TOML — either a
+/// bare list of names (each binds to the backend's sole model) or a map from
+/// alias name to the real model id it targets. Deserialised untagged: a TOML
+/// array parses as [`AliasSpec::Names`], an inline table as
+/// [`AliasSpec::Targets`]. (Untagged enums can't carry `deny_unknown_fields`.)
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum AliasSpec {
+    Names(Vec<String>),
+    Targets(HashMap<String, String>),
+}
+
+impl AliasSpec {
+    /// Normalise to `alias name → optional explicit target`. A list entry maps
+    /// to `None` (resolve to the backend's sole model at request time); a map
+    /// entry maps to `Some(real_id)`.
+    pub fn into_map(&self) -> HashMap<String, Option<String>> {
+        match self {
+            AliasSpec::Names(names) => names.iter().map(|n| (n.clone(), None)).collect(),
+            AliasSpec::Targets(m) => m
+                .iter()
+                .map(|(k, v)| (k.clone(), Some(v.clone())))
+                .collect(),
+        }
+    }
+}
+
+/// Unknown-model fallback, keyed by request kind. When a request names a model
+/// that is neither a real id nor any alias, the router substitutes the model
+/// configured here for that kind (re-resolved through the normal path, single
+/// hop). Answers "the client asked for something we've never heard of" — a typo
+/// or a renamed model. An unset kind ⇒ the miss surfaces as `404
+/// model_not_found`, as before. Per-kind because a chat model can't sensibly
+/// rescue an embeddings or transcription miss. Distinct from a pool's
+/// [`fallback_offline`](UpstreamPoolConfig::fallback_offline), which handles a
+/// *known* model whose backends are all down.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackConfig {
+    #[serde(default)]
+    pub chat: Option<String>,
+    #[serde(default)]
+    pub embedding: Option<String>,
+    #[serde(default)]
+    pub transcription: Option<String>,
+}
+
+impl FallbackConfig {
+    /// The configured unknown-model fallback for `kind`, if any.
+    pub fn for_kind(&self, kind: PoolKind) -> Option<&str> {
+        match kind {
+            PoolKind::Chat => self.chat.as_deref(),
+            PoolKind::Embedding => self.embedding.as_deref(),
+            PoolKind::Transcription => self.transcription.as_deref(),
+        }
+    }
 }
 
 fn default_weight() -> u32 {
@@ -248,5 +336,68 @@ mod tests {
         "#;
         let p: UpstreamPoolConfig = toml::from_str(s).unwrap();
         assert_eq!(p.strategy, PickerStrategy::LeastInflight);
+    }
+
+    #[test]
+    fn alias_list_form_parses_and_normalises_to_bare_targets() {
+        let s = r#"
+            kind = "chat"
+            fallback_offline = "glm-4.6"
+
+            [[backend]]
+            name = "gpu-a"
+            base_url = "http://gpu-a:8000/v1"
+            alias = ["qwen", "fast"]
+        "#;
+        let p: UpstreamPoolConfig = toml::from_str(s).unwrap();
+        assert_eq!(p.fallback_offline.as_deref(), Some("glm-4.6"));
+        let map = p.backend[0].alias.as_ref().unwrap().into_map();
+        assert_eq!(map.get("qwen"), Some(&None));
+        assert_eq!(map.get("fast"), Some(&None));
+    }
+
+    #[test]
+    fn alias_map_form_parses_with_explicit_targets() {
+        let s = r#"
+            kind = "chat"
+
+            [[backend]]
+            name = "zai"
+            base_url = "https://api.z.ai/v1"
+            alias = { smart = "glm-4.6", cheap = "glm-4.5-air" }
+        "#;
+        let p: UpstreamPoolConfig = toml::from_str(s).unwrap();
+        let map = p.backend[0].alias.as_ref().unwrap().into_map();
+        assert_eq!(map.get("smart"), Some(&Some("glm-4.6".to_string())));
+        assert_eq!(map.get("cheap"), Some(&Some("glm-4.5-air".to_string())));
+    }
+
+    #[test]
+    fn alias_absent_and_fallback_offline_default_to_none() {
+        let s = r#"
+            kind = "chat"
+
+            [[backend]]
+            name = "x"
+            base_url = "http://x"
+        "#;
+        let p: UpstreamPoolConfig = toml::from_str(s).unwrap();
+        assert!(p.fallback_offline.is_none());
+        assert!(p.backend[0].alias.is_none());
+    }
+
+    #[test]
+    fn fallback_config_parses_per_kind_and_reports_by_kind() {
+        let s = r#"
+            chat = "qwen"
+            embedding = "text-embedding-3-small"
+        "#;
+        let fb: FallbackConfig = toml::from_str(s).unwrap();
+        assert_eq!(fb.for_kind(PoolKind::Chat), Some("qwen"));
+        assert_eq!(
+            fb.for_kind(PoolKind::Embedding),
+            Some("text-embedding-3-small")
+        );
+        assert_eq!(fb.for_kind(PoolKind::Transcription), None);
     }
 }

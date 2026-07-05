@@ -27,7 +27,7 @@ use session_core::icons;
 
 use crate::rama_server::state::RamaState;
 use crate::server::db::usage;
-use crate::server::upstreams::{PickerStrategy, PoolKind};
+use crate::server::upstreams::{AliasStatus, PickerStrategy, PoolKind};
 
 /// Sparkline window: `BUCKETS` buckets of `BUCKET_MINUTES` each =
 /// the last hour, in 5-minute steps.
@@ -71,6 +71,7 @@ pub async fn backends_index(State(state): State<Arc<RamaState>>, req: Request) -
                         inflight: b.inflight(),
                         max_inflight: b.max_inflight,
                         models,
+                        aliases: b.alias_status(),
                         recent: rates
                             .get(&b.name)
                             .cloned()
@@ -82,13 +83,27 @@ pub async fn backends_index(State(state): State<Arc<RamaState>>, req: Request) -
                 name: pool.name.clone(),
                 kind: pool.kind,
                 strategy: pool.strategy,
+                fallback_offline: pool.fallback_offline().map(str::to_string),
                 backends,
             }
         })
         .collect();
     pools.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let body = render_backends_body(&pools);
+    // Global unknown-model fallbacks (`[fallback]`), per kind — shown once in
+    // the page header since they're not pool-scoped.
+    let unknown_fallbacks: Vec<(&'static str, String)> =
+        [PoolKind::Chat, PoolKind::Transcription, PoolKind::Embedding]
+            .into_iter()
+            .filter_map(|k| {
+                state
+                    .upstreams
+                    .fallback_model(k)
+                    .map(|m| (kind_label(k), m.to_string()))
+            })
+            .collect();
+
+    let body = render_backends_body(&pools, &unknown_fallbacks);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     nav_or_html_page(
         datastar,
@@ -109,6 +124,8 @@ struct PoolView {
     name: String,
     kind: PoolKind,
     strategy: PickerStrategy,
+    /// The pool's `fallback_offline` backup model, if configured.
+    fallback_offline: Option<String>,
     backends: Vec<BackendView>,
 }
 
@@ -119,6 +136,8 @@ struct BackendView {
     inflight: u32,
     max_inflight: u32,
     models: Vec<String>,
+    /// Configured aliases (client-facing names) + their live state.
+    aliases: Vec<AliasStatus>,
     /// Request counts per 5-min bucket over the last hour, oldest → newest
     /// (always `BUCKETS` long; all-zero when idle).
     recent: Vec<i64>,
@@ -151,7 +170,7 @@ fn strategy_label(strategy: PickerStrategy) -> &'static str {
     }
 }
 
-fn render_backends_body(pools: &[PoolView]) -> Html {
+fn render_backends_body(pools: &[PoolView], unknown_fallbacks: &[(&'static str, String)]) -> Html {
     let total: usize = pools.iter().map(|p| p.backends.len()).sum();
     let healthy = pools
         .iter()
@@ -160,6 +179,17 @@ fn render_backends_body(pools: &[PoolView]) -> Html {
         .count();
     let down = total - healthy;
     let summary = format!("{total} backends · {healthy} healthy · {down} down");
+    let unknown_fallback_line = if unknown_fallbacks.is_empty() {
+        None
+    } else {
+        Some(
+            unknown_fallbacks
+                .iter()
+                .map(|(kind, model)| format!("{kind} → {model}"))
+                .collect::<Vec<_>>()
+                .join(" · "),
+        )
+    };
 
     let cards: Vec<Html> = pools.iter().map(render_pool_card).collect();
     html! {
@@ -176,6 +206,12 @@ fn render_backends_body(pools: &[PoolView]) -> Html {
                 }
                 if total > 0 {
                     p(class: "text-base-content/60 text-sm tabular-nums") { (summary) }
+                }
+                if let Some(line) = unknown_fallback_line.as_deref() {
+                    p(class: "text-base-content/60 text-sm") {
+                        "Unknown-model fallback — "
+                        span(class: "font-mono") { (line.to_string()) }
+                    }
                 }
             }
             if pools.is_empty() {
@@ -206,9 +242,17 @@ fn render_pool_card(pool: &PoolView) -> Html {
             div(class: "card-body gap-3") {
                 header(class: "flex items-center justify-between gap-3 flex-wrap") {
                     h2(class: "card-title text-base font-mono break-all") { (pool.name.clone()) }
-                    div(class: "flex items-center gap-2") {
+                    div(class: "flex items-center gap-2 flex-wrap") {
                         span(class: "badge badge-secondary") { (kind_label(pool.kind)) }
                         span(class: "badge badge-ghost font-mono") { (strategy_label(pool.strategy)) }
+                        if let Some(model) = pool.fallback_offline.as_deref() {
+                            span(
+                                class: "badge badge-warning badge-outline font-mono",
+                                title: "fallback_offline: served when every backend for a known model in this pool is down"
+                            ) {
+                                "offline ↩ " (model.to_string())
+                            }
+                        }
                     }
                 }
                 if pool.backends.is_empty() {
@@ -252,6 +296,29 @@ fn render_backend_row(b: &BackendView) -> Html {
     let c30 = tail(6);
     let c60: i64 = b.recent.iter().sum();
     let spark = sparkline_svg(&b.recent);
+    // Alias chips: map form shows "name → target"; a bare alias disabled by
+    // multi-model ambiguity is flagged; an active bare alias shows just its name.
+    let aliases: Vec<(String, &'static str, String)> = b
+        .aliases
+        .iter()
+        .map(|a| match (&a.target, a.disabled) {
+            (Some(t), _) => (
+                format!("{} → {t}", a.name),
+                "badge badge-info badge-sm font-mono",
+                format!("alias → {t}"),
+            ),
+            (None, true) => (
+                format!("{} (disabled)", a.name),
+                "badge badge-warning badge-sm font-mono",
+                "bare alias disabled — this backend serves multiple models; give it an explicit target (map form)".to_string(),
+            ),
+            (None, false) => (
+                a.name.clone(),
+                "badge badge-info badge-sm font-mono",
+                "alias → this backend's model".to_string(),
+            ),
+        })
+        .collect();
     html! {
         div(class: "flex flex-col gap-2 rounded-lg border border-base-300 p-3") {
             div(class: "flex items-center justify-between gap-3 flex-wrap") {
@@ -294,6 +361,14 @@ fn render_backend_row(b: &BackendView) -> Html {
                 } else {
                     for m in models.iter() {
                         span(class: "badge badge-ghost badge-sm font-mono") { (m.clone()) }
+                    }
+                }
+            }
+            if !aliases.is_empty() {
+                div(class: "flex flex-wrap gap-1 items-center") {
+                    span(class: "text-xs text-base-content/50") { "aliases:" }
+                    for (label, class, title) in aliases.iter() {
+                        span(class: (*class), title: (title.clone())) { (label.clone()) }
                     }
                 }
             }

@@ -211,8 +211,10 @@ async fn extract_fields(
 ) -> Result<serde_json::Value, String> {
     let acquired = state
         .upstreams
-        .acquire_for(model, PoolKind::Chat)
+        .route(model, PoolKind::Chat)
         .map_err(|e| e.to_string())?;
+    // The chat model may be an alias; forward the real id the backend knows.
+    let real_model = acquired.resolved_model().to_string();
     let backend = acquired.backend();
     let url = format!("{}/chat/completions", backend.base_url);
 
@@ -226,7 +228,7 @@ async fn extract_fields(
     let user_content = format!("Transcript:\n{transcript}{lang_directive}\n\n/no_think");
 
     let body = json!({
-        "model": model,
+        "model": real_model,
         "messages": [
             { "role": "system", "content": EXTRACT_SYSTEM_PROMPT },
             { "role": "user", "content": user_content },

@@ -44,8 +44,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("opening database: {e:#}"))?;
 
-    let upstreams = srv::upstreams::UpstreamRegistry::new(&config.upstream_pools)
-        .map_err(|e| anyhow::anyhow!("building upstream registry: {e}"))?;
+    let upstreams = srv::upstreams::UpstreamRegistry::with_fallback(
+        &config.upstream_pools,
+        config.fallback.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("building upstream registry: {e}"))?;
     // `spawn` does an initial parallel probe round before returning, so
     // the first request lands on a registry that already knows which
     // model lives where. Worst case: every backend is unreachable, in

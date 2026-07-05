@@ -21,7 +21,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::server::rbac::config::{RbacConfig, RoleConfig};
-use crate::server::upstreams::config::UpstreamPoolConfig;
+use crate::server::upstreams::config::{FallbackConfig, UpstreamPoolConfig};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -124,6 +124,15 @@ pub struct Config {
     /// GitHub issue. See `server::github` + `rama_server::pages::feedback`.
     #[serde(default)]
     pub feedback: Option<FeedbackConfig>,
+    /// Unknown-model fallback, per request kind. When a request names a model
+    /// that no backend serves and that isn't an alias, the router substitutes
+    /// the model named here for that kind instead of returning `404`. Optional;
+    /// an unset kind keeps today's `model_not_found` behaviour. See
+    /// [`FallbackConfig`] and `docs/upstreams.md`. Note the *offline* fallback
+    /// (a known model whose replicas are all down) lives per-pool as
+    /// `fallback_offline`, not here.
+    #[serde(default)]
+    pub fallback: FallbackConfig,
 }
 
 /// Feedback-widget settings: where issues are filed and how the voice

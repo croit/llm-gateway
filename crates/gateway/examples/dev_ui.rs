@@ -168,11 +168,13 @@ async fn main() -> anyhow::Result<()> {
     pools.insert(
         "chat".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
             backend: vec![BackendConfig {
+                alias: None,
                 name: "wiremock-chat".into(),
                 base_url: chat_mock.uri(),
                 api_key_env: None,
@@ -186,11 +188,13 @@ async fn main() -> anyhow::Result<()> {
     pools.insert(
         "voice".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Transcription,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
             backend: vec![BackendConfig {
+                alias: None,
                 name: "wiremock-voice".into(),
                 base_url: voice_mock.uri(),
                 api_key_env: None,

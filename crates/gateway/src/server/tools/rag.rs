@@ -395,6 +395,7 @@ mod tests {
                 kind: PoolKind::Embedding,
                 strategy: PickerStrategy::RoundRobin,
                 models: Vec::new(),
+                fallback_offline: None,
                 backend: vec![BackendConfig {
                     name: "mock".into(),
                     base_url: upstream_url.into(),
@@ -403,6 +404,7 @@ mod tests {
                     max_inflight: 16,
                     health_path: "/models".into(),
                     models: Vec::new(),
+                    alias: None,
                 }],
             },
         );

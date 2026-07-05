@@ -265,11 +265,13 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
     pools.insert(
         "embed".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Embedding,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
             backend: vec![BackendConfig {
+                alias: None,
                 name: "mock".into(),
                 base_url: "http://unused.invalid".into(),
                 api_key_env: None,
@@ -283,11 +285,13 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
     pools.insert(
         "chat".to_string(),
         UpstreamPoolConfig {
+            fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
             backend: vec![BackendConfig {
+                alias: None,
                 name: "chat".into(),
                 base_url: "http://unused.invalid".into(),
                 api_key_env: None,
