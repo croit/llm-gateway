@@ -29,7 +29,7 @@
   paper: "a4",
   margin: (left: 22mm, right: 22mm, top: 18mm, bottom: 26mm),
   footer: [
-    #rect(width: 100%, height: 1pt, fill: brand, stroke: none)
+    #image("assets/brand-bar.png", width: 100%, height: 1pt)
     #v(3pt)
     #set text(size: 8pt, fill: muted)
     #set par(justify: false, leading: 0.5em)
@@ -49,7 +49,7 @@
 // ---- Header: logo + brand gradient rule ------------------------------------
 #image("assets/logo.svg", height: 10mm)
 #v(6pt)
-#rect(width: 100%, height: 2pt, fill: brand, stroke: none)
+#image("assets/brand-bar.png", width: 100%, height: 2pt)
 
 #v(9mm)
 

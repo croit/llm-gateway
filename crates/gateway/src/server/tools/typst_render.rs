@@ -275,8 +275,17 @@ async fn render_and_attach(
     let png_name = format!("{base}.png");
     let json_name = format!("{base}.json");
     let pptx_name = format!("{base}.pptx");
+    let docx_name = format!("{base}.docx");
 
     let data_bytes = serialize_data(data);
+
+    // Keep the PDF bytes for the docx conversion (the upload below moves
+    // `rendered.pdf`). Only clone when a docx export is actually wired.
+    let pdf_for_docx = if template.docx.is_some() && sandbox.is_some() {
+        Some(rendered.pdf.clone())
+    } else {
+        None
+    };
 
     let pdf_out = chat_attachments::upload(s3, turn_id, &pdf_name, "application/pdf", rendered.pdf)
         .await
@@ -313,6 +322,27 @@ async fn render_and_attach(
         }
     }
 
+    // Optional editable-Word export (`[docx]`): convert the finished PDF
+    // to an editable .docx via pdf2docx in the sandbox. Best-effort, same
+    // as pptx — the PDF/preview already landed, so a failure only notes
+    // an error rather than failing the render.
+    let mut docx_out = None;
+    let mut docx_error: Option<String> = None;
+    if let (Some(pdf), Some(sandbox)) = (pdf_for_docx.as_ref(), sandbox) {
+        match convert_to_docx(sandbox, pdf).await {
+            Ok(bytes) => {
+                match chat_attachments::upload(s3, turn_id, &docx_name, DOCX_MIME, bytes).await {
+                    Ok(out) => docx_out = Some(out),
+                    Err(e) => docx_error = Some(format!("upload docx: {e}")),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, template = %template.id, "docx export failed");
+                docx_error = Some(e.to_string());
+            }
+        }
+    }
+
     // Visible markers in one chunk: the PDF chip, the PNG preview
     // (linking through to the PDF so clicking the inline image opens the
     // document, not a bigger copy of the preview), and — when produced —
@@ -326,6 +356,10 @@ async fn render_and_attach(
     if let Some(p) = &pptx_out {
         chunk.push('\n');
         chunk.push_str(&chat_attachments::marker_line(turn_id, p));
+    }
+    if let Some(d) = &docx_out {
+        chunk.push('\n');
+        chunk.push_str(&chat_attachments::marker_line(turn_id, d));
     }
     chunk.push_str("\n\n");
 
@@ -380,16 +414,95 @@ async fn render_and_attach(
             "Editable .pptx export failed (PDF/preview are fine): {err}"
         ));
     }
+    if let Some(d) = &docx_out {
+        result["docx"] = json!({
+            "filename": d.filename, "size": d.bytes,
+            "id": format!("{turn_id}/{}", d.filename),
+            "note": "Editable Word document (.docx) — same content as the PDF, \
+                     openable and editable in Word.",
+        });
+    } else if let Some(err) = docx_error {
+        result["docx_error"] = json!(format!(
+            "Editable .docx export failed (PDF/preview are fine): {err}"
+        ));
+    }
     Ok(result)
 }
 
 /// MIME for a `.pptx` (OOXML presentation).
 const PPTX_MIME: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+/// MIME for a `.docx` (OOXML word-processing document).
+const DOCX_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 
 /// Single input file name carrying the zipped template + deck.
 const BUNDLE_NAME: &str = "bundle.zip";
 /// The lone `.pptx` the sandbox script leaves in `/work`.
 const PPTX_OUT: &str = "presentation.pptx";
+/// Input PDF name for the docx conversion, and the `.docx` the script
+/// leaves in `/work`.
+const DOCX_IN: &str = "in.pdf";
+const DOCX_OUT: &str = "out.docx";
+
+/// Convert a finished PDF to an editable `.docx` in the sandbox.
+///
+/// The letter/one-pager are fixed-layout typst documents; pdf2docx
+/// reconstructs an editable Word doc from the rendered PDF (real,
+/// selectable text; logo + brand bars survive because the templates draw
+/// the bars as images, which pdf2docx keeps — unlike vector fills). A
+/// LibreOffice round-trip then re-flows the absolutely-positioned footer
+/// so the brand bar sits correctly. Returns the `.docx` bytes.
+async fn convert_to_docx(sandbox: &SandboxClient, pdf: &[u8]) -> Result<Vec<u8>, ToolError> {
+    let req = RunRequest {
+        language: Language::Bash,
+        code: docx_script(),
+        files: vec![InputFile {
+            name: DOCX_IN.to_string(),
+            content_b64: b64::encode(pdf),
+        }],
+        timeout_secs: None,
+        network: false,
+    };
+    let resp = sandbox.run_job(req).await?;
+    if resp.exit_code != 0 || resp.timed_out {
+        return Err(ToolError::Failed(format!(
+            "sandbox docx conversion failed (exit {}{}): {}",
+            resp.exit_code,
+            if resp.timed_out { ", timed out" } else { "" },
+            tail(&resp.stderr, 600),
+        )));
+    }
+    let art = resp
+        .artifacts
+        .iter()
+        .find(|a| a.name == DOCX_OUT)
+        .ok_or_else(|| {
+            ToolError::Failed(format!(
+                "sandbox produced no {DOCX_OUT}; stderr: {}",
+                tail(&resp.stderr, 600)
+            ))
+        })?;
+    b64::decode(&art.content_b64)
+        .ok_or_else(|| ToolError::Failed("docx artifact base64 invalid".into()))
+}
+
+/// The bash recipe for PDF -> editable .docx. pdf2docx does the
+/// layout-preserving conversion; the LibreOffice pass realigns the
+/// footer. Only `out.docx` is left in `/work` so it is the sole returned
+/// artifact (the input PDF is removed).
+fn docx_script() -> String {
+    format!(
+        r#"set -e
+export HOME=/tmp
+cd /work
+python3 -c 'from pdf2docx import Converter; c = Converter("{din}"); c.convert("/tmp/raw.docx"); c.close()'
+libreoffice -env:UserInstallation=file:///tmp/lo --headless --convert-to docx:"MS Word 2007 XML" --outdir /work /tmp/raw.docx >/dev/null 2>&1
+mv -f /work/raw.docx /work/{dout}
+rm -f /work/{din}
+"#,
+        din = DOCX_IN,
+        dout = DOCX_OUT,
+    )
+}
 
 /// Convert a rendered deck to an editable `.pptx` in the sandbox.
 ///
@@ -501,8 +614,12 @@ fn build_bundle_zip(root: &Path, data_file: &str, deck_bytes: &[u8]) -> Result<V
 
 /// The bash recipe run in the sandbox. All messy work happens in a
 /// subdir; only the final `.pptx` is copied to `/work` so it is the sole
-/// returned artifact. The optional `font` stamp corrects typ2pptx
-/// writing the deck's font as `Consolas`.
+/// returned artifact. Post-processing on the typ2pptx output:
+///   1. stamp the brand `font` over typ2pptx's `Consolas` misclassification;
+///   2. switch text bodies to `normAutofit` (shrink-to-fit) so a renderer's
+///      slightly-different metrics can't overflow/overlap the tight boxes;
+///   3. embed the brand font (from the bundle's `fonts/`) so the deck
+///      renders correctly even where the font isn't installed.
 fn pptx_script(source_file: &str, font: Option<&str>) -> String {
     // Python string literal for the font (or None).
     let font_py = match font {
@@ -517,16 +634,66 @@ unzip -q /work/{bundle}
 export TYPST_FONT_PATHS="$PWD/fonts"
 typ2pptx {src} --root "$PWD" --detect-paragraphs -o deck.pptx
 python3 - <<'PYEOF'
-import zipfile, glob, os, tempfile
+import zipfile, glob, os, tempfile, re, shutil
 FONT = {font_py}
 d = tempfile.mkdtemp()
 with zipfile.ZipFile("deck.pptx") as z:
     z.extractall(d)
-if FONT:
-    for f in glob.glob(os.path.join(d, "ppt", "slides", "*.xml")):
-        s = open(f, encoding="utf-8").read()
+# Font fixup + shrink-to-fit autofit, per slide.
+for f in glob.glob(os.path.join(d, "ppt", "slides", "*.xml")):
+    s = open(f, encoding="utf-8").read()
+    if FONT:
         s = s.replace('typeface="Consolas"', 'typeface="%s"' % FONT)
-        open(f, "w", encoding="utf-8").write(s)
+    s = s.replace("<a:spAutoFit/>", "<a:normAutofit/>").replace("<a:noAutofit/>", "<a:normAutofit/>")
+    s = re.sub(r'<a:bodyPr\b[^>]*/>', lambda m: m.group(0)[:-2] + "><a:normAutofit/></a:bodyPr>", s)
+    open(f, "w", encoding="utf-8").write(s)
+# Embed the brand font so the deck renders correctly without it installed.
+if FONT:
+    ttfs = sorted(glob.glob("fonts/*.ttf"))
+    def pick(subs):
+        for t in ttfs:
+            if any(x in os.path.basename(t) for x in subs):
+                return t
+        return None
+    reg = pick(["Regular"]) or (ttfs[0] if ttfs else None)
+    bold = pick(["SemiBold", "Semibold", "Bold"]) or reg
+    faces = []
+    if reg:
+        faces.append(("regular", reg))
+    if bold and bold != reg:
+        faces.append(("bold", bold))
+    if faces:
+        os.makedirs(os.path.join(d, "ppt", "fonts"), exist_ok=True)
+        ct = os.path.join(d, "[Content_Types].xml")
+        s = open(ct, encoding="utf-8").read()
+        if "fntdata" not in s:
+            s = s.replace("</Types>", '<Default Extension="fntdata" ContentType="application/x-fontdata"/></Types>')
+            open(ct, "w", encoding="utf-8").write(s)
+        pr = os.path.join(d, "ppt", "_rels", "presentation.xml.rels")
+        s = open(pr, encoding="utf-8").read()
+        ids = [int(x) for x in re.findall(r'Id="rId(\d+)"', s)]
+        nid = (max(ids) + 1) if ids else 1
+        addrel = ""
+        slotrids = []
+        for i, (slot, ttf) in enumerate(faces, start=1):
+            shutil.copy(ttf, os.path.join(d, "ppt", "fonts", "font%d.fntdata" % i))
+            rid = "rId%d" % nid
+            nid += 1
+            addrel += '<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/font" Target="fonts/font%d.fntdata"/>' % (rid, i)
+            slotrids.append((slot, rid))
+        s = s.replace("</Relationships>", addrel + "</Relationships>")
+        open(pr, "w", encoding="utf-8").write(s)
+        pf = os.path.join(d, "ppt", "presentation.xml")
+        s = open(pf, encoding="utf-8").read()
+        s = s.replace("<p:presentation ", '<p:presentation embedTrueTypeFonts="1" ', 1)
+        slots = "".join('<p:%s r:id="%s"/>' % (slot, rid) for slot, rid in slotrids)
+        efl = '<p:embeddedFontLst><p:embeddedFont><p:font typeface="%s"/>%s</p:embeddedFont></p:embeddedFontLst>' % (FONT, slots)
+        m = re.search(r'<p:notesSz[^>]*/>', s)
+        if m:
+            s = s[:m.end()] + efl + s[m.end():]
+        else:
+            s = s.replace("</p:presentation>", efl + "</p:presentation>")
+        open(pf, "w", encoding="utf-8").write(s)
 out = "/work/{out}"
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     for root, _, files in os.walk(d):
@@ -1264,7 +1431,7 @@ fn apply_identity_defaults(t: &Template, args: &mut Map<String, Value>, id: &Ide
 /// chat chip. The static template `.typ` is deliberately NOT attached —
 /// it can't be edited through the tool and can't recompile without its
 /// fonts/assets, so it only adds clutter.
-const TYPST_EXTS: &[&str] = &["pdf", "png", "json", "pptx"];
+const TYPST_EXTS: &[&str] = &["pdf", "png", "json", "pptx", "docx"];
 
 /// Whether `filename` is one of this template's visible typst chips
 /// (`<base>.pdf` / `.png` / `.pptx`, including the `-2`, `-3`, … dedup
@@ -1276,7 +1443,7 @@ const TYPST_EXTS: &[&str] = &["pdf", "png", "json", "pptx"];
 fn is_template_typst_chip(template: &Template, filename: &str) -> bool {
     let base = template.output_basename.as_str();
     let stem = match filename.rsplit_once('.') {
-        Some((stem, "pdf" | "png" | "pptx")) => stem,
+        Some((stem, "pdf" | "png" | "pptx" | "docx")) => stem,
         _ => return false,
     };
     if stem == base {
@@ -1345,6 +1512,7 @@ mod tests {
             root: PathBuf::from("/dev/null"),
             source_file: "template.typ".into(),
             pptx: None,
+            docx: None,
         }
     }
 
@@ -1608,6 +1776,7 @@ mod tests {
             root: PathBuf::from("/dev/null"),
             source_file: "template.typ".into(),
             pptx: None,
+            docx: None,
         }
     }
 
@@ -1638,6 +1807,7 @@ mod tests {
             root: PathBuf::from("/dev/null"),
             source_file: "template.typ".into(),
             pptx: None,
+            docx: None,
         }
     }
 

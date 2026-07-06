@@ -93,6 +93,8 @@ RUN pip install --no-cache-dir \
         typ2pptx \
         # PDF read/write/manipulate/render (PyMuPDF = fitz)
         pypdf pdfplumber pymupdf reportlab img2pdf weasyprint markdown \
+        # PDF -> editable Word (.docx), layout-preserving (used by typst docx export)
+        pdf2docx \
         # images / computer vision / OCR
         pillow opencv-python-headless imageio pytesseract \
         # parsing + http (in-sandbox fetching when egress is on)

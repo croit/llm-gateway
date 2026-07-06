@@ -19,6 +19,10 @@ it twice.
 """
 output_basename = "letter"
 
+# Editable Word (.docx) export: convert the finished PDF to an editable
+# .docx (pdf2docx, in the sandbox) and attach it alongside the PDF.
+[docx]
+
 [[field]]
 name = "entity"
 required = false

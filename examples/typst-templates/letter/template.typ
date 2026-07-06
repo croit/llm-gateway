@@ -88,7 +88,7 @@
   // `footer-descent` small so the footer sits high in the bottom margin,
   // leaving ~14mm clearance to the sheet edge — inside any printer's area.
   footer: [
-    #rect(width: 100%, height: 1.1pt, fill: brand, stroke: none)
+    #image("assets/brand-bar.png", width: 100%, height: 1.1pt)
     #v(4pt)
     #set text(size: 7pt, fill: muted)
     #set par(leading: 0.5em, justify: false)
@@ -140,7 +140,7 @@
   sender-block,
 )
 #v(6pt)
-#rect(width: 100%, height: 2pt, fill: brand, stroke: none)
+#image("assets/brand-bar.png", width: 100%, height: 2pt)
 
 #v(13mm)
 

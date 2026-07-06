@@ -78,6 +78,11 @@ pub struct Template {
     /// (typ2pptx). `None` for document templates like the letter, where
     /// a slide export makes no sense.
     pub pptx: Option<PptxExport>,
+    /// When set (manifest `[docx]` table), the finished PDF is also
+    /// converted to an editable Word `.docx` (via pdf2docx in the
+    /// sandbox) and attached. Used for document templates (letter,
+    /// one-pager); mutually distinct from `pptx` (slide decks).
+    pub docx: Option<DocxExport>,
 }
 
 /// PowerPoint-export settings for a slide template (manifest `[pptx]`).
@@ -96,6 +101,13 @@ pub struct PptxExport {
     /// to this. Use a Google Font so Google Slides renders it on import.
     pub font: Option<String>,
 }
+
+/// Word-export marker for a document template (manifest `[docx]`). The
+/// render converts the finished PDF to an editable `.docx` via pdf2docx
+/// in the sandbox — no per-template config is needed (the conversion
+/// works off the rendered PDF), so this is presence-only for now.
+#[derive(Debug, Clone)]
+pub struct DocxExport;
 
 /// One field the model fills in. The JSON-schema type maps to a
 /// stringified `--input k=v` pair the typst template reads via
@@ -172,7 +184,18 @@ struct Manifest {
     /// Optional `[pptx]` table: opt into editable PowerPoint export.
     #[serde(default)]
     pptx: Option<ManifestPptx>,
+    /// Optional `[docx]` table (presence-only): opt into editable Word
+    /// export of the finished PDF.
+    #[serde(default)]
+    docx: Option<ManifestDocx>,
 }
+
+/// Presence-only `[docx]` table — opts a document template into editable
+/// Word export. No fields today; kept as a table so options can be added
+/// later without a manifest-format break.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ManifestDocx {}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -327,6 +350,7 @@ fn load_template(root: &Path, manifest_path: &Path) -> Result<Template, Discover
         data_file: p.data_file,
         font: p.font,
     });
+    let docx = manifest.docx.map(|_| DocxExport);
     let title = manifest
         .title
         .filter(|t| !t.trim().is_empty())
@@ -340,6 +364,7 @@ fn load_template(root: &Path, manifest_path: &Path) -> Result<Template, Discover
         root: root.to_path_buf(),
         source_file: manifest.source_file,
         pptx,
+        docx,
     })
 }
 
