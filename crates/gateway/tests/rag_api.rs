@@ -39,6 +39,32 @@ fn create_body() -> &'static str {
     }"#
 }
 
+/// Seed a session whose user carries the `"admin"` role so the admin
+/// gate on `/api/v0/rag/*` lets it through. Mirrors `seed_admin` in
+/// `admin_models.rs`. Must be paired with `state_with_admin_rbac`, whose
+/// resolver maps the `"admin"` OIDC value to an admin-flagged role.
+async fn seed_admin(state: &gateway::rama_server::RamaState, user_id: &str) -> String {
+    use gateway::server::db::users;
+    use jiff::Timestamp;
+    let cookie = common::seed_session(state, user_id, &format!("{user_id}@example.com")).await;
+    let now = Timestamp::now();
+    users::upsert(
+        &state.db,
+        &users::User {
+            id: user_id.into(),
+            email: format!("{user_id}@example.com"),
+            name: None,
+            roles: vec!["admin".into()],
+            created_at: now,
+            updated_at: now,
+            timezone: None,
+        },
+    )
+    .await
+    .unwrap();
+    cookie
+}
+
 #[tokio::test]
 async fn list_collections_anonymous_is_401() {
     let state = common::state_with_chat_pool("http://unused.invalid").await;
@@ -51,9 +77,46 @@ async fn list_collections_anonymous_is_401() {
 }
 
 #[tokio::test]
+async fn non_admin_is_forbidden_on_every_endpoint() {
+    // The RAG registry is operator-global and admin-only. A signed-in
+    // but non-admin user must be blocked from the whole API. Regression
+    // guard for the missing authorization gate (previously any active
+    // session passed, letting any user read/mutate/delete collections).
+    // The gate runs before any DB lookup, so 403 (not 404) is expected
+    // even for a non-existent id.
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = common::seed_session(&state, "mallory", "mallory@example.com").await;
+    let app = common::app(state);
+
+    let cases: [(Method, &str, Option<&str>); 6] = [
+        (Method::GET, "/api/v0/rag/collections", None),
+        (Method::POST, "/api/v0/rag/collections", Some(create_body())),
+        (Method::GET, "/api/v0/rag/collections/1", None),
+        (
+            Method::PATCH,
+            "/api/v0/rag/collections/1",
+            Some(r#"{"git_ref":"evil"}"#),
+        ),
+        (Method::POST, "/api/v0/rag/collections/1/reindex", None),
+        (Method::DELETE, "/api/v0/rag/collections/1", None),
+    ];
+    for (method, uri, body) in cases {
+        let resp = app
+            .serve(req_with_cookie(method.clone(), uri, &cookie, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "non-admin must get 403 on {method} {uri}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn full_create_get_list_update_reindex_delete_round_trip() {
-    let state = common::state_with_chat_pool("http://unused.invalid").await;
-    let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "alice").await;
     let db = state.db.clone();
     let app = common::app(state);
 
@@ -184,8 +247,8 @@ async fn full_create_get_list_update_reindex_delete_round_trip() {
 
 #[tokio::test]
 async fn create_rejects_duplicate_name_with_a_helpful_400() {
-    let state = common::state_with_chat_pool("http://unused.invalid").await;
-    let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "alice").await;
     let app = common::app(state);
 
     let _ = app
@@ -214,8 +277,8 @@ async fn create_rejects_duplicate_name_with_a_helpful_400() {
 
 #[tokio::test]
 async fn create_validates_inputs() {
-    let state = common::state_with_chat_pool("http://unused.invalid").await;
-    let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "alice").await;
     let app = common::app(state);
 
     // chunk_overlap >= chunk_size
@@ -237,8 +300,8 @@ async fn create_validates_inputs() {
 
 #[tokio::test]
 async fn update_with_empty_body_returns_current_state() {
-    let state = common::state_with_chat_pool("http://unused.invalid").await;
-    let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "alice").await;
     let app = common::app(state);
     let resp = app
         .serve(req_with_cookie(
@@ -269,8 +332,8 @@ async fn update_with_empty_body_returns_current_state() {
 
 #[tokio::test]
 async fn update_can_clear_pat() {
-    let state = common::state_with_chat_pool("http://unused.invalid").await;
-    let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "alice").await;
     let app = common::app(state);
     // Create with a PAT.
     let body = r#"{

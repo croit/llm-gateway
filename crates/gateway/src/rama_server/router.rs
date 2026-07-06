@@ -188,6 +188,8 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/auth/cli/start", cli_handlers::start)
         .with_get("/auth/cli/begin", cli_handlers::begin)
         .with_post("/auth/cli/poll", cli_handlers::poll)
+        .with_post("/auth/cli/approve", cli_handlers::approve)
+        .with_post("/auth/cli/deny", cli_handlers::deny)
         .with_get("/api/v0/me", api::me)
         .with_get("/api/v0/tokens", api::list_tokens)
         .with_post("/api/v0/tokens", api::create_token)

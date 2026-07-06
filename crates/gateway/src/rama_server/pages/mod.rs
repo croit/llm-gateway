@@ -817,7 +817,7 @@ async fn require_session_or_redirect(
 fn login_redirect(req: &Request) -> Response {
     if req.method() == Method::GET
         && let Some(path_and_query) = req.uri().path_and_query().map(|pq| pq.as_str())
-        && path_and_query.starts_with('/')
+        && crate::rama_server::oidc_handlers::is_safe_return_to(path_and_query)
         && !path_and_query.starts_with("/login")
         && let Ok(query) = serde_urlencoded::to_string([("return_to", path_and_query)])
     {
@@ -841,7 +841,7 @@ pub async fn login(State(_state): State<Arc<RamaState>>, req: Request) -> Respon
         .query()
         .and_then(|q| serde_urlencoded::from_str::<LoginPageQuery>(q).ok())
         .and_then(|q| q.return_to)
-        .filter(|rt| rt.starts_with('/'));
+        .filter(|rt| crate::rama_server::oidc_handlers::is_safe_return_to(rt));
     let body = html! {
         main(class: "min-h-dvh flex items-center justify-center p-8") {
             div(class: "card border border-base-300 w-full max-w-md") {

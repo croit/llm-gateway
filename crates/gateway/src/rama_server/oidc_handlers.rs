@@ -21,7 +21,7 @@ use rama::http::{HeaderMap, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::rama_server::session::COOKIE_NAME;
+use crate::rama_server::session::{COOKIE_NAME, read_cookie};
 use crate::rama_server::state::RamaState;
 use crate::server::db::users;
 
@@ -29,6 +29,13 @@ use crate::server::db::users;
 /// IdPs (Authentik, Keycloak's account-linking flows) bounce the user
 /// through several screens before redirecting back.
 const PENDING_LOGIN_TTL: SignedDuration = SignedDuration::from_mins(15);
+
+/// Cookie that binds an in-flight OIDC login to the browser that started
+/// it. Set at `/auth/login`, and required to match the `state` parameter
+/// at `/auth/callback`. Without it, the `state` row alone doesn't prove
+/// the callback arrived in the same browser, opening login CSRF / session
+/// fixation. Scoped to `Path=/auth` so it only rides the login routes.
+const OIDC_BINDING_COOKIE: &str = "gw_oidc";
 
 #[derive(Deserialize)]
 pub struct LoginParams {
@@ -53,7 +60,7 @@ pub async fn login(
 
     let start = oidc.begin();
     let now = Timestamp::now();
-    let return_to = params.return_to.filter(|rt| rt.starts_with('/'));
+    let return_to = params.return_to.filter(|rt| is_safe_return_to(rt));
     let cli_state = params.cli_state.filter(|s| !s.is_empty());
 
     let res = sqlx::query(
@@ -78,10 +85,12 @@ pub async fn login(
         );
     }
 
-    redirect_to(&start.url)
+    // Bind the flow to this browser (see OIDC_BINDING_COOKIE): the
+    // callback must echo `state` back via this cookie or we reject it.
+    redirect_to_with_binding(&start.url, &start.csrf)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct CallbackParams {
     pub code: Option<String>,
     pub state: Option<String>,
@@ -89,11 +98,15 @@ pub struct CallbackParams {
     pub error_description: Option<String>,
 }
 
-/// GET /auth/callback — receives the IdP's redirect.
-pub async fn callback(
-    State(state): State<Arc<RamaState>>,
-    Query(params): Query<CallbackParams>,
-) -> Response {
+/// GET /auth/callback — receives the IdP's redirect. Takes the whole
+/// `Request` (not a `Query` extractor) so it can also read the
+/// browser-binding cookie set by `/auth/login`.
+pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let params: CallbackParams = req
+        .uri()
+        .query()
+        .and_then(|q| serde_urlencoded::from_str::<CallbackParams>(q).ok())
+        .unwrap_or_default();
     if let Some(err) = params.error {
         let desc = params.error_description.unwrap_or_default();
         return error_html(
@@ -107,6 +120,18 @@ pub async fn callback(
     let Some(state_param) = params.state else {
         return error_html(StatusCode::BAD_REQUEST, "OIDC callback missing `state`");
     };
+
+    // Bind the callback to the browser that began login. `state` is
+    // unguessable + single-use, but on its own it does not prove the
+    // callback landed in the same browser — without this a phisher could
+    // feed a victim their own `code`+`state` and silently log the victim
+    // into the *attacker's* account (login CSRF / session fixation).
+    if read_cookie(req.headers(), OIDC_BINDING_COOKIE).as_deref() != Some(state_param.as_str()) {
+        return error_html(
+            StatusCode::BAD_REQUEST,
+            "OIDC callback was not initiated by this browser — restart at /auth/login",
+        );
+    }
 
     // Pull the in-flight row. Missing → either expired, already consumed,
     // or never started — all "go back to /auth/login" from the user POV.
@@ -214,12 +239,16 @@ pub async fn callback(
     // should drop straight into a conversation, not a dashboard. An
     // explicit, same-origin `return_to` still wins.
     let target = return_to
-        .filter(|rt| rt.starts_with('/'))
+        .filter(|rt| is_safe_return_to(rt))
         .unwrap_or_else(|| "/chat".into());
+    // Flow complete — clear the login-binding cookie.
+    let clear_binding =
+        format!("{OIDC_BINDING_COOKIE}=; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=0");
     Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, target)
         .header(header::SET_COOKIE, cookie)
+        .header(header::SET_COOKIE, clear_binding)
         .body("".into())
         .unwrap()
 }
@@ -241,10 +270,8 @@ pub async fn logout(State(state): State<Arc<RamaState>>, req: Request) -> Respon
         .unwrap()
 }
 
-async fn finish_cli_login(state: &RamaState, cli_state: &str, user_id: &str) -> Response {
-    use crate::server::auth::token;
-    use crate::server::db::{cli_logins, tokens};
-    use uuid::Uuid;
+async fn finish_cli_login(state: &RamaState, cli_state: &str, subject: &str) -> Response {
+    use crate::server::db::cli_logins;
 
     let row = match cli_logins::find(&state.db, cli_state).await {
         Ok(Some(r)) => r,
@@ -263,63 +290,106 @@ async fn finish_cli_login(state: &RamaState, cli_state: &str, user_id: &str) -> 
         return error_html(StatusCode::BAD_REQUEST, "CLI login state has expired");
     }
 
-    let (plaintext, hash) = token::mint();
-    let now = Timestamp::now();
-    let ttl_days = state.config.gateway.token_ttl_days.max(1);
-    let expires_at = now + SignedDuration::from_hours(24 * ttl_days);
+    // Do NOT mint a token here. Render a consent page instead — the token
+    // is only minted when the authenticated user explicitly authorizes
+    // (POST /auth/cli/approve). This is what defeats the phishing case:
+    // completing OIDC alone (which a tricked user might) no longer hands a
+    // token to whoever initiated the CLI flow. The confirmation code lets
+    // the user check the prompt matches the code shown in *their* terminal.
+    let email = users::find_by_id(&state.db, subject)
+        .await
+        .ok()
+        .flatten()
+        .map(|u| u.email)
+        .unwrap_or_else(|| subject.to_string());
+    let code = shared::cli_login_code(cli_state);
+    let approval =
+        crate::rama_server::cli_handlers::approval_token(&state.sessions, cli_state, subject);
 
-    let insert = tokens::insert(
-        &state.db,
-        &tokens::Token {
-            id: Uuid::new_v4().to_string(),
-            user_id: user_id.to_string(),
-            name: format!("cli-{}", &cli_state[..8.min(cli_state.len())]),
-            hash,
-            created_at: now,
-            last_used_at: None,
-            expires_at,
-            revoked_at: None,
-            // Tool use is opt-in per token; a fresh CLI token starts with
-            // gateway tools off until the owner enables it on /tokens.
-            tools_enabled: false,
-        },
-    )
-    .await;
-    if let Err(err) = insert {
-        tracing::warn!(error = %err, "storing CLI token");
-        return error_html(StatusCode::INTERNAL_SERVER_ERROR, "could not store token");
-    }
-
-    if let Err(err) = cli_logins::set_token(&state.db, cli_state, &plaintext).await {
-        tracing::warn!(error = %err, "storing CLI plaintext");
-        return error_html(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not stage plaintext for CLI",
-        );
-    }
-
-    let html = r#"<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>Signed in</title>
-<style>body{font:14px system-ui;background:#0f1115;color:#e6e8eb;text-align:center;padding-top:6rem}h1{font-weight:600}p{color:#8a93a6}</style>
-</head><body>
-<h1>You're signed in</h1>
-<p>Return to your terminal — the CLI has picked up the token.</p>
-<p>You can close this tab.</p>
-</body></html>"#;
+    let html = CLI_CONSENT_HTML
+        .replace("%%EMAIL%%", &escape_html(&email))
+        .replace("%%CODE%%", &escape_html(&code))
+        .replace("%%APPROVAL%%", &escape_html(&approval));
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        html.to_string(),
+        html,
     )
         .into_response()
 }
 
-fn redirect_to(url: &str) -> Response {
+/// Consent page shown after a successful OIDC login that was started by
+/// the CLI. `%%EMAIL%%` / `%%CODE%%` / `%%APPROVAL%%` are substituted
+/// (HTML-escaped) per request. Both buttons POST the signed approval token
+/// so the server can act without a browser session.
+const CLI_CONSENT_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Authorize CLI sign-in</title>
+<style>
+ body{font:15px/1.5 system-ui;background:#0f1115;color:#e6e8eb;display:flex;min-height:100vh;margin:0;align-items:center;justify-content:center}
+ .card{max-width:30rem;padding:2rem;border:1px solid #2a2f3a;border-radius:12px;background:#151923}
+ h1{font-size:1.2rem;margin:0 0 .5rem}
+ .code{font:600 1.6rem ui-monospace,monospace;letter-spacing:.15em;background:#0f1115;border:1px solid #2a2f3a;border-radius:8px;padding:.6rem 1rem;text-align:center;margin:1rem 0}
+ .warn{color:#f0b429;font-size:.85rem}
+ .muted{color:#8a93a6;font-size:.85rem}
+ .row{display:flex;gap:.75rem;margin-top:1.5rem}
+ .row form{flex:1;margin:0}
+ button{width:100%;padding:.6rem 1rem;border-radius:8px;border:0;font:600 1rem system-ui;cursor:pointer}
+ .approve{background:#3b82f6;color:#fff}
+ .deny{background:#2a2f3a;color:#e6e8eb}
+</style></head><body>
+<div class="card">
+ <h1>Authorize command-line sign-in</h1>
+ <p>A command-line application is requesting an API token for <strong>%%EMAIL%%</strong>.</p>
+ <p class="muted">Confirm this matches the code shown in your terminal:</p>
+ <div class="code">%%CODE%%</div>
+ <p class="warn">⚠ Only authorize if you just ran <code>gw auth login</code> yourself and the code matches. If you didn't start this, click Deny.</p>
+ <div class="row">
+  <form method="post" action="/auth/cli/approve">
+    <input type="hidden" name="approval" value="%%APPROVAL%%">
+    <button class="approve" type="submit">Authorize</button>
+  </form>
+  <form method="post" action="/auth/cli/deny">
+    <input type="hidden" name="approval" value="%%APPROVAL%%">
+    <button class="deny" type="submit">Deny</button>
+  </form>
+ </div>
+</div>
+</body></html>"#;
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// 303 to the IdP while dropping the browser-binding cookie (see
+/// [`OIDC_BINDING_COOKIE`]). `state` is the CSRF/state value the callback
+/// will later require this cookie to match.
+fn redirect_to_with_binding(url: &str, state: &str) -> Response {
+    // Path=/auth confines the cookie to the login + callback routes;
+    // Max-Age=900 matches PENDING_LOGIN_TTL (15 min). HttpOnly keeps it
+    // away from JS; SameSite=Lax is sufficient because the value must
+    // still equal `state` at the callback.
+    let binding =
+        format!("{OIDC_BINDING_COOKIE}={state}; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=900");
     Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, url)
+        .header(header::SET_COOKIE, binding)
         .body("".into())
         .unwrap()
+}
+
+/// True if `p` is a safe *same-origin* redirect target. `starts_with('/')`
+/// is not enough: `//evil.com` and `/\evil.com` are protocol-relative URLs
+/// (browsers normalise `\`→`/`), so a naive check would let a post-login
+/// redirect bounce the user to an attacker's host. Leading ASCII
+/// whitespace is trimmed first, since browsers strip it before resolving.
+pub(crate) fn is_safe_return_to(p: &str) -> bool {
+    let p = p.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    p.starts_with('/') && !p.starts_with("//") && !p.starts_with("/\\")
 }
 
 fn error_html(status: StatusCode, message: &str) -> Response {
@@ -340,4 +410,37 @@ fn error_html(status: StatusCode, message: &str) -> Response {
         .header(header::CONTENT_TYPE, "application/json")
         .body(body.to_string().into())
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_return_to;
+
+    #[test]
+    fn accepts_local_paths() {
+        assert!(is_safe_return_to("/"));
+        assert!(is_safe_return_to("/chat/abc"));
+        assert!(is_safe_return_to("/chat/shared-1?x=1"));
+    }
+
+    #[test]
+    fn rejects_protocol_relative_and_absolute_urls() {
+        // The whole point of the guard: these all pass `starts_with('/')`
+        // (or look local) yet resolve off-origin in a browser.
+        assert!(!is_safe_return_to("//evil.com"));
+        assert!(!is_safe_return_to("/\\evil.com"));
+        assert!(!is_safe_return_to("https://evil.com"));
+        assert!(!is_safe_return_to("http://evil.com"));
+        assert!(!is_safe_return_to("evil.com"));
+        assert!(!is_safe_return_to(""));
+    }
+
+    #[test]
+    fn rejects_whitespace_smuggled_protocol_relative() {
+        // Browsers strip leading whitespace before resolving, so we must
+        // trim before checking, else `\t//evil.com` would slip through.
+        assert!(!is_safe_return_to("  //evil.com"));
+        assert!(!is_safe_return_to("\t//evil.com"));
+        assert!(!is_safe_return_to("\n//evil.com"));
+    }
 }

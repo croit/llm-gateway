@@ -57,8 +57,15 @@ async fn login(gateway_url: String, profile: &str, no_browser: bool) -> Result<(
         .await
         .context("starting CLI login at the gateway")?;
 
+    let code = shared::cli_login_code(&start.state);
     eprintln!("→ Opening sign-in page in your browser:");
     eprintln!("  {}", start.login_url);
+    eprintln!();
+    eprintln!("  After signing in, authorize the request and confirm this code:");
+    eprintln!("      {code}");
+    eprintln!("  (If the browser shows a different code, do NOT authorize — someone");
+    eprintln!("   else may be trying to sign in as you.)");
+    eprintln!();
     if !no_browser && let Err(err) = webbrowser::open(&start.login_url) {
         eprintln!("(could not auto-open the browser: {err}; please open it manually)");
     }
