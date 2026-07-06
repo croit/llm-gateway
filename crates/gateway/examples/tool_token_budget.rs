@@ -31,7 +31,7 @@ fn main() {
         .with(gateway::server::tools::echo::Echo)
         .with(gateway::server::tools::time::CurrentTimestamp)
         .with(gateway::server::tools::fetch_url::FetchUrl)
-        .with(gateway::server::tools::fetch_attachment::FetchAttachment)
+        .with(gateway::server::tools::fetch_attachment::FetchAttachment::new(None))
         .with(gateway::server::tools::upload_attachment::UploadAttachment)
         .with(gateway::server::tools::search_web::SearchWeb)
         .with(gateway::server::tools::location::GetUserLocation)

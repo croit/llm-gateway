@@ -38,6 +38,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
+use std::sync::Arc;
+
+use shared::sandbox::{InputFile, Language, RunRequest};
+
+use super::sandbox::{SandboxClient, b64};
 use super::{Tool, ToolContext, ToolError, ToolFuture, tool_content_parts};
 use crate::server::chat_attachments::{self, BinaryDisposition, PayloadLimits};
 use crate::server::pdf::{self, PdfError};
@@ -56,7 +61,208 @@ const HARD_MAX_BYTES_DEFAULT: usize = HARD_MAX_BYTES;
 /// didn't get the bytes inline.
 const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 
-pub struct FetchAttachment;
+pub struct FetchAttachment {
+    /// Sandbox client for reading Office formats (docx/pptx/xlsx), which
+    /// aren't text and aren't PDFs — a python extractor in the sandbox
+    /// turns them into verbatim structured content. `None` when no
+    /// `[sandbox]` is configured; those uploads then fall back to the
+    /// generic "binary — re-upload" stub.
+    sandbox: Option<Arc<SandboxClient>>,
+}
+
+impl FetchAttachment {
+    pub fn new(sandbox: Option<Arc<SandboxClient>>) -> Self {
+        Self { sandbox }
+    }
+}
+
+/// Office extension (`docx`/`pptx`/`xlsx`) for an attachment, from its mime
+/// or filename. PDFs are deliberately excluded — they keep the richer
+/// two-tier text/vision path. `None` for everything else.
+fn office_ext(mime: &str, filename: &str) -> Option<&'static str> {
+    let lname = filename.to_ascii_lowercase();
+    let has = |ext: &str, m: &str| lname.ends_with(ext) || mime.contains(m);
+    if has(".pptx", "presentationml") {
+        Some("pptx")
+    } else if has(".docx", "wordprocessingml") {
+        Some("docx")
+    } else if has(".xlsx", "spreadsheetml") {
+        Some("xlsx")
+    } else {
+        None
+    }
+}
+
+/// MIME for an embedded image the extractor pulled out of a document, keyed
+/// off the filename the extractor chose (`.png`/`.jpg`/…). Vector blobs
+/// python-pptx emits (`.emf`/`.wmf`) return `None` — typst can't place them,
+/// so we skip carrying them rather than ship an unusable attachment.
+fn image_mime(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    if n.ends_with(".png") {
+        Some("image/png")
+    } else if n.ends_with(".jpg") || n.ends_with(".jpeg") {
+        Some("image/jpeg")
+    } else if n.ends_with(".gif") {
+        Some("image/gif")
+    } else if n.ends_with(".svg") {
+        Some("image/svg+xml")
+    } else if n.ends_with(".webp") {
+        Some("image/webp")
+    } else if n.ends_with(".bmp") {
+        Some("image/bmp")
+    } else if n.ends_with(".tiff") || n.ends_with(".tif") {
+        Some("image/tiff")
+    } else {
+        None
+    }
+}
+
+/// Verbatim structured extractor run in the sandbox. Dispatches by the
+/// input file's extension (python-pptx / python-docx / openpyxl). Prints one
+/// JSON object of the document's content — titles, text, bullets, tables,
+/// notes, image filenames — with NO modification, so the model can re-author
+/// it into a template (letter / presentation / one-pager) losslessly. Each
+/// embedded image is written to `/work` top-level (NOT a subdir) so the
+/// sandbox agent returns it as an artifact for the gateway to re-attach.
+const EXTRACT_PY: &str = r#"import sys, json, os
+src, imgdir = sys.argv[1], sys.argv[2]
+os.makedirs(imgdir, exist_ok=True)
+ext = os.path.splitext(src)[1].lower()
+def extract_pptx():
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    prs = Presentation(src); out=[]
+    def walk(shapes, tshape, acc):
+        for sh in shapes:
+            if sh.shape_type==MSO_SHAPE_TYPE.GROUP: walk(sh.shapes,tshape,acc); continue
+            if sh.shape_type==MSO_SHAPE_TYPE.PICTURE: acc["_p"].append(sh); continue
+            if sh.has_table: acc["tables"].append([[c.text for c in r.cells] for r in sh.table.rows]); continue
+            if sh.has_text_frame:
+                ps=[p.text for p in sh.text_frame.paragraphs if p.text.strip()]
+                if not ps: continue
+                if sh is tshape: acc["title"]=sh.text_frame.text.strip()
+                elif len(ps)>1: acc["bullets"].append(ps)
+                else: acc["text"].append(ps[0])
+    for i,sl in enumerate(prs.slides):
+        acc={"title":"","text":[],"bullets":[],"tables":[],"_p":[]}
+        walk(sl.shapes, sl.shapes.title, acc)
+        imgs=[]
+        for j,sh in enumerate(acc.pop("_p")):
+            im=sh.image; fn="slide%d_img%d.%s"%(i+1,j+1,im.ext); open(os.path.join(imgdir,fn),"wb").write(im.blob); imgs.append(fn)
+        notes=sl.notes_slide.notes_text_frame.text.strip() if sl.has_notes_slide else ""
+        s={"index":i+1}
+        for k in ("title","text","bullets","tables"):
+            if acc[k]: s[k]=acc[k]
+        if imgs: s["images"]=imgs
+        if notes: s["notes"]=notes
+        out.append(s)
+    return {"kind":"presentation","units":"slides","content":out}
+def extract_docx():
+    import docx
+    d=docx.Document(src); blocks=[]
+    for p in d.paragraphs:
+        t=p.text.strip()
+        if t: blocks.append({"style":p.style.name if p.style else "", "text":t})
+    tables=[[[c.text for c in r.cells] for r in t.rows] for t in d.tables]
+    imgs=[]
+    for i,rel in enumerate(d.part.rels.values()):
+        if "image" in rel.reltype:
+            blob=rel.target_part.blob; fn="img%d.%s"%(i+1,(rel.target_part.content_type.split("/")[-1] or "png"))
+            open(os.path.join(imgdir,fn),"wb").write(blob); imgs.append(fn)
+    r={"kind":"document","paragraphs":blocks}
+    if tables: r["tables"]=tables
+    if imgs: r["images"]=imgs
+    return r
+def extract_xlsx():
+    from openpyxl import load_workbook
+    wb=load_workbook(src, data_only=True); sheets=[]
+    for ws in wb.worksheets:
+        rows=[[("" if c is None else str(c)) for c in row] for row in ws.iter_rows(values_only=True)]
+        rows=[r for r in rows if any(x.strip() for x in r)]
+        sheets.append({"name":ws.title,"rows":rows})
+    return {"kind":"spreadsheet","sheets":sheets}
+fn={".pptx":extract_pptx,".docx":extract_docx,".xlsx":extract_xlsx}.get(ext)
+if not fn: print(json.dumps({"error":"unsupported: "+ext})); sys.exit(1)
+res=fn(); res["source"]=os.path.basename(src)
+print(json.dumps(res, ensure_ascii=False))
+"#;
+
+/// Run [`EXTRACT_PY`] over `bytes` in the sandbox and return the parsed
+/// structured content. The document rides in as `upload.<ext>` so the
+/// extractor dispatches on the real format.
+async fn extract_office(
+    sandbox: &SandboxClient,
+    ctx: &ToolContext,
+    s3: &crate::server::config::S3Config,
+    turn_id: &str,
+    ext: &str,
+    bytes: Vec<u8>,
+) -> Result<Value, ToolError> {
+    let infile = format!("upload.{ext}");
+    // `EXTRACT_PY` is concatenated (not `format!`-interpolated) so its Python
+    // dict/set braces don't collide with format placeholders. Images go to
+    // `.` (== `/work`, the cwd) so the agent collects them as artifacts.
+    let code =
+        format!("set -e\ncd /work\npython3 - {infile} . <<'PYEOF'\n") + EXTRACT_PY + "PYEOF\n";
+    let req = RunRequest {
+        language: Language::Bash,
+        code,
+        files: vec![InputFile {
+            name: infile,
+            content_b64: b64::encode(&bytes),
+        }],
+        timeout_secs: None,
+        network: false,
+    };
+    let resp = sandbox.run_job(req).await?;
+    if resp.exit_code != 0 || resp.timed_out {
+        return Err(ToolError::Failed(format!(
+            "document extraction failed (exit {}): {}",
+            resp.exit_code,
+            resp.stderr.chars().rev().take(400).collect::<String>()
+        )));
+    }
+    let mut document: Value = serde_json::from_str(resp.stdout.trim())
+        .map_err(|e| ToolError::Failed(format!("extractor did not return JSON: {e}")))?;
+
+    // Re-attach each embedded image the extractor pulled out. They ride back
+    // as sandbox artifacts (top-level `/work` files); store each as a
+    // markerless attachment of this turn (invisible — source material, not a
+    // deliverable, like the typst `.json` edit-base) and hand the model a
+    // ready-to-use `att:<id>` ref. Dropping such a ref into any image field of
+    // a render makes typst stage the real pixels (see `typst_render`). The
+    // `file` key matches the filename listed on each slide/paragraph, so the
+    // model can map "slide 3 had slide3_img1.png" → the ref to use.
+    let mut image_refs = Vec::new();
+    for art in &resp.artifacts {
+        let Some(mime) = image_mime(&art.name) else {
+            continue;
+        };
+        let Some(img) = b64::decode(&art.content_b64) else {
+            continue;
+        };
+        let stored = match ctx.attachment_reservations.as_ref() {
+            Some(res) => chat_attachments::reserve_filename(&ctx.db, turn_id, res, &art.name)
+                .await
+                .map_err(|e| ToolError::Failed(format!("reserve image name: {e}")))?,
+            None => art.name.clone(),
+        };
+        chat_attachments::upload(s3, turn_id, &stored, mime, img)
+            .await
+            .map_err(|e| ToolError::Failed(format!("upload extracted image: {e}")))?;
+        image_refs.push(json!({
+            "file": art.name,
+            "ref": format!("att:{turn_id}/{stored}"),
+        }));
+    }
+    if !image_refs.is_empty()
+        && let Value::Object(map) = &mut document
+    {
+        map.insert("image_refs".into(), json!(image_refs));
+    }
+    Ok(document)
+}
 
 #[derive(Deserialize)]
 struct FetchArgs {
@@ -101,10 +307,15 @@ impl Tool for FetchAttachment {
              (cheap — use this first); if the result comes back empty or \
              garbled (a scanned / image-only PDF), call again with \
              `mode=\"images\"` to get the pages rendered as images you can \
-             actually see. Other binary files (zip, audio, …) return \
-             metadata only; ask the user to re-upload if you need them. \
-             Skip calling this if the user's question doesn't depend on the \
-             attachment's contents.",
+             actually see. Office files (`.docx`/`.pptx`/`.xlsx`) return \
+             `kind:\"document_structure\"` — the verbatim content (titles, \
+             text, bullets, tables, notes) plus `image_refs` for any embedded \
+             images; use this to re-author an upload into a branded template \
+             (typst_presentation / typst_letter / typst_onepager), carrying \
+             images over by their `att:` ref. Other binary files (zip, audio, \
+             …) return metadata only; ask the user to re-upload if you need \
+             them. Skip calling this if the user's question doesn't depend on \
+             the attachment's contents.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -140,6 +351,7 @@ impl Tool for FetchAttachment {
     }
 
     fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        let sandbox = self.sandbox.clone();
         Box::pin(async move {
             let args: FetchArgs = serde_json::from_value(args)
                 .map_err(|e| ToolError::InvalidArgs(format!("expected {{id, max_bytes?}}: {e}")))?;
@@ -162,6 +374,30 @@ impl Tool for FetchAttachment {
                 .unwrap_or(HARD_MAX_BYTES_DEFAULT)
                 .min(HARD_MAX_BYTES);
             let mime = fetched.mime.clone();
+
+            // Office formats (docx/pptx/xlsx): not text, not PDF. Route to the
+            // sandbox extractor for verbatim structured content the model can
+            // re-author into a template (letter/presentation/one-pager) without
+            // changing wording. Falls through to the binary stub with no sandbox.
+            if let (Some(ext), Some(sb)) = (office_ext(&mime, filename), sandbox.as_ref()) {
+                let document = extract_office(sb, &ctx, s3, turn_id, ext, fetched.bytes).await?;
+                return Ok(json!({
+                    "id": args.id,
+                    "filename": filename,
+                    "mime": mime,
+                    "kind": "document_structure",
+                    "note": "Verbatim structured content of the uploaded file. \
+                             Re-author it into a template (typst_presentation / \
+                             typst_letter / typst_onepager) WITHOUT changing the \
+                             wording. Any embedded images are listed under \
+                             `image_refs` (file → `att:` ref); to carry an image \
+                             into a render, copy its `ref` string verbatim into \
+                             the matching image field (image / bg_image / avatar \
+                             / banner). The renderer resolves `att:` refs to the \
+                             real pixels — do NOT invent file paths for them.",
+                    "document": document,
+                }));
+            }
 
             // PDFs get their own two-tier path (text layer, then
             // page-images on escalation) instead of the generic
@@ -460,7 +696,10 @@ mod tests {
 
     #[test]
     fn schema_names_match_id() {
-        assert_eq!(FetchAttachment.id(), FetchAttachment.schema().function.name);
+        assert_eq!(
+            FetchAttachment::new(None).id(),
+            FetchAttachment::new(None).schema().function.name
+        );
     }
 
     #[tokio::test]
@@ -481,7 +720,7 @@ mod tests {
             attachment_reservations: None,
             indexer: None,
         };
-        let err = FetchAttachment
+        let err = FetchAttachment::new(None)
             .run(ctx, json!({"id": "t-1/x.csv"}))
             .await
             .unwrap_err();
@@ -518,7 +757,7 @@ mod tests {
             attachment_reservations: None,
             indexer: None,
         };
-        let err = FetchAttachment
+        let err = FetchAttachment::new(None)
             .run(ctx, json!({"id": "nope"}))
             .await
             .unwrap_err();
@@ -547,7 +786,7 @@ mod tests {
 
     #[test]
     fn schema_advertises_pdf_mode() {
-        let schema = FetchAttachment.schema();
+        let schema = FetchAttachment::new(None).schema();
         let modes = &schema.function.parameters["properties"]["mode"]["enum"];
         assert_eq!(*modes, json!(["text", "images"]));
     }

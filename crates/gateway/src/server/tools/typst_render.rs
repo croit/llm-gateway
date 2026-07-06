@@ -69,6 +69,18 @@ impl Tool for TypstRenderTool {
         self.id
     }
 
+    /// A render is fast (PDF+PNG on the host, ~seconds) UNLESS the template
+    /// runs a sandbox export (pptx/docx via typ2pptx/pdf2docx), which can take
+    /// tens of seconds. Without this the 30 s default `TOOL_TIMEOUT` kills the
+    /// whole call mid-export — discarding the PDF that already rendered. Size
+    /// to the sandbox's own ceiling (+ margin for the host render) so the slow
+    /// export finishes, or fails cleanly on its own, before the runner gives up.
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        self.sandbox
+            .as_ref()
+            .map(|s| s.loop_timeout() + std::time::Duration::from_secs(30))
+    }
+
     fn schema(&self) -> ToolDef {
         let t = &self.template;
         let mut props = Map::new();
@@ -233,20 +245,47 @@ async fn render_and_attach(
     sandbox: Option<&Arc<SandboxClient>>,
     preview_page: u32,
 ) -> ToolResult {
-    let rendered = typst::compile(template, &inputs, preview_page)
-        .await
-        .map_err(|e| {
-            // Compile errors become InvalidArgs so the model is nudged to
-            // fix its input — typst's stderr usually names the offending
-            // line / variable.
-            use typst::CompileError;
-            match e {
-                CompileError::Failed(msg) => {
-                    ToolError::InvalidArgs(format!("typst compile failed:\n{msg}"))
-                }
-                other => ToolError::Failed(other.to_string()),
+    // Resolve any `att:` image refs the model dropped into image fields
+    // (uploaded / extracted images): fetch the bytes, stage them under
+    // `uploads/`, and rewrite each ref to that path. The ORIGINAL `data` (refs
+    // intact) is what we persist as the `.json` edit-base below, so a later
+    // `_edit` / `_pptx` re-stages from scratch — staged files are ephemeral,
+    // scoped to this one render.
+    let (staged, reps) = stage_att_refs(s3, data).await?;
+    let inputs: Vec<(String, String)> = inputs
+        .into_iter()
+        .map(|(k, v)| (k, apply_replacements(&v, &reps)))
+        .collect();
+    let render_data = apply_reps_to_value(data, &reps)?;
+
+    // With staged images, compile against a temp root = a copy of the template
+    // dir + the staged files, so `image("uploads/…")` resolves alongside the
+    // shipped `assets/`. No staging → compile straight against the template
+    // (no copy). The tempdir must outlive the compile, hence the binding.
+    let staging = if staged.is_empty() {
+        None
+    } else {
+        Some(build_staging_root(&template.root, &staged)?)
+    };
+    let rendered = typst::compile(
+        template,
+        &inputs,
+        preview_page,
+        staging.as_ref().map(|d| d.path()),
+    )
+    .await
+    .map_err(|e| {
+        // Compile errors become InvalidArgs so the model is nudged to
+        // fix its input — typst's stderr usually names the offending
+        // line / variable.
+        use typst::CompileError;
+        match e {
+            CompileError::Failed(msg) => {
+                ToolError::InvalidArgs(format!("typst compile failed:\n{msg}"))
             }
-        })?;
+            other => ToolError::Failed(other.to_string()),
+        }
+    })?;
 
     // Same-turn dedup, race-safe across concurrent tool calls: a second
     // typst call (or a sibling `upload_attachment` claiming e.g.
@@ -308,7 +347,7 @@ async fn render_and_attach(
     let mut pptx_out = None;
     let mut pptx_error: Option<String> = None;
     if let (Some(cfg), Some(sandbox)) = (template.pptx.as_ref(), sandbox) {
-        match convert_to_pptx(sandbox, template, cfg, data).await {
+        match convert_to_pptx(sandbox, template, cfg, &render_data, &staged).await {
             Ok(bytes) => {
                 match chat_attachments::upload(s3, turn_id, &pptx_name, PPTX_MIME, bytes).await {
                     Ok(out) => pptx_out = Some(out),
@@ -518,6 +557,7 @@ async fn convert_to_pptx(
     template: &Template,
     cfg: &PptxExport,
     data: &Value,
+    staged: &[(String, Vec<u8>)],
 ) -> Result<Vec<u8>, ToolError> {
     let deck = data.get(&cfg.data_field).ok_or_else(|| {
         ToolError::Failed(format!(
@@ -528,7 +568,7 @@ async fn convert_to_pptx(
     let deck_bytes = serde_json::to_vec_pretty(deck)
         .map_err(|e| ToolError::Failed(format!("pptx export: serialize deck: {e}")))?;
 
-    let bundle = build_bundle_zip(&template.root, &cfg.data_file, &deck_bytes)?;
+    let bundle = build_bundle_zip(&template.root, &cfg.data_file, &deck_bytes, staged)?;
     let script = pptx_script(&template.source_file, cfg.font.as_deref());
 
     let req = RunRequest {
@@ -567,7 +607,12 @@ async fn convert_to_pptx(
 /// Zip the template directory (template.typ + fonts + assets), swapping
 /// in the freshly-serialized deck as `data_file` (any on-disk sample of
 /// that name is skipped). Nested paths are preserved as ZIP entry names.
-fn build_bundle_zip(root: &Path, data_file: &str, deck_bytes: &[u8]) -> Result<Vec<u8>, ToolError> {
+fn build_bundle_zip(
+    root: &Path,
+    data_file: &str,
+    deck_bytes: &[u8],
+    staged: &[(String, Vec<u8>)],
+) -> Result<Vec<u8>, ToolError> {
     let mut buf = Vec::new();
     {
         let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
@@ -606,10 +651,164 @@ fn build_bundle_zip(root: &Path, data_file: &str, deck_bytes: &[u8]) -> Result<V
             .map_err(|e| ToolError::Failed(format!("pptx bundle: start deck: {e}")))?;
         zw.write_all(deck_bytes)
             .map_err(|e| ToolError::Failed(format!("pptx bundle: write deck: {e}")))?;
+        // Staged uploads (e.g. `uploads/…` images the deck references) so
+        // typ2pptx can place them from the unzipped bundle root, same as the
+        // shipped `assets/`.
+        for (rel, bytes) in staged {
+            zw.start_file(rel.clone(), opts)
+                .map_err(|e| ToolError::Failed(format!("pptx bundle: start staged {rel}: {e}")))?;
+            zw.write_all(bytes)
+                .map_err(|e| ToolError::Failed(format!("pptx bundle: write staged {rel}: {e}")))?;
+        }
         zw.finish()
             .map_err(|e| ToolError::Failed(format!("pptx bundle: finish: {e}")))?;
     }
     Ok(buf)
+}
+
+// --- Uploaded-image staging (the `att:` image pipeline) --------------------
+//
+// `fetch_attachment` re-attaches images it pulls out of an uploaded document
+// and hands the model `att:<turn>/<file>` refs. When such a ref lands in an
+// image field of a render, we fetch the bytes and stage them under `uploads/`
+// in the compile root (host PDF/PNG) and the pptx bundle, rewriting the ref to
+// that path so `image("uploads/…")` resolves. Refs are NEVER persisted as
+// paths — the `.json` edit-base keeps the `att:` form and re-stages each run.
+
+/// Prefix marking an image-field value as a reference to a chat attachment
+/// (an uploaded / extracted image) rather than a template-relative path.
+const ATT_REF_PREFIX: &str = "att:";
+
+/// Recursively copy `src` into `dst` (files + subdirs; symlinks/others
+/// skipped) to build a staging root that overlays the template dir with the
+/// per-render uploaded images.
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Build a temp compile root: a copy of the template dir plus the `staged`
+/// files written at their relative paths. The returned [`tempfile::TempDir`]
+/// must outlive the compile that reads from it.
+fn build_staging_root(
+    template_root: &Path,
+    staged: &[(String, Vec<u8>)],
+) -> Result<tempfile::TempDir, ToolError> {
+    let dir = tempfile::tempdir()
+        .map_err(|e| ToolError::Failed(format!("staging root: tempdir: {e}")))?;
+    copy_dir_all(template_root, dir.path())
+        .map_err(|e| ToolError::Failed(format!("staging root: copy template: {e}")))?;
+    for (rel, bytes) in staged {
+        let dest = dir.path().join(rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ToolError::Failed(format!("staging root: mkdir for {rel}: {e}")))?;
+        }
+        std::fs::write(&dest, bytes)
+            .map_err(|e| ToolError::Failed(format!("staging root: write {rel}: {e}")))?;
+    }
+    Ok(dir)
+}
+
+/// Collect the unique `att:<turn>/<file>` refs appearing as string values
+/// anywhere in `v` (fields, nested slides, arrays).
+fn collect_att_tokens(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) if s.starts_with(ATT_REF_PREFIX) && !out.contains(s) => {
+            out.push(s.clone());
+        }
+        Value::Array(a) => a.iter().for_each(|x| collect_att_tokens(x, out)),
+        Value::Object(m) => m.values().for_each(|x| collect_att_tokens(x, out)),
+        _ => {}
+    }
+}
+
+/// Sanitize an attachment filename into one safe path component for the
+/// staging `uploads/` dir (no separators, no traversal).
+fn sanitize_component(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let s: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let s = s.trim_matches('.').to_string();
+    if s.is_empty() { "img".to_string() } else { s }
+}
+
+/// Apply the staging replacements (`att:` token → `uploads/…` path) to a raw
+/// string. `reps` is sorted longest-token-first by [`stage_att_refs`] so a
+/// shorter ref can't be a textual prefix that partially clobbers a longer one.
+fn apply_replacements(s: &str, reps: &[(String, String)]) -> String {
+    let mut out = s.to_string();
+    for (from, to) in reps {
+        out = out.replace(from.as_str(), to.as_str());
+    }
+    out
+}
+
+/// Apply the staging replacements to every string in a JSON value by
+/// round-tripping its serialized form (the tokens are opaque and unique, so a
+/// textual replace is safe and simplest).
+fn apply_reps_to_value(data: &Value, reps: &[(String, String)]) -> Result<Value, ToolError> {
+    if reps.is_empty() {
+        return Ok(data.clone());
+    }
+    let s = serde_json::to_string(data)
+        .map_err(|e| ToolError::Failed(format!("stage images: serialize data: {e}")))?;
+    let s = apply_replacements(&s, reps);
+    serde_json::from_str(&s)
+        .map_err(|e| ToolError::Failed(format!("stage images: reparse data: {e}")))
+}
+
+/// Resolve `att:` image refs in `data`: fetch each referenced attachment's
+/// bytes and assign a unique `uploads/u<n>_<file>` staging path. Returns the
+/// staged files (path → bytes) and the token→path replacements to apply to the
+/// render inputs/data. A missing / malformed ref is a hard error so the model
+/// fixes the ref instead of silently rendering a broken image.
+async fn stage_att_refs(
+    s3: &crate::server::config::S3Config,
+    data: &Value,
+) -> Result<(Vec<(String, Vec<u8>)>, Vec<(String, String)>), ToolError> {
+    let mut tokens = Vec::new();
+    collect_att_tokens(data, &mut tokens);
+    let mut staged = Vec::new();
+    let mut reps = Vec::new();
+    for (idx, tok) in tokens.iter().enumerate() {
+        let id = tok.strip_prefix(ATT_REF_PREFIX).unwrap_or(tok);
+        let (turn, file) = id.split_once('/').ok_or_else(|| {
+            ToolError::InvalidArgs(format!(
+                "image ref {tok:?} is malformed; expected `att:<turn_id>/<filename>`"
+            ))
+        })?;
+        let fetched = chat_attachments::fetch(s3, turn, file).await.map_err(|e| {
+            ToolError::InvalidArgs(format!(
+                "image ref {tok:?} could not be fetched ({e}); use the exact `ref` \
+                 string from fetch_attachment's image_refs"
+            ))
+        })?;
+        let relpath = format!("uploads/u{idx}_{}", sanitize_component(file));
+        staged.push((relpath.clone(), fetched.bytes));
+        reps.push((tok.clone(), relpath));
+    }
+    reps.sort_by_key(|r| std::cmp::Reverse(r.0.len()));
+    Ok((staged, reps))
 }
 
 /// The bash recipe run in the sandbox. All messy work happens in a
@@ -751,6 +950,14 @@ impl TypstEditTool {
 impl Tool for TypstEditTool {
     fn id(&self) -> &str {
         self.id
+    }
+
+    /// Same as the render tool: an edit re-renders (incl. any sandbox pptx/docx
+    /// export), so allow the sandbox ceiling rather than the 30 s default.
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        self.sandbox
+            .as_ref()
+            .map(|s| s.loop_timeout() + std::time::Duration::from_secs(30))
     }
 
     fn schema(&self) -> ToolDef {
@@ -1056,6 +1263,12 @@ impl Tool for TypstPptxTool {
         self.id
     }
 
+    /// This tool's whole job is the sandbox pptx export, so it always needs the
+    /// sandbox ceiling rather than the 30 s default `TOOL_TIMEOUT`.
+    fn max_duration(&self) -> Option<std::time::Duration> {
+        Some(self.sandbox.loop_timeout() + std::time::Duration::from_secs(30))
+    }
+
     fn schema(&self) -> ToolDef {
         let render_id = format!("typst_{}", self.template.id);
         ToolDef::function(
@@ -1116,7 +1329,12 @@ impl Tool for TypstPptxTool {
                 ))
             })?;
 
-            let bytes = convert_to_pptx(&self.sandbox, &template, cfg, &data).await?;
+            // Re-stage any `att:` image refs the stored deck carries (the
+            // edit-base persists refs, not the ephemeral staged paths).
+            let (staged, reps) = stage_att_refs(s3, &data).await?;
+            let render_data = apply_reps_to_value(&data, &reps)?;
+            let bytes =
+                convert_to_pptx(&self.sandbox, &template, cfg, &render_data, &staged).await?;
             // Share the deck stem so the .pptx sits beside its siblings.
             let stem = base_file
                 .strip_suffix(".json")
@@ -1929,7 +2147,7 @@ mod tests {
         std::fs::write(root.join("deck.json"), b"{\"stale\":true}").unwrap();
 
         let deck = br#"{"deck_title":"Fresh"}"#;
-        let zip_bytes = build_bundle_zip(root, "deck.json", deck).unwrap();
+        let zip_bytes = build_bundle_zip(root, "deck.json", deck, &[]).unwrap();
 
         let mut zr = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).unwrap();
         let mut names: Vec<String> = (0..zr.len())
@@ -1945,6 +2163,107 @@ mod tests {
             .read_to_string(&mut s)
             .unwrap();
         assert!(s.contains("Fresh") && !s.contains("stale"), "{s}");
+    }
+
+    #[test]
+    fn build_bundle_zip_carries_staged_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("template.typ"), b"= deck").unwrap();
+        let staged = vec![("uploads/u0_pic.png".to_string(), b"PNGBYTES".to_vec())];
+        let zip_bytes = build_bundle_zip(root, "deck.json", b"{}", &staged).unwrap();
+        let mut zr = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).unwrap();
+        let names: Vec<String> = (0..zr.len())
+            .map(|i| zr.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "uploads/u0_pic.png"), "{names:?}");
+    }
+
+    // --- `att:` image-ref staging -----------------------------------------
+
+    #[test]
+    fn collect_att_tokens_finds_nested_refs_and_dedups() {
+        let data = json!({
+            "deck": {
+                "slides": [
+                    {"layout": "media", "image": "att:T1/slide1_img1.png"},
+                    {"layout": "cover", "bg_image": "assets/img/grainient.jpg"},
+                    {"layout": "gallery", "items": [
+                        {"image": "att:T1/slide3_img1.jpg"},
+                        {"image": "att:T1/slide1_img1.png"}
+                    ]}
+                ]
+            }
+        });
+        let mut out = Vec::new();
+        collect_att_tokens(&data, &mut out);
+        out.sort();
+        // The on-disk path is NOT collected; the duplicate ref appears once.
+        assert_eq!(
+            out,
+            vec![
+                "att:T1/slide1_img1.png".to_string(),
+                "att:T1/slide3_img1.jpg".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_component_strips_separators_and_traversal() {
+        assert_eq!(sanitize_component("slide1_img1.png"), "slide1_img1.png");
+        // Any path separators / traversal collapse to a single safe component.
+        assert_eq!(sanitize_component("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_component("a/b/c.PNG"), "c.PNG");
+        assert_eq!(sanitize_component("weird name!@#.jpg"), "weird_name___.jpg");
+        assert_eq!(sanitize_component("..."), "img");
+    }
+
+    #[test]
+    fn apply_reps_rewrites_refs_in_strings_and_values() {
+        let reps = vec![
+            ("att:T1/a.png".to_string(), "uploads/u0_a.png".to_string()),
+            ("att:T1/b.jpg".to_string(), "uploads/u1_b.jpg".to_string()),
+        ];
+        // Raw string (as it appears in a `--input deck=<json>` value).
+        let s = r#"{"image":"att:T1/a.png","bg":"att:T1/b.jpg"}"#;
+        let got = apply_replacements(s, &reps);
+        assert_eq!(
+            got,
+            r#"{"image":"uploads/u0_a.png","bg":"uploads/u1_b.jpg"}"#
+        );
+        // Nested Value round-trip keeps structure, rewrites only the refs.
+        let data = json!({"slides": [{"image": "att:T1/a.png"}, {"x": "keep"}]});
+        let out = apply_reps_to_value(&data, &reps).unwrap();
+        assert_eq!(out["slides"][0]["image"], "uploads/u0_a.png");
+        assert_eq!(out["slides"][1]["x"], "keep");
+        // No reps → unchanged clone.
+        assert_eq!(apply_reps_to_value(&data, &[]).unwrap(), data);
+    }
+
+    #[test]
+    fn build_staging_root_overlays_template_with_uploads() {
+        let tpl = tempfile::tempdir().unwrap();
+        let root = tpl.path();
+        std::fs::write(root.join("template.typ"), b"= deck").unwrap();
+        std::fs::create_dir(root.join("assets")).unwrap();
+        std::fs::write(root.join("assets").join("logo.svg"), b"<svg/>").unwrap();
+
+        let staged = vec![("uploads/u0_pic.png".to_string(), b"PIX".to_vec())];
+        let staging = build_staging_root(root, &staged).unwrap();
+        let sp = staging.path();
+        // Template files copied through (including nested dirs)...
+        assert_eq!(std::fs::read(sp.join("template.typ")).unwrap(), b"= deck");
+        assert_eq!(
+            std::fs::read(sp.join("assets").join("logo.svg")).unwrap(),
+            b"<svg/>"
+        );
+        // ...and the staged upload written under uploads/.
+        assert_eq!(
+            std::fs::read(sp.join("uploads").join("u0_pic.png")).unwrap(),
+            b"PIX"
+        );
+        // The original template dir is untouched (no uploads/ leaked in).
+        assert!(!root.join("uploads").exists());
     }
 
     #[test]

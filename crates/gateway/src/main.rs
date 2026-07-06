@@ -78,11 +78,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Build the sandbox client once (when `[sandbox]` is enabled) — shared by
+    // the sandbox tools, the typst PPTX/DOCX-export path, AND fetch_attachment's
+    // Office-file extractor. `None` leaves typst rendering PDF + preview only
+    // and Office uploads unreadable (binary stub).
+    let sandbox_client: Option<Arc<srv::tools::sandbox::SandboxClient>> =
+        match config.sandbox.as_ref() {
+            Some(c) if c.enabled => Some(srv::tools::sandbox::SandboxClient::new(
+                Arc::new(c.clone()),
+                config.gateway.public_url.clone(),
+            )),
+            _ => None,
+        };
+
     let mut tool_registry = srv::tools::ToolRegistry::new()
         .with(srv::tools::echo::Echo)
         .with(srv::tools::time::CurrentTimestamp)
         .with(srv::tools::fetch_url::FetchUrl)
-        .with(srv::tools::fetch_attachment::FetchAttachment)
+        .with(srv::tools::fetch_attachment::FetchAttachment::new(
+            sandbox_client.clone(),
+        ))
         .with(srv::tools::upload_attachment::UploadAttachment)
         .with(srv::tools::search_web::SearchWeb)
         .with(srv::tools::location::GetUserLocation)
@@ -120,18 +135,6 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::info!("no [geoip] config — lookup_ip tool not registered");
     }
-    // Build the sandbox client once (when `[sandbox]` is enabled) — shared by
-    // the sandbox tools below AND the typst PPTX-export path, so a deck render
-    // can ship its bundle to the same runner. `None` leaves typst rendering
-    // PDF + preview only (no `.pptx`).
-    let sandbox_client: Option<Arc<srv::tools::sandbox::SandboxClient>> =
-        match config.sandbox.as_ref() {
-            Some(c) if c.enabled => Some(srv::tools::sandbox::SandboxClient::new(
-                Arc::new(c.clone()),
-                config.gateway.public_url.clone(),
-            )),
-            _ => None,
-        };
     // Display metadata for the discovered templates, for the per-template
     // toggle rows in the tool menu / `/tools` page (the human title isn't in
     // the tool schema). Stays empty when `[typst]` isn't configured.

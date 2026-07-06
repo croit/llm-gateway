@@ -419,23 +419,31 @@ pub async fn compile(
     template: &Template,
     inputs: &[(String, String)],
     preview_page: u32,
+    root_override: Option<&Path>,
 ) -> Result<Rendered, CompileError> {
     let workdir = tempfile::tempdir()?;
     let pdf_path = workdir
         .path()
         .join(format!("{}.pdf", template.output_basename));
 
-    let source_path = template.root.join(&template.source_file);
+    // Compile against `root_override` when the caller staged extra assets
+    // (e.g. uploaded images the model dropped into an image field) — that dir
+    // is a copy of `template.root` plus the staged files, so `image(...)`
+    // paths resolve for both the shipped assets and the staged ones. With no
+    // staging (the common case) we compile straight against `template.root`,
+    // no copy.
+    let root = root_override.unwrap_or(&template.root);
+    let source_path = root.join(&template.source_file);
     // A template may bundle its own fonts in a `fonts/` subdir (the corporate
     // letter ships Urbanist there); add it to typst's font search so brand
     // typefaces render. Missing dir → omit the flag and use system/bundled
     // fonts. `--font-path` augments, it doesn't replace, the font set.
-    let font_dir = template.root.join("fonts");
+    let font_dir = root.join("fonts");
     let has_fonts = font_dir.is_dir();
 
     // PDF pass.
     let mut pdf_cmd = Command::new("typst");
-    pdf_cmd.arg("compile").arg("--root").arg(&template.root);
+    pdf_cmd.arg("compile").arg("--root").arg(root);
     if has_fonts {
         pdf_cmd.arg("--font-path").arg(&font_dir);
     }
@@ -451,7 +459,7 @@ pub async fn compile(
     let want = preview_page.max(1);
     let png = match render_preview_png(
         workdir.path(),
-        &template.root,
+        root,
         &source_path,
         has_fonts.then_some(&font_dir),
         inputs,
@@ -464,7 +472,7 @@ pub async fn compile(
         Err(_) if want != 1 => {
             render_preview_png(
                 workdir.path(),
-                &template.root,
+                root,
                 &source_path,
                 has_fonts.then_some(&font_dir),
                 inputs,

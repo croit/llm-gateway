@@ -69,7 +69,10 @@ impl SandboxClient {
     /// Wall-clock ceiling the tool runner should allow around a sandbox
     /// call: the HTTP timeout plus margin, so the client's own timeout
     /// (producing a clean error) fires before the loop cancels the future.
-    fn loop_timeout(&self) -> Duration {
+    /// `pub` so tools that call the sandbox indirectly (the typst templates,
+    /// which run a pptx/docx export in the sandbox as part of a render) can
+    /// size their own `max_duration` to it instead of the 30 s default.
+    pub fn loop_timeout(&self) -> Duration {
         Duration::from_secs(self.cfg.timeout_secs.saturating_add(15))
     }
 
