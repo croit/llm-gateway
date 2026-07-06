@@ -181,6 +181,13 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     };
     state.union_mcp_tool_ids(&mut allowed_tools, &user_mcp);
 
+    // Drop chat-session-only tools: the `/v1` proxy paths carry no session
+    // (`assistant_turn_id`/`session_id` are None below), so the typst render
+    // family, the document-canvas tools, and `upload_attachment` can't run
+    // here — advertising them just lets the model pick one and hit a
+    // "only available inside a chat session" error instead of a completion.
+    allowed_tools.retain(|id| !crate::server::tools::catalog::requires_chat_session(id));
+
     // Byte-dumb proxy: only when the user has no gateway tool grants.
     // There's nothing to inject, so route bytes 1:1 and leave any
     // client-driven tool loop untouched. When the user *does* have

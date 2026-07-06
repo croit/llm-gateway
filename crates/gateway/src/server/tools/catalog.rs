@@ -185,6 +185,20 @@ pub fn is_hidden(tool_id: &str) -> bool {
     HIDDEN.contains(&tool_id)
 }
 
+/// Tools that only work inside a chat session — their `run` hard-fails
+/// (`"… only available inside a chat session"`) off the chat path because
+/// there is no assistant turn / conversation to attach their output to:
+/// the per-template typst render family (`typst_*`), the document-canvas
+/// tools (incl. `export_document`), and `upload_attachment`. The `/v1`
+/// proxy paths have no session, so they must NOT advertise these — else the
+/// model picks one and gets an error instead of a completion. Single source
+/// of truth so the advertise filter can't drift from the runtime gate.
+pub fn requires_chat_session(tool_id: &str) -> bool {
+    tool_id.starts_with(TYPST_PREFIX)
+        || DOCUMENT_IDS.contains(&tool_id)
+        || tool_id == "upload_attachment"
+}
+
 /// `mcp__<server>__<tool>` → `mcp__<server>` (the per-server toggle key).
 /// Falls back to the whole id if the shape is unexpected.
 fn mcp_server_key(tool_id: &str) -> &str {
@@ -570,6 +584,48 @@ mod tests {
         // No manifest meta → prettified id fallback.
         let invoice = rows.iter().find(|e| e.key == "typst_invoice").unwrap();
         assert_eq!(invoice.title, "Invoice");
+    }
+
+    #[test]
+    fn requires_chat_session_covers_session_only_tools() {
+        // The typst render family (every template + its edit/read/pptx
+        // variants) and the document-canvas tools + upload_attachment hard-fail
+        // off the chat path, so they must be reported session-only.
+        for id in [
+            "typst_letter",
+            "typst_letter_edit",
+            "typst_letter_read",
+            "typst_letter_pptx",
+            "typst_presentation",
+            "create_document",
+            "edit_document",
+            "read_document",
+            "list_documents",
+            "edit_document_section",
+            "export_document",
+            "upload_attachment",
+        ] {
+            assert!(requires_chat_session(id), "{id} should be session-only");
+        }
+        // Tools that work on the proxy path (no session) must NOT be dropped —
+        // notably read_skill (explicitly proxy-safe), the sandbox tools that
+        // return content rather than a turn attachment, and plain retrieval.
+        for id in [
+            "read_skill",
+            "search_web",
+            "fetch_url",
+            "fetch_attachment",
+            "generate_document",
+            "render_typst",
+            "run_in_sandbox",
+            "rag_search",
+            "remember",
+        ] {
+            assert!(
+                !requires_chat_session(id),
+                "{id} must stay on the proxy path"
+            );
+        }
     }
 
     #[test]

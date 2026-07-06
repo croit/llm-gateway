@@ -1,0 +1,54 @@
+id = "onepager"
+# Human-readable label for the tool menu's "Document templates" section.
+title = "Branded one-pager"
+description = """
+Render a branded one-pager / info sheet as a PDF on company stationery (logo, \
+brand gradient, page footer — all built in). Use this for a NON-letter branded \
+document: a product or program one-pager, a fact sheet, an announcement, a \
+role/offer overview — anything that is NOT addressed to a specific recipient \
+(for outgoing correspondence with a recipient, use `typst_letter`; for slides \
+use `typst_presentation`).
+
+You supply a title, an optional subtitle, and the body content. Do NOT ask the \
+user for the logo, colours, or company data — those are baked in. Never tell the \
+user you lack the company logo: it is embedded in this template.
+"""
+output_basename = "onepager"
+
+[[field]]
+name = "title"
+required = true
+description = "The main headline of the one-pager, printed large at the top. Keep it short and punchy (a few words)."
+
+[[field]]
+name = "subtitle"
+required = false
+description = "Optional one-line subheading / tagline under the title (e.g. a short descriptor of what the sheet covers). Leave unset if there is nothing to add."
+
+[[field]]
+name = "body"
+required = true
+description = """
+The one-pager content, as prose paragraphs separated by blank lines (the \
+template handles spacing). Unlike a letter, a one-pager has NO salutation, date, \
+or sign-off — just the content itself; the template supplies the header and \
+footer. Light Markdown is supported and renders in the brand style: \"**bold**\" \
+for emphasis, \"*italic*\" for light emphasis, and ATX headings — \"# Heading\" \
+(large), \"## Heading\" (medium), \"### Heading\" (small), each on its own line — \
+which print in the brand colour. Bullet lists ARE supported here (unlike the \
+letter): start each item line with \"- \" or \"* \"; consecutive item lines \
+become one list. For tabular data (features, prices, comparisons) you MAY use a \
+Markdown-style pipe table — put the whole table in its own block surrounded by \
+blank lines, one row per line, cells wrapped in \"|\", the first line the header, \
+an optional \"| --- | --- |\" separator, then one line per data row, e.g.:\\n\\n| \
+Feature | Included |\\n| --- | --- |\\n| Support | Yes |\\n\\nKeep cell text \
+short."""
+
+[[field]]
+name = "language"
+required = false
+description = """
+Document language for correct typography (hyphenation / justification) only: \
+\"en\" (English, the default) or \"de\" for a German one-pager. It does not \
+translate anything — write the body yourself in whatever language the user \
+asked for; the footer is generic."""
