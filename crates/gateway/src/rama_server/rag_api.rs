@@ -22,6 +22,7 @@ use serde_json::json;
 use crate::rama_server::session::Session;
 use crate::rama_server::state::RamaState;
 use crate::server::db::rag as rag_db;
+use crate::server::db::users;
 
 /// Wire shape returned from every list / get / update response.
 #[derive(Serialize)]
@@ -133,7 +134,7 @@ where
 }
 
 pub async fn list_collections(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    if let Err(resp) = require_session(&state, &req).await {
+    if let Err(resp) = require_admin(&state, &req).await {
         return resp;
     }
     let rows = match rag_db::list_collections(&state.db).await {
@@ -152,7 +153,7 @@ pub async fn get_collection(
     Path(id): Path<i64>,
     req: Request,
 ) -> Response {
-    if let Err(resp) = require_session(&state, &req).await {
+    if let Err(resp) = require_admin(&state, &req).await {
         return resp;
     }
     match rag_db::find_collection_by_id(&state.db, id).await {
@@ -166,7 +167,7 @@ pub async fn get_collection(
 }
 
 pub async fn create_collection(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    if let Err(resp) = require_session(&state, &req).await {
+    if let Err(resp) = require_admin(&state, &req).await {
         return resp;
     }
     let body = match read_json::<CreateRequest>(req).await {
@@ -245,7 +246,7 @@ pub async fn update_collection(
     Path(id): Path<i64>,
     req: Request,
 ) -> Response {
-    if let Err(resp) = require_session(&state, &req).await {
+    if let Err(resp) = require_admin(&state, &req).await {
         return resp;
     }
     let body = match read_json::<UpdateRequest>(req).await {
@@ -359,7 +360,7 @@ pub async fn delete_collection(
     Path(id): Path<i64>,
     req: Request,
 ) -> Response {
-    if let Err(resp) = require_session(&state, &req).await {
+    if let Err(resp) = require_admin(&state, &req).await {
         return resp;
     }
     // Capture every ref's store folder before the cascade delete so we can
@@ -389,7 +390,7 @@ pub async fn reindex_collection(
     Path(id): Path<i64>,
     req: Request,
 ) -> Response {
-    if let Err(resp) = require_session(&state, &req).await {
+    if let Err(resp) = require_admin(&state, &req).await {
         return resp;
     }
     if let Err(err) = rag_db::request_reindex(&state.db, id).await {
@@ -408,15 +409,34 @@ pub async fn reindex_collection(
 
 // ----- helpers ------------------------------------------------------------
 
-async fn require_session(state: &RamaState, req: &Request) -> Result<Session, Response> {
-    match state.sessions.lookup_from_headers(req.headers()).await {
-        Ok(Some(s)) => Ok(s),
-        Ok(None) => Err(unauthorized("no active session — sign in at /auth/login")),
+/// Gate for every `/api/v0/rag/*` handler. The RAG collection registry
+/// is an operator-global resource (no per-row owner — see
+/// `migrations/0013_rag.sql`), so these endpoints are admin-only, exactly
+/// like the HTML surface in `pages::rag_*` which gates on
+/// `require_admin_or_403`. Anonymous → 401 JSON; an authenticated
+/// non-admin → 403 JSON. Returns the session on success.
+async fn require_admin(state: &RamaState, req: &Request) -> Result<Session, Response> {
+    let session = match state.sessions.lookup_from_headers(req.headers()).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Err(unauthorized("no active session — sign in at /auth/login")),
         Err(err) => {
             tracing::warn!(error = %err, "session lookup");
-            Err(internal_error("session lookup failed"))
+            return Err(internal_error("session lookup failed"));
         }
+    };
+    let user = match users::find_by_id(&state.db, &session.user_id).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return Err(unauthorized("session references a missing user")),
+        Err(err) => {
+            tracing::warn!(error = %err, "user lookup");
+            return Err(internal_error("user lookup failed"));
+        }
+    };
+    let role_ids = state.rbac.role_ids_for(&user.roles);
+    if !state.rbac.is_admin(&role_ids) {
+        return Err(forbidden("admin role required"));
     }
+    Ok(session)
 }
 
 async fn read_json<T: for<'de> Deserialize<'de>>(req: Request) -> Result<T, Response> {
@@ -457,6 +477,9 @@ fn invalid_request(message: &str) -> Response {
 }
 fn unauthorized(message: &str) -> Response {
     error_envelope(StatusCode::UNAUTHORIZED, "unauthorized", message)
+}
+fn forbidden(message: &str) -> Response {
+    error_envelope(StatusCode::FORBIDDEN, "forbidden", message)
 }
 fn internal_error(message: &str) -> Response {
     error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)

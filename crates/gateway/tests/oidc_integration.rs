@@ -267,10 +267,20 @@ async fn full_oidc_dance_completes_and_stamps_the_session() {
         .mount(&idp)
         .await;
 
-    // 4. Hit /auth/callback with the matching code + state.
+    // 4. Hit /auth/callback with the matching code + state, carrying the
+    // browser-binding cookie that /auth/login set (value == state). The
+    // callback now rejects any request whose `gw_oidc` cookie doesn't
+    // match `state`, so the flow must echo it back.
     let callback_uri = format!("/auth/callback?code=test-code&state={csrf}");
     let resp = app
-        .serve(common::req(Method::GET, &callback_uri))
+        .serve(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&callback_uri)
+                .header("cookie", format!("gw_oidc={csrf}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = resp.status();
@@ -293,21 +303,20 @@ async fn full_oidc_dance_completes_and_stamps_the_session() {
         "callback must honour the stored return_to; body = {body}"
     );
 
-    // 5. Re-run the callback request to grab the Set-Cookie header (the
-    // previous response was consumed by read_body in the error branch).
-    // Pull the cookie out of the original response headers.
+    // 5. Replay the *same* state + binding cookie. The pending row is
+    // single-use, so the first callback deleted it and this must now 400
+    // — confirms the row is consumed (not merely that a bad state fails).
     let resp = app
         .serve(
             Request::builder()
                 .method(Method::GET)
-                .uri(format!("/auth/callback?code=test-code-2&state={csrf}-2"))
+                .uri(format!("/auth/callback?code=test-code-2&state={csrf}"))
+                .header("cookie", format!("gw_oidc={csrf}"))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    // The second call uses a state that doesn't exist (single-use row
-    // was deleted by the first call) — confirms the row is consumed.
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     // 6. Confirm the user landed in the DB with the right claims.
@@ -361,13 +370,247 @@ async fn callback_without_pending_state_is_400() {
     let state = state_with_oidc(&idp.uri(), Some("groups")).await;
     let app = router(Arc::new(state));
 
-    // No /auth/login first — the pending_logins table is empty.
+    // No /auth/login first — the pending_logins table is empty. Send a
+    // matching binding cookie so we exercise the pending-absence path
+    // (not the browser-binding check, which is covered separately).
+    let resp = app
+        .serve(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/auth/callback?code=x&state=does-not-exist")
+                .header("cookie", "gw_oidc=does-not-exist")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn callback_without_matching_binding_cookie_is_rejected() {
+    // Regression for login-CSRF / session fixation: even with a valid,
+    // in-flight `state`, a callback arriving in a *different* browser
+    // (no binding cookie, or a mismatched one) must be rejected before
+    // any token exchange, and must NOT consume the legit pending row.
+    let private_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let public_key = RsaPublicKey::from(&private_key);
+    let idp = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": idp.uri(),
+            "authorization_endpoint": format!("{}/auth", idp.uri()),
+            "token_endpoint": format!("{}/token", idp.uri()),
+            "jwks_uri": format!("{}/jwks", idp.uri()),
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        })))
+        .mount(&idp)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "keys": [jwk_for(&public_key)]
+        })))
+        .mount(&idp)
+        .await;
+
+    let state = state_with_oidc(&idp.uri(), Some("groups")).await;
+    let app = router(Arc::new(state.clone()));
+
+    // Start a real login so a valid pending row exists.
+    let resp = app
+        .serve(common::req(Method::GET, "/auth/login"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let csrf: String = sqlx::query_scalar("SELECT state FROM pending_logins LIMIT 1")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+
+    // Valid state, but NO binding cookie (attacker feeds it to a victim
+    // browser that never started this login) → rejected.
     let resp = app
         .serve(common::req(
             Method::GET,
-            "/auth/callback?code=x&state=does-not-exist",
+            &format!("/auth/callback?code=test-code&state={csrf}"),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Valid state, but a *mismatched* binding cookie → also rejected.
+    let resp = app
+        .serve(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/auth/callback?code=test-code&state={csrf}"))
+                .header("cookie", "gw_oidc=some-other-browser")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The rejected attempts must not have consumed the legit pending row.
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_logins")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining, 1,
+        "a rejected CSRF callback must not burn the user's in-flight login"
+    );
+}
+
+#[tokio::test]
+async fn cli_login_requires_explicit_approval_before_minting_a_token() {
+    // F2 regression: completing the browser OIDC leg of a `gw auth login`
+    // must NOT stage a token. Only an explicit POST /auth/cli/approve does.
+    // This is what stops a phished victim (who merely finishes the login)
+    // from handing a token to whoever initiated the CLI flow.
+    let private_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let public_key = RsaPublicKey::from(&private_key);
+    let idp = MockServer::start().await;
+    let issuer = idp.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/auth"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        })))
+        .mount(&idp)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"keys": [jwk_for(&public_key)]})),
+        )
+        .mount(&idp)
+        .await;
+
+    let state = state_with_oidc(&issuer, Some("groups")).await;
+    let app = router(Arc::new(state.clone()));
+
+    // 1. CLI starts the flow (challenge value is irrelevant to this path).
+    let resp = app
+        .serve(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/cli/start")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"pkce_challenge":"dummy-challenge"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let start: serde_json::Value = serde_json::from_slice(&common::read_body(resp).await).unwrap();
+    let cli_state = start["state"].as_str().unwrap().to_string();
+
+    // 2. Browser hits /auth/login?cli_state=… (what /auth/cli/begin 303s to).
+    let resp = app
+        .serve(common::req(
+            Method::GET,
+            &format!("/auth/login?cli_state={cli_state}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let (oidc_state, nonce, stored_cli): (String, String, Option<String>) =
+        sqlx::query_as("SELECT state, nonce, cli_state FROM pending_logins LIMIT 1")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(stored_cli.as_deref(), Some(cli_state.as_str()));
+
+    // 3. Mount the token endpoint now that we know the nonce.
+    let id_token = sign_id_token(&private_key, &issuer, CLIENT_ID, &nonce);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "test-access",
+            "id_token": id_token,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        })))
+        .mount(&idp)
+        .await;
+
+    // 4. Complete the callback (with the browser-binding cookie). This must
+    // render the consent page — NOT mint a token.
+    let resp = app
+        .serve(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/auth/callback?code=test-code&state={oidc_state}"))
+                .header("cookie", format!("gw_oidc={oidc_state}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let consent = String::from_utf8(common::read_body(resp).await.to_vec()).unwrap();
+
+    let staged: Option<String> =
+        sqlx::query_scalar("SELECT token_plain FROM cli_logins WHERE state = ?")
+            .bind(&cli_state)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert!(staged.is_none(), "callback alone must not stage a token");
+    let token_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tokens")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(token_count, 0, "callback alone must not mint a token");
+
+    // 5. User authorizes. Pull the signed approval out of the consent page.
+    let approval = consent
+        .split("name=\"approval\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("consent page carries an approval token")
+        .to_string();
+    let resp = app
+        .serve(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/cli/approve")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(format!("approval={approval}")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Now exactly one token exists and is staged for the CLI to poll.
+    let staged: Option<String> =
+        sqlx::query_scalar("SELECT token_plain FROM cli_logins WHERE state = ?")
+            .bind(&cli_state)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert!(staged.is_some(), "approval must stage the token for pickup");
+    let token_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tokens")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(token_count, 1, "approval must mint exactly one token");
+    let owner: String = sqlx::query_scalar("SELECT user_id FROM tokens LIMIT 1")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(owner, SUBJECT, "token belongs to the authenticated subject");
 }
