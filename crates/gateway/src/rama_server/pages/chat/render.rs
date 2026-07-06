@@ -633,7 +633,12 @@ fn render_capabilities_inner(base: &str, caps: &[CapabilityRow]) -> Html {
                         // visible while the list scrolls.
                         div(style: "max-height:52vh; overflow-y:auto; scrollbar-gutter:stable") {
                             div(
-                                "data-show": "$capQuery === ''",
+                                // Drive `display` reactively via the style
+                                // plugin, NOT `data-show`: on re-show datastar's
+                                // `show` does `removeProperty("display")`, which
+                                // would drop the `flex` below and revert the row
+                                // to `display:block` (breaking the layout).
+                                "data-style-display": "$capQuery === '' ? 'flex' : 'none'",
                                 class: "bg-base-100",
                                 style: (format!(
                                     "position:sticky; top:0; z-index:1; display:flex; \
@@ -754,7 +759,13 @@ fn render_cap_section(base: &str, group: &'static str, rows: &[&CapabilityRow]) 
             // Heading row: a collapse button on the left, the aggregate pill on
             // the right (a sibling, so its clicks don't trip the collapse).
             div(
-                "data-show": "$capQuery === ''",
+                // Drive `display` reactively via the style plugin, NOT
+                // `data-show`: on re-show datastar's `show` does
+                // `removeProperty("display")`, dropping the `flex` here and
+                // reverting to `display:block` — the block-level `flex` collapse
+                // button then fills the row and shoves the aggregate pill onto a
+                // second line.
+                "data-style-display": "$capQuery === '' ? 'flex' : 'none'",
                 style: (format!("display:flex; align-items:center; gap:0.4rem; padding:0.1rem {ROW_PAD_X} 0.1rem 0.2rem"))
             ) {
                 button(
