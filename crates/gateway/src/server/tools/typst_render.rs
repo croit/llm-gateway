@@ -256,7 +256,7 @@ async fn render_and_attach(
         .into_iter()
         .map(|(k, v)| (k, apply_replacements(&v, &reps)))
         .collect();
-    let render_data = apply_reps_to_value(data, &reps)?;
+    let mut render_data = apply_reps_to_value(data, &reps)?;
 
     // With staged images, compile against a temp root = a copy of the template
     // dir + the staged files, so `image("uploads/…")` resolves alongside the
@@ -267,25 +267,47 @@ async fn render_and_attach(
     } else {
         Some(build_staging_root(&template.root, &staged)?)
     };
-    let rendered = typst::compile(
-        template,
-        &inputs,
-        preview_page,
-        staging.as_ref().map(|d| d.path()),
-    )
-    .await
-    .map_err(|e| {
-        // Compile errors become InvalidArgs so the model is nudged to
-        // fix its input — typst's stderr usually names the offending
-        // line / variable.
-        use typst::CompileError;
-        match e {
-            CompileError::Failed(msg) => {
-                ToolError::InvalidArgs(format!("typst compile failed:\n{msg}"))
+    let staging_path = staging.as_ref().map(|d| d.path());
+
+    // Compile. If it fails on the unescaped-`@` signature — Typst reads an
+    // email/@-handle as a cross-reference and the WHOLE render crashes, by far
+    // the most common failure and the one the tool descriptions warn hardest
+    // about — escape the stray `@`s and recompile ONCE. On success we adopt the
+    // escaped content for every downstream consumer (the `.json` edit base, the
+    // pptx bundle, the chips) so a later `_edit` stays consistent, and note the
+    // fix-up in the result so the model can spot the rare collateral (a `@` in a
+    // raw, non-markup field picking up a stray backslash). Any other failure —
+    // and a retry that still fails — surfaces the ORIGINAL stderr unchanged, so
+    // the model sees the real problem and iterates. Compile errors map to
+    // InvalidArgs (nudge the model to fix its input); other errors to Failed.
+    let mut auto_escaped: usize = 0;
+    let mut edit_base_escaped: Option<Value> = None;
+    let compile_failed =
+        |msg: String| ToolError::InvalidArgs(format!("typst compile failed:\n{msg}"));
+    let rendered = match typst::compile(template, &inputs, preview_page, staging_path).await {
+        Ok(r) => r,
+        Err(typst::CompileError::Failed(msg)) if is_unescaped_at_error(&msg) => {
+            let (esc_render, n) = escape_unescaped_ats(&render_data);
+            if n == 0 {
+                // Signature matched but there was no unescaped `@` to fix
+                // (some other unresolved reference) — don't retry blindly.
+                return Err(compile_failed(msg));
             }
-            other => ToolError::Failed(other.to_string()),
+            let esc_inputs = inputs_from_data(template, &esc_render)?;
+            match typst::compile(template, &esc_inputs, preview_page, staging_path).await {
+                Ok(r) => {
+                    let (esc_base, _) = escape_unescaped_ats(data);
+                    edit_base_escaped = Some(esc_base);
+                    render_data = esc_render;
+                    auto_escaped = n;
+                    r
+                }
+                Err(_) => return Err(compile_failed(msg)),
+            }
         }
-    })?;
+        Err(typst::CompileError::Failed(msg)) => return Err(compile_failed(msg)),
+        Err(other) => return Err(ToolError::Failed(other.to_string())),
+    };
 
     // Same-turn dedup, race-safe across concurrent tool calls: a second
     // typst call (or a sibling `upload_attachment` claiming e.g.
@@ -316,7 +338,10 @@ async fn render_and_attach(
     let pptx_name = format!("{base}.pptx");
     let docx_name = format!("{base}.docx");
 
-    let data_bytes = serialize_data(data);
+    // Persist the escaped variant as the edit base when the auto-escape retry
+    // fired, so a later `_edit`/`_read` sees exactly what rendered (and doesn't
+    // re-crash on the same `@`); otherwise store the model's data untouched.
+    let data_bytes = serialize_data(edit_base_escaped.as_ref().unwrap_or(data));
 
     // Keep the PDF bytes for the docx conversion (the upload below moves
     // `rendered.pdf`). Only clone when a docx export is actually wired.
@@ -463,6 +488,16 @@ async fn render_and_attach(
     } else if let Some(err) = docx_error {
         result["docx_error"] = json!(format!(
             "Editable .docx export failed (PDF/preview are fine): {err}"
+        ));
+    }
+    if auto_escaped > 0 {
+        result["auto_escaped"] = json!(format!(
+            "The render first failed because {auto_escaped} unescaped '@' \
+             character(s) were read as Typst cross-references; I escaped them \
+             (\\@) and re-rendered successfully. Check the preview: if a '@' now \
+             shows a stray backslash (e.g. in a title or other non-markup \
+             field), call this template's `_edit` tool to fix just that text. \
+             Escape '@' yourself next time to avoid the retry.",
         ));
     }
     Ok(result)
@@ -1428,6 +1463,82 @@ fn replace_in_strings(v: &mut Value, find: &str, replace: &str) -> usize {
     }
 }
 
+/// Does `stderr` carry the Typst "unescaped `@`" signature? An unescaped `@`
+/// in a markup field is read as a cross-reference (`@label`), and when that
+/// label doesn't exist Typst fails the whole compile with
+/// ``label `<…>` does not exist in the document``. This is the single most
+/// common render crash (every unescaped email / @-handle) and the one we
+/// auto-fix via [`escape_unescaped_ats`] + a one-shot recompile. Matched on
+/// the stable tail of that message rather than the label name.
+fn is_unescaped_at_error(stderr: &str) -> bool {
+    stderr.contains("does not exist in the document")
+}
+
+/// Escape every UNescaped `@` (→ `\@`) in one string, returning the rewritten
+/// string and how many were escaped. An `@` already preceded by a backslash is
+/// left alone, so re-running over already-escaped text is a no-op (idempotent).
+fn escape_unescaped_ats_str(s: &str) -> (String, usize) {
+    let mut out = String::with_capacity(s.len() + 4);
+    // Whether the NEXT character is currently escaped by a preceding backslash.
+    // Toggling on `\` (rather than a flat "prev was backslash") makes `\\@`
+    // correctly count as an escaped-backslash followed by a bare `@`.
+    let mut escaped = false;
+    let mut n = 0;
+    for c in s.chars() {
+        if c == '@' && !escaped {
+            out.push('\\');
+            out.push('@');
+            n += 1;
+            escaped = false;
+        } else {
+            out.push(c);
+            escaped = c == '\\' && !escaped;
+        }
+    }
+    (out, n)
+}
+
+/// Recursively escape unescaped `@` in every string *value* of a JSON document
+/// (object values and array elements; keys untouched), returning the rewritten
+/// value and the total escaped. Operating on the parsed [`Value`] — not the raw
+/// `--input` text — is what keeps the presentation's `deck` JSON valid: serde
+/// re-serializes the `\@` we insert as the JSON escape `\\@`, so `json()` still
+/// parses, while the string the template `eval`s as markup now carries a
+/// literal `@`. The auto-fix paired with [`is_unescaped_at_error`].
+fn escape_unescaped_ats(v: &Value) -> (Value, usize) {
+    match v {
+        Value::String(s) => {
+            let (out, n) = escape_unescaped_ats_str(s);
+            (Value::String(out), n)
+        }
+        Value::Array(a) => {
+            let mut n = 0;
+            let out = a
+                .iter()
+                .map(|x| {
+                    let (v, k) = escape_unescaped_ats(x);
+                    n += k;
+                    v
+                })
+                .collect();
+            (Value::Array(out), n)
+        }
+        Value::Object(m) => {
+            let mut n = 0;
+            let out = m
+                .iter()
+                .map(|(k, x)| {
+                    let (v, c) = escape_unescaped_ats(x);
+                    n += c;
+                    (k.clone(), v)
+                })
+                .collect();
+            (Value::Object(out), n)
+        }
+        other => (other.clone(), 0),
+    }
+}
+
 /// Walk the manifest's declared fields, pull each one out of `args`,
 /// type-check it, and stringify it for `typst --input k=v`. Unknown
 /// fields in `args` are rejected (the schema declares
@@ -1923,6 +2034,75 @@ mod tests {
         assert_eq!(v["theme"], "dark");
         // No match → zero, unchanged.
         assert_eq!(replace_in_strings(&mut v, "nope", "x"), 0);
+    }
+
+    // --- auto-escape-on-`@` retry -----------------------------------------
+
+    #[test]
+    fn escape_unescaped_ats_str_handles_emails_and_idempotency() {
+        // The dominant case: a bare email gets its `@` escaped, once.
+        assert_eq!(
+            escape_unescaped_ats_str("john@acme.com"),
+            ("john\\@acme.com".to_string(), 1)
+        );
+        // Already escaped → left alone (idempotent, so re-running is a no-op).
+        assert_eq!(
+            escape_unescaped_ats_str("john\\@acme.com"),
+            ("john\\@acme.com".to_string(), 0)
+        );
+        // Multiple bare `@` → each escaped.
+        assert_eq!(
+            escape_unescaped_ats_str("a@b@c"),
+            ("a\\@b\\@c".to_string(), 2)
+        );
+        // An escaped backslash (`\\`) does NOT escape a following `@` — the two
+        // backslashes cancel, so the `@` is bare and must be escaped.
+        assert_eq!(
+            escape_unescaped_ats_str("\\\\@x"),
+            ("\\\\\\@x".to_string(), 1)
+        );
+        // No `@` → untouched.
+        assert_eq!(
+            escape_unescaped_ats_str("plain text"),
+            ("plain text".to_string(), 0)
+        );
+    }
+
+    #[test]
+    fn escape_unescaped_ats_walks_nested_values_and_stays_valid_json() {
+        // Mirrors the presentation case: the deck is a nested object with `@`
+        // inside a markup field AND a raw title. Both string values get the
+        // `@` escaped (the count is the total), keys and numbers are untouched.
+        let v = json!({
+            "deck": {
+                "slides": [{"body": "ping me @ a@b.com", "title": "Sync @ 5"}],
+                "count": 3
+            }
+        });
+        let (out, n) = escape_unescaped_ats(&v);
+        assert_eq!(n, 3, "two in body + one in title");
+        assert_eq!(out["deck"]["slides"][0]["body"], "ping me \\@ a\\@b.com");
+        assert_eq!(out["deck"]["slides"][0]["title"], "Sync \\@ 5");
+        assert_eq!(out["deck"]["count"], 3); // number untouched
+        // The whole point of escaping at the Value layer: re-serializing to the
+        // `deck=<json>` --input string stays valid JSON (serde emits `\\@`), so
+        // typst's `json()` still parses it and the eval'd markup sees `\@`.
+        let s = serde_json::to_string(&out).unwrap();
+        let reparsed: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            reparsed["deck"]["slides"][0]["body"],
+            "ping me \\@ a\\@b.com"
+        );
+    }
+
+    #[test]
+    fn is_unescaped_at_error_matches_only_the_label_signature() {
+        assert!(is_unescaped_at_error(
+            "error: label `<acme.com>` does not exist in the document"
+        ));
+        // Unrelated compile failures must NOT trigger the escape-retry.
+        assert!(!is_unescaped_at_error("error: unknown variable: foo"));
+        assert!(!is_unescaped_at_error("error: expected expression"));
     }
 
     #[test]

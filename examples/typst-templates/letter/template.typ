@@ -109,6 +109,36 @@
 #set text(font: "Urbanist", size: 11pt, fill: ink, lang: lang)
 #set par(justify: true, leading: 0.7em, spacing: 1.15em)
 
+// ---- Brand styling for the body's native Typst elements --------------------
+// The body is rendered with eval(mode: "markup") below; these rules make
+// Typst's own headings / links / quotes / lists / tables come out in the sample
+// brand automatically, so the model just writes plain Typst markup and never
+// sets colours itself. Swap the colours for your own.
+#let heading-sizes = (14pt, 12.5pt, 11.5pt)
+#show heading: it => {
+  set text(fill: c-primary, weight: "bold", size: heading-sizes.at(calc.min(it.level, 3) - 1))
+  block(above: if it.level == 1 { 4mm } else { 3mm }, below: 2mm, it.body)
+}
+#show link: it => underline(text(fill: c-primary, it))
+#show quote.where(block: true): it => block(
+  width: 100%, above: 8pt, below: 8pt,
+  inset: (left: 12pt, top: 4pt, bottom: 4pt),
+  stroke: (left: 3pt + c-primary),
+  it.body,
+)
+#set enum(numbering: n => text(fill: c-primary, weight: 600)[#n.])
+#set list(marker: (text(fill: c-primary)[•], text(fill: c-primary)[‣], text(fill: c-primary)[·]))
+// Tables the model writes with #table(...) get the sample look (brand header
+// row, light zebra body, hairline rules). Works with or without table.header.
+#set table(
+  inset: (x: 8pt, y: 5pt), align: left + horizon,
+  stroke: (y: 0.5pt + rgb("#DCE4F7")),
+  fill: (_, row) => if row == 0 { c-primary } else if calc.odd(row) { rgb("#EFF4FE") } else { white },
+)
+#show table.cell: it => if it.y == 0 {
+  text(fill: white, weight: "semibold", it)
+} else { it }
+
 // ---- DIN 5008 fold + hole marks (~8mm from the sheet edge) -----------------
 #let mark(y, len) = place(top + left, dx: -17mm, dy: y, line(length: len, stroke: 0.4pt + muted))
 #mark(87mm - 18mm, 4mm) // upper fold
@@ -206,10 +236,10 @@
   let fallback = if lang == "de" { "Sehr geehrte Damen und Herren," } else { "Dear Sir or Madam," }
   paras = (fallback,) + paras
 }
-#for block in paras {
-  block.replace("\n", " ")
-  parbreak()
-}
+// Render the body as native Typst markup: *bold*, _italic_, `= headings`,
+// `- ` / `+ ` lists, #link(...), #table(...) all style themselves via the show
+// rules above. Paragraphs stay blank-line separated; a lone newline is a space.
+#eval(paras.join("\n\n"), mode: "markup")
 
 #v(5mm)
 

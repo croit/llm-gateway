@@ -1,0 +1,148 @@
+id = "presentation"
+# Human-readable label for the tool menu's "Document templates" section
+# (optional; falls back to the prettified id). Distinct from `description`,
+# which is written for the model.
+title = "Slide deck"
+description = """
+Render a branded slide deck (16:9 PDF) in the sample house style — Urbanist \
+type, dark/white surfaces, the brand gradient, glass cards, the logo. The deck \
+is built from a SEQUENCE OF SLIDES; you pick a `layout` per \
+slide and fill its fields, and the renderer applies all branding automatically. \
+You never write Typst layout code — you fill the `deck` JSON; only a few prose \
+fields take lightweight Typst markup (see MARKUP & ESCAPING below).
+
+Before you build the deck, plan the narrative: a typical deck opens with a \
+`cover`, may use `agenda`, groups content with `section` dividers, carries the \
+message on `content`/`split`/`cards`/`stats`/`comparison`/`process`/`bignumber`/ \
+`quote`/`media`/`gallery`/`timeline`/`logos`/`team`/`table`/`diagram`, and ends \
+with `closing`. ONE idea per slide. Keep it tight: ≤6 bullets, ≤4 cards/stats \
+per row, ≤6 process steps, ≤8 table rows (there is NO auto-pagination — content \
+that overflows the slide height is simply cut off, so split long material across \
+several slides).
+
+THE `deck` FIELD IS A SINGLE JSON OBJECT (as a string):
+  {
+    "deck_title": "Example Corp — Product Overview",   // shown in every footer
+    "footer_left": "example.com",                       // optional, defaults example.com
+    "theme": "dark",                                  // "dark" (default) or "light"
+    "slides": [ { "layout": "...", ... }, ... ]
+  }
+
+THEME: set it ONCE at the top (`"theme"`). Dark = anthracite background, white \
+text, white logo. Light = white background, anthracite text, black logo. Do NOT \
+mix — every slide uses the deck theme (a lone white slide in a dark deck looks \
+like a mistake). Every layout renders identically in both themes.
+
+GLOBAL OPTIONAL KEYS on any content slide: `kicker` (a short ALL-CAPS section \
+label shown top-right). Footer + slide number are added automatically.
+
+LAYOUTS AND THEIR FIELDS (✱ = required):
+• cover — title slide. eyebrow?, title✱, title_line_2?, subtitle?, presenter?, role?, date?, bg_image?
+• agenda — title?, items✱[{label✱, note?}] (2–8)
+• section — divider. number?, title✱, summary?, bg_image?
+• content — workhorse text. title✱, subtitle?, tags? (array of short strings → a row of pill badges under the subtitle), and ONE of body (prose, blank-line-separated paragraphs) OR bullets[] (≤6, one line each)
+• split — two columns. title✱, left_body?, left_bullets[]?, right_kind ("text"|"code"|"image"), right✱ (payload for that kind — text, code, or image path), frame? (true → wrap an image right side in a browser/device frame)
+• cards — glass cards. title✱, card_style? ("glass" default | "gradient" = gradient-border cards), cards✱[{title✱, body✱, icon?, image?, link?}] (2–4). icon = the NAME of a built-in outline icon (one of: server, activity, trending-up, shield, database, bell, users, zap, cloud, lock, layers, clock, gauge, globe, rocket, check-circle, arrow-up-right) — rendered outline-only, white on dark / anthracite on light, per CI. image = a top banner photo (overrides icon). link = inline "learn more ↗" text at the card bottom (example.com product-card style).
+• stats — big numbers (centred, no cards). title✱, stats✱[{value✱, label✱, note?}] (2–4)
+• dashboard — a metrics dashboard: a row of glass metric CARDS, each with a label, a big gradient value, an optional trend and an optional sparkline. title✱, cards✱[{value✱, label✱, trend?, spark?}] (2–4). `value` = the metric (e.g. "99.98%", "1.24 PB"). `trend` = a SIGNED delta string ("+18%", "-2.1pt") — a leading "+" renders green, "-" renders peach, so choose the sign to match sentiment. `spark` = an array of ≥2 numbers drawn as a mini trend line at the card bottom. Prefer this over pasting a dashboard SCREENSHOT: it renders real numbers natively (crisp, on-brand, editable in the pptx export). Use `stats` instead when you only have bare figures with no trend/series.
+• comparison — title✱, left✱{heading✱, points✱[]}, right✱{heading✱, points✱[]}, highlight ("left"|"right", default right; the highlighted side gets the gradient border)
+• process — horizontal steps. title✱, steps✱[{label✱, detail?}] (2–6)
+• bignumber — one hero metric. value✱, title✱, body?
+• quote — quote✱, attribution✱, attribution_role?, style? ("default" = left, gradient text | "hero" = big white centred quote, the example.com hero look)
+• media — image showcase. image? (omit → gradient + centred statement), frame? (true → centred screenshot inside a browser/device frame instead of full-bleed), title✱, caption?
+• gallery — image grid. title✱, items✱[{image?, caption?}], per_row (default 3). Omitted image → gradient tile.
+• timeline — vertical roadmap. title✱, milestones✱[{label✱, date?, detail?}]
+• logos — "trusted by" wall. title✱, logos✱[strings], per_row (default 4)
+• team — title✱, people✱[{name✱, role✱, avatar?}] (2–6)
+• table — title✱, columns✱[strings], rows✱[[strings]] (each row MUST have one cell per column). Best on its own; ≤8 rows.
+• diagram — flow. title✱, nodes✱[{label✱}], legend?
+• statement — big centred line. title✱, eyebrow?, subtitle?, bg_image?, buttons?
+• cta-panel — full-width brand-gradient callout band on a dark slide. kicker?, title✱, body?, buttons? (defaults to light+outline styles)
+• closing — end/CTA. headline?, subline?, cta_label?, contact_name?, contact_email?, buttons?
+
+BUTTONS: cover, statement, cta-panel and closing accept a `buttons` array — each \
+entry is either a string or {label✱, style?}. Styles mirror example.com: "primary" \
+(gradient pill, white text — use on dark), "light" (white pill, purple text — use \
+on the gradient panel), "outline" (transparent pill, white border — secondary). \
+All render a pill with the ↗ arrow. `cta_label` is the single-button shortcut.
+
+IMAGES: any image/avatar/bg_image/banner field takes EITHER (a) a file path \
+string (PNG/JPEG/SVG) resolved relative to the template root — e.g. \
+"assets/img/photo.png", if you add your own images under the template dir — OR \
+(b) an `att:<turn>/<file>` ref that `fetch_attachment` \
+returned in its `image_refs` for an image it pulled out of a document you were \
+given. Copy that ref string VERBATIM into the field; the renderer fetches the \
+real pixels and stages them automatically (do NOT invent a path for an uploaded \
+image, and do NOT paste base64 — you cannot embed pixels in JSON). So when you \
+rebuild an uploaded deck as branded slides, carry each source image over by \
+dropping its `att:` ref into the matching slide's image field. \
+Omitting an image always yields a clean gradient fallback, never a broken slide. \
+BACKGROUNDS: this sample ships NO background art, so cover, section and \
+statement render on the plain themed background by default; closing uses a full \
+brand-gradient background. To use your own, set `bg_image` to an image path \
+(text and logo turn white over it automatically); set `bg_image` to "none" to \
+force the plain background. Content-type slides always stay on the flat themed \
+background. The brand gradient direction is set in the template.
+
+COPY RULES: Headlines short, action-oriented, headline case; body sentence \
+case; kickers/section labels ALL CAPS. Warm, confident, "we" voice — no stiff \
+corporate jargon.
+
+MARKUP & ESCAPING — applies to the PROSE fields ONLY: `content` body, `content` \
+bullets[], `cards[].body`, `split` left_body, and `split` left_bullets[]. Those \
+five are rendered as native Typst markup (NOT Markdown); the renderer styles \
+them in the brand automatically, so write plain Typst: inline emphasis \"*bold*\" \
+with SINGLE asterisks (not **double**) and \"_italic_\" with SINGLE underscores; \
+a line \"- item\" / \"+ item\" for a bullet / numbered list (but prefer the \
+dedicated `bullets` array); a link \"#link(\"https://example.com\")[example.com]\". \
+Separate paragraphs in a `body` with a blank line. EVERY OTHER field (titles, \
+subtitles, eyebrows, kickers, quotes, attributions, stats values/labels, table \
+cells, `split` right text, buttons, captions, agenda/timeline/process labels) is \
+PLAIN TEXT — write it literally, with NO markup and NO escaping. \
+ESCAPING, in the five prose fields ONLY — MANDATORY: because they are real \
+Typst, five characters start Typst syntax and MUST each be preceded by a \
+backslash EVERY time they appear as ordinary text, or the WHOLE deck fails to \
+render (you get no slides at all, not just a wrong character): \
+(1) \"@\" is THE most common trap — EVERY email address and @-handle must be \
+escaped: write \"john\\@acme.com\", NEVER \"john@acme.com\"; an unescaped @ is \
+read as a cross-reference and always crashes the render. \
+(2) \"*\" — write \"5 \\* 3\". (3) \"#\" — write \"C\\#\", \"issue \\#42\". \
+(4) \"$\" — write \"\\$5,000\", or spell it \"USD 5,000\". (5) the backtick \"`\" \
+— escape it unless you deliberately want inline code. You do NOT need to escape \
+underscores inside words/file names (my_var, config.txt), nor the characters \
+% & [ ] < >. A backslash prints nothing itself; it just makes the next \
+character literal. (In every OTHER field these characters print literally as-is \
+— do not add backslashes there.)
+"""
+output_basename = "presentation"
+
+# Editable PowerPoint export (via the code sandbox + typ2pptx). The deck
+# content lives in the `deck` field; it is written to `deck.json`, which this
+# template reads by default, then compiled to an editable .pptx. `font` is
+# stamped onto the text runs (typ2pptx misclassifies Urbanist as monospace);
+# Urbanist is a Google Font, so Google Slides renders it correctly on import.
+[pptx]
+data_field = "deck"
+data_file = "deck.json"
+font = "Urbanist"
+
+[[field]]
+name = "deck"
+required = true
+description = """
+The entire presentation as a JSON object (passed as a string). Top-level keys: \
+`deck_title` (string, shown in footers), `footer_left` (optional, default \
+"example.com"), `theme` ("dark" default | "light", applied to the WHOLE deck), and \
+`slides` (an array of slide objects). Each slide has a `layout` plus that \
+layout's fields — see the full layout/field catalogue in this manifest's \
+description. Build the slide sequence to tell one clear story, one idea per \
+slide, and do not overflow a slide (no auto-pagination)."""
+
+[[field]]
+name = "theme"
+required = false
+description = """
+Optional override of the deck-wide theme: "dark" (default) or "light". Normally \
+leave this UNSET and set `"theme"` inside the `deck` JSON instead; this exists \
+only to re-render the same deck in the other theme without editing the content. \
+Dark = anthracite surfaces + white logo; light = white surfaces + black logo."""

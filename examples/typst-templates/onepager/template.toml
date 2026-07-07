@@ -33,20 +33,37 @@ description = "Optional one-line subheading / tagline under the title (e.g. a sh
 name = "body"
 required = true
 description = """
-The one-pager content, as prose paragraphs separated by blank lines (the \
-template handles spacing). Unlike a letter, a one-pager has NO salutation, date, \
-or sign-off — just the content itself; the template supplies the header and \
-footer. Light Markdown is supported and renders in the brand style: \"**bold**\" \
-for emphasis, \"*italic*\" for light emphasis, and ATX headings — \"# Heading\" \
-(large), \"## Heading\" (medium), \"### Heading\" (small), each on its own line — \
-which print in the brand colour. Bullet lists ARE supported here (unlike the \
-letter): start each item line with \"- \" or \"* \"; consecutive item lines \
-become one list. For tabular data (features, prices, comparisons) you MAY use a \
-Markdown-style pipe table — put the whole table in its own block surrounded by \
-blank lines, one row per line, cells wrapped in \"|\", the first line the header, \
-an optional \"| --- | --- |\" separator, then one line per data row, e.g.:\\n\\n| \
-Feature | Included |\\n| --- | --- |\\n| Support | Yes |\\n\\nKeep cell text \
-short."""
+The one-pager content. Unlike a letter, a one-pager has NO salutation, date, or \
+sign-off — just the content itself; the template supplies the header and footer. \
+Separate paragraphs with a blank line. \
+The body is rendered as native Typst markup (NOT Markdown); the template styles \
+it in the sample brand automatically, so just write plain Typst: \
+Inline emphasis — \"*bold*\" with SINGLE asterisks (not **double**) and \
+\"_italic_\" with SINGLE underscores. Headings, each on its own line — \
+\"= Heading\" (large), \"== Heading\" (medium), \"=== Heading\" (small) — print \
+in the brand colour. Lists — a line \"- item\" for a bullet or \"+ item\" for a \
+numbered list; indent two spaces to nest. A pull-quote: \
+\"#quote(block: true)[the quoted sentence]\" on its own line. A link: \
+\"#link(\"https://example.com\")[example.com]\". For tabular data (features, \
+prices, comparisons) write ONE Typst table call: #table with a columns count and \
+one \"[cell]\" per cell, left-to-right, the first row of cells being the header \
+(styled automatically), e.g. \"#table(columns: 2, [Feature], [Included], \
+[Support], [Yes], [Onboarding], [Yes])\". Keep cell text short. \
+ESCAPING LITERAL SYMBOLS — MANDATORY, READ CAREFULLY. Because the body is real \
+Typst, five characters start Typst syntax and MUST each be preceded by a \
+backslash EVERY time they appear as ordinary text — otherwise the WHOLE page \
+fails to render (you get no document at all, not just a wrong character): \
+(1) \"@\" is THE most common trap — EVERY email address and @-handle must be \
+escaped: write \"john\\@acme.com\", NEVER \"john@acme.com\"; write \"\\@team\". \
+An unescaped @ is read as a cross-reference and always crashes the render. \
+(2) \"*\" — write \"5 \\* 3\" or \"cost \\* units\" (a stray * crashes too). \
+(3) \"#\" — write \"C\\#\", \"issue \\#42\". \
+(4) \"$\" — write \"\\$5,000\", or just spell it \"USD 5,000\" / \"EUR 5,000\". \
+(5) the backtick \"`\" — escape it unless you deliberately want inline code. \
+You do NOT need to escape underscores inside words or file names (my_var, \
+config.txt render fine), nor the characters % & [ ] < > — those already print \
+literally, so do not clutter the text with needless backslashes. Only escape a \
+lone _ or * that you want to show as a literal symbol between spaces."""
 
 [[field]]
 name = "language"

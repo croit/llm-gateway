@@ -95,6 +95,48 @@ async fn compiles_example_letter_template() {
     assert_eq!(rendered.source, on_disk);
 }
 
+/// The presentation example is discoverable and renders through the gateway
+/// path (`--input deck=<inline JSON>`): its deck field carries the whole deck
+/// as a JSON string, exercising the inline branch of the template's input
+/// handling and the shipped neutral assets (logo, icons, fonts, gradient
+/// backgrounds). Also confirms an escaped `@` in an eval'd prose field renders.
+#[tokio::test]
+async fn compiles_example_presentation_template() {
+    if !typst_available() {
+        eprintln!("skipping: typst CLI not on PATH");
+        return;
+    }
+    let templates = gw_typst::discover_templates(&example_dir()).expect("discover");
+    let deck = templates
+        .iter()
+        .find(|t| t.id == "presentation")
+        .expect("presentation template not found under examples/typst-templates");
+    // Minimal inline deck: a cover + a content slide whose body has an escaped
+    // email (`\@`) in the eval'd markup, plus a card with a built-in icon.
+    let deck_json = r#"{
+        "deck_title": "Example Corp",
+        "theme": "dark",
+        "slides": [
+            {"layout": "cover", "title": "Hello", "subtitle": "A sample deck"},
+            {"layout": "content", "title": "Contact",
+             "body": "Reach us at hi\\@example.com for *details*."},
+            {"layout": "cards", "title": "Why us",
+             "cards": [{"title": "Fast", "body": "Quick.", "icon": "zap"}]}
+        ]
+    }"#;
+    let inputs = vec![("deck".to_string(), deck_json.to_string())];
+    let rendered = gw_typst::compile(deck, &inputs, 1, None)
+        .await
+        .expect("presentation compile");
+    assert!(rendered.pdf.starts_with(b"%PDF-"), "PDF magic missing");
+    assert!(rendered.pdf.len() > 1024, "pdf suspiciously small");
+    assert_eq!(
+        &rendered.png[..8],
+        &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+        "PNG signature missing"
+    );
+}
+
 #[tokio::test]
 async fn compile_surfaces_typst_error_on_bad_input() {
     if !typst_available() {
@@ -125,4 +167,56 @@ async fn compile_surfaces_typst_error_on_bad_input() {
         }
         other => panic!("expected Failed, got {other:?}"),
     }
+}
+
+/// Pins the premise behind the gateway's auto-escape-on-`@` retry (see
+/// `typst_render::escape_unescaped_ats`): the example body is `eval`'d as
+/// markup, so an unescaped `@` (email/handle) crashes the WHOLE render with
+/// the exact ``does not exist in the document`` signature the retry keys on,
+/// and escaping it (`\@`) — what the retry does — makes the same input render.
+/// If typst ever changes that error text or `@`-handling, this breaks and we
+/// learn before the retry silently stops firing.
+#[tokio::test]
+async fn unescaped_at_crashes_and_escaped_at_renders() {
+    if !typst_available() {
+        eprintln!("skipping: typst CLI not on PATH");
+        return;
+    }
+    let templates = gw_typst::discover_templates(&example_dir()).expect("discover");
+    let letter = templates.iter().find(|t| t.id == "letter").unwrap();
+    let with_body = |body: &str| {
+        vec![
+            ("recipient_name".to_string(), "Acme Co.".to_string()),
+            ("recipient_address".to_string(), "123 Main St".to_string()),
+            ("subject".to_string(), "Hi".to_string()),
+            ("body".to_string(), body.to_string()),
+            ("sender_name".to_string(), "Jane Doe".to_string()),
+        ]
+    };
+    // Bare `@` → crash with the signature.
+    let err = gw_typst::compile(
+        letter,
+        &with_body("Dear Ms. Roe,\n\nReach me at jane@example.com."),
+        1,
+        None,
+    )
+    .await
+    .unwrap_err();
+    match err {
+        gw_typst::CompileError::Failed(msg) => assert!(
+            msg.contains("does not exist in the document"),
+            "signature the retry keys on changed: {msg}"
+        ),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    // Escaped `@` → renders (this is what the auto-escape retry produces).
+    let rendered = gw_typst::compile(
+        letter,
+        &with_body("Dear Ms. Roe,\n\nReach me at jane\\@example.com."),
+        1,
+        None,
+    )
+    .await
+    .expect("escaped @ should compile");
+    assert!(rendered.pdf.starts_with(b"%PDF-"), "PDF magic missing");
 }

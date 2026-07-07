@@ -1,0 +1,91 @@
+{
+  "deck_title": "Example Corp — Product Overview",
+  "footer_left": "example.com",
+  "theme": "dark",
+  "slides": [
+    {
+      "layout": "cover",
+      "eyebrow": "Product Overview",
+      "title": "Storage, simplified",
+      "subtitle": "One platform for block, file and object.",
+      "presenter": "Jane Doe",
+      "role": "Solutions Engineer",
+      "date": "2026"
+    },
+    {
+      "layout": "agenda",
+      "title": "Agenda",
+      "items": [
+        { "label": "The problem", "note": "why storage sprawl hurts" },
+        { "label": "Our approach", "note": "one control plane" },
+        { "label": "Results", "note": "what customers see" },
+        { "label": "Next steps", "note": "getting started" }
+      ]
+    },
+    {
+      "layout": "section",
+      "number": "01",
+      "title": "The problem",
+      "summary": "Teams juggle three storage silos and pay for all of them."
+    },
+    {
+      "layout": "content",
+      "kicker": "Overview",
+      "title": "What we deliver",
+      "subtitle": "A single platform, not a pile of tools.",
+      "body": "We unify storage behind one API so your team stops babysitting hardware. Questions? Write to us at hello\\@example.com — we reply within a day.\n\nEverything below is *native Typst markup*, styled automatically."
+    },
+    {
+      "layout": "cards",
+      "title": "Built for operators",
+      "cards": [
+        { "title": "Resilient", "body": "Self-healing across nodes.", "icon": "shield" },
+        { "title": "Fast", "body": "NVMe-first data path.", "icon": "zap" },
+        { "title": "Observable", "body": "Metrics on every layer.", "icon": "activity" }
+      ]
+    },
+    {
+      "layout": "stats",
+      "title": "By the numbers",
+      "stats": [
+        { "value": "99.99%", "label": "Availability", "note": "trailing 12 months" },
+        { "value": "1.2 PB", "label": "Under management" },
+        { "value": "40%", "label": "Lower TCO", "note": "vs. legacy SAN" }
+      ]
+    },
+    {
+      "layout": "split",
+      "title": "How it fits",
+      "left_body": "Drop it in next to what you run today.",
+      "left_bullets": [
+        "No forklift migration",
+        "Works with your *existing* hardware",
+        "One console for every protocol"
+      ],
+      "right_kind": "code",
+      "right": "$ example-ctl cluster create \\\n    --nodes 3 --replicas 2"
+    },
+    {
+      "layout": "quote",
+      "quote": "We cut our storage overhead in half and never look back.",
+      "attribution": "Alex Rivera",
+      "attribution_role": "Head of Infrastructure, Acme Co.",
+      "style": "hero"
+    },
+    {
+      "layout": "cta-panel",
+      "kicker": "Get started",
+      "title": "See it on your own data",
+      "body": "Spin up a proof-of-concept in an afternoon.",
+      "buttons": [ { "label": "Book a demo", "style": "light" }, { "label": "Read the docs", "style": "outline" } ]
+    },
+    {
+      "layout": "closing",
+      "headline": "Let's build it together",
+      "subline": "Storage that gets out of your way.",
+      "contact_name": "Jane Doe",
+      "contact_email": "jane@example.com",
+      "cta_label": "Book a demo"
+    }
+  ]
+}

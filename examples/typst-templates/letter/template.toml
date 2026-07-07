@@ -86,10 +86,39 @@ letter's language — never skip it — e.g. \"Sehr geehrte Frau Dr. Roe,\" or \
 Madam,\" only when no contact person is known). Do NOT write a \
 sign-off — no \"Mit freundlichen Grüßen\" / \"Sincerely\" / \"Kind regards\" and \
 no sender name at the end: the template appends the closing and signature for \
-you. Writing one yourself produces a duplicate closing. Write PLAIN TEXT only — \
-no Markdown: do not use **, *, #, or \"- \"/\"* \" bullet markers, they print \
-literally. To enumerate points, use flowing prose or short separate paragraphs \
-(each separated by a blank line), not a bullet list."""
+you. Writing one yourself produces a duplicate closing. \
+FORMATTING — the body is rendered as native Typst markup (NOT Markdown); the \
+template styles it in the sample brand automatically. Use it sparingly: a \
+business letter should still read as flowing prose. Inline emphasis: \"*bold*\" \
+with SINGLE asterisks (not **double**) and \"_italic_\" with SINGLE underscores. \
+Headings to structure a longer letter, each on its own line: \"= Heading\" \
+(large), \"== Heading\" (medium), \"=== Heading\" (small) — they print in the \
+brand colour. Lists (sparingly in a letter) — a line \"- item\" for a bullet or \
+\"+ item\" for a numbered list; indent two spaces to nest. A pull-quote: \
+\"#quote(block: true)[the quoted sentence]\" on its own line. A link: \
+\"#link(\"https://example.com\")[example.com]\". For tabular data (line items, \
+prices, comparisons) write ONE Typst table call: #table with a columns count and \
+one \"[cell]\" per cell, left-to-right, the first row of cells being the header \
+(styled automatically), e.g. \"#table(columns: 3, [Item], [Qty], [Net price], \
+[Support plan], [1], [EUR 12,000], [Onsite day], [2], [EUR 3,000])\". Keep cell \
+text short. \
+ESCAPING LITERAL SYMBOLS — MANDATORY, READ CAREFULLY. Because the body is real \
+Typst, five characters start Typst syntax and MUST each be preceded by a \
+backslash EVERY time they appear as ordinary text — otherwise the WHOLE letter \
+fails to render (you get no document at all, not just a wrong character): \
+(1) \"@\" is THE most common trap — EVERY email address and @-handle must be \
+escaped: write \"john\\@acme.com\", NEVER \"john@acme.com\"; write \"\\@team\". \
+An unescaped @ is read as a cross-reference and always crashes the render. \
+(2) \"*\" — write \"5 \\* 3\" or \"cost \\* units\" (a stray * crashes too). \
+(3) \"#\" — write \"C\\#\", \"issue \\#42\". \
+(4) \"$\" — write \"\\$5,000\", or just spell it \"USD 5,000\" / \"EUR 5,000\". \
+(5) the backtick \"`\" — escape it unless you deliberately want inline code. \
+You do NOT need to escape underscores inside words or file names (my_var, \
+config.txt render fine), nor the characters % & [ ] < > — those already print \
+literally, so do not clutter the text with needless backslashes. Only escape a \
+lone _ or * that you want to show as a literal symbol between spaces. Every \
+backslash you add prints nothing itself; it just makes the next character \
+literal."""
 
 [[field]]
 name = "sender_name"
