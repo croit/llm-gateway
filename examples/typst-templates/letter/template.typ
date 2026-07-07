@@ -81,29 +81,32 @@
   [#month-name #today.day(), #today.year()]
 }
 
+// ---- Footer content (shared: page footer for PDF + trailing block for HTML) -
+#let footer-body = [
+  #image("assets/brand-bar.png", width: 100%, height: 1.1pt)
+  #v(4pt)
+  #set text(size: 7pt, fill: muted)
+  #set par(leading: 0.5em, justify: false)
+  #let fcol(label, lines) = [
+    #text(weight: "semibold", fill: c-primary)[#label]#linebreak()#lines.map(l => [#l]).join(linebreak())
+  ]
+  #grid(
+    columns: footer-cols,
+    column-gutter: 5mm,
+    fcol(L.addr, co.address),
+    fcol(L.contact, co.contact),
+    fcol(L.company, co.company),
+    fcol(L.bank, co.bank),
+  )
+]
+
 // ---- Page (structured 4-column footer; safe print clearance) ---------------
 #set page(
   paper: "a4",
   margin: (left: 25mm, right: 20mm, top: 18mm, bottom: 32mm),
   // `footer-descent` small so the footer sits high in the bottom margin,
   // leaving ~14mm clearance to the sheet edge — inside any printer's area.
-  footer: [
-    #image("assets/brand-bar.png", width: 100%, height: 1.1pt)
-    #v(4pt)
-    #set text(size: 7pt, fill: muted)
-    #set par(leading: 0.5em, justify: false)
-    #let fcol(label, lines) = [
-      #text(weight: "semibold", fill: c-primary)[#label]#linebreak()#lines.map(l => [#l]).join(linebreak())
-    ]
-    #grid(
-      columns: footer-cols,
-      column-gutter: 5mm,
-      fcol(L.addr, co.address),
-      fcol(L.contact, co.contact),
-      fcol(L.company, co.company),
-      fcol(L.bank, co.bank),
-    )
-  ],
+  footer: footer-body,
   footer-descent: 3mm,
 )
 #set text(font: "Urbanist", size: 11pt, fill: ink, lang: lang)
@@ -250,3 +253,23 @@
 
 #text(weight: "medium")[#s-name]
 #if s-title != "" [ \ #text(size: 9.5pt, fill: muted)[#s-title]]
+
+// ---- HTML-target footer -----------------------------------------------------
+// The .docx/.odt export compiles this template to HTML, where the page footer
+// is dropped. Re-emit the register/VAT/bank details as a trailing block for the
+// HTML target only, so the Word/ODT output keeps the legally required company
+// info. Emitted as flowing lines (NOT the page's `grid` — typst's HTML export
+// drops grid layout). The PDF is untouched (it uses `footer-body` above).
+#context if target() == "html" [
+  #v(8mm)
+  #image("assets/brand-bar.png", width: 100%, height: 1.1pt)
+  #v(3pt)
+  #set text(size: 7pt, fill: muted)
+  #let fline(label, lines) = [
+    #text(weight: "semibold", fill: c-primary)[#label]: #lines.join(" · ") #linebreak()
+  ]
+  #fline(L.addr, co.address)
+  #fline(L.contact, co.contact)
+  #fline(L.company, co.company)
+  #fline(L.bank, co.bank)
+]

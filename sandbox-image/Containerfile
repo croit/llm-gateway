@@ -52,8 +52,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ripgrep grep gawk sed jq less file binutils xxd bsdextrautils \
         moreutils dateutils tree pv lnav sqlite3 \
         # office documents (writer/calc/impress/draw) + conversion/rendering
+        # (pandoc is installed from an upstream .deb below — the distro package
+        # lags far behind and its Typst reader / docx+odt writers are much older)
         libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw \
-        pandoc weasyprint \
+        weasyprint \
         # PDF tooling
         poppler-utils ghostscript qpdf \
         # images + media + fast image conversion
@@ -63,6 +65,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         # fonts for document/chart rendering (Latin + CJK + emoji)
         fonts-dejavu fonts-liberation fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
+
+# Pandoc, pinned to a recent upstream release. The Debian package lags badly;
+# newer pandoc has a much-improved Typst reader and docx/odt writers (and adds
+# `--typst-input` for sys.inputs). Used by `generate_document` and the
+# typst -> HTML -> pandoc letter/one-pager docx/odt export. Static binary, no
+# extra deps. Bump PANDOC_VERSION to upgrade.
+ARG PANDOC_VERSION=3.10
+RUN curl -fsSL -o /tmp/pandoc.deb \
+        "https://github.com/jgm/pandoc/releases/download/${PANDOC_VERSION}/pandoc-${PANDOC_VERSION}-1-amd64.deb" \
+    && dpkg -i /tmp/pandoc.deb \
+    && rm -f /tmp/pandoc.deb \
+    && pandoc --version | head -1
 
 # ImageMagick ships a hardened policy that blocks PDF/PS (a web-server
 # concern); inside a single-use sandbox that just gets in the way of format
@@ -93,7 +107,8 @@ RUN pip install --no-cache-dir \
         typ2pptx \
         # PDF read/write/manipulate/render (PyMuPDF = fitz)
         pypdf pdfplumber pymupdf reportlab img2pdf weasyprint markdown \
-        # PDF -> editable Word (.docx), layout-preserving (used by typst docx export)
+        # PDF -> editable Word (.docx), layout-preserving (general utility for
+        # run_in_sandbox; the typst docx export now goes via HTML + pandoc)
         pdf2docx \
         # images / computer vision / OCR
         pillow opencv-python-headless imageio pytesseract \

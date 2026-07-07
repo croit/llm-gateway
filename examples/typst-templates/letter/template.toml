@@ -22,6 +22,11 @@ output_basename = "letter"
 # Editable Word (.docx) export: convert the finished PDF to an editable
 # .docx (pdf2docx, in the sandbox) and attach it alongside the PDF.
 [docx]
+# Brand font applied + embedded in the .docx export (from this template's own
+# fonts/Urbanist-*.ttf). The export is typst -> HTML -> pandoc; the font is set
+# as the document default and embedded as .odttf so the Word file is on-brand
+# even where Urbanist isn't installed.
+font = "Urbanist"
 
 [[field]]
 name = "entity"

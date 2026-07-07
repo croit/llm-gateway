@@ -37,7 +37,8 @@ use shared::sandbox::{InputFile, Language, RunRequest};
 use super::sandbox::{SandboxClient, b64};
 use super::{Tool, ToolContext, ToolError, ToolFuture, ToolResult};
 use crate::server::chat_attachments;
-use crate::server::typst::{self, DefaultSource, FieldType, PptxExport, Template};
+use crate::server::db::documents::{self, DocumentFormat};
+use crate::server::typst::{self, DefaultSource, DocxExport, FieldType, PptxExport, Template};
 
 pub struct TypstRenderTool {
     template: Arc<Template>,
@@ -84,7 +85,6 @@ impl Tool for TypstRenderTool {
     fn schema(&self) -> ToolDef {
         let t = &self.template;
         let mut props = Map::new();
-        let mut required: Vec<Value> = Vec::new();
         for f in &t.fields {
             props.insert(
                 f.name.clone(),
@@ -93,10 +93,39 @@ impl Tool for TypstRenderTool {
                     "description": f.description,
                 }),
             );
-            if f.required {
-                required.push(Value::String(f.name.clone()));
-            }
         }
+        // Alternative data source: a canvas JSON document. `required` is left
+        // empty at the schema level because the input is either-or (inline
+        // fields OR `document_id`); the runtime enforces exactly one path
+        // (`stringify_args` rejects a missing required field on the inline
+        // path). Each field's own description still says whether it's required.
+        props.insert(
+            "document_id".to_string(),
+            json!({
+                "type": "string",
+                "description": "Optional. Render from a saved canvas document \
+                    instead of inline fields. Pass the `document_id` of a JSON \
+                    document (create it with `create_document`, format \"json\") \
+                    holding THIS template's field map — for a deck the slides \
+                    live under the `deck` key, exactly the shape this template's \
+                    `_read` tool shows. When set, inline field args are ignored \
+                    and the document is the single source of truth: it appears \
+                    in the user's document panel, you change it with \
+                    `edit_document` (JSON Patch — same vocabulary as `_edit`), \
+                    and you re-render with the SAME document_id to pick up the \
+                    edits. Use this for a deck/letter you'll iterate on; omit it \
+                    for a one-shot render.",
+            }),
+        );
+        props.insert(
+            "version".to_string(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional. With `document_id`, render a specific \
+                    document version instead of the latest.",
+            }),
+        );
         // A non-field control: which page to show as the inline preview.
         props.insert(
             "preview_page".to_string(),
@@ -144,7 +173,7 @@ impl Tool for TypstRenderTool {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": properties,
-                "required": required,
+                "required": [],
             }),
         )
     }
@@ -188,6 +217,73 @@ impl Tool for TypstRenderTool {
             // validation (which rejects anything not declared in the
             // manifest).
             let preview_page = take_preview_page(&mut arg_map)?;
+
+            // Canvas-document source. Pull these control keys out before field
+            // validation (they aren't template fields). When `document_id` is
+            // given the document IS the data — inline fields are ignored, and
+            // the document (not a hidden edit-base) is the single edit surface.
+            let document_id = arg_map
+                .remove("document_id")
+                .and_then(|v| v.as_str().map(str::to_owned));
+            let doc_version = arg_map.remove("version").and_then(|v| v.as_i64());
+            if let Some(doc_id) = document_id {
+                let session_id = ctx.session_id.as_deref().ok_or_else(|| {
+                    ToolError::Failed(
+                        "canvas documents are only available inside a chat session".into(),
+                    )
+                })?;
+                let (doc, ver) = documents::get_version(&ctx.db, session_id, &doc_id, doc_version)
+                    .await
+                    .map_err(|e| ToolError::Failed(format!("reading canvas document: {e}")))?
+                    .ok_or_else(|| {
+                        ToolError::InvalidArgs(format!(
+                            "no canvas document `{doc_id}` in this conversation — create it \
+                                 with create_document (format \"json\"), or check list_documents"
+                        ))
+                    })?;
+                if doc.format != DocumentFormat::Json {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "canvas document `{doc_id}` is `{}` — a typst render needs a JSON document \
+                         holding the field map (a deck's slides under the `deck` key)",
+                        doc.format.as_str()
+                    )));
+                }
+                let data: Value = serde_json::from_str(&ver.content).map_err(|e| {
+                    ToolError::InvalidArgs(format!(
+                        "canvas document `{doc_id}` is not valid JSON: {e}"
+                    ))
+                })?;
+                let inputs = inputs_from_data(&template, &data)?;
+                let mut result = render_and_attach(
+                    &ctx,
+                    turn_id,
+                    s3,
+                    &template,
+                    inputs,
+                    &data,
+                    self.sandbox.as_ref(),
+                    preview_page,
+                )
+                .await?;
+                // The canvas document is the source of truth, so drop the
+                // hidden edit-base pointer and steer edits back to the document
+                // (editing the stale base would diverge from the panel).
+                if let Value::Object(m) = &mut result {
+                    m.remove("data_id");
+                    m.insert("canvas_document_id".into(), json!(doc_id));
+                    m.insert("canvas_version".into(), json!(ver.version));
+                    m.insert("note".into(), json!(format!(
+                        "Rendered from canvas document `{doc_id}` (v{ver}), shown in the user's \
+                         document panel. To change it, call edit_document on `{doc_id}` with a \
+                         JSON Patch (same vocabulary as {id}_edit), then re-render with the same \
+                         document_id — do NOT use the _read/_edit data_id path for this render.",
+                        ver = ver.version,
+                        id = self.id(),
+                    )));
+                }
+                return Ok(result);
+            }
+
             if wants_identity(&template, &arg_map) {
                 match crate::server::db::users::find_by_id(&ctx.db, &ctx.user_id).await {
                     Ok(Some(u)) => apply_identity_defaults(
@@ -337,19 +433,12 @@ async fn render_and_attach(
     let json_name = format!("{base}.json");
     let pptx_name = format!("{base}.pptx");
     let docx_name = format!("{base}.docx");
+    let odt_name = format!("{base}.odt");
 
     // Persist the escaped variant as the edit base when the auto-escape retry
     // fired, so a later `_edit`/`_read` sees exactly what rendered (and doesn't
     // re-crash on the same `@`); otherwise store the model's data untouched.
     let data_bytes = serialize_data(edit_base_escaped.as_ref().unwrap_or(data));
-
-    // Keep the PDF bytes for the docx conversion (the upload below moves
-    // `rendered.pdf`). Only clone when a docx export is actually wired.
-    let pdf_for_docx = if template.docx.is_some() && sandbox.is_some() {
-        Some(rendered.pdf.clone())
-    } else {
-        None
-    };
 
     let pdf_out = chat_attachments::upload(s3, turn_id, &pdf_name, "application/pdf", rendered.pdf)
         .await
@@ -386,18 +475,30 @@ async fn render_and_attach(
         }
     }
 
-    // Optional editable-Word export (`[docx]`): convert the finished PDF
-    // to an editable .docx via pdf2docx in the sandbox. Best-effort, same
-    // as pptx — the PDF/preview already landed, so a failure only notes
-    // an error rather than failing the render.
+    // Optional editable-Word export (`[docx]`): compile the template to HTML
+    // and convert it to an editable .docx with pandoc + brand-font embedding.
+    // Best-effort, same as pptx — the PDF/preview already landed, so a failure
+    // only notes an error rather than failing the render.
     let mut docx_out = None;
+    let mut odt_out = None;
     let mut docx_error: Option<String> = None;
-    if let (Some(pdf), Some(sandbox)) = (pdf_for_docx.as_ref(), sandbox) {
-        match convert_to_docx(sandbox, pdf).await {
-            Ok(bytes) => {
-                match chat_attachments::upload(s3, turn_id, &docx_name, DOCX_MIME, bytes).await {
+    if let (Some(cfg), Some(sandbox)) = (template.docx.as_ref(), sandbox) {
+        match convert_to_docx(sandbox, template, cfg, &inputs, &staged).await {
+            Ok((docx_bytes, odt_bytes)) => {
+                match chat_attachments::upload(s3, turn_id, &docx_name, DOCX_MIME, docx_bytes).await
+                {
                     Ok(out) => docx_out = Some(out),
                     Err(e) => docx_error = Some(format!("upload docx: {e}")),
+                }
+                // ODT is a best-effort bonus format; an upload hiccup only skips
+                // it (the docx already landed).
+                if let Some(odt_bytes) = odt_bytes {
+                    match chat_attachments::upload(s3, turn_id, &odt_name, ODT_MIME, odt_bytes)
+                        .await
+                    {
+                        Ok(out) => odt_out = Some(out),
+                        Err(e) => tracing::warn!(error = %e, "upload odt"),
+                    }
                 }
             }
             Err(e) => {
@@ -424,6 +525,10 @@ async fn render_and_attach(
     if let Some(d) = &docx_out {
         chunk.push('\n');
         chunk.push_str(&chat_attachments::marker_line(turn_id, d));
+    }
+    if let Some(o) = &odt_out {
+        chunk.push('\n');
+        chunk.push_str(&chat_attachments::marker_line(turn_id, o));
     }
     chunk.push_str("\n\n");
 
@@ -500,6 +605,14 @@ async fn render_and_attach(
              Escape '@' yourself next time to avoid the retry.",
         ));
     }
+    if let Some(o) = &odt_out {
+        result["odt"] = json!({
+            "filename": o.filename, "size": o.bytes,
+            "id": format!("{turn_id}/{}", o.filename),
+            "note": "Editable OpenDocument text (.odt) — the same content for \
+                     LibreOffice / OpenOffice users.",
+        });
+    }
     Ok(result)
 }
 
@@ -507,31 +620,56 @@ async fn render_and_attach(
 const PPTX_MIME: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 /// MIME for a `.docx` (OOXML word-processing document).
 const DOCX_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+/// MIME for a `.odt` (OpenDocument text).
+const ODT_MIME: &str = "application/vnd.oasis.opendocument.text";
+/// The `.odt` the sandbox script leaves in `/work` (best-effort — a LibreOffice
+/// conversion of the `.docx`, so it inherits the brand font).
+const ODT_OUT: &str = "out.odt";
 
 /// Single input file name carrying the zipped template + deck.
 const BUNDLE_NAME: &str = "bundle.zip";
 /// The lone `.pptx` the sandbox script leaves in `/work`.
 const PPTX_OUT: &str = "presentation.pptx";
-/// Input PDF name for the docx conversion, and the `.docx` the script
-/// leaves in `/work`.
-const DOCX_IN: &str = "in.pdf";
+/// The `.docx` the sandbox script leaves in `/work`.
 const DOCX_OUT: &str = "out.docx";
 
-/// Convert a finished PDF to an editable `.docx` in the sandbox.
+/// Convert a document template to an editable `.docx` in the sandbox via
+/// `typst --format html` → pandoc → brand-font post-process.
 ///
-/// The letter/one-pager are fixed-layout typst documents; pdf2docx
-/// reconstructs an editable Word doc from the rendered PDF (real,
-/// selectable text; logo + brand bars survive because the templates draw
-/// the bars as images, which pdf2docx keeps — unlike vector fills). A
-/// LibreOffice round-trip then re-flows the absolutely-positioned footer
-/// so the brand bar sits correctly. Returns the `.docx` bytes.
-async fn convert_to_docx(sandbox: &SandboxClient, pdf: &[u8]) -> Result<Vec<u8>, ToolError> {
+/// typst has no native `.docx` export, so we compile the template to HTML
+/// (the real compiler — content, headings, lists, tables, and the logo/brand
+/// bar images all come through; only fixed-layout chrome like a `place()`d
+/// footer is dropped) and let pandoc turn that into an editable Word doc. When
+/// the template declares a `[docx] font`, we set it as the document default and
+/// **embed** it as an obfuscated `.odttf` (sourced from the template's own
+/// `fonts/<font>-Regular.ttf` / `-Bold.ttf`), so the output renders on-brand
+/// even where the font isn't installed. Single-source: no reference.docx.
+///
+/// `inputs` are the same `--input k=v` pairs the PDF render used; they ride in
+/// as `inputs.json` and drive the sandbox-side HTML compile.
+async fn convert_to_docx(
+    sandbox: &SandboxClient,
+    template: &Template,
+    cfg: &DocxExport,
+    inputs: &[(String, String)],
+    staged: &[(String, Vec<u8>)],
+) -> Result<(Vec<u8>, Option<Vec<u8>>), ToolError> {
+    let map: serde_json::Map<String, Value> = inputs
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
+    let inputs_json = serde_json::to_vec(&Value::Object(map))
+        .map_err(|e| ToolError::Failed(format!("docx export: serialize inputs: {e}")))?;
+    // Reuse the pptx bundler: zip the template dir + inject `inputs.json` +
+    // any staged upload images.
+    let bundle = build_bundle_zip(&template.root, "inputs.json", &inputs_json, staged)?;
+
     let req = RunRequest {
         language: Language::Bash,
-        code: docx_script(),
+        code: docx_script(&template.source_file, cfg.font.as_deref()),
         files: vec![InputFile {
-            name: DOCX_IN.to_string(),
-            content_b64: b64::encode(pdf),
+            name: BUNDLE_NAME.to_string(),
+            content_b64: b64::encode(&bundle),
         }],
         timeout_secs: None,
         network: false,
@@ -555,28 +693,110 @@ async fn convert_to_docx(sandbox: &SandboxClient, pdf: &[u8]) -> Result<Vec<u8>,
                 tail(&resp.stderr, 600)
             ))
         })?;
-    b64::decode(&art.content_b64)
-        .ok_or_else(|| ToolError::Failed("docx artifact base64 invalid".into()))
+    let docx = b64::decode(&art.content_b64)
+        .ok_or_else(|| ToolError::Failed("docx artifact base64 invalid".into()))?;
+    // ODT is best-effort (a LibreOffice conversion of the docx); if it didn't
+    // materialise, the docx still stands.
+    let odt = resp
+        .artifacts
+        .iter()
+        .find(|a| a.name == ODT_OUT)
+        .and_then(|a| b64::decode(&a.content_b64));
+    Ok((docx, odt))
 }
 
-/// The bash recipe for PDF -> editable .docx. pdf2docx does the
-/// layout-preserving conversion; the LibreOffice pass realigns the
-/// footer. Only `out.docx` is left in `/work` so it is the sole returned
-/// artifact (the input PDF is removed).
-fn docx_script() -> String {
+/// The bash wrapper for the docx recipe: unzip the bundle, hand `SRC`/`FONT`
+/// to the python driver ([`DOCX_PY`]), and surface `out.docx` at `/work`.
+/// `DOCX_PY` is concatenated (not `format!`-interpolated) so its Python
+/// braces don't collide with format placeholders.
+fn docx_script(source_file: &str, font: Option<&str>) -> String {
     format!(
-        r#"set -e
-export HOME=/tmp
-cd /work
-python3 -c 'from pdf2docx import Converter; c = Converter("{din}"); c.convert("/tmp/raw.docx"); c.close()'
-libreoffice -env:UserInstallation=file:///tmp/lo --headless --convert-to docx:"MS Word 2007 XML" --outdir /work /tmp/raw.docx >/dev/null 2>&1
-mv -f /work/raw.docx /work/{dout}
-rm -f /work/{din}
-"#,
-        din = DOCX_IN,
-        dout = DOCX_OUT,
-    )
+        "set -e\nexport HOME=/tmp\nmkdir -p /work/build && cd /work/build\n\
+         unzip -q /work/{bundle}\nexport SRC='{src}' FONT='{font}'\npython3 - <<'PYEOF'\n",
+        bundle = BUNDLE_NAME,
+        src = source_file,
+        font = font.unwrap_or(""),
+    ) + DOCX_PY
+        + &format!(
+            "PYEOF\n\
+             mv -f /work/build/{DOCX_OUT} /work/{DOCX_OUT}\n\
+             [ -f /work/build/{ODT_OUT} ] && mv -f /work/build/{ODT_OUT} /work/{ODT_OUT} || true\n"
+        )
 }
+
+/// Python driver for the docx export (reads env `SRC` = template `.typ`,
+/// `FONT` = brand font name or ""): compile the template to HTML, pandoc it to
+/// `out.docx`, then — when a font is set — make it the document default and
+/// embed it as obfuscated `.odttf` (ECMA-376: first 32 bytes XOR the reversed
+/// fontKey GUID) from the template's `fonts/<font>-{Regular,Bold}.ttf`.
+const DOCX_PY: &str = r#"import json, subprocess, os, zipfile, uuid, re
+src = os.environ["SRC"]
+font = os.environ.get("FONT") or None
+inp = json.load(open("inputs.json"))
+cmd = ["typst","compile","--format","html","--features","html","--root",".",src,"doc.html"]
+for k,v in inp.items():
+    cmd += ["--input","%s=%s"%(k,v)]
+subprocess.run(cmd, check=True)
+subprocess.run(["pandoc","-f","html","-t","docx","doc.html","-o","out.docx"], check=True)
+# ODT as a bonus format for LibreOffice/OpenOffice users (small, from the same
+# HTML; best-effort — a failure just skips it).
+subprocess.run(["pandoc","-f","html","-t","odt","doc.html","-o","out.odt"], check=False)
+if font:
+    from docx import Document
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    d = Document("out.docx")
+    d.styles["Normal"].font.name = font
+    rpr = d.styles["Normal"].element.get_or_add_rPr()
+    rf = rpr.find(qn("w:rFonts"))
+    if rf is None:
+        rf = OxmlElement("w:rFonts"); rpr.append(rf)
+    for a in ("w:ascii","w:hAnsi","w:cs","w:eastAsia"):
+        rf.set(qn(a), font)
+    d.save("out.docx")
+    def obf(data, guid_hex):
+        key = bytes.fromhex(guid_hex)[::-1]
+        out = bytearray(data)
+        for i in range(32): out[i] ^= key[i % 16]
+        return bytes(out)
+    NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    fonts = []
+    for i,(fn,tag) in enumerate(((font+"-Regular.ttf","embedRegular"),(font+"-Bold.ttf","embedBold")), 1):
+        p = os.path.join("fonts", fn)
+        if os.path.exists(p):
+            g = uuid.uuid4()
+            fonts.append((i, tag, "{%s}"%str(g).upper(), "font%d.odttf"%i, obf(open(p,"rb").read(), g.hex)))
+    if fonts:
+        zin = zipfile.ZipFile("out.docx","r"); items = {n: zin.read(n) for n in zin.namelist()}; zin.close()
+        for i,tag,guid,fname,data in fonts:
+            items["word/fonts/"+fname] = data
+        ft = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="%s"><w:font w:name="%s">' % (NS_R, font)
+        for i,tag,guid,fname,data in fonts:
+            ft += '<w:%s r:id="rIdF%d" w:fontKey="%s" w:subsetted="false"/>' % (tag, i, guid)
+        ft += '</w:font></w:fonts>'
+        items["word/fontTable.xml"] = ft.encode()
+        rels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        for i,tag,guid,fname,data in fonts:
+            rels += '<Relationship Id="rIdF%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/font" Target="fonts/%s"/>' % (i, fname)
+        rels += '</Relationships>'
+        items["word/_rels/fontTable.xml.rels"] = rels.encode()
+        ct = items["[Content_Types].xml"].decode()
+        if "obfuscatedFont" not in ct:
+            ct = ct.replace("</Types>", '<Default Extension="odttf" ContentType="application/vnd.openxmlformats-officedocument.obfuscatedFont"/><Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/></Types>')
+            items["[Content_Types].xml"] = ct.encode()
+        if "word/settings.xml" in items:
+            st = items["word/settings.xml"].decode()
+            if "embedTrueTypeFonts" not in st:
+                st = re.sub(r"(<w:settings[^>]*>)", r"\1<w:embedTrueTypeFonts/><w:embedSystemFonts/><w:saveSubsetFonts/>", st, count=1)
+                items["word/settings.xml"] = st.encode()
+        dr = items["word/_rels/document.xml.rels"].decode()
+        if "fontTable" not in dr:
+            dr = dr.replace("</Relationships>", '<Relationship Id="rIdFontTable" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable" Target="fontTable.xml"/></Relationships>')
+            items["word/_rels/document.xml.rels"] = dr.encode()
+        zout = zipfile.ZipFile("out.docx","w",zipfile.ZIP_DEFLATED)
+        for n,data in items.items(): zout.writestr(n, data)
+        zout.close()
+"#;
 
 /// Convert a rendered deck to an editable `.pptx` in the sandbox.
 ///
@@ -1760,7 +1980,7 @@ fn apply_identity_defaults(t: &Template, args: &mut Map<String, Value>, id: &Ide
 /// chat chip. The static template `.typ` is deliberately NOT attached —
 /// it can't be edited through the tool and can't recompile without its
 /// fonts/assets, so it only adds clutter.
-const TYPST_EXTS: &[&str] = &["pdf", "png", "json", "pptx", "docx"];
+const TYPST_EXTS: &[&str] = &["pdf", "png", "json", "pptx", "docx", "odt"];
 
 /// Whether `filename` is one of this template's visible typst chips
 /// (`<base>.pdf` / `.png` / `.pptx`, including the `-2`, `-3`, … dedup
@@ -1772,7 +1992,7 @@ const TYPST_EXTS: &[&str] = &["pdf", "png", "json", "pptx", "docx"];
 fn is_template_typst_chip(template: &Template, filename: &str) -> bool {
     let base = template.output_basename.as_str();
     let stem = match filename.rsplit_once('.') {
-        Some((stem, "pdf" | "png" | "pptx" | "docx")) => stem,
+        Some((stem, "pdf" | "png" | "pptx" | "docx" | "odt")) => stem,
         _ => return false,
     };
     if stem == base {
@@ -2138,13 +2358,23 @@ mod tests {
     }
 
     #[test]
-    fn schema_lists_required_fields_only() {
+    fn schema_advertises_fields_but_leaves_required_empty() {
+        // Since a render can be driven inline OR from a canvas `document_id`,
+        // the schema advertises every field in `properties` but keeps the
+        // top-level `required` empty (either-or input); requiredness for the
+        // inline path is enforced at runtime by `stringify_args`.
         let tool = TypstRenderTool::new(std::sync::Arc::new(stub_template()), None);
         let def = tool.schema();
         let params = serde_json::to_value(&def.function.parameters).unwrap();
-        let required = params["required"].as_array().unwrap();
-        assert_eq!(required.len(), 1);
-        assert_eq!(required[0], "title");
+        assert!(
+            params["required"].as_array().unwrap().is_empty(),
+            "required must be empty: {params}"
+        );
+        let props = &params["properties"];
+        assert!(
+            props.get("title").is_some(),
+            "title field advertised: {params}"
+        );
     }
 
     /// Template with a `deck` JSON-string field + an optional `theme`,
@@ -2460,5 +2690,93 @@ mod tests {
         let def = tool.schema();
         let params = serde_json::to_value(&def.function.parameters).unwrap();
         assert_eq!(params["required"], json!(["base"]));
+    }
+
+    // --- deck-as-canvas (#13) ---------------------------------------------
+
+    #[test]
+    fn render_schema_advertises_canvas_document_source() {
+        // The render tool offers `document_id` (+ `version`) as an alternative
+        // data source, and drops the hard `required` list so the input is
+        // either-or (inline fields OR a canvas document) — runtime enforces.
+        let tool = TypstRenderTool::new(std::sync::Arc::new(deck_template()), None);
+        let def = tool.schema();
+        let params = serde_json::to_value(&def.function.parameters).unwrap();
+        let props = &params["properties"];
+        assert!(
+            props.get("document_id").is_some(),
+            "document_id prop: {params}"
+        );
+        assert!(props.get("version").is_some(), "version prop: {params}");
+        // The template field is still advertised, just not forced.
+        assert!(
+            props.get("deck").is_some(),
+            "deck prop still present: {params}"
+        );
+        assert_eq!(
+            params["required"].as_array().unwrap(),
+            &Vec::<Value>::new(),
+            "required must be empty (either-or input): {params}"
+        );
+    }
+
+    #[test]
+    fn docx_script_carries_the_html_pandoc_recipe_and_font() {
+        let s = docx_script("template.typ", Some("Urbanist"));
+        // The compile command is a python argv list: "typst","compile",…,"--format","html".
+        assert!(s.contains("\"typst\""), "{s}");
+        assert!(s.contains("\"--format\"") && s.contains("\"html\""), "{s}");
+        assert!(s.contains("pandoc"), "{s}");
+        assert!(s.contains("FONT='Urbanist'"), "{s}");
+        assert!(s.contains("SRC='template.typ'"), "{s}");
+        // embedding path present (obfuscated .odttf)
+        assert!(s.contains("embedRegular") && s.contains("odttf"), "{s}");
+        // ends leaving the artifact at /work
+        assert!(s.contains(&format!("/work/{DOCX_OUT}")), "{s}");
+        // also emits the bonus .odt
+        assert!(s.contains("\"odt\"") && s.contains(ODT_OUT), "{s}");
+    }
+
+    #[test]
+    fn docx_script_without_font_skips_embedding_branch() {
+        // No font → FONT='' → the python `font` is None → no embed.
+        let s = docx_script("template.typ", None);
+        assert!(s.contains("FONT=''"), "{s}");
+    }
+
+    #[test]
+    fn inputs_from_data_accepts_a_canvas_field_map() {
+        // A canvas JSON document holds the field map (deck object under the
+        // `deck` key) — exactly what a doc-sourced render parses and feeds to
+        // inputs_from_data. Prove that shape validates and the deck round-trips
+        // to a compact `--input deck=<json>` string.
+        let t = deck_template();
+        let data = json!({
+            "deck": {"deck_title": "Q3", "slides": [{"layout": "cover", "title": "Hi"}]}
+        });
+        let inputs = inputs_from_data(&t, &data).expect("canvas field map should validate");
+        let deck = inputs
+            .iter()
+            .find(|(k, _)| k == "deck")
+            .expect("deck input");
+        // Value re-serialized as compact JSON, ready for `typst --input`.
+        assert!(
+            deck.1.contains("\"slides\""),
+            "deck json preserved: {}",
+            deck.1
+        );
+        assert!(
+            deck.1.starts_with('{'),
+            "deck is a JSON object string: {}",
+            deck.1
+        );
+
+        // A canvas doc missing the required `deck` field is rejected (the
+        // runtime guard behind the empty schema `required`).
+        let bad = json!({"theme": "dark"});
+        assert!(
+            inputs_from_data(&t, &bad).is_err(),
+            "missing required deck must error"
+        );
     }
 }

@@ -34,7 +34,7 @@ which tool/engine does each job, and — importantly — what each path can and
 | `generate_document` | Markdown → file | pandoc (+weasyprint for PDF) | Markdown → `pdf`/`docx`/`pptx`. Generic, quick, **unbranded**. |
 | `typst_letter` / `typst_onepager` / `typst_presentation` | structured input → file | typst | Renders a **branded** PDF + PNG preview from operator-defined templates. Also emits an editable export (below). |
 | — editable **PPTX** (presentation) | typst → pptx | **typ2pptx** | Direct typst→PowerPoint: real editable text/shapes/gradients. Post-processed with a font fixup + shrink-to-fit + **embedded fonts** (see limitations). |
-| — editable **DOCX** (letter/one-pager) | typst → PDF → docx | **pdf2docx** + LibreOffice | The rendered PDF is reconstructed into an editable Word doc. Layout-preserving but *flowing* (see limitations). |
+| — editable **DOCX** (letter/one-pager) | typst → HTML → docx | **pandoc** (+ python-docx) | The template is compiled to HTML and converted to editable Word by pandoc; the `[docx] font` is set as the document default and embedded as `.odttf` (from the template's own `fonts/`). Genuinely editable, on-brand text; fixed-layout chrome (a `place()`d footer) is dropped — see limitations. |
 | `create_document` / `edit_document` / `export_document` | canvas → file | in-proc + pandoc | Build a Markdown "canvas" doc across turns; export to pdf/docx/pptx. |
 | `run_in_sandbox` | anything | Python/bash in sandbox | Escape hatch: pandas, PyMuPDF, python-docx/pptx, LibreOffice, etc. for bespoke conversions. |
 
@@ -66,7 +66,7 @@ Each path below: **how it's done**, and the **expectation / limitation**.
 | Branded **deck** → PDF | `typst_presentation` | Pixel-perfect croit slides from a `deck.json` structure. |
 | Deck → **editable PPTX** | `typst_presentation` (auto, via typ2pptx) | Editable text/shapes. **Fonts are embedded** so it renders correctly without Urbanist installed; text bodies use **shrink-to-fit** so a renderer's metric differences can't overflow. Brand rules must be gradient **fills**, not gradient line **strokes** (typ2pptx drops the latter). |
 | Uploaded images → **into a render** | `att:` ref in any image field | Images that `fetch_attachment` pulled out of an upload (its `image_refs`) are carried into a render by pasting the `att:<turn>/<file>` ref into an image/bg_image/avatar field. The renderer fetches the bytes and **stages** them under `uploads/` in the compile root (and the pptx bundle), so `image("uploads/…")` resolves. Refs are re-staged on every render/edit — never persisted as paths. |
-| Letter / one-pager → **editable DOCX** | `typst_*` (auto, via pdf2docx) | Editable Word text + logo + brand bars. It's a **flowing** reconstruction of a fixed layout, so expect minor drift (see limitations). |
+| Letter / one-pager → **editable DOCX** | `typst_*` (auto, via typst→HTML→pandoc) | Editable Word text + logo + brand bar + headings/lists/tables, in the brand font (embedded). Content, not fixed layout — a `place()`d footer is dropped (see limitations). |
 | Uploaded Office/PDF → **PDF** | `convert_document(target=pdf)` | Faithful to the *original* file's look (LibreOffice). Keeps the source styling, **not** ours. |
 
 ## Typical office use cases
@@ -98,11 +98,21 @@ Ordered by how much they bite.
    an image dropped from a field), not a lossy extraction step. Same shape for
    `.docx` → letter/one-pager.
 
-2. **Editable DOCX (letter/one-pager) is a flowing reconstruction.** pdf2docx
-   rebuilds the PDF as Word content, so: the pinned footer can reflow to a 2nd
-   page, the recipient block can wrap in a narrow box, and **fonts are not
-   embedded** in the `.docx` (it degrades gracefully to a substitute, since it's
-   flowing text). Good for editing; not byte-identical to the PDF.
+2. **Editable DOCX (letter/one-pager) carries content, not fixed layout.**
+   typst can't emit `.docx`, so the export compiles the template to HTML and
+   converts *that* with pandoc. Body text, headings, lists, tables, and the
+   logo/brand-bar images come through as editable Word content, in the brand
+   font (`[docx] font`, set as the default and embedded as `.odttf` from the
+   template's `fonts/`, so it renders on-brand even without the font installed).
+   The legal footer (register/VAT/bank) is a `place()`d element that HTML export
+   drops, so the letter template re-emits it as a flowing block for the HTML
+   target (`#context if target() == "html"`) — keeping it in the Word/ODT
+   output. What's still **lost**: other fixed-layout chrome, and per-element
+   font variation collapses to the one `[docx] font`. It's an on-brand editable
+   draft, not a byte-match of the PDF. A `.odt` is emitted alongside the `.docx`
+   (same pandoc HTML source) for LibreOffice/OpenOffice users. Only text-centric
+   templates should opt into `[docx]`; layout/graphics-heavy ones (decks) use
+   `[pptx]` instead.
 
 3. **Editable PPTX is renderer-sensitive by nature.** typ2pptx positions text
    using typst's own shaping; another renderer's metrics differ. Mitigated by
