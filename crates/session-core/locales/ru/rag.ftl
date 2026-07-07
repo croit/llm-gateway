@@ -1,0 +1,138 @@
+# STATUS: llm-generated, unreviewed — pending native-speaker QA
+
+rag-page-title = Коллекции RAG — LLM Gateway
+rag-heading = Коллекции RAG
+rag-description-prefix = Кодовые базы, проиндексированные шлюзом. Инструмент
+rag-description-suffix = обращается к этим коллекциям, чтобы отвечать на вопросы о коде.
+rag-collections-heading = Настроенные коллекции
+rag-empty-list = Пока нет коллекций. Создайте одну выше.
+
+# Toasts — collection CRUD
+rag-toast-malformed-form = некорректная форма: { $err }
+rag-toast-name-exists = коллекция с именем `{ $name }` уже существует
+rag-toast-create-failed = не удалось создать коллекцию
+rag-toast-indexing-queued = Индексация `{ $name }` @ `{ $ref }` поставлена в очередь.
+rag-toast-created-aggregate = `{ $name }` создана (агрегат). Добавьте исходные репозитории ниже, чтобы их проиндексировать.
+rag-toast-collection-not-found = коллекция не найдена
+rag-toast-collection-not-found-cap = Коллекция не найдена.
+rag-toast-load-collection-failed = не удалось загрузить коллекцию
+rag-toast-load-collection-failed-cap = Не удалось загрузить коллекцию.
+rag-toast-name-length = Имя должно содержать от 1 до 64 символов.
+rag-toast-git-url-required = Требуется URL Git.
+rag-toast-embedding-model-required = Требуется модель embedding.
+rag-toast-chunk-size-range = Размер чанка должен быть в диапазоне (0, 8000].
+rag-toast-chunk-overlap-range = Перекрытие чанков должно быть в диапазоне [0, chunk_size).
+rag-toast-save-failed = Не удалось сохранить коллекцию.
+rag-toast-vanished = Коллекция исчезла после сохранения.
+rag-toast-saved-reload-failed = Сохранено, но перезагрузка не удалась.
+rag-toast-saved = `{ $name }` сохранена.
+rag-toast-collection-removed = Коллекция удалена.
+rag-toast-collection-already-gone = Коллекция уже удалена.
+rag-toast-delete-failed = Ошибка удаления.
+
+# Toasts — refs / sources
+rag-toast-reindex-queue-failed = не удалось поставить переиндексацию в очередь
+rag-toast-reindex-queued-count = Переиндексация { $count } ref(ов) поставлена в очередь.
+rag-toast-ref-required = Требуется ref (ветка/тег/коммит).
+rag-toast-ref-exists = ref `{ $ref }` уже существует в этой коллекции
+rag-toast-add-ref-failed = не удалось добавить ref
+rag-toast-indexing-queued-ref = Индексация `{ $ref }` поставлена в очередь.
+rag-toast-no-source-urls = URL источников не найдены.
+rag-toast-bulk-queued-skipped = Поставлено в очередь { $added } источник(ов); пропущено { $skipped } дубликат(ов).
+rag-toast-bulk-queued = Индексация { $added } источник(ов) поставлена в очередь.
+rag-toast-ref-not-found = ref не найден
+rag-toast-reindex-queued-ref = Переиндексация `{ $ref }` поставлена в очередь.
+rag-toast-set-primary-failed = не удалось назначить основным
+rag-toast-now-default = `{ $ref }` теперь ref по умолчанию.
+rag-toast-delete-ref-failed = не удалось удалить ref
+rag-toast-ref-removed = Ref `{ $ref }` удалён.
+rag-toast-load-log-failed = не удалось загрузить журнал
+rag-toast-git-url-required-aggregate = Для источника агрегата требуется URL Git.
+rag-toast-update-source-failed = не удалось обновить источник
+rag-toast-source-updated = Источник обновлён.
+
+# Status badges
+rag-status-pending = в ожидании
+rag-status-cloning = клонирование
+rag-status-indexing = индексация
+rag-status-ready = готово
+rag-status-error = ошибка
+
+# Collection row
+rag-pat-set = PAT задан
+rag-pat-none = нет PAT
+rag-meta-aggregate = { $count } источник(ов) · { $hint }
+rag-meta-versioned = { $url } · { $hint }
+rag-badge-aggregate = агрегат
+rag-embed-prefix = embed:
+rag-button-edit = Изменить
+rag-button-delete-collection = Удалить коллекцию
+rag-placeholder-source-git-url = https://github.com/org/repo.git
+rag-placeholder-ref-default = ref (по умолчанию: как у коллекции)
+rag-button-add-source = Добавить источник
+rag-placeholder-branch-tag-commit = ветка, тег или коммит
+rag-button-add-ref = Добавить ref
+rag-placeholder-bulk-sources = Массовое добавление — один репозиторий на строку, необязательный @ref:
+    https://github.com/proxmox/pve-manager.git
+    https://github.com/proxmox/qemu-server.git @master
+rag-button-add-bulk = Добавить источники (массово)
+
+# Ref / source row
+rag-badge-primary = основной
+rag-ref-indexed-line = проиндексировано { $date } · { $commit }
+rag-never = никогда
+rag-button-log = Журнал
+rag-button-reindex = Переиндексировать
+rag-button-set-primary = Сделать основным
+rag-button-remove = Удалить
+
+# Indexing log
+rag-log-info = инфо
+rag-log-warn = предупр.
+rag-log-error = ошибка
+rag-log-heading = Журнал индексации
+rag-log-empty = Событий индексации пока не зафиксировано. Первый запуск появится здесь, как только индексатор возьмётся за этот ref.
+
+# Inline per-source editor
+rag-label-git-url-source = URL Git (этот источник)
+rag-label-git-url-inherit = URL Git (пусто = унаследовать от коллекции)
+rag-placeholder-git-url = https://example.com/org/repo.git
+rag-label-branch-tag = Ветка / тег
+rag-button-save-source = Сохранить источник
+rag-button-cancel = Отмена
+
+# Create-collection form
+rag-create-heading = Индексировать новую коллекцию
+rag-create-description = Индексатор клонирует репозиторий, разбивает каждый файл на чанки и создаёт для них embedding с помощью настроенной модели. PAT хранятся в открытом виде (шлюз работает на доверенной инфраструктуре).
+rag-label-name = Имя
+rag-placeholder-name = напр. gateway-repo
+rag-label-description-optional = Описание (необязательно)
+rag-placeholder-description = кратко, для людей
+rag-label-git-url-versioned = URL Git (только для версионированных)
+rag-label-pat-optional = Персональный токен доступа (необязательно)
+rag-placeholder-pat = для приватных репозиториев
+rag-label-include-globs-full = Include-шаблоны (через запятую или с новой строки)
+rag-placeholder-include-globs = *.rs, *.md
+rag-label-exclude-globs = Exclude-шаблоны
+rag-placeholder-exclude-globs = target/, node_modules/
+rag-label-chunk-size = Размер чанка
+rag-label-chunk-overlap = Перекрытие чанков
+rag-create-aggregate-help = Агрегат (несколько источников): поиск по многим репозиториям как по единому корпусу. Оставьте URL Git пустым и добавьте каждый исходный репозиторий после создания. Ветка/тег станет ref по умолчанию для добавленных источников.
+rag-button-queue-indexing = Поставить индексацию в очередь
+
+# Edit-collection form
+rag-edit-heading = Редактирование { $name }
+rag-label-description = Описание
+rag-label-pat = Персональный токен доступа
+rag-badge-pat-set = сейчас задан
+rag-badge-pat-none = не сохранён
+rag-placeholder-pat-keep = оставьте пустым, чтобы сохранить текущий
+rag-label-clear-pat = Удалить сохранённый PAT (прекратить аутентификацию)
+rag-label-include-globs = Include-шаблоны
+rag-button-save-changes = Сохранить изменения
+
+# Embedding model field
+rag-label-embedding-model = Модель embedding
+rag-placeholder-embedding-model-none = пулы embedding не настроены — введите id модели
+rag-option-choose-embedding-model = Выберите модель embedding…
+rag-suffix-not-advertised = (больше не предлагается)

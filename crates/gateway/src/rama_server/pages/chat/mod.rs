@@ -41,6 +41,7 @@ use session_core::chrome::{
     NavSections, Theme, is_datastar_request, read_body_to_bytes, see_other, sse_patch,
     sse_response, sse_signals, sse_toast,
 };
+use session_core::i18n::{self, Lang, t, t_args};
 use session_core::{RegisterOutcome, TurnUpdate};
 
 use session_core::db as chat;
@@ -63,6 +64,7 @@ pub async fn chat_index(State(state): State<Arc<RamaState>>, req: Request) -> Re
     };
     let datastar = is_datastar_request(req.headers());
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let target = match resolve_landing_session(&state, &user).await {
         Ok(s) => s,
@@ -76,6 +78,7 @@ pub async fn chat_index(State(state): State<Arc<RamaState>>, req: Request) -> Re
             datastar,
             session.impersonator_id.is_some(),
             theme,
+            lang,
             nav,
         )
         .await
@@ -111,6 +114,7 @@ pub async fn chat_session_view(
     };
     let datastar = is_datastar_request(req.headers());
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     // Readable = owned OR shared. A non-owner viewing a shared chat gets a
     // read-only render (see `render_chat_response`); mutations stay owner-only.
@@ -126,6 +130,7 @@ pub async fn chat_session_view(
         datastar,
         session.impersonator_id.is_some(),
         theme,
+        lang,
         nav,
     )
     .await
@@ -139,6 +144,7 @@ async fn render_chat_response(
     datastar: bool,
     impersonating: bool,
     theme: Theme,
+    lang: Lang,
     nav: NavSections,
 ) -> Response {
     let sessions = match chat::list_sessions(&state.db, &user.id).await {
@@ -206,13 +212,16 @@ async fn render_chat_response(
                 .flatten()
                 .as_deref(),
         );
-        (effort, build_capabilities(&state, user, &active.id).await)
+        (
+            effort,
+            build_capabilities(&state, user, &active.id, lang).await,
+        )
     };
     // The session's document canvas (active = most-recently-updated
     // document), pre-rendered to HTML for the always-present slot. `None`
     // when the conversation has no documents.
     let document_canvas_html =
-        crate::server::tools::document::render_canvas_html(&state.db, &active.id, None, None)
+        crate::server::tools::document::render_canvas_html(&state.db, &active.id, None, None, lang)
             .await
             .ok()
             .flatten();
@@ -228,6 +237,7 @@ async fn render_chat_response(
         effort,
         capabilities: &capabilities,
         document_canvas_html: document_canvas_html.as_deref(),
+        lang,
     });
     let chat_sidebar = SidebarChat {
         sessions: sessions
@@ -240,12 +250,16 @@ async fn render_chat_response(
             .collect(),
         active_session_id: Some(active.id.clone()),
     };
-    let title = active.title.clone().unwrap_or_else(|| "Chat".to_string());
+    let title = active
+        .title
+        .clone()
+        .unwrap_or_else(|| t(lang, "chat-default-title"));
     let url = format!("/chat/{}", active.id);
     if datastar {
         nav_or_html_page(
             true,
             theme,
+            lang,
             nav,
             NavItem::Chat,
             &format!("{title} — LLM Gateway"),
@@ -259,6 +273,7 @@ async fn render_chat_response(
     } else {
         html_authed_page(
             theme,
+            lang,
             nav,
             Some(NavItem::Chat),
             &format!("{title} — LLM Gateway"),
@@ -292,6 +307,7 @@ pub async fn chat_session_create(State(state): State<Arc<RamaState>>, req: Reque
             true,
             session.impersonator_id.is_some(),
             Theme::from_headers(req.headers()),
+            Lang::from_headers(req.headers()),
             NavSections::from_headers(req.headers()),
         )
         .await
@@ -313,6 +329,7 @@ pub async fn chat_session_delete(
         Err(resp) => return resp,
     };
     let datastar = is_datastar_request(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let deleted = match chat::delete_session(&state.db, &user.id, &session_id).await {
         Ok(v) => v,
         Err(err) => return internal_error_html(&user.email, &err.to_string()),
@@ -320,7 +337,7 @@ pub async fn chat_session_delete(
     if !deleted {
         return sse_response(&[sse_toast(&super::Flash {
             kind: super::FlashKind::Info,
-            message: "Conversation was already gone.".into(),
+            message: t(lang, "chat-toast-conversation-already-gone"),
         })]);
     }
     let next = match resolve_landing_session(&state, &user).await {
@@ -334,6 +351,7 @@ pub async fn chat_session_delete(
         datastar,
         session.impersonator_id.is_some(),
         Theme::from_headers(req.headers()),
+        lang,
         NavSections::from_headers(req.headers()),
     )
     .await
@@ -353,6 +371,7 @@ pub async fn chat_share_toggle(
         Err(resp) => return resp,
     };
     let datastar = is_datastar_request(req.headers());
+    let lang = Lang::from_headers(req.headers());
     // Owner-only on both reads and writes: get_session is owner-scoped, and
     // set_shared's UPDATE is `WHERE id = ? AND user_id = ?`. A non-owner POST
     // finds no session and is redirected away with no effect.
@@ -376,16 +395,16 @@ pub async fn chat_share_toggle(
     // up un-sharing can never claim "everyone can read this". A full re-render
     // is unnecessary: toggling `shared` changes nothing else on the page.
     let share_url = format!("/chat/{session_id}/share");
-    let control = render::render_share_control(&share_url, now_shared).to_string();
+    let control = render::render_share_control(&share_url, now_shared, lang).to_string();
     let toast = if now_shared {
         sse_toast(&super::Flash {
             kind: super::FlashKind::Success,
-            message: "Link copied — any signed-in user with the link can read along.".into(),
+            message: t(lang, "chat-toast-share-copied"),
         })
     } else {
         sse_toast(&super::Flash {
             kind: super::FlashKind::Info,
-            message: "Sharing stopped — the link no longer works.".into(),
+            message: t(lang, "chat-toast-share-stopped"),
         })
     };
     sse_response(&[
@@ -418,6 +437,7 @@ pub async fn chat_session_pin(
         Err(resp) => return resp,
     };
     let datastar = is_datastar_request(req.headers());
+    let lang = Lang::from_headers(req.headers());
     // Owner-only on both reads and writes: get_session is owner-scoped, and
     // set_pinned's UPDATE is `WHERE id = ? AND user_id = ?`. A non-owner POST
     // finds no session and is redirected away with no effect.
@@ -447,17 +467,21 @@ pub async fn chat_session_pin(
     // (pinned rows float to the top), so a single-row patch wouldn't reflect
     // the move — patch the full `#session-list`.
     let sidebar = super::fetch_sidebar_chat(&state, &user.id, active).await;
-    let list = super::render_session_list(&sidebar.sessions, sidebar.active_session_id.as_deref())
-        .to_string();
+    let list = super::render_session_list(
+        &sidebar.sessions,
+        sidebar.active_session_id.as_deref(),
+        lang,
+    )
+    .to_string();
     let toast = if now_pinned {
         sse_toast(&super::Flash {
             kind: super::FlashKind::Success,
-            message: "Pinned — this conversation now stays at the top.".into(),
+            message: t(lang, "chat-toast-pinned"),
         })
     } else {
         sse_toast(&super::Flash {
             kind: super::FlashKind::Info,
-            message: "Unpinned.".into(),
+            message: t(lang, "chat-toast-unpinned"),
         })
     };
     sse_response(&[
@@ -487,6 +511,7 @@ pub async fn chat_capabilities_toggle(
         return see_other("/chat");
     }
     let datastar = is_datastar_request(req.headers());
+    let lang = Lang::from_headers(req.headers());
     // The toggle button isn't inside a form (the composer is the only form on
     // the page), so the kind+key ride in the query string, not a body.
     let form: CapabilityForm = match serde_urlencoded::from_str(req.uri().query().unwrap_or("")) {
@@ -509,7 +534,7 @@ pub async fn chat_capabilities_toggle(
     // `group`/`all` fan a single click out across the affected rows; `tool`/
     // `skill` apply to one. Resolve the set from the *current* capability list
     // so a group's membership matches exactly what's on screen.
-    let caps_before = build_capabilities(&state, &user, &session_id).await;
+    let caps_before = build_capabilities(&state, &user, &session_id, lang).await;
     let targets: Vec<(render::CapKind, String)> = match form.kind.as_str() {
         "all" => caps_before
             .iter()
@@ -537,8 +562,8 @@ pub async fn chat_capabilities_toggle(
     // Patch only the volatile leaves — the segmented controls, the aggregate
     // pills, and the chips — never the section containers or the search box, so
     // the open/collapse and search signals on `#cap-wrap` survive untouched.
-    let caps_after = build_capabilities(&state, &user, &session_id).await;
-    let patches = render::render_capability_patches(&session_id, &caps_after);
+    let caps_after = build_capabilities(&state, &user, &session_id, lang).await;
+    let patches = render::render_capability_patches(&session_id, &caps_after, lang);
     let events: Vec<_> = patches
         .iter()
         .map(|(sel, html)| sse_patch(Some(sel), Some("outer"), html))
@@ -610,6 +635,7 @@ pub async fn chat_effort_set(
         return see_other("/chat");
     }
     let datastar = is_datastar_request(req.headers());
+    let lang = Lang::from_headers(req.headers());
     // The picker isn't a form (it lives inside the composer's form), so the
     // chosen level rides in the query string.
     let form: EffortForm = match serde_urlencoded::from_str(req.uri().query().unwrap_or("")) {
@@ -632,7 +658,11 @@ pub async fn chat_effort_set(
     }
     sse_response(&[sse_toast(&super::Flash {
         kind: super::FlashKind::Success,
-        message: format!("Thinking effort: {}", effort.label()),
+        message: t_args(
+            lang,
+            "chat-toast-effort-set",
+            &i18n::args([("level", effort.label().to_string().into())]),
+        ),
     })])
 }
 
@@ -649,6 +679,7 @@ async fn build_capabilities(
     state: &RamaState,
     user: &User,
     session_id: &str,
+    lang: Lang,
 ) -> Vec<render::CapabilityRow> {
     use crate::server::tools::catalog::Category;
     use render::{CapKind, CapabilityRow, SKILL_ORDER, ToolState};
@@ -703,10 +734,13 @@ async fn build_capabilities(
             }
             let key = format!("{}{ck}", crate::server::tools::mcp::MCP_ID_PREFIX);
             let state_tier = ToolState::from_row(states.get(&key).copied());
-            let description = c
-                .description
-                .clone()
-                .unwrap_or_else(|| format!("Tools bridged from the \"{}\" integration.", c.name));
+            let description = c.description.clone().unwrap_or_else(|| {
+                t_args(
+                    lang,
+                    "chat-mcp-bridged-description",
+                    &i18n::args([("name", c.name.clone().into())]),
+                )
+            });
             out.push(CapabilityRow {
                 key,
                 kind: CapKind::Tool,
@@ -766,6 +800,7 @@ pub async fn chat_fork(
         Err(resp) => return resp,
     };
     let datastar = is_datastar_request(req.headers());
+    let lang = Lang::from_headers(req.headers());
 
     // Recipient-only: the source must be readable (owner or shared) AND not
     // already owned by the viewer. Forking your own chat is a no-op — the
@@ -782,7 +817,7 @@ pub async fn chat_fork(
         }
         return sse_response(&[sse_toast(&super::Flash {
             kind: super::FlashKind::Info,
-            message: "This conversation is already in your chats.".into(),
+            message: t(lang, "chat-toast-already-in-your-chats"),
         })]);
     }
 
@@ -826,6 +861,7 @@ pub async fn chat_fork(
             true,
             impersonating,
             Theme::from_headers(req.headers()),
+            lang,
             NavSections::from_headers(req.headers()),
         )
         .await
@@ -846,12 +882,13 @@ pub async fn chat_message_send(
         Ok(s) => s,
         Err(resp) => return resp,
     };
+    let lang = Lang::from_headers(req.headers());
 
     // Make sure the user owns this session.
     let active = match chat::get_session(&state.db, &user.id, &session_id).await {
         Ok(Some(s)) => s,
         Ok(None) => {
-            return sse_error_response("Conversation not found.");
+            return sse_error_response(&t(lang, "chat-error-conversation-not-found"));
         }
         Err(err) => return sse_error_response(&err.to_string()),
     };
@@ -889,7 +926,7 @@ pub async fn chat_message_send(
         Err(msg) => return sse_error_response(&msg),
     };
     if submit.user_text.is_empty() && submit.attachments.is_empty() {
-        return sse_error_response("message can't be empty");
+        return sse_error_response(&t(lang, "chat-error-message-empty"));
     }
 
     // Build the final user_text: typed text + per-attachment marker
@@ -913,9 +950,7 @@ pub async fn chat_message_send(
     let worker = match outcome {
         RegisterOutcome::Registered { worker } => worker,
         RegisterOutcome::Busy { .. } => {
-            return sse_error_response(
-                "A response is still streaming for this user — wait for it or hit stop.",
-            );
+            return sse_error_response(&t(lang, "chat-error-still-streaming"));
         }
     };
 
@@ -1010,13 +1045,14 @@ pub async fn chat_message_send(
     // conversation.
     let initial_html = format!(
         "{}{}",
-        session_core::render::render_user_turn(&user_turn, Some("/chat")),
+        session_core::render::render_user_turn(&user_turn, Some("/chat"), lang),
         session_core::render::render_assistant_turn(
             &chat::TurnWithTools {
                 turn: assistant_turn.clone(),
                 tool_calls: Vec::new(),
             },
-            Some("/chat")
+            Some("/chat"),
+            lang
         )
     );
     let initial_patch = sse_patch(Some("#conversation"), Some("append"), &initial_html);
@@ -1027,8 +1063,9 @@ pub async fn chat_message_send(
         assistant_turn.id.clone(),
         broadcast_rx,
         Some(initial_patch),
-        gateway_sidebar_emitter(state.clone(), user.id.clone(), active.id.clone()),
+        gateway_sidebar_emitter(state.clone(), user.id.clone(), active.id.clone(), lang),
         Some("/chat".to_string()),
+        lang,
     )
 }
 
@@ -1045,6 +1082,7 @@ pub async fn chat_tail(
         Ok(s) => s,
         Err(resp) => return resp,
     };
+    let lang = Lang::from_headers(req.headers());
 
     // Confirm the session is readable (owned or shared) + that there's
     // actually a live worker for THIS session. Workers are keyed by the
@@ -1075,8 +1113,9 @@ pub async fn chat_tail(
         assistant_turn_id,
         broadcast_rx,
         None,
-        gateway_sidebar_emitter(state.clone(), user.id.clone(), session_id),
+        gateway_sidebar_emitter(state.clone(), user.id.clone(), session_id, lang),
         Some("/chat".to_string()),
+        lang,
     )
 }
 
@@ -1092,6 +1131,7 @@ pub async fn chat_document_view(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_session, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -1107,6 +1147,7 @@ pub async fn chat_document_view(
         &session_id,
         Some(&doc_id),
         version,
+        lang,
     )
     .await
     {
@@ -1179,15 +1220,21 @@ async fn load_owned_turn(
     user: &User,
     session_id: &str,
     turn_id: &str,
+    lang: Lang,
 ) -> Result<chat::Turn, Response> {
     match chat::get_session(&state.db, &user.id, session_id).await {
         Ok(Some(_)) => {}
-        Ok(None) => return Err(sse_error_response("Conversation not found.")),
+        Ok(None) => {
+            return Err(sse_error_response(&t(
+                lang,
+                "chat-error-conversation-not-found",
+            )));
+        }
         Err(err) => return Err(sse_error_response(&err.to_string())),
     }
     match chat::get_turn(&state.db, session_id, turn_id).await {
         Ok(Some(t)) => Ok(t),
-        Ok(None) => Err(sse_error_response("Message not found.")),
+        Ok(None) => Err(sse_error_response(&t(lang, "chat-error-message-not-found"))),
         Err(err) => Err(sse_error_response(&err.to_string())),
     }
 }
@@ -1201,6 +1248,7 @@ pub async fn chat_retry(
         Ok(s) => s,
         Err(resp) => return resp,
     };
+    let lang = Lang::from_headers(req.headers());
     let client_ip = crate::server::geoip::client_ip(req.headers())
         .or_else(|| crate::server::geoip::peer_ip(&req));
     let secure =
@@ -1215,12 +1263,12 @@ pub async fn chat_retry(
         Err(err) => return sse_error_response(&format!("malformed form: {err}")),
     };
 
-    let turn = match load_owned_turn(&state, &user, &id, &turn_id).await {
+    let turn = match load_owned_turn(&state, &user, &id, &turn_id, lang).await {
         Ok(t) => t,
         Err(resp) => return resp,
     };
     if turn.role != chat::TurnRole::Assistant {
-        return sse_error_response("Retry applies to assistant replies.");
+        return sse_error_response(&t(lang, "chat-error-retry-assistant-only"));
     }
     // Drop this reply + everything below, then regenerate from the
     // preceding user turn.
@@ -1233,6 +1281,7 @@ pub async fn chat_retry(
         id,
         form.model,
         RequestCtx { client_ip, secure },
+        lang,
     )
     .await
 }
@@ -1246,6 +1295,7 @@ pub async fn chat_edit(
         Ok(s) => s,
         Err(resp) => return resp,
     };
+    let lang = Lang::from_headers(req.headers());
     let client_ip = crate::server::geoip::client_ip(req.headers())
         .or_else(|| crate::server::geoip::peer_ip(&req));
     let secure =
@@ -1261,15 +1311,15 @@ pub async fn chat_edit(
     };
     let new_text = form.message.trim();
     if new_text.is_empty() {
-        return sse_error_response("Message must not be empty.");
+        return sse_error_response(&t(lang, "chat-error-message-must-not-be-empty"));
     }
 
-    let turn = match load_owned_turn(&state, &user, &id, &turn_id).await {
+    let turn = match load_owned_turn(&state, &user, &id, &turn_id, lang).await {
         Ok(t) => t,
         Err(resp) => return resp,
     };
     if turn.role != chat::TurnRole::User {
-        return sse_error_response("Edit applies to your own messages.");
+        return sse_error_response(&t(lang, "chat-error-edit-own-messages-only"));
     }
     // Rewrite the message, drop everything below it, regenerate.
     if let Err(err) = chat::update_user_turn_content(&state.db, &id, &turn_id, new_text).await {
@@ -1284,6 +1334,7 @@ pub async fn chat_edit(
         id,
         form.model,
         RequestCtx { client_ip, secure },
+        lang,
     )
     .await
 }
@@ -1372,6 +1423,7 @@ async fn start_regeneration(
     session_id: String,
     model: String,
     req: RequestCtx,
+    lang: Lang,
 ) -> Response {
     let assistant_turn_id = uuid::Uuid::new_v4().to_string();
     let worker = match state
@@ -1380,9 +1432,7 @@ async fn start_regeneration(
     {
         RegisterOutcome::Registered { worker } => worker,
         RegisterOutcome::Busy { .. } => {
-            return sse_error_response(
-                "A response is still streaming for this user — wait for it or hit stop.",
-            );
+            return sse_error_response(&t(lang, "chat-error-still-streaming"));
         }
     };
     let assistant_turn = match chat::create_assistant_turn_in_progress(
@@ -1421,8 +1471,8 @@ async fn start_regeneration(
         .await
         .unwrap_or_default();
     let mut inner = String::new();
-    for t in &turns {
-        inner.push_str(&session_core::render::render_turn(t, Some("/chat")).to_string());
+    for turn in &turns {
+        inner.push_str(&session_core::render::render_turn(turn, Some("/chat"), lang).to_string());
     }
     let initial_patch = sse_patch(Some("#conversation"), Some("inner"), &inner);
 
@@ -1432,8 +1482,9 @@ async fn start_regeneration(
         assistant_turn.id.clone(),
         broadcast_rx,
         Some(initial_patch),
-        gateway_sidebar_emitter(state.clone(), user.id.clone(), session_id),
+        gateway_sidebar_emitter(state.clone(), user.id.clone(), session_id, lang),
         Some("/chat".to_string()),
+        lang,
     )
 }
 
@@ -1450,6 +1501,7 @@ fn gateway_sidebar_emitter(
     state: Arc<RamaState>,
     user_id: String,
     session_id: String,
+    lang: Lang,
 ) -> SidebarEmitter {
     use rama::futures::sink::SinkExt;
 
@@ -1471,7 +1523,7 @@ fn gateway_sidebar_emitter(
                 title: session.title,
                 pinned: session.pinned,
             };
-            let html = super::render_sidebar_session(&sidebar, Some(&session.id)).to_string();
+            let html = super::render_sidebar_session(&sidebar, Some(&session.id), lang).to_string();
             let selector = format!("#session-row-{session_id}");
             let patch = sse_patch(Some(&selector), Some("outer"), &html);
             if tx.send(Ok(patch)).await.is_err() {
@@ -1689,6 +1741,7 @@ pub async fn chat_export_pdf(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (session, turns) = match load_exportable_chat(&state, &session_id, &req).await {
         Ok(pair) => pair,
         Err(resp) => return resp,
@@ -1701,13 +1754,13 @@ pub async fn chat_export_pdf(
         Ok(pdf) => download_response("application/pdf", &export_filename(&session, "pdf"), pdf),
         Err(crate::server::typst::CompileError::BinaryNotFound) => export_error(
             rama::http::StatusCode::SERVICE_UNAVAILABLE,
-            "PDF export unavailable: the typst CLI is not installed on the gateway",
+            &t(lang, "chat-error-pdf-export-unavailable"),
         ),
         Err(err) => {
             tracing::error!(error = %err, %session_id, "chat PDF export compile");
             export_error(
                 rama::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "PDF export failed",
+                &t(lang, "chat-error-pdf-export-failed"),
             )
         }
     }
@@ -1817,11 +1870,17 @@ pub async fn chat_attachment(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     // 401 (not redirect) — `<img src>` will just show broken-image
     // if the cookie went bad, and a 401 is honest in operator logs.
     let session = match state.sessions.lookup_from_headers(req.headers()).await {
         Ok(Some(s)) => s,
-        _ => return attachment_error(rama::http::StatusCode::UNAUTHORIZED, "auth required"),
+        _ => {
+            return attachment_error(
+                rama::http::StatusCode::UNAUTHORIZED,
+                &t(lang, "chat-error-auth-required"),
+            );
+        }
     };
     // Readable = the turn's session is owned by the caller OR shared. Mirrors
     // the chat-view gate so attachments in a shared conversation are
@@ -1834,27 +1893,39 @@ pub async fn chat_attachment(
                 requester = %session.user_id, %turn_id,
                 "rejected attachment fetch (not owner, not shared)",
             );
-            return attachment_error(rama::http::StatusCode::NOT_FOUND, "no such turn");
+            return attachment_error(
+                rama::http::StatusCode::NOT_FOUND,
+                &t(lang, "chat-error-no-such-turn"),
+            );
         }
         Err(err) => {
             tracing::warn!(error = %err, "turn_session_readable");
-            return attachment_error(rama::http::StatusCode::INTERNAL_SERVER_ERROR, "db error");
+            return attachment_error(
+                rama::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &t(lang, "chat-error-db-error"),
+            );
         }
     }
     let Some(cfg) = state.config.chat.s3.as_ref() else {
         return attachment_error(
             rama::http::StatusCode::SERVICE_UNAVAILABLE,
-            "chat attachments not configured",
+            &t(lang, "chat-error-attachments-not-configured"),
         );
     };
     let fetched = match chat_attachments::fetch(cfg, &turn_id, &filename).await {
         Ok(f) => f,
         Err(chat_attachments::AttachmentError::BadFilename(_)) => {
-            return attachment_error(rama::http::StatusCode::BAD_REQUEST, "bad filename");
+            return attachment_error(
+                rama::http::StatusCode::BAD_REQUEST,
+                &t(lang, "chat-error-bad-filename"),
+            );
         }
         Err(err) => {
             tracing::warn!(error = %err, %turn_id, %filename, "attachment fetch");
-            return attachment_error(rama::http::StatusCode::NOT_FOUND, "not found");
+            return attachment_error(
+                rama::http::StatusCode::NOT_FOUND,
+                &t(lang, "chat-error-attachment-not-found"),
+            );
         }
     };
     Response::builder()

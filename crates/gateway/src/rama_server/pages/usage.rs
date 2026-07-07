@@ -28,6 +28,7 @@ use serde::Deserialize;
 
 use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_session_or_redirect};
 use session_core::chrome::{NavSections, Theme, is_datastar_request};
+use session_core::i18n::{Lang, t};
 use session_core::icons;
 
 use crate::rama_server::state::RamaState;
@@ -52,6 +53,7 @@ struct UsageQuery {
 /// "All users" toggle (`?scope=all`) that widens it to the whole roster.
 pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_session_or_redirect(&state, &req).await {
@@ -92,11 +94,12 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
         .unwrap_or_default();
 
     let title = if show_all {
-        "Usage — all users — LLM Gateway"
+        t(lang, "usage-title-all")
     } else {
-        "Your usage — LLM Gateway"
+        t(lang, "usage-title-mine")
     };
     let body = render_body(
+        lang,
         admin,
         show_all,
         state.usage.is_enabled(),
@@ -109,9 +112,10 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
     nav_or_html_page(
         datastar,
         theme,
+        lang,
         nav,
         NavItem::Usage,
-        title,
+        &title,
         &user.email,
         admin,
         session.impersonator_id.is_some(),
@@ -121,19 +125,21 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
     )
 }
 
-/// Source filter options: `(value, label)`. Empty value = "all".
+/// Source filter options: `(value, i18n key)`. Empty value = "all".
 const SOURCE_OPTIONS: [(&str, &str); 4] = [
-    ("", "All sources"),
+    ("", "usage-source-all"),
     (
         // keep in sync with UsageSource::V1Api.as_str()
         "v1_api",
-        "API (/v1)",
+        "usage-source-api",
     ),
-    ("chat", "Chat UI"),
-    ("scheduled", "Scheduled"),
+    ("chat", "usage-source-chat"),
+    ("scheduled", "usage-source-scheduled"),
 ];
 
+#[allow(clippy::too_many_arguments)]
 fn render_body(
+    lang: Lang,
     admin: bool,
     show_all: bool,
     metrics_on: bool,
@@ -143,18 +149,14 @@ fn render_body(
     agg: &Aggregates,
 ) -> Html {
     let heading = if show_all {
-        "Usage — all users"
+        t(lang, "usage-heading-all")
     } else {
-        "Your usage"
+        t(lang, "usage-heading-mine")
     };
     let blurb = if show_all {
-        "Per-user and per-backend request volume and token usage across every \
-         access method. \u{201c}Requests\u{201d} counts upstream backend calls, so a \
-         tool-using turn (which makes several round-trips) counts as more than one."
+        t(lang, "usage-blurb-all")
     } else {
-        "Your request volume and token usage across the chat UI, the API, and \
-         scheduled actions. \u{201c}Requests\u{201d} counts upstream backend calls, so a \
-         tool-using turn counts as more than one."
+        t(lang, "usage-blurb-mine")
     };
 
     // When metrics are switched off (`[usage].enabled = false`), the page
@@ -167,33 +169,53 @@ fn render_body(
             div(class: "alert alert-warning") {
                 (icons::alert(18))
                 span {
-                    "Usage metrics are disabled ("
+                    (t(lang, "usage-metrics-disabled-prefix"))
                     code(class: "text-xs") { "[usage].enabled = false" }
-                    "). Figures below reflect only data recorded before it was turned off."
+                    (t(lang, "usage-metrics-disabled-suffix"))
                 }
             }
         }
         .to_html()
     };
 
-    let filter_bar = render_filter_bar(period, filter, backends, show_all);
+    let filter_bar = render_filter_bar(lang, period, filter, backends, show_all);
     // Empty fragment for non-admins (no "All users" toggle).
     let scope_toggle = if admin {
-        render_scope_toggle(show_all, period, filter)
+        render_scope_toggle(lang, show_all, period, filter)
     } else {
         html! {}.to_html()
     };
-    let stats = render_stats(show_all, &agg.summary);
+    let stats = render_stats(lang, show_all, &agg.summary);
 
     // The all-users view gets a leading per-user table; everyone gets the
     // dimension splits.
     let mut tables: Vec<Html> = Vec::new();
     if show_all {
-        tables.push(render_table("By user", "User", &agg.by_user));
+        tables.push(render_table(
+            lang,
+            "usage-table-by-user",
+            "usage-key-user",
+            &agg.by_user,
+        ));
     }
-    tables.push(render_table("By backend", "Backend", &agg.by_backend));
-    tables.push(render_table("By source", "Source", &agg.by_source));
-    tables.push(render_table("By model", "Model", &agg.by_model));
+    tables.push(render_table(
+        lang,
+        "usage-table-by-backend",
+        "usage-key-backend",
+        &agg.by_backend,
+    ));
+    tables.push(render_table(
+        lang,
+        "usage-table-by-source",
+        "usage-key-source",
+        &agg.by_source,
+    ));
+    tables.push(render_table(
+        lang,
+        "usage-table-by-model",
+        "usage-key-model",
+        &agg.by_model,
+    ));
 
     html! {
         section(class: "max-w-5xl mx-auto p-4 sm:p-6 flex flex-col gap-4") {
@@ -238,7 +260,7 @@ fn usage_href(scope_all: bool, period: Period, filter: &Filter) -> String {
 /// Admin-only segmented toggle between the caller's own usage and the
 /// whole-roster view. Each side is a link preserving the current filters,
 /// so flipping scope doesn't reset the period/source/backend.
-fn render_scope_toggle(show_all: bool, period: Period, filter: &Filter) -> Html {
+fn render_scope_toggle(lang: Lang, show_all: bool, period: Period, filter: &Filter) -> Html {
     let mine_href = usage_href(false, period, filter);
     let all_href = usage_href(true, period, filter);
     let mine_class = if show_all {
@@ -251,10 +273,12 @@ fn render_scope_toggle(show_all: bool, period: Period, filter: &Filter) -> Html 
     } else {
         "join-item btn btn-sm"
     };
+    let mine_label = t(lang, "usage-toggle-mine");
+    let all_label = t(lang, "usage-toggle-all");
     html! {
         div(class: "join") {
-            a(href: (mine_href), class: (mine_class), "data-on:click__prevent": (super::nav_get_directive(&mine_href))) { "Mine" }
-            a(href: (all_href), class: (all_class), "data-on:click__prevent": (super::nav_get_directive(&all_href))) { "All users" }
+            a(href: (mine_href), class: (mine_class), "data-on:click__prevent": (super::nav_get_directive(&mine_href))) { (mine_label) }
+            a(href: (all_href), class: (all_class), "data-on:click__prevent": (super::nav_get_directive(&all_href))) { (all_label) }
         }
     }
     .to_html()
@@ -272,7 +296,13 @@ fn opt(value: &str, label: &str, selected: bool) -> Html {
     }
 }
 
-fn render_filter_bar(period: Period, filter: &Filter, backends: &[String], show_all: bool) -> Html {
+fn render_filter_bar(
+    lang: Lang,
+    period: Period,
+    filter: &Filter,
+    backends: &[String],
+    show_all: bool,
+) -> Html {
     let cur_source = filter.source.clone().unwrap_or_default();
     let cur_backend = filter.backend.clone().unwrap_or_default();
     // Native GET submit on change — no datastar dependency; the URL fully
@@ -285,99 +315,116 @@ fn render_filter_bar(period: Period, filter: &Filter, backends: &[String], show_
         .collect();
     let source_opts: Vec<Html> = SOURCE_OPTIONS
         .iter()
-        .map(|(value, label)| opt(value, label, *value == cur_source))
+        .map(|(value, key)| opt(value, &t(lang, key), *value == cur_source))
         .collect();
-    let mut backend_opts: Vec<Html> = vec![opt("", "All backends", cur_backend.is_empty())];
+    let all_backends_label = t(lang, "usage-backend-all");
+    let mut backend_opts: Vec<Html> = vec![opt("", &all_backends_label, cur_backend.is_empty())];
     for b in backends {
         backend_opts.push(opt(b, b, *b == cur_backend));
     }
     // Preserve the admin "all users" scope across filter changes (the
     // form's GET would otherwise drop it). Empty for the self view.
     let scope_value = if show_all { "all" } else { "" };
+    let period_label = t(lang, "usage-filter-period");
+    let source_label = t(lang, "usage-filter-source");
+    let backend_label = t(lang, "usage-filter-backend");
+    let apply_label = t(lang, "usage-apply");
 
     html! {
         form(method: "get", action: "/usage", class: "flex flex-wrap items-end gap-3") {
             input(type: "hidden", name: "scope", value: (scope_value));
             label(class: "form-control") {
-                span(class: "label-text text-xs text-base-content/60") { "Period" }
+                span(class: "label-text text-xs text-base-content/60") { (period_label) }
                 select(name: "period", class: "select select-bordered select-sm", "data-on:change": (on_change)) {
                     for o in period_opts.iter() { (o.clone()) }
                 }
             }
             label(class: "form-control") {
-                span(class: "label-text text-xs text-base-content/60") { "Source" }
+                span(class: "label-text text-xs text-base-content/60") { (source_label) }
                 select(name: "source", class: "select select-bordered select-sm", "data-on:change": (on_change)) {
                     for o in source_opts.iter() { (o.clone()) }
                 }
             }
             label(class: "form-control") {
-                span(class: "label-text text-xs text-base-content/60") { "Backend" }
+                span(class: "label-text text-xs text-base-content/60") { (backend_label) }
                 select(name: "backend", class: "select select-bordered select-sm", "data-on:change": (on_change)) {
                     for o in backend_opts.iter() { (o.clone()) }
                 }
             }
             // Fallback for clients without JS: an explicit apply.
             noscript {
-                button(type: "submit", class: "btn btn-sm btn-primary") { "Apply" }
+                button(type: "submit", class: "btn btn-sm btn-primary") { (apply_label) }
             }
         }
     }
     .to_html()
 }
 
-fn render_stats(show_all: bool, s: &usage::Summary) -> Html {
+fn render_stats(lang: Lang, show_all: bool, s: &usage::Summary) -> Html {
     let requests = fmt_int(s.requests);
     let tokens = fmt_int(s.total_tokens);
     let errors = fmt_int(s.errors);
     let users = fmt_int(s.unique_users);
+    let requests_title = t(lang, "usage-stat-requests-title");
+    let requests_desc = t(lang, "usage-stat-requests-desc");
+    let tokens_title = t(lang, "usage-stat-tokens-title");
+    let tokens_desc = t(lang, "usage-stat-tokens-desc");
+    let users_title = t(lang, "usage-stat-users-title");
+    let users_desc = t(lang, "usage-stat-users-desc");
+    let errors_title = t(lang, "usage-stat-errors-title");
+    let errors_desc = t(lang, "usage-stat-errors-desc");
     html! {
         div(class: "stats stats-vertical sm:stats-horizontal shadow bg-base-100 border border-base-300 w-full") {
             div(class: "stat") {
-                div(class: "stat-title") { "Requests" }
+                div(class: "stat-title") { (requests_title) }
                 div(class: "stat-value text-2xl tabular-nums") { (requests) }
-                div(class: "stat-desc") { "upstream backend calls" }
+                div(class: "stat-desc") { (requests_desc) }
             }
             div(class: "stat") {
-                div(class: "stat-title") { "Tokens" }
+                div(class: "stat-title") { (tokens_title) }
                 div(class: "stat-value text-2xl tabular-nums") { (tokens) }
-                div(class: "stat-desc") { "prompt + completion" }
+                div(class: "stat-desc") { (tokens_desc) }
             }
             if show_all {
                 div(class: "stat") {
-                    div(class: "stat-title") { "Users" }
+                    div(class: "stat-title") { (users_title) }
                     div(class: "stat-value text-2xl tabular-nums") { (users) }
-                    div(class: "stat-desc") { "active in range" }
+                    div(class: "stat-desc") { (users_desc) }
                 }
             }
             div(class: "stat") {
-                div(class: "stat-title") { "Errors" }
+                div(class: "stat-title") { (errors_title) }
                 div(class: "stat-value text-2xl tabular-nums") { (errors) }
-                div(class: "stat-desc") { "status \u{2265} 400" }
+                div(class: "stat-desc") { (errors_desc) }
             }
         }
     }
     .to_html()
 }
 
-fn render_table(title: &str, key_header: &str, rows: &[GroupCount]) -> Html {
-    let title = title.to_string();
-    let key_header = key_header.to_string();
+fn render_table(lang: Lang, title_key: &str, key_header_key: &str, rows: &[GroupCount]) -> Html {
+    let title = t(lang, title_key);
+    let key_header = t(lang, key_header_key);
+    let no_activity = t(lang, "usage-no-activity");
+    let col_requests = t(lang, "usage-col-requests");
+    let col_tokens = t(lang, "usage-col-tokens");
+    let col_errors = t(lang, "usage-col-errors");
     let body: Vec<Html> = rows.iter().map(render_row).collect();
     html! {
         div(class: "card border border-base-300 bg-base-100") {
             div(class: "card-body gap-2 p-4") {
                 h2(class: "card-title text-base") { (title) }
                 if rows.is_empty() {
-                    p(class: "text-base-content/60 text-sm") { "No activity in this range." }
+                    p(class: "text-base-content/60 text-sm") { (no_activity) }
                 } else {
                     div(class: "overflow-x-auto") {
                         table(class: "table table-sm") {
                             thead {
                                 tr {
                                     th { (key_header) }
-                                    th(class: "text-right") { "Requests" }
-                                    th(class: "text-right") { "Tokens" }
-                                    th(class: "text-right") { "Errors" }
+                                    th(class: "text-right") { (col_requests) }
+                                    th(class: "text-right") { (col_tokens) }
+                                    th(class: "text-right") { (col_errors) }
                                 }
                             }
                             tbody {

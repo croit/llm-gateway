@@ -33,6 +33,7 @@ use session_core::chrome::{
     Flash, FlashKind, NavSections, Theme, is_datastar_request, sse_patch, sse_response, sse_script,
     sse_toast,
 };
+use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use crate::rama_server::state::RamaState;
@@ -75,16 +76,22 @@ impl ScheduleFields {
     /// Assemble the 5-field cron string this builder describes, or a
     /// user-facing error. The friendly modes are valid by construction;
     /// Advanced is whatever the user typed, validated by the caller.
-    fn assemble_cron(&self) -> Result<String, String> {
-        let minute = parse_in_range(self.minute.as_deref(), 0, 59, "minute")?;
-        let hour = parse_in_range(self.hour.as_deref(), 0, 23, "hour")?;
+    fn assemble_cron(&self, lang: Lang) -> Result<String, String> {
+        let minute = parse_in_range(
+            self.minute.as_deref(),
+            0,
+            59,
+            "scheduled-field-minute",
+            lang,
+        )?;
+        let hour = parse_in_range(self.hour.as_deref(), 0, 23, "scheduled-field-hour", lang)?;
         match self.mode.as_str() {
             "hourly" => Ok(format!("{minute} * * * *")),
             "daily" => Ok(format!("{minute} {hour} * * *")),
             "weekly" => {
                 let days = self.weekdays();
                 if days.is_empty() {
-                    return Err("Pick at least one weekday.".to_string());
+                    return Err(t(lang, "scheduled-err-pick-weekday"));
                 }
                 let days = days
                     .iter()
@@ -94,17 +101,27 @@ impl ScheduleFields {
                 Ok(format!("{minute} {hour} * * {days}"))
             }
             "monthly" => {
-                let dom = parse_in_range(self.dom.as_deref(), 1, 31, "day of month")?;
+                let dom = parse_in_range(
+                    self.dom.as_deref(),
+                    1,
+                    31,
+                    "scheduled-field-day-of-month",
+                    lang,
+                )?;
                 Ok(format!("{minute} {hour} {dom} * *"))
             }
             "advanced" => {
                 let raw = self.advanced.as_deref().unwrap_or("").trim().to_string();
                 if raw.is_empty() {
-                    return Err("Enter a cron expression.".to_string());
+                    return Err(t(lang, "scheduled-err-enter-cron"));
                 }
                 Ok(raw)
             }
-            other => Err(format!("Unknown schedule type `{other}`.")),
+            other => Err(t_args(
+                lang,
+                "scheduled-err-unknown-schedule-type",
+                &i18n::args([("kind", other.to_string().into())]),
+            )),
         }
     }
 }
@@ -146,14 +163,42 @@ struct PreviewForm {
     schedule: ScheduleFields,
 }
 
-fn parse_in_range(v: Option<&str>, min: u8, max: u8, name: &str) -> Result<u8, String> {
+fn parse_in_range(
+    v: Option<&str>,
+    min: u8,
+    max: u8,
+    field_key: &str,
+    lang: Lang,
+) -> Result<u8, String> {
     let v = v.unwrap_or("").trim();
+    let field = t(lang, field_key);
     if v.is_empty() {
-        return Err(format!("Enter a {name}."));
+        return Err(t_args(
+            lang,
+            "scheduled-err-enter-field",
+            &i18n::args([("field", field.into())]),
+        ));
     }
-    let n: u8 = v.parse().map_err(|_| format!("Invalid {name}: {v}."))?;
+    let n: u8 = v.parse().map_err(|_| {
+        t_args(
+            lang,
+            "scheduled-err-invalid-field",
+            &i18n::args([
+                ("field", field.clone().into()),
+                ("value", v.to_string().into()),
+            ]),
+        )
+    })?;
     if n < min || n > max {
-        return Err(format!("{name} must be {min}–{max}."));
+        return Err(t_args(
+            lang,
+            "scheduled-err-field-range",
+            &i18n::args([
+                ("field", field.into()),
+                ("min", min.to_string().into()),
+                ("max", max.to_string().into()),
+            ]),
+        ));
     }
     Ok(n)
 }
@@ -170,6 +215,7 @@ fn resolve_tz(name: &str) -> TimeZone {
 /// GET /scheduled — the management page: a builder form + the user's list.
 pub async fn scheduled_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_session_or_redirect(&state, &req).await {
@@ -185,14 +231,15 @@ pub async fn scheduled_index(State(state): State<Arc<RamaState>>, req: Request) 
     };
     let models = list_models(&state).await;
     let default_tz = user.timezone.clone().unwrap_or_else(|| "UTC".to_string());
-    let body = render_index_body(&actions, &models, &default_tz);
+    let body = render_index_body(&actions, &models, &default_tz, lang);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     nav_or_html_page(
         datastar,
         theme,
+        lang,
         nav,
         NavItem::Scheduled,
-        "Scheduled actions — LLM Gateway",
+        &t(lang, "scheduled-page-title"),
         &user.email,
         is_admin(&state, &user),
         session.impersonator_id.is_some(),
@@ -204,6 +251,7 @@ pub async fn scheduled_index(State(state): State<Arc<RamaState>>, req: Request) 
 
 /// POST /scheduled — create from the builder form.
 pub async fn scheduled_create(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -220,6 +268,7 @@ pub async fn scheduled_create(State(state): State<Arc<RamaState>>, req: Request)
         &form.model,
         &form.timezone,
         &form.schedule,
+        lang,
     ) {
         Ok(p) => p,
         Err(msg) => return toast(FlashKind::Error, msg),
@@ -241,11 +290,11 @@ pub async fn scheduled_create(State(state): State<Arc<RamaState>>, req: Request)
         Ok(a) => a,
         Err(err) => {
             tracing::warn!(error = %err, "creating scheduled action");
-            return toast(FlashKind::Error, "Could not save the schedule.");
+            return toast(FlashKind::Error, t(lang, "scheduled-toast-save-failed"));
         }
     };
 
-    let row_html = render_action_row(&created).to_string();
+    let row_html = render_action_row(&created, lang).to_string();
     // Reset the form, then re-sync the builder: `form.reset()` restores the
     // default-checked mode radio but doesn't touch datastar's `$mode` signal,
     // so without this the panel + preview would stay on the just-submitted
@@ -265,7 +314,7 @@ pub async fn scheduled_create(State(state): State<Arc<RamaState>>, req: Request)
         sse_script(reset_script),
         sse_toast(&Flash {
             kind: FlashKind::Success,
-            message: "Scheduled action created.".into(),
+            message: t(lang, "scheduled-toast-created"),
         }),
     ])
 }
@@ -277,6 +326,7 @@ pub async fn scheduled_edit_form(
     req: Request,
 ) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_session_or_redirect(&state, &req).await {
@@ -292,14 +342,15 @@ pub async fn scheduled_edit_form(
         }
     };
     let models = list_models(&state).await;
-    let body = render_edit_body(&action, &models);
+    let body = render_edit_body(&action, &models, lang);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     nav_or_html_page(
         datastar,
         theme,
+        lang,
         nav,
         NavItem::Scheduled,
-        "Edit scheduled action — LLM Gateway",
+        &t(lang, "scheduled-edit-page-title"),
         &user.email,
         is_admin(&state, &user),
         session.impersonator_id.is_some(),
@@ -316,6 +367,7 @@ pub async fn scheduled_update(
     Path(id): Path<String>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -331,6 +383,7 @@ pub async fn scheduled_update(
         &form.model,
         &form.timezone,
         &form.schedule,
+        lang,
     ) {
         Ok(p) => p,
         Err(msg) => return toast(FlashKind::Error, msg),
@@ -360,14 +413,14 @@ pub async fn scheduled_update(
         Ok(true) => sse_response(&[
             sse_toast(&Flash {
                 kind: FlashKind::Success,
-                message: "Schedule updated.".into(),
+                message: t(lang, "scheduled-toast-updated"),
             }),
             sse_script("window.location.assign('/scheduled')"),
         ]),
-        Ok(false) => toast(FlashKind::Error, "No such scheduled action."),
+        Ok(false) => toast(FlashKind::Error, t(lang, "scheduled-toast-not-found")),
         Err(err) => {
             tracing::warn!(error = %err, "updating scheduled action");
-            toast(FlashKind::Error, "Could not update the schedule.")
+            toast(FlashKind::Error, t(lang, "scheduled-toast-update-failed"))
         }
     }
 }
@@ -379,16 +432,17 @@ pub async fn scheduled_toggle(
     Path(id): Path<String>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
     let action = match scheduled::get(&state.db, &user.id, &id).await {
         Ok(Some(a)) => a,
-        Ok(None) => return toast(FlashKind::Error, "No such scheduled action."),
+        Ok(None) => return toast(FlashKind::Error, t(lang, "scheduled-toast-not-found")),
         Err(err) => {
             tracing::warn!(error = %err, "toggling scheduled action");
-            return toast(FlashKind::Error, "Could not update the schedule.");
+            return toast(FlashKind::Error, t(lang, "scheduled-toast-update-failed"));
         }
     };
     let resume = !action.enabled;
@@ -401,27 +455,27 @@ pub async fn scheduled_toggle(
     };
     if let Err(err) = scheduled::set_enabled(&state.db, &user.id, &id, resume, next).await {
         tracing::warn!(error = %err, "toggling scheduled action");
-        return toast(FlashKind::Error, "Could not update the schedule.");
+        return toast(FlashKind::Error, t(lang, "scheduled-toast-update-failed"));
     }
     // Re-render the row fresh from the DB so the badge + next-run line and
     // the pause/resume button reflect the new state.
     match scheduled::get(&state.db, &user.id, &id).await {
         Ok(Some(updated)) => {
             let selector = format!("#sched-row-{id}");
-            let row_html = render_action_row(&updated).to_string();
+            let row_html = render_action_row(&updated, lang).to_string();
             sse_response(&[
                 sse_patch(Some(&selector), Some("outer"), &row_html),
                 sse_toast(&Flash {
                     kind: FlashKind::Success,
                     message: if resume {
-                        "Schedule resumed.".into()
+                        t(lang, "scheduled-toast-resumed")
                     } else {
-                        "Schedule paused.".into()
+                        t(lang, "scheduled-toast-paused")
                     },
                 }),
             ])
         }
-        _ => toast(FlashKind::Error, "Could not refresh the schedule."),
+        _ => toast(FlashKind::Error, t(lang, "scheduled-toast-refresh-failed")),
     }
 }
 
@@ -431,6 +485,7 @@ pub async fn scheduled_delete(
     Path(id): Path<String>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -442,14 +497,14 @@ pub async fn scheduled_delete(
                 sse_patch(Some(&selector), Some("remove"), ""),
                 sse_toast(&Flash {
                     kind: FlashKind::Success,
-                    message: "Scheduled action deleted.".into(),
+                    message: t(lang, "scheduled-toast-deleted"),
                 }),
             ])
         }
-        Ok(false) => toast(FlashKind::Info, "Already gone."),
+        Ok(false) => toast(FlashKind::Info, t(lang, "scheduled-toast-already-gone")),
         Err(err) => {
             tracing::warn!(error = %err, "deleting scheduled action");
-            toast(FlashKind::Error, "Could not delete the schedule.")
+            toast(FlashKind::Error, t(lang, "scheduled-toast-delete-failed"))
         }
     }
 }
@@ -457,6 +512,7 @@ pub async fn scheduled_delete(
 /// POST /scheduled/preview — the live summary + next-runs for the current
 /// builder state. Returns an SSE patch of `#schedule-preview`.
 pub async fn scheduled_preview(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if require_session_or_redirect(&state, &req).await.is_err() {
         // Don't redirect a fetch; just send an empty patch.
         return sse_response(&[sse_patch(Some("#schedule-preview"), Some("inner"), "")]);
@@ -466,8 +522,8 @@ pub async fn scheduled_preview(State(state): State<Arc<RamaState>>, req: Request
         Ok(f) => f,
         Err(resp) => return resp,
     };
-    let html = match form.schedule.assemble_cron() {
-        Ok(cron) => render_preview(&cron, &form.timezone),
+    let html = match form.schedule.assemble_cron(lang) {
+        Ok(cron) => render_preview(&cron, &form.timezone, lang),
         Err(msg) => render_preview_error(&msg),
     };
     sse_response(&[sse_patch(
@@ -497,24 +553,29 @@ fn prepare(
     model: &str,
     timezone: &str,
     schedule: &ScheduleFields,
+    lang: Lang,
 ) -> Result<Prepared, String> {
     let name = name.trim();
     if name.is_empty() || name.len() > 128 {
-        return Err("Name must be 1–128 characters.".to_string());
+        return Err(t(lang, "scheduled-err-name-length"));
     }
     let prompt = prompt.trim();
     if prompt.is_empty() || prompt.len() > 8000 {
-        return Err("Prompt must be 1–8000 characters.".to_string());
+        return Err(t(lang, "scheduled-err-prompt-length"));
     }
     let model = model.trim();
     if model.is_empty() {
-        return Err("Pick a model.".to_string());
+        return Err(t(lang, "scheduled-err-pick-model"));
     }
     let timezone = timezone.trim();
     if TimeZone::get(timezone).is_err() {
-        return Err(format!("Unknown timezone `{timezone}`."));
+        return Err(t_args(
+            lang,
+            "scheduled-err-unknown-timezone",
+            &i18n::args([("tz", timezone.to_string().into())]),
+        ));
     }
-    let cron = schedule.assemble_cron()?;
+    let cron = schedule.assemble_cron(lang)?;
     let parsed = Cron::parse(&cron).map_err(|e| e.to_string())?;
     let next_run_at = parsed.next_after(Timestamp::now(), &resolve_tz(timezone));
     Ok(Prepared {
@@ -549,12 +610,24 @@ async fn list_models(state: &RamaState) -> Vec<ModelOption> {
         .collect()
 }
 
-fn model_label(m: &ModelOption) -> String {
+fn model_label(m: &ModelOption, lang: Lang) -> String {
     match (m.gdpr, m.nda) {
         (true, true) => m.id.clone(),
-        (false, true) => format!("{} (non-GDPR)", m.id),
-        (true, false) => format!("{} (confidential-restricted)", m.id),
-        (false, false) => format!("{} (non-GDPR, confidential-restricted)", m.id),
+        (false, true) => t_args(
+            lang,
+            "scheduled-model-non-gdpr",
+            &i18n::args([("model", m.id.clone().into())]),
+        ),
+        (true, false) => t_args(
+            lang,
+            "scheduled-model-nda-restricted",
+            &i18n::args([("model", m.id.clone().into())]),
+        ),
+        (false, false) => t_args(
+            lang,
+            "scheduled-model-non-gdpr-nda-restricted",
+            &i18n::args([("model", m.id.clone().into())]),
+        ),
     }
 }
 
@@ -680,30 +753,29 @@ fn render_index_body(
     actions: &[ScheduledAction],
     models: &[ModelOption],
     default_tz: &str,
+    lang: Lang,
 ) -> Html {
     let init = BuilderInit::defaults(default_tz);
     html! {
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
-            h1(class: "text-2xl font-bold mb-2") { "Scheduled actions" }
+            h1(class: "text-2xl font-bold mb-2") { (t(lang, "scheduled-heading")) }
             p(class: "text-base-content/60 text-sm mb-6") {
-                "Run a prompt automatically on a schedule. Each run opens as a "
-                "new chat you can read here — pick a model, write the prompt, and "
-                "choose when it should run."
+                (t(lang, "scheduled-intro"))
             }
 
-            (render_form("/scheduled", "sched-create-form", "Create scheduled action", None, models, &init))
+            (render_form("/scheduled", "sched-create-form", &t(lang, "scheduled-create-submit"), None, models, &init, lang))
 
             section(class: "card border border-base-300") {
                 div(class: "card-body") {
-                    h2(class: "card-title") { "Your scheduled actions" }
+                    h2(class: "card-title") { (t(lang, "scheduled-list-heading")) }
                     ul(id: "sched-list", class: "sched-list flex flex-col divide-y divide-base-300") {
                         for a in actions.iter() {
-                            (render_action_row(a))
+                            (render_action_row(a, lang))
                         }
                     }
                     if actions.is_empty() {
                         p(class: "text-base-content/60 text-sm") {
-                            "No scheduled actions yet. Create one above."
+                            (t(lang, "scheduled-list-empty"))
                         }
                     }
                 }
@@ -713,7 +785,7 @@ fn render_index_body(
     .to_html()
 }
 
-fn render_edit_body(action: &ScheduledAction, models: &[ModelOption]) -> Html {
+fn render_edit_body(action: &ScheduledAction, models: &[ModelOption], lang: Lang) -> Html {
     let init = BuilderInit::from_cron(&action.cron, &action.timezone);
     html! {
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
@@ -723,17 +795,18 @@ fn render_edit_body(action: &ScheduledAction, models: &[ModelOption]) -> Html {
                     class: "btn btn-ghost btn-sm",
                     "data-on:click__prevent": "@get('/scheduled')"
                 ) {
-                    (icons::chevron_left(16)) "Back"
+                    (icons::chevron_left(16)) (t(lang, "scheduled-back"))
                 }
-                h1(class: "text-2xl font-bold") { "Edit scheduled action" }
+                h1(class: "text-2xl font-bold") { (t(lang, "scheduled-edit-heading")) }
             }
             (render_form(
                 &format!("/scheduled/{}", action.id),
                 "sched-edit-form",
-                "Save changes",
+                &t(lang, "scheduled-save-submit"),
                 Some(action),
                 models,
                 &init,
+                lang,
             ))
         }
     }
@@ -749,6 +822,7 @@ fn render_form(
     action: Option<&ScheduledAction>,
     models: &[ModelOption],
     init: &BuilderInit,
+    lang: Lang,
 ) -> Html {
     let models_empty = models.is_empty();
     let selected_model = action
@@ -769,7 +843,7 @@ fn render_form(
     let submit_directive = format!("@post('{post_url}', {{contentType: 'form'}})");
     let model_opts: Vec<(String, String, bool)> = models
         .iter()
-        .map(|m| (m.id.clone(), model_label(m), m.id == selected_model))
+        .map(|m| (m.id.clone(), model_label(m, lang), m.id == selected_model))
         .collect();
     let post_url_owned = post_url.to_string();
     let submit_label = submit_label.to_string();
@@ -794,28 +868,28 @@ fn render_form(
             div(class: "card-body gap-4") {
                 // --- Name ---
                 label(class: "form-control w-full") {
-                    div(class: "label") { span(class: "label-text") { "Name" } }
+                    div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-name-label")) } }
                     input(
                         name: "name",
                         type: "text",
                         required: "required",
                         maxlength: "128",
                         value: (name_val),
-                        placeholder: "e.g. Daily news digest",
+                        placeholder: (t(lang, "scheduled-name-placeholder")),
                         class: "input input-bordered w-full"
                     );
                 }
 
                 // --- Model + compliance banner ---
                 label(class: "form-control w-full") {
-                    div(class: "label") { span(class: "label-text") { "Model" } }
+                    div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-model-label")) } }
                     if models_empty {
                         input(
                             name: "model",
                             type: "text",
                             required: "required",
                             value: (selected_model.clone()),
-                            placeholder: "model id (e.g. gpt-4o-mini)",
+                            placeholder: (t(lang, "scheduled-model-placeholder")),
                             class: "input input-bordered w-full"
                         );
                     } else {
@@ -853,8 +927,7 @@ fn render_form(
                     ) {
                         (icons::alert(20))
                         span {
-                            "This model is not GDPR-compliant. Scheduled runs will "
-                            "send your prompt to it automatically — avoid personal data."
+                            (t(lang, "scheduled-gdpr-warning"))
                         }
                     }
                 }
@@ -867,27 +940,26 @@ fn render_form(
                     ) {
                         (icons::alert(20))
                         span {
-                            "This model is not covered by a confidentiality agreement. "
-                            "Don't schedule NDA-protected or proprietary material to it."
+                            (t(lang, "scheduled-nda-warning"))
                         }
                     }
                 }
 
                 // --- Prompt ---
                 label(class: "form-control w-full") {
-                    div(class: "label") { span(class: "label-text") { "Prompt" } }
+                    div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-prompt-label")) } }
                     textarea(
                         name: "prompt",
                         required: "required",
                         rows: "4",
                         maxlength: "8000",
-                        placeholder: "What should the model do each time it runs?",
+                        placeholder: (t(lang, "scheduled-prompt-placeholder")),
                         class: "textarea textarea-bordered w-full"
                     ) { (prompt_val) }
                 }
 
                 // --- Schedule builder ---
-                (render_schedule_builder(init))
+                (render_schedule_builder(init, lang))
 
                 // --- Tools toggle ---
                 label(class: "label cursor-pointer justify-start gap-3") {
@@ -897,7 +969,7 @@ fn render_form(
                         input(type: "checkbox", name: "tools", class: "checkbox checkbox-sm");
                     }
                     span(class: "label-text") {
-                        "Allow tools (web search, RAG, attachments) — same as in chat"
+                        (t(lang, "scheduled-tools-toggle-label"))
                     }
                 }
 
@@ -921,21 +993,21 @@ fn render_form(
                             );
                         }
                         span(class: "label-text") {
-                            "Reuse the previous run's chat — each run continues the same conversation"
+                            (t(lang, "scheduled-reuse-toggle-label"))
                         }
                     }
                     label(class: "flex items-center gap-2 text-sm", "data-show": "$reuse") {
-                        span(class: "label-text opacity-70") { "send last" }
+                        span(class: "label-text opacity-70") { (t(lang, "scheduled-reuse-rounds-prefix")) }
                         input(
                             name: "reuse_rounds",
                             type: "number",
                             min: "1",
                             max: "50",
                             value: (reuse_rounds_val),
-                            "aria-label": "Rounds of history to replay",
+                            "aria-label": (t(lang, "scheduled-reuse-rounds-aria")),
                             class: "input input-bordered input-sm w-20"
                         );
-                        span(class: "label-text opacity-70") { "rounds" }
+                        span(class: "label-text opacity-70") { (t(lang, "scheduled-reuse-rounds-suffix")) }
                     }
                 }
 
@@ -958,43 +1030,43 @@ const PREVIEW_REFRESH: &str = "@post('/scheduled/preview', {contentType: 'form'}
 
 /// The Repeat selector + per-mode sub-panels + live preview. Every change
 /// reposts `/scheduled/preview`, which patches `#schedule-preview`.
-fn render_schedule_builder(init: &BuilderInit) -> Html {
+fn render_schedule_builder(init: &BuilderInit, lang: Lang) -> Html {
     let signals = format!(
         "{{mode: {}}}",
         serde_json::to_string(&init.mode).unwrap_or_else(|_| "\"daily\"".into())
     );
     let weekdays = init.weekdays.clone();
     // Mon-first display order, mapped to cron numbering (Sun = 0).
-    let day_cells: Vec<(u8, &str)> = vec![
-        (1, "Mon"),
-        (2, "Tue"),
-        (3, "Wed"),
-        (4, "Thu"),
-        (5, "Fri"),
-        (6, "Sat"),
-        (0, "Sun"),
+    let day_cells: Vec<(u8, String)> = vec![
+        (1, t(lang, "scheduled-weekday-mon")),
+        (2, t(lang, "scheduled-weekday-tue")),
+        (3, t(lang, "scheduled-weekday-wed")),
+        (4, t(lang, "scheduled-weekday-thu")),
+        (5, t(lang, "scheduled-weekday-fri")),
+        (6, t(lang, "scheduled-weekday-sat")),
+        (0, t(lang, "scheduled-weekday-sun")),
     ];
     let minute_str = format!("{:02}", init.minute);
     let hour_str = format!("{:02}", init.hour);
     let dom_str = init.dom.to_string();
     let advanced_str = init.advanced.clone();
     let tz_str = init.timezone.clone();
-    let initial_preview = render_preview(&init.advanced_raw, &init.timezone);
+    let initial_preview = render_preview(&init.advanced_raw, &init.timezone, lang);
 
     // The outer div owns the `$mode` signal store; the controls below carry
     // their own `data-on:change` to refresh the preview (see PREVIEW_REFRESH).
     html! {
         div("data-signals": (signals)) {
         div(class: "rounded-lg border border-base-300 p-4 flex flex-col gap-4") {
-            div(class: "text-sm font-medium") { "Schedule" }
+            div(class: "text-sm font-medium") { (t(lang, "scheduled-builder-heading")) }
 
             // Repeat selector.
             div(class: "flex flex-wrap gap-2") {
-                (mode_radio("hourly", "Hourly", &init.mode))
-                (mode_radio("daily", "Daily", &init.mode))
-                (mode_radio("weekly", "Weekly", &init.mode))
-                (mode_radio("monthly", "Monthly", &init.mode))
-                (mode_radio("advanced", "Advanced", &init.mode))
+                (mode_radio("hourly", &t(lang, "scheduled-mode-hourly"), &init.mode))
+                (mode_radio("daily", &t(lang, "scheduled-mode-daily"), &init.mode))
+                (mode_radio("weekly", &t(lang, "scheduled-mode-weekly"), &init.mode))
+                (mode_radio("monthly", &t(lang, "scheduled-mode-monthly"), &init.mode))
+                (mode_radio("advanced", &t(lang, "scheduled-mode-advanced"), &init.mode))
             }
 
             // Weekly: which weekdays. (Shown only in weekly mode.)
@@ -1007,10 +1079,10 @@ fn render_schedule_builder(init: &BuilderInit) -> Html {
             // Monthly: which day of the month. (Shown only in monthly mode.)
             div("data-show": "$mode === 'monthly'", class: "flex items-end gap-2") {
                 label(class: "form-control") {
-                    div(class: "label") { span(class: "label-text") { "On day" } }
+                    div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-on-day-label")) } }
                     input(name: "dom", type: "number", min: "1", max: "31", value: (dom_str), "data-on:change": (PREVIEW_REFRESH), class: "input input-bordered w-24");
                 }
-                span(class: "text-base-content/60 pb-3") { "of every month" }
+                span(class: "text-base-content/60 pb-3") { (t(lang, "scheduled-of-every-month")) }
             }
 
             // Time of day + timezone share one row. ONE hour + ONE minute
@@ -1021,32 +1093,32 @@ fn render_schedule_builder(init: &BuilderInit) -> Html {
             // (which needs only a minute); "of every hour" shows there instead.
             div(class: "flex items-end flex-wrap gap-6") {
                 div("data-show": "$mode !== 'advanced'", class: "form-control") {
-                    div(class: "label") { span(class: "label-text") { "At" } }
+                    div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-at-label")) } }
                     div(class: "flex items-end gap-1") {
                         span("data-show": "$mode !== 'hourly'", class: "flex items-end gap-1") {
-                            input(name: "hour", type: "number", min: "0", max: "23", value: (hour_str), "aria-label": "Hour", "data-on:change": (PREVIEW_REFRESH), class: "input input-bordered w-20");
+                            input(name: "hour", type: "number", min: "0", max: "23", value: (hour_str), "aria-label": (t(lang, "scheduled-hour-aria")), "data-on:change": (PREVIEW_REFRESH), class: "input input-bordered w-20");
                             span(class: "font-bold pb-3") { ":" }
                         }
-                        input(name: "minute", type: "number", min: "0", max: "59", value: (minute_str), "aria-label": "Minute", "data-on:change": (PREVIEW_REFRESH), class: "input input-bordered w-20");
-                        span("data-show": "$mode === 'hourly'", class: "text-base-content/60 pb-3 ml-1") { "of every hour" }
+                        input(name: "minute", type: "number", min: "0", max: "59", value: (minute_str), "aria-label": (t(lang, "scheduled-minute-aria")), "data-on:change": (PREVIEW_REFRESH), class: "input input-bordered w-20");
+                        span("data-show": "$mode === 'hourly'", class: "text-base-content/60 pb-3 ml-1") { (t(lang, "scheduled-of-every-hour")) }
                     }
                 }
 
                 // Timezone.
                 label(class: "form-control w-full max-w-xs") {
-                    div(class: "label") { span(class: "label-text") { "Timezone" } }
-                    input(name: "timezone", type: "text", value: (tz_str), placeholder: "Europe/Berlin", "data-on:change": (PREVIEW_REFRESH), class: "input input-bordered w-full");
+                    div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-timezone-label")) } }
+                    input(name: "timezone", type: "text", value: (tz_str), placeholder: (t(lang, "scheduled-timezone-placeholder")), "data-on:change": (PREVIEW_REFRESH), class: "input input-bordered w-full");
                 }
             }
 
             // Advanced panel.
             div("data-show": "$mode === 'advanced'", class: "flex flex-col gap-1") {
                 label(class: "form-control") {
-                    div(class: "label") { span(class: "label-text") { "Cron expression" } }
+                    div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-cron-label")) } }
                     input(name: "advanced", type: "text", value: (advanced_str), placeholder: "0 9 * * *", "data-on:change": (PREVIEW_REFRESH), class: "input input-bordered w-full font-mono");
                 }
                 span(class: "text-xs text-base-content/60") {
-                    "Five fields: minute hour day-of-month month day-of-week."
+                    (t(lang, "scheduled-cron-help"))
                 }
             }
 
@@ -1097,13 +1169,17 @@ fn weekday_toggle(num: u8, label: &str, checked: bool) -> Html {
 
 /// The summary + next-three-runs block. Used for both the initial render
 /// and the live `/scheduled/preview` patches.
-fn render_preview(cron: &str, timezone: &str) -> Html {
+fn render_preview(cron: &str, timezone: &str, lang: Lang) -> Html {
     let parsed = match Cron::parse(cron) {
         Ok(c) => c,
         Err(e) => return render_preview_error(&e.to_string()),
     };
     if TimeZone::get(timezone).is_err() {
-        return render_preview_error(&format!("Unknown timezone `{timezone}`."));
+        return render_preview_error(&t_args(
+            lang,
+            "scheduled-err-unknown-timezone",
+            &i18n::args([("tz", timezone.to_string().into())]),
+        ));
     }
     let tz = resolve_tz(timezone);
     let summary = parsed.describe();
@@ -1121,10 +1197,10 @@ fn render_preview(cron: &str, timezone: &str) -> Html {
         div(class: "flex flex-col gap-1") {
             div(class: "font-medium") { (summary) " (" (tz_label) ")" }
             if run_lines.is_empty() {
-                div(class: "text-base-content/60") { "No upcoming runs." }
+                div(class: "text-base-content/60") { (t(lang, "scheduled-no-upcoming-runs")) }
             } else {
                 div(class: "text-base-content/70") {
-                    "Next runs: "
+                    (t(lang, "scheduled-next-runs-prefix"))
                     (run_lines.join("  ·  "))
                 }
             }
@@ -1146,20 +1222,27 @@ fn render_preview_error(msg: &str) -> Html {
 
 /// One row in the list. Single source of truth for the initial render and
 /// the toggle SSE patch.
-fn render_action_row(a: &ScheduledAction) -> Html {
+fn render_action_row(a: &ScheduledAction, lang: Lang) -> Html {
     let row_id = format!("sched-row-{}", a.id);
     let summary = Cron::parse(&a.cron)
         .map(|c| c.describe())
         .unwrap_or_else(|_| format!("cron: {}", a.cron));
     let schedule_line = format!("{} · {} ({})", a.model, summary, a.timezone);
     let next_line = match (a.enabled, a.next_run_at) {
-        (false, _) => "Paused".to_string(),
-        (true, Some(t)) => format!(
-            "Next run: {}",
-            t.to_zoned(resolve_tz(&a.timezone))
-                .strftime("%a %b %-d, %H:%M")
+        (false, _) => t(lang, "scheduled-status-paused"),
+        (true, Some(t_run)) => t_args(
+            lang,
+            "scheduled-next-run",
+            &i18n::args([(
+                "when",
+                t_run
+                    .to_zoned(resolve_tz(&a.timezone))
+                    .strftime("%a %b %-d, %H:%M")
+                    .to_string()
+                    .into(),
+            )]),
         ),
-        (true, None) => "No upcoming run".to_string(),
+        (true, None) => t(lang, "scheduled-no-upcoming-run"),
     };
     let prompt_preview: String = {
         let p = a.prompt.trim();
@@ -1195,9 +1278,9 @@ fn render_action_row(a: &ScheduledAction) -> Html {
                 div(class: "flex items-center gap-2") {
                     span(class: "text-sm font-medium text-base-content") { (name) }
                     if enabled {
-                        span(class: "badge badge-success badge-sm") { "active" }
+                        span(class: "badge badge-success badge-sm") { (t(lang, "scheduled-badge-active")) }
                     } else {
-                        span(class: "badge badge-ghost badge-sm") { "paused" }
+                        span(class: "badge badge-ghost badge-sm") { (t(lang, "scheduled-badge-paused")) }
                     }
                 }
                 div(class: "text-xs text-base-content/60 truncate") { (prompt_preview) }
@@ -1212,10 +1295,12 @@ fn render_action_row(a: &ScheduledAction) -> Html {
                                     class: "link link-hover text-success",
                                     "data-on:click__prevent": (format!("@get('/chat/{sid}')"))
                                 ) {
-                                    "Last: ✓ " (when.clone()) " — open"
+                                    (t_args(lang, "scheduled-last-success-open", &i18n::args([("when", when.clone().into())])))
                                 }
                             } else {
-                                span(class: "text-success") { "Last: ✓ " (when.clone()) }
+                                span(class: "text-success") {
+                                    (t_args(lang, "scheduled-last-success", &i18n::args([("when", when.clone().into())])))
+                                }
                             }
                         } else {
                             if let Some(sid) = session {
@@ -1224,10 +1309,12 @@ fn render_action_row(a: &ScheduledAction) -> Html {
                                     class: "link link-hover text-error",
                                     "data-on:click__prevent": (format!("@get('/chat/{sid}')"))
                                 ) {
-                                    "Last: ✗ " (when.clone()) " — open"
+                                    (t_args(lang, "scheduled-last-failure-open", &i18n::args([("when", when.clone().into())])))
                                 }
                             } else {
-                                span(class: "text-error") { "Last: ✗ " (when.clone()) }
+                                span(class: "text-error") {
+                                    (t_args(lang, "scheduled-last-failure", &i18n::args([("when", when.clone().into())])))
+                                }
                             }
                         }
                     }
@@ -1236,17 +1323,22 @@ fn render_action_row(a: &ScheduledAction) -> Html {
             div(class: "flex items-center gap-1 shrink-0") {
                 // Pause / resume.
                 form(action: (toggle_url), method: "post", class: "m-0", "data-on:submit__prevent": (toggle_directive)) {
-                    button(type: "submit", class: "btn btn-ghost btn-sm btn-square", title: (if enabled { "Pause" } else { "Resume" }), "aria-label": (if enabled { "Pause" } else { "Resume" })) {
+                    button(
+                        type: "submit",
+                        class: "btn btn-ghost btn-sm btn-square",
+                        title: (if enabled { t(lang, "scheduled-pause-title") } else { t(lang, "scheduled-resume-title") }),
+                        "aria-label": (if enabled { t(lang, "scheduled-pause-title") } else { t(lang, "scheduled-resume-title") })
+                    ) {
                         if enabled { (icons::pause(16)) } else { (icons::play(16)) }
                     }
                 }
                 // Edit (SPA nav to the edit sub-page).
-                a(href: (edit_url), class: "btn btn-ghost btn-sm btn-square", title: "Edit", "aria-label": "Edit", "data-on:click__prevent": (edit_directive)) {
+                a(href: (edit_url), class: "btn btn-ghost btn-sm btn-square", title: (t(lang, "scheduled-edit-title")), "aria-label": (t(lang, "scheduled-edit-title")), "data-on:click__prevent": (edit_directive)) {
                     (icons::pencil(16))
                 }
                 // Delete.
                 form(action: (delete_url), method: "post", class: "m-0", "data-on:submit__prevent": (delete_directive)) {
-                    button(type: "submit", class: "btn btn-ghost btn-sm btn-square text-error", title: "Delete", "aria-label": "Delete") {
+                    button(type: "submit", class: "btn btn-ghost btn-sm btn-square text-error", title: (t(lang, "scheduled-delete-title")), "aria-label": (t(lang, "scheduled-delete-title"))) {
                         (icons::trash(16))
                     }
                 }

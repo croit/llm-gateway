@@ -105,6 +105,32 @@ window.pushToast = (kind, message) => {
     } catch (_) { /* sessionStorage unavailable / private mode */ }
 })();
 
+// ---- Confirm-guarded forms --------------------------------------------
+//
+// A `data-confirm="..."` attribute on a <form> pops a native confirm()
+// before letting the submit through. This replaces inline
+// `onsubmit="return confirm('...')"` handlers: a translated confirm
+// message can contain apostrophes/quotes that would otherwise need to
+// be escaped across TWO nested string boundaries (Rust string -> HTML
+// attribute -> JS string literal). Reading `dataset.confirm` skips the
+// JS-string boundary entirely — the browser already HTML-decoded the
+// attribute, so there's nothing left to escape.
+//
+// Registered on `document` in the CAPTURE phase (the `true` below) and
+// ahead of datastar's own per-form submit listeners in the DOM (this
+// script loads before the datastar module — see the `<head>` ordering
+// comment in `layout_authed`), so cancelling here calls
+// `stopPropagation()` to keep the event from ever reaching a form's
+// `data-on:submit` directive (e.g. the `@post(...)` that would
+// otherwise fire regardless of the cancelled confirm).
+document.addEventListener('submit', (ev) => {
+    const form = ev.target;
+    if (form instanceof HTMLFormElement && form.dataset.confirm && !confirm(form.dataset.confirm)) {
+        ev.preventDefault();
+        ev.stopPropagation();
+    }
+}, true);
+
 // ---- SPA-style nav back/forward -------------------------------------
 //
 // `history.pushState` from the server-driven nav doesn't fire its own

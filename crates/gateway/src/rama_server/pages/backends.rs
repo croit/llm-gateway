@@ -23,6 +23,7 @@ use rama::http::{Request, Response};
 
 use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_admin_or_403};
 use session_core::chrome::{NavSections, Theme, is_datastar_request};
+use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use crate::rama_server::state::RamaState;
@@ -40,6 +41,7 @@ const BUCKETS: i64 = 12;
 /// this the card order would flap between renders).
 pub async fn backends_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
@@ -103,14 +105,15 @@ pub async fn backends_index(State(state): State<Arc<RamaState>>, req: Request) -
             })
             .collect();
 
-    let body = render_backends_body(&pools, &unknown_fallbacks);
+    let body = render_backends_body(lang, &pools, &unknown_fallbacks);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     nav_or_html_page(
         datastar,
         theme,
+        lang,
         nav,
         NavItem::Backends,
-        "Upstream backends — LLM Gateway",
+        &t(lang, "backends-page-title"),
         &user.email,
         is_admin(&state, &user),
         session.impersonator_id.is_some(),
@@ -170,7 +173,11 @@ fn strategy_label(strategy: PickerStrategy) -> &'static str {
     }
 }
 
-fn render_backends_body(pools: &[PoolView], unknown_fallbacks: &[(&'static str, String)]) -> Html {
+fn render_backends_body(
+    lang: Lang,
+    pools: &[PoolView],
+    unknown_fallbacks: &[(&'static str, String)],
+) -> Html {
     let total: usize = pools.iter().map(|p| p.backends.len()).sum();
     let healthy = pools
         .iter()
@@ -178,7 +185,15 @@ fn render_backends_body(pools: &[PoolView], unknown_fallbacks: &[(&'static str, 
         .filter(|b| b.healthy)
         .count();
     let down = total - healthy;
-    let summary = format!("{total} backends · {healthy} healthy · {down} down");
+    let summary = t_args(
+        lang,
+        "backends-summary",
+        &i18n::args([
+            ("total", total.to_string().into()),
+            ("healthy", healthy.to_string().into()),
+            ("down", down.to_string().into()),
+        ]),
+    );
     let unknown_fallback_line = if unknown_fallbacks.is_empty() {
         None
     } else {
@@ -191,25 +206,25 @@ fn render_backends_body(pools: &[PoolView], unknown_fallbacks: &[(&'static str, 
         )
     };
 
-    let cards: Vec<Html> = pools.iter().map(render_pool_card).collect();
+    let cards: Vec<Html> = pools.iter().map(|p| render_pool_card(lang, p)).collect();
     html! {
         section(class: "max-w-5xl mx-auto p-4 sm:p-6 flex flex-col gap-4") {
             header(class: "flex flex-col gap-1") {
-                h1(class: "text-2xl font-bold") { "Upstream backends" }
+                h1(class: "text-2xl font-bold") { (t(lang, "backends-heading")) }
                 p(class: "text-base-content/70 text-sm") {
-                    "Live view of the configured upstream pools — health, in-flight load \
-                     against each backend's cap, and the models each one currently \
-                     advertises. Read-only: routing is driven entirely by what the \
-                     backends report on their "
+                    (t(lang, "backends-description-prefix"))
+                    " "
                     code(class: "text-xs") { "/models" }
-                    " probe."
+                    " "
+                    (t(lang, "backends-description-suffix"))
                 }
                 if total > 0 {
                     p(class: "text-base-content/60 text-sm tabular-nums") { (summary) }
                 }
                 if let Some(line) = unknown_fallback_line.as_deref() {
                     p(class: "text-base-content/60 text-sm") {
-                        "Unknown-model fallback — "
+                        (t(lang, "backends-unknown-fallback-prefix"))
+                        " "
                         span(class: "font-mono") { (line.to_string()) }
                     }
                 }
@@ -218,9 +233,11 @@ fn render_backends_body(pools: &[PoolView], unknown_fallbacks: &[(&'static str, 
                 div(class: "alert") {
                     (icons::info(18))
                     span {
-                        "No upstream pools configured. Add an "
+                        (t(lang, "backends-empty-prefix"))
+                        " "
                         code(class: "text-xs") { "[upstream_pools.<name>]" }
-                        " block to gateway.toml and restart."
+                        " "
+                        (t(lang, "backends-empty-suffix"))
                     }
                 }
             } else {
@@ -235,8 +252,12 @@ fn render_backends_body(pools: &[PoolView], unknown_fallbacks: &[(&'static str, 
     .to_html()
 }
 
-fn render_pool_card(pool: &PoolView) -> Html {
-    let rows: Vec<Html> = pool.backends.iter().map(render_backend_row).collect();
+fn render_pool_card(lang: Lang, pool: &PoolView) -> Html {
+    let rows: Vec<Html> = pool
+        .backends
+        .iter()
+        .map(|b| render_backend_row(lang, b))
+        .collect();
     html! {
         article(class: "card border border-base-300 bg-base-100") {
             div(class: "card-body gap-3") {
@@ -248,15 +269,19 @@ fn render_pool_card(pool: &PoolView) -> Html {
                         if let Some(model) = pool.fallback_offline.as_deref() {
                             span(
                                 class: "badge badge-warning badge-outline font-mono",
-                                title: "fallback_offline: served when every backend for a known model in this pool is down"
+                                title: (t(lang, "backends-fallback-offline-title"))
                             ) {
-                                "offline ↩ " (model.to_string())
+                                (t_args(
+                                    lang,
+                                    "backends-fallback-offline-badge",
+                                    &i18n::args([("model", model.to_string().into())])
+                                ))
                             }
                         }
                     }
                 }
                 if pool.backends.is_empty() {
-                    p(class: "text-base-content/60 text-sm") { "No backends in this pool." }
+                    p(class: "text-base-content/60 text-sm") { (t(lang, "backends-pool-empty")) }
                 } else {
                     div(class: "flex flex-col gap-2") {
                         for r in rows.iter() {
@@ -270,16 +295,16 @@ fn render_pool_card(pool: &PoolView) -> Html {
     .to_html()
 }
 
-fn render_backend_row(b: &BackendView) -> Html {
+fn render_backend_row(lang: Lang, b: &BackendView) -> Html {
     // One badge collapses health + saturation: down (probe failing) >
     // saturated (up but at cap) > up. The in-flight bar to the right
     // shows the load that drives the saturated state.
     let (status_class, status_label) = if !b.healthy {
-        ("badge badge-error", "down")
+        ("badge badge-error", t(lang, "backends-status-down"))
     } else if b.saturated() {
-        ("badge badge-warning", "saturated")
+        ("badge badge-warning", t(lang, "backends-status-saturated"))
     } else {
-        ("badge badge-success", "up")
+        ("badge badge-success", t(lang, "backends-status-up"))
     };
     let load = format!("{} / {}", b.inflight, b.max_inflight);
     let bar_class = if b.saturated() {
@@ -302,20 +327,28 @@ fn render_backend_row(b: &BackendView) -> Html {
         .aliases
         .iter()
         .map(|a| match (&a.target, a.disabled) {
-            (Some(t), _) => (
-                format!("{} → {t}", a.name),
+            (Some(target), _) => (
+                format!("{} → {target}", a.name),
                 "badge badge-info badge-sm font-mono",
-                format!("alias → {t}"),
+                t_args(
+                    lang,
+                    "backends-alias-target-title",
+                    &i18n::args([("target", target.to_string().into())]),
+                ),
             ),
             (None, true) => (
-                format!("{} (disabled)", a.name),
+                t_args(
+                    lang,
+                    "backends-alias-disabled-label",
+                    &i18n::args([("name", a.name.clone().into())]),
+                ),
                 "badge badge-warning badge-sm font-mono",
-                "bare alias disabled — this backend serves multiple models; give it an explicit target (map form)".to_string(),
+                t(lang, "backends-alias-disabled-title"),
             ),
             (None, false) => (
                 a.name.clone(),
                 "badge badge-info badge-sm font-mono",
-                "alias → this backend's model".to_string(),
+                t(lang, "backends-alias-bare-title"),
             ),
         })
         .collect();
@@ -337,7 +370,7 @@ fn render_backend_row(b: &BackendView) -> Html {
                 div(class: "flex flex-col items-end gap-1 shrink-0") {
                     div(class: "flex items-center gap-2") {
                         span(class: "text-xs text-base-content/60 tabular-nums") {
-                            "inflight " (load)
+                            (t_args(lang, "backends-inflight-label", &i18n::args([("load", load.clone().into())])))
                         }
                         progress(
                             class: (bar_class),
@@ -347,7 +380,15 @@ fn render_backend_row(b: &BackendView) -> Html {
                     }
                     div(class: "flex items-center gap-2 text-base-content/50") {
                         span(class: "text-xs tabular-nums whitespace-nowrap") {
-                            "15m " (c15.to_string()) " · 30m " (c30.to_string()) " · 60m " (c60.to_string())
+                            (t_args(
+                                lang,
+                                "backends-activity-summary",
+                                &i18n::args([
+                                    ("m15", c15.to_string().into()),
+                                    ("m30", c30.to_string().into()),
+                                    ("m60", c60.to_string().into()),
+                                ])
+                            ))
                         }
                         span(class: "text-primary") { #(spark.clone()) }
                     }
@@ -356,7 +397,7 @@ fn render_backend_row(b: &BackendView) -> Html {
             div(class: "flex flex-wrap gap-1") {
                 if models.is_empty() {
                     span(class: "text-xs text-base-content/50 italic") {
-                        "no models advertised"
+                        (t(lang, "backends-no-models"))
                     }
                 } else {
                     for m in models.iter() {
@@ -366,7 +407,7 @@ fn render_backend_row(b: &BackendView) -> Html {
             }
             if !aliases.is_empty() {
                 div(class: "flex flex-wrap gap-1 items-center") {
-                    span(class: "text-xs text-base-content/50") { "aliases:" }
+                    span(class: "text-xs text-base-content/50") { (t(lang, "backends-aliases-label")) }
                     for (label, class, title) in aliases.iter() {
                         span(class: (*class), title: (title.clone())) { (label.clone()) }
                     }

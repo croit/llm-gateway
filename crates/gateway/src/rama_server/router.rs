@@ -175,6 +175,7 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
             "/nav/toggle/{section}",
             session_core::chrome::nav_sections_toggle,
         )
+        .with_post("/lang", session_core::chrome::lang_set)
         .with_get("/v1/models", proxy::list_models)
         // Catch-all param: model ids contain `/` (e.g.
         // `mistralai/Voxtral-Mini-4B-Realtime-2602`).
