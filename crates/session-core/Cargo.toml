@@ -27,6 +27,12 @@ markdown = { workspace = true }
 lumis = { workspace = true }
 regex = { workspace = true }
 
+# UI language selection (Lang cookie/Accept-Language resolution + the
+# `t`/`t_args` Fluent lookups every page render calls). Lives here for
+# the same reason Theme/chrome do — see `src/i18n.rs`.
+fluent-templates = { workspace = true }
+fluent-bundle = { workspace = true }
+
 # HTTP server primitives + asset/chrome handlers shared with both
 # binaries. `rama` is the server stack; its re-exports cover the
 # buffer type (`rama::bytes`, for the SSE payloads `chrome::sse_*`
@@ -44,6 +50,7 @@ tracing = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
 jiff = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }

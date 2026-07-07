@@ -1,0 +1,80 @@
+# STATUS: llm-generated, unreviewed — pending native-speaker QA
+
+tokens-page-title = API-токены — LLM Gateway
+tokens-page-heading = API-токены
+tokens-intro = Bearer-токены для API, совместимого с OpenAI. Открытый текст показывается только при создании — сохраните его в надёжном месте.
+
+tokens-create-heading = Создать токен
+tokens-create-description = Создайте новый Bearer-токен для API, совместимого с OpenAI.
+tokens-name-label = Имя
+tokens-name-placeholder = напр. laptop, ci-runner
+tokens-ttl-label = Срок действия (дней)
+tokens-create-submit = Создать токен
+
+tokens-list-heading = Ваши токены
+tokens-list-empty = Токенов пока нет. Создайте один выше.
+
+tokens-badge-revoked = отозван
+tokens-badge-active = активен
+tokens-remove-button = Удалить
+tokens-rotate-button = Обновить
+tokens-rotate-title = Выпустить новый секрет для этого токена (имя и настройки сохраняются)
+tokens-revoke-button = Отозвать
+
+tokens-row-meta = создан { $created } · последнее использование { $last_used } · истекает { $expires }
+tokens-last-used-never = никогда
+
+tokens-tool-use-aria = Использование инструментов
+tokens-tool-use-label = Использование инструментов
+tokens-tool-use-description = Разрешить этому токену вызывать инструменты шлюза (веб-поиск, RAG, …).
+tokens-capabilities-summary = Возможности
+
+tokens-mcp-allow-aria = Разрешить MCP-инструменты в режиме «ask» через API
+tokens-mcp-allow-label = Разрешить MCP-инструменты «ask» через API
+tokens-mcp-allow-description = Инструменты коннектора, требующие подтверждения, не могут запрашивать его через API; включение этой опции запускает их без запроса.
+
+tokens-minted-heading = Токен создан
+tokens-minted-copy-warning = Скопируйте значение сейчас — повторно увидеть его будет нельзя.
+tokens-copy-aria = Скопировать токен
+tokens-copy-title = Скопировать токен
+tokens-minted-name = Имя: { $name }
+
+tokens-account-heading = Аккаунт
+tokens-signed-in-as = Вы вошли как { $email }
+tokens-account-user-id-label = ID пользователя
+tokens-account-oidc-label = Роли OIDC
+tokens-account-rbac-label = ID ролей RBAC
+tokens-roles-none = нет
+tokens-roles-none-granted = не предоставлены
+
+tokens-malformed-form = некорректная форма: { $err }
+tokens-name-length = Имя токена должно содержать от 1 до 128 символов.
+tokens-store-failed = Не удалось сохранить токен.
+tokens-created-toast = Токен создан.
+
+tokens-revoked-not-found = Отозванный токен не найден.
+tokens-revoked-toast = Токен отозван.
+tokens-already-revoked = Токен уже был отозван.
+tokens-revoke-failed = Не удалось отозвать токен.
+
+tokens-load-failed = Не удалось загрузить токен.
+tokens-not-found-or-revoked = Токен не найден или уже отозван.
+tokens-rotated-not-found = Обновлённый токен не найден.
+tokens-rotated-toast = Токен обновлён — скопируйте новое значение.
+tokens-rotate-failed = Не удалось обновить токен.
+
+tokens-removed-toast = Токен удалён.
+tokens-still-active = Токен всё ещё активен — сначала отзовите его.
+tokens-remove-failed = Не удалось удалить токен.
+
+tokens-not-found = Токен не найден.
+tokens-update-failed = Не удалось обновить токен.
+tokens-tool-use-enabled-toast = Использование инструментов включено для этого токена.
+tokens-tool-use-disabled-toast = Использование инструментов отключено для этого токена.
+tokens-mcp-ask-enabled-toast = MCP-инструменты «ask» через API включены для этого токена.
+tokens-mcp-ask-disabled-toast = MCP-инструменты «ask» через API отключены для этого токена.
+
+tokens-unknown-tool = Неизвестный инструмент.
+tokens-save-pref-failed = Не удалось сохранить настройку.
+tokens-capability-enabled-toast = { $name } включён для этого токена.
+tokens-capability-disabled-toast = { $name } отключён для этого токена.

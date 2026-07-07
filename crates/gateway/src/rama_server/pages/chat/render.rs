@@ -12,6 +12,7 @@
 
 use plait::{Html, ToHtml, html};
 use session_core::db::{Session, TurnWithTools};
+use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 use session_core::render;
 
@@ -155,6 +156,9 @@ pub(super) struct ChatPage<'a> {
     /// `None` if the session has never been compacted. Drives the transcript's
     /// "earlier messages condensed" divider.
     pub compacted_up_to_seq: Option<i64>,
+    /// UI language for this render's own chrome (header pickers, composer
+    /// toolbar, popovers) — threaded down into `session_core::render` too.
+    pub lang: Lang,
 }
 
 /// Chat page body — header (model pickers) + conversation +
@@ -162,13 +166,14 @@ pub(super) struct ChatPage<'a> {
 /// (see `render_app_sidebar` in pages/mod.rs); we don't render
 /// it here.
 pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
+    let lang = page.lang;
     let models_empty = page.models.is_empty();
     // (value, label) per option — label carries the compliance suffix, value
     // stays the raw id so the form still posts the real model name.
     let model_options: Vec<(String, String)> = page
         .models
         .iter()
-        .map(|m| (m.id.clone(), model_label(m)))
+        .map(|m| (m.id.clone(), model_label(lang, m)))
         .collect();
     // Compliance UI is owner-only (a read-only shared viewer sends nothing)
     // and only meaningful when there's a real model picker. The signal store
@@ -227,7 +232,7 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
         div(class: "chat-header flex") {
             div(class: "chat-header__title hidden sm:block") {
                 h1(class: "text-lg font-semibold truncate") {
-                    (session_label(page.active))
+                    (session_label(lang, page.active))
                 }
             }
             // Right group: model/voice pickers (desktop-only — the `<select>`
@@ -240,24 +245,24 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
             div(class: "flex items-center gap-2 ml-auto") {
             // Export is available to anyone who can read the chat (owner or a
             // shared viewer), so it lives outside the owner-only block below.
-            (render_export_control(&session_id))
+            (render_export_control(&session_id, lang))
             // Document-canvas toggle. Hidden until a document exists (the live
             // create flips `$hasCanvas`); click shows/hides the docked panel.
             button(
                 type: "button",
                 class: "btn btn-ghost btn-sm gap-1",
-                title: "Show / hide the document canvas",
+                title: (t(lang, "chat-render-canvas-toggle-title")),
                 "data-show": "$hasCanvas",
                 "data-on:click": "$canvasOpen = !$canvasOpen"
             ) {
                 (icons::pencil(16))
-                span(class: "hidden sm:inline") { "Document" }
+                span(class: "hidden sm:inline") { (t(lang, "chat-render-canvas-toggle-label")) }
             }
             // A read-only viewer (recipient of a shared chat) gets the inverse
             // of the owner controls: a "fork into my chats" button instead of
             // the model pickers + share toggle.
             if read_only {
-                (render_fork_control(&session_id))
+                (render_fork_control(&session_id, lang))
             }
             if !read_only {
             div(class: "chat-header__pickers hidden sm:flex") {
@@ -268,7 +273,7 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                         form: "chat-form",
                         type: "text",
                         required: "required",
-                        placeholder: "model (e.g. gpt-4o-mini)",
+                        placeholder: (t(lang, "chat-render-model-placeholder")),
                         class: "input input-bordered input-sm w-56"
                     );
                 } else {
@@ -278,7 +283,7 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                             id: "model",
                             name: "model",
                             form: "chat-form",
-                            "aria-label": "Chat model",
+                            "aria-label": (t(lang, "chat-render-model-aria")),
                             // Track the picked model so the compliance banner
                             // below reacts when the user switches models.
                             "data-on:change": "$selectedModel = evt.target.value",
@@ -296,7 +301,7 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                         select(
                             id: "voice-model",
                             "data-mic-model": "1",
-                            "aria-label": "Voice model",
+                            "aria-label": (t(lang, "chat-render-voice-model-aria")),
                             class: "select select-bordered select-sm chat-model-select"
                         ) {
                             for m in voice_models.iter() {
@@ -306,7 +311,7 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                     }
                 }
             }
-            (render_share_control(&share_url, page.shared))
+            (render_share_control(&share_url, page.shared, lang))
             }
             }
         }
@@ -340,9 +345,7 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                 ) {
                     (icons::alert(20))
                     span {
-                        "You are sending data to a non-GDPR-compliant model. \
-                         Do not enter personal information (names, emails, \
-                         addresses, customer or employee data)."
+                        (t(lang, "chat-render-gdpr-banner"))
                     }
                 }
             }
@@ -355,8 +358,7 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                 ) {
                     (icons::alert(20))
                     span {
-                        "This model is not covered by a confidentiality agreement. \
-                         Do not send NDA-protected or proprietary material."
+                        (t(lang, "chat-render-nda-banner"))
                     }
                 }
             }
@@ -369,19 +371,19 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
             }
         }
 
-        (render::render_conversation(&turns_owned, in_flight_tail_url.as_deref(), Some("/chat"), page.compacted_up_to_seq))
+        (render::render_conversation(&turns_owned, in_flight_tail_url.as_deref(), Some("/chat"), page.compacted_up_to_seq, lang))
         // Owner gets the composer; a read-only viewer of a shared chat gets a
         // banner instead (mutations are owner-only on the server regardless).
         if read_only {
             div(class: "alert mt-4") {
                 (icons::alert(20))
-                span { "Shared chat — read-only. Only the creator can reply." }
+                span { (t(lang, "chat-render-shared-readonly-banner")) }
             }
         } else {
             (render::render_composer(render::ComposerOpts {
                 post_url: &post_url,
                 cancel_url: &cancel_url,
-                placeholder: "Message the model…",
+                placeholder: &t(lang, "chat-render-composer-placeholder"),
                 has_voice,
                 // A turn already in flight seeds the Stop control server-side,
                 // so a reload mid-stream still offers a way to stop it.
@@ -394,7 +396,9 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                     &session_id,
                     page.capabilities,
                     page.effort,
+                    lang,
                 )),
+                lang,
             }))
         }
         } // .chat-col
@@ -426,12 +430,13 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
 
 /// Dropdown label for one model: the raw id, plus a parenthetical suffix
 /// naming each restriction so the user sees it before opening any banner.
-fn model_label(m: &ChatModelOption) -> String {
+fn model_label(lang: Lang, m: &ChatModelOption) -> String {
+    let id = || i18n::args([("id", m.id.clone().into())]);
     match (m.gdpr, m.nda) {
         (true, true) => m.id.clone(),
-        (false, true) => format!("{} (non-GDPR)", m.id),
-        (true, false) => format!("{} (confidential-restricted)", m.id),
-        (false, false) => format!("{} (non-GDPR, confidential-restricted)", m.id),
+        (false, true) => t_args(lang, "chat-render-model-non-gdpr", &id()),
+        (true, false) => t_args(lang, "chat-render-model-confidential", &id()),
+        (false, false) => t_args(lang, "chat-render-model-non-gdpr-confidential", &id()),
     }
 }
 
@@ -461,11 +466,11 @@ fn compliance_signals(models: &[ChatModelOption]) -> String {
     )
 }
 
-fn session_label(session: &Session) -> String {
+fn session_label(lang: Lang, session: &Session) -> String {
     session
         .title
         .clone()
-        .unwrap_or_else(|| "New conversation".to_string())
+        .unwrap_or_else(|| t(lang, "chat-render-new-conversation-fallback"))
 }
 
 /// The conversation's effort ("Denkaufwand") picker: a one-field form whose
@@ -478,6 +483,7 @@ fn render_composer_toolbar(
     session_id: &str,
     caps: &[CapabilityRow],
     effort: crate::server::reasoning::Effort,
+    lang: Lang,
 ) -> Html {
     html! {
         // Full width so the effort picker can sit hard-right: "+ Tools" (+ active
@@ -486,10 +492,10 @@ fn render_composer_toolbar(
         // composer's rounded corners and line up with the typed text.
         div(style: "display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem; \
                     width:100%; padding:0.5rem 1.125rem 0") {
-            (render_capabilities(session_id, caps))
+            (render_capabilities(session_id, caps, lang))
             div(style: "margin-left:auto; display:flex; align-items:center; gap:0.5rem") {
-                (render_effort_select(session_id, effort))
-                (render_composer_feedback_button())
+                (render_effort_select(session_id, effort, lang))
+                (render_composer_feedback_button(lang))
             }
         }
     }
@@ -503,14 +509,15 @@ fn render_composer_toolbar(
 /// (`body:has(#feedback-fab:not([hidden]))`), so no `hidden` attribute here.
 /// The click delegates to the real FAB so all the dialog machinery in
 /// feedback.ts stays in one place.
-fn render_composer_feedback_button() -> Html {
+fn render_composer_feedback_button(lang: Lang) -> Html {
+    let label = t(lang, "chat-render-feedback-title");
     html! {
         button(
             type: "button",
             "data-on:click": "document.getElementById('feedback-fab')?.click()",
             class: "composer-feedback-btn btn btn-ghost btn-sm btn-circle",
-            title: "Send feedback",
-            "aria-label": "Send feedback"
+            title: (label.clone()),
+            "aria-label": (label)
         ) {
             (icons::help(18))
         }
@@ -528,13 +535,31 @@ fn render_composer_feedback_button() -> Html {
 /// control. The `#effort-wrap` carries the signals and is never re-patched, so
 /// the bindings keep working. The visible "Thinking:" label + sparkle make it
 /// findable next to the "+" button.
-fn render_effort_select(session_id: &str, effort: crate::server::reasoning::Effort) -> Html {
+fn render_effort_select(
+    session_id: &str,
+    effort: crate::server::reasoning::Effort,
+    lang: Lang,
+) -> Html {
     use crate::server::reasoning::Effort;
     let action = format!("/chat/{session_id}/effort");
     let levels = [Effort::Fast, Effort::Standard, Effort::Deep, Effort::Max];
     let signals = format!(
         "{{effortMenu: false, effort: {}}}",
         serde_json::to_string(effort.as_str()).unwrap_or_else(|_| "\"standard\"".into())
+    );
+    // Localized labels keyed by the wire value ("fast"/"standard"/…), built as a
+    // JSON object literal so the reactive trigger label ($effort-keyed) shows
+    // the same translated text the static items below render.
+    let effort_label_map = format!(
+        "({{fast:{}, standard:{}, deep:{}, max:{}}})[$effort]",
+        serde_json::to_string(&effort_display_label(lang, Effort::Fast))
+            .unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(&effort_display_label(lang, Effort::Standard))
+            .unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(&effort_display_label(lang, Effort::Deep))
+            .unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(&effort_display_label(lang, Effort::Max))
+            .unwrap_or_else(|_| "\"\"".into()),
     );
     let items: Vec<Html> = levels
         .iter()
@@ -552,12 +577,13 @@ fn render_effort_select(session_id: &str, effort: crate::server::reasoning::Effo
                     class: "chat-pop-item"
                 ) {
                     span(class: "chat-pop-item__check") { (icons::check(16)) }
-                    span { (e.label()) }
+                    span { (effort_display_label(lang, *e)) }
                 }
             }
             .to_html()
         })
         .collect();
+    let effort_title = t(lang, "chat-render-effort-title");
     html! {
         div(
             id: "effort-wrap",
@@ -571,16 +597,16 @@ fn render_effort_select(session_id: &str, effort: crate::server::reasoning::Effo
                 class: "btn btn-sm gap-1",
                 style: "border:1px solid color-mix(in oklch, currentColor 15%, transparent); \
                         border-radius:9999px",
-                title: "Thinking effort: higher = more reasoning and more tool rounds, but slower",
-                "aria-label": "Thinking effort"
+                title: (t(lang, "chat-render-effort-tooltip")),
+                "aria-label": (effort_title.clone())
             ) {
                 (icons::sparkles(16))
-                span(class: "opacity-70 hidden sm:inline") { "Thinking:" }
+                span(class: "opacity-70 hidden sm:inline") { (t(lang, "chat-render-effort-label-prefix")) }
                 // Label tracks the reactive selection (updates without a
                 // round-trip); seeded server-side with the current level.
                 span(
-                    "data-text": "({fast:'Fast', standard:'Standard', deep:'Deep', max:'Max'})[$effort]"
-                ) { (effort.label()) }
+                    "data-text": (effort_label_map)
+                ) { (effort_display_label(lang, effort)) }
                 (icons::chevron_down(14))
             }
             // Dimming backdrop behind the sheet (mobile only; CSS hides it on
@@ -596,7 +622,7 @@ fn render_effort_select(session_id: &str, effort: crate::server::reasoning::Effo
                 "data-show": "$effortMenu",
                 style: "display:none"
             ) {
-                (sheet_chrome("Thinking effort", "$effortMenu = false"))
+                (sheet_chrome(&effort_title, "$effortMenu = false", lang))
                 for it in items.iter() {
                     (it.clone())
                 }
@@ -604,6 +630,22 @@ fn render_effort_select(session_id: &str, effort: crate::server::reasoning::Effo
         }
     }
     .to_html()
+}
+
+/// Localized display label for one effort level. Deliberately separate from
+/// `Effort::label()` (which stays the English constant used to build the
+/// server-side toast message) — this is purely what the picker shows.
+fn effort_display_label(lang: Lang, effort: crate::server::reasoning::Effort) -> String {
+    use crate::server::reasoning::Effort;
+    t(
+        lang,
+        match effort {
+            Effort::Fast => "chat-render-effort-fast",
+            Effort::Standard => "chat-render-effort-standard",
+            Effort::Deep => "chat-render-effort-deep",
+            Effort::Max => "chat-render-effort-max",
+        },
+    )
 }
 
 /// The composer's "+" menu + active-capability chips. Rendered *inside* the
@@ -617,7 +659,7 @@ fn render_effort_select(session_id: &str, effort: crate::server::reasoning::Effo
 /// several things). The popup opens upward (`bottom:100%`) via inline style —
 /// daisyUI's `dropdown-top` / Tailwind's `bottom-full` aren't in the purged
 /// build, so positioning is hand-rolled with styles that always ship.
-pub(super) fn render_capabilities(session_id: &str, caps: &[CapabilityRow]) -> Html {
+pub(super) fn render_capabilities(session_id: &str, caps: &[CapabilityRow], lang: Lang) -> Html {
     // `#cap-wrap` carries the menu's signals and is never re-patched, so they
     // survive the targeted patches the toggle handler emits:
     //   * `capMenu`  — popup open/closed
@@ -639,7 +681,7 @@ pub(super) fn render_capabilities(session_id: &str, caps: &[CapabilityRow]) -> H
             // — which lives inside — isn't treated as an outside click.
             "data-on:click__outside": "$capMenu = false"
         ) {
-            (render_capabilities_inner(&base, caps))
+            (render_capabilities_inner(&base, caps, lang))
         }
     }
     .to_html()
@@ -649,7 +691,7 @@ pub(super) fn render_capabilities(session_id: &str, caps: &[CapabilityRow]) -> H
 /// popover. Both are hidden on desktop and revealed only when the popover
 /// renders as a mobile bottom sheet (see `.chat-pop-*` in main.css), giving
 /// the sheet a dismiss affordance where there's no click-outside gesture.
-fn sheet_chrome(title: &str, close_expr: &str) -> Html {
+fn sheet_chrome(title: &str, close_expr: &str, lang: Lang) -> Html {
     html! {
         span(class: "chat-pop-grab") {}
         div(class: "chat-pop-sheet-head") {
@@ -658,7 +700,7 @@ fn sheet_chrome(title: &str, close_expr: &str) -> Html {
                 type: "button",
                 "data-on:click": (close_expr.to_string()),
                 class: "btn btn-ghost btn-xs btn-circle",
-                "aria-label": "Close"
+                "aria-label": (t(lang, "chat-render-close"))
             ) {
                 (icons::x_mark(16))
             }
@@ -670,7 +712,7 @@ fn sheet_chrome(title: &str, close_expr: &str) -> Html {
 /// The `#capabilities` subtree: the "+" button, the popup tree, and the active
 /// chips. Rendered once at page load and left in place — the handler patches
 /// only its volatile leaves.
-fn render_capabilities_inner(base: &str, caps: &[CapabilityRow]) -> Html {
+fn render_capabilities_inner(base: &str, caps: &[CapabilityRow], lang: Lang) -> Html {
     let has_caps = !caps.is_empty();
     // Full catalog ⇒ a search box is always worthwhile.
     let show_search = caps.len() > 6;
@@ -690,10 +732,10 @@ fn render_capabilities_inner(base: &str, caps: &[CapabilityRow]) -> Html {
                     "data-on:click": "$capMenu = !$capMenu",
                     class: "btn btn-ghost btn-sm gap-1",
                     style: "border-radius:9999px",
-                    title: "Tools, integrations & skills for this conversation"
+                    title: (t(lang, "chat-render-tools-tooltip"))
                 ) {
                     (icons::plus(16))
-                    span { "Tools" }
+                    span { (t(lang, "chat-render-tools-label")) }
                 }
                 // Dimming backdrop behind the sheet (mobile only; CSS hides
                 // it on desktop). Tapping it closes the menu.
@@ -709,11 +751,11 @@ fn render_capabilities_inner(base: &str, caps: &[CapabilityRow]) -> Html {
                         "data-show": "$capMenu",
                         style: "display:none"
                     ) {
-                        (sheet_chrome("Tools", "$capMenu = false"))
+                        (sheet_chrome(&t(lang, "chat-render-tools-label"), "$capMenu = false", lang))
                         if show_search {
                             input(
                                 type: "text",
-                                placeholder: "Search tools…",
+                                placeholder: (t(lang, "chat-render-tools-search-placeholder")),
                                 "data-on:input": "$capQuery = evt.target.value.toLowerCase()",
                                 class: "input input-sm",
                                 style: "width:100%; margin-bottom:0.25rem; \
@@ -746,11 +788,11 @@ fn render_capabilities_inner(base: &str, caps: &[CapabilityRow]) -> Html {
                             ) {
                                 span(style: "flex:1; font-size:0.78rem; font-weight:700; \
                                              text-transform:uppercase; letter-spacing:0.05em; opacity:0.7") {
-                                    "All tools"
+                                    (t(lang, "chat-render-all-tools-label"))
                                 }
-                                (render_master_pill(base, caps))
+                                (render_master_pill(base, caps, lang))
                             }
-                            (render_cap_groups(base, caps))
+                            (render_cap_groups(base, caps, lang))
                         }
                     }
                 } else {
@@ -759,14 +801,14 @@ fn render_capabilities_inner(base: &str, caps: &[CapabilityRow]) -> Html {
                         "data-show": "$capMenu",
                         style: "display:none; padding:0.75rem"
                     ) {
-                        (sheet_chrome("Tools", "$capMenu = false"))
-                        "No tools are available to your account yet. Connect an integration under "
-                        a(href: "/integrations", style: "text-decoration:underline") { "Integrations" }
-                        "."
+                        (sheet_chrome(&t(lang, "chat-render-tools-label"), "$capMenu = false", lang))
+                        (format!("{} ", t(lang, "chat-render-no-tools-prefix")))
+                        a(href: "/integrations", style: "text-decoration:underline") { (t(lang, "nav-integrations")) }
+                        (t(lang, "chat-render-no-tools-suffix"))
                     }
                 }
             }
-            (render_cap_chips(base, caps))
+            (render_cap_chips(base, caps, lang))
         }
     }
     .to_html()
@@ -782,6 +824,7 @@ fn render_capabilities_inner(base: &str, caps: &[CapabilityRow]) -> Html {
 pub(super) fn render_capability_patches(
     session_id: &str,
     caps: &[CapabilityRow],
+    lang: Lang,
 ) -> Vec<(String, String)> {
     let base = format!("/chat/{session_id}/capabilities");
     let mut patches: Vec<(String, String)> = Vec::new();
@@ -796,22 +839,22 @@ pub(super) fn render_capability_patches(
     for (group, rows) in groups.iter() {
         patches.push((
             format!("#cap-grp-{}", group_slug(group)),
-            render_group_pill(&base, group, rows).to_string(),
+            render_group_pill(&base, group, rows, lang).to_string(),
         ));
         for c in rows.iter() {
             patches.push((
                 format!("#{}", cap_seg_id(c)),
-                render_cap_segment(&base, c).to_string(),
+                render_cap_segment(&base, c, lang).to_string(),
             ));
         }
     }
     patches.push((
         "#cap-all".to_string(),
-        render_master_pill(&base, caps).to_string(),
+        render_master_pill(&base, caps, lang).to_string(),
     ));
     patches.push((
         "#cap-chips".to_string(),
-        render_cap_chips(&base, caps).to_string(),
+        render_cap_chips(&base, caps, lang).to_string(),
     ));
     patches
 }
@@ -821,7 +864,7 @@ pub(super) fn render_capability_patches(
 /// body shows when expanded *or* while a search is active (so matches surface
 /// regardless of collapse). Section containers are never re-patched, so their
 /// `data-show` bindings stay live.
-fn render_cap_groups(base: &str, caps: &[CapabilityRow]) -> Html {
+fn render_cap_groups(base: &str, caps: &[CapabilityRow], lang: Lang) -> Html {
     // Stable, order-respecting grouping (caps arrive pre-sorted by order).
     let mut groups: Vec<(&'static str, Vec<&CapabilityRow>)> = Vec::new();
     for c in caps {
@@ -832,26 +875,53 @@ fn render_cap_groups(base: &str, caps: &[CapabilityRow]) -> Html {
     }
     html! {
         for (group, rows) in groups.iter() {
-            (render_cap_section(base, group, rows))
+            (render_cap_section(base, group, rows, lang))
         }
     }
     .to_html()
 }
 
+/// Translated text for a group heading. `group` stays the stable English
+/// constant used for routing (`group_slug`, aggregate/section matching,
+/// `group != "Skills"`) everywhere else in this module — this is purely what
+/// gets painted into the DOM. Unrecognized groups (shouldn't happen — the
+/// full set is `Category::label()` + the literal `"Skills"`) fall back to the
+/// raw string rather than panicking.
+fn group_display(lang: Lang, group: &str) -> String {
+    let key = match group {
+        "Web & Network" => "chat-render-group-web-network",
+        "Attachments & Documents" => "chat-render-group-attachments-documents",
+        "Document templates" => "chat-render-group-document-templates",
+        "Knowledge base" => "chat-render-group-knowledge-base",
+        "Code & Sandbox" => "chat-render-group-code-sandbox",
+        "Memory" => "chat-render-group-memory",
+        "Integrations" => "chat-render-group-integrations",
+        "Utility" => "chat-render-group-utility",
+        "Skills" => "chat-render-group-skills",
+        other => return other.to_string(),
+    };
+    t(lang, key)
+}
+
 /// One collapsible category section: a clickable heading (chevron + label +
 /// count) with the group-aggregate pill beside it, over a body of rows.
-fn render_cap_section(base: &str, group: &'static str, rows: &[&CapabilityRow]) -> Html {
+fn render_cap_section(
+    base: &str,
+    group: &'static str,
+    rows: &[&CapabilityRow],
+    lang: Lang,
+) -> Html {
     let slug = group_slug(group);
     let open_expr = format!("$openCats['{slug}']");
     // Body visible when this section is expanded, or whenever a search is
     // active (then headings hide and matching rows filter themselves in).
     let body_show = format!("{open_expr} || $capQuery !== ''");
     let count = rows.len();
-    let count_label = if count == 1 {
-        "1 tool".to_string()
-    } else {
-        format!("{count} tools")
-    };
+    let count_label = t_args(
+        lang,
+        "chat-render-tool-count",
+        &i18n::args([("count", count.into())]),
+    );
     html! {
         section(style: "margin-bottom:0.1rem") {
             // Heading row: a collapse button on the left, the aggregate pill on
@@ -881,15 +951,15 @@ fn render_cap_section(base: &str, group: &'static str, rows: &[&CapabilityRow]) 
                     ) { (icons::chevron_down(14)) }
                     span(style: "flex:1; font-size:0.7rem; font-weight:700; letter-spacing:0.05em; \
                                  text-transform:uppercase; opacity:0.7; min-width:0") {
-                        (group.to_string())
+                        (group_display(lang, group))
                     }
                     span(style: "font-size:0.65rem; opacity:0.45") { (count_label) }
                 }
-                (render_group_pill(base, group, rows))
+                (render_group_pill(base, group, rows, lang))
             }
             div("data-show": (body_show)) {
                 for c in rows.iter() {
-                    (render_cap_row(base, c))
+                    (render_cap_row(base, c, lang))
                 }
             }
         }
@@ -903,7 +973,7 @@ fn render_cap_section(base: &str, group: &'static str, rows: &[&CapabilityRow]) 
 /// instead of being boxed into a narrow left column. The row wrapper carries
 /// the search-filter `data-show` and is never re-patched, so the filter
 /// survives a toggle; only the inner `#cap-seg-*` control is patched.
-fn render_cap_row(base: &str, c: &CapabilityRow) -> Html {
+fn render_cap_row(base: &str, c: &CapabilityRow, lang: Lang) -> Html {
     let label_lower =
         serde_json::to_string(&c.label.to_lowercase()).unwrap_or_else(|_| "\"\"".to_string());
     let desc_lower =
@@ -926,7 +996,7 @@ fn render_cap_row(base: &str, c: &CapabilityRow) -> Html {
                 span(style: "flex:1; min-width:0; font-size:0.82rem; font-weight:500") {
                     (c.label.clone())
                 }
-                (render_cap_segment(base, c))
+                (render_cap_segment(base, c, lang))
             }
             if has_desc {
                 // Full-width: spans under the icon *and* the control.
@@ -942,7 +1012,7 @@ fn render_cap_row(base: &str, c: &CapabilityRow) -> Html {
 /// Active-capability chips below the "+" button: the force-**On** tools and
 /// loaded skills. Clicking a chip returns it to Auto (un-pin). `#cap-chips` is
 /// patched whenever the On set changes.
-fn render_cap_chips(base: &str, caps: &[CapabilityRow]) -> Html {
+fn render_cap_chips(base: &str, caps: &[CapabilityRow], lang: Lang) -> Html {
     let on_count = caps.iter().filter(|c| c.is_on()).count();
     html! {
         div(id: "cap-chips", style: "display:contents") {
@@ -960,7 +1030,7 @@ fn render_cap_chips(base: &str, caps: &[CapabilityRow]) -> Html {
                     // picker onto a second line.
                     class: "cap-chips-summary badge badge-outline gap-1",
                     style: "cursor:pointer",
-                    title: "Active tools — tap to manage"
+                    title: (t(lang, "chat-render-active-count-title"))
                 ) {
                     (icons::plug(14))
                     span { (on_count.to_string()) }
@@ -975,7 +1045,7 @@ fn render_cap_chips(base: &str, caps: &[CapabilityRow]) -> Html {
                     )),
                     class: "cap-chip-item badge badge-outline gap-1",
                     style: "cursor:pointer",
-                    title: "Unpin (back to automatic)"
+                    title: (t(lang, "chat-render-unpin-title"))
                 ) {
                     span(style: "display:inline-flex") { (cap_icon(c)) }
                     span { (c.label.clone()) }
@@ -989,7 +1059,7 @@ fn render_cap_chips(base: &str, caps: &[CapabilityRow]) -> Html {
 
 /// The per-row tri-state segmented control (`#cap-seg-<kind>-<key>`). Tools get
 /// all three segments; skills get only Auto / On (a skill can't be "blocked").
-fn render_cap_segment(base: &str, c: &CapabilityRow) -> Html {
+fn render_cap_segment(base: &str, c: &CapabilityRow, lang: Lang) -> Html {
     let include_off = c.kind == CapKind::Tool;
     segmented(
         &cap_seg_id(c),
@@ -998,13 +1068,14 @@ fn render_cap_segment(base: &str, c: &CapabilityRow) -> Html {
         &c.key,
         Some(c.state),
         include_off,
+        lang,
     )
 }
 
 /// The group-aggregate pill (`#cap-grp-<slug>`): a segmented control that sets
 /// every row in the group at once. Its active segment reflects the aggregate —
 /// none highlighted when the rows disagree (mixed).
-fn render_group_pill(base: &str, group: &'static str, rows: &[&CapabilityRow]) -> Html {
+fn render_group_pill(base: &str, group: &'static str, rows: &[&CapabilityRow], lang: Lang) -> Html {
     let include_off = group != "Skills";
     segmented(
         &format!("cap-grp-{}", group_slug(group)),
@@ -1013,14 +1084,23 @@ fn render_group_pill(base: &str, group: &'static str, rows: &[&CapabilityRow]) -
         &group_slug(group),
         aggregate_state(rows),
         include_off,
+        lang,
     )
 }
 
 /// The master pill (`#cap-all`): sets every capability at once. Three segments
 /// (applying Off to a skill is treated as Auto by the handler).
-fn render_master_pill(base: &str, caps: &[CapabilityRow]) -> Html {
+fn render_master_pill(base: &str, caps: &[CapabilityRow], lang: Lang) -> Html {
     let rows: Vec<&CapabilityRow> = caps.iter().collect();
-    segmented("cap-all", base, "all", "*", aggregate_state(&rows), true)
+    segmented(
+        "cap-all",
+        base,
+        "all",
+        "*",
+        aggregate_state(&rows),
+        true,
+        lang,
+    )
 }
 
 /// Render a segmented Off/Auto/On (or Auto/On) control. `current` is the active
@@ -1033,6 +1113,7 @@ fn segmented(
     key: &str,
     current: Option<ToolState>,
     include_off: bool,
+    lang: Lang,
 ) -> Html {
     let mut segs: Vec<ToolState> = Vec::new();
     if include_off {
@@ -1047,7 +1128,7 @@ fn segmented(
                     border:1px solid color-mix(in oklch, currentColor 18%, transparent)"
         ) {
             for st in segs.iter() {
-                (seg_button(base, kind, key, *st, current == Some(*st)))
+                (seg_button(base, kind, key, *st, current == Some(*st), lang))
             }
         }
     }
@@ -1055,24 +1136,21 @@ fn segmented(
 }
 
 /// One segment button within a [`segmented`] control.
-fn seg_button(base: &str, kind: &str, key: &str, st: ToolState, active: bool) -> Html {
-    let (glyph, tip, active_color) = match st {
+fn seg_button(base: &str, kind: &str, key: &str, st: ToolState, active: bool, lang: Lang) -> Html {
+    let (glyph, tip_key, active_color) = match st {
         ToolState::Off => (
             "⊘",
-            "Off — blocked; hidden from the assistant",
+            "chat-render-state-off-tip",
             "var(--color-error, #dc2626)",
         ),
-        ToolState::Auto => (
-            "◐",
-            "Auto — the assistant turns it on when a request needs it",
-            "currentColor",
-        ),
+        ToolState::Auto => ("◐", "chat-render-state-auto-tip", "currentColor"),
         ToolState::On => (
             "✓",
-            "On — always available to the assistant",
+            "chat-render-state-on-tip",
             "var(--color-success, #16a34a)",
         ),
     };
+    let tip = t(lang, tip_key);
     let base_style = "padding:0.05rem 0.45rem; font-size:0.8rem; line-height:1.5; \
                       background:transparent; border:0; cursor:pointer";
     let style = if active {
@@ -1086,7 +1164,7 @@ fn seg_button(base: &str, kind: &str, key: &str, st: ToolState, active: bool) ->
     html! {
         button(
             type: "button",
-            title: (tip),
+            title: (tip.clone()),
             "aria-label": (tip),
             "data-on:click": (format!("@post('{base}?kind={kind}&key={key}&state={}')", st.as_str())),
             style: (style)
@@ -1172,7 +1250,7 @@ fn cap_icon(c: &CapabilityRow) -> Html {
 /// state says not-yet-shared); copying is harmless if that state was stale, and
 /// the server toast governs what the user is actually told. Plain (non-JS) POST
 /// still works as a fallback — the handler redirects.
-pub(super) fn render_share_control(share_url: &str, shared: bool) -> Html {
+pub(super) fn render_share_control(share_url: &str, shared: bool, lang: Lang) -> Html {
     // Plain `@post` (default JSON content type). The toggle is a standalone
     // `<button>`, not wrapped in a `<form>`, and the handler reads nothing
     // from the body — it keys off the path alone. Asking datastar for
@@ -1187,14 +1265,21 @@ pub(super) fn render_share_control(share_url: &str, shared: bool) -> Html {
             "navigator.clipboard && navigator.clipboard.writeText(window.location.href); {toggle}"
         )
     };
-    let label = if shared { "Shared ✓" } else { "Share" };
+    let label = t(
+        lang,
+        if shared {
+            "chat-render-share-label-on"
+        } else {
+            "chat-render-share-label-off"
+        },
+    );
     html! {
         button(
             id: "share-toggle",
             type: "button",
             "data-on:click": (on_click),
             class: "btn btn-ghost btn-sm whitespace-nowrap",
-            title: "Shared chats are readable by any signed-in user who has the link"
+            title: (t(lang, "chat-render-share-tooltip"))
         ) {
             (label)
         }
@@ -1208,7 +1293,7 @@ pub(super) fn render_share_control(share_url: &str, shared: bool) -> Html {
 /// copies the conversation into the viewer's account and navigates into
 /// the editable copy. Owner-only mutation it is *not*: the endpoint
 /// re-checks that the caller isn't the owner.
-pub(super) fn render_fork_control(session_id: &str) -> Html {
+pub(super) fn render_fork_control(session_id: &str, lang: Lang) -> Html {
     let fork_url = format!("/chat/{session_id}/fork");
     html! {
         button(
@@ -1216,10 +1301,10 @@ pub(super) fn render_fork_control(session_id: &str) -> Html {
             type: "button",
             "data-on:click": (format!("@post('{fork_url}')")),
             class: "btn btn-primary btn-sm whitespace-nowrap",
-            title: "Copy this conversation into your own chats so you can keep chatting"
+            title: (t(lang, "chat-render-fork-tooltip"))
         ) {
             (icons::copy(16))
-            span(class: "hidden sm:inline") { "Continue in my chats" }
+            span(class: "hidden sm:inline") { (t(lang, "chat-render-fork-label")) }
         }
     }
     .to_html()
@@ -1243,7 +1328,7 @@ pub(super) fn render_fork_control(session_id: &str) -> Html {
 /// the download. Closing on selection is handled by a panel-level `data-on:click`
 /// (no `__prevent`), so a bubbled click closes the menu while the link's default
 /// download still fires; tapping elsewhere closes it via `click__outside`.
-pub(super) fn render_export_control(session_id: &str) -> Html {
+pub(super) fn render_export_control(session_id: &str, lang: Lang) -> Html {
     let md_url = format!("/chat/{session_id}/export.md");
     let pdf_url = format!("/chat/{session_id}/export.pdf");
     html! {
@@ -1257,11 +1342,11 @@ pub(super) fn render_export_control(session_id: &str) -> Html {
                 type: "button",
                 "data-on:click": "$exportMenu = !$exportMenu",
                 class: "btn btn-ghost btn-sm whitespace-nowrap",
-                title: "Download this conversation",
-                "aria-label": "Export conversation"
+                title: (t(lang, "chat-render-export-tooltip")),
+                "aria-label": (t(lang, "chat-render-export-aria"))
             ) {
                 (icons::download(16))
-                span(class: "hidden sm:inline") { "Export" }
+                span(class: "hidden sm:inline") { (t(lang, "chat-render-export-label")) }
             }
             div(
                 class: "export-panel rounded-box border border-base-300 bg-base-100 shadow",
@@ -1269,8 +1354,8 @@ pub(super) fn render_export_control(session_id: &str) -> Html {
                 "data-on:click": "$exportMenu = false",
                 style: "display:none"
             ) {
-                a(href: (pdf_url), download: "download", class: "chat-pop-item") { "PDF document" }
-                a(href: (md_url), download: "download", class: "chat-pop-item") { "Markdown (.md)" }
+                a(href: (pdf_url), download: "download", class: "chat-pop-item") { (t(lang, "chat-render-export-pdf")) }
+                a(href: (md_url), download: "download", class: "chat-pop-item") { (t(lang, "chat-render-export-md")) }
             }
         }
     }
@@ -1315,6 +1400,7 @@ mod tests {
             capabilities: &[],
             document_canvas_html: None,
             compacted_up_to_seq: None,
+            lang: Lang::En,
         })
         .to_string()
     }
@@ -1334,6 +1420,7 @@ mod tests {
             capabilities: &[],
             document_canvas_html: None,
             compacted_up_to_seq: None,
+            lang: Lang::En,
         })
         .to_string()
     }
@@ -1348,17 +1435,17 @@ mod tests {
 
     #[test]
     fn model_label_suffixes_each_restriction() {
-        assert_eq!(model_label(&opt("qwen", true, true)), "qwen");
+        assert_eq!(model_label(Lang::En, &opt("qwen", true, true)), "qwen");
         assert_eq!(
-            model_label(&opt("glm-4.6", false, true)),
+            model_label(Lang::En, &opt("glm-4.6", false, true)),
             "glm-4.6 (non-GDPR)"
         );
         assert_eq!(
-            model_label(&opt("x", true, false)),
+            model_label(Lang::En, &opt("x", true, false)),
             "x (confidential-restricted)"
         );
         assert_eq!(
-            model_label(&opt("glm-5.2", false, false)),
+            model_label(Lang::En, &opt("glm-5.2", false, false)),
             "glm-5.2 (non-GDPR, confidential-restricted)"
         );
     }
@@ -1451,7 +1538,7 @@ mod tests {
         // `@post(..., {contentType:'form'})` makes datastar look for an
         // enclosing form and throw FetchFormNotFound, so the toggle silently
         // never fires. The directive must post plainly.
-        let s = render_share_control("/chat/s1/share", false).to_string();
+        let s = render_share_control("/chat/s1/share", false, Lang::En).to_string();
         // The attribute value is HTML-escaped (`'` → `&#39;`); datastar
         // un-escapes it back to `@post('/chat/s1/share')` at parse time.
         assert!(
@@ -1535,7 +1622,7 @@ mod tests {
         // chrome (trigger button, backdrop, panel) does carry datastar
         // directives, but every download anchor must stay a plain `download`
         // link. Closing on selection rides a panel-level handler + bubbling.
-        let menu = render_export_control("s1").to_string();
+        let menu = render_export_control("s1", Lang::En).to_string();
         assert!(menu.contains("download"), "expected download attr: {menu}");
         for anchor in menu.split("<a ").skip(1) {
             let tag = anchor.split('>').next().unwrap_or("");
@@ -1643,7 +1730,7 @@ mod tests {
     #[test]
     fn capabilities_menu_wires_tristate_and_reflects_state() {
         let caps = sample_caps();
-        let html = render_capabilities("s1", &caps).to_string();
+        let html = render_capabilities("s1", &caps, Lang::En).to_string();
 
         // Wrapper carries the persistent signals (open / search / collapse).
         assert!(
@@ -1739,7 +1826,7 @@ mod tests {
     #[test]
     fn capability_patches_target_only_volatile_leaves() {
         let caps = sample_caps();
-        let patches = render_capability_patches("s1", &caps);
+        let patches = render_capability_patches("s1", &caps, Lang::En);
         let selectors: Vec<&str> = patches.iter().map(|(s, _)| s.as_str()).collect();
 
         // Every row's seg control, every group pill, the master, and chips.
@@ -1798,7 +1885,7 @@ mod tests {
         // The tools menu must render as the bottom-sheet-capable popover
         // (`.cap-panel`) with a tap-to-close backdrop, so on a phone it fits
         // the viewport instead of spilling off the right / top edges.
-        let html = render_capabilities("s1", &sample_caps()).to_string();
+        let html = render_capabilities("s1", &sample_caps(), Lang::En).to_string();
         assert!(
             html.contains("cap-panel"),
             "tools panel must use the .cap-panel sheet class: {html}"
@@ -1817,7 +1904,7 @@ mod tests {
     fn active_caps_collapse_into_a_summary_pill() {
         // sample_caps() pins exactly one tool (dns_lookup) On. On a phone the
         // individual chips fold into a single count pill that reopens the menu.
-        let html = render_capabilities("s1", &sample_caps()).to_string();
+        let html = render_capabilities("s1", &sample_caps(), Lang::En).to_string();
         assert!(
             html.contains("cap-chips-summary"),
             "an active cap must render the mobile summary pill: {html}"

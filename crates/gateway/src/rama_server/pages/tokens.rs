@@ -29,6 +29,7 @@ use session_core::chrome::{
     Flash, FlashKind, NavSections, Theme, is_datastar_request, read_body_to_bytes, sse_patch,
     sse_response, sse_script, sse_toast,
 };
+use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use crate::rama_server::state::RamaState;
@@ -59,6 +60,7 @@ struct CreateTokenForm {
 /// caller's tokens plus an inline form to mint a new one.
 pub async fn tokens_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
 
@@ -73,28 +75,29 @@ pub async fn tokens_index(State(state): State<Arc<RamaState>>, req: Request) -> 
             return internal_error_html(&user.email, "could not list tokens");
         }
     };
-    let account = AccountSummary::new(&user, &state.rbac.role_ids_for(&user.roles));
+    let account = AccountSummary::new(&user, &state.rbac.role_ids_for(&user.roles), lang);
     // The capability catalog is the same for every token (it's the
     // user's role grants); each token carries its own disabled set.
     let entries = tool_toggles::entries_for_roles(&state, &user.roles);
     let mut rows: Vec<(TokenRowData, HashSet<String>)> = Vec::with_capacity(list.len());
-    for t in &list {
-        let disabled = token_tool_prefs::disabled_for_token(&state.db, &t.id)
+    for tok in &list {
+        let disabled = token_tool_prefs::disabled_for_token(&state.db, &tok.id)
             .await
             .unwrap_or_default();
         rows.push((
-            row_with_policy(&state.db, TokenRowData::from(t)).await,
+            row_with_policy(&state.db, TokenRowData::from_token(tok, lang)).await,
             disabled,
         ));
     }
-    let body = render_tokens_body(&rows, &entries, None, &account);
+    let body = render_tokens_body(&rows, &entries, None, &account, lang);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     nav_or_html_page(
         datastar,
         theme,
+        lang,
         nav,
         NavItem::Tokens,
-        "API tokens — LLM Gateway",
+        &t(lang, "tokens-page-title"),
         &user.email,
         is_admin(&state, &user),
         session.impersonator_id.is_some(),
@@ -119,6 +122,7 @@ fn sse_toast_response(kind: FlashKind, message: impl Into<String>) -> Response {
 }
 
 pub async fn tokens_create(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_session, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -131,12 +135,19 @@ pub async fn tokens_create(State(state): State<Arc<RamaState>>, req: Request) ->
     let form: CreateTokenForm = match serde_urlencoded::from_bytes(&body) {
         Ok(f) => f,
         Err(err) => {
-            return sse_toast_response(FlashKind::Error, format!("malformed form: {err}"));
+            return sse_toast_response(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "tokens-malformed-form",
+                    &i18n::args([("err", err.to_string().into())]),
+                ),
+            );
         }
     };
     let name = form.name.trim();
     if name.is_empty() || name.len() > 128 {
-        return sse_toast_response(FlashKind::Error, "Token name must be 1..=128 characters.");
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-name-length"));
     }
     let ttl_days = form
         .ttl_days
@@ -161,7 +172,7 @@ pub async fn tokens_create(State(state): State<Arc<RamaState>>, req: Request) ->
     };
     if let Err(err) = tokens::insert(&state.db, &row).await {
         tracing::warn!(error = %err, "storing token");
-        return sse_toast_response(FlashKind::Error, "Storing token failed.");
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-store-failed"));
     }
 
     // Surgical patches:
@@ -171,14 +182,17 @@ pub async fn tokens_create(State(state): State<Arc<RamaState>>, req: Request) ->
     //   3. Reset the create form so the next mint starts clean.
     //   4. Append a success toast.
     let entries = tool_toggles::entries_for_roles(&state, &user.roles);
-    let row_data = TokenRowData::from(&row);
+    let row_data = TokenRowData::from_token(&row, lang);
     // A brand-new token has no disabled keys yet (and tool use is off, so
     // the panel renders collapsed regardless).
-    let row_html = render_token_row(&row_data, &entries, &HashSet::new()).to_string();
-    let banner_html = render_minted_banner(&MintedBanner {
-        name: row.name.clone(),
-        plaintext,
-    })
+    let row_html = render_token_row(&row_data, &entries, &HashSet::new(), lang).to_string();
+    let banner_html = render_minted_banner(
+        &MintedBanner {
+            name: row.name.clone(),
+            plaintext,
+        },
+        lang,
+    )
     .to_string();
     sse_response(&[
         sse_patch(Some("#token-list"), Some("append"), &row_html),
@@ -186,7 +200,7 @@ pub async fn tokens_create(State(state): State<Arc<RamaState>>, req: Request) ->
         sse_script("document.getElementById('token-create-form').reset()"),
         sse_toast(&Flash {
             kind: FlashKind::Success,
-            message: "Token created.".into(),
+            message: t(lang, "tokens-created-toast"),
         }),
     ])
 }
@@ -198,6 +212,7 @@ async fn render_row_after_state_change(
     state: &RamaState,
     user: &User,
     token_id: &str,
+    lang: Lang,
 ) -> Option<String> {
     let list = tokens::list_for_user(&state.db, &user.id).await.ok()?;
     let token = list.iter().find(|t| t.id == token_id)?;
@@ -205,8 +220,8 @@ async fn render_row_after_state_change(
     let disabled = token_tool_prefs::disabled_for_token(&state.db, token_id)
         .await
         .unwrap_or_default();
-    let row = row_with_policy(&state.db, TokenRowData::from(token)).await;
-    Some(render_token_row(&row, &entries, &disabled).to_string())
+    let row = row_with_policy(&state.db, TokenRowData::from_token(token, lang)).await;
+    Some(render_token_row(&row, &entries, &disabled, lang).to_string())
 }
 
 /// POST /tokens/{id}/revoke — form action from the row's Revoke
@@ -217,29 +232,31 @@ pub async fn tokens_revoke(
     Path(token_id): Path<String>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
     match tokens::revoke(&state.db, &user.id, &token_id).await {
         Ok(true) => {
-            let Some(row_html) = render_row_after_state_change(&state, &user, &token_id).await
+            let Some(row_html) =
+                render_row_after_state_change(&state, &user, &token_id, lang).await
             else {
-                return sse_toast_response(FlashKind::Error, "Revoked token not found.");
+                return sse_toast_response(FlashKind::Error, t(lang, "tokens-revoked-not-found"));
             };
             let selector = format!("#token-row-{token_id}");
             sse_response(&[
                 sse_patch(Some(&selector), Some("outer"), &row_html),
                 sse_toast(&Flash {
                     kind: FlashKind::Success,
-                    message: "Token revoked.".into(),
+                    message: t(lang, "tokens-revoked-toast"),
                 }),
             ])
         }
-        Ok(false) => sse_toast_response(FlashKind::Info, "Token was already revoked."),
+        Ok(false) => sse_toast_response(FlashKind::Info, t(lang, "tokens-already-revoked")),
         Err(err) => {
             tracing::warn!(error = %err, %token_id, "revoke");
-            sse_toast_response(FlashKind::Error, "Revoke failed.")
+            sse_toast_response(FlashKind::Error, t(lang, "tokens-revoke-failed"))
         }
     }
 }
@@ -256,6 +273,7 @@ pub async fn tokens_rotate(
     Path(token_id): Path<String>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -265,14 +283,14 @@ pub async fn tokens_rotate(
         Ok(l) => l,
         Err(err) => {
             tracing::warn!(error = %err, "listing tokens");
-            return sse_toast_response(FlashKind::Error, "Could not load token.");
+            return sse_toast_response(FlashKind::Error, t(lang, "tokens-load-failed"));
         }
     };
     let Some(existing) = list
         .iter()
         .find(|t| t.id == token_id && t.revoked_at.is_none())
     else {
-        return sse_toast_response(FlashKind::Error, "Token not found or already revoked.");
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found-or-revoked"));
     };
 
     // Preserve the originally-configured lifetime: re-issue with the same
@@ -285,11 +303,13 @@ pub async fn tokens_rotate(
 
     match tokens::rotate(&state.db, &user.id, &token_id, &hash, now, expires_at).await {
         Ok(true) => {
-            let Some(row_html) = render_row_after_state_change(&state, &user, &token_id).await
+            let Some(row_html) =
+                render_row_after_state_change(&state, &user, &token_id, lang).await
             else {
-                return sse_toast_response(FlashKind::Error, "Rotated token not found.");
+                return sse_toast_response(FlashKind::Error, t(lang, "tokens-rotated-not-found"));
             };
-            let banner_html = render_minted_banner(&MintedBanner { name, plaintext }).to_string();
+            let banner_html =
+                render_minted_banner(&MintedBanner { name, plaintext }, lang).to_string();
             let selector = format!("#token-row-{token_id}");
             sse_response(&[
                 sse_patch(Some(&selector), Some("outer"), &row_html),
@@ -304,14 +324,14 @@ pub async fn tokens_rotate(
                 ),
                 sse_toast(&Flash {
                     kind: FlashKind::Success,
-                    message: "Token rotated — copy the new value.".into(),
+                    message: t(lang, "tokens-rotated-toast"),
                 }),
             ])
         }
-        Ok(false) => sse_toast_response(FlashKind::Error, "Token not found or already revoked."),
+        Ok(false) => sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found-or-revoked")),
         Err(err) => {
             tracing::warn!(error = %err, %token_id, "rotate");
-            sse_toast_response(FlashKind::Error, "Rotate failed.")
+            sse_toast_response(FlashKind::Error, t(lang, "tokens-rotate-failed"))
         }
     }
 }
@@ -323,6 +343,7 @@ pub async fn tokens_delete(
     Path(token_id): Path<String>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -334,16 +355,14 @@ pub async fn tokens_delete(
                 sse_patch(Some(&selector), Some("remove"), ""),
                 sse_toast(&Flash {
                     kind: FlashKind::Success,
-                    message: "Token removed.".into(),
+                    message: t(lang, "tokens-removed-toast"),
                 }),
             ])
         }
-        Ok(false) => {
-            sse_toast_response(FlashKind::Info, "Token is still active — revoke it first.")
-        }
+        Ok(false) => sse_toast_response(FlashKind::Info, t(lang, "tokens-still-active")),
         Err(err) => {
             tracing::warn!(error = %err, %token_id, "delete");
-            sse_toast_response(FlashKind::Error, "Remove failed.")
+            sse_toast_response(FlashKind::Error, t(lang, "tokens-remove-failed"))
         }
     }
 }
@@ -380,6 +399,7 @@ pub async fn tokens_tools_master(
     Path(token_id): Path<String>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -392,22 +412,26 @@ pub async fn tokens_tools_master(
     let enabled = form.enabled.is_some();
     match tokens::set_tools_enabled(&state.db, &user.id, &token_id, enabled).await {
         Ok(true) => {}
-        Ok(false) => return sse_toast_response(FlashKind::Error, "Token not found."),
+        Ok(false) => return sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found")),
         Err(err) => {
             tracing::warn!(error = %err, %token_id, "set tools_enabled");
-            return sse_toast_response(FlashKind::Error, "Could not update token.");
+            return sse_toast_response(FlashKind::Error, t(lang, "tokens-update-failed"));
         }
     }
-    let Some(row_html) = render_row_after_state_change(&state, &user, &token_id).await else {
-        return sse_toast_response(FlashKind::Error, "Token not found.");
+    let Some(row_html) = render_row_after_state_change(&state, &user, &token_id, lang).await else {
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found"));
     };
     let selector = format!("#token-row-{token_id}");
-    let verb = if enabled { "enabled" } else { "disabled" };
+    let message_key = if enabled {
+        "tokens-tool-use-enabled-toast"
+    } else {
+        "tokens-tool-use-disabled-toast"
+    };
     sse_response(&[
         sse_patch(Some(&selector), Some("outer"), &row_html),
         sse_toast(&Flash {
             kind: FlashKind::Success,
-            message: format!("Tool use {verb} for this token."),
+            message: t(lang, message_key),
         }),
     ])
 }
@@ -422,6 +446,7 @@ pub async fn tokens_mcp_policy(
     req: Request,
 ) -> Response {
     use crate::server::db::user_mcp::{AskOverApi, set_token_policy};
+    let lang = Lang::from_headers(req.headers());
     let (_, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -437,7 +462,7 @@ pub async fn tokens_mcp_policy(
         .map(|list| list.iter().any(|t| t.id == token_id))
         .unwrap_or(false);
     if !owns {
-        return sse_toast_response(FlashKind::Error, "Token not found.");
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found"));
     }
     let policy = if form.enabled.is_some() {
         AskOverApi::Allow
@@ -446,22 +471,22 @@ pub async fn tokens_mcp_policy(
     };
     if let Err(err) = set_token_policy(&state.db, &token_id, "*", policy).await {
         tracing::warn!(error = %err, %token_id, "set token mcp policy");
-        return sse_toast_response(FlashKind::Error, "Could not update token.");
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-update-failed"));
     }
-    let Some(row_html) = render_row_after_state_change(&state, &user, &token_id).await else {
-        return sse_toast_response(FlashKind::Error, "Token not found.");
+    let Some(row_html) = render_row_after_state_change(&state, &user, &token_id, lang).await else {
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found"));
     };
     let selector = format!("#token-row-{token_id}");
-    let verb = if matches!(policy, AskOverApi::Allow) {
-        "enabled"
+    let message_key = if matches!(policy, AskOverApi::Allow) {
+        "tokens-mcp-ask-enabled-toast"
     } else {
-        "disabled"
+        "tokens-mcp-ask-disabled-toast"
     };
     sse_response(&[
         sse_patch(Some(&selector), Some("outer"), &row_html),
         sse_toast(&Flash {
             kind: FlashKind::Success,
-            message: format!("Ask-mode MCP tools over API {verb} for this token."),
+            message: t(lang, message_key),
         }),
     ])
 }
@@ -473,6 +498,7 @@ pub async fn tokens_tools_toggle(
     Path(token_id): Path<String>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -483,28 +509,37 @@ pub async fn tokens_tools_toggle(
         Err(resp) => return resp,
     };
     if !owns_token(&state, &user.id, &token_id).await {
-        return sse_toast_response(FlashKind::Error, "Token not found.");
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found"));
     }
     // Only a key the user's roles actually expose can be toggled — the
     // panel never offers others, so a request for one is bogus.
     let entries = tool_toggles::entries_for_roles(&state, &user.roles);
     let Some(entry) = entries.iter().find(|e| e.key == form.tool_key) else {
-        return sse_toast_response(FlashKind::Error, "Unknown tool.");
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-unknown-tool"));
     };
     let enabled = form.enabled.is_some();
     if let Err(err) = token_tool_prefs::set(&state.db, &token_id, &entry.key, enabled).await {
         tracing::warn!(error = %err, %token_id, tool_key = %entry.key, "token tool pref save");
-        return sse_toast_response(FlashKind::Error, "Could not save preference.");
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-save-pref-failed"));
     }
     let ctx = token_toggle_ctx(&token_id);
     let selector = format!("#{}", ctx.row_id(&entry.key));
     let row_html = tool_toggles::render_toggle_row(entry, enabled, &ctx).to_string();
-    let verb = if enabled { "enabled" } else { "disabled" };
+    let message_key = if enabled {
+        "tokens-capability-enabled-toast"
+    } else {
+        "tokens-capability-disabled-toast"
+    };
+    let message = t_args(
+        lang,
+        message_key,
+        &i18n::args([("name", entry.title.clone().into())]),
+    );
     sse_response(&[
         sse_patch(Some(&selector), Some("outer"), &row_html),
         sse_toast(&Flash {
             kind: FlashKind::Success,
-            message: format!("{} {} for this token.", entry.title, verb),
+            message,
         }),
     ])
 }
@@ -527,10 +562,10 @@ struct AccountSummary {
 }
 
 impl AccountSummary {
-    fn new(user: &User, role_ids: &[String]) -> Self {
-        let join_or = |items: &[String], empty: &str| {
+    fn new(user: &User, role_ids: &[String], lang: Lang) -> Self {
+        let join_or = |items: &[String], empty: String| {
             if items.is_empty() {
-                empty.to_string()
+                empty
             } else {
                 items.join(", ")
             }
@@ -538,8 +573,8 @@ impl AccountSummary {
         Self {
             email: user.email.clone(),
             user_id: user.id.clone(),
-            oidc_roles: join_or(&user.roles, "none"),
-            rbac_roles: join_or(role_ids, "none granted"),
+            oidc_roles: join_or(&user.roles, t(lang, "tokens-roles-none")),
+            rbac_roles: join_or(role_ids, t(lang, "tokens-roles-none-granted")),
         }
     }
 }
@@ -548,24 +583,28 @@ impl AccountSummary {
 /// dashboard surfaced (email, user id, OIDC roles, RBAC role IDs) but
 /// tucked at the foot of the tokens page where it doesn't compete with
 /// the primary task.
-fn render_account_section(account: &AccountSummary) -> Html {
-    let email = account.email.clone();
+fn render_account_section(account: &AccountSummary, lang: Lang) -> Html {
     let user_id = account.user_id.clone();
     let oidc_roles = account.oidc_roles.clone();
     let rbac_roles = account.rbac_roles.clone();
+    let signed_in_as = t_args(
+        lang,
+        "tokens-signed-in-as",
+        &i18n::args([("email", account.email.clone().into())]),
+    );
     html! {
         section(class: "card border border-base-300 mt-6") {
             div(class: "card-body") {
-                h2(class: "card-title text-base") { "Account" }
-                p(class: "text-base-content/60 text-sm") { "Signed in as " (email) }
+                h2(class: "card-title text-base") { (t(lang, "tokens-account-heading")) }
+                p(class: "text-base-content/60 text-sm") { (signed_in_as) }
                 // `minmax(0, 1fr)` on the value column lets the long
                 // UUID shrink to the card width instead of overflowing.
                 dl(class: "grid grid-cols-[8rem_minmax(0,1fr)] gap-y-2 gap-x-4 text-sm mt-2") {
-                    dt(class: "text-base-content/60") { "User ID" }
+                    dt(class: "text-base-content/60") { (t(lang, "tokens-account-user-id-label")) }
                     dd(class: "font-mono text-xs break-all min-w-0") { (user_id) }
-                    dt(class: "text-base-content/60") { "OIDC roles" }
+                    dt(class: "text-base-content/60") { (t(lang, "tokens-account-oidc-label")) }
                     dd(class: "min-w-0 break-words") { (oidc_roles) }
-                    dt(class: "text-base-content/60") { "RBAC role IDs" }
+                    dt(class: "text-base-content/60") { (t(lang, "tokens-account-rbac-label")) }
                     dd(class: "min-w-0 break-words") { (rbac_roles) }
                 }
             }
@@ -579,20 +618,20 @@ fn render_tokens_body(
     entries: &[ToolEntry],
     minted: Option<&MintedBanner>,
     account: &AccountSummary,
+    lang: Lang,
 ) -> Html {
     // The banner is either the rendered minted-card or an empty
     // placeholder that the create handler can patch in via SSE
     // (`mode outer` on `#token-minted-banner`).
     let banner = match minted {
-        Some(b) => render_minted_banner(b),
+        Some(b) => render_minted_banner(b, lang),
         None => empty_banner_placeholder(),
     };
     html! {
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
-        h1(class: "text-2xl font-bold mb-2") { "API tokens" }
+        h1(class: "text-2xl font-bold mb-2") { (t(lang, "tokens-page-heading")) }
         p(class: "text-base-content/60 text-sm mb-6") {
-            "Bearer tokens for the OpenAI-compatible API. The plaintext "
-            "is shown only at creation time — store it somewhere safe."
+            (t(lang, "tokens-intro"))
         }
 
         (banner)
@@ -608,26 +647,26 @@ fn render_tokens_body(
             "data-on:submit__prevent": "@post('/tokens', {contentType: 'form'})"
         ) {
             div(class: "card-body") {
-                h2(class: "card-title") { "Create token" }
+                h2(class: "card-title") { (t(lang, "tokens-create-heading")) }
                 p(class: "text-base-content/70") {
-                    "Mint a new bearer token for the OpenAI-compatible API."
+                    (t(lang, "tokens-create-description"))
                 }
                 label(class: "form-control w-full") {
                     div(class: "label") {
-                        span(class: "label-text") { "Name" }
+                        span(class: "label-text") { (t(lang, "tokens-name-label")) }
                     }
                     input(
                         id: "name",
                         name: "name",
                         type: "text",
                         required: "required",
-                        placeholder: "e.g. laptop, ci-runner",
+                        placeholder: (t(lang, "tokens-name-placeholder")),
                         class: "input input-bordered w-full"
                     );
                 }
                 label(class: "form-control w-32") {
                     div(class: "label") {
-                        span(class: "label-text") { "TTL (days)" }
+                        span(class: "label-text") { (t(lang, "tokens-ttl-label")) }
                     }
                     input(
                         id: "ttl_days",
@@ -640,14 +679,14 @@ fn render_tokens_body(
                     );
                 }
                 div(class: "card-actions justify-end mt-2") {
-                    button(type: "submit", class: "btn btn-primary") { "Create token" }
+                    button(type: "submit", class: "btn btn-primary") { (t(lang, "tokens-create-submit")) }
                 }
             }
         }
 
         section(class: "card border border-base-300") {
             div(class: "card-body") {
-                h2(class: "card-title") { "Your tokens" }
+                h2(class: "card-title") { (t(lang, "tokens-list-heading")) }
                 // Always emit the <ul>; the empty-state paragraph
                 // below is hidden via CSS while the list has children
                 // (`.token-list:not(:empty) ~ .token-list-empty {
@@ -659,16 +698,16 @@ fn render_tokens_body(
                     class: "token-list flex flex-col divide-y divide-base-300"
                 ) {
                     for (r, disabled) in rows.iter() {
-                        (render_token_row(r, entries, disabled))
+                        (render_token_row(r, entries, disabled, lang))
                     }
                 }
                 p(class: "token-list-empty text-base-content/60 text-sm") {
-                    "No tokens yet. Create one above."
+                    (t(lang, "tokens-list-empty"))
                 }
             }
         }
 
-        (render_account_section(account))
+        (render_account_section(account, lang))
         }
     }
     .to_html()
@@ -713,24 +752,36 @@ impl TokenRowData {
     }
 }
 
-impl From<&tokens::Token> for TokenRowData {
-    fn from(t: &tokens::Token) -> Self {
-        let revoked = t.revoked_at.is_some();
-        let created = t.created_at.strftime("%Y-%m-%d").to_string();
-        let last_used = t
+impl TokenRowData {
+    /// Build a row from a stored token, localizing the "created / last
+    /// used / expires" meta line. A plain associated function rather than
+    /// `From` since it now needs `lang` to render that text.
+    fn from_token(token: &tokens::Token, lang: Lang) -> Self {
+        let revoked = token.revoked_at.is_some();
+        let created = token.created_at.strftime("%Y-%m-%d").to_string();
+        let last_used = token
             .last_used_at
             .map(|lu| lu.strftime("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "never".to_string());
-        let expires = t.expires_at.strftime("%Y-%m-%d").to_string();
+            .unwrap_or_else(|| t(lang, "tokens-last-used-never"));
+        let expires = token.expires_at.strftime("%Y-%m-%d").to_string();
+        let meta = t_args(
+            lang,
+            "tokens-row-meta",
+            &i18n::args([
+                ("created", created.into()),
+                ("last_used", last_used.into()),
+                ("expires", expires.into()),
+            ]),
+        );
         Self {
-            id: t.id.clone(),
-            name: t.name.clone(),
-            meta: format!("created {created} · last used {last_used} · expires {expires}"),
+            id: token.id.clone(),
+            name: token.name.clone(),
+            meta,
             revoked,
-            revoke_action: format!("/tokens/{}/revoke", t.id),
-            rotate_action: format!("/tokens/{}/rotate", t.id),
-            delete_action: format!("/tokens/{}/delete", t.id),
-            tools_enabled: t.tools_enabled,
+            revoke_action: format!("/tokens/{}/revoke", token.id),
+            rotate_action: format!("/tokens/{}/rotate", token.id),
+            delete_action: format!("/tokens/{}/delete", token.id),
+            tools_enabled: token.tools_enabled,
             mcp_allow: false,
         }
     }
@@ -761,9 +812,11 @@ fn render_token_tools_panel(
     mcp_allow: bool,
     entries: &[ToolEntry],
     disabled: &HashSet<String>,
+    lang: Lang,
 ) -> Html {
     let master_action = format!("/tokens/{token_id}/tools/master");
     let directive = master_directive(token_id);
+    let tool_use_aria = t(lang, "tokens-tool-use-aria");
     let sections = if tools_enabled {
         Some(tool_toggles::render_toggle_sections(
             entries,
@@ -788,7 +841,7 @@ fn render_token_tools_panel(
                         value: "true",
                         class: "toggle toggle-primary toggle-sm",
                         checked: "checked",
-                        "aria-label": "Tool use"
+                        "aria-label": (tool_use_aria.clone())
                     );
                 } else {
                     input(
@@ -796,24 +849,24 @@ fn render_token_tools_panel(
                         name: "enabled",
                         value: "true",
                         class: "toggle toggle-primary toggle-sm",
-                        "aria-label": "Tool use"
+                        "aria-label": (tool_use_aria.clone())
                     );
                 }
-                span(class: "text-sm font-medium text-base-content") { "Tool use" }
+                span(class: "text-sm font-medium text-base-content") { (t(lang, "tokens-tool-use-label")) }
                 span(class: "text-xs text-base-content/60") {
-                    "Let this token call gateway tools (web search, RAG, …)."
+                    (t(lang, "tokens-tool-use-description"))
                 }
             }
             if let Some(sections) = &sections {
                 details(class: "mt-2") {
                     summary(class: "text-sm text-base-content/70 cursor-pointer select-none") {
-                        "Capabilities"
+                        (t(lang, "tokens-capabilities-summary"))
                     }
                     div(class: "mt-2") { (sections) }
                 }
             }
             if tools_enabled {
-                (render_token_mcp_policy(token_id, mcp_allow))
+                (render_token_mcp_policy(token_id, mcp_allow, lang))
             }
         }
     }
@@ -824,9 +877,10 @@ fn render_token_tools_panel(
 /// API. The API can't pause for interactive approval, so `ask` tools are
 /// hidden by default; flipping this exposes them (treating `ask` as `always`)
 /// for this token. Connected-connector read tools (`always`) are unaffected.
-fn render_token_mcp_policy(token_id: &str, allow: bool) -> Html {
+fn render_token_mcp_policy(token_id: &str, allow: bool, lang: Lang) -> Html {
     let action = format!("/tokens/{token_id}/mcp-policy");
     let directive = format!("@post('{action}', {{contentType: 'form'}})");
+    let allow_aria = t(lang, "tokens-mcp-allow-aria");
     html! {
         form(
             action: (action),
@@ -837,15 +891,15 @@ fn render_token_mcp_policy(token_id: &str, allow: bool) -> Html {
             if allow {
                 input(type: "checkbox", name: "enabled", value: "true",
                       class: "toggle toggle-warning toggle-sm", checked: "checked",
-                      "aria-label": "Allow ask-mode MCP tools over API");
+                      "aria-label": (allow_aria.clone()));
             } else {
                 input(type: "checkbox", name: "enabled", value: "true",
                       class: "toggle toggle-warning toggle-sm",
-                      "aria-label": "Allow ask-mode MCP tools over API");
+                      "aria-label": (allow_aria.clone()));
             }
-            span(class: "text-sm font-medium text-base-content") { "Allow “ask” MCP tools over API" }
+            span(class: "text-sm font-medium text-base-content") { (t(lang, "tokens-mcp-allow-label")) }
             span(class: "text-xs text-base-content/60") {
-                "Approval-required connector tools can't prompt over the API; enabling runs them without asking."
+                (t(lang, "tokens-mcp-allow-description"))
             }
         }
     }
@@ -857,12 +911,18 @@ fn render_token_mcp_policy(token_id: &str, allow: bool) -> Html {
 /// swap (revoke) or replace (active ↔ revoked) a row in place. Active
 /// tokens carry a per-token tool panel below the row line; `entries` is
 /// the capability catalog and `disabled` this token's off keys.
-fn render_token_row(r: &TokenRowData, entries: &[ToolEntry], disabled: &HashSet<String>) -> Html {
+fn render_token_row(
+    r: &TokenRowData,
+    entries: &[ToolEntry],
+    disabled: &HashSet<String>,
+    lang: Lang,
+) -> Html {
     let dom_id = r.dom_id();
     // A revoked token can't authenticate, so its tool config is moot — no
     // panel there.
-    let panel = (!r.revoked)
-        .then(|| render_token_tools_panel(&r.id, r.tools_enabled, r.mcp_allow, entries, disabled));
+    let panel = (!r.revoked).then(|| {
+        render_token_tools_panel(&r.id, r.tools_enabled, r.mcp_allow, entries, disabled, lang)
+    });
     html! {
         li(id: (dom_id), class: "py-3") {
         div(class: "flex items-center gap-4") {
@@ -876,7 +936,7 @@ fn render_token_row(r: &TokenRowData, entries: &[ToolEntry], disabled: &HashSet<
                 // shadcn destructive badge: filled error background,
                 // light error-content text. Matches the look of the
                 // Revoke action that produced this state.
-                span(class: "badge badge-error") { "revoked" }
+                span(class: "badge badge-error") { (t(lang, "tokens-badge-revoked")) }
                 // Outline variant — cleanup of an already-revoked
                 // row isn't destructive (the damage is done), but
                 // ghost reads as "no action available" in shadcn's
@@ -892,13 +952,13 @@ fn render_token_row(r: &TokenRowData, entries: &[ToolEntry], disabled: &HashSet<
                     button(
                         type: "submit",
                         class: "btn btn-outline btn-sm"
-                    ) { "Remove" }
+                    ) { (t(lang, "tokens-remove-button")) }
                 }
             } else {
                 // shadcn secondary badge: filled neutral surface,
                 // base-content text. "Active" is the normal state —
                 // the eye shouldn't be drawn to it.
-                span(class: "badge badge-secondary") { "active" }
+                span(class: "badge badge-secondary") { (t(lang, "tokens-badge-active")) }
                 // Rotate: re-mints the secret in place (same name + tool
                 // config), so the owner doesn't have to revoke + recreate
                 // just to roll a key. Outline variant — it's a normal
@@ -913,8 +973,8 @@ fn render_token_row(r: &TokenRowData, entries: &[ToolEntry], disabled: &HashSet<
                     button(
                         type: "submit",
                         class: "btn btn-outline btn-sm",
-                        title: "Issue a new secret for this token (keeps its name and settings)"
-                    ) { "Rotate" }
+                        title: (t(lang, "tokens-rotate-title"))
+                    ) { (t(lang, "tokens-rotate-button")) }
                 }
                 // shadcn destructive button: filled error background,
                 // light text, hover dims to /90. Loud on purpose —
@@ -928,7 +988,7 @@ fn render_token_row(r: &TokenRowData, entries: &[ToolEntry], disabled: &HashSet<
                     button(
                         type: "submit",
                         class: "btn btn-error btn-sm"
-                    ) { "Revoke" }
+                    ) { (t(lang, "tokens-revoke-button")) }
                 }
             }
         }
@@ -962,9 +1022,15 @@ fn render_token_row(r: &TokenRowData, entries: &[ToolEntry], disabled: &HashSet<
 /// `window.uiCopy` helper (ui/ts/clipboard.ts), which is wired via the
 /// button's `data-on:click` — no need to reflect the plaintext into a
 /// data-attribute (which would put the secret in the DOM twice).
-fn render_minted_banner(banner: &MintedBanner) -> Html {
-    let name = banner.name.clone();
+fn render_minted_banner(banner: &MintedBanner, lang: Lang) -> Html {
     let plain = banner.plaintext.clone();
+    let name_line = t_args(
+        lang,
+        "tokens-minted-name",
+        &i18n::args([("name", banner.name.clone().into())]),
+    );
+    let copy_aria = t(lang, "tokens-copy-aria");
+    let copy_title = t(lang, "tokens-copy-title");
     html! {
         div(
             id: "token-minted-banner",
@@ -973,10 +1039,10 @@ fn render_minted_banner(banner: &MintedBanner) -> Html {
             div(class: "card-body") {
                 div(class: "flex items-center gap-2") {
                     span(class: "text-success") { (icons::check(18)) }
-                    h2(class: "card-title text-base m-0") { "Token created" }
+                    h2(class: "card-title text-base m-0") { (t(lang, "tokens-minted-heading")) }
                 }
                 p(class: "text-sm text-base-content/70 mt-1 mb-3") {
-                    "Copy the value now — you won't be able to see it again."
+                    (t(lang, "tokens-minted-copy-warning"))
                 }
                 // `relative` wrapper so the copy button can anchor
                 // top-right of the pre via `absolute`. The pre's
@@ -996,8 +1062,8 @@ fn render_minted_banner(banner: &MintedBanner) -> Html {
                         type: "button",
                         "data-copy-target": "#minted-token-value",
                         "data-on:click": "window.uiCopy(el)",
-                        "aria-label": "Copy token",
-                        title: "Copy token",
+                        "aria-label": (copy_aria),
+                        title: (copy_title),
                         class: "btn btn-ghost btn-sm btn-square \
                                 absolute top-1.5 right-1.5"
                     ) {
@@ -1005,7 +1071,7 @@ fn render_minted_banner(banner: &MintedBanner) -> Html {
                     }
                 }
                 p(class: "text-xs text-base-content/60 mt-3 mb-0") {
-                    "Name: " (name)
+                    (name_line)
                 }
             }
         }

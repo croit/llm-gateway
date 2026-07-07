@@ -98,6 +98,10 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
             pages::integrations_tools_all,
         )
         .with_get("/chat", pages::chat_index)
+        // `/chat/search` MUST precede `/chat/{id}` — rama matches routes in
+        // registration order, so the `{id}` param would otherwise capture
+        // "search" and hand it to `chat_session_view` (a 303 to /chat).
+        .with_get("/chat/search", pages::chat_search)
         .with_get("/chat/{id}", pages::chat_session_view)
         .with_post("/chat/sessions", pages::chat_session_create)
         .with_post("/chat/{id}/messages", pages::chat_message_send)
@@ -179,6 +183,7 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
             "/nav/toggle/{section}",
             session_core::chrome::nav_sections_toggle,
         )
+        .with_post("/lang", session_core::chrome::lang_set)
         .with_get("/v1/models", proxy::list_models)
         // Catch-all param: model ids contain `/` (e.g.
         // `mistralai/Voxtral-Mini-4B-Realtime-2602`).

@@ -463,6 +463,195 @@ pub async fn delete_session(pool: &Pool, user_id: &str, session_id: &str) -> Res
     Ok(result.rows_affected() > 0)
 }
 
+/// Turn a raw user search string into a safe FTS5 MATCH expression.
+///
+/// The user types free text; FTS5's MATCH grammar treats characters like
+/// `.`, `-`, `:`, `"`, `*`, `(`, and bare `AND`/`OR`/`NEAR` as operators,
+/// so passing the raw string through throws "fts5: syntax error" on
+/// perfectly reasonable queries (a filename like `config.yaml`, a flag
+/// like `--verbose`, an email). We defuse this by splitting on Unicode
+/// whitespace and wrapping each token as a double-quoted FTS5 *string*
+/// (a `""` escapes an embedded quote). Quoted tokens are literal — no
+/// operator is honoured inside them — and joining them with spaces makes
+/// FTS5 require every token (implicit AND), which is the intuitive
+/// "results contain all my words" behaviour. Language-agnostic: it never
+/// inspects the words themselves, only whitespace boundaries.
+///
+/// Returns an empty string when the query is blank or all-punctuation,
+/// which the caller treats as "no search" (falls back to the normal list).
+fn to_fts_match_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter(|tok| !tok.is_empty())
+        .map(|tok| format!("\"{}\"", tok.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Sentinel characters `snippet()` wraps each matching term with: ASCII STX
+/// (0x02) opens a highlight, ETX (0x03) closes it. We ask FTS5 to mark
+/// matches with these control chars (via `char(2)`/`char(3)` in the query)
+/// rather than literal `<b>`/`</b>`, HTML-escape the surrounding text in
+/// [`highlight_snippet`], then swap the sentinels for real `<b>` tags — so a
+/// `<script>` a user typed renders as inert text while the highlight markup
+/// we control survives.
+///
+/// For this to be unambiguous the sentinels must never occur in the indexed
+/// text itself (otherwise a user-typed STX would be rewritten into stray
+/// `<b>`). [`strip_fts_sentinels`] enforces that at every write to an indexed
+/// column, so any sentinel reaching [`highlight_snippet`] is one we injected.
+const SNIPPET_OPEN: char = '\u{2}';
+const SNIPPET_CLOSE: char = '\u{3}';
+
+/// Remove the FTS highlight sentinels ([`SNIPPET_OPEN`] / [`SNIPPET_CLOSE`])
+/// from text bound for an FTS-indexed column (`user_content` / `content`).
+/// These ASCII control chars have no legitimate place in chat text or
+/// markdown, and stripping them keeps [`highlight_snippet`]'s sentinel
+/// invariant true — a user can't smuggle raw STX/ETX into a conversation to
+/// forge highlight markup in the search sidebar. Borrows unchanged when the
+/// text (the overwhelmingly common case) contains neither char.
+fn strip_fts_sentinels(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains(SNIPPET_OPEN) || s.contains(SNIPPET_CLOSE) {
+        std::borrow::Cow::Owned(s.replace([SNIPPET_OPEN, SNIPPET_CLOSE], ""))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// Convert a raw `snippet()` result — which embeds the [`SNIPPET_OPEN`] /
+/// [`SNIPPET_CLOSE`] control chars around matches and otherwise contains
+/// verbatim, attacker-influenced conversation text — into a safe HTML
+/// fragment: the surrounding text is HTML-escaped (via
+/// [`crate::chrome::escape_html`]) so it can't inject markup, then the
+/// sentinels become `<b>`/`</b>`. Since [`strip_fts_sentinels`] guarantees
+/// no sentinel survives in the indexed text, every sentinel here is ours.
+fn highlight_snippet(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 16);
+    // Walk sentinel-delimited segments: escape the text, emit our own tags
+    // at the boundaries. `split_inclusive` would keep the delimiter; instead
+    // scan char-by-char, buffering plain runs so escaping runs once per run.
+    let mut buf = String::new();
+    let flush = |buf: &mut String, out: &mut String| {
+        if !buf.is_empty() {
+            out.push_str(&crate::chrome::escape_html(buf));
+            buf.clear();
+        }
+    };
+    for ch in raw.chars() {
+        match ch {
+            SNIPPET_OPEN => {
+                flush(&mut buf, &mut out);
+                out.push_str("<b>");
+            }
+            SNIPPET_CLOSE => {
+                flush(&mut buf, &mut out);
+                out.push_str("</b>");
+            }
+            _ => buf.push(ch),
+        }
+    }
+    flush(&mut buf, &mut out);
+    out
+}
+
+/// Full-text search across a user's conversations. Matches against
+/// user prompts and assistant responses (excluding reasoning/thinking).
+/// Returns a ranked list of conversations with highlighted snippets.
+///
+/// The raw query is normalised into a safe FTS5 MATCH expression by
+/// [`to_fts_match_query`]. A blank / punctuation-only query returns the
+/// normal recency-ordered list (via [`list_sessions`]).
+///
+/// One row per conversation: the query groups by session and keeps the
+/// best-ranked matching turn (its snippet), so `limit` counts
+/// *conversations*, not turns — a chatty conversation with many hits can't
+/// crowd other matching conversations out of the results. Snippets are
+/// HTML-escaped (see [`highlight_snippet`]) with only the match highlight
+/// as live markup.
+pub async fn search_sessions(
+    pool: &Pool,
+    user_id: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>, DbError> {
+    let match_query = to_fts_match_query(query);
+    if match_query.is_empty() {
+        // Empty or punctuation-only query → fall back to the normal list,
+        // capped at `limit` so the "limit counts conversations" contract
+        // holds on this path too (a user with hundreds of chats must not
+        // flood the sidebar patch).
+        let sessions = list_sessions(pool, user_id).await?;
+        return Ok(sessions
+            .into_iter()
+            .take(limit)
+            .map(|s| SearchHit {
+                session_id: s.id,
+                title: s.title,
+                updated_at: s.updated_at,
+                pinned: s.pinned,
+                snippet: String::new(),
+            })
+            .collect());
+    }
+
+    // Two-stage query. The inner `matches` CTE queries the FTS table
+    // *directly* with no joins — the only context where `bm25()` and
+    // `snippet()` are allowed (a join lets the planner reach the FTS table
+    // by rowid, which breaks the auxiliary functions). It yields one row
+    // per matching turn: rowid + rank + highlighted snippet. The outer
+    // query joins that to `chat_turns`/`chat_sessions` for metadata and
+    // GROUP BYs session — `MIN(rank)` picks each conversation's best turn,
+    // and SQLite's "bare column" rule takes the remaining columns (incl.
+    // `snippet`) from that same min-rank row. Grouping *before* LIMIT means
+    // LIMIT counts conversations, not turns — a chatty conversation with
+    // many hits can't crowd others out. The `char(2)`/`char(3)` sentinels
+    // become `<b>` after escaping (see `highlight_snippet`), so raw HTML in
+    // the text can't inject markup.
+    let rows = sqlx::query(
+        r#"
+        WITH matches AS MATERIALIZED (
+            SELECT
+                rowid AS turn_rowid,
+                bm25(chat_turns_fts) AS rank,
+                snippet(chat_turns_fts, -1, char(2), char(3), '…', 40) AS snippet
+            FROM chat_turns_fts
+            WHERE chat_turns_fts MATCH ?
+        )
+        SELECT
+            s.id AS session_id,
+            s.title AS title,
+            s.updated_at AS updated_at,
+            s.pinned AS pinned,
+            MIN(m.rank) AS rank,
+            m.snippet AS snippet
+        FROM matches m
+        JOIN chat_turns t ON t.rowid = m.turn_rowid
+        JOIN chat_sessions s ON s.id = t.session_id
+        WHERE s.user_id = ?
+        GROUP BY s.id
+        ORDER BY rank ASC, s.updated_at DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(&match_query)
+    .bind(user_id)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter()
+        .map(|row| {
+            Ok(SearchHit {
+                session_id: row.try_get("session_id")?,
+                title: row.try_get("title")?,
+                updated_at: parse_ts(row.try_get("updated_at")?, "updated_at")?,
+                pinned: row.try_get::<i64, _>("pinned")? != 0,
+                snippet: highlight_snippet(&row.try_get::<String, _>("snippet")?),
+            })
+        })
+        .collect()
+}
+
 /// One attachment object that the fork path must copy in the blob
 /// store: the source turn-scoped key, the destination turn-scoped key,
 /// and the (raw, un-encoded) filename they share. Returned by
@@ -473,6 +662,28 @@ pub struct AttachmentCopy {
     pub from_turn_id: String,
     pub to_turn_id: String,
     pub filename: String,
+}
+
+/// One conversation matching a search query. Returned by
+/// [`search_sessions`] with a highlighted snippet of where the term
+/// matched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    /// The conversation's session id.
+    pub session_id: String,
+    /// The conversation's title. `None` when it was never titled; the
+    /// renderer supplies the "Untitled chat" fallback (this layer does not
+    /// substitute).
+    pub title: Option<String>,
+    /// Last activity timestamp.
+    pub updated_at: Timestamp,
+    /// Whether the conversation is pinned.
+    pub pinned: bool,
+    /// A highlighted, **HTML-safe** excerpt of the matching content: the
+    /// surrounding text is HTML-escaped and only the match itself is wrapped
+    /// in `<b>`/`</b>` (see [`highlight_snippet`]). Safe to render as raw
+    /// HTML. Empty for the no-query fallback listing.
+    pub snippet: String,
 }
 
 /// Copy an entire conversation into `new_user_id`'s account as a fresh,
@@ -706,7 +917,7 @@ pub async fn create_user_turn(
     .bind(&turn.session_id)
     .bind(turn.seq)
     .bind(turn.role.as_str())
-    .bind(content)
+    .bind(strip_fts_sentinels(content).as_ref())
     .bind(turn.status.as_str())
     .bind(turn.created_at.to_string())
     .bind(turn.completed_at.map(|t| t.to_string()))
@@ -772,7 +983,7 @@ pub async fn append_content(pool: &Pool, turn_id: &str, chunk: &str) -> Result<(
            SET content = COALESCE(content, '') || ?
            WHERE id = ?"#,
     )
-    .bind(chunk)
+    .bind(strip_fts_sentinels(chunk).as_ref())
     .bind(turn_id)
     .execute(pool)
     .await?;
@@ -792,7 +1003,7 @@ pub async fn set_content(pool: &Pool, turn_id: &str, content: &str) -> Result<()
            SET content = ?
            WHERE id = ?"#,
     )
-    .bind(content)
+    .bind(strip_fts_sentinels(content).as_ref())
     .bind(turn_id)
     .execute(pool)
     .await?;
@@ -1017,7 +1228,7 @@ pub async fn update_user_turn_content(
         r#"UPDATE chat_turns SET user_content = ?
            WHERE id = ? AND session_id = ? AND role = 'user'"#,
     )
-    .bind(content)
+    .bind(strip_fts_sentinels(content).as_ref())
     .bind(turn_id)
     .bind(session_id)
     .execute(pool)
@@ -1406,6 +1617,41 @@ mod tests {
                 FOREIGN KEY (turn_id) REFERENCES chat_turns(id) ON DELETE CASCADE,
                 UNIQUE (turn_id, seq)
             )"#,
+            // FTS5 table for search (matches migration 0031). Keyed on the
+            // implicit integer `rowid` because `chat_turns.id` is a TEXT UUID
+            // and FTS5's content_rowid must be an integer.
+            r#"CREATE VIRTUAL TABLE chat_turns_fts USING fts5(
+                user_content,
+                content,
+                content='chat_turns',
+                tokenize='unicode61'
+            )"#,
+            // Terminal-status-gated triggers (see migration 0031 for the
+            // full rationale): a row is indexed IFF status != 'in_progress',
+            // so streaming `append_content` updates do no FTS work and each
+            // turn is tokenized exactly once at finalize.
+            r#"CREATE TRIGGER chat_turns_fts_ai AFTER INSERT ON chat_turns
+               WHEN new.status != 'in_progress'
+               BEGIN
+                INSERT INTO chat_turns_fts(rowid, user_content, content)
+                VALUES (new.rowid, new.user_content, new.content);
+            END"#,
+            r#"CREATE TRIGGER chat_turns_fts_ad AFTER DELETE ON chat_turns
+               WHEN old.status != 'in_progress'
+               BEGIN
+                INSERT INTO chat_turns_fts(chat_turns_fts, rowid, user_content, content)
+                VALUES ('delete', old.rowid, old.user_content, old.content);
+            END"#,
+            r#"CREATE TRIGGER chat_turns_fts_au AFTER UPDATE OF user_content, content, status ON chat_turns
+               WHEN old.status != 'in_progress' OR new.status != 'in_progress'
+               BEGIN
+                INSERT INTO chat_turns_fts(chat_turns_fts, rowid, user_content, content)
+                    SELECT 'delete', old.rowid, old.user_content, old.content
+                    WHERE old.status != 'in_progress';
+                INSERT INTO chat_turns_fts(rowid, user_content, content)
+                    SELECT new.rowid, new.user_content, new.content
+                    WHERE new.status != 'in_progress';
+            END"#,
         ] {
             sqlx::query(stmt).execute(&pool).await.unwrap();
         }
@@ -1885,6 +2131,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_indexes_crashed_in_progress_turns_for_search() {
+        // A turn left in_progress by a crash is not indexed (streaming path
+        // skips indexing). The startup sweep flips it in_progress → errored,
+        // and that transition must index its partial content so a crashed
+        // reply is still findable.
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        let a = create_assistant_turn_in_progress(&pool, &s.id, "t0", "m")
+            .await
+            .unwrap();
+        append_content(&pool, &a.id, "crashedneedle partial reply")
+            .await
+            .unwrap();
+
+        // Not searchable while in_progress.
+        assert_eq!(
+            search_sessions(&pool, "u1", "crashedneedle", 10)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+
+        sweep_in_progress_at_startup(&pool).await.unwrap();
+
+        // Now searchable (swept to errored → indexed).
+        assert_eq!(
+            search_sessions(&pool, "u1", "crashedneedle", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn mark_orphaned_in_progress_skips_the_exempt_turn() {
         let pool = pool().await;
         let s = create_session(&pool, "u1").await.unwrap();
@@ -2165,5 +2447,326 @@ mod tests {
         let (fork2, _) = fork_session(&pool, &src, "u2").await.unwrap();
         let copy2 = list_turns(&pool, &fork2.id).await.unwrap();
         assert_ne!(copy1[0].tool_calls[0].id, copy2[0].tool_calls[0].id);
+    }
+
+    // -----------------------------------------------------------------------
+    // search_sessions tests
+
+    #[tokio::test]
+    async fn search_sessions_finds_content_match() {
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        create_user_turn(&pool, &s.id, "t0", "ceph osd timeout")
+            .await
+            .unwrap();
+        let a = create_assistant_turn_in_progress(&pool, &s.id, "t1", "gpt")
+            .await
+            .unwrap();
+        append_content(&pool, &a.id, "yes, that config")
+            .await
+            .unwrap();
+        finalize_turn(&pool, &a.id, TurnStatus::Completed, None)
+            .await
+            .unwrap();
+
+        let hits = search_sessions(&pool, "u1", "ceph osd", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, s.id);
+        assert!(hits[0].snippet.contains("<b>ceph</b>") || hits[0].snippet.contains("<b>osd</b>"));
+    }
+
+    #[tokio::test]
+    async fn search_sessions_excludes_reasoning() {
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        create_user_turn(&pool, &s.id, "t0", "hello").await.unwrap();
+        let a = create_assistant_turn_in_progress(&pool, &s.id, "t1", "gpt")
+            .await
+            .unwrap();
+        append_content(&pool, &a.id, "response").await.unwrap();
+        finalize_turn(&pool, &a.id, TurnStatus::Completed, None)
+            .await
+            .unwrap();
+
+        // Put "unique_term" only in reasoning, not in content.
+        sqlx::query(
+            r#"UPDATE chat_turns SET reasoning = 'thinking about unique_term' WHERE id = 't1'"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let hits = search_sessions(&pool, "u1", "unique_term", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 0, "reasoning should not be indexed");
+    }
+
+    #[tokio::test]
+    async fn search_sessions_finds_attachment_filename() {
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+
+        // Attachment marker inline in user_content.
+        let marker = crate::attachments::marker_line(
+            "config.yaml",
+            "text/yaml",
+            "/chat/attachment/t0/config.yaml",
+            123,
+        );
+        create_user_turn(&pool, &s.id, "t0", &format!("here is the file\n{marker}"))
+            .await
+            .unwrap();
+
+        let hits = search_sessions(&pool, "u1", "config.yaml", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "attachment filenames are indexed");
+        assert_eq!(hits[0].session_id, s.id);
+    }
+
+    #[tokio::test]
+    async fn search_sessions_respects_user_scoping() {
+        let pool = pool().await;
+        seed_user(&pool, "u2").await;
+        let _s1 = create_session(&pool, "u1").await.unwrap();
+        create_user_turn(&pool, &_s1.id, "t0", "secret")
+            .await
+            .unwrap();
+
+        let _s2 = create_session(&pool, "u2").await.unwrap();
+        create_user_turn(&pool, &_s2.id, "t1", "secret")
+            .await
+            .unwrap();
+
+        let hits = search_sessions(&pool, "u1", "secret", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, _s1.id, "must not return u2's session");
+    }
+
+    #[tokio::test]
+    async fn search_sessions_empty_query_returns_normal_list() {
+        let pool = pool().await;
+        let _s1 = create_session(&pool, "u1").await.unwrap();
+        let _s2 = create_session(&pool, "u1").await.unwrap();
+
+        let hits = search_sessions(&pool, "u1", "", 10).await.unwrap();
+        assert_eq!(hits.len(), 2, "empty query lists all sessions");
+
+        let hits = search_sessions(&pool, "u1", "   ", 10).await.unwrap();
+        assert_eq!(hits.len(), 2, "whitespace-only query lists all sessions");
+    }
+
+    #[tokio::test]
+    async fn search_sessions_deduplicates_by_session() {
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        create_user_turn(&pool, &s.id, "t0", "term").await.unwrap();
+        create_user_turn(&pool, &s.id, "t1", "term again")
+            .await
+            .unwrap();
+        let a = create_assistant_turn_in_progress(&pool, &s.id, "t2", "gpt")
+            .await
+            .unwrap();
+        append_content(&pool, &a.id, "term response").await.unwrap();
+        finalize_turn(&pool, &a.id, TurnStatus::Completed, None)
+            .await
+            .unwrap();
+
+        let hits = search_sessions(&pool, "u1", "term", 10).await.unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "multiple matching turns → one hit per session"
+        );
+        assert_eq!(hits[0].session_id, s.id);
+    }
+
+    #[test]
+    fn to_fts_match_query_quotes_tokens_and_neutralises_punctuation() {
+        // Plain words → quoted, AND-joined.
+        assert_eq!(to_fts_match_query("ceph osd"), "\"ceph\" \"osd\"");
+        // Punctuation that FTS5 would treat as an operator is defused.
+        assert_eq!(to_fts_match_query("config.yaml"), "\"config.yaml\"");
+        assert_eq!(to_fts_match_query("--verbose"), "\"--verbose\"");
+        // Embedded quotes are escaped by doubling.
+        assert_eq!(to_fts_match_query("a\"b"), "\"a\"\"b\"");
+        // Blank / whitespace-only → empty (caller falls back to the list).
+        assert_eq!(to_fts_match_query(""), "");
+        assert_eq!(to_fts_match_query("   "), "");
+    }
+
+    #[tokio::test]
+    async fn search_sessions_handles_punctuation_query_without_error() {
+        // Regression: a filename query used to throw "fts5: syntax error".
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        create_user_turn(&pool, &s.id, "t0", "look at --flag and osd:timeout")
+            .await
+            .unwrap();
+
+        // These must not error, even though they contain FTS5 operators.
+        for q in ["--flag", "osd:timeout", "a.b.c", "(", "AND OR"] {
+            let hits = search_sessions(&pool, "u1", q, 10).await;
+            assert!(hits.is_ok(), "query {q:?} should not error: {hits:?}");
+        }
+    }
+
+    #[test]
+    fn highlight_snippet_escapes_html_and_keeps_only_our_markup() {
+        // Sentinels become <b>; surrounding attacker text is escaped.
+        let raw = format!("a {SNIPPET_OPEN}b{SNIPPET_CLOSE} <script>x</script> &\"'");
+        let out = highlight_snippet(&raw);
+        assert_eq!(
+            out,
+            "a <b>b</b> &lt;script&gt;x&lt;/script&gt; &amp;&quot;&#39;"
+        );
+        assert!(!out.contains("<script>"), "raw <script> must be escaped");
+    }
+
+    #[tokio::test]
+    async fn search_sessions_snippet_escapes_stored_html() {
+        // A conversation containing an XSS payload must come back escaped —
+        // no live <script>/<img> tag in the rendered snippet.
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        create_user_turn(
+            &pool,
+            &s.id,
+            "t0",
+            "danger <img src=x onerror=alert(1)> danger",
+        )
+        .await
+        .unwrap();
+
+        let hits = search_sessions(&pool, "u1", "danger", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        let snip = &hits[0].snippet;
+        assert!(!snip.contains("<img"), "raw <img> leaked: {snip}");
+        assert!(snip.contains("&lt;img"), "payload not escaped: {snip}");
+        // The match highlight we control is still real markup.
+        assert!(snip.contains("<b>danger</b>"), "highlight missing: {snip}");
+    }
+
+    #[tokio::test]
+    async fn search_sessions_limit_counts_conversations_not_turns() {
+        // One chatty conversation with many matching turns must not crowd a
+        // second matching conversation out of a limit-1 result set — the
+        // limit counts conversations, so we still see both when limit >= 2.
+        let pool = pool().await;
+        let chatty = create_session(&pool, "u1").await.unwrap();
+        for i in 0..5 {
+            create_user_turn(&pool, &chatty.id, &format!("c{i}"), "needle here")
+                .await
+                .unwrap();
+        }
+        let other = create_session(&pool, "u1").await.unwrap();
+        create_user_turn(&pool, &other.id, "o0", "needle there")
+            .await
+            .unwrap();
+
+        // limit 1 → exactly one conversation (not one of five chatty turns).
+        let hits = search_sessions(&pool, "u1", "needle", 1).await.unwrap();
+        assert_eq!(hits.len(), 1, "limit counts conversations");
+
+        // limit 2 → both distinct conversations surface.
+        let hits = search_sessions(&pool, "u1", "needle", 2).await.unwrap();
+        assert_eq!(hits.len(), 2, "both conversations, deduped to one row each");
+        let ids: std::collections::HashSet<_> = hits.iter().map(|h| &h.session_id).collect();
+        assert!(ids.contains(&chatty.id) && ids.contains(&other.id));
+    }
+
+    #[tokio::test]
+    async fn search_sessions_blank_query_respects_limit() {
+        // A blank / whitespace-only query falls back to the session list, but
+        // must still honour `limit` so a big account can't flood the sidebar.
+        let pool = pool().await;
+        for i in 0..5 {
+            create_session(&pool, "u1").await.unwrap();
+            let _ = i;
+        }
+        let hits = search_sessions(&pool, "u1", "   ", 3).await.unwrap();
+        assert_eq!(hits.len(), 3, "blank-query fallback must cap at limit");
+    }
+
+    #[test]
+    fn strip_fts_sentinels_removes_only_the_control_chars() {
+        // Borrows unchanged when clean (common case).
+        assert!(matches!(
+            strip_fts_sentinels("plain text"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // Strips STX/ETX, keeps everything else (incl. tabs/newlines).
+        let dirty = format!("a{SNIPPET_OPEN}b{SNIPPET_CLOSE}c\td\ne");
+        assert_eq!(strip_fts_sentinels(&dirty).as_ref(), "abc\td\ne");
+    }
+
+    #[tokio::test]
+    async fn search_snippet_cannot_be_forged_with_typed_sentinels() {
+        // A user pasting raw STX/ETX must NOT be able to forge highlight
+        // markup: the sentinels are stripped at write time, so the only <b>
+        // in a snippet is the one we inject around the real match.
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        let payload = format!("hello {SNIPPET_OPEN}forged{SNIPPET_CLOSE} needle");
+        create_user_turn(&pool, &s.id, "t0", &payload)
+            .await
+            .unwrap();
+
+        // The stored text has no sentinels left.
+        let turn = get_turn(&pool, &s.id, "t0").await.unwrap().unwrap();
+        let stored = turn.user_content.unwrap();
+        assert!(
+            !stored.contains(SNIPPET_OPEN) && !stored.contains(SNIPPET_CLOSE),
+            "sentinels must be stripped at write: {stored:?}"
+        );
+
+        // Searching highlights only the real match, not the forged span.
+        let hits = search_sessions(&pool, "u1", "needle", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        let snip = &hits[0].snippet;
+        assert!(
+            snip.contains("<b>needle</b>"),
+            "real match highlighted: {snip}"
+        );
+        assert!(
+            snip.matches("<b>").count() == snip.matches("</b>").count(),
+            "balanced highlight markup only: {snip}"
+        );
+        assert!(
+            !snip.contains("forged</b>"),
+            "forged span must not exist: {snip}"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_progress_turn_is_not_indexed_until_finalized() {
+        // The FTS invariant: an in_progress assistant turn is NOT searchable;
+        // it becomes searchable exactly when finalize_turn flips its status.
+        // (This is what keeps streaming append_content off the FTS hot path.)
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        let a = create_assistant_turn_in_progress(&pool, &s.id, "t0", "gpt")
+            .await
+            .unwrap();
+        append_content(&pool, &a.id, "distinctword reply")
+            .await
+            .unwrap();
+
+        // Mid-stream: content exists on the row but is not yet in the index.
+        let hits = search_sessions(&pool, "u1", "distinctword", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 0, "in_progress turn must not be searchable");
+
+        // Finalize → now indexed and searchable.
+        finalize_turn(&pool, &a.id, TurnStatus::Completed, None)
+            .await
+            .unwrap();
+        let hits = search_sessions(&pool, "u1", "distinctword", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "finalized turn must be searchable");
+        assert_eq!(hits[0].session_id, s.id);
     }
 }

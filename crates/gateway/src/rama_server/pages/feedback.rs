@@ -33,6 +33,7 @@ use rama::http::{Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::json;
 use session_core::chrome::read_body_to_bytes;
+use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use crate::rama_server::session::Session;
@@ -63,15 +64,22 @@ fn json_err(status: StatusCode, message: &str) -> Response {
 
 /// Session gate that returns a 401 JSON envelope (not a redirect) on miss —
 /// these are API-shaped endpoints called from the dialog.
-async fn require_session_json(state: &RamaState, req: &Request) -> Result<Session, Response> {
+async fn require_session_json(
+    state: &RamaState,
+    req: &Request,
+    lang: Lang,
+) -> Result<Session, Response> {
     match state.sessions.lookup_from_headers(req.headers()).await {
         Ok(Some(s)) => Ok(s),
-        Ok(None) => Err(json_err(StatusCode::UNAUTHORIZED, "no active session")),
+        Ok(None) => Err(json_err(
+            StatusCode::UNAUTHORIZED,
+            &t(lang, "feedback-err-no-session"),
+        )),
         Err(err) => {
             tracing::warn!(error = %err, "feedback: session lookup");
             Err(json_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "session lookup failed",
+                &t(lang, "feedback-err-session-lookup-failed"),
             ))
         }
     }
@@ -85,7 +93,8 @@ async fn require_session_json(state: &RamaState, req: &Request) -> Result<Sessio
 /// concern (config), never the end user's — the form has no model picker; the
 /// client just needs the resolved voice model id to attach to its upload.
 pub async fn feedback_config(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    if let Err(resp) = require_session_json(&state, &req).await {
+    let lang = Lang::from_request(req.headers());
+    if let Err(resp) = require_session_json(&state, &req, lang).await {
         return resp;
     }
     let enabled = state
@@ -136,21 +145,43 @@ struct ExtractRequest {
 }
 
 pub async fn feedback_extract(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    if let Err(resp) = require_session_json(&state, &req).await {
+    let lang = Lang::from_request(req.headers());
+    if let Err(resp) = require_session_json(&state, &req, lang).await {
         return resp;
     }
     let (_, body) = req.into_parts();
     let bytes = match read_body_to_bytes(body).await {
         Ok(b) => b,
-        Err(msg) => return json_err(StatusCode::BAD_REQUEST, &msg),
+        Err(msg) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                &t_args(
+                    lang,
+                    "feedback-err-body-read",
+                    &i18n::args([("error", msg.into())]),
+                ),
+            );
+        }
     };
     let parsed: ExtractRequest = match serde_json::from_slice(&bytes) {
         Ok(p) => p,
-        Err(err) => return json_err(StatusCode::BAD_REQUEST, &format!("malformed JSON: {err}")),
+        Err(err) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                &t_args(
+                    lang,
+                    "feedback-err-malformed-json",
+                    &i18n::args([("error", err.to_string().into())]),
+                ),
+            );
+        }
     };
     let transcript = parsed.transcript.trim();
     if transcript.is_empty() {
-        return json_err(StatusCode::BAD_REQUEST, "empty transcript");
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            &t(lang, "feedback-err-empty-transcript"),
+        );
     }
 
     // Model selection is an operator concern: the configured `extraction_model`
@@ -168,7 +199,7 @@ pub async fn feedback_extract(State(state): State<Arc<RamaState>>, req: Request)
     let Some(model) = model else {
         return json_err(
             StatusCode::SERVICE_UNAVAILABLE,
-            "no chat model available for extraction",
+            &t(lang, "feedback-err-no-chat-model"),
         );
     };
 
@@ -178,7 +209,11 @@ pub async fn feedback_extract(State(state): State<Arc<RamaState>>, req: Request)
             tracing::warn!(error = %err, %model, "feedback: field extraction failed");
             json_err(
                 StatusCode::BAD_GATEWAY,
-                &format!("extraction failed: {err}"),
+                &t_args(
+                    lang,
+                    "feedback-err-extraction-failed",
+                    &i18n::args([("error", err.into())]),
+                ),
             )
         }
     }
@@ -366,42 +401,64 @@ struct SubmitRequest {
 }
 
 pub async fn feedback_submit(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let session = match require_session_json(&state, &req).await {
+    let lang = Lang::from_request(req.headers());
+    let session = match require_session_json(&state, &req, lang).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
     let Some(cfg) = state.config.feedback.clone() else {
         return json_err(
             StatusCode::SERVICE_UNAVAILABLE,
-            "feedback is not configured",
+            &t(lang, "feedback-err-not-configured"),
         );
     };
     if !cfg.is_configured() {
         return json_err(
             StatusCode::SERVICE_UNAVAILABLE,
-            "feedback is not configured",
+            &t(lang, "feedback-err-not-configured"),
         );
     }
 
     let (_, body) = req.into_parts();
     let bytes = match read_body_to_bytes(body).await {
         Ok(b) => b,
-        Err(msg) => return json_err(StatusCode::BAD_REQUEST, &msg),
+        Err(msg) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                &t_args(
+                    lang,
+                    "feedback-err-body-read",
+                    &i18n::args([("error", msg.into())]),
+                ),
+            );
+        }
     };
     let parsed: SubmitRequest = match serde_json::from_slice(&bytes) {
         Ok(p) => p,
-        Err(err) => return json_err(StatusCode::BAD_REQUEST, &format!("malformed JSON: {err}")),
+        Err(err) => {
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                &t_args(
+                    lang,
+                    "feedback-err-malformed-json",
+                    &i18n::args([("error", err.to_string().into())]),
+                ),
+            );
+        }
     };
 
     let title = parsed.title.trim();
     if title.chars().count() < 4 {
         return json_err(
             StatusCode::BAD_REQUEST,
-            "title is required (at least 4 characters)",
+            &t(lang, "feedback-err-title-required"),
         );
     }
     if parsed.description.trim().is_empty() {
-        return json_err(StatusCode::BAD_REQUEST, "description is required");
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            &t(lang, "feedback-err-description-required"),
+        );
     }
 
     // Reporter email — best-effort, for attribution in the issue body.
@@ -431,13 +488,13 @@ pub async fn feedback_submit(State(state): State<Arc<RamaState>>, req: Request) 
         })),
         Err(github::GithubError::NotConfigured) => json_err(
             StatusCode::SERVICE_UNAVAILABLE,
-            "feedback is not configured",
+            &t(lang, "feedback-err-not-configured"),
         ),
         Err(err) => {
             tracing::warn!(error = %err, "feedback: issue creation failed");
             json_err(
                 StatusCode::BAD_GATEWAY,
-                "could not file the issue — please try again",
+                &t(lang, "feedback-err-submit-failed"),
             )
         }
     }
@@ -450,7 +507,7 @@ pub async fn feedback_submit(State(state): State<Arc<RamaState>>, req: Request) 
 /// client removes it once `GET /feedback/config` confirms the feature is
 /// configured, so it never appears on a deployment without a GitHub repo set
 /// up. `data-feedback-fab` marks it for exclusion from the screenshot.
-pub(super) fn render_fab() -> Html {
+pub(super) fn render_fab(lang: Lang) -> Html {
     html! {
         button(
             id: "feedback-fab",
@@ -458,8 +515,8 @@ pub(super) fn render_fab() -> Html {
             class: "feedback-fab",
             "data-feedback-fab": "",
             hidden: "hidden",
-            title: "Send feedback",
-            "aria-label": "Send feedback"
+            title: (t(lang, "feedback-fab-title")),
+            "aria-label": (t(lang, "feedback-fab-aria"))
         ) {
             (icons::help(18))
         }
@@ -469,7 +526,7 @@ pub(super) fn render_fab() -> Html {
 
 /// The feedback dialog. A native `<dialog>` (opened via `showModal()` from
 /// `feedback.ts`). Excluded from the screenshot by `data-feedback-dialog`.
-pub(super) fn render_dialog() -> Html {
+pub(super) fn render_dialog(lang: Lang) -> Html {
     html! {
         dialog(
             id: "feedback-dialog",
@@ -483,22 +540,22 @@ pub(super) fn render_dialog() -> Html {
                 // `/feedback/config` confirms voice is available.
                 div(class: "flex items-center gap-2 px-5 py-3 border-b border-base-300") {
                     (icons::message(18))
-                    h2(class: "font-semibold flex-1") { "Send feedback" }
+                    h2(class: "font-semibold flex-1") { (t(lang, "feedback-dialog-heading")) }
                     button(
                         id: "feedback-voice-btn",
                         type: "button",
                         class: "btn btn-ghost btn-sm gap-2",
                         hidden: "hidden",
-                        title: "Tap, describe the issue, tap again — we'll fill the fields below"
+                        title: (t(lang, "feedback-voice-button-title"))
                     ) {
                         span(class: "feedback-voice-icon inline-flex") { (icons::mic(16)) }
-                        span(class: "feedback-voice-label") { "Fill in by voice" }
+                        span(class: "feedback-voice-label") { (t(lang, "feedback-voice-button-label")) }
                     }
                     button(
                         id: "feedback-close",
                         type: "button",
                         class: "btn btn-ghost btn-square btn-sm",
-                        "aria-label": "Close"
+                        "aria-label": (t(lang, "feedback-close-aria"))
                     ) {
                         (icons::x_mark(16))
                     }
@@ -506,90 +563,90 @@ pub(super) fn render_dialog() -> Html {
 
                 div(class: "px-5 py-4 flex flex-col gap-3 overflow-y-auto") {
                     label(class: "form-control") {
-                        span(class: "label-text text-sm font-medium") { "Title" }
+                        span(class: "label-text text-sm font-medium") { (t(lang, "feedback-title-label")) }
                         input(
                             id: "feedback-title",
                             name: "title",
                             type: "text",
                             required: "required",
                             maxlength: "120",
-                            placeholder: "Short summary",
+                            placeholder: (t(lang, "feedback-title-placeholder")),
                             class: "input input-bordered w-full"
                         );
                     }
                     label(class: "form-control") {
-                        span(class: "label-text text-sm font-medium") { "Description" }
+                        span(class: "label-text text-sm font-medium") { (t(lang, "feedback-description-label")) }
                         textarea(
                             id: "feedback-description",
                             name: "description",
                             required: "required",
                             rows: "4",
-                            placeholder: "What happened, or what would you like?",
+                            placeholder: (t(lang, "feedback-description-placeholder")),
                             class: "textarea textarea-bordered w-full"
                         ) {}
                     }
                     label(class: "form-control") {
-                        span(class: "label-text text-sm font-medium") { "Business value" }
+                        span(class: "label-text text-sm font-medium") { (t(lang, "feedback-business-label")) }
                         textarea(
                             id: "feedback-business",
                             name: "business_value",
                             rows: "2",
-                            placeholder: "Why does this matter? Who is impacted?",
+                            placeholder: (t(lang, "feedback-business-placeholder")),
                             class: "textarea textarea-bordered w-full"
                         ) {}
                     }
                     label(class: "form-control") {
-                        span(class: "label-text text-sm font-medium") { "Acceptance criteria" }
+                        span(class: "label-text text-sm font-medium") { (t(lang, "feedback-acceptance-label")) }
                         textarea(
                             id: "feedback-acceptance",
                             name: "acceptance_criteria",
                             rows: "2",
-                            placeholder: "When is this done?",
+                            placeholder: (t(lang, "feedback-acceptance-placeholder")),
                             class: "textarea textarea-bordered w-full"
                         ) {}
                     }
                     label(class: "form-control") {
-                        span(class: "label-text text-sm font-medium") { "Priority" }
+                        span(class: "label-text text-sm font-medium") { (t(lang, "feedback-priority-label")) }
                         select(
                             id: "feedback-priority",
                             name: "priority",
                             class: "select select-bordered w-full"
                         ) {
-                            option(value: "low") { "Low" }
-                            option(value: "medium", selected: "selected") { "Medium" }
-                            option(value: "high") { "High" }
+                            option(value: "low") { (t(lang, "feedback-priority-low")) }
+                            option(value: "medium", selected: "selected") { (t(lang, "feedback-priority-medium")) }
+                            option(value: "high") { (t(lang, "feedback-priority-high")) }
                         }
                     }
 
                     // Screenshot + annotation.
                     div(class: "feedback-shot") {
                         div(class: "flex items-center gap-2 text-sm") {
-                            span(class: "label-text text-sm font-medium") { "Screenshot" }
+                            span(class: "label-text text-sm font-medium") { (t(lang, "feedback-shot-label")) }
                             span(id: "feedback-shot-status", class: "text-xs text-base-content/60") {
-                                "Capturing…"
+                                (t(lang, "feedback-shot-status-capturing"))
                             }
                             div(class: "ml-auto flex gap-2") {
                                 button(
                                     id: "feedback-shot-recapture",
                                     type: "button",
                                     class: "btn btn-ghost btn-xs"
-                                ) { "Recapture" }
+                                ) { (t(lang, "feedback-shot-recapture")) }
                                 button(
                                     id: "feedback-shot-remove",
                                     type: "button",
                                     class: "btn btn-ghost btn-xs"
-                                ) { "Remove" }
+                                ) { (t(lang, "feedback-shot-remove")) }
                             }
                         }
                         // Annotation toolbar — tool, colour, history, zoom.
                         // `feedback.ts` wires every control by id / data-attr.
                         div(id: "feedback-annot-toolbar", class: "feedback-annot-toolbar", hidden: "hidden") {
                             div(class: "feedback-tool-group") {
-                                button(type: "button", class: "feedback-tool-btn", "data-tool": "rect", title: "Rectangle") { "▭" }
-                                button(type: "button", class: "feedback-tool-btn", "data-tool": "arrow", title: "Arrow") { "↗" }
-                                button(type: "button", class: "feedback-tool-btn", "data-tool": "pen", title: "Freehand") { "✎" }
-                                button(type: "button", class: "feedback-tool-btn", "data-tool": "text", title: "Text") { "T" }
-                                button(type: "button", class: "feedback-tool-btn", "data-tool": "redact", title: "Hide / redact (filled box)") { "▮" }
+                                button(type: "button", class: "feedback-tool-btn", "data-tool": "rect", title: (t(lang, "feedback-tool-rect-title"))) { "▭" }
+                                button(type: "button", class: "feedback-tool-btn", "data-tool": "arrow", title: (t(lang, "feedback-tool-arrow-title"))) { "↗" }
+                                button(type: "button", class: "feedback-tool-btn", "data-tool": "pen", title: (t(lang, "feedback-tool-pen-title"))) { "✎" }
+                                button(type: "button", class: "feedback-tool-btn", "data-tool": "text", title: (t(lang, "feedback-tool-text-title"))) { "T" }
+                                button(type: "button", class: "feedback-tool-btn", "data-tool": "redact", title: (t(lang, "feedback-tool-redact-title"))) { "▮" }
                             }
                             div(class: "feedback-tool-group") {
                                 for c in ["#ef4444", "#3b82f6", "#10b981", "#f59e0b", "#ffffff"] {
@@ -598,20 +655,20 @@ pub(super) fn render_dialog() -> Html {
                                         class: "feedback-color-btn",
                                         "data-color": (c),
                                         style: (format!("background:{c}")),
-                                        title: "Colour",
-                                        "aria-label": "Colour"
+                                        title: (t(lang, "feedback-color-title")),
+                                        "aria-label": (t(lang, "feedback-color-aria"))
                                     ) {}
                                 }
                             }
                             div(class: "feedback-tool-group") {
-                                button(id: "feedback-undo", type: "button", class: "btn btn-ghost btn-xs", title: "Undo") { "↶" }
-                                button(id: "feedback-redo", type: "button", class: "btn btn-ghost btn-xs", title: "Redo") { "↷" }
-                                button(id: "feedback-clear-annot", type: "button", class: "btn btn-ghost btn-xs", title: "Clear annotations") { "Clear" }
+                                button(id: "feedback-undo", type: "button", class: "btn btn-ghost btn-xs", title: (t(lang, "feedback-undo-title"))) { "↶" }
+                                button(id: "feedback-redo", type: "button", class: "btn btn-ghost btn-xs", title: (t(lang, "feedback-redo-title"))) { "↷" }
+                                button(id: "feedback-clear-annot", type: "button", class: "btn btn-ghost btn-xs", title: (t(lang, "feedback-clear-annot-title"))) { (t(lang, "feedback-clear-annot-label")) }
                             }
                             div(class: "feedback-tool-group ml-auto") {
-                                button(id: "feedback-zoom-out", type: "button", class: "btn btn-ghost btn-xs", title: "Zoom out") { "−" }
-                                button(id: "feedback-zoom-reset", type: "button", class: "btn btn-ghost btn-xs", title: "Reset zoom") { "100%" }
-                                button(id: "feedback-zoom-in", type: "button", class: "btn btn-ghost btn-xs", title: "Zoom in") { "+" }
+                                button(id: "feedback-zoom-out", type: "button", class: "btn btn-ghost btn-xs", title: (t(lang, "feedback-zoom-out-title"))) { "−" }
+                                button(id: "feedback-zoom-reset", type: "button", class: "btn btn-ghost btn-xs", title: (t(lang, "feedback-zoom-reset-title"))) { "100%" }
+                                button(id: "feedback-zoom-in", type: "button", class: "btn btn-ghost btn-xs", title: (t(lang, "feedback-zoom-in-title"))) { "+" }
                             }
                         }
                         div(id: "feedback-shot-wrap", class: "feedback-shot-wrap", hidden: "hidden") {
@@ -629,7 +686,7 @@ pub(super) fn render_dialog() -> Html {
                                 class: "checkbox checkbox-sm",
                                 checked: "checked"
                             );
-                            span(class: "label-text text-sm") { "Submit browser activity log (console + network)" }
+                            span(class: "label-text text-sm") { (t(lang, "feedback-log-browser-label")) }
                         }
                         label(
                             id: "feedback-log-chat-wrap",
@@ -642,7 +699,7 @@ pub(super) fn render_dialog() -> Html {
                                 class: "checkbox checkbox-sm",
                                 checked: "checked"
                             );
-                            span(class: "label-text text-sm") { "Submit chat & tool usage log" }
+                            span(class: "label-text text-sm") { (t(lang, "feedback-log-chat-label")) }
                         }
                     }
                 }
@@ -653,12 +710,12 @@ pub(super) fn render_dialog() -> Html {
                         id: "feedback-cancel",
                         type: "button",
                         class: "btn btn-ghost btn-sm"
-                    ) { "Cancel" }
+                    ) { (t(lang, "feedback-cancel-button")) }
                     button(
                         id: "feedback-submit",
                         type: "submit",
                         class: "btn btn-primary btn-sm"
-                    ) { "Send feedback" }
+                    ) { (t(lang, "feedback-submit-button")) }
                 }
             }
         }
@@ -673,7 +730,7 @@ pub(super) fn render_dialog() -> Html {
 /// warns that the issue tracker is public so no personal/private data leaks
 /// into the screenshot or submitted fields. Excluded from any screenshot by
 /// `data-feedback-dialog`.
-pub(super) fn render_confirm() -> Html {
+pub(super) fn render_confirm(lang: Lang) -> Html {
     html! {
         dialog(
             id: "feedback-confirm",
@@ -684,20 +741,24 @@ pub(super) fn render_confirm() -> Html {
                 // Header
                 div(class: "flex items-center gap-2 px-5 py-3 border-b border-base-300") {
                     span(class: "text-warning inline-flex") { (icons::alert(18)) }
-                    h2(class: "font-semibold flex-1") { "Are you sure?" }
+                    h2(class: "font-semibold flex-1") { (t(lang, "feedback-confirm-heading")) }
                 }
 
                 // Body — the public-tracker / no-private-data warning.
                 div(class: "px-5 py-4 flex flex-col gap-3 text-sm") {
                     p {
-                        "This feedback opens a ticket in our "
-                        strong { "public" }
-                        " issue tracker. Anyone can read it."
+                        (t(lang, "feedback-confirm-public-p1-prefix"))
+                        " "
+                        strong { (t(lang, "feedback-confirm-public-p1-strong")) }
+                        " "
+                        (t(lang, "feedback-confirm-public-p1-suffix"))
                     }
                     p {
-                        "Please make sure your screenshot and the submitted data contain "
-                        strong { "no personal or private information" }
-                        " (names, emails, tokens, customer data, …)."
+                        (t(lang, "feedback-confirm-private-p2-prefix"))
+                        " "
+                        strong { (t(lang, "feedback-confirm-private-p2-strong")) }
+                        " "
+                        (t(lang, "feedback-confirm-private-p2-suffix"))
                     }
                 }
 
@@ -707,12 +768,12 @@ pub(super) fn render_confirm() -> Html {
                         id: "feedback-confirm-cancel",
                         type: "button",
                         class: "btn btn-ghost btn-sm"
-                    ) { "No, let me edit" }
+                    ) { (t(lang, "feedback-confirm-cancel-button")) }
                     button(
                         id: "feedback-confirm-ok",
                         type: "button",
                         class: "btn btn-primary btn-sm"
-                    ) { "Yes, send" }
+                    ) { (t(lang, "feedback-confirm-ok-button")) }
                 }
             }
         }
@@ -756,7 +817,7 @@ mod tests {
     // client queries, the widget silently breaks — pin it here.
     #[test]
     fn fab_carries_marker_and_starts_hidden() {
-        let html = render_fab().to_string();
+        let html = render_fab(Lang::En).to_string();
         assert!(html.contains("id=\"feedback-fab\""));
         assert!(html.contains("data-feedback-fab"));
         assert!(
@@ -767,7 +828,7 @@ mod tests {
 
     #[test]
     fn dialog_exposes_every_id_the_client_queries() {
-        let html = render_dialog().to_string();
+        let html = render_dialog(Lang::En).to_string();
         // Exclusion marker so the dialog isn't baked into its own screenshot.
         assert!(html.contains("data-feedback-dialog"));
         // Every id `feedback.ts` resolves via getElementById / querySelector.
@@ -825,7 +886,7 @@ mod tests {
     // controls by id. Pin the wiring + the public-tracker warning copy.
     #[test]
     fn confirm_dialog_exposes_ids_and_warning() {
-        let html = render_confirm().to_string();
+        let html = render_confirm(Lang::En).to_string();
         // Excluded from the screenshot like the main dialog.
         assert!(html.contains("data-feedback-dialog"));
         for id in [

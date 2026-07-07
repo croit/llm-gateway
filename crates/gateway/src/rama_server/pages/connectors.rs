@@ -25,12 +25,14 @@ use super::{
 use crate::rama_server::state::RamaState;
 use crate::server::db::mcp_catalog::{self, AuthKind, Connector, ConnectorInput};
 use session_core::chrome::{NavSections, Theme, is_datastar_request};
+use session_core::i18n::{self, Lang, t, t_args};
 
 // ---------------------------------------------------------------------------
 // GET /admin/connectors
 
 pub async fn connectors_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
@@ -43,14 +45,16 @@ pub async fn connectors_index(State(state): State<Arc<RamaState>>, req: Request)
         "{}/integrations/callback",
         state.config.gateway.public_url.trim_end_matches('/')
     );
-    let body = render_body(&connectors, &redirect_uri);
+    let body = render_body(lang, &connectors, &redirect_uri);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
+    let title = t(lang, "connectors-page-title");
     nav_or_html_page(
         datastar,
         theme,
+        lang,
         nav,
         NavItem::Connectors,
-        "Connectors — LLM Gateway",
+        &title,
         &user.email,
         true,
         session.impersonator_id.is_some(),
@@ -117,6 +121,7 @@ fn parse_client_json(raw: &str) -> ParsedClientJson {
 }
 
 pub async fn connectors_save(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_session, user) = match require_admin_or_403(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -129,7 +134,7 @@ pub async fn connectors_save(State(state): State<Arc<RamaState>>, req: Request) 
 
     let key = form.key.trim().to_string();
     if key.is_empty() || form.name.trim().is_empty() || form.url.trim().is_empty() {
-        return internal_error_html(&user.email, "key, name and URL are required");
+        return internal_error_html(&user.email, &t(lang, "connectors-error-missing-fields"));
     }
     // A pasted OAuth client JSON wins over the individual fields (which stay as
     // a manual fallback). Reject obviously-malformed JSON so the admin gets a
@@ -140,8 +145,7 @@ pub async fn connectors_save(State(state): State<Arc<RamaState>>, req: Request) 
             if p.client_id.is_none() {
                 return internal_error_html(
                     &user.email,
-                    "couldn't read a client_id from the pasted JSON — expected the Google \
-                     OAuth client file ({\"web\":{\"client_id\":…,\"client_secret\":…}}).",
+                    &t(lang, "connectors-error-bad-client-json"),
                 );
             }
             p
@@ -157,7 +161,16 @@ pub async fn connectors_save(State(state): State<Arc<RamaState>>, req: Request) 
     let sealed = match secret_plain {
         Some(secret) => match state.mcp_crypto.seal_str(&secret) {
             Ok(s) => Some(s),
-            Err(err) => return internal_error_html(&user.email, &format!("sealing secret: {err}")),
+            Err(err) => {
+                return internal_error_html(
+                    &user.email,
+                    &t_args(
+                        lang,
+                        "connectors-error-sealing-secret",
+                        &i18n::args([("error", err.to_string().into())]),
+                    ),
+                );
+            }
         },
         None => None,
     };
@@ -199,7 +212,14 @@ pub async fn connectors_save(State(state): State<Arc<RamaState>>, req: Request) 
         mcp_catalog::create(&state.db, input).await
     };
     if let Err(err) = res {
-        return internal_error_html(&user.email, &format!("saving connector: {err}"));
+        return internal_error_html(
+            &user.email,
+            &t_args(
+                lang,
+                "connectors-error-saving",
+                &i18n::args([("error", err.to_string().into())]),
+            ),
+        );
     }
     redirect("/admin/connectors")
 }
@@ -217,6 +237,7 @@ pub async fn connectors_toggle(
     Path(key): Path<String>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_session, user) = match require_admin_or_403(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -233,14 +254,17 @@ pub async fn connectors_toggle(
         && let Ok(Some(c)) = mcp_catalog::get(&state.db, &key).await
         && c.needs_setup()
     {
-        return internal_error_html(
-            &user.email,
-            "this connector needs an OAuth client id before it can be enabled \
-             (it can't use dynamic registration). Edit it and add the client id/secret.",
-        );
+        return internal_error_html(&user.email, &t(lang, "connectors-error-needs-client-id"));
     }
     if let Err(err) = mcp_catalog::set_enabled(&state.db, &key, enabled).await {
-        return internal_error_html(&user.email, &format!("toggling connector: {err}"));
+        return internal_error_html(
+            &user.email,
+            &t_args(
+                lang,
+                "connectors-error-toggling",
+                &i18n::args([("error", err.to_string().into())]),
+            ),
+        );
     }
     redirect("/admin/connectors")
 }
@@ -250,12 +274,20 @@ pub async fn connectors_delete(
     Path(key): Path<String>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_session, user) = match require_admin_or_403(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
     if let Err(err) = mcp_catalog::delete(&state.db, &key).await {
-        return internal_error_html(&user.email, &format!("deleting connector: {err}"));
+        return internal_error_html(
+            &user.email,
+            &t_args(
+                lang,
+                "connectors-error-deleting",
+                &i18n::args([("error", err.to_string().into())]),
+            ),
+        );
     }
     // Drop every user's connection (incl. encrypted tokens) + prefs for it, so
     // deleting a connector doesn't leave orphaned secrets behind.
@@ -269,12 +301,20 @@ pub async fn connectors_delete(
 // POST /admin/connectors/restore-defaults
 
 pub async fn connectors_restore(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_session, user) = match require_admin_or_403(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
     if let Err(err) = mcp_catalog::seed_defaults(&state.db).await {
-        return internal_error_html(&user.email, &format!("restoring defaults: {err}"));
+        return internal_error_html(
+            &user.email,
+            &t_args(
+                lang,
+                "connectors-error-restoring",
+                &i18n::args([("error", err.to_string().into())]),
+            ),
+        );
     }
     redirect("/admin/connectors")
 }
@@ -290,30 +330,27 @@ fn redirect(location: &str) -> Response {
         .unwrap()
 }
 
-fn render_body(connectors: &[Connector], redirect_uri: &str) -> Html {
+fn render_body(lang: Lang, connectors: &[Connector], redirect_uri: &str) -> Html {
     let rows: Vec<Html> = connectors
         .iter()
-        .map(|c| render_connector_row(c, redirect_uri))
+        .map(|c| render_connector_row(lang, c, redirect_uri))
         .collect();
     html! {
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
             div(class: "flex items-center justify-between gap-3 mb-2 flex-wrap") {
-                h1(class: "text-2xl font-bold m-0") { "Connectors" }
+                h1(class: "text-2xl font-bold m-0") { (t(lang, "connectors-heading")) }
                 form(method: "post", action: "/admin/connectors/restore-defaults", class: "m-0") {
-                    button(type: "submit", class: "btn btn-sm btn-ghost") { "Restore defaults" }
+                    button(type: "submit", class: "btn btn-sm btn-ghost") { (t(lang, "connectors-restore-defaults-button")) }
                 }
             }
             p(class: "text-base-content/60 text-sm mb-6") {
-                "Curate the MCP servers users can connect under Integrations. Enable a "
-                "connector to make it visible. Connectors that can't use dynamic client "
-                "registration (e.g. Google) need a deployment OAuth client id/secret before "
-                "they can be enabled."
+                (t(lang, "connectors-catalog-intro"))
             }
-            (render_add_form(redirect_uri))
+            (render_add_form(lang, redirect_uri))
             if connectors.is_empty() {
                 div(class: "card border border-base-300") {
                     div(class: "card-body") {
-                        p(class: "text-base-content/60 text-sm m-0") { "No connectors yet." }
+                        p(class: "text-base-content/60 text-sm m-0") { (t(lang, "connectors-empty-state")) }
                     }
                 }
             }
@@ -327,7 +364,7 @@ fn render_body(connectors: &[Connector], redirect_uri: &str) -> Html {
     .to_html()
 }
 
-fn render_connector_row(c: &Connector, redirect_uri: &str) -> Html {
+fn render_connector_row(lang: Lang, c: &Connector, redirect_uri: &str) -> Html {
     let enabled = c.enabled;
     let key = c.key.clone();
     let name = c.name.clone();
@@ -338,6 +375,7 @@ fn render_connector_row(c: &Connector, redirect_uri: &str) -> Html {
     let toggle_action = format!("/admin/connectors/{key}/toggle");
     let delete_action = format!("/admin/connectors/{key}/delete");
     let has_secret = c.client_secret_ct.is_some();
+    let delete_confirm = t(lang, "connectors-delete-confirm");
     html! {
         section(class: "card border border-base-300") {
             div(class: "card-body gap-2") {
@@ -348,18 +386,18 @@ fn render_connector_row(c: &Connector, redirect_uri: &str) -> Html {
                             h2(class: "card-title text-base m-0") { (name) }
                             code(class: "text-xs text-base-content/50") { (key.clone()) }
                             if enabled {
-                                span(class: "badge badge-success badge-sm") { "Enabled" }
+                                span(class: "badge badge-success badge-sm") { (t(lang, "connectors-badge-enabled")) }
                             } else {
-                                span(class: "badge badge-ghost badge-sm") { "Disabled" }
+                                span(class: "badge badge-ghost badge-sm") { (t(lang, "connectors-badge-disabled")) }
                             }
                             if c.seeded {
-                                span(class: "badge badge-outline badge-sm") { "Default" }
+                                span(class: "badge badge-outline badge-sm") { (t(lang, "connectors-badge-default")) }
                             }
                             if c.use_dcr {
-                                span(class: "badge badge-outline badge-sm") { "DCR" }
+                                span(class: "badge badge-outline badge-sm") { (t(lang, "connectors-badge-dcr")) }
                             }
                             if c.needs_setup() {
-                                span(class: "badge badge-warning badge-sm") { "Needs client id" }
+                                span(class: "badge badge-warning badge-sm") { (t(lang, "connectors-badge-needs-client-id")) }
                             }
                         }
                         p(class: "text-xs text-base-content/50 m-0 mt-0.5 break-all") { (url) }
@@ -367,29 +405,29 @@ fn render_connector_row(c: &Connector, redirect_uri: &str) -> Html {
                     div(class: "flex items-center gap-2 shrink-0") {
                         form(method: "post", action: (toggle_action), class: "m-0") {
                             if enabled {
-                                button(type: "submit", class: "btn btn-xs btn-ghost") { "Disable" }
+                                button(type: "submit", class: "btn btn-xs btn-ghost") { (t(lang, "connectors-disable-button")) }
                             } else if c.needs_setup() {
                                 // Required OAuth client id missing → can't be
                                 // enabled yet. Grey it out instead of erroring
                                 // on click; the Edit form + help box explain it.
                                 button(type: "button", disabled: "disabled",
                                        class: "btn btn-xs btn-primary btn-disabled",
-                                       title: "Add the OAuth client id below first (Edit → OAuth client id)") {
-                                    "Enable"
+                                       title: (t(lang, "connectors-enable-disabled-title"))) {
+                                    (t(lang, "connectors-enable-button"))
                                 }
                             } else {
-                                button(type: "submit", name: "enabled", value: "1", class: "btn btn-xs btn-primary") { "Enable" }
+                                button(type: "submit", name: "enabled", value: "1", class: "btn btn-xs btn-primary") { (t(lang, "connectors-enable-button")) }
                             }
                         }
                         form(method: "post", action: (delete_action), class: "m-0",
-                             onsubmit: "return confirm('Delete this connector? It is removed for all users, along with their stored connections and tokens. This cannot be undone.')") {
-                            button(type: "submit", class: "btn btn-xs btn-ghost text-error") { "Delete" }
+                             "data-confirm": (delete_confirm)) {
+                            button(type: "submit", class: "btn btn-xs btn-ghost text-error") { (t(lang, "connectors-delete-button")) }
                         }
                     }
                 }
                 details {
-                    summary(class: "cursor-pointer text-sm text-base-content/70") { "Edit" }
-                    (render_edit_form(c, has_secret, redirect_uri))
+                    summary(class: "cursor-pointer text-sm text-base-content/70") { (t(lang, "connectors-edit-summary")) }
+                    (render_edit_form(lang, c, has_secret, redirect_uri))
                 }
             }
         }
@@ -397,22 +435,22 @@ fn render_connector_row(c: &Connector, redirect_uri: &str) -> Html {
     .to_html()
 }
 
-fn render_add_form(redirect_uri: &str) -> Html {
+fn render_add_form(lang: Lang, redirect_uri: &str) -> Html {
     html! {
         details(class: "card border border-base-300 mb-2") {
-            summary(class: "cursor-pointer card-body py-3 font-medium text-sm") { "Add a connector" }
+            summary(class: "cursor-pointer card-body py-3 font-medium text-sm") { (t(lang, "connectors-add-summary")) }
             div(class: "card-body pt-0") {
-                (render_form_fields(None, false, redirect_uri))
+                (render_form_fields(lang, None, false, redirect_uri))
             }
         }
     }
     .to_html()
 }
 
-fn render_edit_form(c: &Connector, has_secret: bool, redirect_uri: &str) -> Html {
+fn render_edit_form(lang: Lang, c: &Connector, has_secret: bool, redirect_uri: &str) -> Html {
     html! {
         div(class: "mt-2") {
-            (render_form_fields(Some(c), has_secret, redirect_uri))
+            (render_form_fields(lang, Some(c), has_secret, redirect_uri))
         }
     }
     .to_html()
@@ -421,7 +459,7 @@ fn render_edit_form(c: &Connector, has_secret: bool, redirect_uri: &str) -> Html
 /// Provider-specific help for obtaining an OAuth client (shown for connectors
 /// that need a manually-created client). Always shows the redirect URI to
 /// register; adds a direct link for Google / GitHub.
-fn render_oauth_help(existing: Option<&Connector>, redirect_uri: &str) -> Html {
+fn render_oauth_help(lang: Lang, existing: Option<&Connector>, redirect_uri: &str) -> Html {
     // Token-based connectors need no OAuth client — users paste their own token.
     if existing
         .map(|c| c.auth == AuthKind::StaticBearer)
@@ -430,10 +468,9 @@ fn render_oauth_help(existing: Option<&Connector>, redirect_uri: &str) -> Html {
         return html! {
             div(class: "rounded-md border border-info/30 bg-info/5 p-3 text-xs leading-relaxed") {
                 p(class: "m-0") {
-                    "Token connector: set the MCP server URL above; each user pastes their own "
-                    "API token under Integrations (sent as "
+                    (t(lang, "connectors-oauth-help-token-1")) " "
                     code { "Authorization: Bearer <token>" }
-                    "). No OAuth client needed."
+                    (t(lang, "connectors-oauth-help-token-2"))
                 }
             }
         }
@@ -463,27 +500,25 @@ fn render_oauth_help(existing: Option<&Connector>, redirect_uri: &str) -> Html {
         let redirect_uri = redirect_uri.to_string();
         return html! {
             div(class: "rounded-md border border-info/30 bg-info/5 p-3 text-xs leading-relaxed") {
-                p(class: "m-0 font-medium") { "Dynamic Client Registration — no OAuth client needed" }
+                p(class: "m-0 font-medium") { (t(lang, "connectors-oauth-help-dcr-heading")) }
                 p(class: "m-0 mt-1") {
-                    "Just set the MCP server URL above. The server registers this gateway "
-                    "automatically (RFC 7591); each user then clicks Connect and authorizes with "
-                    "their own account — one sign-in covers every service the server exposes."
+                    (t(lang, "connectors-oauth-help-dcr-body"))
                 }
                 if is_google_ws {
                     p(class: "m-0 mt-2") {
-                        "Point this at your "
-                        strong { "self-hosted Google Workspace MCP server" }
-                        " (e.g. "
+                        (t(lang, "connectors-oauth-help-gws-1")) " "
+                        strong { (t(lang, "connectors-oauth-help-gws-self-hosted")) } " "
+                        (t(lang, "connectors-oauth-help-gws-2")) " "
                         a(class: "link", target: "_blank", rel: "noopener noreferrer",
                           href: "https://github.com/taylorwilsdon/google_workspace_mcp") {
                             "taylorwilsdon/google_workspace_mcp"
                         }
-                        ") running in streamable-HTTP mode — URL ends in "
+                        " "
+                        (t(lang, "connectors-oauth-help-gws-3")) " "
                         code { "/mcp/" }
-                        ". That server holds the Google OAuth client and uses the "
-                        strong { "GA Google APIs" }
-                        " (no developer preview). Allow this gateway's redirect URI on the server "
-                        "via "
+                        (t(lang, "connectors-oauth-help-gws-4")) " "
+                        strong { (t(lang, "connectors-oauth-help-gws-ga-apis")) } " "
+                        (t(lang, "connectors-oauth-help-gws-5")) " "
                         code { "WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS" }
                         ":"
                     }
@@ -491,9 +526,7 @@ fn render_oauth_help(existing: Option<&Connector>, redirect_uri: &str) -> Html {
                         (redirect_uri)
                     }
                     p(class: "m-0 mt-2 text-base-content/60") {
-                        "Google's hosted MCP endpoints (gmailmcp/calendarmcp/drivemcp.googleapis.com) "
-                        "are intentionally not used — they require enrolling the org in the Workspace "
-                        "Developer Preview Program. See docs/connectors.md for the deploy recipe."
+                        (t(lang, "connectors-oauth-help-gws-footer"))
                     }
                 }
             }
@@ -506,34 +539,32 @@ fn render_oauth_help(existing: Option<&Connector>, redirect_uri: &str) -> Html {
     let redirect_uri = redirect_uri.to_string();
     html! {
         div(class: "rounded-md border border-info/30 bg-info/5 p-3 text-xs leading-relaxed") {
-            p(class: "m-0 font-medium") { "Setting up the OAuth client" }
+            p(class: "m-0 font-medium") { (t(lang, "connectors-oauth-help-generic-heading")) }
             p(class: "m-0 mt-1") {
-                "Register this exact redirect URI with your OAuth client, then paste its "
-                "client id (and secret) below:"
+                (t(lang, "connectors-oauth-help-generic-intro"))
             }
             code(class: "block mt-1 mb-2 p-1.5 rounded bg-base-300/60 break-all select-all") {
                 (redirect_uri)
             }
             if is_google {
                 p(class: "m-0") {
-                    "Google: create an "
+                    (t(lang, "connectors-oauth-help-google-1")) " "
                     a(class: "link", target: "_blank", rel: "noopener noreferrer",
                       href: "https://console.cloud.google.com/apis/credentials") {
-                        "OAuth 2.0 Client ID (Web application)"
+                        (t(lang, "connectors-oauth-help-google-link"))
                     }
-                    " in Google Cloud Console, add the redirect URI above, and enable the "
-                    "Gmail / Google Calendar / Google Drive APIs for the project."
+                    " "
+                    (t(lang, "connectors-oauth-help-google-2"))
                 }
             } else if is_github {
                 p(class: "m-0") {
-                    "GitHub: create an "
+                    (t(lang, "connectors-oauth-help-github-1")) " "
                     a(class: "link", target: "_blank", rel: "noopener noreferrer",
                       href: "https://github.com/settings/developers") {
-                        "OAuth App"
+                        (t(lang, "connectors-oauth-help-github-link"))
                     }
-                    " (Settings → Developer settings → OAuth Apps), set the Authorization "
-                    "callback URL to the redirect URI above, and copy the Client ID + a "
-                    "generated client secret."
+                    " "
+                    (t(lang, "connectors-oauth-help-github-2"))
                 }
             } else if is_slack {
                 p(class: "m-0") {
@@ -550,22 +581,15 @@ fn render_oauth_help(existing: Option<&Connector>, redirect_uri: &str) -> Html {
                 }
             } else {
                 p(class: "m-0") {
-                    "Create an OAuth client at your provider with this redirect URI and the "
-                    "authorize / token URLs set below."
+                    (t(lang, "connectors-oauth-help-fallback"))
                 }
             }
             p(class: "m-0 mt-2 text-base-content/60") {
-                "Why a one-time admin step? In OAuth the client id identifies "
-                strong { "this gateway" } " as an app (shared by all users) — only the "
-                "per-user access token differs. Claude Desktop skips it because Anthropic "
-                "ships pre-registered apps tied to its fixed redirect URL; a self-hosted "
-                "gateway uses its own redirect URI (above), and Google/GitHub don't support "
-                "automatic registration (DCR) the way Atlassian does — so you register once, "
-                "then every user just clicks Connect. "
-                strong { "No OAuth app at all?" }
-                " Switch Authentication to “User-supplied token” and each user pastes their "
-                "own token (e.g. a GitHub Personal Access Token) — credentials then come "
-                "straight from the user, no admin client."
+                (t(lang, "connectors-oauth-why-1")) " "
+                strong { (t(lang, "connectors-term-this-gateway")) } " "
+                (t(lang, "connectors-oauth-why-2")) " "
+                strong { (t(lang, "connectors-oauth-why-no-app")) } " "
+                (t(lang, "connectors-oauth-why-3"))
             }
         }
     }
@@ -574,7 +598,12 @@ fn render_oauth_help(existing: Option<&Connector>, redirect_uri: &str) -> Html {
 
 /// The shared create/edit form. `existing` pre-fills the fields (and pins the
 /// key read-only); `None` renders a blank create form.
-fn render_form_fields(existing: Option<&Connector>, has_secret: bool, redirect_uri: &str) -> Html {
+fn render_form_fields(
+    lang: Lang,
+    existing: Option<&Connector>,
+    has_secret: bool,
+    redirect_uri: &str,
+) -> Html {
     let v = |f: fn(&Connector) -> String| existing.map(f).unwrap_or_default();
     let key = existing.map(|c| c.key.clone()).unwrap_or_default();
     let name = v(|c| c.name.clone());
@@ -608,9 +637,9 @@ fn render_form_fields(existing: Option<&Connector>, has_secret: bool, redirect_u
     let auth_none = auth_kind == AuthKind::None;
     let is_edit = existing.is_some();
     let secret_placeholder = if has_secret {
-        "•••••••• (leave blank to keep)"
+        t(lang, "connectors-secret-placeholder-existing")
     } else {
-        "client secret (optional)"
+        t(lang, "connectors-secret-placeholder-new")
     };
 
     let text_field = |label: &str, fname: &str, val: &str, ph: &str| -> Html {
@@ -630,43 +659,62 @@ fn render_form_fields(existing: Option<&Connector>, has_secret: bool, redirect_u
         .to_html()
     };
 
+    let key_label = t(lang, "connectors-field-key-label");
+    let key_placeholder = t(lang, "connectors-field-key-placeholder");
+    let name_label = t(lang, "connectors-field-name-label");
+    let name_placeholder = t(lang, "connectors-field-name-placeholder");
+    let icon_label = t(lang, "connectors-field-icon-label");
+    let category_label = t(lang, "connectors-field-category-label");
+    let category_placeholder = t(lang, "connectors-field-category-placeholder");
+    let description_label = t(lang, "connectors-field-description-label");
+    let description_placeholder = t(lang, "connectors-field-description-placeholder");
+    let url_label = t(lang, "connectors-field-url-label");
+    let scopes_label = t(lang, "connectors-field-scopes-label");
+    let optional_override = t(lang, "connectors-placeholder-optional-override");
+    let authorize_url_label = t(lang, "connectors-field-authorize-url-label");
+    let token_url_label = t(lang, "connectors-field-token-url-label");
+    let registration_url_label = t(lang, "connectors-field-registration-url-label");
+    let required_role_label = t(lang, "connectors-field-required-role-label");
+    let required_role_placeholder = t(lang, "connectors-placeholder-optional");
+    let client_id_placeholder = t(lang, "connectors-field-client-id-placeholder");
+
     html! {
         form(method: "post", action: "/admin/connectors", class: "flex flex-col gap-2") {
             div(class: "grid grid-cols-1 sm:grid-cols-2 gap-2") {
                 if is_edit {
                     label(class: "form-control w-full") {
-                        span(class: "label-text text-xs") { "Key" }
+                        span(class: "label-text text-xs") { (t(lang, "connectors-field-key-readonly-label")) }
                         input(type: "text", name: "key", value: (key.clone()), readonly: "readonly",
                               class: "input input-bordered input-sm w-full opacity-60");
                     }
                 } else {
-                    (text_field("Key (stable id)", "key", "", "e.g. gmail"))
+                    (text_field(&key_label, "key", "", &key_placeholder))
                 }
-                (text_field("Name", "name", &name, "Display name"))
-                (text_field("Icon (emoji)", "icon", &icon, "📧"))
-                (text_field("Category", "category", &category, "Google"))
+                (text_field(&name_label, "name", &name, &name_placeholder))
+                (text_field(&icon_label, "icon", &icon, "📧"))
+                (text_field(&category_label, "category", &category, &category_placeholder))
             }
-            (text_field("Description", "description", &description, "What this connector does"))
-            (text_field("MCP server URL", "url", &url, "https://…/mcp"))
+            (text_field(&description_label, "description", &description, &description_placeholder))
+            (text_field(&url_label, "url", &url, "https://…/mcp"))
             label(class: "form-control w-full") {
-                span(class: "label-text text-xs") { "Authentication" }
+                span(class: "label-text text-xs") { (t(lang, "connectors-field-auth-label")) }
                 select(name: "auth", class: "select select-bordered select-sm w-full") {
                     if auth_static {
-                        option(value: "oauth2") { "OAuth 2.1 (each user authorizes via the provider)" }
-                        option(value: "static_bearer", selected: "selected") { "User-supplied token (each user pastes their own API token)" }
-                        option(value: "none") { "None (public server, no authentication)" }
+                        option(value: "oauth2") { (t(lang, "connectors-auth-option-oauth")) }
+                        option(value: "static_bearer", selected: "selected") { (t(lang, "connectors-auth-option-token")) }
+                        option(value: "none") { (t(lang, "connectors-auth-option-none")) }
                     } else if auth_none {
-                        option(value: "oauth2") { "OAuth 2.1 (each user authorizes via the provider)" }
-                        option(value: "static_bearer") { "User-supplied token (each user pastes their own API token)" }
-                        option(value: "none", selected: "selected") { "None (public server, no authentication)" }
+                        option(value: "oauth2") { (t(lang, "connectors-auth-option-oauth")) }
+                        option(value: "static_bearer") { (t(lang, "connectors-auth-option-token")) }
+                        option(value: "none", selected: "selected") { (t(lang, "connectors-auth-option-none")) }
                     } else {
-                        option(value: "oauth2", selected: "selected") { "OAuth 2.1 (each user authorizes via the provider)" }
-                        option(value: "static_bearer") { "User-supplied token (each user pastes their own API token)" }
-                        option(value: "none") { "None (public server, no authentication)" }
+                        option(value: "oauth2", selected: "selected") { (t(lang, "connectors-auth-option-oauth")) }
+                        option(value: "static_bearer") { (t(lang, "connectors-auth-option-token")) }
+                        option(value: "none") { (t(lang, "connectors-auth-option-none")) }
                     }
                 }
             }
-            (render_oauth_help(existing, redirect_uri))
+            (render_oauth_help(lang, existing, redirect_uri))
             // OAuth-client fields only make sense for OAuth connectors. A
             // user-supplied-token (static_bearer) or public (none) connector
             // has no app-level client, so hide the whole block (incl. the
@@ -674,36 +722,33 @@ fn render_form_fields(existing: Option<&Connector>, has_secret: bool, redirect_u
             if !auth_static && !auth_none {
                 label(class: "form-control w-full") {
                     span(class: "label-text text-xs") {
-                        "Paste OAuth client JSON (optional — e.g. Google’s “Download JSON”)"
+                        (t(lang, "connectors-field-client-json-label"))
                     }
                     textarea(name: "client_json", rows: "3", autocomplete: "off",
                              placeholder: "{\"web\":{\"client_id\":\"…\",\"client_secret\":\"…\",\"auth_uri\":\"…\",\"token_uri\":\"…\"}}",
                              class: "textarea textarea-bordered textarea-sm w-full font-mono text-xs") {}
                     span(class: "label-text-alt text-base-content/50") {
-                        "Fills client id / secret (and authorize + token URLs) from the file. Or use the individual fields below."
+                        (t(lang, "connectors-field-client-json-help"))
                     }
                 }
                 div(class: "grid grid-cols-1 sm:grid-cols-2 gap-2") {
                     label(class: "form-control w-full") {
-                        span(class: "label-text text-xs") { "OAuth client id" }
+                        span(class: "label-text text-xs") { (t(lang, "connectors-field-client-id-label")) }
                         input(type: "text", name: "client_id", value: (client_id),
-                              placeholder: "…apps.googleusercontent.com / GitHub OAuth App id",
+                              placeholder: (client_id_placeholder),
                               class: "input input-bordered input-sm w-full");
                         span(class: "label-text-alt text-base-content/50") {
-                            "The public id that identifies "
-                            strong { "this gateway" }
-                            " as an app to the provider — created once by an admin on the provider’s "
-                            "OAuth credentials page (Google Cloud → Credentials, GitHub → OAuth Apps). "
-                            "Not a per-user secret. Leave blank if DCR is enabled."
+                            (t(lang, "connectors-field-client-id-help-1")) " "
+                            strong { (t(lang, "connectors-term-this-gateway")) } " "
+                            (t(lang, "connectors-field-client-id-help-2"))
                         }
                     }
                     label(class: "form-control w-full") {
-                        span(class: "label-text text-xs") { "OAuth client secret" }
+                        span(class: "label-text text-xs") { (t(lang, "connectors-field-client-secret-label")) }
                         input(type: "password", name: "client_secret", placeholder: (secret_placeholder),
                               class: "input input-bordered input-sm w-full");
                         span(class: "label-text-alt text-base-content/50") {
-                            "Issued alongside the client id on the same page. Stored encrypted; "
-                            "leave blank to keep the existing one."
+                            (t(lang, "connectors-field-client-secret-help"))
                         }
                     }
                 }
@@ -713,23 +758,23 @@ fn render_form_fields(existing: Option<&Connector>, has_secret: bool, redirect_u
                     } else {
                         input(type: "checkbox", name: "use_dcr", value: "1", class: "checkbox checkbox-sm");
                     }
-                    span(class: "label-text text-xs") { "Try dynamic client registration (RFC 7591)" }
+                    span(class: "label-text text-xs") { (t(lang, "connectors-field-use-dcr-label")) }
                 }
-                (text_field("Scopes (space-separated)", "scopes", &scopes, "scope.a scope.b"))
+                (text_field(&scopes_label, "scopes", &scopes, "scope.a scope.b"))
                 details {
-                    summary(class: "cursor-pointer text-xs text-base-content/60") { "Advanced: discovery overrides" }
+                    summary(class: "cursor-pointer text-xs text-base-content/60") { (t(lang, "connectors-advanced-summary")) }
                     div(class: "grid grid-cols-1 gap-2 mt-2") {
-                        (text_field("Authorize URL", "authorize_url", &authorize_url, "optional override"))
-                        (text_field("Token URL", "token_url", &token_url, "optional override"))
-                        (text_field("Registration URL", "registration_url", &registration_url, "optional override"))
+                        (text_field(&authorize_url_label, "authorize_url", &authorize_url, &optional_override))
+                        (text_field(&token_url_label, "token_url", &token_url, &optional_override))
+                        (text_field(&registration_url_label, "registration_url", &registration_url, &optional_override))
                     }
                 }
             }
             // RBAC gate applies to any connector (who may *connect* it).
-            (text_field("Required role (RBAC gate)", "required_role", &required_role, "optional"))
+            (text_field(&required_role_label, "required_role", &required_role, &required_role_placeholder))
             div {
                 button(type: "submit", class: "btn btn-sm btn-primary") {
-                    if is_edit { "Save changes" } else { "Add connector" }
+                    if is_edit { (t(lang, "connectors-save-changes-button")) } else { (t(lang, "connectors-add-connector-button")) }
                 }
             }
         }

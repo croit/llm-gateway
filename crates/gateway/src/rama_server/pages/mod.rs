@@ -20,6 +20,7 @@ use session_core::chrome::{
     self, Flash, FlashKind, NavSections, Theme, html_response, read_body_to_bytes, see_other,
     sse_patch, sse_response, sse_script, sse_toast,
 };
+use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use crate::rama_server::session::Session;
@@ -198,6 +199,7 @@ fn render_app_sidebar(
     user_email: &str,
     is_admin: bool,
     theme: Theme,
+    lang: Lang,
     chat: &SidebarChat,
 ) -> Html {
     let user_email = user_email.to_string();
@@ -211,6 +213,11 @@ fn render_app_sidebar(
         })
         .collect();
     let active_sess = chat.active_session_id.clone();
+    let source_line = t_args(
+        lang,
+        "nav-source-line",
+        &i18n::args([("version", crate::build_info::version_label().into())]),
+    );
     html! {
         aside(id: "app-sidebar", class: "app-sidebar") {
             div(class: "app-sidebar__brand") {
@@ -230,31 +237,63 @@ fn render_app_sidebar(
             // `nav_group`), so a nav patch that re-renders this sidebar
             // never has to know the fold state.
             nav(class: "app-sidebar__primary") {
-                (sidebar_nav_link("/chat", NavItem::Chat, active, icons::message(16), "Chat"))
-                (nav_group("workspace", "Workspace", html! {
-                    (sidebar_nav_link("/memory", NavItem::Memory, active, icons::folder(16), "Memory"))
-                    (sidebar_nav_link("/scheduled", NavItem::Scheduled, active, icons::clock(16), "Scheduled"))
-                    (sidebar_nav_link("/integrations", NavItem::Integrations, active, icons::plug(16), "Integrations"))
-                    (sidebar_nav_link("/tools", NavItem::Tools, active, icons::sliders(16), "Tools"))
+                (sidebar_nav_link("/chat", NavItem::Chat, active, icons::message(16), &t(lang, "nav-chat")))
+                (nav_group(lang, "workspace", &t(lang, "nav-group-workspace"), html! {
+                    (sidebar_nav_link("/memory", NavItem::Memory, active, icons::folder(16), &t(lang, "nav-memory")))
+                    (sidebar_nav_link("/scheduled", NavItem::Scheduled, active, icons::clock(16), &t(lang, "nav-scheduled")))
+                    (sidebar_nav_link("/integrations", NavItem::Integrations, active, icons::plug(16), &t(lang, "nav-integrations")))
+                    (sidebar_nav_link("/tools", NavItem::Tools, active, icons::sliders(16), &t(lang, "nav-tools")))
                 }.to_html()))
-                (nav_group("account", "Account", html! {
-                    (sidebar_nav_link("/tokens", NavItem::Tokens, active, icons::key(16), "Tokens"))
-                    (sidebar_nav_link("/usage", NavItem::Usage, active, icons::chart(16), "Usage"))
+                (nav_group(lang, "account", &t(lang, "nav-group-account"), html! {
+                    (sidebar_nav_link("/tokens", NavItem::Tokens, active, icons::key(16), &t(lang, "nav-tokens")))
+                    (sidebar_nav_link("/usage", NavItem::Usage, active, icons::chart(16), &t(lang, "nav-usage")))
                 }.to_html()))
                 if is_admin {
-                    (nav_group("admin", "Admin", html! {
-                        (sidebar_nav_link("/admin/users", NavItem::Users, active, icons::users(16), "Users"))
-                        (sidebar_nav_link("/admin/models", NavItem::Admin, active, icons::cpu(16), "Models"))
-                        (sidebar_nav_link("/admin/backends", NavItem::Backends, active, icons::cube(16), "Backends"))
-                        (sidebar_nav_link("/rag", NavItem::Rag, active, icons::database(16), "RAG"))
-                        (sidebar_nav_link("/admin/skills", NavItem::Skills, active, icons::sparkles(16), "Skills"))
-                        (sidebar_nav_link("/admin/connectors", NavItem::Connectors, active, icons::plug(16), "Connectors"))
+                    (nav_group(lang, "admin", &t(lang, "nav-group-admin"), html! {
+                        (sidebar_nav_link("/admin/users", NavItem::Users, active, icons::users(16), &t(lang, "nav-users")))
+                        (sidebar_nav_link("/admin/models", NavItem::Admin, active, icons::cpu(16), &t(lang, "nav-models")))
+                        (sidebar_nav_link("/admin/backends", NavItem::Backends, active, icons::cube(16), &t(lang, "nav-backends")))
+                        (sidebar_nav_link("/rag", NavItem::Rag, active, icons::database(16), &t(lang, "nav-rag")))
+                        (sidebar_nav_link("/admin/skills", NavItem::Skills, active, icons::sparkles(16), &t(lang, "nav-skills")))
+                        (sidebar_nav_link("/admin/connectors", NavItem::Connectors, active, icons::plug(16), &t(lang, "nav-connectors")))
                     }.to_html()))
                 }
             }
             div(class: "app-sidebar__sessions-section") {
                 div(class: "app-sidebar__sessions-header") {
-                    span(class: "app-sidebar__sessions-label") { "Conversations" }
+                    span(class: "app-sidebar__sessions-label") { (t(lang, "nav-conversations-label")) }
+                    // Conversation search. Submitting fires a Datastar `@get`
+                    // (NOT a native GET) so the server sees `Datastar-Request:
+                    // true` and answers with an SSE patch of `#session-list`
+                    // rather than a full-page navigation. The query rides in
+                    // `$searchQuery`, url-encoded into the request path. On the
+                    // no-JS path the plain `action`/`method` still submit, and
+                    // the handler serves a full results page.
+                    form(
+                        id: "sidebar-search-form",
+                        method: "get",
+                        action: "/chat/search",
+                        class: "app-sidebar__search-form m-0",
+                        "data-signals": "{searchQuery: ''}",
+                        "data-on:submit__prevent":
+                            "@get('/chat/search?q=' + encodeURIComponent($searchQuery))"
+                    ) {
+                        input(
+                            type: "text",
+                            name: "q",
+                            placeholder: (t(lang, "nav-search-placeholder")),
+                            class: "input input-sm app-sidebar__search-input",
+                            "data-bind": "searchQuery"
+                        );
+                        button(
+                            type: "submit",
+                            class: "btn btn-ghost btn-sm app-sidebar__search-btn",
+                            "aria-label": (t(lang, "nav-search-aria")),
+                            title: (t(lang, "nav-search-title"))
+                        ) {
+                            (icons::search(14))
+                        }
+                    }
                     form(
                         method: "post",
                         action: "/chat/sessions",
@@ -265,19 +304,20 @@ fn render_app_sidebar(
                         button(
                             type: "submit",
                             class: "app-sidebar__new-btn",
-                            "aria-label": "Start a new conversation",
-                            title: "New conversation"
+                            "aria-label": (t(lang, "nav-new-conversation-aria")),
+                            title: (t(lang, "nav-new-conversation-title"))
                         ) {
                             (icons::plus(14))
                         }
                     }
                 }
-                (render_session_list(&sessions, active_sess.as_deref()))
+                (render_session_list(&sessions, active_sess.as_deref(), lang))
             }
             div(class: "app-sidebar__user") {
                 span(class: "app-sidebar__email") { (user_email) }
                 div(class: "app-sidebar__user-actions") {
-                    (chrome::render_theme_toggle_form(theme))
+                    (chrome::render_lang_switcher_form(lang, "/", chrome::LangPanelAnchor::Up))
+                    (chrome::render_theme_toggle_form(theme, lang))
                     form(
                         method: "post",
                         action: "/auth/logout",
@@ -286,8 +326,8 @@ fn render_app_sidebar(
                         button(
                             type: "submit",
                             class: "btn btn-ghost btn-square btn-sm",
-                            title: "Sign out",
-                            "aria-label": "Sign out"
+                            title: (t(lang, "nav-sign-out")),
+                            "aria-label": (t(lang, "nav-sign-out"))
                         ) {
                             (icons::logout(16))
                         }
@@ -303,9 +343,9 @@ fn render_app_sidebar(
                     class: "text-[11px] leading-tight text-base-content/45 link link-hover",
                     target: "_blank",
                     rel: "noopener noreferrer",
-                    title: "Source code (AGPL-3.0)"
+                    title: (t(lang, "nav-source-title"))
                 ) {
-                    "Source · AGPL-3.0 · " (crate::build_info::version_label())
+                    (source_line)
                 }
             }
         }
@@ -349,11 +389,15 @@ fn sidebar_nav_link(
 /// markup is identical open or closed, so a nav patch that re-renders the
 /// sidebar doesn't need to know the fold state (it lives on `<html>`,
 /// which patches never touch).
-fn nav_group(key: &str, label: &str, items: Html) -> Html {
+fn nav_group(lang: Lang, key: &str, label: &str, items: Html) -> Html {
     let key = key.to_string();
     let label = label.to_string();
     let directive = format!("@post('/nav/toggle/{key}')");
-    let aria = format!("Toggle {label} section");
+    let aria = t_args(
+        lang,
+        "nav-group-toggle-aria",
+        &i18n::args([("label", label.clone().into())]),
+    );
     html! {
         div(class: "app-sidebar__group", "data-group": (key)) {
             button(
@@ -376,11 +420,71 @@ fn nav_group(key: &str, label: &str, items: Html) -> Html {
 /// The `<ul>` of conversation rows. Pulled out of `render_app_sidebar` so
 /// the pin toggle can re-patch just `#session-list` (the pin re-sorts the
 /// list — pinned rows float to the top — so a single-row patch won't do).
-fn render_session_list(sessions: &[SidebarSession], active_id: Option<&str>) -> Html {
+fn render_session_list(sessions: &[SidebarSession], active_id: Option<&str>, lang: Lang) -> Html {
     html! {
         ul(id: "session-list", class: "app-sidebar__sessions") {
             for s in sessions.iter() {
-                (render_sidebar_session(s, active_id))
+                (render_sidebar_session(s, active_id, lang, None))
+            }
+        }
+    }
+    .to_html()
+}
+
+/// Render search results into the sidebar's `#session-list` (the SSE patch
+/// replaces the normal list in place). Each row is a *full* sidebar row —
+/// same pin/delete forms, active-row highlight, and `#session-row-{id}` id
+/// as [`render_sidebar_session`] — with the match snippet appended, so
+/// searching never strips the sidebar's affordances.
+pub(super) fn render_search_results(hits: &[session_core::db::SearchHit], lang: Lang) -> Html {
+    html! {
+        ul(id: "session-list", class: "app-sidebar__sessions") {
+            for h in hits.iter() {
+                (render_search_hit_row(h, lang))
+            }
+        }
+    }
+    .to_html()
+}
+
+/// One search-result row: the same full sidebar row (pin/delete/active/id)
+/// plus the highlighted snippet. Delegates to [`render_sidebar_session`] so
+/// the two paths can't drift.
+fn render_search_hit_row(hit: &session_core::db::SearchHit, lang: Lang) -> Html {
+    let s = SidebarSession {
+        id: hit.session_id.clone(),
+        title: hit.title.clone(),
+        pinned: hit.pinned,
+    };
+    let snippet = (!hit.snippet.is_empty()).then_some(hit.snippet.as_str());
+    // No active row: search is issued from any page and the patch carries no
+    // "currently open" session context.
+    render_sidebar_session(&s, None, lang, snippet)
+}
+
+/// Full-page search-results body for the no-JS fallback path (a plain GET
+/// to `/chat/search`). The JS path never hits this — it SSE-patches the
+/// sidebar's `#session-list` in place. Rendered into the main content
+/// column with the query echoed back so the page doesn't look like the
+/// search was ignored.
+pub(super) fn render_search_page_body(
+    query: &str,
+    hits: &[session_core::db::SearchHit],
+    lang: Lang,
+) -> Html {
+    html! {
+        div(class: "p-4 max-w-3xl mx-auto w-full") {
+            h1(class: "text-lg font-semibold mb-3") {
+                (t_args(lang, "nav-search-results-heading", &i18n::args([("query", query.to_string().into())])))
+            }
+            if hits.is_empty() {
+                p(class: "opacity-60 text-sm") { (t(lang, "nav-search-no-results")) }
+            } else {
+                ul(class: "app-sidebar__sessions") {
+                    for h in hits.iter() {
+                        (render_search_hit_row(h, lang))
+                    }
+                }
             }
         }
     }
@@ -389,8 +493,15 @@ fn render_session_list(sessions: &[SidebarSession], active_id: Option<&str>) -> 
 
 /// One conversation row in the sidebar. Hover reveals the pin + delete
 /// buttons (a pinned row keeps its star lit); active row gets a soft
-/// tinted background.
-fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>) -> Html {
+/// tinted background. `snippet`, when present, is a pre-escaped highlight
+/// excerpt (search results) appended below the title — see
+/// [`render_search_hit_row`].
+fn render_sidebar_session(
+    s: &SidebarSession,
+    active_id: Option<&str>,
+    lang: Lang,
+    snippet: Option<&str>,
+) -> Html {
     let id = s.id.clone();
     let row_id = format!("session-row-{id}");
     let href = format!("/chat/{id}");
@@ -402,7 +513,7 @@ fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>) -> Html {
     let title = s
         .title
         .clone()
-        .unwrap_or_else(|| "Untitled chat".to_string());
+        .unwrap_or_else(|| t(lang, "nav-untitled-chat"));
     let is_active = active_id == Some(&s.id);
     let row_class = if is_active {
         "session-row session-row--active"
@@ -420,10 +531,12 @@ fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>) -> Html {
         "session-row__pin"
     };
     let (pin_label, pin_icon) = if s.pinned {
-        ("Unpin conversation", icons::star_filled(12))
+        (t(lang, "nav-unpin-conversation"), icons::star_filled(12))
     } else {
-        ("Pin conversation", icons::star(12))
+        (t(lang, "nav-pin-conversation"), icons::star(12))
     };
+    let delete_label = t(lang, "nav-delete-conversation");
+    let snippet = snippet.map(str::to_string);
     html! {
         li(id: (row_id), class: "session-row__item") {
             // The whole row is the clickable target so a sloppy
@@ -437,6 +550,12 @@ fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>) -> Html {
                 "data-on:click__prevent": (directive)
             ) {
                 span(class: "session-row__title") { (title) }
+                // Search-result snippet: pre-escaped at the DB layer (only
+                // the `<b>` highlight is live markup — see
+                // `db::highlight_snippet`), so splicing it raw is XSS-safe.
+                if let Some(snip) = snippet.as_deref() {
+                    span(class: "session-row__snippet") { #(snip.to_string()) }
+                }
             }
             form(
                 method: "post",
@@ -448,7 +567,7 @@ fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>) -> Html {
                 button(
                     type: "submit",
                     class: (pin_class),
-                    "aria-label": (pin_label),
+                    "aria-label": (pin_label.clone()),
                     title: (pin_label)
                 ) {
                     (pin_icon)
@@ -463,8 +582,8 @@ fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>) -> Html {
                 button(
                     type: "submit",
                     class: "session-row__delete",
-                    "aria-label": "Delete conversation",
-                    title: "Delete conversation"
+                    "aria-label": (delete_label.clone()),
+                    title: (delete_label)
                 ) {
                     (icons::trash(12))
                 }
@@ -487,6 +606,7 @@ fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>) -> Html {
 fn nav_or_html_page(
     datastar: bool,
     theme: Theme,
+    lang: Lang,
     nav: NavSections,
     active: NavItem,
     title: &str,
@@ -500,6 +620,7 @@ fn nav_or_html_page(
     if !datastar {
         return html_authed_page(
             theme,
+            lang,
             nav,
             Some(active),
             title,
@@ -518,7 +639,7 @@ fn nav_or_html_page(
     .to_string();
     let title_html = html! { title { (title) } }.to_html().to_string();
     let sidebar_html =
-        render_app_sidebar(Some(active), user_email, is_admin, theme, chat).to_string();
+        render_app_sidebar(Some(active), user_email, is_admin, theme, lang, chat).to_string();
     let push_url = serde_json::to_string(url).expect("url is JSON-encodable");
     // After the patch lands, push the URL and — if this page has a chat
     // composer (`#message`, only on /chat) — focus it so the user can
@@ -580,6 +701,7 @@ fn main_class_for(active: Option<NavItem>) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 fn html_authed_page(
     theme: Theme,
+    lang: Lang,
     nav: NavSections,
     active: Option<NavItem>,
     title: &str,
@@ -591,6 +713,7 @@ fn html_authed_page(
 ) -> Response {
     let html = layout_authed(
         theme,
+        lang,
         nav,
         active,
         title,
@@ -610,6 +733,7 @@ fn html_authed_page(
 #[allow(clippy::too_many_arguments)]
 fn layout_authed(
     theme: Theme,
+    lang: Lang,
     nav: NavSections,
     active: Option<NavItem>,
     title: &str,
@@ -620,6 +744,7 @@ fn layout_authed(
     chat: &SidebarChat,
 ) -> String {
     let theme_str = theme.as_str();
+    let lang_code = lang.code();
     let css_href = assets::app_css_url();
     let datastar_src = assets::datastar_js_url();
     let app_src = assets::app_js_url();
@@ -634,7 +759,7 @@ fn layout_authed(
     let nav_admin = NavSections::attr(nav.admin);
     let frag = html! {
         html(
-            lang: "en",
+            lang: (lang_code),
             "data-theme": (theme_str),
             class: (theme_str),
             "data-nav-workspace": (nav_workspace),
@@ -691,7 +816,7 @@ fn layout_authed(
                         label(
                             "for": "app-sidebar-toggle",
                             class: "app-mobile-menu-btn lg:hidden",
-                            "aria-label": "Open menu"
+                            "aria-label": (t(lang, "nav-open-menu-aria"))
                         ) {
                             (icons::menu(18))
                         }
@@ -703,7 +828,7 @@ fn layout_authed(
                         // start/stop redirects) re-render the shell, which is
                         // exactly when the banner should appear or vanish.
                         if impersonating {
-                            (render_impersonation_banner(user_email))
+                            (render_impersonation_banner(user_email, lang))
                         }
                         main(class: (main_class)) {
                             (body)
@@ -714,17 +839,17 @@ fn layout_authed(
                         // across in-page nav patches. The FAB starts hidden;
                         // `feedback.ts` reveals it once `/feedback/config`
                         // confirms the feature is configured.
-                        (feedback::render_fab())
-                        (feedback::render_dialog())
-                        (feedback::render_confirm())
+                        (feedback::render_fab(lang))
+                        (feedback::render_dialog(lang))
+                        (feedback::render_confirm(lang))
                     }
                     div(class: "drawer-side z-40") {
                         label(
                             "for": "app-sidebar-toggle",
-                            "aria-label": "Close menu",
+                            "aria-label": (t(lang, "nav-close-menu-aria")),
                             class: "drawer-overlay"
                         ) {}
-                        (render_app_sidebar(active, user_email, is_admin, theme, chat))
+                        (render_app_sidebar(active, user_email, is_admin, theme, lang, chat))
                     }
                 }
                 (chrome::toast_container())
@@ -743,8 +868,9 @@ fn layout_authed(
 /// impersonation is unrestricted by design (the admin can act entirely as
 /// the user); this banner + the impersonation_audit trail are the
 /// accountability controls.
-fn render_impersonation_banner(email: &str) -> Html {
+fn render_impersonation_banner(email: &str, lang: Lang) -> Html {
     let email = email.to_string();
+    let prefix = t(lang, "impersonation-banner-prefix");
     html! {
         div(
             id: "impersonation-banner",
@@ -754,7 +880,7 @@ fn render_impersonation_banner(email: &str) -> Html {
         ) {
             (icons::alert(18))
             span(class: "text-sm font-medium min-w-0 break-words") {
-                "You are impersonating " strong { (email) } "."
+                (prefix) " " strong { (email) } "."
             }
             form(
                 method: "post",
@@ -762,7 +888,7 @@ fn render_impersonation_banner(email: &str) -> Html {
                 class: "m-0 ml-auto shrink-0"
             ) {
                 button(type: "submit", class: "btn btn-sm") {
-                    "Return to your account"
+                    (t(lang, "impersonation-return-button"))
                 }
             }
         }
@@ -834,6 +960,7 @@ fn login_redirect(req: &Request) -> Response {
 /// with the "Continue with OIDC" button.
 pub async fn login(State(_state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     // Carry a deep-link target across the OIDC round-trip. `login_redirect`
     // sends unauthenticated deep links here as `?return_to=/path`; forward that
     // into the GET form as a hidden field so `/auth/login` persists it and the
@@ -850,10 +977,9 @@ pub async fn login(State(_state): State<Arc<RamaState>>, req: Request) -> Respon
         main(class: "min-h-dvh flex items-center justify-center p-8") {
             div(class: "card border border-base-300 w-full max-w-md") {
                 div(class: "card-body") {
-                    h2(class: "card-title text-2xl") { "Sign in to LLM Gateway" }
+                    h2(class: "card-title text-2xl") { (t(lang, "login-heading")) }
                     p(class: "text-base-content/70") {
-                        "Authenticate with your company's OIDC provider to mint "
-                        "API tokens and route LLM requests."
+                        (t(lang, "login-description"))
                     }
                     form(action: "/auth/login", method: "get", class: "mt-2") {
                         if let Some(rt) = return_to.as_ref() {
@@ -863,7 +989,7 @@ pub async fn login(State(_state): State<Arc<RamaState>>, req: Request) -> Respon
                             type: "submit",
                             class: "btn btn-primary btn-block"
                         ) {
-                            "Continue with OIDC →"
+                            (t(lang, "login-continue-button"))
                         }
                     }
                     // AGPL-3.0 §13 source offer, also reachable pre-login.
@@ -874,7 +1000,7 @@ pub async fn login(State(_state): State<Arc<RamaState>>, req: Request) -> Respon
                             target: "_blank",
                             rel: "noopener noreferrer"
                         ) {
-                            "Source code · AGPL-3.0"
+                            (t(lang, "login-source-link"))
                         }
                     }
                 }
@@ -882,7 +1008,7 @@ pub async fn login(State(_state): State<Arc<RamaState>>, req: Request) -> Respon
         }
     }
     .to_html();
-    chrome::html_page(theme, "Sign in — LLM Gateway", body)
+    chrome::html_page(theme, lang, "/login", "Sign in — LLM Gateway", body)
 }
 
 /// Query for the `/login` page — the optional deep-link target threaded through
@@ -906,8 +1032,8 @@ mod chat;
 pub use chat::{
     chat_attachment, chat_cancel, chat_capabilities_toggle, chat_document_view, chat_edit,
     chat_effort_set, chat_export_markdown, chat_export_pdf, chat_fork, chat_index,
-    chat_message_send, chat_retry, chat_session_create, chat_session_delete, chat_session_pin,
-    chat_session_view, chat_share_toggle, chat_tail,
+    chat_message_send, chat_retry, chat_search, chat_session_create, chat_session_delete,
+    chat_session_pin, chat_session_view, chat_share_toggle, chat_tail,
 };
 
 // SSE helpers (`sse_patch`, `sse_script`, `sse_signals`,
@@ -1033,12 +1159,17 @@ pub use usage::usage_index;
 mod feedback;
 pub use feedback::{feedback_config, feedback_extract, feedback_submit};
 
+// Both error pages below hardcode `Theme::Dark` (not derived from the
+// request) since they're rare failure paths, not a preference-sensitive
+// surface — same reasoning now extends to `Lang::En`: these two hardcode
+// English rather than threading `lang` through the ~80 call sites that
+// invoke them with an ad-hoc `message`, matching the existing precedent.
 fn internal_error_html(user_email: &str, message: &str) -> Response {
     let body = html! {
         div(class: "alert alert-error max-w-md mx-auto items-start") {
             (icons::alert(20))
             div(class: "flex-1") {
-                div(class: "font-bold") { "Internal error" }
+                div(class: "font-bold") { (t(Lang::En, "error-internal-heading")) }
                 div { (message) }
             }
         }
@@ -1050,6 +1181,7 @@ fn internal_error_html(user_email: &str, message: &str) -> Response {
         .body(
             layout_authed(
                 Theme::Dark,
+                Lang::En,
                 NavSections::default(),
                 None,
                 "Error — LLM Gateway",
@@ -1072,7 +1204,7 @@ pub(super) fn forbidden_html(user_email: &str, message: &str) -> Response {
         div(class: "alert alert-warning max-w-md mx-auto items-start") {
             (icons::alert(20))
             div(class: "flex-1") {
-                div(class: "font-bold") { "Forbidden" }
+                div(class: "font-bold") { (t(Lang::En, "error-forbidden-heading")) }
                 div { (message) }
             }
         }
@@ -1084,6 +1216,7 @@ pub(super) fn forbidden_html(user_email: &str, message: &str) -> Response {
         .body(
             layout_authed(
                 Theme::Dark,
+                Lang::En,
                 NavSections::default(),
                 None,
                 "Forbidden — LLM Gateway",

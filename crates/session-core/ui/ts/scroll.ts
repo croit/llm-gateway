@@ -71,6 +71,45 @@ const init = (conversation: HTMLElement): void => {
     const basePadBottom = parseFloat(cs.paddingBottom) || 0;
     const topInset = Math.max(parseFloat(cs.paddingTop) || 0, 8);
 
+    // Dynamic composer clearance. The floating composer's height changes
+    // as tool chips wrap onto multiple rows; the authored `padding-bottom`
+    // (`basePadBottom`) only clears a single-row composer. We track the
+    // live height via ResizeObserver so the conversation always reserves
+    // enough bottom space to scroll the last message clear of the composer.
+    //
+    // `clearanceFloor()` is the *minimum* bottom padding: the larger of the
+    // authored clearance and the current composer height plus a margin. It
+    // is the single source of truth used by BOTH `updateComposerHeight`
+    // (which bumps padding immediately when the composer grows) and
+    // `reserveTailSpace` (which must never collapse padding below it — that
+    // was the bug where a wrapped-chip composer re-hid the last message
+    // once the reply grew past one viewport).
+    const COMPOSER_MARGIN_PX = 24;
+    let composerHeight = 0;
+    const clearanceFloor = (): number =>
+        Math.max(basePadBottom, composerHeight + COMPOSER_MARGIN_PX);
+    const updateComposerHeight = (): void => {
+        const composer = document.querySelector<HTMLElement>('.chat-composer');
+        if (!composer || !composer.isConnected) return;
+        const h = composer.getBoundingClientRect().height;
+        if (h === composerHeight) return;
+        composerHeight = h;
+        if (anchor) {
+            // Mid-turn: `reserveTailSpace` owns the padding and already
+            // floors it at `clearanceFloor()`; just re-run it so the new
+            // floor takes effect without fighting an in-flight scroll.
+            reserveTailSpace();
+            return;
+        }
+        // Idle (no anchored turn): set the padding to exactly the floor.
+        // This both GROWS it when chips wrap the composer taller and SHRINKS
+        // it back when they're removed — the `.chat-composer` is outside the
+        // conversation subtree, so the MutationObserver never fires on a
+        // compose-area change; this ResizeObserver-driven path is the only
+        // thing that keeps the idle clearance correct.
+        conversation.style.paddingBottom = `${clearanceFloor()}px`;
+    };
+
     // The latest user bubble we anchored to the top for this turn.
     // Null until the first send (or after a patch removes it).
     let anchor: HTMLElement | null = null;
@@ -90,22 +129,27 @@ const init = (conversation: HTMLElement): void => {
 
     // Reserve just enough trailing space that `anchor` can sit at the
     // top of the viewport (offset by `topInset`). Collapses toward the
-    // authored padding as the reply grows past one viewport. Measures
+    // clearance floor as the reply grows past one viewport. Measures
     // via the tracked `reservePx` — it never zeroes the inline padding
     // to measure, which would clamp the scroll position.
+    //
+    // The resting padding is `clearanceFloor()` (NOT the authored
+    // `basePadBottom`): when tool chips have grown the composer, collapsing
+    // to the smaller authored value would tuck the last message back under
+    // the composer. Reserve is measured on top of that floor.
     const reserveTailSpace = (): void => {
+        const floor = clearanceFloor();
         if (!anchor || !conversation.contains(anchor)) {
             reservePx = 0;
-            conversation.style.paddingBottom = '';
+            conversation.style.paddingBottom = `${floor}px`;
             return;
         }
-        // Height of real content (incl. base padding) below the anchor,
+        // Height of real content (incl. the floor padding) below the anchor,
         // backing out whatever reserve is currently applied.
         const belowAnchor = conversation.scrollHeight - reservePx - anchorOffset();
         const need = conversation.clientHeight - topInset - belowAnchor;
         reservePx = Math.max(0, need);
-        conversation.style.paddingBottom =
-            reservePx > 0 ? `${basePadBottom + reservePx}px` : '';
+        conversation.style.paddingBottom = `${floor + reservePx}px`;
     };
 
     const cancelAnim = (): void => {
@@ -181,6 +225,23 @@ const init = (conversation: HTMLElement): void => {
         subtree: true,
         characterData: true,
     });
+
+    // Track composer height changes (tool chips wrapping, etc.) so the
+    // conversation always has enough bottom clearance to scroll past it.
+    // Self-cleansing: removes itself when the conversation detaches.
+    const composer = document.querySelector<HTMLElement>('.chat-composer');
+    if (composer) {
+        const resizeObserver = new ResizeObserver(() => {
+            if (!conversation.isConnected) {
+                resizeObserver.disconnect();
+                return;
+            }
+            updateComposerHeight();
+        });
+        resizeObserver.observe(composer);
+        // Initial read.
+        updateComposerHeight();
+    }
 
     // Keep the reserve viewport-accurate across resizes (orientation
     // change, devtools, window drag) without touching scroll position.

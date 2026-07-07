@@ -21,6 +21,7 @@
 use plait::{Html, ToHtml, html};
 
 use crate::db::{ToolCall, ToolCallStatus, Turn, TurnRole, TurnStatus, TurnWithTools};
+use crate::i18n::{self, Lang, t, t_args};
 use crate::icons;
 
 // ---------------------------------------------------------------------------
@@ -180,6 +181,7 @@ pub fn render_conversation(
     in_flight_tail_url: Option<&str>,
     actions: Option<&str>,
     compacted_up_to_seq: Option<i64>,
+    lang: Lang,
 ) -> Html {
     let turns_owned: Vec<TurnWithTools> = turns.to_vec();
     // `data-init` fires every time datastar mounts this element —
@@ -206,9 +208,9 @@ pub fn render_conversation(
     let mut items: Vec<Html> = Vec::with_capacity(turns_owned.len() + 1);
     for (i, t) in turns_owned.iter().enumerate() {
         if Some(i) == divider_at {
-            items.push(render_compaction_divider());
+            items.push(render_compaction_divider(lang));
         }
-        items.push(render_turn(t, actions));
+        items.push(render_turn(t, actions, lang));
     }
     html! {
         section(
@@ -226,15 +228,16 @@ pub fn render_conversation(
 /// The transcript marker between compacted (summarised) turns above and the
 /// verbatim tail the model still sees below. Purely informational — the turns
 /// above remain fully readable.
-fn render_compaction_divider() -> Html {
+fn render_compaction_divider(lang: Lang) -> Html {
+    let label = t(lang, "render-compaction-divider");
     html! {
         div(
             class: "divider text-xs opacity-60 my-2",
             role: "separator",
-            "aria-label": "Earlier messages condensed to save context"
+            "aria-label": (label.clone())
         ) {
             (icons::info(14))
-            span { "Earlier messages condensed to save context" }
+            span { (label) }
         }
     }
     .to_html()
@@ -242,14 +245,14 @@ fn render_compaction_divider() -> Html {
 
 /// Dispatch on role. Renders the right bubble shape. `actions` is the
 /// retry/edit base path (see [`render_conversation`]).
-pub fn render_turn(turn: &TurnWithTools, actions: Option<&str>) -> Html {
+pub fn render_turn(turn: &TurnWithTools, actions: Option<&str>, lang: Lang) -> Html {
     match turn.turn.role {
-        TurnRole::User => render_user_turn(&turn.turn, actions),
-        TurnRole::Assistant => render_assistant_turn(turn, actions),
+        TurnRole::User => render_user_turn(&turn.turn, actions, lang),
+        TurnRole::Assistant => render_assistant_turn(turn, actions, lang),
     }
 }
 
-pub fn render_user_turn(turn: &Turn, actions: Option<&str>) -> Html {
+pub fn render_user_turn(turn: &Turn, actions: Option<&str>, lang: Lang) -> Html {
     let content = turn.user_content.clone().unwrap_or_default();
     let dom_id = format!("turn-{}", turn.id);
     let segments = crate::attachments::split_markers(&content);
@@ -259,7 +262,7 @@ pub fn render_user_turn(turn: &Turn, actions: Option<&str>) -> Html {
     let show_actions = actions.is_some();
     // Build the edit affordance first — it borrows `content` before the
     // body macro moves a clone of it into a closure.
-    let edit_block = render_user_edit(turn, actions.unwrap_or(""), &content);
+    let edit_block = render_user_edit(turn, actions.unwrap_or(""), &content, lang);
     // The message body — either the plain text fast path or the
     // text+attachment segmented path. Kept in `.chat-msg__body` so the
     // edit form can replace it visually via the `.editing` class.
@@ -277,7 +280,7 @@ pub fn render_user_turn(turn: &Turn, actions: Option<&str>) -> Html {
                             }
                         }
                         crate::attachments::Segment::Attachment(att) => {
-                            (render_attachment(att, &turn.id))
+                            (render_attachment(att, &turn.id, lang))
                         }
                     }
                 }
@@ -306,9 +309,16 @@ fn action_url(base: &str, turn: &Turn, action: &str) -> String {
 /// model dropdown into the form's hidden `model` input, confirm the
 /// destructive drop, then `@post` (whose SSE response streams the
 /// regenerated reply back in).
+///
+/// `confirm` is JSON-encoded (not hand-escaped) before splicing into the
+/// JS string literal: JSON string syntax is a strict subset of JS string
+/// syntax, so this correctly escapes quotes/backslashes/control chars in
+/// one call — safe even once `confirm` carries translated text that may
+/// contain apostrophes (French/Spanish) the caller didn't anticipate.
 fn action_submit(url: &str, confirm: &str) -> String {
+    let confirm_js = serde_json::to_string(confirm).expect("String always serialises");
     format!(
-        "window.chatActions.fillModel(el) && confirm('{confirm}') && \
+        "window.chatActions.fillModel(el) && confirm({confirm_js}) && \
          @post('{url}', {{contentType: 'form'}})"
     )
 }
@@ -317,16 +327,17 @@ fn action_submit(url: &str, confirm: &str) -> String {
 /// inline edit form (revealed by toggling `.editing` on the bubble via
 /// `window.chatActions`). Submitting drops everything below this turn
 /// and regenerates from the edited text.
-fn render_user_edit(turn: &Turn, base: &str, content: &str) -> Html {
+fn render_user_edit(turn: &Turn, base: &str, content: &str, lang: Lang) -> Html {
     let id = turn.id.clone();
     let content = content.to_string();
     let edit_url = action_url(base, turn, "edit");
-    let submit = action_submit(
-        &edit_url,
-        "Save and regenerate? This deletes all messages below.",
-    );
+    let confirm_text = t(lang, "render-edit-confirm");
+    let submit = action_submit(&edit_url, &confirm_text);
     let start = format!("window.chatActions.editStart('{id}')");
     let cancel = format!("window.chatActions.editCancel('{id}')");
+    let edit_label = t(lang, "render-edit-button");
+    let save_label = t(lang, "render-edit-save");
+    let cancel_label = t(lang, "render-edit-cancel");
     html! {
         div(class: "chat-msg__actions") {
             button(
@@ -334,7 +345,7 @@ fn render_user_edit(turn: &Turn, base: &str, content: &str) -> Html {
                 class: "chat-msg__action",
                 "data-on:click": (start)
             ) {
-                "✎ Edit"
+                (edit_label)
             }
         }
         form(
@@ -346,12 +357,12 @@ fn render_user_edit(turn: &Turn, base: &str, content: &str) -> Html {
             input(type: "hidden", name: "model");
             textarea(name: "message", class: "chat-msg__edit-textarea") { (content) }
             div(class: "chat-msg__edit-actions") {
-                button(type: "submit", class: "btn btn-sm btn-primary") { "Save & regenerate" }
+                button(type: "submit", class: "btn btn-sm btn-primary") { (save_label) }
                 button(
                     type: "button",
                     class: "btn btn-sm btn-ghost",
                     "data-on:click": (cancel)
-                ) { "Cancel" }
+                ) { (cancel_label) }
             }
         }
     }
@@ -375,7 +386,11 @@ fn attachment_turn_id(url: &str) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
-fn render_attachment(att: &crate::attachments::ParsedAttachment, owner_turn_id: &str) -> Html {
+fn render_attachment(
+    att: &crate::attachments::ParsedAttachment,
+    owner_turn_id: &str,
+    lang: Lang,
+) -> Html {
     let url = att.url.clone();
     let filename = att.filename.clone();
     let mime = att.mime.clone();
@@ -390,14 +405,16 @@ fn render_attachment(att: &crate::attachments::ParsedAttachment, owner_turn_id: 
     if let Some(att_turn) = attachment_turn_id(&url)
         && att_turn != owner_turn_id
     {
+        let unavailable_title = t(lang, "render-attachment-unavailable-title");
+        let unavailable_meta = t(lang, "render-attachment-unavailable-meta");
         return html! {
             span(
                 class: "chat-msg__attachment-chip chat-msg__attachment-chip--missing",
-                title: "This attachment is no longer available"
+                title: (unavailable_title)
             ) {
                 span(class: "chat-msg__attachment-icon") { (icons::paperclip(14)) }
                 span(class: "chat-msg__attachment-name") { (filename) }
-                span(class: "chat-msg__attachment-meta") { "unavailable" }
+                span(class: "chat-msg__attachment-meta") { (unavailable_meta) }
             }
         }
         .to_html();
@@ -409,8 +426,24 @@ fn render_attachment(att: &crate::attachments::ParsedAttachment, owner_turn_id: 
         // own full-res bytes. The `<img src>` is always the image url.
         let href = att.link.clone().unwrap_or_else(|| url.clone());
         let title = match &att.link {
-            Some(_) => format!("Open {filename} · {mime} · {size}"),
-            None => format!("{filename} · {mime} · {size}"),
+            Some(_) => t_args(
+                lang,
+                "render-attachment-open-title",
+                &i18n::args([
+                    ("filename", filename.clone().into()),
+                    ("mime", mime.clone().into()),
+                    ("size", size.clone().into()),
+                ]),
+            ),
+            None => t_args(
+                lang,
+                "render-attachment-title",
+                &i18n::args([
+                    ("filename", filename.clone().into()),
+                    ("mime", mime.clone().into()),
+                    ("size", size.clone().into()),
+                ]),
+            ),
         };
         return html! {
             a(href: (href), target: "_blank", rel: "noopener", class: "chat-msg__attachment-image") {
@@ -419,13 +452,18 @@ fn render_attachment(att: &crate::attachments::ParsedAttachment, owner_turn_id: 
         }
         .to_html();
     }
+    let chip_title = t_args(
+        lang,
+        "render-attachment-chip-title",
+        &i18n::args([("mime", mime.clone().into()), ("size", size.clone().into())]),
+    );
     html! {
         a(
             href: (url.clone()),
             target: "_blank",
             rel: "noopener",
             class: "chat-msg__attachment-chip",
-            title: (format!("{mime} · {size}"))
+            title: (chip_title)
         ) {
             span(class: "chat-msg__attachment-icon") { (icons::paperclip(14)) }
             span(class: "chat-msg__attachment-name") { (filename) }
@@ -481,9 +519,9 @@ fn assistant_segments(content: &str) -> Vec<AssistantSegment> {
         .collect()
 }
 
-pub fn render_assistant_turn(t: &TurnWithTools, actions: Option<&str>) -> Html {
-    let turn = t.turn.clone();
-    let tools = t.tool_calls.clone();
+pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: Lang) -> Html {
+    let turn = tw.turn.clone();
+    let tools = tw.tool_calls.clone();
     let dom_id = format!("turn-{}", turn.id);
     let reasoning = turn.reasoning.clone().unwrap_or_default();
     let content = turn.content.clone().unwrap_or_default();
@@ -512,7 +550,7 @@ pub fn render_assistant_turn(t: &TurnWithTools, actions: Option<&str>) -> Html {
             // empty placeholder (so subsequent inner-patches of the
             // bubble can morph it in without touching siblings).
             if has_reasoning {
-                (render_thinking_block(&turn.id, &reasoning, elapsed_ms, !in_progress))
+                (render_thinking_block(&turn.id, &reasoning, elapsed_ms, !in_progress, lang))
             } else {
                 div(id: (thinking_id.clone()), class: "thinking-block-slot") {}
             }
@@ -520,7 +558,7 @@ pub fn render_assistant_turn(t: &TurnWithTools, actions: Option<&str>) -> Html {
             // so datastar's morph preserves user open/close state
             // across re-renders.
             div(id: (tools_id), class: "tool-calls flex flex-col") {
-                (render_tool_call_list(&tools, &turn.id))
+                (render_tool_call_list(&tools, &turn.id, lang))
             }
             // Main response text. Each prose segment is its own
             // markdown-rendered block, with attachment chips/images
@@ -532,7 +570,7 @@ pub fn render_assistant_turn(t: &TurnWithTools, actions: Option<&str>) -> Html {
                             #(html.clone())
                         }
                         AssistantSegment::Attachment(att) => {
-                            (render_attachment(att, &turn.id))
+                            (render_attachment(att, &turn.id, lang))
                         }
                     }
                 }
@@ -544,7 +582,7 @@ pub fn render_assistant_turn(t: &TurnWithTools, actions: Option<&str>) -> Html {
             if show_spinner {
                 div(class: "thinking flex items-center gap-2 text-base-content/60 text-sm") {
                     (icons::spinner(16))
-                    span { "Thinking…" }
+                    span { (t(lang, "render-thinking-spinner")) }
                 }
             }
             if errored {
@@ -557,7 +595,7 @@ pub fn render_assistant_turn(t: &TurnWithTools, actions: Option<&str>) -> Html {
             // this reply + everything below and regenerates from the
             // preceding user message with the currently-selected model.
             if actions.is_some() && !in_progress {
-                (render_retry_action(&turn, actions.unwrap_or("")))
+                (render_retry_action(&turn, actions.unwrap_or(""), lang))
             }
         }
     }
@@ -565,12 +603,11 @@ pub fn render_assistant_turn(t: &TurnWithTools, actions: Option<&str>) -> Html {
 }
 
 /// Hover "Retry" affordance under a settled assistant bubble.
-fn render_retry_action(turn: &Turn, base: &str) -> Html {
+fn render_retry_action(turn: &Turn, base: &str, lang: Lang) -> Html {
     let retry_url = action_url(base, turn, "retry");
-    let submit = action_submit(
-        &retry_url,
-        "Regenerate this reply? This deletes it and everything below.",
-    );
+    let confirm_text = t(lang, "render-retry-confirm");
+    let submit = action_submit(&retry_url, &confirm_text);
+    let retry_label = t(lang, "render-retry-button");
     html! {
         div(class: "chat-msg__actions") {
             form(
@@ -580,7 +617,7 @@ fn render_retry_action(turn: &Turn, base: &str) -> Html {
                 "data-on:submit__prevent": (submit)
             ) {
                 input(type: "hidden", name: "model");
-                button(type: "submit", class: "chat-msg__action") { "↻ Retry" }
+                button(type: "submit", class: "chat-msg__action") { (retry_label) }
             }
         }
     }
@@ -596,15 +633,29 @@ pub fn render_thinking_block(
     reasoning: &str,
     elapsed_ms: Option<i64>,
     finalized: bool,
+    lang: Lang,
 ) -> Html {
     let body_id = format!("turn-{turn_id}-thinking-body");
     let shell_id = format!("turn-{turn_id}-thinking");
     let summary_id = format!("turn-{turn_id}-thinking-summary");
     let elapsed_secs = elapsed_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
+    // Pre-format the number ourselves (rather than handing Fluent a raw
+    // f64) so every locale gets the same fixed one-decimal "12.3" shape —
+    // Fluent's NUMBER() would otherwise apply locale-specific grouping/
+    // decimal-separator rules we don't want for a short elapsed-time label.
+    let secs_str = format!("{elapsed_secs:.1}");
     let summary_label = if finalized {
-        format!("Thought for {elapsed_secs:.1}s")
+        t_args(
+            lang,
+            "render-thinking-finalized",
+            &i18n::args([("secs", secs_str.into())]),
+        )
     } else {
-        format!("Thinking… ({elapsed_secs:.1}s)")
+        t_args(
+            lang,
+            "render-thinking-in-progress",
+            &i18n::args([("secs", secs_str.into())]),
+        )
     };
     let rendered = render_markdown(reasoning);
     html! {
@@ -667,7 +718,7 @@ pub struct DocCanvas<'a> {
 /// Markdown is rendered to formatted HTML; every other format is shown as
 /// escaped source in a code block — never executed — so an `html` /
 /// `json` document can't inject markup into the operator's page.
-pub fn render_document_canvas(c: &DocCanvas<'_>) -> String {
+pub fn render_document_canvas(c: &DocCanvas<'_>, lang: Lang) -> String {
     let is_markdown = c.format.eq_ignore_ascii_case("markdown");
     let body_html = if is_markdown {
         render_markdown(c.content)
@@ -683,6 +734,10 @@ pub fn render_document_canvas(c: &DocCanvas<'_>) -> String {
     let sid = c.session_id;
     let active = c.active_id;
     let versions: Vec<i64> = (1..=c.max_version).rev().collect();
+    let close_title = t(lang, "render-canvas-close-title");
+    let close_aria = t(lang, "render-canvas-close-aria");
+    let document_aria = t(lang, "render-canvas-document-aria");
+    let version_aria = t(lang, "render-canvas-version-aria");
 
     html! {
         div(id: "document-canvas", class: "document-canvas") {
@@ -695,8 +750,8 @@ pub fn render_document_canvas(c: &DocCanvas<'_>) -> String {
                 button(
                     type: "button",
                     class: "document-canvas__close",
-                    title: "Close",
-                    "aria-label": "Close document canvas",
+                    title: (close_title),
+                    "aria-label": (close_aria),
                     "data-on:click": "$canvasOpen = false"
                 ) { (icons::x_mark(16)) }
             }
@@ -704,7 +759,7 @@ pub fn render_document_canvas(c: &DocCanvas<'_>) -> String {
                 if show_doc_switcher {
                     select(
                         class: "select select-bordered select-xs",
-                        "aria-label": "Document",
+                        "aria-label": (document_aria),
                         "data-on:change": (format!("@get('/chat/{sid}/document/' + evt.target.value)"))
                     ) {
                         for (id, title) in c.all_docs.iter() {
@@ -719,7 +774,7 @@ pub fn render_document_canvas(c: &DocCanvas<'_>) -> String {
                 if show_versions {
                     select(
                         class: "select select-bordered select-xs",
-                        "aria-label": "Version",
+                        "aria-label": (version_aria),
                         "data-on:change": (format!("@get('/chat/{sid}/document/{active}?version=' + evt.target.value)"))
                     ) {
                         for v in versions.iter() {
@@ -753,7 +808,7 @@ pub fn render_document_canvas(c: &DocCanvas<'_>) -> String {
 /// byte of a fetched HTML page.
 const TOOL_CALL_RENDER_CAP: usize = 16 * 1024;
 
-fn truncate_for_display(raw: String) -> String {
+fn truncate_for_display(raw: String, lang: Lang) -> String {
     if raw.len() <= TOOL_CALL_RENDER_CAP {
         return raw;
     }
@@ -768,12 +823,18 @@ fn truncate_for_display(raw: String) -> String {
         .unwrap_or(TOOL_CALL_RENDER_CAP);
     let mut out = String::with_capacity(head_end + 128);
     out.push_str(&raw[..head_end]);
-    out.push_str(&format!(
-        "\n\n…\n(truncated for display — full {} bytes still available to the model + persisted in the DB; \
-         displaying first {} chars)\n",
-        raw.len(),
-        head_end,
-    ));
+    let note = t_args(
+        lang,
+        "render-tool-output-truncated",
+        &i18n::args([
+            ("bytes", raw.len().to_string().into()),
+            ("chars", head_end.to_string().into()),
+        ]),
+    );
+    out.push_str("\n\n…\n(");
+    out.push_str(&note);
+    out.push(')');
+    out.push('\n');
     out
 }
 
@@ -792,11 +853,11 @@ const TOOL_GROUP_THRESHOLD: usize = 3;
 /// viewport. The individual rows (with their stable `tc-<id>` ids) live
 /// unchanged inside the group, so streaming morphs and per-row
 /// open/close state keep working.
-pub fn render_tool_call_list(tools: &[ToolCall], turn_id: &str) -> Html {
+pub fn render_tool_call_list(tools: &[ToolCall], turn_id: &str, lang: Lang) -> Html {
     if tools.len() <= TOOL_GROUP_THRESHOLD {
         return html! {
             for c in tools.iter() {
-                (render_tool_call(c))
+                (render_tool_call(c, lang))
             }
         }
         .to_html();
@@ -828,13 +889,20 @@ pub fn render_tool_call_list(tools: &[ToolCall], turn_id: &str) -> Html {
         .collect::<Vec<_>>()
         .join(", ");
     let label = if any_running {
-        "Running tools"
+        t(lang, "render-tools-running")
     } else if any_errored {
-        "Tool calls"
+        t(lang, "render-tools-errored")
     } else {
-        "Used tools"
+        t(lang, "render-tools-used")
     };
-    let summary_text = format!("{} calls · {breakdown}", tools.len());
+    let summary_text = t_args(
+        lang,
+        "render-tools-summary",
+        &i18n::args([
+            ("count", tools.len().to_string().into()),
+            ("breakdown", breakdown.into()),
+        ]),
+    );
 
     html! {
         // Collapsed by default (like the thinking block). The reader
@@ -860,7 +928,7 @@ pub fn render_tool_call_list(tools: &[ToolCall], turn_id: &str) -> Html {
             }
             div(class: "tool-calls-group__body flex flex-col") {
                 for c in tools.iter() {
-                    (render_tool_call(c))
+                    (render_tool_call(c, lang))
                 }
             }
         }
@@ -871,20 +939,25 @@ pub fn render_tool_call_list(tools: &[ToolCall], turn_id: &str) -> Html {
 /// One tool-call row. `<details>` so the user can expand to see
 /// input and output. `data-preserve-attr="open"` keeps their
 /// toggle state across re-renders.
-pub fn render_tool_call(call: &ToolCall) -> Html {
+pub fn render_tool_call(call: &ToolCall, lang: Lang) -> Html {
     let dom_id = format!("tc-{}", call.id);
     let args_pretty = match serde_json::from_str::<serde_json::Value>(&call.arguments_json) {
         Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| call.arguments_json.clone()),
         Err(_) => call.arguments_json.clone(),
     };
-    let args_pretty = truncate_for_display(args_pretty);
-    let output_pretty = call.output_json.clone().map(truncate_for_display);
+    let args_pretty = truncate_for_display(args_pretty, lang);
+    let output_pretty = call
+        .output_json
+        .clone()
+        .map(|s| truncate_for_display(s, lang));
     let is_running = call.status == ToolCallStatus::Running;
     let status_label = match call.status {
-        ToolCallStatus::Running => "Calling",
-        ToolCallStatus::Completed => "Used",
-        ToolCallStatus::Errored => "Tool error",
+        ToolCallStatus::Running => t(lang, "render-tool-status-calling"),
+        ToolCallStatus::Completed => t(lang, "render-tool-status-used"),
+        ToolCallStatus::Errored => t(lang, "render-tool-status-error"),
     };
+    let input_label = t(lang, "render-tool-input-label");
+    let output_label = t(lang, "render-tool-output-label");
     let name = call.name.clone();
     html! {
         details(
@@ -907,12 +980,12 @@ pub fn render_tool_call(call: &ToolCall) -> Html {
             }
             div(class: "tool-call__body") {
                 div(class: "tool-call__section") {
-                    div(class: "tool-call__section-label") { "Input" }
+                    div(class: "tool-call__section-label") { (input_label) }
                     pre(class: "tool-call__code") { (args_pretty) }
                 }
                 if let Some(out) = output_pretty.as_ref() {
                     div(class: "tool-call__section") {
-                        div(class: "tool-call__section-label") { "Output" }
+                        div(class: "tool-call__section-label") { (output_label) }
                         pre(class: "tool-call__code") { (out.clone()) }
                     }
                 }
@@ -949,6 +1022,8 @@ pub struct ComposerOpts<'a> {
     /// no `<form>` (the composer itself is a form; nested forms are invalid) —
     /// use button-driven actions instead.
     pub toolbar: Option<Html>,
+    /// UI language for the composer's own labels (attach/record/send/stop).
+    pub lang: Lang,
 }
 
 pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
@@ -959,7 +1034,14 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
         has_voice,
         streaming,
         toolbar,
+        lang,
     } = opts;
+    let attach_aria = t(lang, "render-composer-attach-aria");
+    let attach_title = t(lang, "render-composer-attach-title");
+    let record_aria = t(lang, "render-composer-record-aria");
+    let record_title = t(lang, "render-composer-record-title");
+    let send_label = t(lang, "render-composer-send");
+    let stop_label = t(lang, "render-composer-stop");
     let submit_directive = format!(
         "window.chatComposer.onSubmit(evt) && ($chatStreaming = true, \
          @post('{post_url}', {{contentType: 'form'}}))"
@@ -1029,8 +1111,8 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
                     button(
                         type: "button",
                         "data-on:click": "window.chatComposer.openFilePicker()",
-                        "aria-label": "Attach files",
-                        title: "Attach files (also drop / paste)",
+                        "aria-label": (attach_aria),
+                        title: (attach_title),
                         class: "btn btn-sm btn-circle btn-ghost chat-composer__attach"
                     ) {
                         (icons::paperclip(16))
@@ -1046,8 +1128,8 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
                             button(
                                 type: "button",
                                 "data-on:click": "window.chatMic.toggle(el)",
-                                "aria-label": "Record voice message",
-                                title: "Record",
+                                "aria-label": (record_aria),
+                                title: (record_title),
                                 class: "btn btn-sm btn-circle btn-ghost data-[recording=1]:btn-error"
                             ) {
                                 span(class: "mic-idle") { (icons::mic(16)) }
@@ -1059,8 +1141,8 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
                     button(
                         type: "submit",
                         class: "btn btn-sm btn-circle btn-primary chat-composer__send",
-                        "aria-label": "Send",
-                        title: "Send"
+                        "aria-label": (send_label.clone()),
+                        title: (send_label)
                     ) {
                         (icons::send(16))
                     }
@@ -1068,8 +1150,8 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
                         type: "button",
                         "data-on:click": (cancel_directive),
                         class: "btn btn-sm btn-circle btn-error chat-composer__stop",
-                        "aria-label": "Stop",
-                        title: "Stop"
+                        "aria-label": (stop_label.clone()),
+                        title: (stop_label)
                     ) {
                         (icons::stop(16))
                     }
@@ -1169,10 +1251,11 @@ pub fn render_busy_post_form(opts: BusyPostForm<'_>) -> Html {
     let post_call = format!("@post('{}', {{contentType: 'form'}})", opts.action);
     let directive = match opts.confirm {
         Some(prompt) => {
-            // Single-quote-escape the prompt so it can ride inside
-            // a single-quoted JS string literal.
-            let safe = prompt.replace('\\', "\\\\").replace('\'', "\\'");
-            format!("confirm('{safe}') && {post_call}")
+            // JSON-encode rather than hand-escape — see `action_submit`'s
+            // doc comment for why this is the safe pattern once `prompt`
+            // can carry translated text.
+            let prompt_js = serde_json::to_string(prompt).expect("String always serialises");
+            format!("confirm({prompt_js}) && {post_call}")
         }
         None => post_call,
     };
@@ -1272,6 +1355,7 @@ mod tests {
             has_voice: false,
             streaming,
             toolbar: None,
+            lang: Lang::En,
         })
         .to_string()
     }
@@ -1328,7 +1412,7 @@ mod tests {
             conv_turn(2, TurnRole::User, "q2"),
         ];
         // Compacted up to seq 1 → divider appears before the seq-2 turn.
-        let html = render_conversation(&turns, None, Some("/chat"), Some(1)).to_string();
+        let html = render_conversation(&turns, None, Some("/chat"), Some(1), Lang::En).to_string();
         assert!(
             html.contains("Earlier messages condensed to save context"),
             "divider must render when the session is compacted"
@@ -1341,7 +1425,7 @@ mod tests {
             conv_turn(0, TurnRole::User, "q1"),
             conv_turn(1, TurnRole::Assistant, "a1"),
         ];
-        let html = render_conversation(&turns, None, Some("/chat"), None).to_string();
+        let html = render_conversation(&turns, None, Some("/chat"), None, Lang::En).to_string();
         assert!(
             !html.contains("Earlier messages condensed"),
             "no divider when the session was never compacted"
@@ -1356,7 +1440,7 @@ mod tests {
             conv_turn(4, TurnRole::User, "q3"),
             conv_turn(5, TurnRole::Assistant, "a3"),
         ];
-        let html = render_conversation(&turns, None, Some("/chat"), Some(1)).to_string();
+        let html = render_conversation(&turns, None, Some("/chat"), Some(1), Lang::En).to_string();
         assert!(!html.contains("Earlier messages condensed"));
     }
 
@@ -1379,7 +1463,7 @@ mod tests {
         let calls: Vec<ToolCall> = (0..TOOL_GROUP_THRESHOLD)
             .map(|i| tool_call(&format!("c{i}"), "rag_search", ToolCallStatus::Completed))
             .collect();
-        let html = render_tool_call_list(&calls, "t1").to_string();
+        let html = render_tool_call_list(&calls, "t1", Lang::En).to_string();
         assert!(
             !html.contains("tool-calls-group"),
             "at/below the threshold the rows stay flat: {html}"
@@ -1396,7 +1480,7 @@ mod tests {
         let calls: Vec<ToolCall> = (0..13)
             .map(|i| tool_call(&format!("c{i}"), "rag_search", ToolCallStatus::Completed))
             .collect();
-        let html = render_tool_call_list(&calls, "t1").to_string();
+        let html = render_tool_call_list(&calls, "t1", Lang::En).to_string();
         assert!(
             html.contains("tool-calls-group"),
             "expected a group wrapper"
@@ -1426,7 +1510,7 @@ mod tests {
             tool_call("d", "rag_search", ToolCallStatus::Running),
         ];
         calls[3].status = ToolCallStatus::Running;
-        let html = render_tool_call_list(&calls, "t9").to_string();
+        let html = render_tool_call_list(&calls, "t9", Lang::En).to_string();
         assert!(html.contains("rag_search ×3"), "tally per name: {html}");
         assert!(html.contains("fetch_url"), "all names listed: {html}");
         assert!(
@@ -1438,13 +1522,13 @@ mod tests {
     #[test]
     fn truncate_for_display_passes_through_small_payloads() {
         let small = "x".repeat(128);
-        assert_eq!(truncate_for_display(small.clone()), small);
+        assert_eq!(truncate_for_display(small.clone(), Lang::En), small);
     }
 
     #[test]
     fn truncate_for_display_caps_oversized_payloads_with_footer() {
         let huge = "x".repeat(TOOL_CALL_RENDER_CAP * 4);
-        let out = truncate_for_display(huge.clone());
+        let out = truncate_for_display(huge.clone(), Lang::En);
         assert!(
             out.len() < huge.len() / 2,
             "expected significant truncation"
@@ -1466,7 +1550,7 @@ mod tests {
         // chars so a naive byte-slice would corrupt the last char.
         let prefix = "x".repeat(TOOL_CALL_RENDER_CAP - 1);
         let payload = format!("{prefix}\u{1F600}\u{1F600}");
-        let out = truncate_for_display(payload);
+        let out = truncate_for_display(payload, Lang::En);
         // If we sliced mid-codepoint, this would panic.
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
@@ -1624,7 +1708,7 @@ mod tests {
             link: None,
         };
         // Owner matches → normal chip with a working download link.
-        let ok = render_attachment(&pdf, "turn-A").to_string();
+        let ok = render_attachment(&pdf, "turn-A", Lang::En).to_string();
         assert!(
             ok.contains("/chat/attachment/turn-A/letter.pdf"),
             "expected the real download link: {ok}"
@@ -1634,7 +1718,7 @@ mod tests {
             "should not be a placeholder: {ok}"
         );
         // Owner differs (orphaned marker) → muted placeholder, no dead link.
-        let orphan = render_attachment(&pdf, "turn-B").to_string();
+        let orphan = render_attachment(&pdf, "turn-B", Lang::En).to_string();
         assert!(
             orphan.contains("unavailable"),
             "expected the unavailable placeholder: {orphan}"
@@ -1655,7 +1739,7 @@ mod tests {
             size: 1000,
             link: None,
         };
-        let orphan_img = render_attachment(&png, "turn-B").to_string();
+        let orphan_img = render_attachment(&png, "turn-B", Lang::En).to_string();
         assert!(
             !orphan_img.contains("<img"),
             "an orphaned image must not emit a broken <img>: {orphan_img}"

@@ -17,6 +17,8 @@ use rama::http::service::web::response::IntoResponse;
 use rama::http::{Body, HeaderMap, HeaderValue, Request, Response, StatusCode, header};
 
 use crate::assets;
+use crate::i18n::{Lang, set_lang_header, t};
+use crate::icons;
 
 // ---------------------------------------------------------------------------
 // Theme.
@@ -73,17 +75,19 @@ pub fn theme_toggle_icon(current: Theme) -> Html {
     }
 }
 
-pub fn theme_toggle_aria(current: Theme) -> &'static str {
+pub fn theme_toggle_aria(current: Theme, lang: Lang) -> String {
     match current {
-        Theme::Dark => "Switch to light theme",
-        Theme::Light => "Switch to dark theme",
+        Theme::Dark => t(lang, "chrome-theme-toggle-aria-to-light"),
+        Theme::Light => t(lang, "chrome-theme-toggle-aria-to-dark"),
     }
 }
 
 /// The theme-toggle form — used for the initial sidebar render *and*
 /// as the `mode outer` SSE patch payload after a flip, so the two
 /// can't drift.
-pub fn render_theme_toggle_form(theme: Theme) -> Html {
+pub fn render_theme_toggle_form(theme: Theme, lang: Lang) -> Html {
+    let title = t(lang, "chrome-theme-toggle-title");
+    let aria = theme_toggle_aria(theme, lang);
     html! {
         form(
             id: "theme-toggle-form",
@@ -95,8 +99,8 @@ pub fn render_theme_toggle_form(theme: Theme) -> Html {
             button(
                 type: "submit",
                 class: "btn btn-ghost btn-square btn-sm",
-                title: "Toggle theme",
-                "aria-label": (theme_toggle_aria(theme))
+                title: (title),
+                "aria-label": (aria)
             ) {
                 (theme_toggle_icon(theme))
             }
@@ -111,6 +115,7 @@ pub fn render_theme_toggle_form(theme: Theme) -> Html {
 /// this on the same path.
 pub async fn theme_toggle(req: Request) -> Response {
     let current = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let next = current.flip();
     let next_str = next.as_str();
     let script = format!(
@@ -118,13 +123,162 @@ pub async fn theme_toggle(req: Request) -> Response {
             h.setAttribute('data-theme', '{next_str}'); \
             h.className = '{next_str}'; }}"
     );
-    let form_html = render_theme_toggle_form(next).to_string();
+    let form_html = render_theme_toggle_form(next, lang).to_string();
     let mut resp = sse_response(&[
         sse_patch(Some("#theme-toggle-form"), Some("outer"), &form_html),
         sse_script(&script),
     ]);
     resp.headers_mut()
         .append(header::SET_COOKIE, set_theme_header(next));
+    resp
+}
+
+// ---------------------------------------------------------------------------
+// Language switcher.
+
+/// Which way the language dropdown opens relative to its trigger button —
+/// `Down` for a switcher anchored near the top of the viewport (the login
+/// page), `Up` for one anchored near the bottom (the app sidebar's user
+/// row), same reasoning as the composer's `effort-panel`/`cap-panel`
+/// (bottom-anchored triggers open upward so the panel doesn't run off
+/// the bottom of the screen).
+#[derive(Copy, Clone)]
+pub enum LangPanelAnchor {
+    Up,
+    Down,
+}
+
+/// The flag shown on the switcher trigger + each dropdown row. Emoji
+/// flags render in colour with no image assets or CSS. Not a strict
+/// country<->language mapping (English isn't tied to one nation) — just
+/// the conventional shorthand every language-switcher UI uses.
+fn lang_flag(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "🇬🇧",
+        Lang::De => "🇩🇪",
+        Lang::Fr => "🇫🇷",
+        Lang::Es => "🇪🇸",
+        Lang::Ru => "🇷🇺",
+        Lang::Zh => "🇨🇳",
+    }
+}
+
+/// The language switcher — a flag-icon trigger button that opens a
+/// hand-rolled popover listing all 6 languages as flag + name rows,
+/// same pattern as the chat page's tools/effort/export popovers
+/// (`data-signals` + `data-show` + `click__outside` dismissal; native
+/// `<details class="dropdown">` was dropped project-wide because its
+/// positioning/card styles don't survive the Tailwind purge on mobile).
+/// Each row is its own plain `<form method="post" action="/lang">` —
+/// unlike the popovers above, submitting one is a real page reload, not
+/// an SSE patch (see `lang_set`), so this degrades to a working,
+/// if-unstyled, list of buttons even if the popover-toggle JS didn't
+/// load. `next` is the current page's path, carried as a hidden field
+/// so the redirect lands back where the user was.
+pub fn render_lang_switcher_form(lang: Lang, next: &str, anchor: LangPanelAnchor) -> Html {
+    let aria = t(lang, "chrome-lang-switcher-aria");
+    let panel_class = match anchor {
+        LangPanelAnchor::Up => {
+            "lang-panel lang-panel--up rounded-box border border-base-300 bg-base-100 shadow"
+        }
+        LangPanelAnchor::Down => {
+            "lang-panel lang-panel--down rounded-box border border-base-300 bg-base-100 shadow"
+        }
+    };
+    html! {
+        div(
+            id: "lang-switcher",
+            "data-signals": "{langMenu: false}",
+            "data-on:click__outside": "$langMenu = false",
+            style: "position:relative"
+        ) {
+            button(
+                type: "button",
+                "data-on:click": "$langMenu = !$langMenu",
+                class: "btn btn-ghost btn-square btn-sm",
+                title: (aria.clone()),
+                "aria-label": (aria)
+            ) {
+                span(class: "text-base leading-none", "aria-hidden": "true") { (lang_flag(lang)) }
+            }
+            div(
+                class: (panel_class),
+                "data-show": "$langMenu",
+                "data-on:click": "$langMenu = false",
+                style: "display:none"
+            ) {
+                for candidate in Lang::ALL {
+                    (render_lang_option(candidate, lang, next))
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// One flag + name row in the language dropdown. A real `<form>` (not a
+/// datastar `@post`) so selecting a language works even without JS —
+/// only the panel's open/close toggle needs it.
+fn render_lang_option(candidate: Lang, current: Lang, next: &str) -> Html {
+    let is_current = candidate == current;
+    let row_class = if is_current {
+        "chat-pop-item chat-pop-item--active"
+    } else {
+        "chat-pop-item"
+    };
+    let next = next.to_string();
+    html! {
+        form(method: "post", action: "/lang", class: "m-0") {
+            input(type: "hidden", name: "lang", value: (candidate.code()));
+            input(type: "hidden", name: "next", value: (next));
+            button(type: "submit", class: (row_class)) {
+                span(class: "chat-pop-item__check") { (icons::check(14)) }
+                span("aria-hidden": "true") { (lang_flag(candidate)) }
+                span { (candidate.label()) }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// A same-origin, absolute path — starts with exactly one `/` (not
+/// `//`, which some URL parsers treat as protocol-relative to another
+/// host, and not `/\`, an old browser normalisation quirk) with no
+/// scheme. Mirrors `oidc_handlers::is_safe_return_to`; duplicated
+/// rather than shared because that lives in the `gateway` crate, which
+/// depends on `session-core`, not the other way around.
+fn is_safe_redirect_target(path: &str) -> bool {
+    let path = path.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    path.starts_with('/') && !path.starts_with("//") && !path.starts_with("/\\")
+}
+
+/// Handler: POST /lang. Sets the `lang` cookie from the submitted
+/// `lang` form field and 303-redirects to `next` (falling back to `/`
+/// if `next` is absent or not a safe same-origin path). Reachable
+/// without a session — the switcher is rendered on `/login` too.
+pub async fn lang_set(req: Request) -> Response {
+    #[derive(serde::Deserialize)]
+    struct LangForm {
+        lang: String,
+        next: Option<String>,
+    }
+    let (_, body) = req.into_parts();
+    let Ok(bytes) = read_body_to_bytes(body).await else {
+        return see_other("/");
+    };
+    let Ok(form) = serde_urlencoded::from_bytes::<LangForm>(&bytes) else {
+        return see_other("/");
+    };
+    let Some(lang) = Lang::from_code(&form.lang) else {
+        return see_other("/");
+    };
+    let target = form
+        .next
+        .filter(|n| is_safe_redirect_target(n))
+        .unwrap_or_else(|| "/".to_string());
+    let mut resp = see_other(&target);
+    resp.headers_mut()
+        .append(header::SET_COOKIE, set_lang_header(lang));
     resp
 }
 
@@ -274,6 +428,29 @@ pub async fn nav_sections_toggle(Path(section): Path<String>, req: Request) -> R
     resp.headers_mut()
         .append(header::SET_COOKIE, set_nav_sections_header(sections));
     resp
+}
+
+// ---------------------------------------------------------------------------
+// HTML escaping.
+
+/// Escape the five HTML-significant characters (`& < > " '`) so a string
+/// can be spliced into markup as inert text. Shared by every hand-built
+/// HTML fragment that isn't going through plait's auto-escaping (e.g. the
+/// gateway's OIDC form fields and the DB layer's search-snippet
+/// highlighter) so the escape set can't drift between copies.
+pub fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -494,12 +671,17 @@ pub fn html_response(body: String) -> Response {
 /// Minimal `<html>` chrome — daisyUI stylesheet + datastar runtime +
 /// a slot for `body`. No sidebar; used by the login/error pages and
 /// anything else that doesn't sit inside the authed app shell.
-pub fn layout(theme: Theme, title: &str, body: Html) -> String {
+///
+/// `next` is the path the language switcher should redirect back to
+/// after a change (see `render_lang_switcher_form`) — typically the
+/// same path this page was requested at.
+pub fn layout(theme: Theme, lang: Lang, next: &str, title: &str, body: Html) -> String {
     let theme_str = theme.as_str();
     let css_href = assets::app_css_url();
     let datastar_src = assets::datastar_js_url();
+    let lang_code = lang.code();
     let frag = html! {
-        html(lang: "en", "data-theme": (theme_str), class: (theme_str)) {
+        html(lang: (lang_code), "data-theme": (theme_str), class: (theme_str)) {
             head {
                 meta(charset: "utf-8");
                 meta(name: "viewport", content: "width=device-width, initial-scale=1");
@@ -508,6 +690,9 @@ pub fn layout(theme: Theme, title: &str, body: Html) -> String {
                 script(type: "module", src: (datastar_src)) {}
             }
             body(class: "min-h-dvh bg-base-100 text-base-content") {
+                div(class: "absolute top-3 right-3") {
+                    (render_lang_switcher_form(lang, next, LangPanelAnchor::Down))
+                }
                 (body)
                 (toast_container())
             }
@@ -517,6 +702,6 @@ pub fn layout(theme: Theme, title: &str, body: Html) -> String {
 }
 
 /// `html_response(layout(...))`.
-pub fn html_page(theme: Theme, title: &str, body: Html) -> Response {
-    html_response(layout(theme, title, body))
+pub fn html_page(theme: Theme, lang: Lang, next: &str, title: &str, body: Html) -> Response {
+    html_response(layout(theme, lang, next, title, body))
 }

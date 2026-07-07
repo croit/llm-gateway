@@ -25,6 +25,7 @@ use session_core::chrome::{
     Flash, FlashKind, NavSections, Theme, is_datastar_request, read_body_to_bytes, sse_response,
     sse_toast,
 };
+use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use crate::rama_server::state::RamaState;
@@ -38,6 +39,7 @@ use crate::server::upstreams::PoolKind;
 /// scratch).
 pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
@@ -85,14 +87,16 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         });
     }
 
-    let body = render_models_body(&rows);
+    let body = render_models_body(lang, &rows);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
+    let title = t(lang, "admin-page-title");
     nav_or_html_page(
         datastar,
         theme,
+        lang,
         nav,
         NavItem::Admin,
-        "Model defaults — LLM Gateway",
+        &title,
         &user.email,
         is_admin(&state, &user),
         session.impersonator_id.is_some(),
@@ -108,6 +112,7 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
 /// case-sensitive HuggingFace IDs) and the `defaults_toml`. An
 /// empty `defaults_toml` clears the stored row.
 pub async fn models_save(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
@@ -119,34 +124,70 @@ pub async fn models_save(State(state): State<Arc<RamaState>>, req: Request) -> R
     let form: SaveForm = match serde_urlencoded::from_bytes(&body) {
         Ok(f) => f,
         Err(err) => {
-            return toast(FlashKind::Error, format!("malformed form: {err}"));
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-malformed-form",
+                    &i18n::args([("err", err.to_string().into())]),
+                ),
+            );
         }
     };
     if form.model_name.is_empty() {
-        return toast(FlashKind::Error, "missing model_name field");
+        return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
     }
     let trimmed = form.defaults_toml.trim();
     if trimmed.is_empty() {
         if let Err(err) = db::delete(&state.db, &form.model_name).await {
-            return toast(FlashKind::Error, format!("db delete: {err}"));
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-db-delete-error",
+                    &i18n::args([("err", err.to_string().into())]),
+                ),
+            );
         }
         return toast(
             FlashKind::Success,
-            format!("cleared defaults for `{}`", form.model_name),
+            t_args(
+                lang,
+                "admin-cleared-defaults",
+                &i18n::args([("model", form.model_name.clone().into())]),
+            ),
         );
     }
     // Parse before persisting so we never store TOML that
     // `apply_defaults` would later reject — keeps the round-trip
     // honest (whatever you save is exactly what the merge will use).
     if let Err(err) = merge::parse_defaults(&form.defaults_toml) {
-        return toast(FlashKind::Error, format!("invalid TOML: {err}"));
+        return toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-invalid-toml",
+                &i18n::args([("err", err.to_string().into())]),
+            ),
+        );
     }
     if let Err(err) = db::upsert(&state.db, &form.model_name, &form.defaults_toml).await {
-        return toast(FlashKind::Error, format!("db upsert: {err}"));
+        return toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-db-upsert-error",
+                &i18n::args([("err", err.to_string().into())]),
+            ),
+        );
     }
     toast(
         FlashKind::Success,
-        format!("saved defaults for `{}`", form.model_name),
+        t_args(
+            lang,
+            "admin-saved-defaults",
+            &i18n::args([("model", form.model_name.clone().into())]),
+        ),
     )
 }
 
@@ -156,6 +197,7 @@ pub async fn models_save(State(state): State<Arc<RamaState>>, req: Request) -> R
 /// reset the reasoning style, and vice versa. An empty / "auto" value clears
 /// the explicit choice and falls back to name-based auto-detection.
 pub async fn models_reasoning_save(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
@@ -166,10 +208,19 @@ pub async fn models_reasoning_save(State(state): State<Arc<RamaState>>, req: Req
     };
     let form: ReasoningForm = match serde_urlencoded::from_bytes(&body) {
         Ok(f) => f,
-        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+        Err(err) => {
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-malformed-form",
+                    &i18n::args([("err", err.to_string().into())]),
+                ),
+            );
+        }
     };
     if form.model_name.is_empty() {
-        return toast(FlashKind::Error, "missing model_name field");
+        return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
     }
     // Empty / "auto" → clear the explicit choice (NULL), otherwise store the
     // canonical value. Validate against the known styles so a bad submission
@@ -180,16 +231,31 @@ pub async fn models_reasoning_save(State(state): State<Arc<RamaState>>, req: Req
         other => {
             return toast(
                 FlashKind::Error,
-                format!("unknown reasoning style `{other}`"),
+                t_args(
+                    lang,
+                    "admin-unknown-reasoning-style",
+                    &i18n::args([("style", other.to_string().into())]),
+                ),
             );
         }
     };
     if let Err(err) = db::set_reasoning_style(&state.db, &form.model_name, style).await {
-        return toast(FlashKind::Error, format!("db: {err}"));
+        return toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-db-error",
+                &i18n::args([("err", err.to_string().into())]),
+            ),
+        );
     }
     toast(
         FlashKind::Success,
-        format!("saved reasoning style for `{}`", form.model_name),
+        t_args(
+            lang,
+            "admin-saved-reasoning-style",
+            &i18n::args([("model", form.model_name.clone().into())]),
+        ),
     )
 }
 
@@ -202,6 +268,7 @@ pub async fn models_reasoning_budget_save(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
@@ -212,10 +279,19 @@ pub async fn models_reasoning_budget_save(
     };
     let form: ReasoningBudgetForm = match serde_urlencoded::from_bytes(&body) {
         Ok(f) => f,
-        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+        Err(err) => {
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-malformed-form",
+                    &i18n::args([("err", err.to_string().into())]),
+                ),
+            );
+        }
     };
     if form.model_name.is_empty() {
-        return toast(FlashKind::Error, "missing model_name field");
+        return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
     }
     // Parse + validate each field; an empty string clears the level.
     let budget = |s: &str| -> Result<Option<i64>, String> {
@@ -225,7 +301,11 @@ pub async fn models_reasoning_budget_save(
         }
         match s.parse::<i64>() {
             Ok(n) if n >= 1 => Ok(Some(n)),
-            _ => Err(format!("budget `{s}` must be a positive integer")),
+            _ => Err(t_args(
+                lang,
+                "admin-budget-not-positive",
+                &i18n::args([("value", s.to_string().into())]),
+            )),
         }
     };
     let effort = |s: &str| -> Result<Option<String>, String> {
@@ -241,7 +321,11 @@ pub async fn models_reasoning_budget_save(
         {
             Ok(Some(s.to_string()))
         } else {
-            Err(format!("unknown reasoning effort `{s}`"))
+            Err(t_args(
+                lang,
+                "admin-unknown-reasoning-effort",
+                &i18n::args([("value", s.to_string().into())]),
+            ))
         }
     };
     let build = || -> Result<db::ReasoningOverrideCols, String> {
@@ -259,11 +343,22 @@ pub async fn models_reasoning_budget_save(
         Err(e) => return toast(FlashKind::Error, e),
     };
     if let Err(err) = db::set_reasoning_overrides(&state.db, &form.model_name, &cols).await {
-        return toast(FlashKind::Error, format!("db: {err}"));
+        return toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-db-error",
+                &i18n::args([("err", err.to_string().into())]),
+            ),
+        );
     }
     toast(
         FlashKind::Success,
-        format!("saved reasoning budget for `{}`", form.model_name),
+        t_args(
+            lang,
+            "admin-saved-reasoning-budget",
+            &i18n::args([("model", form.model_name.clone().into())]),
+        ),
     )
 }
 
@@ -275,6 +370,7 @@ pub async fn models_context_window_save(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
@@ -285,10 +381,19 @@ pub async fn models_context_window_save(
     };
     let form: ContextWindowForm = match serde_urlencoded::from_bytes(&body) {
         Ok(f) => f,
-        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+        Err(err) => {
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-malformed-form",
+                    &i18n::args([("err", err.to_string().into())]),
+                ),
+            );
+        }
     };
     if form.model_name.is_empty() {
-        return toast(FlashKind::Error, "missing model_name field");
+        return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
     }
     let window = match form.context_window.trim() {
         "" => None,
@@ -297,21 +402,38 @@ pub async fn models_context_window_save(
             _ => {
                 return toast(
                     FlashKind::Error,
-                    format!("context window `{s}` must be a positive integer"),
+                    t_args(
+                        lang,
+                        "admin-context-window-invalid",
+                        &i18n::args([("value", s.to_string().into())]),
+                    ),
                 );
             }
         },
     };
     if let Err(err) = db::set_context_window(&state.db, &form.model_name, window).await {
-        return toast(FlashKind::Error, format!("db: {err}"));
+        return toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-db-upsert-error",
+                &i18n::args([("err", err.to_string().into())]),
+            ),
+        );
     }
-    toast(
-        FlashKind::Success,
-        match window {
-            Some(n) => format!("set context window {n} for `{}`", form.model_name),
-            None => format!("cleared context window for `{}`", form.model_name),
-        },
-    )
+    let msg = match window {
+        Some(_) => t_args(
+            lang,
+            "admin-context-window-saved",
+            &i18n::args([("model", form.model_name.clone().into())]),
+        ),
+        None => t_args(
+            lang,
+            "admin-context-window-cleared",
+            &i18n::args([("model", form.model_name.clone().into())]),
+        ),
+    };
+    toast(FlashKind::Success, msg)
 }
 
 #[derive(serde::Deserialize)]
@@ -373,29 +495,31 @@ struct ModelRow {
     context_window: Option<i64>,
 }
 
-fn render_models_body(rows: &[ModelRow]) -> Html {
-    let cards: Vec<Html> = rows.iter().map(render_model_card).collect();
+fn render_models_body(lang: Lang, rows: &[ModelRow]) -> Html {
+    let cards: Vec<Html> = rows
+        .iter()
+        .map(|row| render_model_card(lang, row))
+        .collect();
     html! {
         section(class: "max-w-5xl mx-auto p-4 sm:p-6 flex flex-col gap-4") {
             header(class: "flex flex-col gap-1") {
-                h1(class: "text-2xl font-bold") { "Model defaults" }
+                h1(class: "text-2xl font-bold") { (t(lang, "admin-heading")) }
                 p(class: "text-base-content/70 text-sm") {
-                    "Server-wide default sampling parameters for this model, in TOML. These \
-                     apply to "
-                    strong { "every" }
-                    " request for this model, from any user or token — unless the caller sets \
-                     the same key in their own request, which "
-                    strong { "always wins" }
-                    ". Think of it as the floor everyone gets when they don't specify their own \
-                     values. Empty = no defaults, the backend's built-in behaviour applies."
+                    (t(lang, "admin-intro-prefix"))
+                    " "
+                    strong { (t(lang, "admin-intro-every")) }
+                    " "
+                    (t(lang, "admin-intro-middle"))
+                    " "
+                    strong { (t(lang, "admin-intro-always-wins")) }
+                    (t(lang, "admin-intro-suffix"))
                 }
             }
             if rows.is_empty() {
                 div(class: "alert") {
                     (icons::info(18))
                     span {
-                        "No chat models advertised yet. Once an upstream backend is reachable, \
-                         it'll appear here."
+                        (t(lang, "admin-no-models"))
                     }
                 }
             } else {
@@ -410,29 +534,32 @@ fn render_models_body(rows: &[ModelRow]) -> Html {
     .to_html()
 }
 
-fn render_model_card(row: &ModelRow) -> Html {
+fn render_model_card(lang: Lang, row: &ModelRow) -> Html {
     let action = "/admin/models";
-    let placeholder = "# Common keys (vLLM/OpenAI):\n\
-                       # temperature      = 0.7\n\
-                       # top_p            = 0.95\n\
-                       # top_k            = 40\n\
-                       # min_p            = 0.05\n\
-                       # repeat_penalty   = 1.1\n\
-                       # frequency_penalty= 0.0\n\
-                       # presence_penalty = 0.0\n\
-                       # max_tokens       = 2048\n\
-                       # stop             = [\"<|im_end|>\"]\n";
+    let placeholder = format!(
+        "{}\n\
+         # temperature      = 0.7\n\
+         # top_p            = 0.95\n\
+         # top_k            = 40\n\
+         # min_p            = 0.05\n\
+         # repeat_penalty   = 1.1\n\
+         # frequency_penalty= 0.0\n\
+         # presence_penalty = 0.0\n\
+         # max_tokens       = 2048\n\
+         # stop             = [\"<|im_end|>\"]\n",
+        t(lang, "admin-toml-placeholder-header")
+    );
     html! {
         article(class: "card border border-base-300 bg-base-100") {
             div(class: "card-body gap-3") {
                 header(class: "flex items-center justify-between gap-3 flex-wrap") {
                     h2(class: "card-title text-base font-mono break-all") { (row.name.clone()) }
                     div(class: "flex items-center gap-2 flex-wrap") {
-                        (render_context_window(row))
-                        (render_reasoning_select(row))
+                        (render_context_window(lang, row))
+                        (render_reasoning_select(lang, row))
                     }
                 }
-                (render_reasoning_budget(row))
+                (render_reasoning_budget(lang, row))
                 form(
                     method: "post",
                     action: (action),
@@ -442,7 +569,7 @@ fn render_model_card(row: &ModelRow) -> Html {
                 ) {
                     input(type: "hidden", name: "model_name", value: (row.name.clone()));
                     label(class: "label sr-only", "for": (format!("toml-{}", row.name))) {
-                        "TOML defaults"
+                        (t(lang, "admin-toml-defaults-label"))
                     }
                     textarea(
                         id: (format!("toml-{}", row.name)),
@@ -455,7 +582,7 @@ fn render_model_card(row: &ModelRow) -> Html {
                     div(class: "flex justify-end") {
                         button(type: "submit", class: "btn btn-primary btn-sm") {
                             (icons::check(14))
-                            span { "Save" }
+                            span { (t(lang, "admin-save")) }
                         }
                     }
                 }
@@ -469,24 +596,28 @@ fn render_model_card(row: &ModelRow) -> Html {
 /// change. Drives the auto-compaction trigger (compaction fires once a session's
 /// replayed prompt reaches `[chat.compaction] trigger_ratio` of this window).
 /// Blank falls back to the global `default_context_window`.
-fn render_context_window(row: &ModelRow) -> Html {
+fn render_context_window(lang: Lang, row: &ModelRow) -> Html {
     let action = "/admin/models/context-window";
     let value = row
         .context_window
         .map(|n| n.to_string())
         .unwrap_or_default();
+    let label_text = t(lang, "admin-context-window-label");
+    let unit_text = t(lang, "admin-context-window-unit");
+    let placeholder = t(lang, "admin-context-window-placeholder");
+    let aria = t(lang, "admin-context-window-aria");
     html! {
         form(method: "post", action: (action), class: "m-0") {
             input(type: "hidden", name: "model_name", value: (row.name.clone()));
             label(class: "input input-bordered input-xs flex items-center gap-1") {
-                span(class: "text-xs opacity-70") { "Context" }
+                span(class: "text-xs opacity-70") { (label_text) }
                 input(
                     type: "number", name: "context_window", value: (value), min: "1",
-                    placeholder: "default", "aria-label": "Context window (tokens)",
+                    placeholder: (placeholder), "aria-label": (aria),
                     "data-on:change": (format!("@post('{action}', {{contentType: 'form'}})")),
                     class: "w-24"
                 );
-                span(class: "text-xs opacity-70") { "tok" }
+                span(class: "text-xs opacity-70") { (unit_text) }
             }
         }
     }
@@ -496,24 +627,25 @@ fn render_context_window(row: &ModelRow) -> Html {
 /// The per-model "reasoning style" picker: a tiny form whose `<select>`
 /// auto-saves on change. Tells `apply_effort` how this model expects its
 /// reasoning budget on the wire; "Auto" leaves it to name detection.
-fn render_reasoning_select(row: &ModelRow) -> Html {
+fn render_reasoning_select(lang: Lang, row: &ModelRow) -> Html {
     let action = "/admin/models/reasoning";
     let options: &[(&str, &str)] = &[
-        ("", "Reasoning: Auto"),
-        ("none", "Reasoning: none"),
-        ("qwen", "Reasoning: Qwen (vLLM)"),
-        ("openai", "Reasoning: OpenAI"),
-        ("glm", "Reasoning: GLM / z.AI"),
-        ("anthropic", "Reasoning: Anthropic"),
+        ("", "admin-reasoning-auto"),
+        ("none", "admin-reasoning-none"),
+        ("qwen", "admin-reasoning-qwen"),
+        ("openai", "admin-reasoning-openai"),
+        ("glm", "admin-reasoning-glm"),
+        ("anthropic", "admin-reasoning-anthropic"),
     ];
     let current = row.reasoning_style.as_str();
     let option_html: Vec<Html> = options
         .iter()
-        .map(|(value, label)| {
+        .map(|(value, key)| {
+            let label = t(lang, key);
             if *value == current {
-                html! { option(value: (*value), selected: "selected") { (*label) } }.to_html()
+                html! { option(value: (*value), selected: "selected") { (label) } }.to_html()
             } else {
-                html! { option(value: (*value)) { (*label) } }.to_html()
+                html! { option(value: (*value)) { (label) } }.to_html()
             }
         })
         .collect();
@@ -526,7 +658,7 @@ fn render_reasoning_select(row: &ModelRow) -> Html {
             input(type: "hidden", name: "model_name", value: (row.name.clone()));
             select(
                 name: "reasoning_style",
-                "aria-label": "Reasoning style",
+                "aria-label": (t(lang, "admin-reasoning-style-aria")),
                 "data-on:change": (format!("@post('{action}', {{contentType: 'form'}})")),
                 class: "select select-bordered select-xs"
             ) {
@@ -545,21 +677,21 @@ fn render_reasoning_select(row: &ModelRow) -> Html {
 /// render nothing. The effective style is resolved the same way the request path
 /// does (explicit choice, else name detection), so the right controls appear
 /// even when the style is left on "Auto".
-fn render_reasoning_budget(row: &ModelRow) -> Html {
+fn render_reasoning_budget(lang: Lang, row: &ModelRow) -> Html {
     use crate::server::reasoning::ReasoningStyle;
     let explicit = (!row.reasoning_style.is_empty()).then_some(row.reasoning_style.as_str());
     let style = ReasoningStyle::resolve(explicit, &row.name);
     let action = "/admin/models/reasoning-budget";
 
     let (controls, hint) = if style.uses_token_budget() {
-        let num = |name: &str, label: &str, val: &Option<i64>| {
+        let num = |name: &str, label_key: &str, val: &Option<i64>| {
             let v = val.map(|n| n.to_string()).unwrap_or_default();
             html! {
                 label(class: "form-control") {
-                    span(class: "label-text text-xs") { (label) }
+                    span(class: "label-text text-xs") { (t(lang, label_key)) }
                     input(
                         type: "number", name: (name), value: (v), min: "1",
-                        placeholder: "default",
+                        placeholder: (t(lang, "admin-budget-placeholder")),
                         class: "input input-bordered input-xs w-28"
                     );
                 }
@@ -567,24 +699,21 @@ fn render_reasoning_budget(row: &ModelRow) -> Html {
             .to_html()
         };
         let controls = html! {
-            (num("budget_standard", "Standard", &row.budget_standard))
-            (num("budget_deep", "Deep", &row.budget_deep))
-            (num("budget_max", "Max", &row.budget_max))
+            (num("budget_standard", "admin-effort-standard", &row.budget_standard))
+            (num("budget_deep", "admin-effort-deep", &row.budget_deep))
+            (num("budget_max", "admin-effort-max", &row.budget_max))
         }
         .to_html();
-        (
-            controls,
-            "Max thinking tokens per effort level. Blank = backend default \
-             (uncapped). Fast disables thinking.",
-        )
+        (controls, t(lang, "admin-budget-hint"))
     } else if style.uses_effort_level() {
         let levels = style.effort_levels();
-        let sel = |name: &str, label: &str, current: &str| {
+        let sel = |name: &str, label_key: &str, current: &str| {
             let mut opts: Vec<Html> = Vec::new();
+            let default_label = t(lang, "admin-effort-default-option");
             opts.push(if current.is_empty() {
-                html! { option(value: "", selected: "selected") { "(default)" } }.to_html()
+                html! { option(value: "", selected: "selected") { (default_label) } }.to_html()
             } else {
-                html! { option(value: "") { "(default)" } }.to_html()
+                html! { option(value: "") { (default_label) } }.to_html()
             });
             for lvl in levels {
                 opts.push(if *lvl == current {
@@ -595,7 +724,7 @@ fn render_reasoning_budget(row: &ModelRow) -> Html {
             }
             html! {
                 label(class: "form-control") {
-                    span(class: "label-text text-xs") { (label) }
+                    span(class: "label-text text-xs") { (t(lang, label_key)) }
                     select(name: (name), class: "select select-bordered select-xs") {
                         for o in opts.iter() { (o.clone()) }
                     }
@@ -604,15 +733,12 @@ fn render_reasoning_budget(row: &ModelRow) -> Html {
             .to_html()
         };
         let controls = html! {
-            (sel("effort_standard", "Standard", &row.effort_standard))
-            (sel("effort_deep", "Deep", &row.effort_deep))
-            (sel("effort_max", "Max", &row.effort_max))
+            (sel("effort_standard", "admin-effort-standard", &row.effort_standard))
+            (sel("effort_deep", "admin-effort-deep", &row.effort_deep))
+            (sel("effort_max", "admin-effort-max", &row.effort_max))
         }
         .to_html();
-        (
-            controls,
-            "Reasoning effort per level. Blank = built-in default. Fast disables thinking.",
-        )
+        (controls, t(lang, "admin-effort-hint"))
     } else {
         // No reasoning support → no controls.
         return html! { (String::new()) }.to_html();
@@ -632,7 +758,7 @@ fn render_reasoning_budget(row: &ModelRow) -> Html {
                 (controls)
                 button(type: "submit", class: "btn btn-ghost btn-xs ml-auto self-end") {
                     (icons::check(12))
-                    span { "Save reasoning budget" }
+                    span { (t(lang, "admin-save-reasoning-budget")) }
                 }
             }
         }
