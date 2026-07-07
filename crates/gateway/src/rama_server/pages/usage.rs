@@ -5,9 +5,9 @@
 //!
 //! `/usage` — every signed-in user's own usage (scoped to their `user_id`),
 //! gated by [`super::require_session_or_redirect`]. Admins additionally get an
-//! in-page "All users" toggle that switches the same renderer to an all-users
-//! + per-backend breakdown (gated on the `admin` role); there is no separate
-//! `/admin/usage` route.
+//! in-page "All users" toggle that switches the same renderer to an
+//! all-users + per-backend breakdown (gated on the `admin` role); there is
+//! no separate `/admin/usage` route.
 //!
 //! A period (today … last month) + optional source/backend filters drive a
 //! server-side aggregation (`server::db::usage`). The filter bar is a plain
