@@ -37,6 +37,7 @@ use tokio::sync::broadcast;
 
 use crate::chrome::{sse_patch, sse_signals};
 use crate::db::{self, Pool};
+use crate::i18n::Lang;
 use crate::render;
 use crate::workers::{SessionWorkers, TurnUpdate};
 
@@ -115,6 +116,7 @@ pub async fn emit_current_state(
     assistant_turn_id: &str,
     tx: &mut SseTx,
     actions: Option<&str>,
+    lang: Lang,
 ) -> Result<(), ()> {
     use rama::futures::sink::SinkExt;
 
@@ -131,7 +133,7 @@ pub async fn emit_current_state(
         return Err(());
     };
     let selector = format!("#turn-{assistant_turn_id}");
-    let html = render::render_assistant_turn(&turn_with_tools, actions).to_string();
+    let html = render::render_assistant_turn(&turn_with_tools, actions, lang).to_string();
     let patch = sse_patch(Some(&selector), Some("outer"), &html);
     tx.send(Ok(patch)).await.map_err(|_| ())
 }
@@ -149,6 +151,7 @@ pub async fn emit_current_state(
 ///      close.
 ///   4. `Lagged` (slow subscriber dropped some Ticks) → catch up by
 ///      re-reading the DB; its state subsumes anything missed.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_session_stream_response(
     pool: Pool,
     session_id: String,
@@ -157,6 +160,7 @@ pub fn spawn_session_stream_response(
     initial_patch: Option<rama::bytes::Bytes>,
     on_sidebar_changed: SidebarEmitter,
     actions: Option<String>,
+    lang: Lang,
 ) -> Response {
     let (mut tx, rx) =
         rama::futures::channel::mpsc::unbounded::<Result<rama::bytes::Bytes, std::io::Error>>();
@@ -172,14 +176,29 @@ pub fn spawn_session_stream_response(
         }
         // Render the empty skeleton (or the just-finalized turn for
         // a fresh tail subscriber) before waiting on the broadcast.
-        let _ = emit_current_state(&pool, &session_id, &assistant_turn_id, &mut tx, actions).await;
+        let _ = emit_current_state(
+            &pool,
+            &session_id,
+            &assistant_turn_id,
+            &mut tx,
+            actions,
+            lang,
+        )
+        .await;
 
         loop {
             match broadcast_rx.recv().await {
                 Ok(TurnUpdate::Tick) => {
-                    if emit_current_state(&pool, &session_id, &assistant_turn_id, &mut tx, actions)
-                        .await
-                        .is_err()
+                    if emit_current_state(
+                        &pool,
+                        &session_id,
+                        &assistant_turn_id,
+                        &mut tx,
+                        actions,
+                        lang,
+                    )
+                    .await
+                    .is_err()
                     {
                         return;
                     }
@@ -203,6 +222,7 @@ pub fn spawn_session_stream_response(
                         &assistant_turn_id,
                         &mut tx,
                         actions,
+                        lang,
                     )
                     .await;
                     let _ = tx.send(Ok(sse_signals(r#"{"chatStreaming":false}"#))).await;
@@ -216,6 +236,7 @@ pub fn spawn_session_stream_response(
                         &assistant_turn_id,
                         &mut tx,
                         actions,
+                        lang,
                     )
                     .await;
                 }

@@ -31,6 +31,7 @@ use session_core::chrome::{
     Flash, FlashKind, NavSections, Theme, is_datastar_request, read_body_to_bytes, sse_patch,
     sse_response, sse_script, sse_toast,
 };
+use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use crate::rama_server::state::RamaState;
@@ -60,6 +61,7 @@ struct CreateForm {
 /// form at the top.
 pub async fn rag_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
@@ -85,14 +87,16 @@ pub async fn rag_index(State(state): State<Arc<RamaState>>, req: Request) -> Res
         m.sort();
         m
     };
-    let body = render_body(&rows, &embedding_models);
+    let body = render_body(lang, &rows, &embedding_models);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
+    let title = t(lang, "rag-page-title");
     nav_or_html_page(
         datastar,
         theme,
+        lang,
         nav,
         NavItem::Rag,
-        "RAG collections — LLM Gateway",
+        &title,
         &user.email,
         is_admin(&state, &user),
         session.impersonator_id.is_some(),
@@ -105,6 +109,7 @@ pub async fn rag_index(State(state): State<Arc<RamaState>>, req: Request) -> Res
 /// POST /rag — create a new collection. Form-encoded body. SSE response
 /// patches the list with the new row and resets the form.
 pub async fn rag_create(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
@@ -115,9 +120,9 @@ pub async fn rag_create(State(state): State<Arc<RamaState>>, req: Request) -> Re
     };
     let form: CreateForm = match serde_urlencoded::from_bytes(&body) {
         Ok(f) => f,
-        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+        Err(err) => return malformed_form_toast(lang, err),
     };
-    let new = match validate(form) {
+    let new = match validate(lang, form) {
         Ok(n) => n,
         Err(msg) => return toast(FlashKind::Error, msg),
     };
@@ -129,9 +134,13 @@ pub async fn rag_create(State(state): State<Arc<RamaState>>, req: Request) -> Re
             return toast(
                 FlashKind::Error,
                 if s.contains("UNIQUE") || s.contains("constraint") {
-                    format!("a collection named `{}` already exists", new.name)
+                    t_args(
+                        lang,
+                        "rag-toast-name-exists",
+                        &i18n::args([("name", new.name.clone().into())]),
+                    )
                 } else {
-                    "could not create collection".to_string()
+                    t(lang, "rag-toast-create-failed")
                 },
             );
         }
@@ -149,20 +158,25 @@ pub async fn rag_create(State(state): State<Arc<RamaState>>, req: Request) -> Re
                 }
                 Err(err) => tracing::warn!(error = %err, "create initial ref"),
             }
-            format!(
-                "Indexing `{}` @ `{}` was queued.",
-                created.name, new.git_ref
+            t_args(
+                lang,
+                "rag-toast-indexing-queued",
+                &i18n::args([
+                    ("name", created.name.clone().into()),
+                    ("ref", new.git_ref.clone().into()),
+                ]),
             )
         }
-        rag_db::SearchMode::Aggregate => format!(
-            "Created `{}` (aggregate). Add source repos below to index them.",
-            created.name
+        rag_db::SearchMode::Aggregate => t_args(
+            lang,
+            "rag-toast-created-aggregate",
+            &i18n::args([("name", created.name.clone().into())]),
         ),
     };
     let refs = rag_db::list_refs(&state.db, created.id)
         .await
         .unwrap_or_default();
-    let row_html = render_row(&created, &refs).to_string();
+    let row_html = render_row(lang, &created, &refs).to_string();
     sse_response(&[
         sse_patch(Some("#rag-list"), Some("append"), &row_html),
         sse_script("document.getElementById('rag-create-form').reset()"),
@@ -174,8 +188,8 @@ pub async fn rag_create(State(state): State<Arc<RamaState>>, req: Request) -> Re
 }
 
 /// Re-patch a collection's `#rag-row-{id}` with its current refs + a toast.
-async fn row_patch(state: &RamaState, collection_id: i64, msg: String) -> Response {
-    row_patch_inner(state, collection_id, msg, None).await
+async fn row_patch(state: &RamaState, lang: Lang, collection_id: i64, msg: String) -> Response {
+    row_patch_inner(state, lang, collection_id, msg, None).await
 }
 
 /// Like [`row_patch`] but also resets the named form after the patch. Used by
@@ -184,20 +198,22 @@ async fn row_patch(state: &RamaState, collection_id: i64, msg: String) -> Respon
 /// add look like it did nothing.
 async fn row_patch_reset(
     state: &RamaState,
+    lang: Lang,
     collection_id: i64,
     msg: String,
     reset_form_id: &str,
 ) -> Response {
-    row_patch_inner(state, collection_id, msg, Some(reset_form_id)).await
+    row_patch_inner(state, lang, collection_id, msg, Some(reset_form_id)).await
 }
 
 async fn row_patch_inner(
     state: &RamaState,
+    lang: Lang,
     collection_id: i64,
     msg: String,
     reset_form_id: Option<&str>,
 ) -> Response {
-    match row_html(state, collection_id).await {
+    match row_html(state, lang, collection_id).await {
         Some(html) => {
             let selector = format!("#rag-row-{collection_id}");
             let mut events = vec![sse_patch(Some(&selector), Some("outer"), &html)];
@@ -212,7 +228,7 @@ async fn row_patch_inner(
             }));
             sse_response(&events)
         }
-        None => toast(FlashKind::Error, "collection not found"),
+        None => toast(FlashKind::Error, t(lang, "rag-toast-collection-not-found")),
     }
 }
 
@@ -251,6 +267,7 @@ pub async fn rag_reindex(
     Path(id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
@@ -258,7 +275,7 @@ pub async fn rag_reindex(
         Ok(r) => r,
         Err(err) => {
             tracing::warn!(error = %err, %id, "rag reindex");
-            return toast(FlashKind::Error, "could not queue re-index");
+            return toast(FlashKind::Error, t(lang, "rag-toast-reindex-queue-failed"));
         }
     };
     for r in &refs {
@@ -266,8 +283,13 @@ pub async fn rag_reindex(
     }
     row_patch(
         &state,
+        lang,
         id,
-        format!("Queued re-index of {} ref(s).", refs.len()),
+        t_args(
+            lang,
+            "rag-toast-reindex-queued-count",
+            &i18n::args([("count", refs.len().to_string().into())]),
+        ),
     )
     .await
 }
@@ -288,6 +310,7 @@ pub async fn rag_add_ref(
     Path(id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
@@ -298,11 +321,11 @@ pub async fn rag_add_ref(
     };
     let form: AddRefForm = match serde_urlencoded::from_bytes(&body) {
         Ok(f) => f,
-        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+        Err(err) => return malformed_form_toast(lang, err),
     };
     let git_ref = form.git_ref.trim();
     if git_ref.is_empty() {
-        return toast(FlashKind::Error, "Ref (branch/tag/commit) is required.");
+        return toast(FlashKind::Error, t(lang, "rag-toast-ref-required"));
     }
     let git_url = form
         .git_url
@@ -326,9 +349,13 @@ pub async fn rag_add_ref(
             return toast(
                 FlashKind::Error,
                 if s.contains("UNIQUE") || s.contains("constraint") {
-                    format!("ref `{git_ref}` already exists on this collection")
+                    t_args(
+                        lang,
+                        "rag-toast-ref-exists",
+                        &i18n::args([("ref", git_ref.to_string().into())]),
+                    )
                 } else {
-                    "could not add ref".to_string()
+                    t(lang, "rag-toast-add-ref-failed")
                 },
             );
         }
@@ -338,8 +365,13 @@ pub async fn rag_add_ref(
     requeue_unified_if_aggregate(&state, id).await;
     row_patch_reset(
         &state,
+        lang,
         id,
-        format!("Queued indexing of `{git_ref}`."),
+        t_args(
+            lang,
+            "rag-toast-indexing-queued-ref",
+            &i18n::args([("ref", git_ref.to_string().into())]),
+        ),
         &format!("rag-addsrc-{id}"),
     )
     .await
@@ -377,15 +409,19 @@ pub async fn rag_add_sources_bulk(
     Path(id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
     let collection = match rag_db::find_collection_by_id(&state.db, id).await {
         Ok(Some(c)) => c,
-        Ok(None) => return toast(FlashKind::Error, "collection not found"),
+        Ok(None) => return toast(FlashKind::Error, t(lang, "rag-toast-collection-not-found")),
         Err(err) => {
             tracing::warn!(error = %err, %id, "bulk add: lookup");
-            return toast(FlashKind::Error, "could not load collection");
+            return toast(
+                FlashKind::Error,
+                t(lang, "rag-toast-load-collection-failed"),
+            );
         }
     };
     let (_, body) = req.into_parts();
@@ -395,7 +431,7 @@ pub async fn rag_add_sources_bulk(
     };
     let form: BulkAddForm = match serde_urlencoded::from_bytes(&body) {
         Ok(f) => f,
-        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+        Err(err) => return malformed_form_toast(lang, err),
     };
     let parsed: Vec<(String, String)> = form
         .sources
@@ -403,7 +439,7 @@ pub async fn rag_add_sources_bulk(
         .filter_map(|l| parse_bulk_line(l, &collection.git_ref))
         .collect();
     if parsed.is_empty() {
-        return toast(FlashKind::Error, "No source URLs found.");
+        return toast(FlashKind::Error, t(lang, "rag-toast-no-source-urls"));
     }
     let had_refs = rag_db::list_refs(&state.db, id)
         .await
@@ -432,11 +468,22 @@ pub async fn rag_add_sources_bulk(
     // newly-added sources.
     requeue_unified_if_aggregate(&state, id).await;
     let msg = if skipped > 0 {
-        format!("Queued {added} source(s); skipped {skipped} duplicate(s).")
+        t_args(
+            lang,
+            "rag-toast-bulk-queued-skipped",
+            &i18n::args([
+                ("added", added.to_string().into()),
+                ("skipped", skipped.to_string().into()),
+            ]),
+        )
     } else {
-        format!("Queued indexing of {added} source(s).")
+        t_args(
+            lang,
+            "rag-toast-bulk-queued",
+            &i18n::args([("added", added.to_string().into())]),
+        )
     };
-    row_patch_reset(&state, id, msg, &format!("rag-bulk-{id}")).await
+    row_patch_reset(&state, lang, id, msg, &format!("rag-bulk-{id}")).await
 }
 
 /// POST /rag/refs/{ref_id}/reindex — re-queue a single ref.
@@ -445,11 +492,12 @@ pub async fn rag_ref_reindex(
     Path(ref_id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
     let Ok(Some(r)) = rag_db::find_ref_by_id(&state.db, ref_id).await else {
-        return toast(FlashKind::Error, "ref not found");
+        return toast(FlashKind::Error, t(lang, "rag-toast-ref-not-found"));
     };
     // Aggregate: there's one unified index (on the primary); re-index rebuilds
     // the whole collection. Versioned: re-index just this ref.
@@ -458,8 +506,13 @@ pub async fn rag_ref_reindex(
     }
     row_patch(
         &state,
+        lang,
         r.collection_id,
-        format!("Queued re-index of `{}`.", r.git_ref),
+        t_args(
+            lang,
+            "rag-toast-reindex-queued-ref",
+            &i18n::args([("ref", r.git_ref.clone().into())]),
+        ),
     )
     .await
 }
@@ -470,20 +523,26 @@ pub async fn rag_ref_set_primary(
     Path(ref_id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
     let Ok(Some(r)) = rag_db::find_ref_by_id(&state.db, ref_id).await else {
-        return toast(FlashKind::Error, "ref not found");
+        return toast(FlashKind::Error, t(lang, "rag-toast-ref-not-found"));
     };
     if let Err(err) = rag_db::set_primary(&state.db, ref_id).await {
         tracing::warn!(error = %err, %ref_id, "set primary ref");
-        return toast(FlashKind::Error, "could not set primary");
+        return toast(FlashKind::Error, t(lang, "rag-toast-set-primary-failed"));
     }
     row_patch(
         &state,
+        lang,
         r.collection_id,
-        format!("`{}` is now the default ref.", r.git_ref),
+        t_args(
+            lang,
+            "rag-toast-now-default",
+            &i18n::args([("ref", r.git_ref.clone().into())]),
+        ),
     )
     .await
 }
@@ -494,11 +553,12 @@ pub async fn rag_ref_delete(
     Path(ref_id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
     let Ok(Some(r)) = rag_db::find_ref_by_id(&state.db, ref_id).await else {
-        return toast(FlashKind::Error, "ref not found");
+        return toast(FlashKind::Error, t(lang, "rag-toast-ref-not-found"));
     };
     let collection_id = r.collection_id;
     match rag_db::delete_ref(&state.db, ref_id).await {
@@ -509,7 +569,7 @@ pub async fn rag_ref_delete(
         }
         Err(err) => {
             tracing::warn!(error = %err, %ref_id, "delete rag ref");
-            return toast(FlashKind::Error, "could not delete ref");
+            return toast(FlashKind::Error, t(lang, "rag-toast-delete-ref-failed"));
         }
     }
     // Aggregate: rebuild the unified index (on the possibly-newly-promoted
@@ -517,8 +577,13 @@ pub async fn rag_ref_delete(
     requeue_unified_if_aggregate(&state, collection_id).await;
     row_patch(
         &state,
+        lang,
         collection_id,
-        format!("Removed ref `{}`.", r.git_ref),
+        t_args(
+            lang,
+            "rag-toast-ref-removed",
+            &i18n::args([("ref", r.git_ref.clone().into())]),
+        ),
     )
     .await
 }
@@ -533,6 +598,7 @@ pub async fn rag_ref_log(
     Path(ref_id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
@@ -540,11 +606,11 @@ pub async fn rag_ref_log(
         Ok(e) => e,
         Err(err) => {
             tracing::warn!(error = %err, %ref_id, "rag: load ref log");
-            return toast(FlashKind::Error, "could not load log");
+            return toast(FlashKind::Error, t(lang, "rag-toast-load-log-failed"));
         }
     };
     let selector = format!("#rag-reflog-{ref_id}");
-    let html = render_ref_log(ref_id, &entries).to_string();
+    let html = render_ref_log(lang, ref_id, &entries).to_string();
     sse_response(&[sse_patch(Some(&selector), Some("inner"), &html)])
 }
 
@@ -560,17 +626,18 @@ pub async fn rag_ref_edit_form(
     Path(ref_id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
     let Ok(Some(r)) = rag_db::find_ref_by_id(&state.db, ref_id).await else {
-        return toast(FlashKind::Error, "ref not found");
+        return toast(FlashKind::Error, t(lang, "rag-toast-ref-not-found"));
     };
     let Ok(Some(c)) = rag_db::find_collection_by_id(&state.db, r.collection_id).await else {
-        return toast(FlashKind::Error, "collection not found");
+        return toast(FlashKind::Error, t(lang, "rag-toast-collection-not-found"));
     };
     let selector = format!("#rag-reflog-{ref_id}");
-    let html = render_ref_edit_form(&c, &r).to_string();
+    let html = render_ref_edit_form(lang, &c, &r).to_string();
     sse_response(&[sse_patch(Some(&selector), Some("inner"), &html)])
 }
 
@@ -606,6 +673,7 @@ pub async fn rag_ref_update(
     Path(ref_id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
@@ -616,10 +684,10 @@ pub async fn rag_ref_update(
     };
     let form: RefUpdateForm = match serde_urlencoded::from_bytes(&body) {
         Ok(f) => f,
-        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+        Err(err) => return malformed_form_toast(lang, err),
     };
     let Ok(Some(existing)) = rag_db::find_ref_by_id(&state.db, ref_id).await else {
-        return toast(FlashKind::Error, "ref not found");
+        return toast(FlashKind::Error, t(lang, "rag-toast-ref-not-found"));
     };
     let git_ref = form
         .git_ref
@@ -643,16 +711,16 @@ pub async fn rag_ref_update(
     {
         return toast(
             FlashKind::Error,
-            "Git URL is required for an aggregate source.",
+            t(lang, "rag-toast-git-url-required-aggregate"),
         );
     }
     let git_url_opt = (!git_url.is_empty()).then_some(git_url);
     let collection_id = match rag_db::update_ref(&state.db, ref_id, git_url_opt, &git_ref).await {
         Ok(Some(cid)) => cid,
-        Ok(None) => return toast(FlashKind::Error, "ref not found"),
+        Ok(None) => return toast(FlashKind::Error, t(lang, "rag-toast-ref-not-found")),
         Err(err) => {
             tracing::warn!(error = %err, %ref_id, "update rag ref");
-            return toast(FlashKind::Error, "could not update source");
+            return toast(FlashKind::Error, t(lang, "rag-toast-update-source-failed"));
         }
     };
     // Fetch the new target: aggregate rebuilds the unified (primary) index so
@@ -660,13 +728,19 @@ pub async fn rag_ref_update(
     if !requeue_unified_if_aggregate(&state, collection_id).await {
         requeue_ref(&state, ref_id).await;
     }
-    row_patch(&state, collection_id, "Source updated.".to_string()).await
+    row_patch(
+        &state,
+        lang,
+        collection_id,
+        t(lang, "rag-toast-source-updated"),
+    )
+    .await
 }
 
 /// Inline per-source editor: Git URL + branch/tag, with Save / Cancel. Lives in
 /// the ref's `#rag-reflog-{id}` container. Mirrors the collection edit form's
 /// datastar wiring (`@post` on submit, morph the response in).
-fn render_ref_edit_form(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Html {
+fn render_ref_edit_form(lang: Lang, c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Html {
     let update_action = format!("/rag/refs/{}/update", r.id);
     let cancel_action = format!("/rag/refs/{}/cancel-edit", r.id);
     let update_directive = format!("@post('{update_action}', {{contentType: 'form'}})");
@@ -676,9 +750,9 @@ fn render_ref_edit_form(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Ht
     // collection's (leave blank), so show the stored override if any.
     let url_value = r.git_url.clone().unwrap_or_default();
     let url_label = if aggregate {
-        "Git URL (this source)"
+        t(lang, "rag-label-git-url-source")
     } else {
-        "Git URL (blank = inherit collection)"
+        t(lang, "rag-label-git-url-inherit")
     };
     html! {
         div(class: "mt-1 mb-1 rounded border border-base-300 bg-base-200/40 p-3") {
@@ -695,12 +769,12 @@ fn render_ref_edit_form(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Ht
                             name: "git_url",
                             type: "text",
                             value: (url_value),
-                            placeholder: "https://example.com/org/repo.git",
+                            placeholder: (t(lang, "rag-placeholder-git-url")),
                             class: "input input-bordered input-sm w-full"
                         );
                     }
                     label(class: "form-control w-full") {
-                        div(class: "label") { span(class: "label-text text-xs") { "Branch / tag" } }
+                        div(class: "label") { span(class: "label-text text-xs") { (t(lang, "rag-label-branch-tag")) } }
                         input(
                             name: "git_ref",
                             type: "text",
@@ -710,12 +784,12 @@ fn render_ref_edit_form(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Ht
                     }
                 }
                 div(class: "flex items-center gap-2") {
-                    button(type: "submit", class: "btn btn-xs btn-primary") { "Save source" }
+                    button(type: "submit", class: "btn btn-xs btn-primary") { (t(lang, "rag-button-save-source")) }
                     button(
                         type: "button",
                         class: "btn btn-xs btn-ghost",
                         "data-on:click": (cancel_directive)
-                    ) { "Cancel" }
+                    ) { (t(lang, "rag-button-cancel")) }
                 }
             }
         }
@@ -730,6 +804,7 @@ fn render_ref_edit_form(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Ht
 /// whole collection rows) so the add-source inputs and an open log are left
 /// alone. Cheap: a couple of indexed reads + a small render per ref.
 pub async fn rag_status(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
@@ -742,7 +817,7 @@ pub async fn rag_status(State(state): State<Arc<RamaState>>, req: Request) -> Re
         let primary = refs.iter().find(|r| r.is_primary);
         for r in &refs {
             let selector = format!("#rag-ref-{}", r.id);
-            let html = render_ref(c, r, primary).to_string();
+            let html = render_ref(lang, c, r, primary).to_string();
             events.push(sse_patch(Some(&selector), Some("outer"), &html));
         }
     }
@@ -759,15 +834,24 @@ pub async fn rag_edit_form(
     Path(id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
     let collection = match rag_db::find_collection_by_id(&state.db, id).await {
         Ok(Some(c)) => c,
-        Ok(None) => return toast(FlashKind::Error, "Collection not found."),
+        Ok(None) => {
+            return toast(
+                FlashKind::Error,
+                t(lang, "rag-toast-collection-not-found-cap"),
+            );
+        }
         Err(err) => {
             tracing::warn!(error = %err, %id, "lookup rag collection");
-            return toast(FlashKind::Error, "Could not load collection.");
+            return toast(
+                FlashKind::Error,
+                t(lang, "rag-toast-load-collection-failed-cap"),
+            );
         }
     };
     let mut models = state.upstreams.models_for_kind(PoolKind::Embedding);
@@ -776,7 +860,7 @@ pub async fn rag_edit_form(
     sse_response(&[sse_patch(
         Some(&selector),
         Some("outer"),
-        &render_edit_form(&collection, &models).to_string(),
+        &render_edit_form(lang, &collection, &models).to_string(),
     )])
 }
 
@@ -787,11 +871,15 @@ pub async fn rag_cancel_edit(
     Path(id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
-    let Some(html) = row_html(&state, id).await else {
-        return toast(FlashKind::Error, "Collection not found.");
+    let Some(html) = row_html(&state, lang, id).await else {
+        return toast(
+            FlashKind::Error,
+            t(lang, "rag-toast-collection-not-found-cap"),
+        );
     };
     let selector = format!("#rag-row-{id}");
     sse_response(&[sse_patch(Some(&selector), Some("outer"), &html)])
@@ -824,6 +912,7 @@ pub async fn rag_update(
     Path(id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
@@ -834,17 +923,25 @@ pub async fn rag_update(
     };
     let form: UpdateForm = match serde_urlencoded::from_bytes(&body) {
         Ok(f) => f,
-        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+        Err(err) => return malformed_form_toast(lang, err),
     };
 
     // Pull the current row so we can resolve "leave unchanged" semantics
     // on PAT and ground the success toast in a stable name.
     let existing = match rag_db::find_collection_by_id(&state.db, id).await {
         Ok(Some(c)) => c,
-        Ok(None) => return toast(FlashKind::Error, "Collection not found."),
+        Ok(None) => {
+            return toast(
+                FlashKind::Error,
+                t(lang, "rag-toast-collection-not-found-cap"),
+            );
+        }
         Err(err) => {
             tracing::warn!(error = %err, %id, "lookup rag collection");
-            return toast(FlashKind::Error, "Could not load collection.");
+            return toast(
+                FlashKind::Error,
+                t(lang, "rag-toast-load-collection-failed-cap"),
+            );
         }
     };
 
@@ -853,11 +950,14 @@ pub async fn rag_update(
     // own), so the collection-level Git URL is optional for them — only
     // versioned collections require it.
     if git_url.is_empty() && existing.search_mode == rag_db::SearchMode::Versioned {
-        return toast(FlashKind::Error, "Git URL is required.");
+        return toast(FlashKind::Error, t(lang, "rag-toast-git-url-required"));
     }
     let embedding_model = form.embedding_model.trim();
     if embedding_model.is_empty() {
-        return toast(FlashKind::Error, "Embedding model is required.");
+        return toast(
+            FlashKind::Error,
+            t(lang, "rag-toast-embedding-model-required"),
+        );
     }
     let git_ref = form
         .git_ref
@@ -867,13 +967,10 @@ pub async fn rag_update(
     let chunk_size = form.chunk_size.unwrap_or(existing.chunk_size);
     let chunk_overlap = form.chunk_overlap.unwrap_or(existing.chunk_overlap);
     if chunk_size <= 0 || chunk_size > 8000 {
-        return toast(FlashKind::Error, "Chunk size must be in (0, 8000].");
+        return toast(FlashKind::Error, t(lang, "rag-toast-chunk-size-range"));
     }
     if chunk_overlap < 0 || chunk_overlap >= chunk_size {
-        return toast(
-            FlashKind::Error,
-            "Chunk overlap must be in [0, chunk_size).",
-        );
+        return toast(FlashKind::Error, t(lang, "rag-toast-chunk-overlap-range"));
     }
     let description = form
         .description
@@ -929,14 +1026,14 @@ pub async fn rag_update(
     .await;
     if let Err(err) = res {
         tracing::warn!(error = %err, %id, "update rag collection");
-        return toast(FlashKind::Error, "Saving collection failed.");
+        return toast(FlashKind::Error, t(lang, "rag-toast-save-failed"));
     }
     let updated = match rag_db::find_collection_by_id(&state.db, id).await {
         Ok(Some(c)) => c,
-        Ok(None) => return toast(FlashKind::Error, "Collection vanished after save."),
+        Ok(None) => return toast(FlashKind::Error, t(lang, "rag-toast-vanished")),
         Err(err) => {
             tracing::warn!(error = %err, %id, "post-update lookup");
-            return toast(FlashKind::Error, "Saved but reload failed.");
+            return toast(FlashKind::Error, t(lang, "rag-toast-saved-reload-failed"));
         }
     };
     let refs = rag_db::list_refs(&state.db, id).await.unwrap_or_default();
@@ -945,11 +1042,15 @@ pub async fn rag_update(
         sse_patch(
             Some(&selector),
             Some("outer"),
-            &render_row(&updated, &refs).to_string(),
+            &render_row(lang, &updated, &refs).to_string(),
         ),
         sse_toast(&Flash {
             kind: FlashKind::Success,
-            message: format!("Saved `{}`.", existing.name),
+            message: t_args(
+                lang,
+                "rag-toast-saved",
+                &i18n::args([("name", existing.name.clone().into())]),
+            ),
         }),
     ])
 }
@@ -964,6 +1065,7 @@ pub async fn rag_delete(
     Path(id): Path<i64>,
     req: Request,
 ) -> Response {
+    let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
@@ -982,14 +1084,17 @@ pub async fn rag_delete(
                 sse_patch(Some(&selector), Some("remove"), ""),
                 sse_toast(&Flash {
                     kind: FlashKind::Success,
-                    message: "Collection removed.".into(),
+                    message: t(lang, "rag-toast-collection-removed"),
                 }),
             ])
         }
-        Ok(false) => toast(FlashKind::Info, "Collection already gone."),
+        Ok(false) => toast(
+            FlashKind::Info,
+            t(lang, "rag-toast-collection-already-gone"),
+        ),
         Err(err) => {
             tracing::warn!(error = %err, %id, "rag delete");
-            toast(FlashKind::Error, "Delete failed.")
+            toast(FlashKind::Error, t(lang, "rag-toast-delete-failed"))
         }
     }
 }
@@ -1001,10 +1106,23 @@ fn toast(kind: FlashKind, message: impl Into<String>) -> Response {
     })])
 }
 
-fn validate(form: CreateForm) -> Result<rag_db::NewCollection, String> {
+/// Shorthand for the "form body didn't parse" error toast every form
+/// handler falls back to on a `serde_urlencoded` failure.
+fn malformed_form_toast(lang: Lang, err: impl std::fmt::Display) -> Response {
+    toast(
+        FlashKind::Error,
+        t_args(
+            lang,
+            "rag-toast-malformed-form",
+            &i18n::args([("err", err.to_string().into())]),
+        ),
+    )
+}
+
+fn validate(lang: Lang, form: CreateForm) -> Result<rag_db::NewCollection, String> {
     let name = form.name.trim();
     if name.is_empty() || name.len() > 64 {
-        return Err("Name must be 1..=64 characters.".into());
+        return Err(t(lang, "rag-toast-name-length"));
     }
     let search_mode = if form.aggregate.is_some() {
         rag_db::SearchMode::Aggregate
@@ -1015,19 +1133,19 @@ fn validate(form: CreateForm) -> Result<rag_db::NewCollection, String> {
     // Aggregate collections carry no single repo — each source brings its
     // own URL — so the collection-level Git URL is optional there.
     if git_url.is_empty() && search_mode == rag_db::SearchMode::Versioned {
-        return Err("Git URL is required.".into());
+        return Err(t(lang, "rag-toast-git-url-required"));
     }
     let embedding_model = form.embedding_model.trim();
     if embedding_model.is_empty() {
-        return Err("Embedding model is required.".into());
+        return Err(t(lang, "rag-toast-embedding-model-required"));
     }
     let chunk_size = form.chunk_size.unwrap_or(800);
     let chunk_overlap = form.chunk_overlap.unwrap_or(100);
     if chunk_size <= 0 || chunk_size > 8000 {
-        return Err("Chunk size must be in (0, 8000].".into());
+        return Err(t(lang, "rag-toast-chunk-size-range"));
     }
     if chunk_overlap < 0 || chunk_overlap >= chunk_size {
-        return Err("Chunk overlap must be in [0, chunk_size).".into());
+        return Err(t(lang, "rag-toast-chunk-overlap-range"));
     }
     Ok(rag_db::NewCollection {
         name: name.to_string(),
@@ -1062,21 +1180,22 @@ fn split_globs(raw: Option<String>) -> Vec<String> {
         .collect()
 }
 
-fn status_badge(status: rag_db::CollectionStatus) -> Html {
-    let (cls, label) = match status {
-        rag_db::CollectionStatus::Pending => ("badge badge-outline", "pending"),
-        rag_db::CollectionStatus::Cloning => ("badge badge-info", "cloning"),
-        rag_db::CollectionStatus::Indexing => ("badge badge-info", "indexing"),
-        rag_db::CollectionStatus::Ready => ("badge badge-success", "ready"),
-        rag_db::CollectionStatus::Error => ("badge badge-error", "error"),
+fn status_badge(lang: Lang, status: rag_db::CollectionStatus) -> Html {
+    let (cls, key) = match status {
+        rag_db::CollectionStatus::Pending => ("badge badge-outline", "rag-status-pending"),
+        rag_db::CollectionStatus::Cloning => ("badge badge-info", "rag-status-cloning"),
+        rag_db::CollectionStatus::Indexing => ("badge badge-info", "rag-status-indexing"),
+        rag_db::CollectionStatus::Ready => ("badge badge-success", "rag-status-ready"),
+        rag_db::CollectionStatus::Error => ("badge badge-error", "rag-status-error"),
     };
+    let label = t(lang, key);
     html! {
         span(class: (cls)) { (label) }
     }
     .to_html()
 }
 
-fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
+fn render_row(lang: Lang, c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
     let dom_id = format!("rag-row-{}", c.id);
     let delete_action = format!("/rag/{}/delete", c.id);
     let edit_action = format!("/rag/{}/edit-form", c.id);
@@ -1091,7 +1210,11 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
     // value in the field, which reads as "did nothing").
     let add_src_form_id = format!("rag-addsrc-{}", c.id);
     let bulk_form_id = format!("rag-bulk-{}", c.id);
-    let pat_hint = if c.pat.is_some() { "PAT set" } else { "no PAT" };
+    let pat_hint = if c.pat.is_some() {
+        t(lang, "rag-pat-set")
+    } else {
+        t(lang, "rag-pat-none")
+    };
     let description = c.description.clone().unwrap_or_default();
     // Aggregate source rows mirror the primary's build lifecycle (one unified
     // index), so hand each row the primary to read status/provenance from.
@@ -1100,9 +1223,23 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
     // Aggregate collections have no single repo URL — summarise by source
     // count instead. Versioned ones show their one repo.
     let meta_line = if aggregate {
-        format!("{} source(s) · {}", refs.len(), pat_hint)
+        t_args(
+            lang,
+            "rag-meta-aggregate",
+            &i18n::args([
+                ("count", refs.len().to_string().into()),
+                ("hint", pat_hint.clone().into()),
+            ]),
+        )
     } else {
-        format!("{} · {}", c.git_url, pat_hint)
+        t_args(
+            lang,
+            "rag-meta-versioned",
+            &i18n::args([
+                ("url", c.git_url.clone().into()),
+                ("hint", pat_hint.clone().into()),
+            ]),
+        )
     };
     html! {
         li(
@@ -1114,7 +1251,7 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
                     div(class: "flex items-center gap-2") {
                         span(class: "text-base font-medium") { (c.name.clone()) }
                         if aggregate {
-                            span(class: "badge badge-sm badge-secondary") { "aggregate" }
+                            span(class: "badge badge-sm badge-secondary") { (t(lang, "rag-badge-aggregate")) }
                         }
                     }
                     if !description.is_empty() {
@@ -1124,7 +1261,7 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
                         (meta_line)
                     }
                     p(class: "text-xs text-base-content/60 mt-1") {
-                        "embed: " (c.embedding_model.clone())
+                        (t(lang, "rag-embed-prefix")) " " (c.embedding_model.clone())
                     }
                 }
                 div(class: "flex flex-col gap-2 shrink-0") {
@@ -1134,7 +1271,7 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
                         class: "m-0",
                         "data-on:submit__prevent": (edit_directive)
                     ) {
-                        button(type: "submit", class: "btn btn-sm btn-outline") { "Edit" }
+                        button(type: "submit", class: "btn btn-sm btn-outline") { (t(lang, "rag-button-edit")) }
                     }
                     form(
                         action: (delete_action.clone()),
@@ -1142,14 +1279,14 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
                         class: "m-0",
                         "data-on:submit__prevent": (delete_directive)
                     ) {
-                        button(type: "submit", class: "btn btn-sm btn-outline btn-error") { "Delete collection" }
+                        button(type: "submit", class: "btn btn-sm btn-outline btn-error") { (t(lang, "rag-button-delete-collection")) }
                     }
                 }
             }
             // Per-ref/source rows: each indexed independently in its own store.
             div(class: "mt-1 pl-3 border-l border-base-300 flex flex-col gap-1.5") {
                 for r in refs.iter() {
-                    (render_ref(c, r, primary))
+                    (render_ref(lang, c, r, primary))
                     // Empty container the "Log" button fills in on demand. Kept
                     // OUTSIDE `render_ref` so the status poll (which re-patches
                     // `#rag-ref-{id}`) doesn't wipe an opened log.
@@ -1168,28 +1305,28 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
                         input(
                             type: "text",
                             name: "git_url",
-                            placeholder: "https://github.com/org/repo.git",
+                            placeholder: (t(lang, "rag-placeholder-source-git-url")),
                             required: "required",
                             class: "input input-bordered input-xs w-80"
                         );
                         input(
                             type: "text",
                             name: "git_ref",
-                            placeholder: "ref (default: collection's)",
+                            placeholder: (t(lang, "rag-placeholder-ref-default")),
                             value: (c.git_ref.clone()),
                             required: "required",
                             class: "input input-bordered input-xs w-44"
                         );
-                        button(type: "submit", class: "btn btn-xs") { "Add source" }
+                        button(type: "submit", class: "btn btn-xs") { (t(lang, "rag-button-add-source")) }
                     } else {
                         input(
                             type: "text",
                             name: "git_ref",
-                            placeholder: "branch, tag, or commit",
+                            placeholder: (t(lang, "rag-placeholder-branch-tag-commit")),
                             required: "required",
                             class: "input input-bordered input-xs w-56"
                         );
-                        button(type: "submit", class: "btn btn-xs") { "Add ref" }
+                        button(type: "submit", class: "btn btn-xs") { (t(lang, "rag-button-add-ref")) }
                     }
                 }
                 // Bulk add (aggregate only): one repo per line, optional
@@ -1205,11 +1342,11 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
                         textarea(
                             name: "sources",
                             rows: "4",
-                            placeholder: "Bulk add — one repo per line, optional @ref:\nhttps://github.com/proxmox/pve-manager.git\nhttps://github.com/proxmox/qemu-server.git @master",
+                            placeholder: (t(lang, "rag-placeholder-bulk-sources")),
                             class: "textarea textarea-bordered textarea-xs w-full font-mono"
                         ) {}
                         div {
-                            button(type: "submit", class: "btn btn-xs") { "Add sources (bulk)" }
+                            button(type: "submit", class: "btn btn-xs") { (t(lang, "rag-button-add-bulk")) }
                         }
                     }
                 }
@@ -1249,6 +1386,7 @@ fn status_ref<'a>(
 /// Re-index on any source row shows *that* row (and all rows) rebuilding, which
 /// is what actually happens. See [`status_ref`].
 fn render_ref(
+    lang: Lang,
     c: &rag_db::Collection,
     r: &rag_db::CollectionRef,
     primary: Option<&rag_db::CollectionRef>,
@@ -1280,7 +1418,7 @@ fn render_ref(
     let last_indexed = s
         .last_indexed_at
         .map(|t| t.strftime("%Y-%m-%d %H:%M UTC").to_string())
-        .unwrap_or_else(|| "never".to_string());
+        .unwrap_or_else(|| t(lang, "rag-never"));
     let last_commit = s
         .last_indexed_commit
         .as_deref()
@@ -1295,17 +1433,25 @@ fn render_ref(
     } else {
         r.git_ref.clone()
     };
+    let indexed_line = t_args(
+        lang,
+        "rag-ref-indexed-line",
+        &i18n::args([
+            ("date", last_indexed.into()),
+            ("commit", last_commit.into()),
+        ]),
+    );
     html! {
         div(id: (dom_id), class: "flex items-center gap-2 text-sm flex-wrap") {
             span(class: "font-mono") { (label) }
             // Primacy is meaningful only for versioned collections (the
             // search default); aggregate search ignores it.
             if r.is_primary && !aggregate {
-                span(class: "badge badge-sm") { "primary" }
+                span(class: "badge badge-sm") { (t(lang, "rag-badge-primary")) }
             }
-            (status_badge(s.status))
+            (status_badge(lang, s.status))
             span(class: "text-xs text-base-content/60") {
-                "indexed " (last_indexed) " · " (last_commit)
+                (indexed_line)
             }
             if let Some(err) = s.last_error.as_ref() {
                 // Headline the most recent error/advisory; the Log button
@@ -1323,20 +1469,20 @@ fn render_ref(
                     type: "button",
                     class: "btn btn-xs btn-ghost",
                     "data-on:click": (log_directive)
-                ) { "Log" }
+                ) { (t(lang, "rag-button-log")) }
                 form(action: (edit_action), method: "post", class: "m-0", "data-on:submit__prevent": (edit_directive)) {
-                    button(type: "submit", class: "btn btn-xs btn-ghost") { "Edit" }
+                    button(type: "submit", class: "btn btn-xs btn-ghost") { (t(lang, "rag-button-edit")) }
                 }
                 form(action: (reindex_action), method: "post", class: "m-0", "data-on:submit__prevent": (reindex_directive)) {
-                    button(type: "submit", class: "btn btn-xs") { "Re-index" }
+                    button(type: "submit", class: "btn btn-xs") { (t(lang, "rag-button-reindex")) }
                 }
                 if !r.is_primary && !aggregate {
                     form(action: (primary_action), method: "post", class: "m-0", "data-on:submit__prevent": (primary_directive)) {
-                        button(type: "submit", class: "btn btn-xs btn-ghost") { "Set primary" }
+                        button(type: "submit", class: "btn btn-xs btn-ghost") { (t(lang, "rag-button-set-primary")) }
                     }
                 }
                 form(action: (delete_action), method: "post", class: "m-0", "data-on:submit__prevent": (delete_directive)) {
-                    button(type: "submit", class: "btn btn-xs btn-ghost btn-error") { "Remove" }
+                    button(type: "submit", class: "btn btn-xs btn-ghost btn-error") { (t(lang, "rag-button-remove")) }
                 }
             }
         }
@@ -1348,27 +1494,28 @@ fn render_ref(
 /// `whitespace-nowrap` keep it on one line — without them the row's
 /// `break-all` on the message would wrap the short label letter-by-letter
 /// ("e/r/r/o/r" stacked).
-fn log_level_badge(level: rag_db::LogLevel) -> Html {
-    let (cls, label) = match level {
-        rag_db::LogLevel::Info => ("badge badge-xs badge-ghost shrink-0", "info"),
-        rag_db::LogLevel::Warn => ("badge badge-xs badge-warning shrink-0", "warn"),
-        rag_db::LogLevel::Error => ("badge badge-xs badge-error shrink-0", "error"),
+fn log_level_badge(lang: Lang, level: rag_db::LogLevel) -> Html {
+    let (cls, key) = match level {
+        rag_db::LogLevel::Info => ("badge badge-xs badge-ghost shrink-0", "rag-log-info"),
+        rag_db::LogLevel::Warn => ("badge badge-xs badge-warning shrink-0", "rag-log-warn"),
+        rag_db::LogLevel::Error => ("badge badge-xs badge-error shrink-0", "rag-log-error"),
     };
+    let label = t(lang, key);
     html! { span(class: (cls)) { (label) } }.to_html()
 }
 
 /// Render a ref's indexing timeline into its `#rag-reflog-{ref_id}` container.
 /// Newest first; each row shows time, severity, phase, and message. Closing is
 /// the "Log" button's job (it toggles the container), so there's no Hide here.
-fn render_ref_log(_ref_id: i64, entries: &[rag_db::IndexLogEntry]) -> Html {
+fn render_ref_log(lang: Lang, _ref_id: i64, entries: &[rag_db::IndexLogEntry]) -> Html {
     html! {
         div(class: "mt-1 mb-1 rounded border border-base-300 bg-base-200/40 p-2 text-xs") {
             div(class: "mb-1") {
-                span(class: "font-medium text-base-content/70") { "Indexing log" }
+                span(class: "font-medium text-base-content/70") { (t(lang, "rag-log-heading")) }
             }
             if entries.is_empty() {
                 p(class: "text-base-content/60") {
-                    "No indexing events recorded yet. The first run logs here once the indexer picks this ref up."
+                    (t(lang, "rag-log-empty"))
                 }
             } else {
                 ul(class: "flex flex-col gap-1") {
@@ -1379,7 +1526,7 @@ fn render_ref_log(_ref_id: i64, entries: &[rag_db::IndexLogEntry]) -> Html {
                             span(class: "text-base-content/50 shrink-0 whitespace-nowrap") {
                                 (e.created_at.strftime("%Y-%m-%d %H:%M:%S").to_string())
                             }
-                            (log_level_badge(e.level))
+                            (log_level_badge(lang, e.level))
                             span(class: "text-base-content/50 shrink-0 w-14") { (e.phase.clone()) }
                             span(class: "min-w-0 break-words") { (e.message.clone()) }
                         }
@@ -1393,7 +1540,7 @@ fn render_ref_log(_ref_id: i64, entries: &[rag_db::IndexLogEntry]) -> Html {
 
 /// Fetch a collection + its refs and render its row. Used by the ref/edit
 /// handlers to re-patch a single `#rag-row-{id}`.
-async fn row_html(state: &RamaState, collection_id: i64) -> Option<String> {
+async fn row_html(state: &RamaState, lang: Lang, collection_id: i64) -> Option<String> {
     let c = rag_db::find_collection_by_id(&state.db, collection_id)
         .await
         .ok()
@@ -1401,10 +1548,10 @@ async fn row_html(state: &RamaState, collection_id: i64) -> Option<String> {
     let refs = rag_db::list_refs(&state.db, collection_id)
         .await
         .unwrap_or_default();
-    Some(render_row(&c, &refs).to_string())
+    Some(render_row(lang, &c, &refs).to_string())
 }
 
-fn render_create_form(embedding_models: &[String]) -> Html {
+fn render_create_form(lang: Lang, embedding_models: &[String]) -> Html {
     html! {
         form(
             id: "rag-create-form",
@@ -1414,30 +1561,28 @@ fn render_create_form(embedding_models: &[String]) -> Html {
             "data-on:submit__prevent": "@post('/rag', {contentType: 'form'})"
         ) {
             div(class: "card-body") {
-                h2(class: "card-title") { "Index a new collection" }
+                h2(class: "card-title") { (t(lang, "rag-create-heading")) }
                 p(class: "text-base-content/70 text-sm") {
-                    "The indexer clones the repo, chunks each file, and embeds it through "
-                    "the configured embedding model. PATs are stored verbatim (the gateway "
-                    "runs on trusted infra)."
+                    (t(lang, "rag-create-description"))
                 }
                 div(class: "grid grid-cols-1 md:grid-cols-2 gap-4 mt-2") {
                     label(class: "form-control w-full") {
-                        div(class: "label") { span(class: "label-text") { "Name" } }
+                        div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-name")) } }
                         input(
                             name: "name",
                             type: "text",
                             required: "required",
-                            placeholder: "e.g. gateway-repo",
+                            placeholder: (t(lang, "rag-placeholder-name")),
                             class: "input input-bordered w-full"
                         );
                     }
-                    (embedding_model_field(embedding_models, None))
+                    (embedding_model_field(lang, embedding_models, None))
                     label(class: "form-control w-full md:col-span-2") {
-                        div(class: "label") { span(class: "label-text") { "Description (optional)" } }
+                        div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-description-optional")) } }
                         input(
                             name: "description",
                             type: "text",
-                            placeholder: "short, human-readable",
+                            placeholder: (t(lang, "rag-placeholder-description")),
                             class: "input input-bordered w-full"
                         );
                     }
@@ -1445,16 +1590,16 @@ fn render_create_form(embedding_models: &[String]) -> Html {
                         // Not `required`: aggregate collections leave this empty
                         // (each source brings its own URL). The server enforces
                         // a non-empty URL for versioned collections.
-                        div(class: "label") { span(class: "label-text") { "Git URL (versioned only)" } }
+                        div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-git-url-versioned")) } }
                         input(
                             name: "git_url",
                             type: "text",
-                            placeholder: "https://example.com/org/repo.git",
+                            placeholder: (t(lang, "rag-placeholder-git-url")),
                             class: "input input-bordered w-full"
                         );
                     }
                     label(class: "form-control w-full") {
-                        div(class: "label") { span(class: "label-text") { "Branch / tag" } }
+                        div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-branch-tag")) } }
                         input(
                             name: "git_ref",
                             type: "text",
@@ -1464,39 +1609,39 @@ fn render_create_form(embedding_models: &[String]) -> Html {
                     }
                     label(class: "form-control w-full md:col-span-2") {
                         div(class: "label") {
-                            span(class: "label-text") { "Personal access token (optional)" }
+                            span(class: "label-text") { (t(lang, "rag-label-pat-optional")) }
                         }
                         input(
                             name: "pat",
                             type: "password",
-                            placeholder: "for private repos",
+                            placeholder: (t(lang, "rag-placeholder-pat")),
                             class: "input input-bordered w-full"
                         );
                     }
                     label(class: "form-control w-full") {
                         div(class: "label") {
-                            span(class: "label-text") { "Include globs (comma- or newline-separated)" }
+                            span(class: "label-text") { (t(lang, "rag-label-include-globs-full")) }
                         }
                         input(
                             name: "include_globs",
                             type: "text",
-                            placeholder: "*.rs, *.md",
+                            placeholder: (t(lang, "rag-placeholder-include-globs")),
                             class: "input input-bordered w-full"
                         );
                     }
                     label(class: "form-control w-full") {
                         div(class: "label") {
-                            span(class: "label-text") { "Exclude globs" }
+                            span(class: "label-text") { (t(lang, "rag-label-exclude-globs")) }
                         }
                         input(
                             name: "exclude_globs",
                             type: "text",
-                            placeholder: "target/, node_modules/",
+                            placeholder: (t(lang, "rag-placeholder-exclude-globs")),
                             class: "input input-bordered w-full"
                         );
                     }
                     label(class: "form-control w-full") {
-                        div(class: "label") { span(class: "label-text") { "Chunk size" } }
+                        div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-chunk-size")) } }
                         input(
                             name: "chunk_size",
                             type: "number",
@@ -1507,7 +1652,7 @@ fn render_create_form(embedding_models: &[String]) -> Html {
                         );
                     }
                     label(class: "form-control w-full") {
-                        div(class: "label") { span(class: "label-text") { "Chunk overlap" } }
+                        div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-chunk-overlap")) } }
                         input(
                             name: "chunk_overlap",
                             type: "number",
@@ -1523,14 +1668,12 @@ fn render_create_form(embedding_models: &[String]) -> Html {
                             class: "checkbox checkbox-sm mt-0.5 shrink-0"
                         );
                         span(class: "label-text min-w-0") {
-                            "Aggregate (multi-source): search across many repos as one corpus. "
-                            "Leave the Git URL empty and add each source repo after creating. "
-                            "Branch / tag becomes the default ref for added sources."
+                            (t(lang, "rag-create-aggregate-help"))
                         }
                     }
                 }
                 div(class: "card-actions justify-end mt-2") {
-                    button(type: "submit", class: "btn btn-primary") { "Queue indexing" }
+                    button(type: "submit", class: "btn btn-primary") { (t(lang, "rag-button-queue-indexing")) }
                 }
             }
         }
@@ -1541,7 +1684,7 @@ fn render_create_form(embedding_models: &[String]) -> Html {
 /// The row swapped in by `rag_edit_form`. Same `<li id="rag-row-{id}">`
 /// shell so the SSE outer-replace round-trips cleanly between display
 /// and edit modes. Fields are pre-filled from the stored row.
-fn render_edit_form(c: &rag_db::Collection, embedding_models: &[String]) -> Html {
+fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[String]) -> Html {
     let dom_id = format!("rag-row-{}", c.id);
     let update_action = format!("/rag/{}/update", c.id);
     let cancel_action = format!("/rag/{}/cancel-edit", c.id);
@@ -1553,6 +1696,16 @@ fn render_edit_form(c: &rag_db::Collection, embedding_models: &[String]) -> Html
     let chunk_size = c.chunk_size.to_string();
     let chunk_overlap = c.chunk_overlap.to_string();
     let pat_present = c.pat.is_some();
+    let pat_placeholder = if pat_present {
+        t(lang, "rag-placeholder-pat-keep")
+    } else {
+        t(lang, "rag-placeholder-pat")
+    };
+    let editing_heading = t_args(
+        lang,
+        "rag-edit-heading",
+        &i18n::args([("name", c.name.clone().into())]),
+    );
     html! {
         li(
             id: (dom_id),
@@ -1567,13 +1720,13 @@ fn render_edit_form(c: &rag_db::Collection, embedding_models: &[String]) -> Html
                 div(class: "card-body") {
                     div(class: "flex items-center gap-2") {
                         h3(class: "card-title text-base m-0") {
-                            "Editing " (c.name.clone())
+                            (editing_heading)
                         }
-                        (status_badge(c.status))
+                        (status_badge(lang, c.status))
                     }
                     div(class: "grid grid-cols-1 md:grid-cols-2 gap-4 mt-2") {
                         label(class: "form-control w-full md:col-span-2") {
-                            div(class: "label") { span(class: "label-text") { "Description" } }
+                            div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-description")) } }
                             input(
                                 name: "description",
                                 type: "text",
@@ -1585,7 +1738,7 @@ fn render_edit_form(c: &rag_db::Collection, embedding_models: &[String]) -> Html
                             // Not `required`: aggregate collections leave this
                             // empty (sources bring their own URLs). The server
                             // only enforces it for versioned collections.
-                            div(class: "label") { span(class: "label-text") { "Git URL (versioned only)" } }
+                            div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-git-url-versioned")) } }
                             input(
                                 name: "git_url",
                                 type: "text",
@@ -1594,7 +1747,7 @@ fn render_edit_form(c: &rag_db::Collection, embedding_models: &[String]) -> Html
                             );
                         }
                         label(class: "form-control w-full") {
-                            div(class: "label") { span(class: "label-text") { "Branch / tag" } }
+                            div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-branch-tag")) } }
                             input(
                                 name: "git_ref",
                                 type: "text",
@@ -1602,27 +1755,24 @@ fn render_edit_form(c: &rag_db::Collection, embedding_models: &[String]) -> Html
                                 class: "input input-bordered w-full"
                             );
                         }
-                        (embedding_model_field(embedding_models, Some(&c.embedding_model)))
+                        (embedding_model_field(lang, embedding_models, Some(&c.embedding_model)))
                         div(class: "form-control w-full") {
                             div(class: "label") {
                                 span(class: "label-text") {
-                                    "Personal access token"
+                                    (t(lang, "rag-label-pat"))
                                     if pat_present {
                                         span(class: "ml-2 badge badge-success badge-outline") {
-                                            "currently set"
+                                            (t(lang, "rag-badge-pat-set"))
                                         }
                                     } else {
-                                        span(class: "ml-2 badge badge-ghost") { "none stored" }
+                                        span(class: "ml-2 badge badge-ghost") { (t(lang, "rag-badge-pat-none")) }
                                     }
                                 }
                             }
                             input(
                                 name: "pat",
                                 type: "password",
-                                placeholder: (
-                                    if pat_present { "leave blank to keep existing" }
-                                    else { "for private repos" }
-                                ),
+                                placeholder: (pat_placeholder),
                                 class: "input input-bordered w-full"
                             );
                             if pat_present {
@@ -1634,37 +1784,37 @@ fn render_edit_form(c: &rag_db::Collection, embedding_models: &[String]) -> Html
                                         class: "checkbox checkbox-sm"
                                     );
                                     span(class: "label-text text-sm") {
-                                        "Remove the stored PAT (no longer authenticate)"
+                                        (t(lang, "rag-label-clear-pat"))
                                     }
                                 }
                             }
                         }
                         label(class: "form-control w-full") {
                             div(class: "label") {
-                                span(class: "label-text") { "Include globs" }
+                                span(class: "label-text") { (t(lang, "rag-label-include-globs")) }
                             }
                             input(
                                 name: "include_globs",
                                 type: "text",
                                 value: (include_csv),
-                                placeholder: "*.rs, *.md",
+                                placeholder: (t(lang, "rag-placeholder-include-globs")),
                                 class: "input input-bordered w-full"
                             );
                         }
                         label(class: "form-control w-full") {
                             div(class: "label") {
-                                span(class: "label-text") { "Exclude globs" }
+                                span(class: "label-text") { (t(lang, "rag-label-exclude-globs")) }
                             }
                             input(
                                 name: "exclude_globs",
                                 type: "text",
                                 value: (exclude_csv),
-                                placeholder: "target/, node_modules/",
+                                placeholder: (t(lang, "rag-placeholder-exclude-globs")),
                                 class: "input input-bordered w-full"
                             );
                         }
                         label(class: "form-control w-full") {
-                            div(class: "label") { span(class: "label-text") { "Chunk size" } }
+                            div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-chunk-size")) } }
                             input(
                                 name: "chunk_size",
                                 type: "number",
@@ -1675,7 +1825,7 @@ fn render_edit_form(c: &rag_db::Collection, embedding_models: &[String]) -> Html
                             );
                         }
                         label(class: "form-control w-full") {
-                            div(class: "label") { span(class: "label-text") { "Chunk overlap" } }
+                            div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-chunk-overlap")) } }
                             input(
                                 name: "chunk_overlap",
                                 type: "number",
@@ -1692,9 +1842,9 @@ fn render_edit_form(c: &rag_db::Collection, embedding_models: &[String]) -> Html
                             class: "m-0 inline",
                             "data-on:submit__prevent": (cancel_directive)
                         ) {
-                            button(type: "submit", class: "btn btn-sm btn-outline") { "Cancel" }
+                            button(type: "submit", class: "btn btn-sm btn-outline") { (t(lang, "rag-button-cancel")) }
                         }
-                        button(type: "submit", class: "btn btn-sm btn-primary") { "Save changes" }
+                        button(type: "submit", class: "btn btn-sm btn-primary") { (t(lang, "rag-button-save-changes")) }
                     }
                 }
             }
@@ -1709,18 +1859,18 @@ fn render_edit_form(c: &rag_db::Collection, embedding_models: &[String]) -> Html
 /// text input so the page stays usable in test scaffolding + before any
 /// upstream has reported its first `/models` probe. `selected` pre-fills
 /// the chosen option in edit forms.
-fn embedding_model_field(models: &[String], selected: Option<&str>) -> Html {
+fn embedding_model_field(lang: Lang, models: &[String], selected: Option<&str>) -> Html {
     if models.is_empty() {
         let value = selected.unwrap_or("");
         return html! {
             label(class: "form-control w-full") {
-                div(class: "label") { span(class: "label-text") { "Embedding model" } }
+                div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-embedding-model")) } }
                 input(
                     name: "embedding_model",
                     type: "text",
                     required: "required",
                     value: (value),
-                    placeholder: "no embedding pools configured — type a model id",
+                    placeholder: (t(lang, "rag-placeholder-embedding-model-none")),
                     class: "input input-bordered w-full"
                 );
             }
@@ -1742,7 +1892,7 @@ fn embedding_model_field(models: &[String], selected: Option<&str>) -> Html {
         .map(str::to_string);
     html! {
         label(class: "form-control w-full") {
-            div(class: "label") { span(class: "label-text") { "Embedding model" } }
+            div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-embedding-model")) } }
             select(
                 name: "embedding_model",
                 required: "required",
@@ -1750,12 +1900,12 @@ fn embedding_model_field(models: &[String], selected: Option<&str>) -> Html {
             ) {
                 if selected.is_none() && stale_selected.is_none() {
                     option(value: "", disabled: "disabled", selected: "selected") {
-                        "Choose an embedding model…"
+                        (t(lang, "rag-option-choose-embedding-model"))
                     }
                 }
                 if let Some(stale) = stale_selected.as_ref() {
                     option(value: (stale.clone()), selected: "selected") {
-                        (stale.clone()) " (no longer advertised)"
+                        (stale.clone()) " " (t(lang, "rag-suffix-not-advertised"))
                     }
                 }
                 for (model, is_selected) in options.iter() {
@@ -1772,6 +1922,7 @@ fn embedding_model_field(models: &[String], selected: Option<&str>) -> Html {
 }
 
 fn render_body(
+    lang: Lang,
     list: &[(rag_db::Collection, Vec<rag_db::CollectionRef>)],
     embedding_models: &[String],
 ) -> Html {
@@ -1779,19 +1930,19 @@ fn render_body(
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
             div(class: "flex items-center gap-2 mb-2") {
                 (icons::folder(20))
-                h1(class: "text-2xl font-bold m-0") { "RAG collections" }
+                h1(class: "text-2xl font-bold m-0") { (t(lang, "rag-heading")) }
             }
             p(class: "text-base-content/60 text-sm mb-6") {
-                "Codebases the gateway has indexed. The "
+                (t(lang, "rag-description-prefix")) " "
                 code(class: "font-mono text-xs") { "rag_search" }
-                " tool reaches into these collections to answer questions about the code."
+                " " (t(lang, "rag-description-suffix"))
             }
 
-            (render_create_form(embedding_models))
+            (render_create_form(lang, embedding_models))
 
             section(class: "card border border-base-300") {
                 div(class: "card-body") {
-                    h2(class: "card-title") { "Configured collections" }
+                    h2(class: "card-title") { (t(lang, "rag-collections-heading")) }
                     // Live status: while on the page, poll `/rag/status` and
                     // morph each ref's status row. Catches transitions driven
                     // by the background indexer (cloning → ready/error) without
@@ -1810,12 +1961,12 @@ fn render_body(
                         "data-on-interval__duration.4s": (if list.is_empty() { "" } else { "@get('/rag/status')" })
                     ) {
                         for (c, refs) in list.iter() {
-                            (render_row(c, refs))
+                            (render_row(lang, c, refs))
                         }
                     }
                     if list.is_empty() {
                         p(class: "text-base-content/60 text-sm") {
-                            "No collections yet. Create one above."
+                            (t(lang, "rag-empty-list"))
                         }
                     }
                 }
@@ -1883,7 +2034,7 @@ mod tests {
             rag_db::CollectionStatus::Error,
             Some("Branch 'x' does not exist"),
         );
-        let html = render_ref(&c, &r, Some(&r)).to_string();
+        let html = render_ref(Lang::En, &c, &r, Some(&r)).to_string();
         // (plait HTML-escapes attribute values, so match escaping-safe
         // substrings — the stable id and the endpoint path.)
         assert!(html.contains("rag-ref-42"), "{html}");
@@ -1910,7 +2061,7 @@ mod tests {
         let mut other = cref(2, rag_db::CollectionStatus::Ready, None);
         other.is_primary = false;
 
-        let html = render_ref(&c, &other, Some(&primary)).to_string();
+        let html = render_ref(Lang::En, &c, &other, Some(&primary)).to_string();
         // The non-primary row shows the primary's live status, not its own.
         assert!(
             html.contains("cloning"),
@@ -1946,7 +2097,7 @@ mod tests {
         let mut other = cref(2, rag_db::CollectionStatus::Ready, None);
         other.is_primary = false;
 
-        let html = render_ref(&c, &other, Some(&primary)).to_string();
+        let html = render_ref(Lang::En, &c, &other, Some(&primary)).to_string();
         assert!(
             html.contains("2026-07-06"),
             "non-primary row must show the primary's indexed date, not 'never': {html}"
@@ -1970,7 +2121,7 @@ mod tests {
         let primary = cref(1, rag_db::CollectionStatus::Cloning, None);
         let mut other = cref(2, rag_db::CollectionStatus::Ready, None);
         other.is_primary = false;
-        let html = render_ref(&c, &other, Some(&primary)).to_string();
+        let html = render_ref(Lang::En, &c, &other, Some(&primary)).to_string();
         assert!(
             html.contains("ready"),
             "versioned row shows its own status: {html}"
@@ -1991,7 +2142,7 @@ mod tests {
         c.search_mode = rag_db::SearchMode::Aggregate;
         let mut r = cref(7, rag_db::CollectionStatus::Ready, None);
         r.is_primary = false;
-        let html = render_ref(&c, &r, Some(&r)).to_string();
+        let html = render_ref(Lang::En, &c, &r, Some(&r)).to_string();
         assert!(html.contains("Edit"), "{html}");
         assert!(html.contains("/rag/refs/7/edit-form"), "{html}");
     }
@@ -2005,7 +2156,7 @@ mod tests {
         let mut r = cref(7, rag_db::CollectionStatus::Ready, None);
         r.git_url = Some("https://example.com/org/cifs-utils.git".into());
         r.git_ref = "master".into();
-        let html = render_ref_edit_form(&c, &r).to_string();
+        let html = render_ref_edit_form(Lang::En, &c, &r).to_string();
         assert!(html.contains("/rag/refs/7/update"), "{html}");
         assert!(html.contains("/rag/refs/7/cancel-edit"), "{html}");
         // The current URL + ref are pre-filled so the operator edits, not retypes.
@@ -2020,7 +2171,7 @@ mod tests {
     fn render_body_arms_status_poll_and_log_container() {
         let c = collection();
         let refs = vec![cref(42, rag_db::CollectionStatus::Cloning, None)];
-        let html = render_body(&[(c, refs)], &["embed".into()]).to_string();
+        let html = render_body(Lang::En, &[(c, refs)], &["embed".into()]).to_string();
         assert!(html.contains("data-on-interval__duration.4s"), "{html}");
         assert!(html.contains("/rag/status"), "{html}");
         assert!(html.contains("rag-reflog-42"), "{html}");
@@ -2029,7 +2180,7 @@ mod tests {
     /// An empty list must NOT arm the poll (nothing to watch → no traffic).
     #[test]
     fn render_body_empty_list_does_not_poll() {
-        let html = render_body(&[], &["embed".into()]).to_string();
+        let html = render_body(Lang::En, &[], &["embed".into()]).to_string();
         assert!(!html.contains("/rag/status"), "{html}");
     }
 
@@ -2049,11 +2200,11 @@ mod tests {
             chunks: None,
             duration_ms: Some(12),
         }];
-        let html = render_ref_log(42, &entries).to_string();
+        let html = render_ref_log(Lang::En, 42, &entries).to_string();
         assert!(html.contains("does not exist in the repository"), "{html}");
         assert!(html.contains("error"), "{html}");
 
-        let empty = render_ref_log(42, &[]).to_string();
+        let empty = render_ref_log(Lang::En, 42, &[]).to_string();
         assert!(empty.contains("No indexing events recorded yet"), "{empty}");
     }
 }

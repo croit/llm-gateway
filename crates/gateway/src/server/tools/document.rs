@@ -67,6 +67,7 @@ pub(crate) async fn render_canvas_html(
     session_id: &str,
     active_id: Option<&str>,
     version: Option<i64>,
+    lang: session_core::i18n::Lang,
 ) -> Result<Option<String>, crate::server::db::DbError> {
     let docs = documents::list_for_session(pool, session_id).await?;
     if docs.is_empty() {
@@ -77,7 +78,7 @@ pub(crate) async fn render_canvas_html(
     let Some((doc, ver)) = documents::get_version(pool, session_id, active, version).await? else {
         // Asked for a doc/version that isn't in this session — fall back
         // to the latest document so the panel never renders empty.
-        return Box::pin(render_canvas_html(pool, session_id, None, None)).await;
+        return Box::pin(render_canvas_html(pool, session_id, None, None, lang)).await;
     };
     let all_docs: Vec<(String, String)> = docs
         .iter()
@@ -93,7 +94,9 @@ pub(crate) async fn render_canvas_html(
         content: &ver.content,
         all_docs,
     };
-    Ok(Some(session_core::render::render_document_canvas(&canvas)))
+    Ok(Some(session_core::render::render_document_canvas(
+        &canvas, lang,
+    )))
 }
 
 /// Push the freshly-changed canvas to the live chat page, if anyone's
@@ -109,7 +112,20 @@ async fn live_update(ctx: &ToolContext, session_id: &str, active_id: &str) {
     if fb.broadcast.receiver_count() == 0 {
         return;
     }
-    let html = match render_canvas_html(&ctx.db, session_id, Some(active_id), None).await {
+    // No live HTTP request here (this fires from tool execution, not a page
+    // load) so there's no `lang` cookie to read — falls back to English,
+    // same as `internal_error_html`/`forbidden_html` do for request-less
+    // render paths. The panel picks up the viewer's real language on the
+    // next full page load or nav-patch, both of which do derive it.
+    let html = match render_canvas_html(
+        &ctx.db,
+        session_id,
+        Some(active_id),
+        None,
+        session_core::i18n::Lang::En,
+    )
+    .await
+    {
         Ok(Some(html)) => html,
         // Nothing to show or a transient read error — skip the live patch;
         // the next page load reconciles from the DB.
@@ -907,7 +923,7 @@ mod tests {
         let pool = seeded_pool().await;
         // No documents yet → no panel.
         assert!(
-            render_canvas_html(&pool, "s1", None, None)
+            render_canvas_html(&pool, "s1", None, None, session_core::i18n::Lang::En)
                 .await
                 .unwrap()
                 .is_none()
@@ -927,7 +943,7 @@ mod tests {
         .await
         .unwrap();
 
-        let html = render_canvas_html(&pool, "s1", None, None)
+        let html = render_canvas_html(&pool, "s1", None, None, session_core::i18n::Lang::En)
             .await
             .unwrap()
             .unwrap();
@@ -1062,7 +1078,7 @@ mod tests {
             .await
             .unwrap();
 
-        let html = render_canvas_html(&pool, "s1", None, None)
+        let html = render_canvas_html(&pool, "s1", None, None, session_core::i18n::Lang::En)
             .await
             .unwrap()
             .unwrap();

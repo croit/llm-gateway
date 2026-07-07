@@ -30,6 +30,7 @@ The whole stack:
 | `POST /chat/{id}/cancel` | Flips the worker's cancel flag. Worker observes between upstream chunks and exits to finalize. | session | **SSE** |
 | `POST /chat/{id}/delete` | Removes the conversation (cascades turns + tool_calls) and nav-patches to the next session. | session | **SSE** |
 | `POST /theme/toggle` | Flips the theme cookie and 303s back. | anonymous | 303 redirect |
+| `POST /lang` | Sets the `lang` cookie (EN/DE/FR/ES/RU/ZH) from the submitted `lang` field and 303s back to `next` (same-origin paths only — anything else falls back to `/`). Unlike the theme toggle this is a plain form-post, not an SSE patch: a language change touches every text node on the page, not one icon. Rendered pre-login too (the switcher sits in the bare `layout()` chrome, not just the authed sidebar), so it works from `/login`. See `session_core::i18n` for the `Lang` resolution rules (page renders are cookie-first with `Accept-Language` as a first-visit default; API JSON responses in `json_err(...)` sites use the opposite priority since bearer/CLI clients never carry the cookie). | anonymous | 303 redirect |
 
 Assets (every URL is `?v=<sha256-prefix>` cache-busted):
 

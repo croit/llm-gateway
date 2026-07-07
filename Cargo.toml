@@ -230,6 +230,20 @@ lumis = { version = "0.9", default-features = false, features = [
 ] }
 regex = "1"
 
+# i18n. Fluent (Mozilla's ICU-based message format) — chosen over
+# simpler alternatives (e.g. rust-i18n) because it correctly handles
+# locale plural/grammar rules (notably Russian's one/few/many/other
+# split), which a flat key->string map can't express. `static_loader!`
+# embeds every locale's `.ftl` files into the binary at compile time
+# (via `include_str!`, so cargo tracks edits to existing files
+# automatically; `session-core/build.rs` adds a directory-level
+# `rerun-if-changed` to also catch newly-added locale files, which
+# `include_str!` alone can't see). `fluent-bundle` is pulled in
+# directly (not re-exported by fluent-templates) to construct
+# `FluentValue` args for interpolated/pluralised messages.
+fluent-templates = "0.14"
+fluent-bundle = "0.16"
+
 # In-process vector index for the RAG subsystem. Unum's usearch — a
 # single-header C++ HNSW served via a thin Rust wrapper; the crate's
 # build.rs compiles the C++ into the binary, so no runtime .so / .dylib

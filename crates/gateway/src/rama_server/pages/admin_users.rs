@@ -38,6 +38,7 @@ use super::{
 use session_core::chrome::{
     NavSections, Theme, is_datastar_request, read_body_to_bytes, see_other,
 };
+use session_core::i18n::{Lang, t};
 use session_core::icons;
 
 use crate::rama_server::session::COOKIE_NAME;
@@ -47,6 +48,7 @@ use crate::server::db::{audit, users};
 /// GET /admin/users — the roster + recent impersonation trail.
 pub async fn users_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, admin) = match require_admin_or_403(&state, &req).await {
@@ -61,14 +63,16 @@ pub async fn users_index(State(state): State<Arc<RamaState>>, req: Request) -> R
             return super::internal_error_html(&admin.email, "could not list users");
         }
     };
+    let no_oidc_groups = t(lang, "admin-users-no-oidc-groups");
+    let no_gateway_roles = t(lang, "admin-users-no-gateway-roles");
     let rows: Vec<UserRow> = all
         .iter()
         .map(|u| UserRow {
             id: u.id.clone(),
             email: u.email.clone(),
             name: u.name.clone().unwrap_or_default(),
-            oidc_roles: join_or(&u.roles, "none"),
-            rbac_roles: join_or(&state.rbac.role_ids_for(&u.roles), "none granted"),
+            oidc_roles: join_or(&u.roles, &no_oidc_groups),
+            rbac_roles: join_or(&state.rbac.role_ids_for(&u.roles), &no_gateway_roles),
             created: u.created_at.strftime("%Y-%m-%d").to_string(),
             is_self: u.id == admin.id,
         })
@@ -76,14 +80,16 @@ pub async fn users_index(State(state): State<Arc<RamaState>>, req: Request) -> R
     let events = audit::recent(&state.db, 20).await.unwrap_or_default();
 
     let allow_impersonation = state.config.gateway.allow_impersonation;
-    let body = render_body(&rows, &events, allow_impersonation);
+    let body = render_body(lang, &rows, &events, allow_impersonation);
     let chat = fetch_sidebar_chat(&state, &admin.id, None).await;
+    let title = t(lang, "admin-users-page-title");
     nav_or_html_page(
         datastar,
         theme,
+        lang,
         nav,
         NavItem::Users,
-        "Users — LLM Gateway",
+        &title,
         &admin.email,
         is_admin(&state, &admin),
         session.impersonator_id.is_some(),
@@ -259,26 +265,31 @@ struct UserRow {
     is_self: bool,
 }
 
-fn render_body(rows: &[UserRow], events: &[audit::ImpersonationEvent], allow: bool) -> Html {
-    let user_rows: Vec<Html> = rows.iter().map(|r| render_user_row(r, allow)).collect();
+fn render_body(
+    lang: Lang,
+    rows: &[UserRow],
+    events: &[audit::ImpersonationEvent],
+    allow: bool,
+) -> Html {
+    let user_rows: Vec<Html> = rows
+        .iter()
+        .map(|r| render_user_row(lang, r, allow))
+        .collect();
     html! {
         section(class: "max-w-5xl mx-auto p-4 sm:p-6 flex flex-col gap-4") {
             header(class: "flex flex-col gap-1") {
-                h1(class: "text-2xl font-bold") { "Users" }
+                h1(class: "text-2xl font-bold") { (t(lang, "admin-users-heading")) }
                 if allow {
                     p(class: "text-base-content/70 text-sm") {
-                        "Everyone who has signed in to this gateway, with their identity-provider \
-                         groups and the gateway roles those map to. "
-                        strong { "Impersonate" }
-                        " starts a session that behaves exactly as that user — useful for \
-                         reproducing what they see. Every impersonation is logged below."
+                        (t(lang, "admin-users-desc-allowed-prefix")) " "
+                        strong { (t(lang, "admin-users-impersonate-button")) }
+                        " " (t(lang, "admin-users-desc-allowed-suffix"))
                     }
                 } else {
                     p(class: "text-base-content/70 text-sm") {
-                        "Everyone who has signed in to this gateway, with their identity-provider \
-                         groups and the gateway roles those map to. Impersonation is "
-                        strong { "disabled" }
-                        " on this gateway (`allow_impersonation = false`)."
+                        (t(lang, "admin-users-desc-disabled-prefix")) " "
+                        strong { (t(lang, "admin-users-disabled-label")) }
+                        " " (t(lang, "admin-users-desc-disabled-suffix"))
                     }
                 }
             }
@@ -286,11 +297,11 @@ fn render_body(rows: &[UserRow], events: &[audit::ImpersonationEvent], allow: bo
                 table(class: "table table-sm") {
                     thead {
                         tr {
-                            th { "User" }
-                            th { "OIDC groups" }
-                            th { "Gateway roles" }
-                            th { "Joined" }
-                            th(class: "text-right") { "Action" }
+                            th { (t(lang, "admin-users-col-user")) }
+                            th { (t(lang, "admin-users-col-oidc-groups")) }
+                            th { (t(lang, "admin-users-col-gateway-roles")) }
+                            th { (t(lang, "admin-users-col-joined")) }
+                            th(class: "text-right") { (t(lang, "admin-users-col-action")) }
                         }
                     }
                     tbody {
@@ -300,13 +311,13 @@ fn render_body(rows: &[UserRow], events: &[audit::ImpersonationEvent], allow: bo
                     }
                 }
             }
-            (render_audit(events))
+            (render_audit(lang, events))
         }
     }
     .to_html()
 }
 
-fn render_user_row(r: &UserRow, allow: bool) -> Html {
+fn render_user_row(lang: Lang, r: &UserRow, allow: bool) -> Html {
     let email = r.email.clone();
     let name = r.name.clone();
     let oidc = r.oidc_roles.clone();
@@ -328,13 +339,13 @@ fn render_user_row(r: &UserRow, allow: bool) -> Html {
             td(class: "text-sm whitespace-nowrap") { (created) }
             td(class: "text-right") {
                 if is_self {
-                    span(class: "badge badge-ghost") { "you" }
+                    span(class: "badge badge-ghost") { (t(lang, "admin-users-you-badge")) }
                 } else if allow {
                     form(method: "post", action: "/admin/users/impersonate", class: "m-0 inline") {
                         input(type: "hidden", name: "user_id", value: (id));
                         button(type: "submit", class: "btn btn-outline btn-sm") {
                             (icons::users(14))
-                            span { "Impersonate" }
+                            span { (t(lang, "admin-users-impersonate-button")) }
                         }
                     }
                 } else {
@@ -346,25 +357,25 @@ fn render_user_row(r: &UserRow, allow: bool) -> Html {
     .to_html()
 }
 
-fn render_audit(events: &[audit::ImpersonationEvent]) -> Html {
+fn render_audit(lang: Lang, events: &[audit::ImpersonationEvent]) -> Html {
     let rows: Vec<Html> = events.iter().map(render_audit_row).collect();
     html! {
         section(class: "card border border-base-300 bg-base-100 mt-2") {
             div(class: "card-body gap-2") {
-                h2(class: "card-title text-base") { "Recent impersonation activity" }
+                h2(class: "card-title text-base") { (t(lang, "admin-users-audit-heading")) }
                 if rows.is_empty() {
                     p(class: "text-base-content/60 text-sm") {
-                        "No impersonations recorded yet."
+                        (t(lang, "admin-users-audit-empty"))
                     }
                 } else {
                     div(class: "overflow-x-auto") {
                         table(class: "table table-sm") {
                             thead {
                                 tr {
-                                    th { "When" }
-                                    th { "Action" }
-                                    th { "Admin" }
-                                    th { "Target" }
+                                    th { (t(lang, "admin-users-audit-col-when")) }
+                                    th { (t(lang, "admin-users-audit-col-action")) }
+                                    th { (t(lang, "admin-users-audit-col-admin")) }
+                                    th { (t(lang, "admin-users-audit-col-target")) }
                                 }
                             }
                             tbody {

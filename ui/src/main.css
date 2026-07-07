@@ -1880,6 +1880,28 @@
         overflow: hidden;
         padding: 0.35rem;
     }
+    /* Language-switcher popover (session_core::chrome). Same shape as
+     * export-panel; the anchor direction flips depending on whether the
+     * trigger sits near the top of the viewport (login page) or the
+     * bottom (sidebar user row) — same reasoning as effort-panel vs
+     * export-panel above. */
+    .lang-panel {
+        position: absolute;
+        right: 0;
+        width: 11rem;
+        max-width: calc(100vw - 2rem);
+        z-index: 30;
+        overflow: hidden;
+        padding: 0.35rem;
+    }
+    .lang-panel--down {
+        top: 100%;
+        margin-top: 0.35rem;
+    }
+    .lang-panel--up {
+        bottom: 100%;
+        margin-bottom: 0.35rem;
+    }
     /* One list item inside the thinking / export popovers. */
     .chat-pop-item {
         display: flex;

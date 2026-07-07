@@ -27,6 +27,7 @@ use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_adm
 use session_core::chrome::{
     NavSections, Theme, is_datastar_request, read_body_to_bytes, see_other,
 };
+use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 /// GET /admin/skills/download?skill=<name> — re-package an installed skill as
@@ -91,6 +92,7 @@ struct SkillView {
 /// skill's detail to show; defaults to the first loaded skill.
 pub async fn skills_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
@@ -102,6 +104,7 @@ pub async fn skills_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         &state,
         datastar,
         theme,
+        lang,
         nav,
         &user,
         session.impersonator_id.is_some(),
@@ -116,6 +119,7 @@ pub async fn skills_index(State(state): State<Arc<RamaState>>, req: Request) -> 
 /// re-renders the page with an inline error.
 pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
@@ -127,11 +131,12 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
             &state,
             datastar,
             theme,
+            lang,
             nav,
             &user,
             session.impersonator_id.is_some(),
             None,
-            Some("Skills aren't configured ([skills] dir is unset)."),
+            Some(&t(lang, "skills-error-not-configured")),
         )
         .await;
     };
@@ -150,6 +155,7 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
                 &state,
                 datastar,
                 theme,
+                lang,
                 nav,
                 &user,
                 session.impersonator_id.is_some(),
@@ -166,11 +172,12 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
                 &state,
                 datastar,
                 theme,
+                lang,
                 nav,
                 &user,
                 session.impersonator_id.is_some(),
                 None,
-                Some("No file was uploaded — pick a .skill archive."),
+                Some(&t(lang, "skills-error-no-file")),
             )
             .await;
         }
@@ -179,6 +186,7 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
                 &state,
                 datastar,
                 theme,
+                lang,
                 nav,
                 &user,
                 session.impersonator_id.is_some(),
@@ -192,11 +200,16 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
     match store.install_archive(&bytes) {
         Ok(name) => see_other(&format!("/admin/skills?skill={name}")),
         Err(err) => {
-            let msg = format!("Could not install skill: {err}");
+            let msg = t_args(
+                lang,
+                "skills-error-install-failed",
+                &i18n::args([("error", err.to_string().into())]),
+            );
             render_page(
                 &state,
                 datastar,
                 theme,
+                lang,
                 nav,
                 &user,
                 session.impersonator_id.is_some(),
@@ -213,6 +226,7 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
 /// back to the list.
 pub async fn skills_delete(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
     let (session, user) = match require_admin_or_403(&state, &req).await {
@@ -230,6 +244,7 @@ pub async fn skills_delete(State(state): State<Arc<RamaState>>, req: Request) ->
                 &state,
                 datastar,
                 theme,
+                lang,
                 nav,
                 &user,
                 session.impersonator_id.is_some(),
@@ -242,11 +257,16 @@ pub async fn skills_delete(State(state): State<Arc<RamaState>>, req: Request) ->
     let form: DeleteForm = match serde_urlencoded::from_bytes(&body) {
         Ok(f) => f,
         Err(err) => {
-            let msg = format!("Bad delete request: {err}");
+            let msg = t_args(
+                lang,
+                "skills-error-bad-delete-request",
+                &i18n::args([("error", err.to_string().into())]),
+            );
             return render_page(
                 &state,
                 datastar,
                 theme,
+                lang,
                 nav,
                 &user,
                 session.impersonator_id.is_some(),
@@ -268,11 +288,16 @@ pub async fn skills_delete(State(state): State<Arc<RamaState>>, req: Request) ->
             see_other("/admin/skills")
         }
         Err(err) => {
-            let msg = format!("Could not delete skill: {err}");
+            let msg = t_args(
+                lang,
+                "skills-error-delete-failed",
+                &i18n::args([("error", err.to_string().into())]),
+            );
             render_page(
                 &state,
                 datastar,
                 theme,
+                lang,
                 nav,
                 &user,
                 session.impersonator_id.is_some(),
@@ -441,6 +466,7 @@ async fn render_page(
     state: &RamaState,
     datastar: bool,
     theme: Theme,
+    lang: Lang,
     nav: NavSections,
     user: &User,
     impersonating: bool,
@@ -458,14 +484,16 @@ async fn render_page(
         None => "/admin/skills".to_string(),
     };
     let roles = all_role_ids(state);
-    let body = render_body(&views, selected, dir.as_deref(), &roles, error);
+    let body = render_body(lang, &views, selected, dir.as_deref(), &roles, error);
     let chat = fetch_sidebar_chat(state, &user.id, None).await;
+    let title = t(lang, "skills-page-title");
     nav_or_html_page(
         datastar,
         theme,
+        lang,
         nav,
         NavItem::Skills,
-        "Skills — LLM Gateway",
+        &title,
         &user.email,
         is_admin(state, user),
         impersonating,
@@ -530,6 +558,7 @@ fn display_dir(dir: &std::path::Path) -> String {
 }
 
 fn render_body(
+    lang: Lang,
     skills: &[SkillView],
     selected: usize,
     dir: Option<&str>,
@@ -540,14 +569,14 @@ fn render_body(
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
             div(class: "flex items-center gap-2") {
                 (icons::sliders(20))
-                h1(class: "text-2xl font-bold m-0") { "Skills" }
+                h1(class: "text-2xl font-bold m-0") { (t(lang, "skills-heading")) }
             }
             p(class: "text-base-content/60 text-sm mt-1 mb-4") {
-                "Operator-installed guidance the chat model loads on demand via the "
+                (t(lang, "skills-intro-part1")) " "
                 code(class: "font-mono text-xs") { "read_skill" }
-                " tool. Upload a "
+                " " (t(lang, "skills-intro-part2")) " "
                 code(class: "font-mono text-xs") { ".skill" }
-                " archive below — it's available immediately, no restart."
+                " " (t(lang, "skills-intro-part3"))
             }
 
             if let Some(error) = error {
@@ -555,18 +584,17 @@ fn render_body(
             }
 
             div(class: "flex gap-6 items-start") {
-                (render_rail(skills, selected, dir))
+                (render_rail(lang, skills, selected, dir))
                 if skills.is_empty() {
                     section(class: "flex-1 min-w-0 text-base-content/60 text-sm pt-2") {
                         if dir.is_some() {
-                            "No skills loaded yet. Upload a .skill archive to add one."
+                            (t(lang, "skills-empty-loaded"))
                         } else {
-                            "Skills aren't configured. Set [skills] dir in the gateway config \
-                             and restart to enable them."
+                            (t(lang, "skills-empty-not-configured"))
                         }
                     }
                 } else {
-                    (render_detail(&skills[selected], all_roles))
+                    (render_detail(lang, &skills[selected], all_roles))
                 }
             }
         }
@@ -576,7 +604,7 @@ fn render_body(
 
 /// Left rail: upload control, every loaded skill, the selected one expanded
 /// to its file tree.
-fn render_rail(skills: &[SkillView], selected: usize, dir: Option<&str>) -> Html {
+fn render_rail(lang: Lang, skills: &[SkillView], selected: usize, dir: Option<&str>) -> Html {
     html! {
         aside(class: "w-60 shrink-0 sticky top-6 flex flex-col gap-3") {
             form(
@@ -587,7 +615,7 @@ fn render_rail(skills: &[SkillView], selected: usize, dir: Option<&str>) -> Html
             ) {
                 div(class: "card-body p-3 gap-2") {
                     div(class: "text-xs uppercase tracking-wide text-base-content/50") {
-                        "Add a skill"
+                        (t(lang, "skills-upload-heading"))
                     }
                     input(
                         type: "file",
@@ -597,7 +625,7 @@ fn render_rail(skills: &[SkillView], selected: usize, dir: Option<&str>) -> Html
                         class: "file-input file-input-sm file-input-bordered w-full"
                     );
                     button(type: "submit", class: "btn btn-sm btn-primary w-full") {
-                        "Upload .skill"
+                        (t(lang, "skills-upload-button"))
                     }
                 }
             }
@@ -605,10 +633,10 @@ fn render_rail(skills: &[SkillView], selected: usize, dir: Option<&str>) -> Html
             div(class: "card border border-base-300") {
                 div(class: "card-body p-2") {
                     div(class: "px-2 py-1 text-xs uppercase tracking-wide text-base-content/50") {
-                        "Loaded skills"
+                        (t(lang, "skills-loaded-heading"))
                     }
                     if skills.is_empty() {
-                        div(class: "px-2 py-1 text-sm text-base-content/50") { "None yet" }
+                        div(class: "px-2 py-1 text-sm text-base-content/50") { (t(lang, "skills-none-yet")) }
                     }
                     ul(class: "flex flex-col") {
                         for (i, s) in skills.iter().enumerate() {
@@ -628,7 +656,7 @@ fn render_rail(skills: &[SkillView], selected: usize, dir: Option<&str>) -> Html
                     }
                     if let Some(dir) = dir {
                         div(class: "px-2 pt-2 mt-1 border-t border-base-300 text-xs text-base-content/40 break-all") {
-                            "Source: " (dir)
+                            (t(lang, "skills-source-prefix")) " " (dir)
                         }
                     }
                 }
@@ -688,10 +716,15 @@ const GRANT_DIALOG_ID: &str = "skill-grant-dialog";
 
 /// Right pane: metadata header (+ delete), the editable "Granted to" control,
 /// and the rendered SKILL.md.
-fn render_detail(s: &SkillView, all_roles: &[String]) -> Html {
+fn render_detail(lang: Lang, s: &SkillView, all_roles: &[String]) -> Html {
     let body_html = s.body_html.as_str();
     let no_grants = s.config_roles.is_empty() && s.granted_roles.is_empty();
     let open_dialog = format!("document.getElementById('{GRANT_DIALOG_ID}').showModal()");
+    let files_count = t_args(
+        lang,
+        "skills-files-count",
+        &i18n::args([("count", s.files.len().to_string().into())]),
+    );
     html! {
         section(class: "flex-1 min-w-0") {
             div(class: "flex items-start justify-between gap-3") {
@@ -703,18 +736,18 @@ fn render_detail(s: &SkillView, all_roles: &[String]) -> Html {
                     a(
                         href: (format!("/admin/skills/download?skill={}", s.name)),
                         class: "btn btn-sm btn-ghost",
-                        title: "Download this skill as a .skill archive"
+                        title: (t(lang, "skills-download-title"))
                     ) {
-                        (icons::download(14)) "Download"
+                        (icons::download(14)) (t(lang, "skills-download-button"))
                     }
                     form(method: "post", action: "/admin/skills/delete") {
                         input(type: "hidden", name: "name", value: (&s.name));
                         button(
                             type: "submit",
                             class: "btn btn-sm btn-ghost text-error",
-                            title: "Remove this skill"
+                            title: (t(lang, "skills-delete-title"))
                         ) {
-                            (icons::trash(14)) "Delete"
+                            (icons::trash(14)) (t(lang, "skills-delete-button"))
                         }
                     }
                 }
@@ -723,14 +756,14 @@ fn render_detail(s: &SkillView, all_roles: &[String]) -> Html {
             div(class: "flex flex-wrap items-start gap-x-8 gap-y-2 mt-2") {
                 div {
                     div(class: "text-xs uppercase tracking-wide text-base-content/50 mb-1") {
-                        "Granted to"
+                        (t(lang, "skills-granted-to-heading"))
                     }
                     div(class: "flex flex-wrap items-center gap-1") {
                         // Config grants — read-only here (managed in gateway.toml).
                         for role in s.config_roles.iter() {
                             span(
                                 class: "badge badge-sm badge-outline",
-                                title: "Granted in the gateway config ([[roles]].skills)"
+                                title: (t(lang, "skills-granted-config-title"))
                             ) { (role) }
                         }
                         // UI overlay grants — what the dialog edits.
@@ -741,36 +774,36 @@ fn render_detail(s: &SkillView, all_roles: &[String]) -> Html {
                             button(
                                 type: "button",
                                 class: "badge badge-sm badge-warning badge-outline cursor-pointer",
-                                title: "Choose which roles can use this skill",
+                                title: (t(lang, "skills-choose-access-title")),
                                 "data-on:click": (open_dialog.clone())
                             ) {
-                                "no role grants this — set access"
+                                (t(lang, "skills-no-grants-warning"))
                             }
                         } else {
                             button(
                                 type: "button",
                                 class: "btn btn-xs btn-ghost gap-1",
-                                title: "Edit which roles can use this skill",
+                                title: (t(lang, "skills-edit-access-title")),
                                 "data-on:click": (open_dialog.clone())
                             ) {
-                                (icons::sliders(12)) "Edit access"
+                                (icons::sliders(12)) (t(lang, "skills-edit-access-button"))
                             }
                         }
                     }
                 }
                 div {
                     div(class: "text-xs uppercase tracking-wide text-base-content/50 mb-1") {
-                        "Files"
+                        (t(lang, "skills-files-heading"))
                     }
                     div(class: "text-sm text-base-content/80") {
-                        (format!("{} bundled", s.files.len()))
+                        (files_count)
                     }
                 }
             }
 
             div(class: "mt-4") {
                 div(class: "text-xs uppercase tracking-wide text-base-content/50 mb-1") {
-                    "Description"
+                    (t(lang, "skills-description-heading"))
                 }
                 p(class: "text-sm text-base-content/80 m-0") { (&s.description) }
             }
@@ -782,7 +815,7 @@ fn render_detail(s: &SkillView, all_roles: &[String]) -> Html {
                 }
             }
 
-            (render_grant_dialog(s, all_roles))
+            (render_grant_dialog(lang, s, all_roles))
         }
     }
     .to_html()
@@ -793,7 +826,7 @@ fn render_detail(s: &SkillView, all_roles: &[String]) -> Html {
 /// back, so it works the same way as the upload/delete forms. Each configured
 /// role is a checkbox; roles granted by config show checked-and-disabled (they
 /// can't be edited here), the rest reflect the live overlay grant.
-fn render_grant_dialog(s: &SkillView, all_roles: &[String]) -> Html {
+fn render_grant_dialog(lang: Lang, s: &SkillView, all_roles: &[String]) -> Html {
     let close = format!("document.getElementById('{GRANT_DIALOG_ID}').close()");
     html! {
         dialog(
@@ -808,23 +841,24 @@ fn render_grant_dialog(s: &SkillView, all_roles: &[String]) -> Html {
                 input(type: "hidden", name: "skill", value: (&s.name));
                 div(class: "p-4 flex flex-col gap-3") {
                     div {
-                        h3(class: "text-base font-semibold m-0") { "Who can use this skill?" }
+                        h3(class: "text-base font-semibold m-0") { (t(lang, "skills-grant-dialog-heading")) }
                         p(class: "text-xs text-base-content/60 mt-1 mb-0") {
-                            "Pick the roles allowed to load "
+                            (t(lang, "skills-grant-dialog-desc-part1")) " "
                             span(class: "font-mono") { (&s.name) }
-                            ". Everyone with a selected role gets it."
+                            (t(lang, "skills-grant-dialog-desc-part2"))
                         }
                     }
                     div(class: "flex flex-col") {
                         if all_roles.is_empty() {
                             p(class: "text-sm text-base-content/60 m-0") {
-                                "No roles are defined in the gateway config. Add "
+                                (t(lang, "skills-grant-dialog-no-roles-part1")) " "
                                 code(class: "font-mono text-xs") { "[[roles]]" }
-                                " entries before you can grant access."
+                                " " (t(lang, "skills-grant-dialog-no-roles-part2"))
                             }
                         }
                         for role in all_roles.iter() {
                             (render_role_row(
+                                lang,
                                 role,
                                 s.config_roles.iter().any(|r| r == role),
                                 s.granted_roles.iter().any(|r| r == role),
@@ -836,8 +870,8 @@ fn render_grant_dialog(s: &SkillView, all_roles: &[String]) -> Html {
                             type: "button",
                             class: "btn btn-sm btn-ghost",
                             "data-on:click": (close)
-                        ) { "Cancel" }
-                        button(type: "submit", class: "btn btn-sm btn-primary") { "Save access" }
+                        ) { (t(lang, "skills-cancel-button")) }
+                        button(type: "submit", class: "btn btn-sm btn-primary") { (t(lang, "skills-save-access-button")) }
                     }
                 }
             }
@@ -851,7 +885,7 @@ fn render_grant_dialog(s: &SkillView, all_roles: &[String]) -> Html {
 /// toggled — they're authoritative and live in TOML); editable roles carry
 /// `name="role"` so they post back, pre-checked when the overlay already grants
 /// them.
-fn render_role_row(role: &str, from_config: bool, granted: bool) -> Html {
+fn render_role_row(lang: Lang, role: &str, from_config: bool, granted: bool) -> Html {
     html! {
         label(class: "flex items-center gap-2 py-1.5 cursor-pointer") {
             if from_config {
@@ -866,7 +900,7 @@ fn render_role_row(role: &str, from_config: bool, granted: bool) -> Html {
             }
             span(class: "text-sm font-mono") { (role) }
             if from_config {
-                span(class: "badge badge-sm badge-outline ml-auto") { "from config" }
+                span(class: "badge badge-sm badge-outline ml-auto") { (t(lang, "skills-from-config-badge")) }
             }
         }
     }
@@ -948,7 +982,8 @@ mod tests {
     /// contract so a rename can't silently break the dialog.
     #[test]
     fn detail_wires_dialog_open_to_the_grant_form_endpoint() {
-        let html = render_detail(&view(&[], &[]), &["eng".into(), "admin".into()]).to_string();
+        let html =
+            render_detail(Lang::En, &view(&[], &[]), &["eng".into(), "admin".into()]).to_string();
         // The dialog exists with the canonical id.
         assert!(html.contains(&format!("id=\"{GRANT_DIALOG_ID}\"")));
         // The id appears three times — on the dialog, in the open directive,
@@ -970,7 +1005,7 @@ mod tests {
 
     #[test]
     fn detail_with_no_grants_shows_the_clickable_warning() {
-        let html = render_detail(&view(&[], &[]), &["eng".into()]).to_string();
+        let html = render_detail(Lang::En, &view(&[], &[]), &["eng".into()]).to_string();
         assert!(html.contains("no role grants this"));
         // Both checkboxes for editable roles carry name="role".
         assert!(html.contains("name=\"role\""));
@@ -981,6 +1016,7 @@ mod tests {
         // `admin` is granted in config (read-only), `eng` via the overlay
         // (editable, pre-checked), `qa` ungranted (editable, unchecked).
         let html = render_detail(
+            Lang::En,
             &view(&["admin"], &["eng"]),
             &["admin", "eng", "qa"]
                 .iter()

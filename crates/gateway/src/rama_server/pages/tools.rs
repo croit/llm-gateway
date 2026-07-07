@@ -28,6 +28,7 @@ use super::{
 use session_core::chrome::{
     Flash, FlashKind, NavSections, Theme, is_datastar_request, sse_patch, sse_response, sse_toast,
 };
+use session_core::i18n::{self, Lang, t, t_args};
 
 use crate::rama_server::state::RamaState;
 use crate::server::db::{user_tool_prefs, users};
@@ -53,6 +54,7 @@ const LOCATION_TOOL_ID: &str = "get_user_location";
 /// GET /tools — render the caller's tool list with a toggle per entry.
 pub async fn tools_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
 
@@ -75,22 +77,28 @@ pub async fn tools_index(State(state): State<Arc<RamaState>>, req: Request) -> R
             .flatten();
         Some(match stored {
             Some(loc) => match loc.accuracy {
-                Some(a) => format!("Shared — accuracy ±{a:.0} m."),
-                None => "Shared.".to_string(),
+                Some(a) => t_args(
+                    lang,
+                    "tools-location-shared-accuracy",
+                    &i18n::args([("accuracy", format!("{a:.0}").into())]),
+                ),
+                None => t(lang, "tools-location-shared"),
             },
-            None => "Not shared.".to_string(),
+            None => t(lang, "tools-location-not-shared"),
         })
     } else {
         None
     };
-    let body = render_tools_body(&entries, &disabled, geo_label.as_deref());
+    let body = render_tools_body(lang, &entries, &disabled, geo_label.as_deref());
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
+    let title = t(lang, "tools-page-title");
     nav_or_html_page(
         datastar,
         theme,
+        lang,
         nav,
         NavItem::Tools,
-        "Tools — LLM Gateway",
+        &title,
         &user.email,
         is_admin(&state, &user),
         session.impersonator_id.is_some(),
@@ -122,6 +130,7 @@ struct ToggleForm {
 /// form (checkbox presence), so double-clicks converge rather than
 /// race a read-modify-write.
 pub async fn tools_toggle(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
     let (_session, user) = match require_session_or_redirect(&state, &req).await {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -136,24 +145,33 @@ pub async fn tools_toggle(State(state): State<Arc<RamaState>>, req: Request) -> 
     // page never offers others, so a request for one is bogus.
     let entries = entries_for_user(&state, &user.roles);
     let Some(entry) = entries.into_iter().find(|e| e.key == form.tool_key) else {
-        return toast(FlashKind::Error, "unknown tool");
+        return toast(FlashKind::Error, t(lang, "tools-toast-unknown-tool"));
     };
 
     let enabled = form.enabled.is_some();
     if let Err(err) = user_tool_prefs::set(&state.db, &user.id, &entry.key, enabled).await {
         tracing::warn!(error = %err, tool_key = %entry.key, "tool pref save");
-        return toast(FlashKind::Error, "could not save preference");
+        return toast(FlashKind::Error, t(lang, "tools-toast-save-error"));
     }
 
     let ctx = toggle_ctx();
     let selector = format!("#{}", ctx.row_id(&entry.key));
     let row_html = tool_toggles::render_toggle_row(&entry, enabled, &ctx).to_string();
-    let verb = if enabled { "enabled" } else { "disabled" };
+    let toast_key = if enabled {
+        "tools-toast-enabled"
+    } else {
+        "tools-toast-disabled"
+    };
+    let message = t_args(
+        lang,
+        toast_key,
+        &i18n::args([("name", entry.title.clone().into())]),
+    );
     sse_response(&[
         sse_patch(Some(&selector), Some("outer"), &row_html),
         sse_toast(&Flash {
             kind: FlashKind::Success,
-            message: format!("{} {}.", entry.title, verb),
+            message,
         }),
     ])
 }
@@ -162,6 +180,7 @@ pub async fn tools_toggle(State(state): State<Arc<RamaState>>, req: Request) -> 
 // Rendering
 
 fn render_tools_body(
+    lang: Lang,
     entries: &[ToolEntry],
     disabled: &HashSet<String>,
     geo_label: Option<&str>,
@@ -171,19 +190,18 @@ fn render_tools_body(
     let sections = tool_toggles::render_toggle_sections(entries, disabled, &toggle_ctx());
     html! {
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
-        h1(class: "text-2xl font-bold mb-2") { "Tools" }
+        h1(class: "text-2xl font-bold mb-2") { (t(lang, "tools-heading")) }
         p(class: "text-base-content/60 text-sm mb-6") {
-            "Turn the tools the assistant may use on or off. Changes apply "
-            "to your account only and take effect on your next message."
+            (t(lang, "tools-description"))
         }
         if geo_label.is_some() {
-            (render_location_card(geo_label.unwrap_or("")))
+            (render_location_card(lang, geo_label.unwrap_or("")))
         }
         if entries.is_empty() {
             div(class: "card border border-base-300") {
                 div(class: "card-body") {
                     p(class: "text-base-content/60 text-sm m-0") {
-                        "Your roles don't grant any tools."
+                        (t(lang, "tools-none-granted"))
                     }
                 }
             }
@@ -201,29 +219,26 @@ fn render_tools_body(
 /// not an automatic post) and `POST`s / `DELETE`s `/api/v0/me/location`.
 /// `status` is the server-rendered initial label; `geo.ts` updates the
 /// `[data-geo-status]` span live after each action.
-fn render_location_card(status: &str) -> Html {
+fn render_location_card(lang: Lang, status: &str) -> Html {
     let status = status.to_string();
     html! {
         section(class: "card border border-base-300 mb-6") {
             div(class: "card-body") {
-                h2(class: "card-title text-base") { "Location" }
+                h2(class: "card-title text-base") { (t(lang, "tools-location-heading")) }
                 p(class: "text-base-content/60 text-sm m-0") {
-                    "Share your device's precise location so the assistant can answer questions "
-                    "like \"what's the weather here?\". It's used only for your tool calls and "
-                    "you can stop sharing anytime. Without it, the assistant falls back to an "
-                    "approximate location derived from your IP address."
+                    (t(lang, "tools-location-description"))
                 }
                 div(class: "flex items-center gap-3 mt-3 flex-wrap") {
                     button(
                         type: "button",
                         class: "btn btn-sm btn-primary",
                         "data-on:click": "window.geo.share(el)"
-                    ) { "Share precise location" }
+                    ) { (t(lang, "tools-location-share-button")) }
                     button(
                         type: "button",
                         class: "btn btn-sm btn-ghost",
                         "data-on:click": "window.geo.forget(el)"
-                    ) { "Stop sharing" }
+                    ) { (t(lang, "tools-location-stop-button")) }
                     span(class: "text-xs text-base-content/60", "data-geo-status": "") {
                         (status)
                     }

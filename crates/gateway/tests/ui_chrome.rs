@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 croit GmbH
 
-//! /theme/toggle + flash cookie roundtrip + the session-authed
-//! transcription mirror. All three are part of the chrome the chat
-//! page expects.
+//! /theme/toggle + /lang + flash cookie roundtrip + the session-authed
+//! transcription mirror. All are part of the chrome the chat page expects.
 
 mod common;
 
@@ -87,6 +86,76 @@ async fn theme_toggle_returns_sse_patch_and_sets_cookie() {
     assert!(
         theme_cookie.starts_with("theme=dark;"),
         "expected theme=dark, got `{theme_cookie}`"
+    );
+}
+
+#[tokio::test]
+async fn lang_set_sets_cookie_and_redirects_to_next() {
+    let state = common::state_with_chat_pool("http://unused.invalid").await;
+    let app = router(Arc::new(state));
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/lang")
+        .body(Body::from("lang=de&next=%2Ftokens"))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp
+        .headers()
+        .get(rama::http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    assert_eq!(location, "/tokens");
+    let cookies = set_cookie_values(&resp);
+    let lang_cookie = cookies
+        .iter()
+        .find(|c| c.starts_with("lang="))
+        .expect("lang cookie set");
+    assert!(
+        lang_cookie.starts_with("lang=de;"),
+        "expected lang=de, got `{lang_cookie}`"
+    );
+}
+
+#[tokio::test]
+async fn lang_set_rejects_open_redirect_and_falls_back_to_root() {
+    let state = common::state_with_chat_pool("http://unused.invalid").await;
+    let app = router(Arc::new(state));
+
+    // A protocol-relative `next` (`//evil.example/...`) must not be honoured
+    // — falls back to `/` instead of letting the redirect leave the site.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/lang")
+        .body(Body::from("lang=fr&next=%2F%2Fevil.example%2Fx"))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let location = resp
+        .headers()
+        .get(rama::http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap();
+    assert_eq!(location, "/", "open-redirect target must be rejected");
+}
+
+#[tokio::test]
+async fn lang_set_ignores_unknown_language_code() {
+    let state = common::state_with_chat_pool("http://unused.invalid").await;
+    let app = router(Arc::new(state));
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/lang")
+        .body(Body::from("lang=xx&next=%2Ftokens"))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let cookies = set_cookie_values(&resp);
+    assert!(
+        !cookies.iter().any(|c| c.starts_with("lang=")),
+        "an unsupported language code must not set the lang cookie: {cookies:?}"
     );
 }
 
