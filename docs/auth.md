@@ -133,4 +133,4 @@ The distinction between API routes (`/v1/*`, `/api/v0/*`) and page routes (`/`, 
 
 - **Refresh tokens between CLI and gateway** — re-login is acceptable for a 90-day TTL.
 - **Service-to-service auth** — no machine accounts yet. When we add them, they're a separate token kind with their own table and explicit RBAC config.
-- **Token scopes** — every token has full access to its user's permitted tools/models. Scoped tokens (e.g. "transcription-only") are a future feature.
+- **Per-model token scopes** — a token can already be scoped to a subset of its user's *tools* (and MCP ask/off policy) from the `/tokens` page; scoping a token to a subset of *models* (e.g. "transcription-only") is not yet implemented — every token can reach all of its user's permitted models.

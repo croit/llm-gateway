@@ -32,16 +32,16 @@ Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests acro
 - **Model aliases + fallback** — give clients a stable name (`alias = ["qwen"]` on a backend) that routes to whatever real model is loaded, so swapping the model needs no client change; the same alias on several backends is a load-balanced group. Optional fallbacks cover an unknown model name (`[fallback].<kind>`) or a known model whose backends are all down (`fallback_offline`). See [`docs/upstreams.md`](docs/upstreams.md#model-aliases).
 - **OIDC login** — browser sign-in against your identity provider; the gateway then issues its own `gwk_…` API tokens. Provider secrets come only from the environment.
 - **Per-user tokens + RBAC** — tokens are SHA-256-hashed at rest and revocable. Roles (mapped from OIDC claims) gate which models and server-side tools each user may use.
-- **Server-side tools** — the gateway runs tools *mid-completion* (web search, fetch-URL, document rendering, RAG, network lookups, and more); the client just sees a normal completion. Full list in [Tools the model can call](#tools-the-model-can-call).
-- **Chat UI** — a server-rendered, mobile-friendly chat at `/chat` with persisted multi-conversation history, token-by-token streaming, file attachments, and resume-on-reconnect (every turn is written to SQLite as it happens).
+- **Server-side tools** — the gateway runs tools *mid-completion* (web search, fetch-URL, document rendering, code execution, RAG, network lookups, and more); the client just sees a normal completion. Full list in [Tools the model can call](#tools-the-model-can-call).
+- **Chat UI** — a server-rendered, mobile-friendly chat at `/chat` with persisted multi-conversation history, token-by-token streaming, file attachments, voice dictation, shareable/exportable conversations, and resume-on-reconnect (every turn is written to SQLite as it happens).
 - **RAG** — operator-managed, indexed codebases that the chat model can search.
 - **Agent Skills** — drop a `SKILL.md` bundle (or `.skill` archive) in and the chat model loads it on demand to follow your house style, brand, or domain playbooks — progressive disclosure, no fine-tuning. Upload, view, and delete them at `/admin/skills`, live (no restart), RBAC-gated per role. See [Agent Skills](#agent-skills).
-- **Scheduled actions** — per-user prompts that run on a cron schedule (hourly / daily / weekly / monthly, or a raw cron expression), each evaluated in its own timezone. A friendly builder assembles the cron and shows the next run times live; every fire opens a fresh chat you can read back in the UI. See [Scheduled actions](#scheduled-actions).
+- **Scheduled actions** — per-user prompts that run on a cron schedule (hourly / daily / weekly / monthly, or a raw cron expression), each evaluated in its own timezone. A friendly builder assembles the cron and shows the next run times live; every fire opens a chat you can read back in the UI — a fresh one each time, or (optionally) continuing the previous run's conversation as history. See [Scheduled actions](#scheduled-actions).
 - **Integrations (per-user MCP connectors)** — an admin-curated catalog of [MCP](https://modelcontextprotocol.io/) servers (Google Workspace, GitHub, Atlassian, GitLab, …) that each user connects to with *their own* account at `/integrations`. OAuth (with dynamic client registration where supported) or a user-supplied token; tokens are encrypted at rest and refreshed in the background. The connected servers' tools then become available to the model, scoped to that user's own permissions. See [Integrations](#integrations-per-user-mcp-connectors).
 
 ## Tools the model can call
 
-This is the part most "OpenAI-compatible proxy" projects don't have. The gateway can execute tools **server-side, in the middle of a completion**: the model asks to search the web, read a PDF you attached, render a branded PDF, or query an indexed codebase — the gateway runs it, feeds the result back, and the client just receives one ordinary completion with the finished answer. It works identically through the raw `/v1/chat/completions` API and the built-in chat UI.
+This is the part most "OpenAI-compatible proxy" projects don't have. The gateway can execute tools **server-side, in the middle of a completion**: the model asks to search the web, read a PDF you attached, render a branded PDF, run code in a throwaway sandbox, or query an indexed codebase — the gateway runs it, feeds the result back, and the client just receives one ordinary completion with the finished answer. It works identically through the raw `/v1/chat/completions` API and the built-in chat UI.
 
 Every tool is **RBAC-gated per role**, and each user can flip their own grants on and off on the `/tools` page:
 
@@ -51,6 +51,8 @@ Every tool is **RBAC-gated per role**, and each user can flip their own grants o
 |---|---|---|
 | **Web & retrieval** | `search_web`, `fetch_url`, `wikipedia` | Search the web (SearXNG or Brave), fetch any URL (text → UTF-8, images → viewable, other binary → metadata), and pull encyclopedic summaries. |
 | **Documents** | `fetch_attachment`, `upload_attachment`, `typst_*` | Read files the user attached — including **two-tier PDF** reading (extract the text layer first; rasterize scanned pages for a vision model if that comes back empty) — attach files back into its own reply, and render **PDF/PNG documents** from operator-defined Typst templates (invoices, letters, reports). |
+| **Document canvas** | `create_document`, `edit_document`, … | Build up a long document (report, spec, article) across turns and edit it section-by-section in a live side panel, then export it to PDF/DOCX/PPTX — instead of regenerating the whole thing every reply. See [`docs/file-conversions.md`](docs/file-conversions.md). |
+| **Code & sandbox** *(opt-in)* | `run_in_sandbox`, `generate_document`, `convert_document`, `capture_webpage`, `render_typst`, … | Run Python/shell in an isolated, single-use VM (data crunching, format conversion, plotting), turn Markdown into PDF/DOCX/PPTX, convert between office/PDF/image formats, screenshot a web page, and render Typst or Excalidraw. Enabled by the `[sandbox]` block — see [`docs/sandbox.md`](docs/sandbox.md) and [`docs/file-conversions.md`](docs/file-conversions.md). |
 | **Memory** | `remember`, `recall` | Persist durable facts about the user (preferences, projects) and recall them in later conversations. |
 | **Network & ops** | `dns_lookup`, `whois_lookup`, `tls_cert`, `lookup_ip` | DNS-over-HTTPS records, RDAP domain registration, TLS-certificate inspection ("is this cert about to expire?"), and GeoIP for any IP or hostname. |
 | **Location** | `get_user_location` | Use the approximate IP-based location that's always in context, or ask the browser for precise GPS when the task needs it. |
@@ -70,11 +72,13 @@ Beyond `/chat`, the gateway ships a small operator and account UI — no separat
 | ![The backends page: each upstream pool with its kind, load-balancing strategy, per-backend health, in-flight load against capacity, and the models each one currently advertises.](docs/img/backends.png) | ![The RAG page: a form to index a new collection from a git repo (embedding model, branch, include/exclude globs, chunk size) and a list of existing collections with their indexing status.](docs/img/rag.png) |
 | **Backends** (`/admin/backends`) — live health, in-flight load, and discovered models for every upstream pool. | **RAG** (`/rag`) — index a codebase from a git URL and watch it go from *pending* to *ready*. |
 
-There's also `/tokens` (mint and revoke your `gwk_…` API tokens), `/memory` (view and edit what the assistant has remembered about you), `/scheduled` (prompts that run on a cron schedule — see [Scheduled actions](#scheduled-actions)), `/admin/models` (server-wide sampling defaults per model), and `/admin/users` (registered users with their resolved roles). The users page can also let an admin **impersonate** another user for debugging — every impersonation is audited and shows a persistent banner. Impersonation is **opt-in**: it's off unless you set `[gateway].allow_impersonation = true` (default `false`), in which case the Impersonate buttons appear and `POST /admin/users/impersonate` is accepted; otherwise the buttons are hidden and that endpoint returns 403.
+There's also `/tokens` (mint, rotate, and revoke your `gwk_…` API tokens — and scope each token to a subset of your tools), `/usage` (your own request/token usage), `/memory` (view and edit what the assistant has remembered about you), `/scheduled` (prompts that run on a cron schedule — see [Scheduled actions](#scheduled-actions)), `/admin/models` (server-wide sampling defaults and per-model reasoning budgets), and `/admin/users` (registered users with their resolved roles). The users page can also let an admin **impersonate** another user for debugging — every impersonation is audited and shows a persistent banner. Impersonation is **opt-in**: it's off unless you set `[gateway].allow_impersonation = true` (default `false`), in which case the Impersonate buttons appear and `POST /admin/users/impersonate` is accepted; otherwise the buttons are hidden and that endpoint returns 403.
+
+The `/chat` page itself does more than stream replies: **fork** a conversation, **share** it via a public link, **pin** favourites, **export** to Markdown or PDF, **edit-and-retry** a turn, **dictate** with the voice button, and set **per-conversation reasoning effort**. See [`docs/ui.md`](docs/ui.md).
 
 ## Scheduled actions
 
-Every signed-in user can have prompts run **automatically on a schedule** at `/scheduled` — a daily standup digest, a weekly repo summary, an hourly health check. Each scheduled action is just a saved prompt plus a model, a schedule, and a timezone; when it fires, the gateway opens a **fresh chat session** driven by the same engine as the interactive `/chat` page, so the result lands as an ordinary conversation you can open and read afterward. Schedules are per-user and private (scoped by user, behind the normal session login — no admin role needed).
+Every signed-in user can have prompts run **automatically on a schedule** at `/scheduled` — a daily standup digest, a weekly repo summary, an hourly health check. Each scheduled action is just a saved prompt plus a model, a schedule, and a timezone; when it fires, the gateway opens a chat session driven by the same engine as the interactive `/chat` page, so the result lands as an ordinary conversation you can open and read afterward. By default each run starts a **fresh** conversation; turn on **reuse** and each run instead continues the previous run's chat — replaying the last few rounds as history — so the model builds on what it said last time. Schedules are per-user and private (scoped by user, behind the normal session login — no admin role needed).
 
 ![The /scheduled page: a builder form (name, model, prompt) with a Hourly/Daily/Weekly/Monthly/Advanced schedule selector, time and timezone fields, a live human-readable summary with the next three run times, and a tools toggle — above the list of your existing scheduled actions.](docs/img/scheduled.png)
 
@@ -82,8 +86,8 @@ Every signed-in user can have prompts run **automatically on a schedule** at `/s
 
 **How runs fire.** A background worker polls every 30 seconds and runs every action whose next occurrence is due, claiming each one atomically first so a slow run or a restart can't double-fire. If the gateway was down across one or more scheduled slots, the missed occurrences **collapse into a single catch-up run** on the first poll after startup rather than replaying as a backlog. Actions can be **paused** (the worker skips them) and resumed, edited, or deleted from the same page.
 
-- **Rust** (edition 2024, toolchain pinned to 1.95 via [mise](https://mise.jdx.dev/)) — a workspace of 4 crates: `gateway`, `session-core`, `cli`, `shared`.
-- **[rama 0.3](https://ramaproxy.org/)** — HTTP server, router, middleware, and proxying.
+- **Rust** (edition 2024, toolchain pinned to 1.95 via [mise](https://mise.jdx.dev/)) — a workspace of 5 crates: `gateway`, `session-core`, `cli`, `shared`, and `sandbox-runner`.
+- **[rama 0.3.0-rc1](https://ramaproxy.org/)** — HTTP server, router, middleware, and proxying.
 - **[plait](https://github.com/devashishdxt/plait)** — type-checked, auto-escaping server-rendered HTML (`html! { … }`).
 - **[datastar](https://data-star.dev/)** — client-side reactivity over SSE, self-hosted from the binary.
 - **[daisyUI v5](https://daisyui.com/) + Tailwind v4** — design system, compiled to a single CSS file at build time.
@@ -187,9 +191,13 @@ Optional blocks, each documented inline in `gateway.example.toml`:
 - `[rbac]` + `[[roles]]` — map OIDC claim values to roles, and gate models/tools per role.
 - `[chat.s3]` — store chat attachments in S3 / MinIO / R2 / Backblaze B2 (see below).
 - `[typst]` — register document-rendering tools from a templates directory.
+- `[sandbox]` — enable the code-execution + document tools by pointing at a sandbox-runner service (see [`docs/sandbox.md`](docs/sandbox.md)).
 - `[geoip]` — IP→location for the `get_user_location` tool (IP2Location LITE database).
 - `[[mcp.servers]]` — bridge external MCP tool servers.
 - `[rag]` — index git repos and search them from chat (see [RAG](#rag-codebase-search)).
+- `[fallback]` — server-wide fallback models per kind, for unknown or all-offline model names (see [`docs/upstreams.md`](docs/upstreams.md#fallback-models)).
+- `[usage]` — request/token usage accounting behind the `/usage` page (retention-pruned; on by default).
+- `[feedback]` — the in-UI feedback widget that files GitHub issues.
 
 ### Chat attachments (S3)
 
@@ -213,8 +221,7 @@ export GATEWAY_S3_SECRET_KEY=…
 ```
 
 Notes:
-- The gateway hands the upstream LLM a **presigned GET URL** (1 h TTL) rooted at the same `endpoint`, so the bucket stays private (no public-read ACL). Path-style requests are always used, so DNS-style bucket subdomains aren't required.
-- `endpoint` must be reachable from the upstream LLM's network (not just the gateway's), since that's the host the presigned URL points at. The same shape works for MinIO, Backblaze B2, and R2.
+- The bucket can stay **fully private** (no public-read ACL, no presign capability needed on the credentials): the gateway fetches every byte **server-side** and hands it to the upstream LLM inline — images as a `data:` URI in the request, other files as text. So `endpoint` only needs to be reachable from the **gateway**, not from the upstream LLM's network. Path-style requests are always used, so DNS-style bucket subdomains aren't required; the same shape works for MinIO, Backblaze B2, and R2.
 - Capability gating isn't done at the gateway — wire only multi-modal chat models into the pools. A mismatch surfaces as the upstream's own error in the chat bubble.
 - Past-turn attachments are stripped from the replayed history (kept as `[attached: name.ext (omitted)]` stubs) so the context window stays bounded.
 
@@ -222,7 +229,7 @@ Notes:
 
 Point the gateway at git repositories; it clones, chunks, and embeds them, and exposes them to the chat model through the `rag_search` tool (plus `rag_list_collections`, so the model can discover what's available). It's for "answer from *our* code and docs" without stuffing a whole repo into the context window.
 
-**Requirements:** an `embedding`-kind upstream pool (chunks and queries are embedded through it), `git` on the host PATH (the indexer shells out to it — the container image ships it), and a `[rag]` block. The block is optional and has exactly one knob:
+**Requirements:** an `embedding`-kind upstream pool (chunks and queries are embedded through it), `git` on the host PATH (the indexer shells out to it — the container image ships it), and a `[rag]` block. The block is optional; its main knob is `data_dir` (a second, `clone_concurrency`, is documented in `gateway.example.toml`):
 
 ```toml
 [rag]
@@ -231,7 +238,7 @@ data_dir = "/mnt/data/gateway-rag"   # optional; default ./data/rag
 
 Each collection gets a self-contained folder `<data_dir>/<uuid>/` holding its SQLite store (chunk text + lexical index), its `index.usearch` (vectors), and the git `clone/`. This is the heavy, fully regenerable state — put `data_dir` on a big/cheap disk, separate from the small `[db].path` you actually back up. Deleting a collection in the UI removes its folder.
 
-**Adding a collection.** As an admin, open `/rag` (or `POST /api/v0/rag/collections`) and provide: a name, git URL + branch/tag, an optional PAT for private repos, the embedding model id, include/exclude globs, and chunk size/overlap (characters; default 800/100). A background worker clones and embeds it; status moves `pending → cloning → indexing → ready` (or `error`, with the message shown). **Re-index** re-pulls and re-embeds only the files whose content changed.
+**Adding a collection.** As an admin, open `/rag` (or `POST /api/v0/rag/collections`) and provide: a name, git URL + branch/tag, an optional PAT for private repos, the embedding model id, include/exclude globs, and chunk size/overlap (characters; default 800/100). A background worker clones and embeds it; status moves `pending → cloning → indexing → ready` (or `error`, with the message shown). A collection can aggregate **several git sources** (multiple repos or branches), each managed and re-indexed independently. **Re-index** re-pulls the sources and rebuilds the collection.
 
 **Globs** match the repo-relative path, in three forms (there is no full glob engine):
 
@@ -301,6 +308,8 @@ In a clone, run it via `mise run cli -- <args>`; a release build produces a stan
 | `POST /v1/embeddings` | Bearer token | Embeddings. |
 | `POST /v1/audio/transcriptions` | Bearer token | Whisper-style transcription (multipart upload). |
 | `GET /v1/models` | Bearer token | All discovered models across pools (deduplicated by id). |
+| `GET /v1/me` | Bearer token | Caller identity + the tools your role(s) grant (backs `gw auth whoami` / `gw auth tools`). |
+| `POST /v1/auth/logout` | Bearer token | Revoke the bearer token used for the call (backs `gw auth logout`). |
 | `GET /v1/sandbox/files/{run}/{filename}` | Bearer token | Download a file a sandbox run produced for the caller (scoped to your user). |
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness probes. |
 | `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled`, `/integrations`, `/usage` | session cookie | Web UI (`/integrations` is the per-user MCP connector store; `/usage` shows your own request/token usage; admins get an in-page "All users" toggle). |

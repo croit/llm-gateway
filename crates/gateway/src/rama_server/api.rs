@@ -66,11 +66,19 @@ pub async fn me(State(state): State<Arc<RamaState>>, req: Request) -> Response {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let user = match users::find_by_id(&state.db, &session.user_id).await {
+    me_response(&state, &session.user_id).await
+}
+
+/// Build the identity response (`Me` JSON, or a 5xx envelope if the user row
+/// has vanished) for an already-authenticated `user_id`. Shared by the
+/// session-gated `GET /api/v0/me` (web UI) and the bearer-gated `GET /v1/me`
+/// (the `gw` CLI), so both surfaces return byte-identical payloads.
+pub(crate) async fn me_response(state: &RamaState, user_id: &str) -> Response {
+    let user = match users::find_by_id(&state.db, user_id).await {
         Ok(Some(u)) => u,
         Ok(None) => {
-            tracing::warn!(user_id = %session.user_id, "session references missing user");
-            return internal_error("session references missing user");
+            tracing::warn!(user_id = %user_id, "identity references missing user");
+            return internal_error("identity references missing user");
         }
         Err(err) => {
             tracing::warn!(error = %err, "user lookup");

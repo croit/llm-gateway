@@ -194,11 +194,12 @@ weight = 1
 # ---- Chat attachments (S3) -------------------------------------------------
 # The chat composer accepts any file (paperclip / drag-drop / clipboard
 # paste). Each upload lands at `<key_prefix>/<turn_id>/<filename>` in the
-# bucket; the gateway then presigns a GET URL (1 h TTL) rooted at the
-# same endpoint and hands that to the upstream LLM as `image_url`
-# content (for images) or alongside a `[gw-attachment …]` marker (for
-# everything else, with text/* and known data formats also inlined as a
-# fenced block). Bucket stays private; no public-read ACL needed.
+# bucket; the gateway then fetches each object **server-side** and hands
+# it to the upstream LLM inline — as `image_url` `data:` content (for
+# images) or alongside a `[gw-attachment …]` marker (for everything
+# else, with text/* and known data formats also inlined as a fenced
+# block). The LLM never receives a presigned URL, so the bucket can stay
+# fully private (no public-read ACL, no presign capability needed).
 #
 # Capability gating is intentionally NOT done here — operators are
 # expected to point [upstream_pools] at multi-modal chat models only;
@@ -209,9 +210,9 @@ weight = 1
 # never blows up the context window.
 
 # [chat.s3]
-# # `endpoint` is both the upload host AND the presigned-URL root, so
-# # it must be reachable from the upstream LLM's network (not just the
-# # gateway's). Path-style requests are always used.
+# # `endpoint` only needs to be reachable from the gateway (it fetches
+# # every byte server-side; the upstream LLM never contacts S3).
+# # Path-style requests are always used.
 # endpoint        = "https://s3.eu-central-1.amazonaws.com"
 # region          = "eu-central-1"
 # bucket          = "my-gateway-attachments"

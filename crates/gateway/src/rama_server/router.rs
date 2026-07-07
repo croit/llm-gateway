@@ -182,6 +182,10 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/v1/chat/completions", proxy::chat_completions)
         .with_post("/v1/audio/transcriptions", proxy::transcribe)
         .with_post("/v1/embeddings", proxy::embeddings)
+        // Bearer-authed identity + self-revoke for the `gw` CLI
+        // (`whoami`/`tools` and `logout`).
+        .with_get("/v1/me", proxy::me)
+        .with_post("/v1/auth/logout", proxy::logout)
         // Bearer-authed download of a file a sandbox run produced for an
         // API caller (scoped to the caller's user; see `sandbox_api`).
         .with_get("/v1/sandbox/files/{run}/{filename}", sandbox_api::download)
