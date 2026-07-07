@@ -34,6 +34,7 @@ Write the test before the code — red, green, refactor (**TDD**). Tests are **s
     - Returns the documented success shape.
 - New tool → test that invokes it via the registry (with a mocked upstream that fakes a `tool_calls` response).
 - Schema change → round-trip serde test (`from_json(to_json(v)) == v` for a representative fixture).
+- New UI string → a Fluent key in `locales/en/<module>.ftl` **and** its translation in all 5 other locales (`de`/`fr`/`es`/`ru`/`zh`) — not a checklist item you can skip, `session-core/build.rs` won't let the crate compile otherwise. See [`docs/ui.md`](ui.md#i18n--every-user-facing-string-must-be-translated).
 
 If a change has no tests, the PR description must explain why and which existing test covers it.
 
