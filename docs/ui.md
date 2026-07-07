@@ -66,6 +66,61 @@ Things to know:
 - `plait` auto-emits `<!DOCTYPE html>` when the root element is `<html>`. Don't write the literal yourself — it goes through HTML-escaping and renders as `&lt;!DOCTYPE html&gt;`.
 - Empty elements that aren't void (`span`, `div`, etc.) need explicit `{}` — `span;` is a syntax error; `span {}` is fine. Void elements (`input`, `meta`, `link`) use `;`.
 
+### i18n — every user-facing string must be translated
+
+**Hard rule: no bare English literals in page bodies.** Any text a user reads —
+headings, labels, button text, `title:`/`placeholder:`/`aria-label:`
+attributes, toast messages, confirm-dialog text — goes through
+`session_core::i18n::{t, t_args}`, never a plain string. The earlier example,
+written correctly:
+
+```rust
+use session_core::i18n::{Lang, t};
+
+fn render_tokens_heading(lang: Lang) -> Html {
+    html! {
+        h1(class: "text-2xl font-bold mb-2") { (t(lang, "tokens-heading")) }
+    }
+}
+```
+
+This isn't just a style preference — it's enforced at compile time.
+`session-core/build.rs` fails the build if any key present in
+`crates/session-core/locales/en/*.ftl` (the source of truth) is missing from
+any of the other 5 locale directories (`de`/`fr`/`es`/`ru`/`zh`), or vice
+versa. Forgetting a translation isn't a review comment, it's a build error —
+`cargo build`/`cargo check`/`cargo test` all refuse to compile the crate
+graph until every language has every key. **This is by design**: partial UI
+translations look like a broken product to a non-English user (some labels
+translated, others not), so we'd rather block the build than ship that.
+
+Adding new UI text:
+1. Add the key to `crates/session-core/locales/en/<module>.ftl`, where
+   `<module>` matches the source file (`tokens.rs` → `tokens.ftl`,
+   `pages/mod.rs`'s shared chrome → `nav.ftl`/`chrome.ftl`). Naming
+   convention: `<module>-<slug>`, e.g. `tokens-heading`,
+   `nav-group-toggle-aria = Toggle { $label } section`.
+2. Add the same key, translated, to `locales/{de,fr,es,ru,zh}/<module>.ftl`.
+   Fluent supports `{ $var }` interpolation (`t_args` + `i18n::args(...)`)
+   and CLDR plural selectors (`{ $count -> [one] … *[other] … }`) — needed
+   for Russian's three-way plural rule.
+3. Call it from the template: `t(lang, "tokens-heading")` /
+   `t_args(lang, "key", &i18n::args([("name", value.into())]))`.
+
+Every non-English `.ftl` file is LLM-generated for now and carries a
+`# STATUS: llm-generated, unreviewed` banner — functionally correct,
+pending native-speaker QA. That's a content-quality caveat, not a licence to
+skip a language: the build gate doesn't distinguish "reviewed" from
+"unreviewed", it only checks that a translation *exists*.
+
+The one sanctioned escape hatch is rare failure paths that were never
+request-derived in the first place (`internal_error_html`/`forbidden_html`
+in `pages/mod.rs`, and `document.rs`'s tool-triggered SSE push with no live
+HTTP request to read a cookie from) — those hardcode `Lang::En` the same way
+they already hardcode `Theme::Dark`, rather than threading `lang` through
+every one of their ~80 call sites for a page nobody is meant to see twice.
+Don't reach for this pattern for anything a user would routinely encounter.
+
 ### Module split
 
 Templates live in a directory module so each page sits in its own file:
