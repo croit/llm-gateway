@@ -37,6 +37,7 @@ use shared::sandbox::{InputFile, Language, RunRequest};
 use super::sandbox::{SandboxClient, b64};
 use super::{Tool, ToolContext, ToolError, ToolFuture, ToolResult};
 use crate::server::chat_attachments;
+use crate::server::db::documents::{self, DocumentFormat};
 use crate::server::typst::{self, DefaultSource, FieldType, PptxExport, Template};
 
 pub struct TypstRenderTool {
@@ -84,7 +85,6 @@ impl Tool for TypstRenderTool {
     fn schema(&self) -> ToolDef {
         let t = &self.template;
         let mut props = Map::new();
-        let mut required: Vec<Value> = Vec::new();
         for f in &t.fields {
             props.insert(
                 f.name.clone(),
@@ -93,10 +93,39 @@ impl Tool for TypstRenderTool {
                     "description": f.description,
                 }),
             );
-            if f.required {
-                required.push(Value::String(f.name.clone()));
-            }
         }
+        // Alternative data source: a canvas JSON document. `required` is left
+        // empty at the schema level because the input is either-or (inline
+        // fields OR `document_id`); the runtime enforces exactly one path
+        // (`stringify_args` rejects a missing required field on the inline
+        // path). Each field's own description still says whether it's required.
+        props.insert(
+            "document_id".to_string(),
+            json!({
+                "type": "string",
+                "description": "Optional. Render from a saved canvas document \
+                    instead of inline fields. Pass the `document_id` of a JSON \
+                    document (create it with `create_document`, format \"json\") \
+                    holding THIS template's field map — for a deck the slides \
+                    live under the `deck` key, exactly the shape this template's \
+                    `_read` tool shows. When set, inline field args are ignored \
+                    and the document is the single source of truth: it appears \
+                    in the user's document panel, you change it with \
+                    `edit_document` (JSON Patch — same vocabulary as `_edit`), \
+                    and you re-render with the SAME document_id to pick up the \
+                    edits. Use this for a deck/letter you'll iterate on; omit it \
+                    for a one-shot render.",
+            }),
+        );
+        props.insert(
+            "version".to_string(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional. With `document_id`, render a specific \
+                    document version instead of the latest.",
+            }),
+        );
         // A non-field control: which page to show as the inline preview.
         props.insert(
             "preview_page".to_string(),
@@ -144,7 +173,7 @@ impl Tool for TypstRenderTool {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": properties,
-                "required": required,
+                "required": [],
             }),
         )
     }
@@ -188,6 +217,73 @@ impl Tool for TypstRenderTool {
             // validation (which rejects anything not declared in the
             // manifest).
             let preview_page = take_preview_page(&mut arg_map)?;
+
+            // Canvas-document source. Pull these control keys out before field
+            // validation (they aren't template fields). When `document_id` is
+            // given the document IS the data — inline fields are ignored, and
+            // the document (not a hidden edit-base) is the single edit surface.
+            let document_id = arg_map
+                .remove("document_id")
+                .and_then(|v| v.as_str().map(str::to_owned));
+            let doc_version = arg_map.remove("version").and_then(|v| v.as_i64());
+            if let Some(doc_id) = document_id {
+                let session_id = ctx.session_id.as_deref().ok_or_else(|| {
+                    ToolError::Failed(
+                        "canvas documents are only available inside a chat session".into(),
+                    )
+                })?;
+                let (doc, ver) = documents::get_version(&ctx.db, session_id, &doc_id, doc_version)
+                    .await
+                    .map_err(|e| ToolError::Failed(format!("reading canvas document: {e}")))?
+                    .ok_or_else(|| {
+                        ToolError::InvalidArgs(format!(
+                            "no canvas document `{doc_id}` in this conversation — create it \
+                                 with create_document (format \"json\"), or check list_documents"
+                        ))
+                    })?;
+                if doc.format != DocumentFormat::Json {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "canvas document `{doc_id}` is `{}` — a typst render needs a JSON document \
+                         holding the field map (a deck's slides under the `deck` key)",
+                        doc.format.as_str()
+                    )));
+                }
+                let data: Value = serde_json::from_str(&ver.content).map_err(|e| {
+                    ToolError::InvalidArgs(format!(
+                        "canvas document `{doc_id}` is not valid JSON: {e}"
+                    ))
+                })?;
+                let inputs = inputs_from_data(&template, &data)?;
+                let mut result = render_and_attach(
+                    &ctx,
+                    turn_id,
+                    s3,
+                    &template,
+                    inputs,
+                    &data,
+                    self.sandbox.as_ref(),
+                    preview_page,
+                )
+                .await?;
+                // The canvas document is the source of truth, so drop the
+                // hidden edit-base pointer and steer edits back to the document
+                // (editing the stale base would diverge from the panel).
+                if let Value::Object(m) = &mut result {
+                    m.remove("data_id");
+                    m.insert("canvas_document_id".into(), json!(doc_id));
+                    m.insert("canvas_version".into(), json!(ver.version));
+                    m.insert("note".into(), json!(format!(
+                        "Rendered from canvas document `{doc_id}` (v{ver}), shown in the user's \
+                         document panel. To change it, call edit_document on `{doc_id}` with a \
+                         JSON Patch (same vocabulary as {id}_edit), then re-render with the same \
+                         document_id — do NOT use the _read/_edit data_id path for this render.",
+                        ver = ver.version,
+                        id = self.id(),
+                    )));
+                }
+                return Ok(result);
+            }
+
             if wants_identity(&template, &arg_map) {
                 match crate::server::db::users::find_by_id(&ctx.db, &ctx.user_id).await {
                     Ok(Some(u)) => apply_identity_defaults(
@@ -1958,13 +2054,23 @@ mod tests {
     }
 
     #[test]
-    fn schema_lists_required_fields_only() {
+    fn schema_advertises_fields_but_leaves_required_empty() {
+        // Since a render can be driven inline OR from a canvas `document_id`,
+        // the schema advertises every field in `properties` but keeps the
+        // top-level `required` empty (either-or input); requiredness for the
+        // inline path is enforced at runtime by `stringify_args`.
         let tool = TypstRenderTool::new(std::sync::Arc::new(stub_template()), None);
         let def = tool.schema();
         let params = serde_json::to_value(&def.function.parameters).unwrap();
-        let required = params["required"].as_array().unwrap();
-        assert_eq!(required.len(), 1);
-        assert_eq!(required[0], "title");
+        assert!(
+            params["required"].as_array().unwrap().is_empty(),
+            "required must be empty: {params}"
+        );
+        let props = &params["properties"];
+        assert!(
+            props.get("title").is_some(),
+            "title field advertised: {params}"
+        );
     }
 
     /// Template with a `deck` JSON-string field + an optional `theme`,
@@ -2280,5 +2386,69 @@ mod tests {
         let def = tool.schema();
         let params = serde_json::to_value(&def.function.parameters).unwrap();
         assert_eq!(params["required"], json!(["base"]));
+    }
+
+    // --- deck-as-canvas (#13) ---------------------------------------------
+
+    #[test]
+    fn render_schema_advertises_canvas_document_source() {
+        // The render tool offers `document_id` (+ `version`) as an alternative
+        // data source, and drops the hard `required` list so the input is
+        // either-or (inline fields OR a canvas document) — runtime enforces.
+        let tool = TypstRenderTool::new(std::sync::Arc::new(deck_template()), None);
+        let def = tool.schema();
+        let params = serde_json::to_value(&def.function.parameters).unwrap();
+        let props = &params["properties"];
+        assert!(
+            props.get("document_id").is_some(),
+            "document_id prop: {params}"
+        );
+        assert!(props.get("version").is_some(), "version prop: {params}");
+        // The template field is still advertised, just not forced.
+        assert!(
+            props.get("deck").is_some(),
+            "deck prop still present: {params}"
+        );
+        assert_eq!(
+            params["required"].as_array().unwrap(),
+            &Vec::<Value>::new(),
+            "required must be empty (either-or input): {params}"
+        );
+    }
+
+    #[test]
+    fn inputs_from_data_accepts_a_canvas_field_map() {
+        // A canvas JSON document holds the field map (deck object under the
+        // `deck` key) — exactly what a doc-sourced render parses and feeds to
+        // inputs_from_data. Prove that shape validates and the deck round-trips
+        // to a compact `--input deck=<json>` string.
+        let t = deck_template();
+        let data = json!({
+            "deck": {"deck_title": "Q3", "slides": [{"layout": "cover", "title": "Hi"}]}
+        });
+        let inputs = inputs_from_data(&t, &data).expect("canvas field map should validate");
+        let deck = inputs
+            .iter()
+            .find(|(k, _)| k == "deck")
+            .expect("deck input");
+        // Value re-serialized as compact JSON, ready for `typst --input`.
+        assert!(
+            deck.1.contains("\"slides\""),
+            "deck json preserved: {}",
+            deck.1
+        );
+        assert!(
+            deck.1.starts_with('{'),
+            "deck is a JSON object string: {}",
+            deck.1
+        );
+
+        // A canvas doc missing the required `deck` field is rejected (the
+        // runtime guard behind the empty schema `required`).
+        let bad = json!({"theme": "dark"});
+        assert!(
+            inputs_from_data(&t, &bad).is_err(),
+            "missing required deck must error"
+        );
     }
 }
