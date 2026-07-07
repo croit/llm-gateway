@@ -431,6 +431,29 @@ pub async fn nav_sections_toggle(Path(section): Path<String>, req: Request) -> R
 }
 
 // ---------------------------------------------------------------------------
+// HTML escaping.
+
+/// Escape the five HTML-significant characters (`& < > " '`) so a string
+/// can be spliced into markup as inert text. Shared by every hand-built
+/// HTML fragment that isn't going through plait's auto-escaping (e.g. the
+/// gateway's OIDC form fields and the DB layer's search-snippet
+/// highlighter) so the escape set can't drift between copies.
+pub fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Datastar request detection.
 
 /// True iff this request was issued by the datastar runtime (any

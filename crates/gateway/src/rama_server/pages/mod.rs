@@ -262,6 +262,38 @@ fn render_app_sidebar(
             div(class: "app-sidebar__sessions-section") {
                 div(class: "app-sidebar__sessions-header") {
                     span(class: "app-sidebar__sessions-label") { (t(lang, "nav-conversations-label")) }
+                    // Conversation search. Submitting fires a Datastar `@get`
+                    // (NOT a native GET) so the server sees `Datastar-Request:
+                    // true` and answers with an SSE patch of `#session-list`
+                    // rather than a full-page navigation. The query rides in
+                    // `$searchQuery`, url-encoded into the request path. On the
+                    // no-JS path the plain `action`/`method` still submit, and
+                    // the handler serves a full results page.
+                    form(
+                        id: "sidebar-search-form",
+                        method: "get",
+                        action: "/chat/search",
+                        class: "app-sidebar__search-form m-0",
+                        "data-signals": "{searchQuery: ''}",
+                        "data-on:submit__prevent":
+                            "@get('/chat/search?q=' + encodeURIComponent($searchQuery))"
+                    ) {
+                        input(
+                            type: "text",
+                            name: "q",
+                            placeholder: (t(lang, "nav-search-placeholder")),
+                            class: "input input-sm app-sidebar__search-input",
+                            "data-bind": "searchQuery"
+                        );
+                        button(
+                            type: "submit",
+                            class: "btn btn-ghost btn-sm app-sidebar__search-btn",
+                            "aria-label": (t(lang, "nav-search-aria")),
+                            title: (t(lang, "nav-search-title"))
+                        ) {
+                            (icons::search(14))
+                        }
+                    }
                     form(
                         method: "post",
                         action: "/chat/sessions",
@@ -392,7 +424,67 @@ fn render_session_list(sessions: &[SidebarSession], active_id: Option<&str>, lan
     html! {
         ul(id: "session-list", class: "app-sidebar__sessions") {
             for s in sessions.iter() {
-                (render_sidebar_session(s, active_id, lang))
+                (render_sidebar_session(s, active_id, lang, None))
+            }
+        }
+    }
+    .to_html()
+}
+
+/// Render search results into the sidebar's `#session-list` (the SSE patch
+/// replaces the normal list in place). Each row is a *full* sidebar row —
+/// same pin/delete forms, active-row highlight, and `#session-row-{id}` id
+/// as [`render_sidebar_session`] — with the match snippet appended, so
+/// searching never strips the sidebar's affordances.
+pub(super) fn render_search_results(hits: &[session_core::db::SearchHit], lang: Lang) -> Html {
+    html! {
+        ul(id: "session-list", class: "app-sidebar__sessions") {
+            for h in hits.iter() {
+                (render_search_hit_row(h, lang))
+            }
+        }
+    }
+    .to_html()
+}
+
+/// One search-result row: the same full sidebar row (pin/delete/active/id)
+/// plus the highlighted snippet. Delegates to [`render_sidebar_session`] so
+/// the two paths can't drift.
+fn render_search_hit_row(hit: &session_core::db::SearchHit, lang: Lang) -> Html {
+    let s = SidebarSession {
+        id: hit.session_id.clone(),
+        title: hit.title.clone(),
+        pinned: hit.pinned,
+    };
+    let snippet = (!hit.snippet.is_empty()).then_some(hit.snippet.as_str());
+    // No active row: search is issued from any page and the patch carries no
+    // "currently open" session context.
+    render_sidebar_session(&s, None, lang, snippet)
+}
+
+/// Full-page search-results body for the no-JS fallback path (a plain GET
+/// to `/chat/search`). The JS path never hits this — it SSE-patches the
+/// sidebar's `#session-list` in place. Rendered into the main content
+/// column with the query echoed back so the page doesn't look like the
+/// search was ignored.
+pub(super) fn render_search_page_body(
+    query: &str,
+    hits: &[session_core::db::SearchHit],
+    lang: Lang,
+) -> Html {
+    html! {
+        div(class: "p-4 max-w-3xl mx-auto w-full") {
+            h1(class: "text-lg font-semibold mb-3") {
+                (t_args(lang, "nav-search-results-heading", &i18n::args([("query", query.to_string().into())])))
+            }
+            if hits.is_empty() {
+                p(class: "opacity-60 text-sm") { (t(lang, "nav-search-no-results")) }
+            } else {
+                ul(class: "app-sidebar__sessions") {
+                    for h in hits.iter() {
+                        (render_search_hit_row(h, lang))
+                    }
+                }
             }
         }
     }
@@ -401,8 +493,15 @@ fn render_session_list(sessions: &[SidebarSession], active_id: Option<&str>, lan
 
 /// One conversation row in the sidebar. Hover reveals the pin + delete
 /// buttons (a pinned row keeps its star lit); active row gets a soft
-/// tinted background.
-fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>, lang: Lang) -> Html {
+/// tinted background. `snippet`, when present, is a pre-escaped highlight
+/// excerpt (search results) appended below the title — see
+/// [`render_search_hit_row`].
+fn render_sidebar_session(
+    s: &SidebarSession,
+    active_id: Option<&str>,
+    lang: Lang,
+    snippet: Option<&str>,
+) -> Html {
     let id = s.id.clone();
     let row_id = format!("session-row-{id}");
     let href = format!("/chat/{id}");
@@ -437,6 +536,7 @@ fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>, lang: Lan
         (t(lang, "nav-pin-conversation"), icons::star(12))
     };
     let delete_label = t(lang, "nav-delete-conversation");
+    let snippet = snippet.map(str::to_string);
     html! {
         li(id: (row_id), class: "session-row__item") {
             // The whole row is the clickable target so a sloppy
@@ -450,6 +550,12 @@ fn render_sidebar_session(s: &SidebarSession, active_id: Option<&str>, lang: Lan
                 "data-on:click__prevent": (directive)
             ) {
                 span(class: "session-row__title") { (title) }
+                // Search-result snippet: pre-escaped at the DB layer (only
+                // the `<b>` highlight is live markup — see
+                // `db::highlight_snippet`), so splicing it raw is XSS-safe.
+                if let Some(snip) = snippet.as_deref() {
+                    span(class: "session-row__snippet") { #(snip.to_string()) }
+                }
             }
             form(
                 method: "post",
@@ -926,8 +1032,8 @@ mod chat;
 pub use chat::{
     chat_attachment, chat_cancel, chat_capabilities_toggle, chat_document_view, chat_edit,
     chat_effort_set, chat_export_markdown, chat_export_pdf, chat_fork, chat_index,
-    chat_message_send, chat_retry, chat_session_create, chat_session_delete, chat_session_pin,
-    chat_session_view, chat_share_toggle, chat_tail,
+    chat_message_send, chat_retry, chat_search, chat_session_create, chat_session_delete,
+    chat_session_pin, chat_session_view, chat_share_toggle, chat_tail,
 };
 
 // SSE helpers (`sse_patch`, `sse_script`, `sse_signals`,

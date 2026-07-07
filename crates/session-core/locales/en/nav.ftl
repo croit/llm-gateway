@@ -30,6 +30,11 @@ nav-untitled-chat = Untitled chat
 nav-pin-conversation = Pin conversation
 nav-unpin-conversation = Unpin conversation
 nav-delete-conversation = Delete conversation
+nav-search-placeholder = Search…
+nav-search-aria = Search
+nav-search-title = Search conversations
+nav-search-results-heading = Search results for “{ $query }”
+nav-search-no-results = No conversations matched.
 
 nav-sign-out = Sign out
 nav-open-menu-aria = Open menu

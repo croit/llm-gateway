@@ -491,6 +491,59 @@ pub async fn chat_session_pin(
 }
 
 // ---------------------------------------------------------------------------
+// GET /chat/search — search across the user's conversations.
+
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+
+pub async fn chat_search(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let (session, user) = match require_session_or_redirect(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let datastar = is_datastar_request(req.headers());
+    let lang = Lang::from_headers(req.headers());
+
+    let form: SearchQuery = match serde_urlencoded::from_str(req.uri().query().unwrap_or("")) {
+        Ok(f) => f,
+        Err(_) => SearchQuery { q: String::new() },
+    };
+
+    let hits = chat::search_sessions(&state.db, &user.id, &form.q, 50)
+        .await
+        .unwrap_or_default();
+
+    if !datastar {
+        // No-JS fallback: render a full results page in the main content
+        // area (the query is echoed back so it doesn't look ignored). The
+        // JS path never reaches here — it SSE-patches the sidebar list.
+        let theme = Theme::from_headers(req.headers());
+        let nav = NavSections::from_headers(req.headers());
+        let chat = super::fetch_sidebar_chat(&state, &user.id, None).await;
+        let body = super::render_search_page_body(&form.q, &hits, lang);
+        return nav_or_html_page(
+            false,
+            theme,
+            lang,
+            nav,
+            NavItem::Chat,
+            &t(lang, "nav-search-title"),
+            &user.email,
+            is_admin(&state, &user),
+            session.impersonator_id.is_some(),
+            body,
+            "/chat/search",
+            &chat,
+        );
+    }
+
+    let list = super::render_search_results(&hits, lang).to_string();
+    sse_response(&[sse_patch(Some("#session-list"), Some("outer"), &list)])
+}
+
+// ---------------------------------------------------------------------------
 // POST /chat/{id}/capabilities — owner pins/unpins a tool, MCP integration, or
 // skill for this conversation (the composer's "+" menu). Writes the same
 // per-conversation overlay the model drives via `enable_tools` / `read_skill`,
@@ -1523,7 +1576,8 @@ fn gateway_sidebar_emitter(
                 title: session.title,
                 pinned: session.pinned,
             };
-            let html = super::render_sidebar_session(&sidebar, Some(&session.id), lang).to_string();
+            let html =
+                super::render_sidebar_session(&sidebar, Some(&session.id), lang, None).to_string();
             let selector = format!("#session-row-{session_id}");
             let patch = sse_patch(Some(&selector), Some("outer"), &html);
             if tx.send(Ok(patch)).await.is_err() {

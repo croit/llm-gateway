@@ -26,6 +26,11 @@ nav-untitled-chat = Без названия
 nav-pin-conversation = Закрепить беседу
 nav-unpin-conversation = Открепить беседу
 nav-delete-conversation = Удалить беседу
+nav-search-placeholder = Поиск…
+nav-search-aria = Поиск
+nav-search-title = Искать по беседам
+nav-search-results-heading = Результаты поиска по «{ $query }»
+nav-search-no-results = Беседы не найдены.
 
 nav-sign-out = Выйти
 nav-open-menu-aria = Открыть меню

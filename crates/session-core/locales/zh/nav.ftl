@@ -26,6 +26,11 @@ nav-untitled-chat = 未命名对话
 nav-pin-conversation = 置顶对话
 nav-unpin-conversation = 取消置顶
 nav-delete-conversation = 删除对话
+nav-search-placeholder = 搜索…
+nav-search-aria = 搜索
+nav-search-title = 搜索对话
+nav-search-results-heading = “{ $query }” 的搜索结果
+nav-search-no-results = 未找到匹配的对话。
 
 nav-sign-out = 退出登录
 nav-open-menu-aria = 打开菜单

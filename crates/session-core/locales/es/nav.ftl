@@ -26,6 +26,11 @@ nav-untitled-chat = Chat sin título
 nav-pin-conversation = Fijar conversación
 nav-unpin-conversation = Dejar de fijar
 nav-delete-conversation = Eliminar conversación
+nav-search-placeholder = Buscar…
+nav-search-aria = Buscar
+nav-search-title = Buscar conversaciones
+nav-search-results-heading = Resultados de búsqueda para «{ $query }»
+nav-search-no-results = No se encontraron conversaciones.
 
 nav-sign-out = Cerrar sesión
 nav-open-menu-aria = Abrir menú
