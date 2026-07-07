@@ -14,6 +14,8 @@ deployment methods are provided — pick one:
 |---|---|---|
 | **gateway** | `ghcr.io/croit/llm-gateway` | The OpenAI-compatible proxy + web UI. The only one that's mandatory. |
 | **google-workspace-mcp** | `ghcr.io/taylorwilsdon/google_workspace_mcp` | Self-hosted Google Workspace MCP server backing the per-user **Google Workspace** connector (Gmail/Calendar/Drive/Docs/…). Optional. |
+| **gitlab-mcp** | `docker.io/zereight050/gitlab-mcp` | Community bridge backing the per-user **GitLab (self-managed / CE)** connector; forwards each request's bearer as that user's GitLab PAT. Optional. |
+| **discord-mcp** | built locally from `barryyip0625/mcp-discord` (no published image) | Discord bot bridge — an operator-level `[[mcp.servers]]` tool, not a per-user connector (see below). Optional. |
 | **sandbox-runner** | `ghcr.io/croit/llm-gateway-sandbox-runner` | Code-execution runner (`run_in_sandbox` etc.). Optional; needs gVisor. |
 | **egress-proxy** | `docker.io/ubuntu/squid` | Allowlisting proxy for networked sandbox runs. Optional. |
 | sandbox workload | `ghcr.io/croit/llm-gateway-sandbox` | The "gold image" the runner spawns per job (pulled by the runner, not run directly). |
@@ -169,6 +171,68 @@ MCP server URL (`http://gitlab-mcp:3002/mcp` full-stack, or
 `http://localhost:3333/mcp` for a native gateway) → Save → Enable. Each user
 connects at **/integrations** and pastes a GitLab **personal access token**
 (scope `api`, or `read_api` for read-only).
+
+---
+
+## Discord
+
+Unlike every other connector in this doc, Discord is **not** wired through
+`/admin/connectors` — it's an operator-level tool configured via
+`gateway.toml`'s `[[mcp.servers]]` block (see `gateway.example.toml`). The
+reason is the credential shape: Discord bots authenticate with a single **bot
+token** for the whole server/guild, not a per-user OAuth account, so there's
+no "each user connects their own Discord account" flow the way there is for
+Slack, GitHub, or Atlassian. One bot, shared by everyone the gateway's RBAC
+grants the `mcp__discord__*` tools to (still individually toggleable
+always/ask/off on `/tools`, same as any other tool).
+
+**Create the bot** (once, in the [Discord Developer Portal](https://discord.com/developers/applications)):
+
+1. **New Application** → note the **Application ID**.
+2. **Bot** tab → **Reset Token** (copy it — this is `DISCORD_TOKEN`) → enable
+   **Message Content Intent**, **Server Members Intent**, and **Presence
+   Intent**.
+3. **OAuth2 → URL Generator** → scope `bot` → permissions: Send Messages,
+   Create/Send in Public Threads, Manage Messages, Manage Threads, Manage
+   Channels, Manage Webhooks, Manage Roles, Add Reactions, View Channel (or
+   just `Administrator` for simplicity) → open the generated URL and invite
+   the bot to your server.
+
+**Run the bridge** ([`barryyip0625/mcp-discord`](https://github.com/barryyip0625/mcp-discord) —
+no published registry image, so it's built from source):
+
+Compose (`discord` profile):
+
+```bash
+cp deploy/quadlet/discord-mcp.example.env deploy/discord-mcp.env
+$EDITOR deploy/discord-mcp.env                       # DISCORD_TOKEN=...
+docker compose -f deploy/compose.example.yml --profile discord up -d
+```
+
+Quadlet ([`quadlet/discord-mcp.container`](quadlet/discord-mcp.container)) —
+build the image first since none is published:
+
+```bash
+git clone https://github.com/barryyip0625/mcp-discord.git /tmp/mcp-discord
+sudo podman build -t localhost/discord-mcp:latest /tmp/mcp-discord
+sudo cp deploy/quadlet/discord-mcp.container /etc/containers/systemd/
+sudo install -m 0600 deploy/quadlet/discord-mcp.example.env /etc/gateway/discord-mcp.env
+sudo $EDITOR /etc/gateway/discord-mcp.env            # DISCORD_TOKEN=...
+sudo systemctl daemon-reload
+sudo systemctl enable --now discord-mcp.service
+```
+
+Endpoint: `/mcp` (container port 8080). Then in `gateway.toml`:
+
+```toml
+[[mcp.servers]]
+name = "discord"                          # → tools mcp__discord__*
+url  = "http://discord-mcp:8080/mcp"      # full-stack; native gateway: http://localhost:3334/mcp
+```
+
+No `bearer_token_env` needed — the bot token is baked into the container, and
+the endpoint must stay internal-only (loopback / private network), never
+exposed publicly: it grants full bot access with no per-caller scoping.
 
 ## Sandbox (code execution)
 

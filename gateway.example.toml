@@ -343,6 +343,25 @@ weight = 1
 # bearer_token_env = "ACME_MCP_TOKEN"     # → Authorization: Bearer <$ACME_MCP_TOKEN>
 # headers         = { X-Tenant = "acme" }
 
+# Discord — belongs here, not the /admin/connectors per-user catalog, because
+# a Discord bot token authenticates one shared bot for the whole server, not a
+# per-user OAuth account (there's no "each user connects their own Discord
+# account" flow). One bot, shared by everyone the gateway's RBAC grants the
+# tool to. See deploy/README.md for bot setup + running the bridge
+# (barryyip0625/mcp-discord — no published image, built from source).
+#
+# Local dev (stdio; needs `node`/`npx` on PATH — not in the production image):
+# [[mcp.servers]]
+# name    = "discord"                     # → tools mcp__discord__*
+# command = "npx"
+# args    = ["-y", "mcp-discord"]
+# env     = { DISCORD_TOKEN = "..." }     # from the Discord Developer Portal
+#
+# Production (http, to the self-hosted bridge — see deploy/README.md):
+# [[mcp.servers]]
+# name = "discord"                        # → tools mcp__discord__*
+# url  = "http://discord-mcp:8080/mcp"    # internal only; the token is baked into the container
+
 # --- RAG (retrieval-augmented generation) ------------------------------
 # Operator-managed indexed codebases. Collections are added via the /rag
 # page (admin-only) or POST /api/v0/rag/collections; the gateway clones

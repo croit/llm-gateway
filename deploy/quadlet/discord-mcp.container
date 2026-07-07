@@ -1,0 +1,53 @@
+# systemd-podman Quadlet for the Discord MCP bridge (barryyip0625/mcp-discord).
+# Backs an operator-level `[[mcp.servers]]` tool (NOT a per-user connector):
+# Discord bots authenticate with a single bot token for the whole server/guild,
+# not a per-user OAuth account, so there's no "each user connects their own
+# Discord account" flow the way there is for Slack/GitHub/Atlassian. One bot,
+# shared by everyone the gateway's RBAC grants the tool to — see
+# gateway.example.toml's `[[mcp.servers]]` section and deploy/README.md.
+#
+# No published registry image exists upstream, so this builds locally first:
+#
+#   git clone https://github.com/barryyip0625/mcp-discord.git /tmp/mcp-discord
+#   sudo podman build -t localhost/discord-mcp:latest /tmp/mcp-discord
+#
+# Install:
+#   sudo cp deploy/quadlet/discord-mcp.container /etc/containers/systemd/
+#   sudo install -m 0600 deploy/quadlet/discord-mcp.example.env \
+#        /etc/gateway/discord-mcp.env
+#   sudo $EDITOR /etc/gateway/discord-mcp.env          # set DISCORD_TOKEN
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now discord-mcp.service
+#
+# Then in the gateway config: add a `[[mcp.servers]]` entry with
+# url = "http://127.0.0.1:3334/mcp" (see gateway.example.toml). No
+# bearer_token_env needed — the bot token is baked into this container, and
+# the endpoint is loopback-only / internal, never exposed publicly.
+
+[Unit]
+Description=Discord MCP bridge (shared bot, gateway [[mcp.servers]] tool)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+ContainerName=discord-mcp
+Image=localhost/discord-mcp:latest
+
+# Loopback only — internal service, reached by the gateway. Never expose it
+# publicly (the bot token grants full bot access, not scoped per caller).
+PublishPort=127.0.0.1:3334:8080
+
+EnvironmentFile=/etc/gateway/discord-mcp.env
+
+# The image's default CMD already runs `node build/app.js --transport http
+# --port 8080` — do not override Exec=.
+
+NoNewPrivileges=true
+DropCapability=ALL
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target default.target

@@ -139,6 +139,29 @@ services:
     security_opt:
       - "no-new-privileges:true"
 
+  # Discord MCP bridge — backs an operator-level `[[mcp.servers]]` tool, NOT a
+  # per-user connector. A Discord bot token authenticates one shared bot for
+  # the whole gateway (there's no per-user Discord account to connect, unlike
+  # Slack/GitHub/Atlassian), so it belongs in gateway.toml's `[[mcp.servers]]`
+  # block rather than /admin/connectors. No published image exists upstream,
+  # so this builds from the git repo directly. Profile: discord.
+  discord-mcp:
+    build:
+      context: https://github.com/barryyip0625/mcp-discord.git
+    profiles:
+      - discord
+    restart: unless-stopped
+    # Loopback publish is only for a native (mise run dev) gateway to reach it
+    # at http://localhost:3334/mcp; the full-stack gateway uses
+    # http://discord-mcp:8080/mcp. Never expose this port publicly — the bot
+    # token grants full bot access, not scoped per caller.
+    ports:
+      - "127.0.0.1:3334:8080"
+    env_file:
+      - discord-mcp.env
+    security_opt:
+      - "no-new-privileges:true"
+
   # Code-execution sandbox runner (run_in_sandbox / generate_document /
   # capture_webpage). Spawns each job as a single-use sibling container via the
   # host Docker socket under gVisor (runsc) — real isolation, provided runsc is

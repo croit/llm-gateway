@@ -8,10 +8,19 @@ Quadlet is the systemd-native way to manage Podman containers — you ship `.con
 
 ```
 deploy/quadlet/
-├── gateway.container       # the unit definition
-├── gateway.volume          # named volume for /var/lib/gateway
-├── gateway.example.env     # template for secrets
-└── README.md               # this file
+├── gateway.container                  # the gateway unit definition
+├── gateway.volume                     # named volume for /var/lib/gateway
+├── gateway.example.env                # template for gateway secrets
+├── google-workspace-mcp.container     # optional: Google Workspace MCP sidecar
+├── google-workspace-mcp.example.env
+├── gitlab-mcp.container               # optional: GitLab (self-managed/CE) MCP bridge
+├── gitlab-mcp.example.env
+├── discord-mcp.container              # optional: Discord MCP bridge
+├── discord-mcp.example.env
+├── egress-proxy.container             # optional: allowlisting proxy for sandbox runs
+├── squid.conf, allowlist.txt          # egress-proxy config
+├── sandbox-egress.network             # network the sandbox + egress-proxy share
+└── README.md                          # this file
 ```
 
 The runtime config + secrets stay on the host at `/etc/gateway/`; the SQLite DB (which also holds the session store) lives in a Podman-managed named volume.
@@ -117,6 +126,62 @@ on the Google OAuth client, and in the gateway's `/admin/connectors` point the
 **Google Workspace** connector's URL at `https://gworkspace-mcp.example.com/mcp/`
 (DCR — no client id/secret in the gateway). The gateway reaches it over the same
 public hostname, so no extra internal networking is needed.
+
+## GitLab MCP bridge (self-managed / CE, optional sidecar)
+
+GitLab's *native* MCP (`/api/v4/mcp`) is a Duo/Premium feature, so Community
+Edition and other self-managed instances instead need the community bridge
+[`zereight/gitlab-mcp`](https://github.com/zereight/gitlab-mcp), which backs
+the **GitLab (self-managed / CE)** connector. It runs in streamable-HTTP +
+remote-authorization mode — each MCP request carries the caller's own GitLab
+token, forwarded to GitLab as that user's permissions — so it needs **no
+public URL and no OAuth**; the gateway reaches it internally.
+
+```bash
+sudo cp deploy/quadlet/gitlab-mcp.container /etc/containers/systemd/
+sudo install -m 0644 deploy/quadlet/gitlab-mcp.example.env /etc/gateway/gitlab-mcp.env
+sudo $EDITOR /etc/gateway/gitlab-mcp.env               # GITLAB_API_URL=https://<your-gitlab>/api/v4
+sudo systemctl daemon-reload
+sudo systemctl enable --now gitlab-mcp.service
+```
+
+Then in the gateway's `/admin/connectors`, point **GitLab (self-managed / CE)**
+at `http://localhost:3333/mcp` → Save → Enable. Each user connects at
+`/integrations` and pastes their own GitLab personal access token (scope
+`api`, or `read_api` for read-only). Full details, including the compose
+equivalent: [`../README.md`](../README.md#gitlab-self-managed--community-edition).
+
+## Discord MCP bridge (optional sidecar)
+
+Unlike the connectors above, Discord is **not** a per-user connector — a
+Discord bot token authenticates one shared bot for the whole server, not a
+per-user OAuth account, so it's configured as an operator-level
+`[[mcp.servers]]` tool in `gateway.toml` rather than through
+`/admin/connectors`. The bridge, [`barryyip0625/mcp-discord`](https://github.com/barryyip0625/mcp-discord),
+has no published registry image, so build it first:
+
+```bash
+git clone https://github.com/barryyip0625/mcp-discord.git /tmp/mcp-discord
+sudo podman build -t localhost/discord-mcp:latest /tmp/mcp-discord
+sudo cp deploy/quadlet/discord-mcp.container /etc/containers/systemd/
+sudo install -m 0600 deploy/quadlet/discord-mcp.example.env /etc/gateway/discord-mcp.env
+sudo $EDITOR /etc/gateway/discord-mcp.env              # DISCORD_TOKEN=... (Developer Portal → Bot)
+sudo systemctl daemon-reload
+sudo systemctl enable --now discord-mcp.service
+```
+
+Then add to `config.toml`:
+
+```toml
+[[mcp.servers]]
+name = "discord"
+url  = "http://localhost:3334/mcp"
+```
+
+No `bearer_token_env` needed (the token is baked into the container), and the
+endpoint must stay internal-only — it grants full bot access with no
+per-caller scoping. Bot creation steps (intents, permissions, invite URL) and
+the compose equivalent: [`../README.md`](../README.md#discord).
 
 ## Hardening
 
