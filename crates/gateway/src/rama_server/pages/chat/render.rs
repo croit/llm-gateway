@@ -483,56 +483,118 @@ fn render_composer_toolbar(
         div(style: "display:flex; flex-wrap:wrap; align-items:center; gap:0.5rem; \
                     width:100%; padding:0.5rem 1.125rem 0") {
             (render_capabilities(session_id, caps))
-            div(style: "margin-left:auto") {
+            div(style: "margin-left:auto; display:flex; align-items:center; gap:0.5rem") {
                 (render_effort_select(session_id, effort))
+                (render_composer_feedback_button())
             }
         }
     }
     .to_html()
 }
 
-/// The "Denken" (effort / thinking) picker. A labelled `<select>` — NOT wrapped
-/// in a `<form>` (it lives inside the composer's form; nested forms are
-/// invalid), so it posts the chosen level in the query string on change. The
-/// visible "Denken:" label + sparkle make it findable next to the "+" button.
+/// Inline feedback trigger, right end of the composer toolbar. On phones the
+/// floating `.feedback-fab` sits on the composer's send-button corner, so it's
+/// hidden there (CSS) and this takes its place in the toolbar row. It's shown
+/// only on phones and only once feedback is enabled — driven entirely by CSS
+/// (`body:has(#feedback-fab:not([hidden]))`), so no `hidden` attribute here.
+/// The click delegates to the real FAB so all the dialog machinery in
+/// feedback.ts stays in one place.
+fn render_composer_feedback_button() -> Html {
+    html! {
+        button(
+            type: "button",
+            "data-on:click": "document.getElementById('feedback-fab')?.click()",
+            class: "composer-feedback-btn btn btn-ghost btn-sm btn-circle",
+            title: "Send feedback",
+            "aria-label": "Send feedback"
+        ) {
+            (icons::help(18))
+        }
+    }
+    .to_html()
+}
+
+/// The "Denken" (effort / thinking) picker. A hand-rolled popover (desktop) /
+/// bottom sheet (phone) rather than a native `<select>`, which Android renders
+/// as a centred modal detached from the button. NOT wrapped in a `<form>` (it
+/// lives inside the composer's form; nested forms are invalid), so each option
+/// `@post`s the chosen level in the query string. The trigger label + the
+/// per-option checkmark track the `$effort` signal so the selection updates in
+/// place — the server handler only fires a toast and never re-patches this
+/// control. The `#effort-wrap` carries the signals and is never re-patched, so
+/// the bindings keep working. The visible "Thinking:" label + sparkle make it
+/// findable next to the "+" button.
 fn render_effort_select(session_id: &str, effort: crate::server::reasoning::Effort) -> Html {
     use crate::server::reasoning::Effort;
     let action = format!("/chat/{session_id}/effort");
     let levels = [Effort::Fast, Effort::Standard, Effort::Deep, Effort::Max];
-    let opts: Vec<Html> = levels
+    let signals = format!(
+        "{{effortMenu: false, effort: {}}}",
+        serde_json::to_string(effort.as_str()).unwrap_or_else(|_| "\"standard\"".into())
+    );
+    let items: Vec<Html> = levels
         .iter()
         .map(|e| {
-            if *e == effort {
-                html! { option(value: (e.as_str()), selected: "selected") { (e.label()) } }
-                    .to_html()
-            } else {
-                html! { option(value: (e.as_str())) { (e.label()) } }.to_html()
+            let key = e.as_str();
+            // Persist the pick, reflect it in the label immediately, and close.
+            let on_click =
+                format!("$effort = '{key}'; @post('{action}?effort={key}'); $effortMenu = false");
+            let active = format!("{{'chat-pop-item--active': $effort === '{key}'}}");
+            html! {
+                button(
+                    type: "button",
+                    "data-on:click": (on_click),
+                    "data-class": (active),
+                    class: "chat-pop-item"
+                ) {
+                    span(class: "chat-pop-item__check") { (icons::check(16)) }
+                    span { (e.label()) }
+                }
             }
+            .to_html()
         })
         .collect();
     html! {
-        span(
-            class: "text-sm",
-            style: "display:inline-flex; align-items:center; gap:0.35rem",
-            title: "Thinking effort: higher = more reasoning and more tool rounds, but slower"
+        div(
+            id: "effort-wrap",
+            "data-signals": (signals),
+            "data-on:click__outside": "$effortMenu = false",
+            style: "position:relative"
         ) {
-            (icons::sparkles(16))
-            span(class: "opacity-70 hidden sm:inline") { "Thinking:" }
-            // `name` deliberately omitted so the surrounding composer form
-            // doesn't serialise this select on send; the value rides in the
-            // `@post` query instead.
-            select(
-                "aria-label": "Thinking effort",
-                "data-on:change": (format!("@post('{action}?effort=' + evt.target.value)")),
-                class: "select select-sm",
-                // `padding-right` clears daisyUI's dropdown arrow (~20px in)
-                // so the label can't run under it; pill radius matches the
-                // rounded "+ Tools" button.
+            button(
+                type: "button",
+                "data-on:click": "$effortMenu = !$effortMenu",
+                class: "btn btn-sm gap-1",
                 style: "border:1px solid color-mix(in oklch, currentColor 15%, transparent); \
-                        border-radius:9999px; padding-right:2rem; min-width:6rem"
+                        border-radius:9999px",
+                title: "Thinking effort: higher = more reasoning and more tool rounds, but slower",
+                "aria-label": "Thinking effort"
             ) {
-                for o in opts.iter() {
-                    (o.clone())
+                (icons::sparkles(16))
+                span(class: "opacity-70 hidden sm:inline") { "Thinking:" }
+                // Label tracks the reactive selection (updates without a
+                // round-trip); seeded server-side with the current level.
+                span(
+                    "data-text": "({fast:'Fast', standard:'Standard', deep:'Deep', max:'Max'})[$effort]"
+                ) { (effort.label()) }
+                (icons::chevron_down(14))
+            }
+            // Dimming backdrop behind the sheet (mobile only; CSS hides it on
+            // desktop). Tapping it closes the menu.
+            div(
+                class: "chat-pop-backdrop",
+                "data-show": "$effortMenu",
+                "data-on:click": "$effortMenu = false",
+                style: "display:none"
+            ) {}
+            div(
+                class: "effort-panel rounded-box border border-base-300 bg-base-100 shadow",
+                "data-show": "$effortMenu",
+                style: "display:none"
+            ) {
+                (sheet_chrome("Thinking effort", "$effortMenu = false"))
+                for it in items.iter() {
+                    (it.clone())
                 }
             }
         }
@@ -579,6 +641,28 @@ pub(super) fn render_capabilities(session_id: &str, caps: &[CapabilityRow]) -> H
     .to_html()
 }
 
+/// Grab handle + titled close row rendered at the top of every composer
+/// popover. Both are hidden on desktop and revealed only when the popover
+/// renders as a mobile bottom sheet (see `.chat-pop-*` in main.css), giving
+/// the sheet a dismiss affordance where there's no click-outside gesture.
+fn sheet_chrome(title: &str, close_expr: &str) -> Html {
+    html! {
+        span(class: "chat-pop-grab") {}
+        div(class: "chat-pop-sheet-head") {
+            span(class: "chat-pop-sheet-head__title") { (title.to_string()) }
+            button(
+                type: "button",
+                "data-on:click": (close_expr.to_string()),
+                class: "btn btn-ghost btn-xs btn-circle",
+                "aria-label": "Close"
+            ) {
+                (icons::x_mark(16))
+            }
+        }
+    }
+    .to_html()
+}
+
 /// The `#capabilities` subtree: the "+" button, the popup tree, and the active
 /// chips. Rendered once at page load and left in place — the handler patches
 /// only its volatile leaves.
@@ -586,11 +670,11 @@ fn render_capabilities_inner(base: &str, caps: &[CapabilityRow]) -> Html {
     let has_caps = !caps.is_empty();
     // Full catalog ⇒ a search box is always worthwhile.
     let show_search = caps.len() > 6;
-    // Opaque card, opening upward above the sticky composer (z above its 20).
-    // Seeded closed; `data-show:$capMenu` governs it thereafter (never
-    // re-patched, so the binding keeps working).
-    let panel_style = "display:none; position:absolute; left:0; bottom:100%; \
-         margin-bottom:8px; width:27rem; z-index:30; overflow:hidden; padding:0.25rem";
+    // Desktop: an anchored popover opening upward above the composer.
+    // Phone: a bottom sheet (see `.cap-panel` in main.css). Seeded
+    // `display:none` so it can't flash before Datastar hydrates;
+    // `data-show:$capMenu` governs it thereafter (never re-patched, so the
+    // binding keeps working). A dimming backdrop (mobile only) sits behind.
     html! {
         div(
             id: "capabilities",
@@ -607,12 +691,21 @@ fn render_capabilities_inner(base: &str, caps: &[CapabilityRow]) -> Html {
                     (icons::plus(16))
                     span { "Tools" }
                 }
+                // Dimming backdrop behind the sheet (mobile only; CSS hides
+                // it on desktop). Tapping it closes the menu.
+                div(
+                    class: "chat-pop-backdrop",
+                    "data-show": "$capMenu",
+                    "data-on:click": "$capMenu = false",
+                    style: "display:none"
+                ) {}
                 if has_caps {
                     div(
-                        class: "rounded-box border border-base-300 bg-base-100 shadow",
+                        class: "cap-panel rounded-box border border-base-300 bg-base-100 shadow",
                         "data-show": "$capMenu",
-                        style: (panel_style)
+                        style: "display:none"
                     ) {
+                        (sheet_chrome("Tools", "$capMenu = false"))
                         if show_search {
                             input(
                                 type: "text",
@@ -631,7 +724,7 @@ fn render_capabilities_inner(base: &str, caps: &[CapabilityRow]) -> Html {
                         // pills line up at the exact same distance from the
                         // border. The master row sticks to the top so it stays
                         // visible while the list scrolls.
-                        div(style: "max-height:52vh; overflow-y:auto; scrollbar-gutter:stable") {
+                        div(class: "cap-scroll", style: "max-height:52vh; overflow-y:auto; scrollbar-gutter:stable") {
                             div(
                                 // Drive `display` reactively via the style
                                 // plugin, NOT `data-show`: on re-show datastar's
@@ -658,10 +751,11 @@ fn render_capabilities_inner(base: &str, caps: &[CapabilityRow]) -> Html {
                     }
                 } else {
                     div(
-                        class: "rounded-box border border-base-300 bg-base-100 shadow text-sm",
+                        class: "cap-panel rounded-box border border-base-300 bg-base-100 shadow text-sm",
                         "data-show": "$capMenu",
-                        style: (format!("{panel_style}; padding:0.75rem"))
+                        style: "display:none; padding:0.75rem"
                     ) {
+                        (sheet_chrome("Tools", "$capMenu = false"))
                         "No tools are available to your account yet. Connect an integration under "
                         a(href: "/integrations", style: "text-decoration:underline") { "Integrations" }
                         "."
@@ -845,8 +939,29 @@ fn render_cap_row(base: &str, c: &CapabilityRow) -> Html {
 /// loaded skills. Clicking a chip returns it to Auto (un-pin). `#cap-chips` is
 /// patched whenever the On set changes.
 fn render_cap_chips(base: &str, caps: &[CapabilityRow]) -> Html {
+    let on_count = caps.iter().filter(|c| c.is_on()).count();
     html! {
         div(id: "cap-chips", style: "display:contents") {
+            // Mobile-only summary pill. The individual chips below wrap over
+            // several rows and swallow the composer on a phone, so there they
+            // collapse (CSS) into this single count that opens the tools sheet
+            // to manage the pins. Lives inside `#cap-chips` so the toggle
+            // handler's patch keeps the count current.
+            if on_count > 0 {
+                button(
+                    type: "button",
+                    "data-on:click": "$capMenu = true",
+                    // Compact (icon + count only) so the composer toolbar keeps
+                    // to one row on a phone — "N active" pushed the thinking
+                    // picker onto a second line.
+                    class: "cap-chips-summary badge badge-outline gap-1",
+                    style: "cursor:pointer",
+                    title: "Active tools — tap to manage"
+                ) {
+                    (icons::plug(14))
+                    span { (on_count.to_string()) }
+                }
+            }
             for c in caps.iter().filter(|c| c.is_on()) {
                 button(
                     type: "button",
@@ -854,7 +969,7 @@ fn render_cap_chips(base: &str, caps: &[CapabilityRow]) -> Html {
                     "data-on:click": (format!(
                         "@post('{base}?kind={}&key={}&state=auto')", c.kind.as_str(), c.key
                     )),
-                    class: "badge badge-outline gap-1",
+                    class: "cap-chip-item badge badge-outline gap-1",
                     style: "cursor:pointer",
                     title: "Unpin (back to automatic)"
                 ) {
@@ -1106,31 +1221,52 @@ pub(super) fn render_fork_control(session_id: &str) -> Html {
     .to_html()
 }
 
-/// Export menu: a `<details>`-based daisyUI dropdown with one plain
-/// download link per format. Pure HTML — no datastar directives — so the
-/// browser performs an ordinary GET and the handler's
-/// `Content-Disposition: attachment` triggers a download. The links must
-/// stay free of `data-on:*` so the SPA-nav path doesn't swallow them and
-/// try to morph a binary/markdown body into the page.
+/// Export menu: a hand-rolled popover anchored under the header button. Replaces
+/// the former daisyUI `<details class="dropdown">`, whose positioning + card
+/// styles are purged from the ship build (same reason the tools popover is
+/// hand-rolled) — on a phone it opened unanchored, uncarded, and never closed
+/// on outside-click or selection.
+///
+/// Unlike the tools/thinking popovers (which become bottom sheets on a phone
+/// because they're tall and triggered from the composer), this stays an anchored
+/// dropdown at every size: it's a two-item menu triggered from the *top* header,
+/// so a bottom sheet would surface far from where the user tapped. It's narrow
+/// enough to fit a phone (`.export-panel` caps at `100vw - 2rem`).
+///
+/// The links stay free of `data-on:*` so the SPA-nav path doesn't swallow them
+/// and try to morph a binary/markdown body into the page; the browser does an
+/// ordinary GET and the handler's `Content-Disposition: attachment` triggers
+/// the download. Closing on selection is handled by a panel-level `data-on:click`
+/// (no `__prevent`), so a bubbled click closes the menu while the link's default
+/// download still fires; tapping elsewhere closes it via `click__outside`.
 pub(super) fn render_export_control(session_id: &str) -> Html {
     let md_url = format!("/chat/{session_id}/export.md");
     let pdf_url = format!("/chat/{session_id}/export.pdf");
     html! {
-        details(class: "dropdown dropdown-end") {
-            summary(
+        div(
+            id: "export-wrap",
+            "data-signals": "{exportMenu: false}",
+            "data-on:click__outside": "$exportMenu = false",
+            style: "position:relative"
+        ) {
+            button(
+                type: "button",
+                "data-on:click": "$exportMenu = !$exportMenu",
                 class: "btn btn-ghost btn-sm whitespace-nowrap",
-                title: "Download this conversation"
+                title: "Download this conversation",
+                "aria-label": "Export conversation"
             ) {
                 (icons::download(16))
                 span(class: "hidden sm:inline") { "Export" }
             }
-            ul(class: "dropdown-content menu bg-base-100 rounded-box z-10 mt-1 w-48 p-2 shadow") {
-                li {
-                    a(href: (pdf_url), download: "download") { "PDF document" }
-                }
-                li {
-                    a(href: (md_url), download: "download") { "Markdown (.md)" }
-                }
+            div(
+                class: "export-panel rounded-box border border-base-300 bg-base-100 shadow",
+                "data-show": "$exportMenu",
+                "data-on:click": "$exportMenu = false",
+                style: "display:none"
+            ) {
+                a(href: (pdf_url), download: "download", class: "chat-pop-item") { "PDF document" }
+                a(href: (md_url), download: "download", class: "chat-pop-item") { "Markdown (.md)" }
             }
         }
     }
@@ -1388,15 +1524,24 @@ mod tests {
 
     #[test]
     fn export_links_are_plain_downloads_not_spa_nav() {
-        // A `data-on:*` directive here would let the SPA-nav path intercept
-        // the click and try to morph a binary PDF into the page. The links
-        // must stay plain anchors with `download`.
+        // A `data-on:*` on an export <a> would let the SPA-nav path intercept
+        // the click and try to morph a binary PDF into the page. The popover
+        // chrome (trigger button, backdrop, panel) does carry datastar
+        // directives, but every download anchor must stay a plain `download`
+        // link. Closing on selection rides a panel-level handler + bubbling.
         let menu = render_export_control("s1").to_string();
         assert!(menu.contains("download"), "expected download attr: {menu}");
-        assert!(
-            !menu.contains("data-on"),
-            "export links must not carry datastar directives: {menu}"
-        );
+        for anchor in menu.split("<a ").skip(1) {
+            let tag = anchor.split('>').next().unwrap_or("");
+            assert!(
+                tag.contains("download"),
+                "export anchor must carry the download attr: {tag}"
+            );
+            assert!(
+                !tag.contains("data-on"),
+                "export anchor must not carry datastar directives: {tag}"
+            );
+        }
     }
 
     #[test]
@@ -1414,10 +1559,21 @@ mod tests {
                 "missing effort level `{label}`: {body}"
             );
         }
-        // page_body seeds Effort::Standard → that option is the selected one.
+        // page_body seeds Effort::Standard → the reactive selection signal is
+        // seeded to it, each level posts its own key, and the current level is
+        // marked reactively (no native <select>, which Android renders as a
+        // detached centred modal).
         assert!(
-            body.contains("value=\"standard\" selected=\"selected\""),
-            "the current effort must be pre-selected: {body}"
+            body.contains("effort: &quot;standard&quot;"),
+            "current effort must seed the reactive selection signal: {body}"
+        );
+        assert!(
+            body.contains("@post(&#39;/chat/s1/effort?effort=standard&#39;)"),
+            "each level must post its key to the effort endpoint: {body}"
+        );
+        assert!(
+            body.contains("chat-pop-item--active"),
+            "the picker must mark the selected level reactively: {body}"
         );
     }
 
@@ -1628,6 +1784,81 @@ mod tests {
         assert!(
             !viewer.contains("/chat/s1/capabilities"),
             "read-only view must not expose the capabilities endpoint: {viewer}"
+        );
+    }
+
+    #[test]
+    fn tools_popover_is_a_dismissable_sheet() {
+        // The tools menu must render as the bottom-sheet-capable popover
+        // (`.cap-panel`) with a tap-to-close backdrop, so on a phone it fits
+        // the viewport instead of spilling off the right / top edges.
+        let html = render_capabilities("s1", &sample_caps()).to_string();
+        assert!(
+            html.contains("cap-panel"),
+            "tools panel must use the .cap-panel sheet class: {html}"
+        );
+        assert!(
+            html.contains("chat-pop-backdrop"),
+            "tools sheet must have a dismiss backdrop: {html}"
+        );
+        assert!(
+            html.contains("chat-pop-grab"),
+            "tools sheet must have a grab/close affordance: {html}"
+        );
+    }
+
+    #[test]
+    fn active_caps_collapse_into_a_summary_pill() {
+        // sample_caps() pins exactly one tool (dns_lookup) On. On a phone the
+        // individual chips fold into a single count pill that reopens the menu.
+        let html = render_capabilities("s1", &sample_caps()).to_string();
+        assert!(
+            html.contains("cap-chips-summary"),
+            "an active cap must render the mobile summary pill: {html}"
+        );
+        assert!(
+            html.contains("Active tools — tap to manage"),
+            "the summary pill must be labelled for what it does: {html}"
+        );
+        // Tapping the pill opens the same menu the "+" button drives.
+        assert!(
+            html.contains("$capMenu = true"),
+            "the summary pill must open the tools menu: {html}"
+        );
+    }
+
+    #[test]
+    fn effort_and_export_popovers_are_self_contained() {
+        // Both replaced native/daisyUI controls with hand-rolled popovers that
+        // carry their own open signal and close on click-outside.
+        let body = page_body(None);
+        assert!(
+            body.contains("id=\"effort-wrap\"") && body.contains("effortMenu"),
+            "effort picker must be a self-contained popover: {body}"
+        );
+        assert!(
+            body.contains("id=\"export-wrap\"") && body.contains("exportMenu"),
+            "export menu must be a self-contained popover: {body}"
+        );
+        // Both dismiss on an outside click (no native/daisyUI auto-close).
+        assert!(
+            body.contains("$effortMenu = false") && body.contains("$exportMenu = false"),
+            "popovers must wire click-outside dismissal: {body}"
+        );
+    }
+
+    #[test]
+    fn composer_offers_an_inline_feedback_trigger() {
+        // On phones the floating FAB overlaps the send button, so the composer
+        // carries an inline trigger that delegates to the real FAB.
+        let body = page_body(None);
+        assert!(
+            body.contains("composer-feedback-btn"),
+            "composer must include the inline feedback trigger: {body}"
+        );
+        assert!(
+            body.contains("getElementById(&#39;feedback-fab&#39;)"),
+            "inline trigger must delegate to the real FAB: {body}"
         );
     }
 }

@@ -1134,6 +1134,20 @@
     @media (max-width: 639px) {
         .chat-col > #conversation {
             padding-top: 3rem;
+            /* Phones use overlay scrollbars, so don't reserve a stable gutter —
+             * it only added ~15px of dead space on the right edge. */
+            scrollbar-gutter: auto;
+        }
+        /* Let user bubbles use almost the full width instead of capping at 80%,
+         * which left a wide empty gutter on a phone. */
+        #conversation > .chat-msg--user {
+            max-width: 92%;
+        }
+        /* Trim the floating composer's side inset to match the tighter phone
+         * gutters so it lines up with the conversation. */
+        .chat-col > .chat-composer {
+            left: 0.5rem;
+            right: 0.5rem;
         }
     }
 
@@ -1812,6 +1826,193 @@
     .voice-level > span:nth-child(3) { height: 70%; }
     .voice-level > span:nth-child(4) { height: 45%; }
 
+    /* ==================================================================
+     * Composer overlays: tools / thinking / export.
+     *
+     * Desktop keeps the hand-rolled anchored popovers (daisyUI's own
+     * `dropdown-*` / Tailwind's `bottom-full` are purged from the ship
+     * build, so positioning is done here with rules that always ship).
+     *
+     * Phone (< 640px): every popover becomes a full-width bottom sheet
+     * with a dimming backdrop. The old 27rem popover spilled past a
+     * phone's right edge and, opening upward, pushed its top rows above
+     * the viewport where they couldn't be reached; a bottom sheet fits
+     * the viewport and scrolls internally. The native `<select>` effort
+     * picker (which Android renders as a centred modal) and the daisyUI
+     * `<details>` export menu (whose card never positioned) are replaced
+     * by this same mechanism so all three behave identically.
+     *
+     * Seeding: each panel/backdrop carries an inline `display:none` so it
+     * can't flash before Datastar hydrates; `data-show` then governs it
+     * (Datastar removes the inline `display` on show, reverting to the
+     * `display` these rules set). Backdrops/grab handles/summary pills
+     * therefore key their visibility off `display` in the media query. */
+    .cap-panel {
+        position: absolute;
+        left: 0;
+        bottom: 100%;
+        margin-bottom: 8px;
+        width: 27rem;
+        max-width: calc(100vw - 2rem);
+        z-index: 30;
+        overflow: hidden;
+        padding: 0.25rem;
+    }
+    .effort-panel {
+        position: absolute;
+        right: 0;
+        bottom: 100%;
+        margin-bottom: 8px;
+        width: 12rem;
+        max-width: calc(100vw - 2rem);
+        z-index: 30;
+        overflow: hidden;
+        padding: 0.35rem;
+    }
+    .export-panel {
+        position: absolute;
+        right: 0;
+        top: 100%;
+        margin-top: 0.35rem;
+        width: 12rem;
+        max-width: calc(100vw - 2rem);
+        z-index: 30;
+        overflow: hidden;
+        padding: 0.35rem;
+    }
+    /* One list item inside the thinking / export popovers. */
+    .chat-pop-item {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        width: 100%;
+        padding: 0.55rem 0.6rem;
+        border-radius: 0.5rem;
+        text-align: left;
+        color: inherit;
+        text-decoration: none;
+        cursor: pointer;
+        font-size: 0.9rem;
+    }
+    @media (hover: hover) {
+        .chat-pop-item:hover {
+            background: color-mix(in oklch, var(--color-base-content) 8%, transparent);
+        }
+    }
+    .chat-pop-item--active {
+        color: var(--color-primary);
+        font-weight: 600;
+    }
+    .chat-pop-item__check {
+        display: inline-flex;
+        width: 1rem;
+        flex: none;
+        opacity: 0;
+    }
+    .chat-pop-item--active .chat-pop-item__check {
+        opacity: 1;
+    }
+
+    /* Backdrop + sheet chrome: desktop never shows them; the media query
+     * below reveals them for the bottom-sheet layout only. */
+    .chat-pop-backdrop { display: none; }
+    .chat-pop-sheet-head { display: none; }
+    .chat-pop-grab { display: none; }
+    /* Mobile-only summary pill that stands in for the individual chips.
+     * `!important` because it carries daisyUI's `.badge` (display:inline-flex,
+     * `@layer utilities`), which otherwise outranks a components-layer rule. */
+    .cap-chips-summary { display: none !important; }
+    /* Inline feedback trigger in the composer toolbar (mobile only). Hidden
+     * until feedback.ts confirms the feature is enabled, then shown only on
+     * phones; the floating .feedback-fab is hidden there instead. `!important`
+     * for the same daisyUI `.btn` layer-precedence reason as above. */
+    .composer-feedback-btn { display: none !important; }
+
+    @media (max-width: 639px) {
+        /* Tools + thinking become bottom sheets (tall, triggered from the
+         * composer at the bottom). Export stays an anchored dropdown — it's a
+         * short menu triggered from the top header, where a bottom sheet would
+         * surface far from the tap. */
+        .cap-panel,
+        .effort-panel {
+            position: fixed;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            top: auto;
+            width: auto;
+            max-width: 100%;
+            margin: 0;
+            border-radius: 1rem 1rem 0 0;
+            z-index: 60;
+            max-height: 85dvh;
+            display: flex;
+            flex-direction: column;
+            padding: 1rem 0.5rem calc(0.5rem + env(safe-area-inset-bottom));
+            animation: sheet-up 200ms cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        .chat-pop-backdrop {
+            display: block;
+            position: fixed;
+            inset: 0;
+            z-index: 55;
+            background: color-mix(in oklch, black 50%, transparent);
+        }
+        .chat-pop-sheet-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 0.25rem 0.5rem;
+            flex: none;
+        }
+        .chat-pop-sheet-head__title {
+            font-size: 0.8rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            opacity: 0.7;
+        }
+        .chat-pop-grab {
+            display: block;
+            position: absolute;
+            top: 0.45rem;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 2.25rem;
+            height: 0.25rem;
+            border-radius: 9999px;
+            background: color-mix(in oklch, var(--color-base-content) 25%, transparent);
+        }
+        /* The tools scroll box grows to fill the sheet instead of its
+         * fixed desktop 52vh cap. */
+        .cap-panel > .cap-scroll {
+            flex: 1 1 auto;
+            max-height: none;
+        }
+        /* Individual pinned-tool chips fold into the summary pill.
+         * `!important` beats daisyUI's `.badge` display (see above). */
+        .cap-chip-item { display: none !important; }
+        .cap-chips-summary {
+            display: inline-flex !important;
+            align-items: center;
+            gap: 0.35rem;
+        }
+        /* Floating FAB gives way to the inline toolbar button on phones.
+         * The inline button only appears once the FAB has been revealed
+         * (feedback enabled) — `:has` bridges the two subtrees (the FAB is a
+         * sibling of <main>, the button lives in the composer) so the reveal
+         * survives SPA nav without re-running feedback.ts. `!important` beats
+         * both the base rule and daisyUI's `.btn` display. */
+        .feedback-fab { display: none !important; }
+        body:has(#feedback-fab:not([hidden])) .composer-feedback-btn {
+            display: inline-flex !important;
+        }
+    }
+    @keyframes sheet-up {
+        from { transform: translateY(100%); }
+        to   { transform: translateY(0); }
+    }
+
 }
 
 /* Markdown styling for chat replies + reasoning blocks.
@@ -1956,5 +2157,19 @@
         margin-top: 0.5rem;
         padding-inline-start: 0.75rem;
         border-inline-start: 2px solid var(--color-base-300);
+    }
+
+    /* Phone: the composer floats over the bottom of the conversation
+     * (z-index 20), so a `toast-bottom` stack lands behind it and its
+     * text is unreadable. Dock toasts to the top on phones and lift the
+     * stack above the composer. Lives in `@layer utilities` (with an
+     * id+class selector) so it outranks daisyUI's own `.toast*` rules,
+     * which ship in daisyUI's utilities sub-layer. */
+    @media (max-width: 639px) {
+        #toasts.toast {
+            top: calc(env(safe-area-inset-top) + 0.75rem);
+            bottom: auto;
+            z-index: 70;
+        }
     }
 }
