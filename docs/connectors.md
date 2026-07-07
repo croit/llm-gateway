@@ -17,15 +17,16 @@ are documented here so you don't have to rediscover them.
 > [`README`](../README.md) for how the key is derived if unset. In dev with no
 > key, connections don't survive a restart — users just reconnect.
 
-## The three auth models
+## The four auth models
 
 A catalog entry (`auth` column + `use_dcr` flag) is one of:
 
 | Model | What the admin must do | Examples |
 |---|---|---|
 | **OAuth2 + DCR** (`use_dcr=true`) | **Nothing** beyond pointing it at a URL. The gateway registers itself dynamically (RFC 7591) the first time a user connects. Zero credentials to manage. | Atlassian, GitLab.com, Google Workspace (self-hosted server) |
-| **OAuth2, manual client** (`use_dcr=false`) | Create an OAuth app in the provider's console, paste its **client ID + secret** into the connector. The app identity is the *gateway's*, shared by all users; each user still authorizes with their own account. | GitHub |
+| **OAuth2, manual client** (`use_dcr=false`) | Create an OAuth app in the provider's console, paste its **client ID + secret** into the connector. The app identity is the *gateway's*, shared by all users; each user still authorizes with their own account. | GitHub, Slack |
 | **Static bearer** (`auth=static_bearer`) | Nothing in the console; the **user** pastes a personal access token when connecting. | self-hosted / on-prem MCP servers, GitLab CE |
+| **None** (`auth=none`) | Nothing — just the server URL. There's no credential of any kind; each user still clicks Connect once, purely so they control whether the tools show up in their chats. | Kiwi.com flight search |
 
 DCR is the nicest experience but most providers don't support it. Where a
 provider requires a manual OAuth client, **the client ID/secret is the
@@ -102,6 +103,25 @@ Requested scopes: `repo`, `read:org`, `read:user`, `user:email`,
 
 ---
 
+## Slack
+
+Slack's MCP server (`https://mcp.slack.com/mcp`) requires a **statically
+registered** app — no dynamic client registration, and only
+directory-published or workspace-internal apps are permitted.
+
+1. **[api.slack.com/apps](https://api.slack.com/apps) → Create New App.**
+2. Under **OAuth & Permissions**, add the redirect URI:
+   `https://<your-gateway-host>/integrations/callback`.
+3. Request the scopes the connector needs (search, read channels/users, send
+   messages — trim to taste in `/admin/connectors`).
+4. Copy the **Client ID** and **Client Secret** from **Basic Information**.
+5. In `/admin/connectors`, edit Slack, enter client ID + secret, save, enable.
+
+Each user then authorizes their own Slack account at `/integrations`. Slack
+speaks streamable HTTP only — the legacy `/sse` transport isn't offered here.
+
+---
+
 ## Atlassian (Jira & Confluence)
 
 **Zero admin config** — Atlassian supports dynamic client registration. Just
@@ -128,6 +148,16 @@ connectors:
   `read_api` for read-only). Deployment recipe (compose + Quadlet) in
   [`../deploy/README.md`](../deploy/README.md). Unlike the Google MCP this bridge
   needs **no public URL and no OAuth** — the gateway reaches it internally.
+
+---
+
+## Kiwi.com flight search
+
+Kiwi's MCP server (`https://mcp.kiwi.com`) is public and unauthenticated — no
+API key, no OAuth, nothing to configure. **Zero admin config**: just enable
+the connector in `/admin/connectors`. Users still connect individually at
+`/integrations` (there's no credential to enter — the click just opts the
+tools into that user's chats).
 
 ---
 

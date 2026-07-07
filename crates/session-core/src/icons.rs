@@ -249,9 +249,26 @@ const SI_GOOGLE_CALENDAR: &str = "M18.316 5.684H24v12.632h-5.684V5.684zM5.684 24
 
 const SI_GOOGLE: &str = "M12.48 10.92v3.28h7.84c-.24 1.84-.853 3.187-1.787 4.133-1.147 1.147-2.933 2.4-6.053 2.4-4.827 0-8.6-3.893-8.6-8.72s3.773-8.72 8.6-8.72c2.6 0 4.507 1.027 5.907 2.347l2.307-2.307C18.747 1.44 16.133 0 12.48 0 5.867 0 .307 5.387.307 12s5.56 12 12.173 12c3.573 0 6.267-1.173 8.373-3.36 2.16-2.16 2.84-5.213 2.84-7.667 0-.76-.053-1.467-.173-2.053H12.48z";
 
+// Font Awesome Free brand mark (CC BY 4.0), 448×512 viewBox — Slack was
+// pulled from simple-icons at the trademark holder's request, so this is
+// the fallback source. `brand()` assumes a 24×24 viewBox, so Slack renders
+// through its own inline `<svg>` instead.
+const SI_SLACK: &str = "M94.12 315.1c0 25.9-21.16 47.06-47.06 47.06S0 341 0 315.1c0-25.9 21.16-47.06 47.06-47.06h47.06v47.06zm23.72 0c0-25.9 21.16-47.06 47.06-47.06s47.06 21.16 47.06 47.06v117.84c0 25.9-21.16 47.06-47.06 47.06s-47.06-21.16-47.06-47.06V315.1zm47.06-188.98c-25.9 0-47.06-21.16-47.06-47.06S139 32 164.9 32s47.06 21.16 47.06 47.06v47.06H164.9zm0 23.72c25.9 0 47.06 21.16 47.06 47.06s-21.16 47.06-47.06 47.06H47.06C21.16 243.96 0 222.8 0 196.9s21.16-47.06 47.06-47.06H164.9zm188.98 47.06c0-25.9 21.16-47.06 47.06-47.06 25.9 0 47.06 21.16 47.06 47.06s-21.16 47.06-47.06 47.06h-47.06V196.9zm-23.72 0c0 25.9-21.16 47.06-47.06 47.06-25.9 0-47.06-21.16-47.06-47.06V79.06c0-25.9 21.16-47.06 47.06-47.06 25.9 0 47.06 21.16 47.06 47.06V196.9zM283.1 385.88c25.9 0 47.06 21.16 47.06 47.06 0 25.9-21.16 47.06-47.06 47.06-25.9 0-47.06-21.16-47.06-47.06v-47.06h47.06zm0-23.72c-25.9 0-47.06-21.16-47.06-47.06 0-25.9 21.16-47.06 47.06-47.06h117.84c25.9 0 47.06 21.16 47.06 47.06 0 25.9-21.16 47.06-47.06 47.06H283.1z";
+
 /// Inline brand logo for a known connector key, sized `size`. `None` for keys
 /// without a bundled logo (caller falls back to the connector's `icon` text).
 pub fn connector_logo(key: &str, size: u32) -> Option<Html> {
+    if key == "slack" {
+        return Some(raw(format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 448 512\" \
+             width=\"{size}\" height=\"{size}\" fill=\"#4A154B\" \
+             class=\"inline-block shrink-0 align-text-bottom\" aria-hidden=\"true\">\
+             <path d=\"{SI_SLACK}\"/></svg>",
+        )));
+    }
+    if key == "kiwi" {
+        return Some(plane(size));
+    }
     let (color, path) = match key {
         "github" => ("currentColor", SI_GITHUB),
         "gitlab" => ("#FC6D26", SI_GITLAB),
@@ -395,5 +412,15 @@ pub fn x_mark(size: u32) -> Html {
     raw(render(
         size,
         r#"<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>"#,
+    ))
+}
+
+/// Plane (lucide `plane`) — the Kiwi.com flight-search connector. Kiwi has no
+/// published brand mark in simple-icons, so this stands in as a semantic icon
+/// rather than an exact logo.
+pub fn plane(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.3c.3.4.8.5 1.3.3l.5-.2c.4-.3.6-.7.5-1.2z"/>"#,
     ))
 }

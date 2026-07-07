@@ -439,6 +439,19 @@ fn render_oauth_help(existing: Option<&Connector>, redirect_uri: &str) -> Html {
         }
         .to_html();
     }
+    // Open connectors need no credentials at all — just the server URL.
+    if existing.map(|c| c.auth == AuthKind::None).unwrap_or(false) {
+        return html! {
+            div(class: "rounded-md border border-info/30 bg-info/5 p-3 text-xs leading-relaxed") {
+                p(class: "m-0") {
+                    "Public connector: set the MCP server URL above. No OAuth client and no "
+                    "per-user token — every user still connects individually so they can opt "
+                    "its tools in or out."
+                }
+            }
+        }
+        .to_html();
+    }
     let key = existing.map(|c| c.key.clone()).unwrap_or_default();
     let category = existing
         .and_then(|c| c.category.clone())
@@ -489,6 +502,7 @@ fn render_oauth_help(existing: Option<&Connector>, redirect_uri: &str) -> Html {
     }
     let is_google = category == "Google" || key.starts_with("google") || key == "gmail";
     let is_github = key == "github";
+    let is_slack = key == "slack";
     let redirect_uri = redirect_uri.to_string();
     html! {
         div(class: "rounded-md border border-info/30 bg-info/5 p-3 text-xs leading-relaxed") {
@@ -520,6 +534,19 @@ fn render_oauth_help(existing: Option<&Connector>, redirect_uri: &str) -> Html {
                     " (Settings → Developer settings → OAuth Apps), set the Authorization "
                     "callback URL to the redirect URI above, and copy the Client ID + a "
                     "generated client secret."
+                }
+            } else if is_slack {
+                p(class: "m-0") {
+                    "Slack: create an app at "
+                    a(class: "link", target: "_blank", rel: "noopener noreferrer",
+                      href: "https://api.slack.com/apps") {
+                        "api.slack.com/apps"
+                    }
+                    ", add the redirect URI above under OAuth & Permissions, request the "
+                    "scopes configured below, and copy the Client ID + Client Secret from "
+                    "Basic Information. Slack requires a statically registered, "
+                    "directory-published or workspace-internal app — dynamic client "
+                    "registration isn't supported."
                 }
             } else {
                 p(class: "m-0") {
@@ -576,9 +603,9 @@ fn render_form_fields(existing: Option<&Connector>, has_secret: bool, redirect_u
         .and_then(|c| c.required_role.clone())
         .unwrap_or_default();
     let use_dcr = existing.map(|c| c.use_dcr).unwrap_or(true);
-    let auth_static = existing
-        .map(|c| c.auth == AuthKind::StaticBearer)
-        .unwrap_or(false);
+    let auth_kind = existing.map(|c| c.auth).unwrap_or(AuthKind::OAuth2);
+    let auth_static = auth_kind == AuthKind::StaticBearer;
+    let auth_none = auth_kind == AuthKind::None;
     let is_edit = existing.is_some();
     let secret_placeholder = if has_secret {
         "•••••••• (leave blank to keep)"
@@ -627,18 +654,24 @@ fn render_form_fields(existing: Option<&Connector>, has_secret: bool, redirect_u
                     if auth_static {
                         option(value: "oauth2") { "OAuth 2.1 (each user authorizes via the provider)" }
                         option(value: "static_bearer", selected: "selected") { "User-supplied token (each user pastes their own API token)" }
+                        option(value: "none") { "None (public server, no authentication)" }
+                    } else if auth_none {
+                        option(value: "oauth2") { "OAuth 2.1 (each user authorizes via the provider)" }
+                        option(value: "static_bearer") { "User-supplied token (each user pastes their own API token)" }
+                        option(value: "none", selected: "selected") { "None (public server, no authentication)" }
                     } else {
                         option(value: "oauth2", selected: "selected") { "OAuth 2.1 (each user authorizes via the provider)" }
                         option(value: "static_bearer") { "User-supplied token (each user pastes their own API token)" }
+                        option(value: "none") { "None (public server, no authentication)" }
                     }
                 }
             }
             (render_oauth_help(existing, redirect_uri))
             // OAuth-client fields only make sense for OAuth connectors. A
-            // user-supplied-token (static_bearer) connector has no app-level
-            // client — each user pastes their own token at connect time — so
-            // hide the whole block (incl. the Google client-JSON paste).
-            if !auth_static {
+            // user-supplied-token (static_bearer) or public (none) connector
+            // has no app-level client, so hide the whole block (incl. the
+            // Google client-JSON paste).
+            if !auth_static && !auth_none {
                 label(class: "form-control w-full") {
                     span(class: "label-text text-xs") {
                         "Paste OAuth client JSON (optional — e.g. Google’s “Download JSON”)"

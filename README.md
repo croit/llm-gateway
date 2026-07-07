@@ -93,15 +93,16 @@ The CSS bundle and `datastar.js` are baked into the binary via `include_bytes!`,
 
 ## Integrations (per-user MCP connectors)
 
-Each signed-in user can connect their **own** accounts — Gmail/Calendar/Drive, GitHub, Atlassian (Jira/Confluence), GitLab, and any other [MCP](https://modelcontextprotocol.io/) server — at `/integrations`, so the model can act on their behalf with **their** permissions. It's a self-hosted, per-user connector store comparable to the connectors in desktop AI apps.
+Each signed-in user can connect their **own** accounts — Gmail/Calendar/Drive, GitHub, Atlassian (Jira/Confluence), GitLab, Slack, Kiwi.com flight search, and any other [MCP](https://modelcontextprotocol.io/) server — at `/integrations`, so the model can act on their behalf with **their** permissions. It's a self-hosted, per-user connector store comparable to the connectors in desktop AI apps.
 
 ![The /integrations page: a list of connectable accounts — Atlassian, GitHub, GitLab (SaaS and self-managed), Google Workspace — each with a short description and a Connect button; the self-managed GitLab card shows a personal-access-token field.](docs/img/integrations.png)
 
-An admin curates which servers the catalog offers at `/admin/connectors`; users just click **Connect**. Three auth models are supported, chosen per connector:
+An admin curates which servers the catalog offers at `/admin/connectors`; users just click **Connect**. Four auth models are supported, chosen per connector:
 
 - **OAuth 2.1 + dynamic client registration** — nothing to configure beyond a URL (e.g. Atlassian, GitLab.com, a self-hosted Google Workspace server).
-- **OAuth 2.1 with a manual client** — the admin registers one OAuth app once (e.g. GitHub).
+- **OAuth 2.1 with a manual client** — the admin registers one OAuth app once (e.g. GitHub, Slack).
 - **User-supplied token** — each user pastes their own API token / PAT (e.g. self-managed GitLab CE).
+- **None** — a public, unauthenticated server (e.g. Kiwi.com flight search); users still connect individually to opt its tools into their own chats.
 
 Per-user OAuth tokens are **encrypted at rest** (AES-256-GCM) and **refreshed in the background** so connections don't silently expire. Each connected server's tools are namespaced (`mcp__<server>__*`) and obey the same per-tool always/ask/off controls as the built-in tools. Provider and deployment setup — including the self-hosted Google Workspace and GitLab CE bridges — is in [`deploy/README.md`](deploy/README.md) and [`docs/connectors.md`](docs/connectors.md).
 

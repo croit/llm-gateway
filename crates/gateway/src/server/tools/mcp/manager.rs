@@ -186,8 +186,12 @@ impl McpConnectionManager {
             .map_err(|e| format!("loading connection: {e}"))?
             .ok_or_else(|| "not connected".to_string())?;
 
-        let (access, refreshed) = self.access_token(user_id, connector, &conn).await?;
-        let connected =
+        // Open connectors carry no credentials at all — the user's "connected"
+        // row exists purely so they can opt the tools in/out, not for auth.
+        let connected = if connector.auth == mcp_catalog::AuthKind::None {
+            connect_http_server(&connector.key, &connector.url, None).await?
+        } else {
+            let (access, refreshed) = self.access_token(user_id, connector, &conn).await?;
             match connect_http_server(&connector.key, &connector.url, Some(&access)).await {
                 Ok(s) => s,
                 // The server rejected a token we didn't think was expired
@@ -206,7 +210,8 @@ impl McpConnectionManager {
                         .map_err(|e2| format!("reconnect after refresh failed: {e2}"))?
                 }
                 Err(e) => return Err(e),
-            };
+            }
+        };
         let ConnectedServer { conn: _live, tools } = connected;
         let tools: Vec<Arc<McpTool>> = tools.into_iter().map(Arc::new).collect();
 

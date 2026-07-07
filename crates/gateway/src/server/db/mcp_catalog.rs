@@ -374,6 +374,47 @@ pub const DEFAULT_CONNECTORS: &[DefaultConnector] = &[
         token_url: Some("https://github.com/login/oauth/access_token"),
     },
     DefaultConnector {
+        key: "kiwi",
+        name: "Kiwi.com Flight Search",
+        description: "Search one-way and round-trip flights (dates, passengers, cabin class) via Kiwi.com.",
+        icon: "kiwi",
+        category: "Travel",
+        // Public, unauthenticated streamable-HTTP endpoint — no OAuth, no API
+        // key. Still opt-in per user (like every other connector) so each
+        // user controls whether flight search is exposed to their chats.
+        url: "https://mcp.kiwi.com",
+        auth: AuthKind::None,
+        use_dcr: false,
+        scopes: &[],
+        authorize_url: None,
+        token_url: None,
+    },
+    DefaultConnector {
+        key: "slack",
+        name: "Slack",
+        description: "Search messages, files, and channels, and send messages in the user's Slack workspace.",
+        icon: "slack",
+        category: "Productivity",
+        // JSON-RPC 2.0 over streamable HTTP; Slack does not support the
+        // legacy HTTP+SSE transport for this endpoint.
+        url: "https://mcp.slack.com/mcp",
+        auth: AuthKind::OAuth2,
+        // Slack requires a statically registered app (fixed client id, no
+        // dynamic client registration) and only permits directory-published
+        // or workspace-internal apps, so an admin must create one manually.
+        use_dcr: false,
+        scopes: &[
+            "search:read.public",
+            "search:read.private",
+            "channels:read",
+            "users:read",
+            "users:read.email",
+            "chat:write",
+        ],
+        authorize_url: Some("https://slack.com/oauth/v2_user/authorize"),
+        token_url: Some("https://slack.com/api/oauth.v2.user.access"),
+    },
+    DefaultConnector {
         key: "gitlab",
         name: "GitLab (SaaS / Premium)",
         description: "Work with projects, issues, and merge requests on GitLab.com. GitLab's native MCP server is a Duo feature (Premium/Ultimate); for Community Edition use the self-managed connector below.",
@@ -520,6 +561,39 @@ mod tests {
         assert!(atl.use_dcr);
         assert!(!atl.url.is_empty());
         assert!(!atl.needs_setup());
+    }
+
+    #[tokio::test]
+    async fn kiwi_needs_no_setup_and_no_auth() {
+        let pool = pool().await;
+        seed_defaults(&pool).await.unwrap();
+        // Public, unauthenticated server with a fixed URL → ready to enable
+        // as-is, unlike every OAuth2/static_bearer default.
+        let kiwi = get(&pool, "kiwi").await.unwrap().unwrap();
+        assert_eq!(kiwi.auth, AuthKind::None);
+        assert!(!kiwi.use_dcr);
+        assert!(!kiwi.url.is_empty());
+        assert!(!kiwi.needs_setup());
+    }
+
+    #[tokio::test]
+    async fn slack_pins_oauth_endpoints_and_needs_manual_client() {
+        let pool = pool().await;
+        seed_defaults(&pool).await.unwrap();
+        // Like GitHub: no DCR, no RFC 8414 metadata → an admin must supply a
+        // client id before the connector can be enabled.
+        let slack = get(&pool, "slack").await.unwrap().unwrap();
+        assert_eq!(slack.auth, AuthKind::OAuth2);
+        assert!(!slack.use_dcr);
+        assert!(slack.needs_setup());
+        assert_eq!(
+            slack.authorize_url.as_deref(),
+            Some("https://slack.com/oauth/v2_user/authorize")
+        );
+        assert_eq!(
+            slack.token_url.as_deref(),
+            Some("https://slack.com/api/oauth.v2.user.access")
+        );
     }
 
     #[tokio::test]

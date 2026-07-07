@@ -129,6 +129,35 @@ pub async fn integrations_connect(
     {
         return forbidden_html(&user.email, "you don't have access to this connector");
     }
+    if connector.auth == AuthKind::None {
+        // No credentials to negotiate — the connection row exists only so the
+        // user can opt this connector's tools in/out, same as any other.
+        let empty = match state.mcp.crypto().seal_str("") {
+            Ok(s) => s,
+            Err(err) => {
+                return internal_error_html(&user.email, &format!("sealing placeholder: {err}"));
+            }
+        };
+        let new = NewConnection {
+            user_id: user.id.clone(),
+            connector_key: key.clone(),
+            access_token_ct: empty.ciphertext,
+            access_token_nonce: empty.nonce,
+            refresh_token_ct: None,
+            refresh_token_nonce: None,
+            token_expires_at: None,
+            scopes: Vec::new(),
+            dcr_client_id: None,
+            dcr_client_secret_ct: None,
+            dcr_client_secret_nonce: None,
+            token_url: None,
+        };
+        if let Err(err) = user_mcp::upsert_connection(&state.db, new).await {
+            return internal_error_html(&user.email, &format!("saving connection: {err}"));
+        }
+        state.mcp.invalidate(&user.id, &key).await;
+        return redirect("/integrations");
+    }
     if connector.auth != AuthKind::OAuth2 {
         return internal_error_html(&user.email, "this connector does not use OAuth");
     }
