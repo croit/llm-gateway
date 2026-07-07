@@ -365,3 +365,128 @@ async fn reindex_after_edit_drops_old_chunks_and_picks_up_new_content() {
     assert!(!hits.is_empty());
     assert_eq!(hits[0].0.file_id, alpha.id);
 }
+
+/// A throwaway git repo containing a single uniquely-named file, so an
+/// aggregate build folding several of these can be told apart by path.
+fn fixture_repo_with(marker: &str) -> Option<tempfile::TempDir> {
+    let dir = tempdir().unwrap();
+    let p = dir.path();
+    let ok = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(p)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !ok(&["init", "-q", "-b", "main", "."]) {
+        return None;
+    }
+    assert!(ok(&["config", "user.email", "t@example.invalid"]));
+    assert!(ok(&["config", "user.name", "t"]));
+    assert!(ok(&["config", "commit.gpgsign", "false"]));
+    std::fs::write(
+        p.join(format!("{marker}.txt")),
+        format!("{marker} {marker} {marker} {marker}\n"),
+    )
+    .unwrap();
+    assert!(ok(&["add", "-A"]));
+    assert!(ok(&["commit", "-q", "-m", "seed"]));
+    Some(dir)
+}
+
+/// An aggregate collection with several sources builds ONE unified index that
+/// folds in *every* source. The sources are cloned concurrently (bounded by
+/// `clone_concurrency`), so this also guards that the parallel clone fan-out
+/// produces the complete, correctly-prefixed corpus — not just whichever clone
+/// happened to finish first.
+#[tokio::test]
+async fn aggregate_folds_every_source_when_clones_run_in_parallel() {
+    let markers = ["src0", "src1", "src2"];
+    let mut repos = Vec::new();
+    for m in markers {
+        let Some(repo) = fixture_repo_with(m) else {
+            eprintln!("git not on PATH — skipping");
+            return;
+        };
+        repos.push(repo);
+    }
+
+    let upstream = start_embedding_upstream().await;
+    let registry = registry_pointed_at(&upstream.uri());
+    let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+    let data_dir = tempdir().unwrap();
+    let indexer = Indexer::new(
+        pool.clone(),
+        Arc::clone(&registry),
+        reqwest::Client::new(),
+        IndexerConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            // Force real parallelism across the sources.
+            clone_concurrency: 3,
+            ..IndexerConfig::default()
+        },
+    );
+
+    // Aggregate collection carries no single repo URL — each source brings its
+    // own (added below).
+    let collection = rag_db::create_collection(
+        &pool,
+        &rag_db::NewCollection {
+            name: "corpus".into(),
+            description: None,
+            git_url: String::new(),
+            git_ref: "main".into(),
+            pat: None,
+            embedding_model: "embed-test".into(),
+            include_globs: vec!["*.txt".into()],
+            exclude_globs: Vec::new(),
+            chunk_size: 80,
+            chunk_overlap: 10,
+            search_mode: rag_db::SearchMode::Aggregate,
+        },
+    )
+    .await
+    .unwrap();
+
+    // First source is the primary (holds the unified index); the rest are
+    // config-only sources folded into it.
+    let mut primary_id = None;
+    for (i, repo) in repos.iter().enumerate() {
+        let url = repo.path().to_string_lossy().to_string();
+        let r = rag_db::add_ref(&pool, collection.id, "main", Some(&url), i == 0)
+            .await
+            .unwrap();
+        if i == 0 {
+            primary_id = Some(r.id);
+        }
+    }
+
+    // Building the primary clones EVERY source (in parallel) and indexes the
+    // combined tree.
+    indexer.index_ref(primary_id.unwrap()).await.unwrap();
+
+    let after = rag_db::find_ref_by_id(&pool, primary_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.status, rag_db::CollectionStatus::Ready);
+
+    let store = indexer
+        .collection_store(after.id, &after.data_uuid)
+        .await
+        .unwrap();
+    let files = rag_db::list_files_for_collection(&store, collection.id)
+        .await
+        .unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    // Every source's file must be present, each under its own repo-label prefix
+    // (`<label>/src{N}.txt`) — proving all three parallel clones were folded in.
+    for m in markers {
+        let want = format!("{m}.txt");
+        assert!(
+            paths.iter().any(|p| p.ends_with(&want) && p.contains('/')),
+            "aggregate corpus is missing source {m}; got {paths:?}"
+        );
+    }
+}

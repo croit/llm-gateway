@@ -678,6 +678,106 @@ async fn admin_can_add_set_primary_reindex_and_delete_refs() {
     assert_eq!(remaining[0].git_ref, "squid");
 }
 
+/// A source's git URL + ref can be edited in place: the edit form pre-fills the
+/// current values, and update saves the new URL/ref and re-queues the source.
+/// This is the "why can't I edit the git URLs" fix — aggregate sources own their
+/// URLs, so editing lives on the row, not the collection.
+#[tokio::test]
+async fn admin_edits_a_source_url_and_ref() {
+    use gateway::server::db::rag as rag_db;
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie =
+        seed_session_with_roles(&state, "boss", "boss@example.com", vec!["admin".into()]).await;
+    // Aggregate collection: no single URL; each source brings its own.
+    let c = rag_db::create_collection(
+        &state.db,
+        &rag_db::NewCollection {
+            name: "smb".into(),
+            description: None,
+            git_url: String::new(),
+            git_ref: "master".into(),
+            pat: None,
+            embedding_model: "embed-1".into(),
+            include_globs: vec![],
+            exclude_globs: vec![],
+            chunk_size: 800,
+            chunk_overlap: 100,
+            search_mode: rag_db::SearchMode::Aggregate,
+        },
+    )
+    .await
+    .unwrap();
+    let db = state.db.clone();
+    let src = rag_db::add_ref(
+        &db,
+        c.id,
+        "master",
+        Some("https://example.com/org/old.git"),
+        true,
+    )
+    .await
+    .unwrap();
+    let app = common::app(state);
+
+    // Open the inline editor → it pre-fills the current URL.
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/rag/refs/{}/edit-form", src.id),
+            &cookie,
+            Some(""),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8(common::read_body(resp).await.to_vec()).unwrap();
+    assert!(
+        body.contains("old.git"),
+        "edit form missing current URL\n{body}"
+    );
+    assert!(
+        body.contains(&format!("/rag/refs/{}/update", src.id)),
+        "edit form not wired to update\n{body}"
+    );
+
+    // Save a new URL + ref.
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/rag/refs/{}/update", src.id),
+            &cookie,
+            Some("git_url=https%3A%2F%2Fexample.com%2Forg%2Fnew.git&git_ref=main"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let after = rag_db::find_ref_by_id(&db, src.id).await.unwrap().unwrap();
+    assert_eq!(
+        after.effective_git_url(&c),
+        "https://example.com/org/new.git"
+    );
+    assert_eq!(after.git_ref, "main");
+
+    // An aggregate source can't be left URL-less — the edit is rejected and the
+    // stored URL is unchanged.
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            &format!("/rag/refs/{}/update", src.id),
+            &cookie,
+            Some("git_url=&git_ref=main"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK); // toast response, not an HTTP error
+    let unchanged = rag_db::find_ref_by_id(&db, src.id).await.unwrap().unwrap();
+    assert_eq!(
+        unchanged.effective_git_url(&c),
+        "https://example.com/org/new.git",
+        "empty aggregate URL must not overwrite the stored one"
+    );
+}
+
 #[tokio::test]
 async fn admin_creates_aggregate_collection_and_bulk_adds_sources() {
     use gateway::server::db::rag as rag_db;

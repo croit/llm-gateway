@@ -1006,8 +1006,8 @@ pub use skills::{
 mod rag;
 pub use rag::{
     rag_add_ref, rag_add_sources_bulk, rag_cancel_edit, rag_create, rag_delete, rag_edit_form,
-    rag_index, rag_ref_delete, rag_ref_log, rag_ref_reindex, rag_ref_set_primary, rag_reindex,
-    rag_status, rag_update,
+    rag_index, rag_ref_cancel_edit, rag_ref_delete, rag_ref_edit_form, rag_ref_log,
+    rag_ref_reindex, rag_ref_set_primary, rag_ref_update, rag_reindex, rag_status, rag_update,
 };
 
 // Admin user roster + impersonation (`/admin/users`, `/admin/users/impersonate`)

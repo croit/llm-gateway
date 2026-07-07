@@ -6,22 +6,31 @@
 //! One [`Indexer`] per gateway instance, `Arc`-shared between the
 //! background loop (which drains `status='pending'` rows) and the
 //! search-tool path (which opens the same on-disk index files to answer
-//! queries). The indexer is deliberately serial per collection: the
+//! queries). The indexer is deliberately serial *per collection*: the
 //! pipeline (clone → walk → diff → chunk → embed → insert) holds the
 //! collection's lifecycle row in `cloning` / `indexing` while it runs,
 //! so a re-queue request only takes effect on the next pass — there's no
 //! concurrent re-index of the same collection.
 //!
+//! *Across* collections it is parallel: each drain pass groups pending
+//! refs by collection and runs up to `clone_concurrency` collections at
+//! once, so one slow clone can't head-of-line block every other
+//! collection behind it. A single global [`Semaphore`] additionally caps
+//! concurrent `git clone`s (including the fan-out within an aggregate
+//! build, which clones all its sources at once) so parallelism can't
+//! swamp the network. Embedding load is bounded by the same knob.
+//!
 //! The shape mirrors `server::geoip::update::spawn`: a long-lived tokio
-//! task that wakes on an interval, scans the DB, and runs one job per
-//! tick. Phase 4 will add an in-process kick channel for the admin API
-//! so an operator's "re-index now" click doesn't wait the full poll
-//! interval.
+//! task that wakes on an interval or an explicit kick, scans the DB, and
+//! runs the pending work for that pass.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -57,6 +66,11 @@ pub struct IndexerConfig {
     /// Poll cadence of the background loop — how often it scans for
     /// `status='pending'` rows.
     pub poll_interval: Duration,
+    /// Upper bound on concurrent git clones *and* on collections indexed in
+    /// parallel. Lets independent repos/collections make progress instead of
+    /// serializing behind one slow clone. `0` is clamped to `1` (fully
+    /// serial). See [`crate::server::config::RagConfig::clone_concurrency`].
+    pub clone_concurrency: usize,
 }
 
 impl Default for IndexerConfig {
@@ -66,6 +80,7 @@ impl Default for IndexerConfig {
             max_file_bytes: 1_000_000,
             embed_batch_size: 32,
             poll_interval: Duration::from_secs(30),
+            clone_concurrency: 4,
         }
     }
 }
@@ -226,6 +241,15 @@ struct IndexerInner {
     /// Wakes the background loop immediately when a ref is (re-)queued, so
     /// a "Re-index" click doesn't wait out the poll interval.
     kick: tokio::sync::Notify,
+    /// Caps concurrent `git clone`s across the whole indexer (all collections
+    /// and all sources within an aggregate build share it). Sized to
+    /// `config.clone_concurrency`, so one slow clone can't starve the rest.
+    clone_sem: Arc<Semaphore>,
+    /// Caps how many collections index in parallel in one drain pass. Refs
+    /// *within* a collection still run serially (the per-collection invariant),
+    /// but independent collections proceed concurrently. Same size as
+    /// `clone_sem` so embedding load stays bounded.
+    job_sem: Arc<Semaphore>,
 }
 
 impl Indexer {
@@ -264,6 +288,8 @@ impl Indexer {
                 "rag indexer ready"
             );
         }
+        // `0` would be a zero-permit semaphore (deadlock); clamp to serial.
+        let permits = config.clone_concurrency.max(1);
         Self {
             inner: Arc::new(IndexerInner {
                 db,
@@ -273,6 +299,8 @@ impl Indexer {
                 indexes: Mutex::new(HashMap::new()),
                 stores: Mutex::new(HashMap::new()),
                 kick: tokio::sync::Notify::new(),
+                clone_sem: Arc::new(Semaphore::new(permits)),
+                job_sem: Arc::new(Semaphore::new(permits)),
             }),
         }
     }
@@ -693,23 +721,51 @@ impl Indexer {
         //     `pve-manager/src/PVE/HA/NodeStatus.pm`.
         let (walked, head) = if collection.search_mode == rag_db::SearchMode::Aggregate {
             let sources = rag_db::list_refs(&self.inner.db, collection.id).await?;
-            let mut files: Vec<walk::WalkedFile> = Vec::new();
-            let mut commits: Vec<String> = Vec::new();
-            for src in &sources {
+            // Clone every source concurrently, bounded by `clone_sem`, so one
+            // slow repo doesn't hold up the rest of the corpus. The unified
+            // index still needs all sources before it can build, but the clones
+            // now overlap — total clone time is the slowest single clone, not
+            // their sum. `JoinSet` aborts any in-flight clones if we return
+            // early (error / supersede), so nothing is left running detached.
+            let mut set: JoinSet<(usize, String, PathBuf, Result<String, GitError>)> =
+                JoinSet::new();
+            for (i, src) in sources.iter().enumerate() {
                 let label = src.source_label(collection);
                 let sub = clone_dir.join(&label);
-                let sha = git::clone_or_update(
-                    src.effective_git_url(collection),
-                    &src.git_ref,
-                    collection.pat.as_deref(),
-                    &sub,
-                )
-                .await?;
+                let url = src.effective_git_url(collection).to_string();
+                let git_ref = src.git_ref.clone();
+                let pat = collection.pat.clone();
+                let sem = Arc::clone(&self.inner.clone_sem);
+                set.spawn(async move {
+                    // Permit frees a clone slot the moment this clone finishes.
+                    let _permit = sem.acquire_owned().await;
+                    let sha = git::clone_or_update(&url, &git_ref, pat.as_deref(), &sub).await;
+                    (i, label, sub, sha)
+                });
+            }
+            let mut cloned: Vec<(usize, String, PathBuf, String)> =
+                Vec::with_capacity(sources.len());
+            while let Some(joined) = set.join_next().await {
+                let (i, label, sub, sha) = joined.map_err(|e| {
+                    WorkerError::Io(std::io::Error::other(format!(
+                        "clone task failed to join: {e}"
+                    )))
+                })?;
+                cloned.push((i, label, sub, sha?));
+            }
+            // A re-queue/delete during the (possibly long) clone fan-out
+            // supersedes this build — bail before the expensive walk + embed.
+            if self.superseded(ref_id).await? {
+                return Ok(BuildOutcome::Superseded);
+            }
+            // Restore source order (clones complete out of order) so the commit
+            // marker is stable across runs regardless of clone timing.
+            cloned.sort_by_key(|(i, ..)| *i);
+            let mut files: Vec<walk::WalkedFile> = Vec::new();
+            let mut commits: Vec<String> = Vec::new();
+            for (_, label, sub, sha) in &cloned {
                 commits.push(format!("{label}:{sha}"));
-                if self.superseded(ref_id).await? {
-                    return Ok(BuildOutcome::Superseded);
-                }
-                for mut wf in walk::walk(&sub, &filter)? {
+                for mut wf in walk::walk(sub, &filter)? {
                     wf.rel_path = format!("{label}/{}", wf.rel_path);
                     files.push(wf);
                 }
@@ -719,13 +775,22 @@ impl Indexer {
             files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
             (files, sha256_hex(&commits.join("\n")))
         } else {
-            let sha = git::clone_or_update(
-                rref.effective_git_url(collection),
-                &rref.git_ref,
-                collection.pat.as_deref(),
-                &clone_dir,
-            )
-            .await?;
+            let sha = {
+                // One clone slot, shared with every other collection's clones.
+                let _permit = self
+                    .inner
+                    .clone_sem
+                    .acquire()
+                    .await
+                    .expect("clone semaphore is never closed");
+                git::clone_or_update(
+                    rref.effective_git_url(collection),
+                    &rref.git_ref,
+                    collection.pat.as_deref(),
+                    &clone_dir,
+                )
+                .await?
+            };
             if self.superseded(ref_id).await? {
                 return Ok(BuildOutcome::Superseded);
             }
@@ -871,10 +936,11 @@ impl Indexer {
 }
 
 /// Spawn the background loop. Runs forever until the gateway shuts down.
-/// Each pass indexes every `pending` ref (oldest-queued first), serially.
-/// It then sleeps until the next poll tick *or* an explicit kick (a
-/// "Re-index" click), whichever comes first, so re-indexes start promptly.
-/// Failures are logged + recorded against the ref; the loop never panics.
+/// Each pass indexes every `pending` ref, running up to `clone_concurrency`
+/// collections in parallel (refs *within* a collection stay serial). It then
+/// sleeps until the next poll tick *or* an explicit kick (a "Re-index" click),
+/// whichever comes first, so re-indexes start promptly. Failures are logged +
+/// recorded against the ref; the loop never panics.
 pub fn spawn(indexer: Indexer) {
     let inner = indexer.clone();
     tokio::spawn(async move {
@@ -893,11 +959,37 @@ pub fn spawn(indexer: Indexer) {
 
 async fn drain_once(indexer: &Indexer) -> Result<(), WorkerError> {
     let pending = rag_db::list_pending_refs(&indexer.inner.db).await?;
+    // Group refs by collection. Refs of the *same* collection must run serially
+    // (the per-collection invariant — and an aggregate collection has a single
+    // unified index), but *different* collections index concurrently so one
+    // slow clone can't block every other collection behind it. Preserve the
+    // oldest-queued-first order across collections for fairness.
+    let mut by_collection: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut order: Vec<i64> = Vec::new();
     for r in pending {
-        if let Err(err) = indexer.index_ref(r.id).await {
-            tracing::warn!(ref_id = r.id, error = %err, "rag: indexing failed");
+        let entry = by_collection.entry(r.collection_id).or_default();
+        if entry.is_empty() {
+            order.push(r.collection_id);
         }
+        entry.push(r.id);
     }
+    let mut set: JoinSet<()> = JoinSet::new();
+    for cid in order {
+        let ref_ids = by_collection.remove(&cid).unwrap_or_default();
+        let idx = indexer.clone();
+        let sem = Arc::clone(&indexer.inner.job_sem);
+        set.spawn(async move {
+            // Bounds how many collections index at once (embedding load).
+            let _permit = sem.acquire_owned().await;
+            for ref_id in ref_ids {
+                if let Err(err) = idx.index_ref(ref_id).await {
+                    tracing::warn!(ref_id, error = %err, "rag: indexing failed");
+                }
+            }
+        });
+    }
+    // Finish the whole pass before the loop sleeps/kicks again.
+    while set.join_next().await.is_some() {}
     Ok(())
 }
 
@@ -1273,5 +1365,69 @@ mod tests {
             log.iter().any(|e| e.level == rag_db::LogLevel::Warn),
             "expected a warn log entry, got {log:?}"
         );
+    }
+
+    /// One drain pass must process EVERY pending collection, not just the
+    /// first. Regression for the head-of-line blocking fix: refs are grouped by
+    /// collection and the groups run in parallel, but the pass still awaits all
+    /// of them, so both collections here end up built. Empty include globs keep
+    /// this embedding-free (0 chunks), so it runs without a mock upstream.
+    #[tokio::test]
+    async fn drain_once_processes_every_pending_collection() {
+        use crate::server::upstreams::UpstreamRegistry;
+        use std::collections::HashMap;
+
+        let Some(src) = fixture_repo() else {
+            eprintln!("git not on PATH — skipping");
+            return;
+        };
+        let url = src.path().to_string_lossy().to_string();
+        let db = crate::server::db::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let indexer = Indexer::new(
+            db.clone(),
+            UpstreamRegistry::new(&HashMap::new()).unwrap(),
+            reqwest::Client::new(),
+            IndexerConfig {
+                data_dir: dir.path().to_path_buf(),
+                clone_concurrency: 2,
+                ..IndexerConfig::default()
+            },
+        );
+
+        let mut ref_ids = Vec::new();
+        for name in ["c1", "c2"] {
+            let new = rag_db::NewCollection {
+                name: name.into(),
+                description: None,
+                git_url: url.clone(),
+                git_ref: "main".into(),
+                pat: None,
+                embedding_model: "embed-model".into(),
+                include_globs: vec!["*.nomatch".into()],
+                exclude_globs: vec![],
+                chunk_size: 800,
+                chunk_overlap: 100,
+                search_mode: rag_db::SearchMode::Versioned,
+            };
+            let c = rag_db::create_collection(&db, &new).await.unwrap();
+            let r = rag_db::add_ref(&db, c.id, "main", None, true)
+                .await
+                .unwrap();
+            ref_ids.push(r.id);
+        }
+
+        drain_once(&indexer).await.unwrap();
+
+        for id in ref_ids {
+            let after = rag_db::find_ref_by_id(&db, id).await.unwrap().unwrap();
+            assert_eq!(
+                after.status,
+                rag_db::CollectionStatus::Ready,
+                "ref {id} was not processed by the drain pass"
+            );
+        }
     }
 }

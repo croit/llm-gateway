@@ -548,6 +548,181 @@ pub async fn rag_ref_log(
     sse_response(&[sse_patch(Some(&selector), Some("inner"), &html)])
 }
 
+/// POST /rag/refs/{ref_id}/edit-form — open an inline editor for a single
+/// source's clone target (its Git URL + branch/tag). Rendered into the ref's
+/// `#rag-reflog-{ref_id}` sibling container — the same spot the Log uses —
+/// because the status poll re-patches `#rag-ref-{id}` every few seconds and
+/// would otherwise clobber a form placed there. This is how an aggregate
+/// collection's per-source repo URLs get edited (the collection-level Edit
+/// only carries the single versioned URL).
+pub async fn rag_ref_edit_form(
+    State(state): State<Arc<RamaState>>,
+    Path(ref_id): Path<i64>,
+    req: Request,
+) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let Ok(Some(r)) = rag_db::find_ref_by_id(&state.db, ref_id).await else {
+        return toast(FlashKind::Error, "ref not found");
+    };
+    let Ok(Some(c)) = rag_db::find_collection_by_id(&state.db, r.collection_id).await else {
+        return toast(FlashKind::Error, "collection not found");
+    };
+    let selector = format!("#rag-reflog-{ref_id}");
+    let html = render_ref_edit_form(&c, &r).to_string();
+    sse_response(&[sse_patch(Some(&selector), Some("inner"), &html)])
+}
+
+/// POST /rag/refs/{ref_id}/cancel-edit — abandon a source edit; just clear the
+/// inline editor container (leaving the live row untouched).
+pub async fn rag_ref_cancel_edit(
+    State(state): State<Arc<RamaState>>,
+    Path(ref_id): Path<i64>,
+    req: Request,
+) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let selector = format!("#rag-reflog-{ref_id}");
+    sse_response(&[sse_patch(Some(&selector), Some("inner"), "")])
+}
+
+#[derive(Deserialize)]
+struct RefUpdateForm {
+    /// Per-source repo URL. Empty → inherit the collection's `git_url`
+    /// (how versioned refs and un-overridden sources work).
+    git_url: Option<String>,
+    git_ref: Option<String>,
+}
+
+/// POST /rag/refs/{ref_id}/update — save an edited source's Git URL + ref, then
+/// re-queue so the new target is fetched. Aggregate: rebuilds the unified index
+/// (the URL change only matters once the corpus is rebuilt); versioned: rebuilds
+/// this ref. Patches the whole collection row back (which also removes the
+/// inline editor from the reflog container).
+pub async fn rag_ref_update(
+    State(state): State<Arc<RamaState>>,
+    Path(ref_id): Path<i64>,
+    req: Request,
+) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let form: RefUpdateForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+    };
+    let Ok(Some(existing)) = rag_db::find_ref_by_id(&state.db, ref_id).await else {
+        return toast(FlashKind::Error, "ref not found");
+    };
+    let git_ref = form
+        .git_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(existing.git_ref.as_str())
+        .to_string();
+    // Empty URL means "inherit the collection URL" (stored as NULL). Aggregate
+    // sources need a URL somewhere: their collection has none, so an empty
+    // source URL would leave the source pointing nowhere — reject it.
+    let git_url = form.git_url.as_deref().map(str::trim).unwrap_or("");
+    let collection = rag_db::find_collection_by_id(&state.db, existing.collection_id)
+        .await
+        .ok()
+        .flatten();
+    if git_url.is_empty()
+        && collection
+            .as_ref()
+            .is_some_and(|c| c.search_mode == rag_db::SearchMode::Aggregate)
+    {
+        return toast(
+            FlashKind::Error,
+            "Git URL is required for an aggregate source.",
+        );
+    }
+    let git_url_opt = (!git_url.is_empty()).then_some(git_url);
+    let collection_id = match rag_db::update_ref(&state.db, ref_id, git_url_opt, &git_ref).await {
+        Ok(Some(cid)) => cid,
+        Ok(None) => return toast(FlashKind::Error, "ref not found"),
+        Err(err) => {
+            tracing::warn!(error = %err, %ref_id, "update rag ref");
+            return toast(FlashKind::Error, "could not update source");
+        }
+    };
+    // Fetch the new target: aggregate rebuilds the unified (primary) index so
+    // the changed source is re-folded in; versioned rebuilds just this ref.
+    if !requeue_unified_if_aggregate(&state, collection_id).await {
+        requeue_ref(&state, ref_id).await;
+    }
+    row_patch(&state, collection_id, "Source updated.".to_string()).await
+}
+
+/// Inline per-source editor: Git URL + branch/tag, with Save / Cancel. Lives in
+/// the ref's `#rag-reflog-{id}` container. Mirrors the collection edit form's
+/// datastar wiring (`@post` on submit, morph the response in).
+fn render_ref_edit_form(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Html {
+    let update_action = format!("/rag/refs/{}/update", r.id);
+    let cancel_action = format!("/rag/refs/{}/cancel-edit", r.id);
+    let update_directive = format!("@post('{update_action}', {{contentType: 'form'}})");
+    let cancel_directive = format!("@post('{cancel_action}', {{contentType: 'form'}})");
+    let aggregate = c.search_mode == rag_db::SearchMode::Aggregate;
+    // Aggregate sources carry their own URL; versioned refs inherit the
+    // collection's (leave blank), so show the stored override if any.
+    let url_value = r.git_url.clone().unwrap_or_default();
+    let url_label = if aggregate {
+        "Git URL (this source)"
+    } else {
+        "Git URL (blank = inherit collection)"
+    };
+    html! {
+        div(class: "mt-1 mb-1 rounded border border-base-300 bg-base-200/40 p-3") {
+            form(
+                action: (update_action),
+                method: "post",
+                class: "flex flex-col gap-2",
+                "data-on:submit__prevent": (update_directive)
+            ) {
+                div(class: "grid grid-cols-1 md:grid-cols-2 gap-3") {
+                    label(class: "form-control w-full") {
+                        div(class: "label") { span(class: "label-text text-xs") { (url_label) } }
+                        input(
+                            name: "git_url",
+                            type: "text",
+                            value: (url_value),
+                            placeholder: "https://example.com/org/repo.git",
+                            class: "input input-bordered input-sm w-full"
+                        );
+                    }
+                    label(class: "form-control w-full") {
+                        div(class: "label") { span(class: "label-text text-xs") { "Branch / tag" } }
+                        input(
+                            name: "git_ref",
+                            type: "text",
+                            value: (r.git_ref.clone()),
+                            class: "input input-bordered input-sm w-full"
+                        );
+                    }
+                }
+                div(class: "flex items-center gap-2") {
+                    button(type: "submit", class: "btn btn-xs btn-primary") { "Save source" }
+                    button(
+                        type: "button",
+                        class: "btn btn-xs btn-ghost",
+                        "data-on:click": (cancel_directive)
+                    ) { "Cancel" }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
 /// GET /rag/status — live-status poll target. Re-patches each ref's status
 /// row (`#rag-ref-{id}`) with its current badge, last-indexed provenance, and
 /// any error/advisory, so the admin sees the background indexer's progress
@@ -564,9 +739,10 @@ pub async fn rag_status(State(state): State<Arc<RamaState>>, req: Request) -> Re
     let mut events: Vec<rama::bytes::Bytes> = Vec::new();
     for c in &collections {
         let refs = rag_db::list_refs(&state.db, c.id).await.unwrap_or_default();
+        let primary = refs.iter().find(|r| r.is_primary);
         for r in &refs {
             let selector = format!("#rag-ref-{}", r.id);
-            let html = render_ref(c, r).to_string();
+            let html = render_ref(c, r, primary).to_string();
             events.push(sse_patch(Some(&selector), Some("outer"), &html));
         }
     }
@@ -917,6 +1093,9 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
     let bulk_form_id = format!("rag-bulk-{}", c.id);
     let pat_hint = if c.pat.is_some() { "PAT set" } else { "no PAT" };
     let description = c.description.clone().unwrap_or_default();
+    // Aggregate source rows mirror the primary's build lifecycle (one unified
+    // index), so hand each row the primary to read status/provenance from.
+    let primary = refs.iter().find(|r| r.is_primary);
     let aggregate = c.search_mode == rag_db::SearchMode::Aggregate;
     // Aggregate collections have no single repo URL — summarise by source
     // count instead. Versioned ones show their one repo.
@@ -970,7 +1149,7 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
             // Per-ref/source rows: each indexed independently in its own store.
             div(class: "mt-1 pl-3 border-l border-base-300 flex flex-col gap-1.5") {
                 for r in refs.iter() {
-                    (render_ref(c, r))
+                    (render_ref(c, r, primary))
                     // Empty container the "Log" button fills in on demand. Kept
                     // OUTSIDE `render_ref` so the status poll (which re-patches
                     // `#rag-ref-{id}`) doesn't wipe an opened log.
@@ -1040,19 +1219,50 @@ fn render_row(c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
     .to_html()
 }
 
+/// The ref whose *lifecycle* a row displays. Aggregate collections keep ONE
+/// unified index (built by the primary ref, folding in every source), so a
+/// re-index of any source rebuilds the whole corpus on the primary — every
+/// source row therefore mirrors the primary's status/provenance/error and they
+/// all transition together. Versioned refs each carry their own build, so a row
+/// reflects itself. Falls back to `r` if no primary is present (shouldn't
+/// happen, but keeps rendering total).
+fn status_ref<'a>(
+    c: &rag_db::Collection,
+    r: &'a rag_db::CollectionRef,
+    primary: Option<&'a rag_db::CollectionRef>,
+) -> &'a rag_db::CollectionRef {
+    if c.search_mode == rag_db::SearchMode::Aggregate {
+        primary.unwrap_or(r)
+    } else {
+        r
+    }
+}
+
 /// One ref/source row inside a collection: its name, primary badge, status,
 /// last-indexed provenance, and per-ref actions (re-index / set-primary /
 /// delete). For aggregate collections the source repo (e.g. `qemu-server`)
 /// is shown as the label, since every source there shares the same `git_ref`.
-fn render_ref(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Html {
+///
+/// `primary` is the collection's primary ref (if any). In aggregate mode the
+/// status/provenance/error shown come from it (the shared unified index), while
+/// the label, id, and per-row actions still come from `r` — so clicking
+/// Re-index on any source row shows *that* row (and all rows) rebuilding, which
+/// is what actually happens. See [`status_ref`].
+fn render_ref(
+    c: &rag_db::Collection,
+    r: &rag_db::CollectionRef,
+    primary: Option<&rag_db::CollectionRef>,
+) -> Html {
     let dom_id = format!("rag-ref-{}", r.id);
     let reindex_action = format!("/rag/refs/{}/reindex", r.id);
     let delete_action = format!("/rag/refs/{}/delete", r.id);
     let primary_action = format!("/rag/refs/{}/primary", r.id);
     let log_action = format!("/rag/refs/{}/log", r.id);
+    let edit_action = format!("/rag/refs/{}/edit-form", r.id);
     let reindex_directive = format!("@post('{reindex_action}', {{contentType: 'form'}})");
     let delete_directive = format!("@post('{delete_action}', {{contentType: 'form'}})");
     let primary_directive = format!("@post('{primary_action}', {{contentType: 'form'}})");
+    let edit_directive = format!("@post('{edit_action}', {{contentType: 'form'}})");
     // Toggle: if the log container already holds content, clear it (close);
     // otherwise fetch + fill it (open). The container always exists (rendered
     // as a sibling in `render_row`), so the bare `.innerHTML` assignment is
@@ -1062,18 +1272,22 @@ fn render_ref(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Html {
         "document.getElementById('{reflog_id}').innerHTML ? \
          document.getElementById('{reflog_id}').innerHTML = '' : @get('{log_action}')"
     );
-    let last_indexed = r
+    let aggregate = c.search_mode == rag_db::SearchMode::Aggregate;
+    // Status, provenance, and error come from the ref that actually holds this
+    // row's build: itself for versioned collections, the shared primary for
+    // aggregate ones (one unified index → all sources rebuild together).
+    let s = status_ref(c, r, primary);
+    let last_indexed = s
         .last_indexed_at
         .map(|t| t.strftime("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| "never".to_string());
-    let last_commit = r
+    let last_commit = s
         .last_indexed_commit
         .as_deref()
         .unwrap_or("—")
         .chars()
         .take(8)
         .collect::<String>();
-    let aggregate = c.search_mode == rag_db::SearchMode::Aggregate;
     // Aggregate: lead with the source repo and show the ref after it.
     // Versioned: the ref is the label (one repo, many refs).
     let label = if aggregate {
@@ -1089,15 +1303,15 @@ fn render_ref(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Html {
             if r.is_primary && !aggregate {
                 span(class: "badge badge-sm") { "primary" }
             }
-            (status_badge(r.status))
+            (status_badge(s.status))
             span(class: "text-xs text-base-content/60") {
                 "indexed " (last_indexed) " · " (last_commit)
             }
-            if let Some(err) = r.last_error.as_ref() {
+            if let Some(err) = s.last_error.as_ref() {
                 // Headline the most recent error/advisory; the Log button
                 // opens the full timeline below.
                 span(
-                    class: (if r.status == rag_db::CollectionStatus::Error {
+                    class: (if s.status == rag_db::CollectionStatus::Error {
                         "text-xs text-error break-all"
                     } else {
                         "text-xs text-warning break-all"
@@ -1110,6 +1324,9 @@ fn render_ref(c: &rag_db::Collection, r: &rag_db::CollectionRef) -> Html {
                     class: "btn btn-xs btn-ghost",
                     "data-on:click": (log_directive)
                 ) { "Log" }
+                form(action: (edit_action), method: "post", class: "m-0", "data-on:submit__prevent": (edit_directive)) {
+                    button(type: "submit", class: "btn btn-xs btn-ghost") { "Edit" }
+                }
                 form(action: (reindex_action), method: "post", class: "m-0", "data-on:submit__prevent": (reindex_directive)) {
                     button(type: "submit", class: "btn btn-xs") { "Re-index" }
                 }
@@ -1666,13 +1883,134 @@ mod tests {
             rag_db::CollectionStatus::Error,
             Some("Branch 'x' does not exist"),
         );
-        let html = render_ref(&c, &r).to_string();
+        let html = render_ref(&c, &r, Some(&r)).to_string();
         // (plait HTML-escapes attribute values, so match escaping-safe
         // substrings — the stable id and the endpoint path.)
         assert!(html.contains("rag-ref-42"), "{html}");
         assert!(html.contains("/rag/refs/42/log"), "{html}");
         // The latest error is headlined on the row itself.
         assert!(html.contains("does not exist"), "{html}");
+    }
+
+    /// Regression: an aggregate collection keeps ONE unified index (built by the
+    /// primary ref, folding in every source), so re-indexing any source rebuilds
+    /// the whole corpus on the primary. Every source row must therefore mirror
+    /// the primary's status — otherwise a non-primary row stays "ready" while the
+    /// primary alone flips to "pending", which reads as "I clicked Re-index on
+    /// cifs-utils but samba started indexing". The clicked row must still target
+    /// its OWN ref id (the re-index URL is per-row).
+    #[test]
+    fn aggregate_source_row_mirrors_primary_status() {
+        let mut c = collection();
+        c.search_mode = rag_db::SearchMode::Aggregate;
+        // Primary source (e.g. `samba`) is mid-rebuild; a non-primary source
+        // (e.g. `cifs-utils`) has no build of its own.
+        let mut primary = cref(1, rag_db::CollectionStatus::Cloning, None);
+        primary.is_primary = true;
+        let mut other = cref(2, rag_db::CollectionStatus::Ready, None);
+        other.is_primary = false;
+
+        let html = render_ref(&c, &other, Some(&primary)).to_string();
+        // The non-primary row shows the primary's live status, not its own.
+        assert!(
+            html.contains("cloning"),
+            "non-primary row should mirror primary status: {html}"
+        );
+        assert!(
+            !html.contains(">ready<"),
+            "non-primary row must not show its own stale 'ready': {html}"
+        );
+        // …but it keeps its own identity + actions (re-index targets ref 2).
+        assert!(html.contains("rag-ref-2"), "{html}");
+        assert!(html.contains("/rag/refs/2/reindex"), "{html}");
+    }
+
+    /// Regression for "individual repos show `indexed never · —`": only the
+    /// primary ref carries the unified index's provenance (last-indexed time +
+    /// commit); non-primary sources are never built and have none. An aggregate
+    /// source row must therefore mirror the *primary's* provenance too — not
+    /// just its status — or every source but the first reads "indexed never".
+    #[test]
+    fn aggregate_source_row_mirrors_primary_provenance() {
+        let mut c = collection();
+        c.search_mode = rag_db::SearchMode::Aggregate;
+        let mut primary = cref(1, rag_db::CollectionStatus::Ready, None);
+        primary.is_primary = true;
+        primary.last_indexed_at = Some(
+            "2026-07-06T11:08:00Z"
+                .parse::<Timestamp>()
+                .expect("valid ts"),
+        );
+        primary.last_indexed_commit = Some("8c585019abcdef".into());
+        // Non-primary source: never built, so its own provenance is empty.
+        let mut other = cref(2, rag_db::CollectionStatus::Ready, None);
+        other.is_primary = false;
+
+        let html = render_ref(&c, &other, Some(&primary)).to_string();
+        assert!(
+            html.contains("2026-07-06"),
+            "non-primary row must show the primary's indexed date, not 'never': {html}"
+        );
+        assert!(
+            html.contains("8c585019"),
+            "non-primary row must show the primary's commit: {html}"
+        );
+        assert!(
+            !html.contains("never"),
+            "non-primary aggregate row must not read 'indexed never': {html}"
+        );
+    }
+
+    /// Versioned collections build each ref independently, so a row must reflect
+    /// its OWN status — never a sibling's. Guards against the aggregate mirroring
+    /// leaking into versioned mode.
+    #[test]
+    fn versioned_row_shows_own_status_not_primary() {
+        let c = collection(); // Versioned
+        let primary = cref(1, rag_db::CollectionStatus::Cloning, None);
+        let mut other = cref(2, rag_db::CollectionStatus::Ready, None);
+        other.is_primary = false;
+        let html = render_ref(&c, &other, Some(&primary)).to_string();
+        assert!(
+            html.contains("ready"),
+            "versioned row shows its own status: {html}"
+        );
+        assert!(
+            !html.contains("cloning"),
+            "versioned row must not borrow primary status: {html}"
+        );
+    }
+
+    /// Every source row must expose an Edit control wired to its own
+    /// `edit-form` endpoint — that's how aggregate per-source repo URLs get
+    /// changed (the collection-level Edit only carries the single versioned
+    /// URL). Regression for "I can't edit the git URLs".
+    #[test]
+    fn render_ref_wires_edit_button_to_endpoint() {
+        let mut c = collection();
+        c.search_mode = rag_db::SearchMode::Aggregate;
+        let mut r = cref(7, rag_db::CollectionStatus::Ready, None);
+        r.is_primary = false;
+        let html = render_ref(&c, &r, Some(&r)).to_string();
+        assert!(html.contains("Edit"), "{html}");
+        assert!(html.contains("/rag/refs/7/edit-form"), "{html}");
+    }
+
+    /// The inline source editor pre-fills the source's URL + ref and submits to
+    /// its `update` endpoint, with a Cancel wired to `cancel-edit`.
+    #[test]
+    fn render_ref_edit_form_prefills_and_wires_update() {
+        let mut c = collection();
+        c.search_mode = rag_db::SearchMode::Aggregate;
+        let mut r = cref(7, rag_db::CollectionStatus::Ready, None);
+        r.git_url = Some("https://example.com/org/cifs-utils.git".into());
+        r.git_ref = "master".into();
+        let html = render_ref_edit_form(&c, &r).to_string();
+        assert!(html.contains("/rag/refs/7/update"), "{html}");
+        assert!(html.contains("/rag/refs/7/cancel-edit"), "{html}");
+        // The current URL + ref are pre-filled so the operator edits, not retypes.
+        assert!(html.contains("cifs-utils.git"), "{html}");
+        assert!(html.contains("master"), "{html}");
     }
 
     /// Initial page render (not just an event) must arm the status poll and

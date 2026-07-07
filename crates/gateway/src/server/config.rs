@@ -328,18 +328,31 @@ pub struct RagConfig {
     /// `data/rag` relative to the gateway's working directory.
     #[serde(default = "default_rag_data_dir")]
     pub data_dir: PathBuf,
+    /// How many git clones the indexer runs at once, and how many
+    /// collections it indexes in parallel. Raising this lets a bunch of
+    /// repos/collections index concurrently instead of head-of-line
+    /// blocking behind one slow clone; the cost is more simultaneous
+    /// network + embedding load. `0` is treated as `1` (fully serial).
+    /// Default `4`.
+    #[serde(default = "default_clone_concurrency")]
+    pub clone_concurrency: usize,
 }
 
 impl Default for RagConfig {
     fn default() -> Self {
         Self {
             data_dir: default_rag_data_dir(),
+            clone_concurrency: default_clone_concurrency(),
         }
     }
 }
 
 fn default_rag_data_dir() -> PathBuf {
     PathBuf::from("data/rag")
+}
+
+fn default_clone_concurrency() -> usize {
+    4
 }
 
 /// External MCP servers the gateway connects to as a client.

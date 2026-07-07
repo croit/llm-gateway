@@ -356,8 +356,14 @@ weight = 1
 # Production: point this at a subdirectory of the same named volume that
 # backs [db].path (e.g. /var/lib/gateway/rag) so the index files + clone
 # cache survive image swaps.
+# `clone_concurrency` caps how many git clones run at once AND how many
+# collections index in parallel, so a bunch of repos/collections no longer
+# head-of-line block behind one slow clone. Raise it on a fast box with a
+# beefy embedding backend; lower it (1 = fully serial) on constrained
+# hardware or a rate-limited embedding upstream. Default 4.
 # [rag]
 # data_dir = "/var/lib/gateway/rag"
+# clone_concurrency = 4
 
 # --- Feedback widget ---------------------------------------------------
 # A floating "feedback" button on every signed-in page. It opens a form

@@ -573,6 +573,32 @@ pub async fn set_primary(pool: &Pool, ref_id: i64) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Update a source ref's clone target: its optional per-source `git_url`
+/// (`None` → inherit the collection's URL, as versioned refs do) and its
+/// `git_ref` (branch/tag/commit). Does *not* re-queue — the caller re-queues
+/// afterwards so the new URL/ref actually gets fetched. Returns the ref's
+/// collection id (so the caller can patch the right row), or `None` if the ref
+/// no longer exists.
+pub async fn update_ref(
+    pool: &Pool,
+    ref_id: i64,
+    git_url: Option<&str>,
+    git_ref: &str,
+) -> Result<Option<i64>, DbError> {
+    let now = Timestamp::now().to_string();
+    let collection_id: Option<i64> = sqlx::query_scalar(
+        "UPDATE rag_collection_refs SET git_url = ?, git_ref = ?, updated_at = ? \
+         WHERE id = ? RETURNING collection_id",
+    )
+    .bind(git_url)
+    .bind(git_ref)
+    .bind(&now)
+    .bind(ref_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(collection_id)
+}
+
 /// Delete a ref. Returns its `data_uuid` so the caller can reap the
 /// on-disk store folder. If the deleted ref was the collection's primary
 /// and other refs remain, one of them is promoted so the collection never
@@ -1575,6 +1601,32 @@ mod tests {
         let searchable = searchable_refs(&pool, c.id).await.unwrap();
         assert_eq!(searchable.len(), 1);
         assert_eq!(searchable[0].id, a.id);
+    }
+
+    #[tokio::test]
+    async fn update_ref_changes_url_and_ref() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let r = add_ref(&pool, c.id, "master", Some("https://x/old-repo.git"), true)
+            .await
+            .unwrap();
+
+        // Point the source at a different repo + branch.
+        let cid = update_ref(&pool, r.id, Some("https://x/new-repo.git"), "main")
+            .await
+            .unwrap();
+        assert_eq!(cid, Some(c.id));
+        let updated = find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
+        assert_eq!(updated.effective_git_url(&c), "https://x/new-repo.git");
+        assert_eq!(updated.git_ref, "main");
+
+        // Clearing the URL (None) falls back to inheriting the collection URL.
+        update_ref(&pool, r.id, None, "main").await.unwrap();
+        let inherited = find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
+        assert_eq!(inherited.effective_git_url(&c), c.git_url.as_str());
+
+        // A missing ref updates nothing.
+        assert_eq!(update_ref(&pool, 9999, None, "x").await.unwrap(), None);
     }
 
     #[tokio::test]

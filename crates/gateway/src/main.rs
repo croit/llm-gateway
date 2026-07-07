@@ -324,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
     let rag_config = state.config.rag.clone().unwrap_or_default();
     let indexer_config = srv::rag::worker::IndexerConfig {
         data_dir: rag_config.data_dir,
+        clone_concurrency: rag_config.clone_concurrency,
         ..srv::rag::worker::IndexerConfig::default()
     };
     let indexer = srv::rag::worker::Indexer::new(
