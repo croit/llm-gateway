@@ -67,6 +67,8 @@ Every tool is **RBAC-gated per role**, and each user can flip their own grants o
 
 Beyond `/chat`, the gateway ships a small operator and account UI — no separate dashboard to deploy. Admin pages are gated to the `admin` role.
 
+The UI is fully localized — English, German, French, Spanish, Russian, and Chinese. Switch languages from the flag icon in the sidebar (or on the login page); the choice is stored in a cookie, so it applies immediately and persists across sessions.
+
 | | |
 |---|---|
 | ![The backends page: each upstream pool with its kind, load-balancing strategy, per-backend health, in-flight load against capacity, and the models each one currently advertises.](docs/img/backends.png) | ![The RAG page: a form to index a new collection from a git repo (embedding model, branch, include/exclude globs, chunk size) and a list of existing collections with their indexing status.](docs/img/rag.png) |
