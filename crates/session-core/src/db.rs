@@ -847,6 +847,44 @@ pub async fn set_reasoning_elapsed(
     Ok(())
 }
 
+/// Record the largest `prompt_tokens` the upstream reported across an
+/// assistant turn's rounds — a model-tokenizer-accurate measure of how
+/// big the session's replayed context had grown by the end of the turn.
+/// The gateway's compaction trigger reads it back via
+/// [`latest_context_tokens`]. Column added in migration 0032.
+pub async fn set_context_tokens(
+    pool: &Pool,
+    turn_id: &str,
+    context_tokens: i64,
+) -> Result<(), DbError> {
+    sqlx::query(r#"UPDATE chat_turns SET context_tokens = ? WHERE id = ?"#)
+        .bind(context_tokens)
+        .bind(turn_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The most recently measured context size for a session — the
+/// `context_tokens` of the latest turn that carried one. `None` when no
+/// turn in the session has a measurement yet (e.g. the upstream never
+/// reported usage). Used by the gateway's auto-compaction threshold check.
+pub async fn latest_context_tokens(pool: &Pool, session_id: &str) -> Result<Option<i64>, DbError> {
+    let row = sqlx::query(
+        r#"SELECT context_tokens
+           FROM chat_turns
+           WHERE session_id = ? AND context_tokens IS NOT NULL
+           ORDER BY seq DESC
+           LIMIT 1"#,
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|r| r.try_get::<i64, _>("context_tokens"))
+        .transpose()
+        .map_err(Into::into)
+}
+
 /// End-of-stream: flip the turn's status and stamp `completed_at`. The
 /// worker calls this exactly once per assistant turn whether the turn
 /// ended naturally, via cancel, or with an error.

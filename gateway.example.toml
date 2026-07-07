@@ -225,6 +225,28 @@ weight = 1
 # # workloads.
 # # key_prefix    = "chat-attachments"
 
+# ---- Conversation compaction -----------------------------------------------
+# A chat replays its whole history to the model every turn, so a long
+# conversation eventually crowds the model's context window. When a turn's
+# prompt size (the upstream's reported `prompt_tokens`) crosses
+# `trigger_ratio` of the model's context window, the gateway summarises the
+# oldest turns in the background and replays that summary in their place,
+# keeping the most recent `keep_recent_turns` turns verbatim. Re-compaction
+# folds the previous summary plus newly-aged turns into a fresh summary, so
+# context stays bounded across an arbitrarily long chat. The summarised turns
+# stay visible in the transcript (above a divider); they're just not sent
+# upstream. Per-model context windows are set in the `/admin/models` UI;
+# `default_context_window` is the fallback for models without one.
+#
+# All keys are optional; the defaults below are the built-in values.
+# [chat.compaction]
+# enabled                = true    # master switch
+# trigger_ratio          = 0.7     # fraction of the window at which it fires
+# default_context_window = 32768   # fallback window (tokens) when unset per-model
+# keep_recent_turns      = 6       # most-recent turns always kept verbatim
+# min_turns_to_compact   = 4       # anti-thrash: min newly-aged turns to re-summarise
+# summary_max_tokens     = 1024    # output-token cap for the summariser call
+
 # ---- Typst templates -------------------------------------------------------
 # Per-template tools (`typst_<id>`) the model can call to render
 # PDFs/letters/presentations in your corporate design. The gateway

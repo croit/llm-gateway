@@ -151,6 +151,10 @@ pub(super) struct ChatPage<'a> {
     /// always-present `#document-canvas-slot` wraps it so a later
     /// `create_document` has a live morph target even on a doc-less load.
     pub document_canvas_html: Option<&'a str>,
+    /// Highest turn `seq` folded into the conversation's compaction summary, or
+    /// `None` if the session has never been compacted. Drives the transcript's
+    /// "earlier messages condensed" divider.
+    pub compacted_up_to_seq: Option<i64>,
 }
 
 /// Chat page body — header (model pickers) + conversation +
@@ -365,7 +369,7 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
             }
         }
 
-        (render::render_conversation(&turns_owned, in_flight_tail_url.as_deref(), Some("/chat")))
+        (render::render_conversation(&turns_owned, in_flight_tail_url.as_deref(), Some("/chat"), page.compacted_up_to_seq))
         // Owner gets the composer; a read-only viewer of a shared chat gets a
         // banner instead (mutations are owner-only on the server regardless).
         if read_only {
@@ -1310,6 +1314,7 @@ mod tests {
             effort: crate::server::reasoning::Effort::Standard,
             capabilities: &[],
             document_canvas_html: None,
+            compacted_up_to_seq: None,
         })
         .to_string()
     }
@@ -1328,6 +1333,7 @@ mod tests {
             effort: crate::server::reasoning::Effort::Standard,
             capabilities: &[],
             document_canvas_html: None,
+            compacted_up_to_seq: None,
         })
         .to_string()
     }

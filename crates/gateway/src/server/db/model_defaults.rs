@@ -41,6 +41,11 @@ pub struct ModelDefaults {
     pub reasoning_effort_standard: Option<String>,
     pub reasoning_effort_deep: Option<String>,
     pub reasoning_effort_max: Option<String>,
+    /// The model's context window in tokens. Drives the auto-compaction
+    /// trigger threshold (a fraction of this window). `None` = fall back
+    /// to the global `[chat.compaction] default_context_window`. See
+    /// migration 0032.
+    pub context_window: Option<i64>,
     pub updated_at: Timestamp,
 }
 
@@ -54,6 +59,7 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
     let reasoning_effort_standard: Option<String> = row.try_get("reasoning_effort_standard")?;
     let reasoning_effort_deep: Option<String> = row.try_get("reasoning_effort_deep")?;
     let reasoning_effort_max: Option<String> = row.try_get("reasoning_effort_max")?;
+    let context_window: Option<i64> = row.try_get("context_window")?;
     let updated_at_s: String = row.try_get("updated_at")?;
     let updated_at: Timestamp = updated_at_s
         .parse()
@@ -71,6 +77,7 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
         reasoning_effort_standard,
         reasoning_effort_deep,
         reasoning_effort_max,
+        context_window,
         updated_at,
     })
 }
@@ -82,7 +89,7 @@ pub async fn get(pool: &Pool, model_name: &str) -> Result<Option<ModelDefaults>,
         r#"SELECT model_name, defaults_toml, reasoning_style,
                   thinking_budget_standard, thinking_budget_deep, thinking_budget_max,
                   reasoning_effort_standard, reasoning_effort_deep, reasoning_effort_max,
-                  updated_at
+                  context_window, updated_at
            FROM model_defaults
            WHERE model_name = ?"#,
     )
@@ -112,6 +119,31 @@ pub async fn set_reasoning_style(
     )
     .bind(model_name)
     .bind(reasoning_style)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Set (or clear, with `None`) the model's context window in tokens without
+/// touching its sampling defaults or reasoning config. Inserts a row with empty
+/// defaults if none exists yet; on conflict only `context_window` is updated,
+/// so it composes with the other setters in any order.
+pub async fn set_context_window(
+    pool: &Pool,
+    model_name: &str,
+    context_window: Option<i64>,
+) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    sqlx::query(
+        r#"INSERT INTO model_defaults (model_name, defaults_toml, context_window, updated_at)
+           VALUES (?, '', ?, ?)
+           ON CONFLICT(model_name) DO UPDATE SET
+             context_window = excluded.context_window,
+             updated_at     = excluded.updated_at"#,
+    )
+    .bind(model_name)
+    .bind(context_window)
     .bind(now)
     .execute(pool)
     .await?;

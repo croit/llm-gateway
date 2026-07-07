@@ -158,7 +158,22 @@ pub fn build_tool_context(
 #[async_trait]
 impl SessionDriver for OpenAiDriver {
     async fn run_turn(&self, ctx: SessionContext) -> Result<(), TurnError> {
-        run_one_turn(self, ctx).await
+        let result = run_one_turn(self, ctx.clone()).await;
+        // On a clean, non-cancelled completion, check whether this session's
+        // context has grown past the compaction threshold and, if so, summarise
+        // its oldest turns in the background so the *next* turn replays a smaller
+        // prompt. Fire-and-forget: never on the turn's critical path (the worker
+        // broadcasts `Finalized` the moment `run_turn` returns), exactly like
+        // title generation.
+        if result.is_ok() && !ctx.cancel.load(Ordering::SeqCst) {
+            let state = self.state.clone();
+            let session_id = ctx.session_id.clone();
+            let model = ctx.model.clone();
+            tokio::spawn(async move {
+                crate::server::compaction::maybe_autocompact(&state, &session_id, &model).await;
+            });
+        }
+        result
     }
 }
 
@@ -226,34 +241,40 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
     let turns = chat::list_turns(&d.state.db, &ctx.session_id)
         .await
         .map_err(upstream_err)?;
-    // Prior turns, oldest-first, minus the in-progress assistant turn.
-    let prior: Vec<_> = turns
-        .iter()
-        .filter(|t| t.turn.id != ctx.assistant_turn_id)
-        .collect();
-    // `history_limit` keeps only the most recent N turns (reuse-mode
-    // scheduled runs); `None` replays them all.
-    let kept = match d.history_limit {
-        Some(n) => &prior[prior.len().saturating_sub(n)..],
-        None => &prior[..],
-    };
-    let mut messages: Vec<serde_json::Value> = kept
-        .iter()
-        .filter_map(|t| message_for_history(&t.turn))
-        .collect();
+    // Compaction overlay: when a session has been compacted, its oldest turns
+    // (seq <= up_to_seq) are represented by one summary message instead of
+    // being replayed verbatim. `None` (never compacted) replays everything as
+    // before. A read error degrades to "no compaction" — the turn still runs,
+    // just with the full (larger) history.
+    let compaction = crate::server::db::chat_compactions::get(&d.state.db, &ctx.session_id)
+        .await
+        .unwrap_or(None);
+    // Build the replayed history: drop the in-progress assistant turn, fold out
+    // the compacted prefix (seq <= up_to_seq), apply any `history_limit`, and
+    // map to OpenAI-shaped messages. Pure so it's unit-tested below.
+    let mut messages = build_history_messages(
+        &turns,
+        &ctx.assistant_turn_id,
+        compaction.as_ref(),
+        d.history_limit,
+    );
 
-    // Prepend an auto-provided request-context system message — the
-    // caller's real connection IP, a coarse IP-based location, and their
-    // timezone. Lets the model answer "what's my IP / where am I / weather
-    // here" directly instead of flailing through fetch_url/search_web/
-    // get_user_location, and reflects the *true* source IP (correct in
-    // production behind a load balancer, unlike an external IP-echo which
-    // would report the gateway's own egress).
-    if let Some(context) = build_request_context(d, &user_mcp).await {
-        messages.insert(
-            0,
-            serde_json::json!({ "role": "system", "content": context }),
-        );
+    // Prepend a SINGLE leading system message combining:
+    //   - the auto-provided request context (caller's real connection IP, a
+    //     coarse IP-based location, timezone) — lets the model answer "what's my
+    //     IP / where am I" directly instead of flailing through tools, and
+    //     reflects the *true* source IP (correct behind a load balancer); and
+    //   - the compaction summary standing in for the folded-out oldest turns.
+    // These must be merged into one message, not inserted as two separate
+    // `system` turns: some backends (e.g. the Qwen3 vLLM chat template) reject a
+    // request with more than one leading system message ("System message must be
+    // at the beginning"). See `leading_system_message`.
+    let request_context = build_request_context(d, &user_mcp).await;
+    if let Some(system) = leading_system_message(
+        request_context,
+        compaction.as_ref().map(|c| c.summary.as_str()),
+    ) {
+        messages.insert(0, system);
     }
 
     let mut started_reasoning: Option<std::time::Instant> = None;
@@ -282,6 +303,20 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         String::new()
     };
 
+    // Whether compaction wants the trailing usage frame even when usage metrics
+    // are off — the trigger sizes the context from `prompt_tokens`, so we must
+    // ask for it. (The threshold check itself still re-reads live config later.)
+    let compaction_enabled = d.state.config.chat.compaction.enabled;
+
+    // Largest `prompt_tokens` seen across this turn's rounds — a
+    // model-tokenizer-accurate measure of how big the replayed context has
+    // grown. Persisted to the turn row and read back by the compaction
+    // trigger after the turn completes. A tool-using turn reports several
+    // usage frames; the last round's is the biggest (it carries the full
+    // history plus every prior round's tool traffic), so a running max is
+    // the right summary.
+    let mut max_prompt_tokens: i64 = 0;
+
     for round in 0..max_rounds {
         if ctx.cancel.load(Ordering::SeqCst) {
             return Ok(());
@@ -302,15 +337,19 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         // `stream_options.include_usage` asks the upstream for a trailing
         // usage frame (prompt/completion token counts) — we own this
         // request, so unlike the /v1 passthrough we always opt in. It's
-        // parsed for metrics below and otherwise ignored (its `choices` is
-        // empty, so the delta loop skips it). Omitted when metrics are off,
-        // so a disabled gateway doesn't even alter the upstream request.
+        // parsed for metrics below and for the compaction trigger (which reads
+        // `prompt_tokens` to size the context), and otherwise ignored (its
+        // `choices` is empty, so the delta loop skips it). Requested when
+        // *either* usage metrics or compaction is on; omitted only when both
+        // are off, so a fully-disabled gateway doesn't alter the request.
         let mut request_body = serde_json::json!({
             "model": ctx.model,
             "messages": messages,
             "stream": true,
         });
-        if metrics_on && let Some(obj) = request_body.as_object_mut() {
+        if (metrics_on || compaction_enabled)
+            && let Some(obj) = request_body.as_object_mut()
+        {
             obj.insert(
                 "stream_options".into(),
                 serde_json::json!({"include_usage": true}),
@@ -658,6 +697,21 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             started,
             round_tokens,
         );
+
+        // Track the context size for the compaction trigger. Persisted only
+        // when it grows, so a tool-using turn writes at most once per round
+        // and a normal turn writes once. Best-effort — a failed write just
+        // leaves the trigger reading a slightly stale value next turn.
+        if let Some(prompt) = round_tokens.0
+            && prompt > max_prompt_tokens
+        {
+            max_prompt_tokens = prompt;
+            if let Err(err) =
+                chat::set_context_tokens(&d.state.db, &ctx.assistant_turn_id, prompt).await
+            {
+                tracing::warn!(error = %err, "chat-stream: persisting context_tokens failed");
+            }
+        }
 
         // Flush any held-back content tail (a partial tag that never
         // completed is real content, minus any complete tag still in it).
@@ -1168,6 +1222,73 @@ fn render_active_skills(
 /// assistant turns map to `{role: "assistant", content: …}` when
 /// they have any text content; in-progress / cancelled / errored
 /// turns are skipped (their content is partial or absent).
+/// Build the prior-history message list replayed upstream: every turn before
+/// the in-progress assistant turn, with the compacted prefix (`seq <=
+/// up_to_seq`) folded out and `history_limit` applied to the verbatim tail.
+///
+/// Returns just the `[user/assistant …]` tail — the caller prepends a single
+/// leading system message (request context + compaction summary) via
+/// [`leading_system_message`]. Pure (no I/O) so the fold contract is unit-tested
+/// directly.
+fn build_history_messages(
+    turns: &[session_core::db::TurnWithTools],
+    assistant_turn_id: &str,
+    compaction: Option<&crate::server::db::chat_compactions::Compaction>,
+    history_limit: Option<usize>,
+) -> Vec<serde_json::Value> {
+    // Prior turns, oldest-first, minus the in-progress assistant turn, minus
+    // any turns folded into the summary.
+    let prior: Vec<_> = turns
+        .iter()
+        .filter(|t| t.turn.id != assistant_turn_id)
+        .filter(|t| match compaction {
+            Some(c) => t.turn.seq > c.up_to_seq,
+            None => true,
+        })
+        .collect();
+    // `history_limit` keeps only the most recent N turns (reuse-mode scheduled
+    // runs); `None` replays them all.
+    let kept = match history_limit {
+        Some(n) => &prior[prior.len().saturating_sub(n)..],
+        None => &prior[..],
+    };
+    kept.iter()
+        .filter_map(|t| message_for_history(&t.turn))
+        .collect()
+}
+
+/// Compose the single leading `system` message from the optional request
+/// context and the optional compaction summary. Returns `None` when neither is
+/// present (so no empty system message is sent).
+///
+/// Both must live in ONE system message: some backends (notably the Qwen3 vLLM
+/// chat template) reject a request carrying more than one leading system turn
+/// ("System message must be at the beginning"). Merging them keeps a single
+/// system turn regardless of which parts are present. Pure so it's unit-tested.
+fn leading_system_message(
+    request_context: Option<String>,
+    summary: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ctx) = request_context {
+        parts.push(ctx);
+    }
+    if let Some(summary) = summary {
+        parts.push(format!(
+            "Summary of the earlier part of this conversation (older messages have been \
+             condensed to save context; treat this as established context and continue \
+             seamlessly):\n\n{summary}"
+        ));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "role": "system",
+        "content": parts.join("\n\n---\n\n"),
+    }))
+}
+
 fn message_for_history(turn: &Turn) -> Option<serde_json::Value> {
     match turn.role {
         TurnRole::User => {
@@ -1351,5 +1472,119 @@ mod tests {
         assert!(out.contains("### Skill: brand"));
         assert!(out.contains("Always use purple #8E54E9."));
         assert!(render_active_skills(&reg, &[]).is_none());
+    }
+
+    mod history_fold {
+        use crate::openai_driver::{build_history_messages, leading_system_message};
+        use crate::server::db::chat_compactions::Compaction;
+        use jiff::Timestamp;
+        use session_core::db::{Turn, TurnRole, TurnStatus, TurnWithTools};
+
+        fn turn(seq: i64, role: TurnRole, id: &str, text: &str) -> TurnWithTools {
+            let now: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+            let (user_content, content) = match role {
+                TurnRole::User => (Some(text.to_string()), None),
+                TurnRole::Assistant => (None, Some(text.to_string())),
+            };
+            TurnWithTools {
+                turn: Turn {
+                    id: id.to_string(),
+                    session_id: "s1".into(),
+                    seq,
+                    role,
+                    user_content,
+                    model: None,
+                    content,
+                    reasoning: None,
+                    reasoning_elapsed_ms: None,
+                    status: TurnStatus::Completed,
+                    error_message: None,
+                    created_at: now,
+                    completed_at: Some(now),
+                },
+                tool_calls: vec![],
+            }
+        }
+
+        fn convo() -> Vec<TurnWithTools> {
+            vec![
+                turn(0, TurnRole::User, "t0", "q1"),
+                turn(1, TurnRole::Assistant, "t1", "a1"),
+                turn(2, TurnRole::User, "t2", "q2"),
+                turn(3, TurnRole::Assistant, "t3", "a2"),
+                turn(4, TurnRole::User, "t4", "q3"), // the in-progress turn's user prompt
+                turn(5, TurnRole::Assistant, "t5", ""), // in-progress assistant (empty)
+            ]
+        }
+
+        /// Without a compaction row every completed turn replays verbatim and
+        /// the in-progress assistant turn is dropped.
+        #[test]
+        fn no_compaction_replays_all_prior() {
+            let turns = convo();
+            let msgs = build_history_messages(&turns, "t5", None, None);
+            // q1,a1,q2,a2,q3 — the empty in-progress assistant (t5) is skipped.
+            assert_eq!(msgs.len(), 5);
+            assert_eq!(msgs[0]["content"], "q1");
+            assert_eq!(msgs[4]["content"], "q3");
+            assert!(msgs.iter().all(|m| m["role"] != "system"));
+        }
+
+        /// With a compaction cutoff, the folded prefix is dropped and only the
+        /// verbatim tail is returned (the summary rides in the single leading
+        /// system message — see the `system_message_*` tests).
+        #[test]
+        fn compaction_folds_out_prefix() {
+            let turns = convo();
+            let compaction = Compaction {
+                up_to_seq: 3,
+                summary: "the gist so far".into(),
+                tokens_before: None,
+                tokens_after: None,
+            };
+            let msgs = build_history_messages(&turns, "t5", Some(&compaction), None);
+            // Only [q3] — seq 0..3 folded out, seq 4 verbatim, t5 dropped, and no
+            // system message in the tail.
+            assert_eq!(msgs.len(), 1);
+            assert_eq!(msgs[0]["content"], "q3");
+            assert!(msgs.iter().all(|m| m["role"] != "system"));
+            // None of the folded turns leak through verbatim.
+            assert!(
+                msgs.iter()
+                    .all(|m| m["content"] != "q1" && m["content"] != "a2")
+            );
+        }
+
+        /// Request context + summary collapse into exactly ONE system message
+        /// (backends reject multiple leading system turns).
+        #[test]
+        fn system_message_merges_context_and_summary() {
+            let m = leading_system_message(Some("CONTEXT".into()), Some("SUMMARY")).expect("some");
+            assert_eq!(m["role"], "system");
+            let content = m["content"].as_str().unwrap();
+            assert!(content.contains("CONTEXT"));
+            assert!(content.contains("SUMMARY"));
+        }
+
+        /// Each part is optional; absent both → no system message at all.
+        #[test]
+        fn system_message_optional_parts() {
+            assert!(leading_system_message(None, None).is_none());
+            let only_ctx = leading_system_message(Some("C".into()), None).unwrap();
+            assert!(only_ctx["content"].as_str().unwrap().contains('C'));
+            let only_sum = leading_system_message(None, Some("S")).unwrap();
+            assert!(only_sum["content"].as_str().unwrap().contains('S'));
+        }
+
+        /// `history_limit` caps the verbatim tail *after* compaction folding.
+        #[test]
+        fn history_limit_caps_tail_after_fold() {
+            let turns = convo();
+            let msgs = build_history_messages(&turns, "t5", None, Some(2));
+            // Last 2 prior turns before t5: a2 (seq3), q3 (seq4).
+            assert_eq!(msgs.len(), 2);
+            assert_eq!(msgs[0]["content"], "a2");
+            assert_eq!(msgs[1]["content"], "q3");
+        }
     }
 }

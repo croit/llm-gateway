@@ -473,6 +473,51 @@ pub struct TypstConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ChatConfig {
     pub s3: Option<S3Config>,
+    /// Automatic conversation compaction — summarise a session's oldest turns
+    /// once its replayed context grows past a fraction of the model's window.
+    #[serde(default)]
+    pub compaction: CompactionConfig,
+}
+
+/// Tunables for automatic conversation compaction. All optional with sane
+/// defaults, so an operator gets compaction out of the box and only touches
+/// this to disable it or tune the aggressiveness.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompactionConfig {
+    /// Master switch. `true` (default) enables the auto-trigger; `false`
+    /// leaves every conversation replaying its full history.
+    pub enabled: bool,
+    /// Fallback context window in tokens for models without a per-model
+    /// `context_window` set in `/admin/models`. Default 32768.
+    pub default_context_window: i64,
+    /// Fraction of the context window (0.0–1.0) at which compaction fires.
+    /// Default 0.7 — compact once the replayed prompt reaches 70% of the
+    /// window, leaving headroom for the model's own answer.
+    pub trigger_ratio: f64,
+    /// How many of the most recent turns to always keep verbatim (never fold
+    /// into the summary). Default 6 — enough that the immediate back-and-forth
+    /// the user is looking at is never lossily summarised.
+    pub keep_recent_turns: usize,
+    /// Anti-thrash floor: re-compaction runs only when at least this many turns
+    /// have aged past the previous cutoff. Default 4 — avoids re-summarising the
+    /// whole history for a one-turn gain.
+    pub min_turns_to_compact: usize,
+    /// Output-token cap for the summariser call. Default 1024.
+    pub summary_max_tokens: i64,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_context_window: 32_768,
+            trigger_ratio: 0.7,
+            keep_recent_turns: 6,
+            min_turns_to_compact: 4,
+            summary_max_tokens: 1024,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

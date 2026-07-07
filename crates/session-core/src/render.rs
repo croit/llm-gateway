@@ -179,6 +179,7 @@ pub fn render_conversation(
     turns: &[TurnWithTools],
     in_flight_tail_url: Option<&str>,
     actions: Option<&str>,
+    compacted_up_to_seq: Option<i64>,
 ) -> Html {
     let turns_owned: Vec<TurnWithTools> = turns.to_vec();
     // `data-init` fires every time datastar mounts this element —
@@ -193,14 +194,47 @@ pub fn render_conversation(
         Some(url) => format!("window.chatScroll?.init?.(el); @get('{url}')"),
         None => "window.chatScroll?.init?.(el)".to_string(),
     };
+    // If the session has been compacted, the turns with `seq <= up_to_seq` are
+    // no longer sent upstream (a summary stands in for them), but they stay in
+    // the transcript. Mark the boundary with a divider so the reader knows
+    // where the model's live context begins. Only shown when there's at least
+    // one summarised turn above the boundary.
+    let divider_at = compacted_up_to_seq.and_then(|cut| {
+        let idx = turns_owned.iter().position(|t| t.turn.seq > cut)?;
+        (idx > 0).then_some(idx)
+    });
+    let mut items: Vec<Html> = Vec::with_capacity(turns_owned.len() + 1);
+    for (i, t) in turns_owned.iter().enumerate() {
+        if Some(i) == divider_at {
+            items.push(render_compaction_divider());
+        }
+        items.push(render_turn(t, actions));
+    }
     html! {
         section(
             id: "conversation",
             "data-init": (init_directive)
         ) {
-            for t in turns_owned.iter() {
-                (render_turn(t, actions))
+            for item in items.iter() {
+                (item.clone())
             }
+        }
+    }
+    .to_html()
+}
+
+/// The transcript marker between compacted (summarised) turns above and the
+/// verbatim tail the model still sees below. Purely informational — the turns
+/// above remain fully readable.
+fn render_compaction_divider() -> Html {
+    html! {
+        div(
+            class: "divider text-xs opacity-60 my-2",
+            role: "separator",
+            "aria-label": "Earlier messages condensed to save context"
+        ) {
+            (icons::info(14))
+            span { "Earlier messages condensed to save context" }
         }
     }
     .to_html()
@@ -1258,6 +1292,72 @@ mod tests {
             composer(false).contains("chatStreaming: false"),
             "an idle composer must not show the streaming/stop state"
         );
+    }
+
+    fn conv_turn(seq: i64, role: TurnRole, text: &str) -> TurnWithTools {
+        let now = jiff::Timestamp::now();
+        let (user_content, content) = match role {
+            TurnRole::User => (Some(text.to_string()), None),
+            TurnRole::Assistant => (None, Some(text.to_string())),
+        };
+        TurnWithTools {
+            turn: Turn {
+                id: format!("t{seq}"),
+                session_id: "s1".into(),
+                seq,
+                role,
+                user_content,
+                model: None,
+                content,
+                reasoning: None,
+                reasoning_elapsed_ms: None,
+                status: TurnStatus::Completed,
+                error_message: None,
+                created_at: now,
+                completed_at: Some(now),
+            },
+            tool_calls: vec![],
+        }
+    }
+
+    #[test]
+    fn compaction_divider_marks_boundary_when_compacted() {
+        let turns = vec![
+            conv_turn(0, TurnRole::User, "q1"),
+            conv_turn(1, TurnRole::Assistant, "a1"),
+            conv_turn(2, TurnRole::User, "q2"),
+        ];
+        // Compacted up to seq 1 → divider appears before the seq-2 turn.
+        let html = render_conversation(&turns, None, Some("/chat"), Some(1)).to_string();
+        assert!(
+            html.contains("Earlier messages condensed to save context"),
+            "divider must render when the session is compacted"
+        );
+    }
+
+    #[test]
+    fn no_compaction_divider_without_compaction() {
+        let turns = vec![
+            conv_turn(0, TurnRole::User, "q1"),
+            conv_turn(1, TurnRole::Assistant, "a1"),
+        ];
+        let html = render_conversation(&turns, None, Some("/chat"), None).to_string();
+        assert!(
+            !html.contains("Earlier messages condensed"),
+            "no divider when the session was never compacted"
+        );
+    }
+
+    #[test]
+    fn no_compaction_divider_when_cutoff_precedes_all_visible_turns() {
+        // Every visible turn is already past the cutoff (folded turns aren't in
+        // this slice) → no divider, since there's nothing summarised above it.
+        let turns = vec![
+            conv_turn(4, TurnRole::User, "q3"),
+            conv_turn(5, TurnRole::Assistant, "a3"),
+        ];
+        let html = render_conversation(&turns, None, Some("/chat"), Some(1)).to_string();
+        assert!(!html.contains("Earlier messages condensed"));
     }
 
     fn tool_call(id: &str, name: &str, status: ToolCallStatus) -> ToolCall {

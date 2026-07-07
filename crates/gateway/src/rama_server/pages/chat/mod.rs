@@ -216,6 +216,14 @@ async fn render_chat_response(
             .await
             .ok()
             .flatten();
+    // Compaction cutoff, if this conversation has been compacted — drives the
+    // transcript's "earlier messages condensed" divider. A read error degrades
+    // to "no divider".
+    let compacted_up_to_seq = crate::server::db::chat_compactions::get(&state.db, &active.id)
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.up_to_seq);
     let body = render::render_chat_page(render::ChatPage {
         active: &active,
         turns: &turns,
@@ -228,6 +236,7 @@ async fn render_chat_response(
         effort,
         capabilities: &capabilities,
         document_canvas_html: document_canvas_html.as_deref(),
+        compacted_up_to_seq,
     });
     let chat_sidebar = SidebarChat {
         sessions: sessions

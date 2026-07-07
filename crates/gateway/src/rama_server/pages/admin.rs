@@ -81,6 +81,7 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
                 .as_ref()
                 .and_then(|r| r.reasoning_effort_max.clone())
                 .unwrap_or_default(),
+            context_window: row.as_ref().and_then(|r| r.context_window),
         });
     }
 
@@ -266,10 +267,64 @@ pub async fn models_reasoning_budget_save(
     )
 }
 
+/// POST /admin/models/context-window — save a model's context window in tokens
+/// (used by the auto-compaction trigger). Touches only its own column so it
+/// composes with the TOML/style/budget saves. An empty value clears the row's
+/// window and falls back to the global `default_context_window`.
+pub async fn models_context_window_save(
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let form: ContextWindowForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(err) => return toast(FlashKind::Error, format!("malformed form: {err}")),
+    };
+    if form.model_name.is_empty() {
+        return toast(FlashKind::Error, "missing model_name field");
+    }
+    let window = match form.context_window.trim() {
+        "" => None,
+        s => match s.parse::<i64>() {
+            Ok(n) if n >= 1 => Some(n),
+            _ => {
+                return toast(
+                    FlashKind::Error,
+                    format!("context window `{s}` must be a positive integer"),
+                );
+            }
+        },
+    };
+    if let Err(err) = db::set_context_window(&state.db, &form.model_name, window).await {
+        return toast(FlashKind::Error, format!("db: {err}"));
+    }
+    toast(
+        FlashKind::Success,
+        match window {
+            Some(n) => format!("set context window {n} for `{}`", form.model_name),
+            None => format!("cleared context window for `{}`", form.model_name),
+        },
+    )
+}
+
 #[derive(serde::Deserialize)]
 struct SaveForm {
     model_name: String,
     defaults_toml: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ContextWindowForm {
+    model_name: String,
+    #[serde(default)]
+    context_window: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -313,6 +368,9 @@ struct ModelRow {
     effort_standard: String,
     effort_deep: String,
     effort_max: String,
+    /// Model context window in tokens; `None` = fall back to the global
+    /// `[chat.compaction] default_context_window`. Drives auto-compaction.
+    context_window: Option<i64>,
 }
 
 fn render_models_body(rows: &[ModelRow]) -> Html {
@@ -369,7 +427,10 @@ fn render_model_card(row: &ModelRow) -> Html {
             div(class: "card-body gap-3") {
                 header(class: "flex items-center justify-between gap-3 flex-wrap") {
                     h2(class: "card-title text-base font-mono break-all") { (row.name.clone()) }
-                    (render_reasoning_select(row))
+                    div(class: "flex items-center gap-2 flex-wrap") {
+                        (render_context_window(row))
+                        (render_reasoning_select(row))
+                    }
                 }
                 (render_reasoning_budget(row))
                 form(
@@ -398,6 +459,34 @@ fn render_model_card(row: &ModelRow) -> Html {
                         }
                     }
                 }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// The per-model context-window field: a tiny number input that auto-saves on
+/// change. Drives the auto-compaction trigger (compaction fires once a session's
+/// replayed prompt reaches `[chat.compaction] trigger_ratio` of this window).
+/// Blank falls back to the global `default_context_window`.
+fn render_context_window(row: &ModelRow) -> Html {
+    let action = "/admin/models/context-window";
+    let value = row
+        .context_window
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    html! {
+        form(method: "post", action: (action), class: "m-0") {
+            input(type: "hidden", name: "model_name", value: (row.name.clone()));
+            label(class: "input input-bordered input-xs flex items-center gap-1") {
+                span(class: "text-xs opacity-70") { "Context" }
+                input(
+                    type: "number", name: "context_window", value: (value), min: "1",
+                    placeholder: "default", "aria-label": "Context window (tokens)",
+                    "data-on:change": (format!("@post('{action}', {{contentType: 'form'}})")),
+                    class: "w-24"
+                );
+                span(class: "text-xs opacity-70") { "tok" }
             }
         }
     }
