@@ -830,6 +830,52 @@
         }
     }
 
+    /* Search form in the conversations header. The form itself is the
+     * flex row (input grows, button hugs its icon). */
+    .app-sidebar__search-form {
+        display: flex;
+        gap: 0.25rem;
+        flex: 1;
+        min-width: 0;
+    }
+    .app-sidebar__search-input {
+        flex: 1;
+        min-width: 0;
+        font-size: 0.75rem;
+        padding: 0.25rem 0.5rem;
+        border: 1px solid color-mix(in oklch, var(--color-base-300) 50%, transparent);
+        background: var(--color-base-100);
+        color: var(--color-base-content);
+    }
+    .app-sidebar__search-btn {
+        flex-shrink: 0;
+        padding: 0 0.5rem;
+        border-radius: 0.25rem;
+        color: color-mix(in oklch, var(--color-base-content) 60%, transparent);
+    }
+    @media (hover: hover) {
+        .app-sidebar__search-btn:hover {
+            background: color-mix(in oklch, var(--color-base-300) 70%, transparent);
+            color: var(--color-base-content);
+        }
+    }
+
+    /* Search result snippet row (reuses session-row base styles). */
+    .session-row__snippet {
+        font-size: 0.75rem;
+        color: color-mix(in oklch, var(--color-base-content) 55%, transparent);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        margin-top: 0.125rem;
+    }
+    /* Highlighted match terms (from FTS5 snippet). */
+    .session-row__snippet b {
+        font-weight: 600;
+        color: var(--color-base-content);
+        background: color-mix(in oklch, var(--color-primary) 20%, transparent);
+    }
+
     .app-sidebar__user {
         border-top: 1px solid
             color-mix(in oklch, var(--color-base-300) 60%, transparent);

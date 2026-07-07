@@ -356,13 +356,9 @@ const CLI_CONSENT_HTML: &str = r#"<!DOCTYPE html>
 </div>
 </body></html>"#;
 
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
+// HTML escaping shares one implementation with the rest of the app
+// (session-core) so the escape set can't drift between copies.
+use session_core::chrome::escape_html;
 
 /// 303 to the IdP while dropping the browser-binding cookie (see
 /// [`OIDC_BINDING_COOKIE`]). `state` is the CSRF/state value the callback

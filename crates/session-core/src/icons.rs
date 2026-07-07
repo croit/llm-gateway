@@ -134,6 +134,14 @@ pub fn message(size: u32) -> Html {
     ))
 }
 
+/// Magnifying glass — search icon.
+pub fn search(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>"#,
+    ))
+}
+
 pub fn logout(size: u32) -> Html {
     raw(render(
         size,
