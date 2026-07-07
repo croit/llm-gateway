@@ -18,6 +18,9 @@ output_basename = "onepager"
 # Editable Word (.docx) export: convert the finished PDF to an editable
 # .docx (pdf2docx, in the sandbox) and attach it alongside the PDF.
 [docx]
+# Brand font applied + embedded in the .docx export (from this template's own
+# fonts/Urbanist-*.ttf); the export is typst -> HTML -> pandoc.
+font = "Urbanist"
 
 [[field]]
 name = "title"

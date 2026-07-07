@@ -38,7 +38,7 @@ use super::sandbox::{SandboxClient, b64};
 use super::{Tool, ToolContext, ToolError, ToolFuture, ToolResult};
 use crate::server::chat_attachments;
 use crate::server::db::documents::{self, DocumentFormat};
-use crate::server::typst::{self, DefaultSource, FieldType, PptxExport, Template};
+use crate::server::typst::{self, DefaultSource, DocxExport, FieldType, PptxExport, Template};
 
 pub struct TypstRenderTool {
     template: Arc<Template>,
@@ -411,16 +411,9 @@ async fn render_and_attach(
     let json_name = format!("{base}.json");
     let pptx_name = format!("{base}.pptx");
     let docx_name = format!("{base}.docx");
+    let odt_name = format!("{base}.odt");
 
     let data_bytes = serialize_data(data);
-
-    // Keep the PDF bytes for the docx conversion (the upload below moves
-    // `rendered.pdf`). Only clone when a docx export is actually wired.
-    let pdf_for_docx = if template.docx.is_some() && sandbox.is_some() {
-        Some(rendered.pdf.clone())
-    } else {
-        None
-    };
 
     let pdf_out = chat_attachments::upload(s3, turn_id, &pdf_name, "application/pdf", rendered.pdf)
         .await
@@ -457,18 +450,30 @@ async fn render_and_attach(
         }
     }
 
-    // Optional editable-Word export (`[docx]`): convert the finished PDF
-    // to an editable .docx via pdf2docx in the sandbox. Best-effort, same
-    // as pptx — the PDF/preview already landed, so a failure only notes
-    // an error rather than failing the render.
+    // Optional editable-Word export (`[docx]`): compile the template to HTML
+    // and convert it to an editable .docx with pandoc + brand-font embedding.
+    // Best-effort, same as pptx — the PDF/preview already landed, so a failure
+    // only notes an error rather than failing the render.
     let mut docx_out = None;
+    let mut odt_out = None;
     let mut docx_error: Option<String> = None;
-    if let (Some(pdf), Some(sandbox)) = (pdf_for_docx.as_ref(), sandbox) {
-        match convert_to_docx(sandbox, pdf).await {
-            Ok(bytes) => {
-                match chat_attachments::upload(s3, turn_id, &docx_name, DOCX_MIME, bytes).await {
+    if let (Some(cfg), Some(sandbox)) = (template.docx.as_ref(), sandbox) {
+        match convert_to_docx(sandbox, template, cfg, &inputs, &staged).await {
+            Ok((docx_bytes, odt_bytes)) => {
+                match chat_attachments::upload(s3, turn_id, &docx_name, DOCX_MIME, docx_bytes).await
+                {
                     Ok(out) => docx_out = Some(out),
                     Err(e) => docx_error = Some(format!("upload docx: {e}")),
+                }
+                // ODT is a best-effort bonus format; an upload hiccup only skips
+                // it (the docx already landed).
+                if let Some(odt_bytes) = odt_bytes {
+                    match chat_attachments::upload(s3, turn_id, &odt_name, ODT_MIME, odt_bytes)
+                        .await
+                    {
+                        Ok(out) => odt_out = Some(out),
+                        Err(e) => tracing::warn!(error = %e, "upload odt"),
+                    }
                 }
             }
             Err(e) => {
@@ -495,6 +500,10 @@ async fn render_and_attach(
     if let Some(d) = &docx_out {
         chunk.push('\n');
         chunk.push_str(&chat_attachments::marker_line(turn_id, d));
+    }
+    if let Some(o) = &odt_out {
+        chunk.push('\n');
+        chunk.push_str(&chat_attachments::marker_line(turn_id, o));
     }
     chunk.push_str("\n\n");
 
@@ -561,6 +570,14 @@ async fn render_and_attach(
             "Editable .docx export failed (PDF/preview are fine): {err}"
         ));
     }
+    if let Some(o) = &odt_out {
+        result["odt"] = json!({
+            "filename": o.filename, "size": o.bytes,
+            "id": format!("{turn_id}/{}", o.filename),
+            "note": "Editable OpenDocument text (.odt) — the same content for \
+                     LibreOffice / OpenOffice users.",
+        });
+    }
     Ok(result)
 }
 
@@ -568,31 +585,56 @@ async fn render_and_attach(
 const PPTX_MIME: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 /// MIME for a `.docx` (OOXML word-processing document).
 const DOCX_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+/// MIME for a `.odt` (OpenDocument text).
+const ODT_MIME: &str = "application/vnd.oasis.opendocument.text";
+/// The `.odt` the sandbox script leaves in `/work` (best-effort — a LibreOffice
+/// conversion of the `.docx`, so it inherits the brand font).
+const ODT_OUT: &str = "out.odt";
 
 /// Single input file name carrying the zipped template + deck.
 const BUNDLE_NAME: &str = "bundle.zip";
 /// The lone `.pptx` the sandbox script leaves in `/work`.
 const PPTX_OUT: &str = "presentation.pptx";
-/// Input PDF name for the docx conversion, and the `.docx` the script
-/// leaves in `/work`.
-const DOCX_IN: &str = "in.pdf";
+/// The `.docx` the sandbox script leaves in `/work`.
 const DOCX_OUT: &str = "out.docx";
 
-/// Convert a finished PDF to an editable `.docx` in the sandbox.
+/// Convert a document template to an editable `.docx` in the sandbox via
+/// `typst --format html` → pandoc → brand-font post-process.
 ///
-/// The letter/one-pager are fixed-layout typst documents; pdf2docx
-/// reconstructs an editable Word doc from the rendered PDF (real,
-/// selectable text; logo + brand bars survive because the templates draw
-/// the bars as images, which pdf2docx keeps — unlike vector fills). A
-/// LibreOffice round-trip then re-flows the absolutely-positioned footer
-/// so the brand bar sits correctly. Returns the `.docx` bytes.
-async fn convert_to_docx(sandbox: &SandboxClient, pdf: &[u8]) -> Result<Vec<u8>, ToolError> {
+/// typst has no native `.docx` export, so we compile the template to HTML
+/// (the real compiler — content, headings, lists, tables, and the logo/brand
+/// bar images all come through; only fixed-layout chrome like a `place()`d
+/// footer is dropped) and let pandoc turn that into an editable Word doc. When
+/// the template declares a `[docx] font`, we set it as the document default and
+/// **embed** it as an obfuscated `.odttf` (sourced from the template's own
+/// `fonts/<font>-Regular.ttf` / `-Bold.ttf`), so the output renders on-brand
+/// even where the font isn't installed. Single-source: no reference.docx.
+///
+/// `inputs` are the same `--input k=v` pairs the PDF render used; they ride in
+/// as `inputs.json` and drive the sandbox-side HTML compile.
+async fn convert_to_docx(
+    sandbox: &SandboxClient,
+    template: &Template,
+    cfg: &DocxExport,
+    inputs: &[(String, String)],
+    staged: &[(String, Vec<u8>)],
+) -> Result<(Vec<u8>, Option<Vec<u8>>), ToolError> {
+    let map: serde_json::Map<String, Value> = inputs
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
+    let inputs_json = serde_json::to_vec(&Value::Object(map))
+        .map_err(|e| ToolError::Failed(format!("docx export: serialize inputs: {e}")))?;
+    // Reuse the pptx bundler: zip the template dir + inject `inputs.json` +
+    // any staged upload images.
+    let bundle = build_bundle_zip(&template.root, "inputs.json", &inputs_json, staged)?;
+
     let req = RunRequest {
         language: Language::Bash,
-        code: docx_script(),
+        code: docx_script(&template.source_file, cfg.font.as_deref()),
         files: vec![InputFile {
-            name: DOCX_IN.to_string(),
-            content_b64: b64::encode(pdf),
+            name: BUNDLE_NAME.to_string(),
+            content_b64: b64::encode(&bundle),
         }],
         timeout_secs: None,
         network: false,
@@ -616,28 +658,110 @@ async fn convert_to_docx(sandbox: &SandboxClient, pdf: &[u8]) -> Result<Vec<u8>,
                 tail(&resp.stderr, 600)
             ))
         })?;
-    b64::decode(&art.content_b64)
-        .ok_or_else(|| ToolError::Failed("docx artifact base64 invalid".into()))
+    let docx = b64::decode(&art.content_b64)
+        .ok_or_else(|| ToolError::Failed("docx artifact base64 invalid".into()))?;
+    // ODT is best-effort (a LibreOffice conversion of the docx); if it didn't
+    // materialise, the docx still stands.
+    let odt = resp
+        .artifacts
+        .iter()
+        .find(|a| a.name == ODT_OUT)
+        .and_then(|a| b64::decode(&a.content_b64));
+    Ok((docx, odt))
 }
 
-/// The bash recipe for PDF -> editable .docx. pdf2docx does the
-/// layout-preserving conversion; the LibreOffice pass realigns the
-/// footer. Only `out.docx` is left in `/work` so it is the sole returned
-/// artifact (the input PDF is removed).
-fn docx_script() -> String {
+/// The bash wrapper for the docx recipe: unzip the bundle, hand `SRC`/`FONT`
+/// to the python driver ([`DOCX_PY`]), and surface `out.docx` at `/work`.
+/// `DOCX_PY` is concatenated (not `format!`-interpolated) so its Python
+/// braces don't collide with format placeholders.
+fn docx_script(source_file: &str, font: Option<&str>) -> String {
     format!(
-        r#"set -e
-export HOME=/tmp
-cd /work
-python3 -c 'from pdf2docx import Converter; c = Converter("{din}"); c.convert("/tmp/raw.docx"); c.close()'
-libreoffice -env:UserInstallation=file:///tmp/lo --headless --convert-to docx:"MS Word 2007 XML" --outdir /work /tmp/raw.docx >/dev/null 2>&1
-mv -f /work/raw.docx /work/{dout}
-rm -f /work/{din}
-"#,
-        din = DOCX_IN,
-        dout = DOCX_OUT,
-    )
+        "set -e\nexport HOME=/tmp\nmkdir -p /work/build && cd /work/build\n\
+         unzip -q /work/{bundle}\nexport SRC='{src}' FONT='{font}'\npython3 - <<'PYEOF'\n",
+        bundle = BUNDLE_NAME,
+        src = source_file,
+        font = font.unwrap_or(""),
+    ) + DOCX_PY
+        + &format!(
+            "PYEOF\n\
+             mv -f /work/build/{DOCX_OUT} /work/{DOCX_OUT}\n\
+             [ -f /work/build/{ODT_OUT} ] && mv -f /work/build/{ODT_OUT} /work/{ODT_OUT} || true\n"
+        )
 }
+
+/// Python driver for the docx export (reads env `SRC` = template `.typ`,
+/// `FONT` = brand font name or ""): compile the template to HTML, pandoc it to
+/// `out.docx`, then — when a font is set — make it the document default and
+/// embed it as obfuscated `.odttf` (ECMA-376: first 32 bytes XOR the reversed
+/// fontKey GUID) from the template's `fonts/<font>-{Regular,Bold}.ttf`.
+const DOCX_PY: &str = r#"import json, subprocess, os, zipfile, uuid, re
+src = os.environ["SRC"]
+font = os.environ.get("FONT") or None
+inp = json.load(open("inputs.json"))
+cmd = ["typst","compile","--format","html","--features","html","--root",".",src,"doc.html"]
+for k,v in inp.items():
+    cmd += ["--input","%s=%s"%(k,v)]
+subprocess.run(cmd, check=True)
+subprocess.run(["pandoc","-f","html","-t","docx","doc.html","-o","out.docx"], check=True)
+# ODT as a bonus format for LibreOffice/OpenOffice users (small, from the same
+# HTML; best-effort — a failure just skips it).
+subprocess.run(["pandoc","-f","html","-t","odt","doc.html","-o","out.odt"], check=False)
+if font:
+    from docx import Document
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    d = Document("out.docx")
+    d.styles["Normal"].font.name = font
+    rpr = d.styles["Normal"].element.get_or_add_rPr()
+    rf = rpr.find(qn("w:rFonts"))
+    if rf is None:
+        rf = OxmlElement("w:rFonts"); rpr.append(rf)
+    for a in ("w:ascii","w:hAnsi","w:cs","w:eastAsia"):
+        rf.set(qn(a), font)
+    d.save("out.docx")
+    def obf(data, guid_hex):
+        key = bytes.fromhex(guid_hex)[::-1]
+        out = bytearray(data)
+        for i in range(32): out[i] ^= key[i % 16]
+        return bytes(out)
+    NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    fonts = []
+    for i,(fn,tag) in enumerate(((font+"-Regular.ttf","embedRegular"),(font+"-Bold.ttf","embedBold")), 1):
+        p = os.path.join("fonts", fn)
+        if os.path.exists(p):
+            g = uuid.uuid4()
+            fonts.append((i, tag, "{%s}"%str(g).upper(), "font%d.odttf"%i, obf(open(p,"rb").read(), g.hex)))
+    if fonts:
+        zin = zipfile.ZipFile("out.docx","r"); items = {n: zin.read(n) for n in zin.namelist()}; zin.close()
+        for i,tag,guid,fname,data in fonts:
+            items["word/fonts/"+fname] = data
+        ft = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="%s"><w:font w:name="%s">' % (NS_R, font)
+        for i,tag,guid,fname,data in fonts:
+            ft += '<w:%s r:id="rIdF%d" w:fontKey="%s" w:subsetted="false"/>' % (tag, i, guid)
+        ft += '</w:font></w:fonts>'
+        items["word/fontTable.xml"] = ft.encode()
+        rels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        for i,tag,guid,fname,data in fonts:
+            rels += '<Relationship Id="rIdF%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/font" Target="fonts/%s"/>' % (i, fname)
+        rels += '</Relationships>'
+        items["word/_rels/fontTable.xml.rels"] = rels.encode()
+        ct = items["[Content_Types].xml"].decode()
+        if "obfuscatedFont" not in ct:
+            ct = ct.replace("</Types>", '<Default Extension="odttf" ContentType="application/vnd.openxmlformats-officedocument.obfuscatedFont"/><Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/></Types>')
+            items["[Content_Types].xml"] = ct.encode()
+        if "word/settings.xml" in items:
+            st = items["word/settings.xml"].decode()
+            if "embedTrueTypeFonts" not in st:
+                st = re.sub(r"(<w:settings[^>]*>)", r"\1<w:embedTrueTypeFonts/><w:embedSystemFonts/><w:saveSubsetFonts/>", st, count=1)
+                items["word/settings.xml"] = st.encode()
+        dr = items["word/_rels/document.xml.rels"].decode()
+        if "fontTable" not in dr:
+            dr = dr.replace("</Relationships>", '<Relationship Id="rIdFontTable" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable" Target="fontTable.xml"/></Relationships>')
+            items["word/_rels/document.xml.rels"] = dr.encode()
+        zout = zipfile.ZipFile("out.docx","w",zipfile.ZIP_DEFLATED)
+        for n,data in items.items(): zout.writestr(n, data)
+        zout.close()
+"#;
 
 /// Convert a rendered deck to an editable `.pptx` in the sandbox.
 ///
@@ -1745,7 +1869,7 @@ fn apply_identity_defaults(t: &Template, args: &mut Map<String, Value>, id: &Ide
 /// chat chip. The static template `.typ` is deliberately NOT attached —
 /// it can't be edited through the tool and can't recompile without its
 /// fonts/assets, so it only adds clutter.
-const TYPST_EXTS: &[&str] = &["pdf", "png", "json", "pptx", "docx"];
+const TYPST_EXTS: &[&str] = &["pdf", "png", "json", "pptx", "docx", "odt"];
 
 /// Whether `filename` is one of this template's visible typst chips
 /// (`<base>.pdf` / `.png` / `.pptx`, including the `-2`, `-3`, … dedup
@@ -1757,7 +1881,7 @@ const TYPST_EXTS: &[&str] = &["pdf", "png", "json", "pptx", "docx"];
 fn is_template_typst_chip(template: &Template, filename: &str) -> bool {
     let base = template.output_basename.as_str();
     let stem = match filename.rsplit_once('.') {
-        Some((stem, "pdf" | "png" | "pptx" | "docx")) => stem,
+        Some((stem, "pdf" | "png" | "pptx" | "docx" | "odt")) => stem,
         _ => return false,
     };
     if stem == base {
@@ -2414,6 +2538,30 @@ mod tests {
             &Vec::<Value>::new(),
             "required must be empty (either-or input): {params}"
         );
+    }
+
+    #[test]
+    fn docx_script_carries_the_html_pandoc_recipe_and_font() {
+        let s = docx_script("template.typ", Some("Urbanist"));
+        // The compile command is a python argv list: "typst","compile",…,"--format","html".
+        assert!(s.contains("\"typst\""), "{s}");
+        assert!(s.contains("\"--format\"") && s.contains("\"html\""), "{s}");
+        assert!(s.contains("pandoc"), "{s}");
+        assert!(s.contains("FONT='Urbanist'"), "{s}");
+        assert!(s.contains("SRC='template.typ'"), "{s}");
+        // embedding path present (obfuscated .odttf)
+        assert!(s.contains("embedRegular") && s.contains("odttf"), "{s}");
+        // ends leaving the artifact at /work
+        assert!(s.contains(&format!("/work/{DOCX_OUT}")), "{s}");
+        // also emits the bonus .odt
+        assert!(s.contains("\"odt\"") && s.contains(ODT_OUT), "{s}");
+    }
+
+    #[test]
+    fn docx_script_without_font_skips_embedding_branch() {
+        // No font → FONT='' → the python `font` is None → no embed.
+        let s = docx_script("template.typ", None);
+        assert!(s.contains("FONT=''"), "{s}");
     }
 
     #[test]

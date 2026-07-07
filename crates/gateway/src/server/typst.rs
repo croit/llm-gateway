@@ -102,12 +102,18 @@ pub struct PptxExport {
     pub font: Option<String>,
 }
 
-/// Word-export marker for a document template (manifest `[docx]`). The
-/// render converts the finished PDF to an editable `.docx` via pdf2docx
-/// in the sandbox — no per-template config is needed (the conversion
-/// works off the rendered PDF), so this is presence-only for now.
+/// Word-export config for a document template (manifest `[docx]`). The
+/// render compiles the template to HTML, converts that to an editable
+/// `.docx` with pandoc, then post-processes the result (see
+/// `typst_render::convert_to_docx`).
 #[derive(Debug, Clone)]
-pub struct DocxExport;
+pub struct DocxExport {
+    /// Brand font applied as the document default and embedded into the
+    /// `.docx` (the template ships the matching `.ttf`s under `fonts/`).
+    /// pandoc emits its own theme font otherwise; setting this makes the
+    /// Word output on-brand. `None` → leave pandoc's default.
+    pub font: Option<String>,
+}
 
 /// One field the model fills in. The JSON-schema type maps to a
 /// stringified `--input k=v` pair the typst template reads via
@@ -190,12 +196,15 @@ struct Manifest {
     docx: Option<ManifestDocx>,
 }
 
-/// Presence-only `[docx]` table — opts a document template into editable
-/// Word export. No fields today; kept as a table so options can be added
-/// later without a manifest-format break.
+/// `[docx]` table — opts a document template into editable Word export.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct ManifestDocx {}
+struct ManifestDocx {
+    /// Brand font applied + embedded in the `.docx` (the template's own
+    /// `fonts/*.ttf`). Omit to keep pandoc's default font.
+    #[serde(default)]
+    font: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -350,7 +359,7 @@ fn load_template(root: &Path, manifest_path: &Path) -> Result<Template, Discover
         data_file: p.data_file,
         font: p.font,
     });
-    let docx = manifest.docx.map(|_| DocxExport);
+    let docx = manifest.docx.map(|d| DocxExport { font: d.font });
     let title = manifest
         .title
         .filter(|t| !t.trim().is_empty())
@@ -653,6 +662,23 @@ description = "Stub template for tests"
         let dir = tempfile::tempdir().unwrap();
         write_stub_template(dir.path(), "letter", "");
         assert!(discover_templates(dir.path()).unwrap()[0].pptx.is_none());
+    }
+
+    #[test]
+    fn manifest_docx_table_parses_font() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_template(dir.path(), "letter", "[docx]\nfont = \"Urbanist\"\n");
+        let templates = discover_templates(dir.path()).unwrap();
+        let docx = templates[0].docx.as_ref().expect("docx export configured");
+        assert_eq!(docx.font.as_deref(), Some("Urbanist"));
+    }
+
+    #[test]
+    fn manifest_docx_table_without_font_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_template(dir.path(), "letter", "[docx]\n");
+        let t = &discover_templates(dir.path()).unwrap()[0];
+        assert!(t.docx.as_ref().expect("docx configured").font.is_none());
     }
 
     #[test]
