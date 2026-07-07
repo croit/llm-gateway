@@ -560,7 +560,11 @@ fn main_class_for(active: Option<NavItem>) -> &'static str {
         // floating elements is moved into `#conversation`'s own
         // padding so messages don't sit permanently behind them.
         Some(NavItem::Chat) => {
-            "chat-main relative flex-1 min-h-0 flex flex-col w-full px-4 sm:px-6 sm:pt-4"
+            // `px-2` on phone (was `px-4`) so the conversation + composer use
+            // nearly the full viewport width — 16px gutters each side wasted a
+            // lot on a narrow screen; `sm:px-6` restores roomy gutters on wider
+            // viewports.
+            "chat-main relative flex-1 min-h-0 flex flex-col w-full px-2 sm:px-6 sm:pt-4"
         }
         _ => "flex-1 min-h-0 overflow-y-auto",
     }
