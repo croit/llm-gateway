@@ -342,7 +342,12 @@ async fn reasoning_timer_advances_while_reasoning_streams() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
     tokio::spawn(async move {
+        // Signal that the server is ready to accept connections
+        let _ = ready_tx.send(());
+
         // Serve every connection the client opens (pool warm-ups /
         // retries may make more than one); each gets the same delayed
         // reasoning stream.
@@ -396,6 +401,11 @@ async fn reasoning_timer_advances_while_reasoning_streams() {
             });
         }
     });
+
+    // Wait for the server to signal it's ready to accept connections.
+    // This prevents a race condition where the test client tries to connect
+    // before the server is ready, causing "error sending request" failures.
+    let _ = ready_rx.await;
 
     let base = format!("http://{addr}");
     let (state, cookie, session_id) = setup(&base).await;
