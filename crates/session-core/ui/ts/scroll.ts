@@ -84,7 +84,13 @@ const init = (conversation: HTMLElement): void => {
     // `reserveTailSpace` (which must never collapse padding below it — that
     // was the bug where a wrapped-chip composer re-hid the last message
     // once the reply grew past one viewport).
-    const COMPOSER_MARGIN_PX = 24;
+    // Margin added on top of the composer's own height. It has to cover three
+    // things so the last message's action row (Retry/Edit — which overhangs the
+    // bubble's flow box) doesn't tuck under the composer: the composer's ~16px
+    // bottom float inset (`.chat-composer { bottom: 1rem }`), the ~15px action
+    // overhang, and a comfortable visible gap. 24 left only an ~8px effective
+    // gap and the actions overlapped by ~7px; 48 lands a clear ~15px+ gap.
+    const COMPOSER_MARGIN_PX = 48;
     let composerHeight = 0;
     const clearanceFloor = (): number =>
         Math.max(basePadBottom, composerHeight + COMPOSER_MARGIN_PX);
