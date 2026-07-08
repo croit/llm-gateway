@@ -422,50 +422,21 @@ weight = 1
 # ---------------------------------------------------------------------------
 # External MCP (Model Context Protocol) servers.
 #
-# Each `[[mcp.servers]]` is connected at startup and its tools appear in chat
-# (and on /tools, grouped under "Integrations") as `mcp__<name>__<tool>`.
-# Optional: with no `[mcp]` block the gateway exposes only its built-in tools.
-# A server that's unreachable at boot is logged and skipped — it never blocks
-# startup. Exactly one transport per server:
+# There is NO `[mcp]` config block. MCP servers are managed entirely in the UI
+# at /admin/connectors (admin) and connected lazily per request, so an operator
+# adds an integration without editing this file or restarting. Each connector
+# is one of two scopes:
 #
-#   * stdio — `command` (+ optional `args` / `env`) spawns the server as a
-#     subprocess. The child inherits the gateway's environment. NOTE: the
-#     deploy image is minimal (no node/python), so stdio is mainly for local
-#     dev; in production prefer http to a server running as its own container.
-#   * http  — `url` is the server's streamable-HTTP endpoint. Authenticate
-#     with `bearer_token_env` (names an env var holding the raw token; sent as
-#     `Authorization: Bearer <token>`) and/or literal `headers` (e.g. an
-#     `X-Api-Key`). Keep secrets in the environment via `bearer_token_env`.
-
-# [[mcp.servers]]
-# name    = "files"                       # → tools mcp__files__*
-# command = "npx"
-# args    = ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
-
-# [[mcp.servers]]
-# name            = "acme"                # → tools mcp__acme__*
-# url             = "https://mcp.acme.example/mcp"
-# bearer_token_env = "ACME_MCP_TOKEN"     # → Authorization: Bearer <$ACME_MCP_TOKEN>
-# headers         = { X-Tenant = "acme" }
-
-# Discord — belongs here, not the /admin/connectors per-user catalog, because
-# a Discord bot token authenticates one shared bot for the whole server, not a
-# per-user OAuth account (there's no "each user connects their own Discord
-# account" flow). One bot, shared by everyone the gateway's RBAC grants the
-# tool to. See deploy/README.md for bot setup + running the bridge
-# (barryyip0625/mcp-discord — no published image, built from source).
+#   * global   — one shared identity for the whole gateway (e.g. a Discord bot).
+#                Available to everyone RBAC allows, no per-user sign-in. Auth is
+#                "none" (credential baked into the server, reached over a private
+#                URL) or a single shared bearer token stored on the connector.
+#   * per_user — each user connects their own account (OAuth) or pastes their
+#                own token on /integrations.
 #
-# Local dev (stdio; needs `node`/`npx` on PATH — not in the production image):
-# [[mcp.servers]]
-# name    = "discord"                     # → tools mcp__discord__*
-# command = "npx"
-# args    = ["-y", "mcp-discord"]
-# env     = { DISCORD_TOKEN = "..." }     # from the Discord Developer Portal
-#
-# Production (http, to the self-hosted bridge — see deploy/README.md):
-# [[mcp.servers]]
-# name = "discord"                        # → tools mcp__discord__*
-# url  = "http://discord-mcp:8080/mcp"    # internal only; the token is baked into the container
+# Its tools appear in chat (and on /tools, grouped under "Integrations") as
+# `mcp__<key>__<tool>`. See deploy/README.md for the Discord example (a global
+# connector backed by a self-hosted sidecar bridge).
 
 # --- RAG (retrieval-augmented generation) ------------------------------
 # Operator-managed indexed codebases. Collections are added via the /rag

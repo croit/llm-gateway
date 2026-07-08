@@ -45,6 +45,34 @@ impl AuthKind {
     }
 }
 
+/// Whether a connector is connected once for the whole gateway (a shared
+/// identity like a Discord bot) or by each user individually (their own OAuth
+/// account or token).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Each user connects their own account/token; connection + credential
+    /// live per-user in `user_mcp_connections`.
+    PerUser,
+    /// One shared connection for everyone RBAC allows; no per-user row. Any
+    /// secret lives on the connector row (`client_secret_ct`).
+    Global,
+}
+
+impl Scope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::PerUser => "per_user",
+            Scope::Global => "global",
+        }
+    }
+    pub fn parse(s: &str) -> Scope {
+        match s {
+            "global" => Scope::Global,
+            _ => Scope::PerUser,
+        }
+    }
+}
+
 /// A catalog connector row.
 #[derive(Debug, Clone)]
 pub struct Connector {
@@ -55,9 +83,16 @@ pub struct Connector {
     pub category: Option<String>,
     pub url: String,
     pub auth: AuthKind,
+    pub scope: Scope,
+    /// When true, every one of this connector's tool calls is recorded to
+    /// `mcp_tool_audit` (who ran what, when, outcome). Admin opt-in per
+    /// connector — off by default to keep low-risk connectors quiet.
+    pub audit: bool,
     pub use_dcr: bool,
     pub client_id: Option<String>,
     /// Encrypted client secret (`nonce`, `ciphertext`) — `None` when unset.
+    /// For a `Global` + `StaticBearer` connector this holds the shared bearer
+    /// token; for `OAuth2` it holds the OAuth client secret.
     pub client_secret_ct: Option<Vec<u8>>,
     pub client_secret_nonce: Option<Vec<u8>>,
     pub authorize_url: Option<String>,
@@ -81,6 +116,11 @@ impl Connector {
         self.url.trim().is_empty()
             || (self.auth == AuthKind::OAuth2 && !self.use_dcr && self.client_id.is_none())
     }
+
+    /// A shared, connect-once connector (vs. one each user connects themselves).
+    pub fn is_global(&self) -> bool {
+        self.scope == Scope::Global
+    }
 }
 
 /// Fields an admin supplies when creating or editing a connector. The client
@@ -94,6 +134,8 @@ pub struct ConnectorInput {
     pub category: Option<String>,
     pub url: String,
     pub auth: AuthKind,
+    pub scope: Scope,
+    pub audit: bool,
     pub use_dcr: bool,
     pub client_id: Option<String>,
     pub client_secret_ct: Option<Vec<u8>>,
@@ -123,6 +165,8 @@ fn map_row(row: &SqliteRow) -> Result<Connector, DbError> {
         category: row.try_get("category")?,
         url: row.try_get("url")?,
         auth: AuthKind::parse(&row.try_get::<String, _>("auth")?),
+        scope: Scope::parse(&row.try_get::<String, _>("scope")?),
+        audit: row.try_get::<i64, _>("audit")? != 0,
         use_dcr: row.try_get::<i64, _>("use_dcr")? != 0,
         client_id: row.try_get("client_id")?,
         client_secret_ct: row.try_get("client_secret_ct")?,
@@ -139,7 +183,7 @@ fn map_row(row: &SqliteRow) -> Result<Connector, DbError> {
     })
 }
 
-const COLS: &str = "key, name, description, icon, category, url, auth, use_dcr, \
+const COLS: &str = "key, name, description, icon, category, url, auth, scope, audit, use_dcr, \
      client_id, client_secret_ct, client_secret_nonce, authorize_url, token_url, \
      registration_url, scopes_json, required_role, enabled, seeded, created_at, updated_at";
 
@@ -172,11 +216,11 @@ pub async fn create(pool: &Pool, input: ConnectorInput) -> Result<(), DbError> {
     let scopes_json = serde_json::to_string(&input.scopes).unwrap_or_else(|_| "[]".into());
     sqlx::query(
         r#"INSERT INTO mcp_catalog_connectors
-              (key, name, description, icon, category, url, auth, use_dcr,
+              (key, name, description, icon, category, url, auth, scope, audit, use_dcr,
                client_id, client_secret_ct, client_secret_nonce, authorize_url,
                token_url, registration_url, scopes_json, required_role,
                enabled, seeded, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)"#,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)"#,
     )
     .bind(&input.key)
     .bind(&input.name)
@@ -185,6 +229,8 @@ pub async fn create(pool: &Pool, input: ConnectorInput) -> Result<(), DbError> {
     .bind(&input.category)
     .bind(&input.url)
     .bind(input.auth.as_str())
+    .bind(input.scope.as_str())
+    .bind(input.audit as i64)
     .bind(input.use_dcr as i64)
     .bind(&input.client_id)
     .bind(&input.client_secret_ct)
@@ -212,14 +258,14 @@ pub async fn update(pool: &Pool, key: &str, input: ConnectorInput) -> Result<boo
     let sql = if set_secret {
         r#"UPDATE mcp_catalog_connectors SET
                name = ?, description = ?, icon = ?, category = ?, url = ?, auth = ?,
-               use_dcr = ?, client_id = ?, client_secret_ct = ?, client_secret_nonce = ?,
+               scope = ?, audit = ?, use_dcr = ?, client_id = ?, client_secret_ct = ?, client_secret_nonce = ?,
                authorize_url = ?, token_url = ?, registration_url = ?, scopes_json = ?,
                required_role = ?, updated_at = ?
            WHERE key = ?"#
     } else {
         r#"UPDATE mcp_catalog_connectors SET
                name = ?, description = ?, icon = ?, category = ?, url = ?, auth = ?,
-               use_dcr = ?, client_id = ?, authorize_url = ?, token_url = ?,
+               scope = ?, audit = ?, use_dcr = ?, client_id = ?, authorize_url = ?, token_url = ?,
                registration_url = ?, scopes_json = ?, required_role = ?, updated_at = ?
            WHERE key = ?"#
     };
@@ -230,6 +276,8 @@ pub async fn update(pool: &Pool, key: &str, input: ConnectorInput) -> Result<boo
         .bind(&input.category)
         .bind(&input.url)
         .bind(input.auth.as_str())
+        .bind(input.scope.as_str())
+        .bind(input.audit as i64)
         .bind(input.use_dcr as i64)
         .bind(&input.client_id);
     if set_secret {
@@ -282,6 +330,8 @@ pub struct DefaultConnector {
     pub category: &'static str,
     pub url: &'static str,
     pub auth: AuthKind,
+    pub scope: Scope,
+    pub audit: bool,
     pub use_dcr: bool,
     pub scopes: &'static [&'static str],
     /// Explicit OAuth endpoints for providers that don't publish RFC 8414
@@ -299,6 +349,8 @@ pub struct DefaultConnector {
 pub const DEFAULT_CONNECTORS: &[DefaultConnector] = &[
     DefaultConnector {
         key: "google_workspace",
+        scope: Scope::PerUser,
+        audit: false,
         name: "Google Workspace",
         description: "Gmail, Calendar, Drive, Docs, Sheets, Slides, Tasks and more — one sign-in via a self-hosted Google Workspace MCP server (GA Google APIs, no developer preview).",
         icon: "google_workspace",
@@ -338,6 +390,8 @@ pub const DEFAULT_CONNECTORS: &[DefaultConnector] = &[
     },
     DefaultConnector {
         key: "atlassian",
+        scope: Scope::PerUser,
+        audit: false,
         name: "Atlassian (Jira & Confluence)",
         description: "Search and work with Jira issues and Confluence pages in the user's Atlassian sites.",
         icon: "atlassian",
@@ -353,6 +407,8 @@ pub const DEFAULT_CONNECTORS: &[DefaultConnector] = &[
     },
     DefaultConnector {
         key: "github",
+        scope: Scope::PerUser,
+        audit: false,
         name: "GitHub",
         description: "Browse repositories, issues, and pull requests in the user's GitHub account.",
         icon: "github",
@@ -375,6 +431,8 @@ pub const DEFAULT_CONNECTORS: &[DefaultConnector] = &[
     },
     DefaultConnector {
         key: "kiwi",
+        scope: Scope::PerUser,
+        audit: false,
         name: "Kiwi.com Flight Search",
         description: "Search one-way and round-trip flights (dates, passengers, cabin class) via Kiwi.com.",
         icon: "kiwi",
@@ -391,6 +449,8 @@ pub const DEFAULT_CONNECTORS: &[DefaultConnector] = &[
     },
     DefaultConnector {
         key: "slack",
+        scope: Scope::PerUser,
+        audit: false,
         name: "Slack",
         description: "Search messages, files, and channels, and send messages in the user's Slack workspace.",
         icon: "slack",
@@ -416,6 +476,8 @@ pub const DEFAULT_CONNECTORS: &[DefaultConnector] = &[
     },
     DefaultConnector {
         key: "gitlab",
+        scope: Scope::PerUser,
+        audit: false,
         name: "GitLab (SaaS / Premium)",
         description: "Work with projects, issues, and merge requests on GitLab.com. GitLab's native MCP server is a Duo feature (Premium/Ultimate); for Community Edition use the self-managed connector below.",
         icon: "gitlab",
@@ -429,6 +491,8 @@ pub const DEFAULT_CONNECTORS: &[DefaultConnector] = &[
     },
     DefaultConnector {
         key: "gitlab_selfmanaged",
+        scope: Scope::PerUser,
+        audit: false,
         name: "GitLab (self-managed / CE)",
         description: "Projects, issues, and merge requests on a self-managed GitLab — including Community Edition. Each user connects with their own GitLab personal access token.",
         icon: "gitlab",
@@ -447,6 +511,29 @@ pub const DEFAULT_CONNECTORS: &[DefaultConnector] = &[
         authorize_url: None,
         token_url: None,
     },
+    DefaultConnector {
+        key: "discord",
+        // A shared bot, not a per-user account: a Discord bot token
+        // authenticates one bot for the whole server, so this is the one seeded
+        // *global* connector (was the config-file `[[mcp.servers]]` case).
+        scope: Scope::Global,
+        audit: true,
+        name: "Discord",
+        description: "Send and read messages, and manage channels, threads, roles, and webhooks via a shared Discord bot. Available to everyone the operator's roles allow — no per-user sign-in.",
+        icon: "discord",
+        category: "Communication",
+        // Self-hosted HTTP bridge (barryy625/mcp-discord, streamable HTTP on
+        // :8080 → `/mcp`). Deployment-specific, so the admin sets the URL
+        // (typically http://discord-mcp:8080/mcp). The bot token is baked into
+        // the bridge container and the endpoint is loopback/internal-only, so
+        // the gateway sends no auth. See deploy/README.md.
+        url: "",
+        auth: AuthKind::None,
+        use_dcr: false,
+        scopes: &[],
+        authorize_url: None,
+        token_url: None,
+    },
 ];
 
 /// Seed the built-in connectors idempotently. Existing rows (matched by key)
@@ -460,9 +547,9 @@ pub async fn seed_defaults(pool: &Pool) -> Result<u64, DbError> {
         let scopes_json = serde_json::to_string(d.scopes).unwrap_or_else(|_| "[]".into());
         let affected = sqlx::query(
             r#"INSERT INTO mcp_catalog_connectors
-                  (key, name, description, icon, category, url, auth, use_dcr,
+                  (key, name, description, icon, category, url, auth, scope, audit, use_dcr,
                    authorize_url, token_url, scopes_json, enabled, seeded, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
                ON CONFLICT(key) DO NOTHING"#,
         )
         .bind(d.key)
@@ -472,6 +559,8 @@ pub async fn seed_defaults(pool: &Pool) -> Result<u64, DbError> {
         .bind(d.category)
         .bind(d.url)
         .bind(d.auth.as_str())
+        .bind(d.scope.as_str())
+        .bind(d.audit as i64)
         .bind(d.use_dcr as i64)
         .bind(d.authorize_url)
         .bind(d.token_url)
@@ -637,6 +726,8 @@ mod tests {
                 category: Some("Other".into()),
                 url: "https://example.test/mcp".into(),
                 auth: AuthKind::OAuth2,
+                scope: Scope::PerUser,
+                audit: false,
                 use_dcr: true,
                 client_id: None,
                 client_secret_ct: None,
@@ -665,6 +756,8 @@ mod tests {
                 category: Some("Other".into()),
                 url: "https://example.test/mcp".into(),
                 auth: AuthKind::OAuth2,
+                scope: Scope::PerUser,
+                audit: false,
                 use_dcr: true,
                 client_id: None,
                 client_secret_ct: None,
@@ -684,5 +777,75 @@ mod tests {
 
         assert!(delete(&pool, "custom").await.unwrap());
         assert!(get(&pool, "custom").await.unwrap().is_none());
+    }
+
+    #[test]
+    fn scope_parse_defaults_to_per_user() {
+        assert_eq!(Scope::parse("global"), Scope::Global);
+        assert_eq!(Scope::parse("per_user"), Scope::PerUser);
+        assert_eq!(Scope::parse("nonsense"), Scope::PerUser);
+        assert_eq!(Scope::Global.as_str(), "global");
+        assert_eq!(Scope::PerUser.as_str(), "per_user");
+    }
+
+    #[tokio::test]
+    async fn discord_seeds_as_global_no_auth_needs_setup() {
+        let pool = pool().await;
+        seed_defaults(&pool).await.unwrap();
+        let d = get(&pool, "discord").await.unwrap().unwrap();
+        // Shared bot → global, no auth from the gateway (token baked into the
+        // sidecar), and ships without a URL so it needs the admin to point it
+        // at the self-hosted bridge before enabling.
+        assert_eq!(d.scope, Scope::Global);
+        assert!(d.is_global());
+        assert_eq!(d.auth, AuthKind::None);
+        assert!(d.url.is_empty());
+        assert!(d.needs_setup());
+        // The shared bot ships with audit on by default (accountability for a
+        // powerful shared identity); admins can turn it off.
+        assert!(d.audit, "discord should default to audited");
+    }
+
+    #[tokio::test]
+    async fn seeded_account_connectors_are_per_user() {
+        let pool = pool().await;
+        seed_defaults(&pool).await.unwrap();
+        for key in ["google_workspace", "atlassian", "github", "slack", "gitlab"] {
+            let c = get(&pool, key).await.unwrap().unwrap();
+            assert_eq!(c.scope, Scope::PerUser, "{key} should be per-user");
+            assert!(!c.is_global());
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_survives_create_and_update() {
+        let pool = pool().await;
+        let input = |scope| ConnectorInput {
+            key: "g".into(),
+            name: "G".into(),
+            description: None,
+            icon: None,
+            category: None,
+            url: "http://localhost:8080/mcp".into(),
+            auth: AuthKind::None,
+            scope,
+            audit: false,
+            use_dcr: false,
+            client_id: None,
+            client_secret_ct: None,
+            client_secret_nonce: None,
+            authorize_url: None,
+            token_url: None,
+            registration_url: None,
+            scopes: vec![],
+            required_role: None,
+        };
+        create(&pool, input(Scope::Global)).await.unwrap();
+        assert_eq!(get(&pool, "g").await.unwrap().unwrap().scope, Scope::Global);
+        update(&pool, "g", input(Scope::PerUser)).await.unwrap();
+        assert_eq!(
+            get(&pool, "g").await.unwrap().unwrap().scope,
+            Scope::PerUser
+        );
     }
 }

@@ -17,9 +17,6 @@ use rama::net::address::SocketAddress;
 
 use gateway::rama_server::SessionStore;
 use gateway::server::{self as srv, AppState, Config};
-// `Tool` brings the `.id()` method into scope for the MCP-tool registration
-// loop below; the built-in registrations only use `ToolRegistry::with`.
-use gateway::server::tools::Tool;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -222,23 +219,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    // Bridge any configured MCP servers: connect, enumerate their tools, and
-    // register each as a `Tool` alongside the built-ins. Non-fatal — a server
-    // that's down at boot is logged and skipped (its tools just won't be
-    // available this run); see `srv::tools::mcp`.
-    if let Some(mcp_cfg) = config.mcp.as_ref() {
-        for tool in srv::tools::mcp::connect_all(mcp_cfg).await {
-            let id = tool.id();
-            // Defend against an id collision (two servers, or a server vs a
-            // built-in) by skipping rather than panicking in `with`.
-            if tool_registry.contains(id) {
-                tracing::warn!(tool = id, "MCP tool id already registered — skipping");
-                continue;
-            }
-            tracing::info!(tool = id, "registered MCP tool");
-            tool_registry = tool_registry.with(tool);
-        }
-    }
+    // MCP servers are no longer registered at boot: they live in the
+    // admin-managed connector catalog (`/admin/connectors`) and are connected
+    // lazily per request by `srv::tools::mcp::manager` — global connectors as a
+    // shared connection, per-user connectors with the user's own credential.
     // Code-execution sandbox. Registered only when `[sandbox]` points at a
     // reachable sandbox-runner; the three tools share one HTTP client.
     match config.sandbox.as_ref() {

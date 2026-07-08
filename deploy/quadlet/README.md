@@ -153,16 +153,13 @@ equivalent: [`../README.md`](../README.md#gitlab-self-managed--community-edition
 
 ## Discord MCP bridge (optional sidecar)
 
-Unlike the connectors above, Discord is **not** a per-user connector — a
-Discord bot token authenticates one shared bot for the whole server, not a
-per-user OAuth account, so it's configured as an operator-level
-`[[mcp.servers]]` tool in `gateway.toml` rather than through
+Discord is a **global** connector — a Discord bot token authenticates one shared
+bot for the whole server, not a per-user OAuth account. It ships seeded (and
+disabled) in the catalog; an admin enables it and points it at this bridge in
 `/admin/connectors`. The bridge, [`barryyip0625/mcp-discord`](https://github.com/barryyip0625/mcp-discord),
-has no published registry image, so build it first:
+publishes a ready HTTP image, so no local build is needed:
 
 ```bash
-git clone https://github.com/barryyip0625/mcp-discord.git /tmp/mcp-discord
-sudo podman build -t localhost/discord-mcp:latest /tmp/mcp-discord
 sudo cp deploy/quadlet/discord-mcp.container /etc/containers/systemd/
 sudo install -m 0600 deploy/quadlet/discord-mcp.example.env /etc/gateway/discord-mcp.env
 sudo $EDITOR /etc/gateway/discord-mcp.env              # DISCORD_TOKEN=... (Developer Portal → Bot)
@@ -170,18 +167,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now discord-mcp.service
 ```
 
-Then add to `config.toml`:
-
-```toml
-[[mcp.servers]]
-name = "discord"
-url  = "http://localhost:3334/mcp"
-```
-
-No `bearer_token_env` needed (the token is baked into the container), and the
-endpoint must stay internal-only — it grants full bot access with no
-per-caller scoping. Bot creation steps (intents, permissions, invite URL) and
-the compose equivalent: [`../README.md`](../README.md#discord).
+Then, as a gateway admin, open **`/admin/connectors`**, **Enable** Discord and
+set its **URL** to `http://localhost:3334/mcp` (the loopback port published by
+the unit) — no `gateway.toml` edit, no restart. No credential is configured on
+the connector (the bot token is baked into the container), and the endpoint must
+stay internal-only — it grants full bot access with no per-caller scoping. Bot
+creation steps (intents, permissions, invite URL) and the compose equivalent:
+[`../README.md`](../README.md#discord).
 
 ## Hardening
 

@@ -67,9 +67,12 @@ pub async fn integrations_index(State(state): State<Arc<RamaState>>, req: Reques
             .await
             .ok()
             .flatten();
+        // Global connectors have no per-user connection — they're always live
+        // for everyone RBAC allows — so load their tools regardless. Per-user
+        // connectors only load once the user has connected.
         // Surface the *real* reason tools can't load (connection/transport/auth
         // error) instead of a generic message — both in the UI and the log.
-        let (tools, tool_error) = if connected.is_some() {
+        let (tools, tool_error) = if connector.is_global() || connected.is_some() {
             match state.mcp.connector_tool_infos(&user.id, connector).await {
                 Ok(t) => (Some(t), None),
                 Err(e) => {
@@ -138,6 +141,11 @@ pub async fn integrations_connect(
             .any(|r| r == required)
     {
         return forbidden_html(&user.email, &t(lang, "integrations-error-forbidden-role"));
+    }
+    if connector.is_global() {
+        // Global connectors are shared by everyone — there's no per-user
+        // connection to make. Their tools are already live on this page.
+        return redirect("/integrations");
     }
     if connector.auth == AuthKind::None {
         // No credentials to negotiate — the connection row exists only so the
@@ -535,6 +543,11 @@ pub async fn integrations_connect_token(
     {
         return forbidden_html(&user.email, &t(lang, "integrations-error-forbidden-role"));
     }
+    if connector.is_global() {
+        // A global static_bearer connector's token is set once by the admin on
+        // the connector row, not per-user here.
+        return redirect("/integrations");
+    }
     if connector.auth != AuthKind::StaticBearer {
         return internal_error_html(&user.email, &t(lang, "integrations-error-not-token-based"));
     }
@@ -793,6 +806,7 @@ fn render_connector_card(
 ) -> Html {
     let connected = connection.is_some();
     let errored = connection.map(|c| c.status == "error").unwrap_or(false);
+    let is_global = connector.is_global();
     let icon_text = connector.icon.clone().unwrap_or_default();
     let logo = session_core::icons::connector_logo(&connector.key, 26).unwrap_or_else(|| {
         html! { span(class: "text-2xl leading-none") { (icon_text) } }.to_html()
@@ -811,26 +825,31 @@ fn render_connector_card(
                     div(class: "min-w-0 flex-1") {
                         div(class: "flex items-center gap-2 flex-wrap") {
                             h2(class: "card-title text-base m-0") { (name) }
-                            if connected && !errored {
+                            if is_global {
+                                span(class: "badge badge-info badge-sm") { "Provided by your operator" }
+                            } else if connected && !errored {
                                 span(class: "badge badge-success badge-sm") { (t(lang, "integrations-badge-connected")) }
                             }
-                            if errored {
+                            if !is_global && errored {
                                 span(class: "badge badge-error badge-sm") { (t(lang, "integrations-badge-needs-reconnect")) }
                             }
-                            if !connected && needs_setup {
+                            if !is_global && !connected && needs_setup {
                                 span(class: "badge badge-ghost badge-sm") { (t(lang, "integrations-badge-needs-admin-setup")) }
                             }
                         }
                         p(class: "text-base-content/60 text-sm m-0 mt-1") { (desc) }
                     }
                     div(class: "shrink-0") {
-                        (render_connect_controls(lang, &key, connected, needs_setup, token_auth))
+                        (render_connect_controls(lang, &key, connected, needs_setup, token_auth, is_global))
                     }
                 }
-                if token_auth && !connected {
+                if token_auth && !connected && !is_global {
                     (render_token_form(lang, &key))
                 }
-                if connected {
+                // Per-user connectors show their tools once connected; global
+                // connectors are always live, so always show them (with the same
+                // per-user always/ask/off pickers).
+                if is_global || connected {
                     (render_tools(lang, &key, tools, tool_error))
                 }
             }
@@ -845,7 +864,16 @@ fn render_connect_controls(
     connected: bool,
     needs_setup: bool,
     token_auth: bool,
+    is_global: bool,
 ) -> Html {
+    // Global connectors have no per-user connect/disconnect — the operator runs
+    // them for everyone. Users only toggle the tools below.
+    if is_global {
+        return html! {
+            span(class: "text-xs text-base-content/50") { "No sign-in needed" }
+        }
+        .to_html();
+    }
     let connect_action = format!("/integrations/{key}/connect");
     let disconnect_action = format!("/integrations/{key}/disconnect");
     let reconnect_action = if token_auth {

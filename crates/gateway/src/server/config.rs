@@ -78,12 +78,6 @@ pub struct Config {
     /// the location as unknown). See `server::geoip`.
     #[serde(default)]
     pub geoip: Option<GeoipConfig>,
-    /// External MCP (Model Context Protocol) servers to bridge. Optional —
-    /// with no `[mcp]` block the gateway exposes only its built-in tools.
-    /// Each `[[mcp.servers]]` is connected at startup and its tools appear
-    /// in chat as `mcp__<server>__<tool>`. See `server::tools::mcp`.
-    #[serde(default)]
-    pub mcp: Option<McpConfig>,
     /// RAG indexer state directory + tuning. Optional — with no `[rag]`
     /// block the indexer falls back to `data/rag` relative to the
     /// gateway's CWD, which is fine for local dev but NOT for the
@@ -353,66 +347,6 @@ fn default_rag_data_dir() -> PathBuf {
 
 fn default_clone_concurrency() -> usize {
     4
-}
-
-/// External MCP servers the gateway connects to as a client.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct McpConfig {
-    /// One entry per server. Connected concurrently at startup; a server
-    /// that fails to connect (or times out) is logged and skipped — it
-    /// never blocks boot.
-    #[serde(default)]
-    pub servers: Vec<McpServerConfig>,
-}
-
-/// One MCP server. Exactly one transport must be set: `command` (+ optional
-/// `args` / `env`) spawns it over stdio; `url` connects over streamable HTTP.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct McpServerConfig {
-    /// Stable label. Namespaces the server's tools (`mcp__<name>__<tool>`)
-    /// and keys its `/tools` toggle. Keep it short and `[a-z0-9_-]`.
-    pub name: String,
-    /// Set to false to declare a server without connecting to it.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// stdio transport: the executable to spawn (e.g. `npx`).
-    #[serde(default)]
-    pub command: Option<String>,
-    /// Arguments passed to `command`.
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Extra environment for the spawned process, layered on top of the
-    /// gateway's own env (which the child inherits — so secrets already in
-    /// the process environment reach the server without being repeated here).
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    /// HTTP transport: the server's streamable-HTTP endpoint URL.
-    #[serde(default)]
-    pub url: Option<String>,
-    /// HTTP transport: name of an env var holding a bearer token. When set,
-    /// the gateway sends `Authorization: Bearer <token>` on every request to
-    /// this server. The secret stays in the environment, not the config file
-    /// (same `*_env` convention as the rest of the config). Ignored for stdio.
-    #[serde(default)]
-    pub bearer_token_env: Option<String>,
-    /// HTTP transport: extra request headers sent verbatim — e.g. an
-    /// `X-Api-Key` for servers that don't use bearer auth, or a tenant id.
-    /// For a bearer secret prefer `bearer_token_env`. Ignored for stdio.
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-}
-
-impl McpServerConfig {
-    /// Resolve the bearer token from its named env var, if configured and
-    /// non-empty. Same env-indirection as [`GeoipConfig::update_token`].
-    pub fn bearer_token(&self) -> Option<String> {
-        self.bearer_token_env
-            .as_ref()
-            .and_then(|name| std::env::var(name).ok())
-            .filter(|v| !v.is_empty())
-    }
 }
 
 fn default_true() -> bool {

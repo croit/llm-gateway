@@ -1,6 +1,6 @@
 # LLM Gateway
 
-Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests across multiple backends — with OIDC login, per-user API tokens, RBAC-gated server-side tools, and a built-in chat UI. Self-hostable, one binary, SQLite for state.
+**One endpoint for all your LLM backends — that also makes them agentic.** LLM Gateway is an OpenAI-API-compatible reverse proxy: point any OpenAI SDK at it and it routes across your self-hosted and cloud models (health checks, failover, stable aliases), then runs tools **mid-completion** — web search, code sandbox, document rendering, RAG, per-user MCP connectors — so plain clients get tool use with zero agent code of their own. Team-ready with OIDC login, per-user tokens, and RBAC, plus a built-in chat UI for people who don't speak curl. Ships as a single self-hosted binary (Rust, SQLite) — no compose file, no vector DB, no separate frontend.
 
 ![The built-in chat UI answering a question by calling the web-search tool mid-completion — the reasoning step, the tool calls, and the final markdown answer all render inline.](docs/img/chat.png)
 
@@ -232,7 +232,6 @@ Optional blocks, each documented inline in `gateway.example.toml`:
 - `[typst]` — register document-rendering tools from a templates directory.
 - `[sandbox]` — enable the code-execution + document tools by pointing at a sandbox-runner service (see [`docs/sandbox.md`](docs/sandbox.md)).
 - `[geoip]` — IP→location for the `get_user_location` tool (IP2Location LITE database).
-- `[[mcp.servers]]` — bridge external MCP tool servers.
 - `[rag]` — index git repos and search them from chat (see [RAG](#rag-codebase-search)).
 - `[fallback]` — server-wide fallback models per kind, for unknown or all-offline model names (see [`docs/upstreams.md`](docs/upstreams.md#fallback-models)).
 - `[usage]` — request/token usage accounting behind the `/usage` page (retention-pruned; on by default).

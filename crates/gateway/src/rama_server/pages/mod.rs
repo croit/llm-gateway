@@ -1119,9 +1119,9 @@ pub use integrations::{
 // Admin-managed MCP connector catalog (`/admin/connectors`).
 mod connectors;
 pub use connectors::{
-    connectors_delete as admin_connectors_delete, connectors_index as admin_connectors_index,
-    connectors_restore as admin_connectors_restore, connectors_save as admin_connectors_save,
-    connectors_toggle as admin_connectors_toggle,
+    connectors_audit as admin_connectors_audit, connectors_delete as admin_connectors_delete,
+    connectors_index as admin_connectors_index, connectors_restore as admin_connectors_restore,
+    connectors_save as admin_connectors_save, connectors_toggle as admin_connectors_toggle,
 };
 
 // ---------------------------------------------------------------------------

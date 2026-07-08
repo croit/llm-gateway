@@ -139,15 +139,14 @@ services:
     security_opt:
       - "no-new-privileges:true"
 
-  # Discord MCP bridge — backs an operator-level `[[mcp.servers]]` tool, NOT a
-  # per-user connector. A Discord bot token authenticates one shared bot for
-  # the whole gateway (there's no per-user Discord account to connect, unlike
-  # Slack/GitHub/Atlassian), so it belongs in gateway.toml's `[[mcp.servers]]`
-  # block rather than /admin/connectors. No published image exists upstream,
-  # so this builds from the git repo directly. Profile: discord.
+  # Discord MCP bridge — backs the seeded *global* Discord connector. A Discord
+  # bot token authenticates one shared bot for the whole gateway (there's no
+  # per-user Discord account to connect, unlike Slack/GitHub/Atlassian), so the
+  # connector's scope is "global": an admin enables it and points it at this
+  # bridge's URL in /admin/connectors. The barryyip0625/mcp-discord project
+  # publishes a ready HTTP image (streamable HTTP on :8080). Profile: discord.
   discord-mcp:
-    build:
-      context: https://github.com/barryyip0625/mcp-discord.git
+    image: docker.io/barryy625/mcp-discord:latest
     profiles:
       - discord
     restart: unless-stopped

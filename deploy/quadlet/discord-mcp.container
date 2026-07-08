@@ -1,15 +1,13 @@
 # systemd-podman Quadlet for the Discord MCP bridge (barryyip0625/mcp-discord).
-# Backs an operator-level `[[mcp.servers]]` tool (NOT a per-user connector):
-# Discord bots authenticate with a single bot token for the whole server/guild,
-# not a per-user OAuth account, so there's no "each user connects their own
-# Discord account" flow the way there is for Slack/GitHub/Atlassian. One bot,
-# shared by everyone the gateway's RBAC grants the tool to — see
-# gateway.example.toml's `[[mcp.servers]]` section and deploy/README.md.
+# Backs the seeded *global* Discord connector: a Discord bot authenticates with
+# a single bot token for the whole server/guild, not a per-user OAuth account,
+# so there's no "each user connects their own Discord account" flow the way
+# there is for Slack/GitHub/Atlassian. One bot, shared by everyone the gateway's
+# RBAC grants the tool to — see deploy/README.md.
 #
-# No published registry image exists upstream, so this builds locally first:
-#
-#   git clone https://github.com/barryyip0625/mcp-discord.git /tmp/mcp-discord
-#   sudo podman build -t localhost/discord-mcp:latest /tmp/mcp-discord
+# The project publishes a ready HTTP image (streamable HTTP on :8080), so no
+# local build is needed. (Not the `mcp/mcp-discord` verified image — that one
+# is stdio-only, for the Docker MCP gateway, and unreachable over HTTP.)
 #
 # Install:
 #   sudo cp deploy/quadlet/discord-mcp.container /etc/containers/systemd/
@@ -19,19 +17,20 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now discord-mcp.service
 #
-# Then in the gateway config: add a `[[mcp.servers]]` entry with
-# url = "http://127.0.0.1:3334/mcp" (see gateway.example.toml). No
-# bearer_token_env needed — the bot token is baked into this container, and
-# the endpoint is loopback-only / internal, never exposed publicly.
+# Then, as a gateway admin, open /admin/connectors, enable Discord, and set its
+# URL to http://127.0.0.1:3334/mcp (the loopback port published below). No
+# credential is configured on the connector — the bot token is baked into this
+# container, and the endpoint is loopback-only / internal, never exposed
+# publicly.
 
 [Unit]
-Description=Discord MCP bridge (shared bot, gateway [[mcp.servers]] tool)
+Description=Discord MCP bridge (shared bot, global gateway connector)
 Wants=network-online.target
 After=network-online.target
 
 [Container]
 ContainerName=discord-mcp
-Image=localhost/discord-mcp:latest
+Image=docker.io/barryy625/mcp-discord:latest
 
 # Loopback only — internal service, reached by the gateway. Never expose it
 # publicly (the bot token grants full bot access, not scoped per caller).

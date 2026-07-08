@@ -1,10 +1,16 @@
-# MCP Connectors (per-user integrations)
+# MCP Connectors (integrations)
 
 The gateway ships a **connector catalog**: an admin curates a list of MCP
-servers (Gmail, GitHub, Atlassian, …) at `/admin/connectors`, and each user
-connects to the ones they want — with **their own** Google/GitHub/Atlassian
-account — at `/integrations`. Tokens are stored per-user, encrypted at rest,
-and refreshed in the background.
+servers (Gmail, GitHub, Atlassian, Discord, …) at `/admin/connectors`. Each
+connector has a **scope**:
+
+- **per-user** — each user connects the ones they want, with **their own**
+  Google/GitHub/Atlassian account, at `/integrations`. Tokens are stored
+  per-user, encrypted at rest, and refreshed in the background.
+- **global** — one shared identity for the whole gateway (e.g. a Discord bot).
+  No per-user sign-in: the connector is enabled by the admin and its tools are
+  live for everyone the connector's role allows. See [Scope](#scope-per-user-vs-global)
+  and [Discord](#discord-a-global-connector) below.
 
 ![The /admin/connectors page: the connector catalog — Atlassian, GitHub, GitLab (SaaS and self-managed), Google Workspace — each row showing its key, endpoint, auth badges (Default / DCR), and Enable / Edit / Delete controls.](img/connectors.png)
 
@@ -43,6 +49,44 @@ https://<your-gateway-host>/integrations/callback
 
 (in local dev: `http://localhost:8080/integrations/callback`). It must be
 registered verbatim in the provider's OAuth app.
+
+---
+
+## Scope: per-user vs global
+
+Every connector has a **scope** (the `scope` column, set on the admin form):
+
+- **Per-user** (default) — each user connects their own account/token at
+  `/integrations`; the credential and connection live per-user. This is the
+  right model whenever the identity is the *user's* (Gmail, GitHub, …). All four
+  auth models above apply.
+- **Global** — one shared identity for the whole gateway. There is no per-user
+  connection step: an admin enables the connector and its tools are immediately
+  available to everyone the connector's `required_role` allows (each user can
+  still set them always/ask/off on their Tools page). The connection is
+  established once and shared across users. Because the identity is shared,
+  **only `none` or `static_bearer` auth is allowed** — OAuth is inherently
+  per-user and is rejected on save. Use `none` when the credential is baked into
+  the MCP server itself (reached over a private URL, e.g. Discord), or
+  `static_bearer` to store one shared token (encrypted) on the connector.
+
+Pick global when authenticating as a single shared identity for the whole
+gateway; pick per-user when each person connects their own account.
+
+---
+
+## Discord (a global connector)
+
+Discord is the shipped example of a global connector: a bot token authenticates
+one shared bot for the whole server, so there's no per-user Discord account to
+connect. It's seeded (disabled) in the catalog. Setup is two steps — run the
+sidecar bridge, then enable + point the connector at it — and is documented in
+full (bot creation, intents, invite URL, running the bridge, and the loopback
+URL to enter) in [`deploy/README.md`](../deploy/README.md#discord).
+
+The connector's auth is **None** (the gateway sends no credential — the bot
+token lives in the bridge container behind a private/loopback endpoint) and its
+scope is **Global**. Its tools surface as `mcp__discord__*`.
 
 ---
 

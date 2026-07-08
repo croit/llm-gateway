@@ -23,7 +23,8 @@ use super::{
     require_admin_or_403,
 };
 use crate::rama_server::state::RamaState;
-use crate::server::db::mcp_catalog::{self, AuthKind, Connector, ConnectorInput};
+use crate::server::db::mcp_audit::{self, McpToolEvent};
+use crate::server::db::mcp_catalog::{self, AuthKind, Connector, ConnectorInput, Scope};
 use session_core::chrome::{NavSections, Theme, is_datastar_request};
 use session_core::i18n::{self, Lang, t, t_args};
 
@@ -76,6 +77,8 @@ struct SaveForm {
     category: Option<String>,
     url: String,
     auth: Option<String>,
+    scope: Option<String>,
+    audit: Option<String>,
     use_dcr: Option<String>,
     client_id: Option<String>,
     client_secret: Option<String>,
@@ -183,6 +186,20 @@ pub async fn connectors_save(State(state): State<Arc<RamaState>>, req: Request) 
         .map(str::to_owned)
         .collect();
 
+    let auth = AuthKind::parse(form.auth.as_deref().unwrap_or("oauth2"));
+    let scope = Scope::parse(form.scope.as_deref().unwrap_or("per_user"));
+    // A global connector is one shared identity for the whole gateway, so it
+    // can't use per-user OAuth. Only `none` (token baked into the server, e.g.
+    // Discord) or `static_bearer` (one shared token on the row) make sense.
+    if scope == Scope::Global && auth == AuthKind::OAuth2 {
+        return internal_error_html(
+            &user.email,
+            "A global connector is a single shared identity for the whole gateway, so it \
+             can't use per-user OAuth. Choose \"No auth\" (token baked into the server, \
+             e.g. Discord) or \"Bearer token\" (one shared token) instead.",
+        );
+    }
+
     let input = ConnectorInput {
         key: key.clone(),
         name: form.name.trim().to_string(),
@@ -190,7 +207,9 @@ pub async fn connectors_save(State(state): State<Arc<RamaState>>, req: Request) 
         icon: clean(form.icon),
         category: clean(form.category),
         url: form.url.trim().to_string(),
-        auth: AuthKind::parse(form.auth.as_deref().unwrap_or("oauth2")),
+        auth,
+        scope,
+        audit: form.audit.is_some(),
         use_dcr: form.use_dcr.is_some(),
         client_id,
         client_secret_ct: sealed.as_ref().map(|s| s.ciphertext.clone()),
@@ -320,6 +339,49 @@ pub async fn connectors_restore(State(state): State<Arc<RamaState>>, req: Reques
 }
 
 // ---------------------------------------------------------------------------
+// GET /admin/connectors/{key}/audit  — dedicated tool-call log for one connector
+
+pub async fn connectors_audit(
+    State(state): State<Arc<RamaState>>,
+    Path(key): Path<String>,
+    req: Request,
+) -> Response {
+    let theme = Theme::from_headers(req.headers());
+    let lang = Lang::from_headers(req.headers());
+    let nav = NavSections::from_headers(req.headers());
+    let datastar = is_datastar_request(req.headers());
+    let (session, user) = match require_admin_or_403(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let connector = mcp_catalog::get(&state.db, &key).await.ok().flatten();
+    let name = connector
+        .as_ref()
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| key.clone());
+    let events = mcp_audit::recent_for_connector(&state.db, &key, 200)
+        .await
+        .unwrap_or_default();
+    let body = render_audit_page(&name, &key, &events);
+    let chat = fetch_sidebar_chat(&state, &user.id, None).await;
+    let title = format!("{name} — audit log");
+    nav_or_html_page(
+        datastar,
+        theme,
+        lang,
+        nav,
+        NavItem::Connectors,
+        &title,
+        &user.email,
+        true,
+        session.impersonator_id.is_some(),
+        body,
+        "/admin/connectors",
+        &chat,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Rendering
 
 fn redirect(location: &str) -> Response {
@@ -364,6 +426,76 @@ fn render_body(lang: Lang, connectors: &[Connector], redirect_uri: &str) -> Html
     .to_html()
 }
 
+/// The dedicated per-connector tool-call log page (opened from the connector's
+/// "Audit log" button). Newest first; last 200.
+fn render_audit_page(name: &str, key: &str, events: &[McpToolEvent]) -> Html {
+    let rows: Vec<Html> = events
+        .iter()
+        .map(|e| {
+            let when = e.created_at.to_string();
+            let who = if e.user_email.is_empty() {
+                e.user_id.clone()
+            } else {
+                e.user_email.clone()
+            };
+            let ok = e.outcome == "ok";
+            let detail = e
+                .error
+                .clone()
+                .or_else(|| e.arguments.clone())
+                .unwrap_or_default();
+            html! {
+                tr {
+                    td(class: "text-xs whitespace-nowrap text-base-content/60") { (when) }
+                    td(class: "text-xs") { (who) }
+                    td(class: "text-xs") { code { (e.tool_id.clone()) } }
+                    td(class: "text-xs") {
+                        if ok {
+                            span(class: "badge badge-success badge-xs") { "ok" }
+                        } else {
+                            span(class: "badge badge-error badge-xs") { "error" }
+                        }
+                    }
+                    td(class: "text-xs text-base-content/50 max-w-md truncate") { (detail) }
+                }
+            }
+            .to_html()
+        })
+        .collect();
+    html! {
+        div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
+            a(href: "/admin/connectors", class: "text-sm text-base-content/60 hover:underline") { "← Connectors" }
+            div(class: "flex items-center gap-2 flex-wrap mt-2 mb-1") {
+                h1(class: "text-2xl font-bold m-0") { (name.to_string()) }
+                span(class: "badge badge-warning badge-sm") { "Audited" }
+            }
+            p(class: "text-base-content/60 text-sm mb-6") {
+                "Tool-call audit for " code { (key.to_string()) } ". Newest first; last 200."
+            }
+            if events.is_empty() {
+                p(class: "text-base-content/50 text-sm m-0") {
+                    "No tool calls recorded for this connector yet."
+                }
+            } else {
+                div(class: "overflow-x-auto") {
+                    table(class: "table table-sm") {
+                        thead {
+                            tr {
+                                th { "When" } th { "User" } th { "Tool" }
+                                th { "Outcome" } th { "Detail" }
+                            }
+                        }
+                        tbody {
+                            for row in rows.iter() { (row.clone()) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
 fn render_connector_row(lang: Lang, c: &Connector, redirect_uri: &str) -> Html {
     let enabled = c.enabled;
     let key = c.key.clone();
@@ -374,6 +506,7 @@ fn render_connector_row(lang: Lang, c: &Connector, redirect_uri: &str) -> Html {
     let url = c.url.clone();
     let toggle_action = format!("/admin/connectors/{key}/toggle");
     let delete_action = format!("/admin/connectors/{key}/delete");
+    let audit_action = format!("/admin/connectors/{key}/audit");
     let has_secret = c.client_secret_ct.is_some();
     let delete_confirm = t(lang, "connectors-delete-confirm");
     html! {
@@ -389,6 +522,12 @@ fn render_connector_row(lang: Lang, c: &Connector, redirect_uri: &str) -> Html {
                                 span(class: "badge badge-success badge-sm") { (t(lang, "connectors-badge-enabled")) }
                             } else {
                                 span(class: "badge badge-ghost badge-sm") { (t(lang, "connectors-badge-disabled")) }
+                            }
+                            if c.is_global() {
+                                span(class: "badge badge-info badge-sm") { "Global" }
+                            }
+                            if c.audit {
+                                span(class: "badge badge-warning badge-sm") { "Audited" }
                             }
                             if c.seeded {
                                 span(class: "badge badge-outline badge-sm") { (t(lang, "connectors-badge-default")) }
@@ -418,6 +557,11 @@ fn render_connector_row(lang: Lang, c: &Connector, redirect_uri: &str) -> Html {
                             } else {
                                 button(type: "submit", name: "enabled", value: "1", class: "btn btn-xs btn-primary") { (t(lang, "connectors-enable-button")) }
                             }
+                        }
+                        // Only when this connector is audited — opens its
+                        // dedicated tool-call log page.
+                        if c.audit {
+                            a(href: (audit_action), class: "btn btn-xs btn-ghost") { "Audit log" }
                         }
                         form(method: "post", action: (delete_action), class: "m-0",
                              "data-confirm": (delete_confirm)) {
@@ -478,12 +622,24 @@ fn render_oauth_help(lang: Lang, existing: Option<&Connector>, redirect_uri: &st
     }
     // Open connectors need no credentials at all — just the server URL.
     if existing.map(|c| c.auth == AuthKind::None).unwrap_or(false) {
+        let is_global = existing.map(|c| c.is_global()).unwrap_or(false);
         return html! {
             div(class: "rounded-md border border-info/30 bg-info/5 p-3 text-xs leading-relaxed") {
-                p(class: "m-0") {
-                    "Public connector: set the MCP server URL above. No OAuth client and no "
-                    "per-user token — every user still connects individually so they can opt "
-                    "its tools in or out."
+                if is_global {
+                    p(class: "m-0") {
+                        "Global connector: set the MCP server URL above (the gateway reaches it "
+                        "with no auth). The credential — e.g. a Discord bot token — is baked into "
+                        "the MCP server itself, so keep its endpoint private/loopback-only, never "
+                        "publicly exposed. Its tools are available to everyone the role below "
+                        "allows, with no per-user sign-in; each user can still toggle them "
+                        "always/ask/off on their Tools page."
+                    }
+                } else {
+                    p(class: "m-0") {
+                        "Public connector: set the MCP server URL above. No OAuth client and no "
+                        "per-user token — every user still connects individually so they can opt "
+                        "its tools in or out."
+                    }
                 }
             }
         }
@@ -635,6 +791,9 @@ fn render_form_fields(
     let auth_kind = existing.map(|c| c.auth).unwrap_or(AuthKind::OAuth2);
     let auth_static = auth_kind == AuthKind::StaticBearer;
     let auth_none = auth_kind == AuthKind::None;
+    let scope_kind = existing.map(|c| c.scope).unwrap_or(Scope::PerUser);
+    let is_global = scope_kind == Scope::Global;
+    let audit = existing.map(|c| c.audit).unwrap_or(false);
     let is_edit = existing.is_some();
     let secret_placeholder = if has_secret {
         t(lang, "connectors-secret-placeholder-existing")
@@ -697,6 +856,21 @@ fn render_form_fields(
             (text_field(&description_label, "description", &description, &description_placeholder))
             (text_field(&url_label, "url", &url, "https://…/mcp"))
             label(class: "form-control w-full") {
+                span(class: "label-text text-xs") { "Scope" }
+                select(name: "scope", class: "select select-bordered select-sm w-full") {
+                    if is_global {
+                        option(value: "per_user") { "Per-user (each user connects their own account)" }
+                        option(value: "global", selected: "selected") { "Global (one shared identity for everyone)" }
+                    } else {
+                        option(value: "per_user", selected: "selected") { "Per-user (each user connects their own account)" }
+                        option(value: "global") { "Global (one shared identity for everyone)" }
+                    }
+                }
+                span(class: "label-text-alt text-base-content/50") {
+                    "Global connectors are shared by everyone (RBAC-gated) with no sign-in — a single bot/token for the whole gateway (e.g. Discord). They must use \"No auth\" or \"Bearer token\", not OAuth."
+                }
+            }
+            label(class: "form-control w-full") {
                 span(class: "label-text text-xs") { (t(lang, "connectors-field-auth-label")) }
                 select(name: "auth", class: "select select-bordered select-sm w-full") {
                     if auth_static {
@@ -715,6 +889,21 @@ fn render_form_fields(
                 }
             }
             (render_oauth_help(lang, existing, redirect_uri))
+            // A global static_bearer connector sends one shared token for
+            // everyone, so the admin enters it here (stored encrypted on the
+            // connector row). Per-user static_bearer connectors instead have
+            // each user paste their own token on /integrations, so the field is
+            // only shown for the global case.
+            if is_global && auth_static {
+                label(class: "form-control w-full") {
+                    span(class: "label-text text-xs") { "Bearer token (shared)" }
+                    input(type: "password", name: "client_secret", placeholder: (secret_placeholder),
+                          class: "input input-bordered input-sm w-full");
+                    span(class: "label-text-alt text-base-content/50") {
+                        "Sent as " code { "Authorization: Bearer <token>" } " to the MCP server for every user. Stored encrypted."
+                    }
+                }
+            }
             // OAuth-client fields only make sense for OAuth connectors. A
             // user-supplied-token (static_bearer) or public (none) connector
             // has no app-level client, so hide the whole block (incl. the
@@ -772,6 +961,16 @@ fn render_form_fields(
             }
             // RBAC gate applies to any connector (who may *connect* it).
             (text_field(&required_role_label, "required_role", &required_role, &required_role_placeholder))
+            // Audit toggle — applies to any connector. Records every tool call
+            // (who/what/when/outcome) to the trail shown at the foot of this page.
+            label(class: "label cursor-pointer justify-start gap-2 py-0") {
+                if audit {
+                    input(type: "checkbox", name: "audit", value: "1", checked: "checked", class: "checkbox checkbox-sm");
+                } else {
+                    input(type: "checkbox", name: "audit", value: "1", class: "checkbox checkbox-sm");
+                }
+                span(class: "label-text text-xs") { "Audit tool calls (log who ran each tool, and the outcome)" }
+            }
             div {
                 button(type: "submit", class: "btn btn-sm btn-primary") {
                     if is_edit { (t(lang, "connectors-save-changes-button")) } else { (t(lang, "connectors-add-connector-button")) }

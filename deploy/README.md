@@ -15,7 +15,7 @@ deployment methods are provided — pick one:
 | **gateway** | `ghcr.io/croit/llm-gateway` | The OpenAI-compatible proxy + web UI. The only one that's mandatory. |
 | **google-workspace-mcp** | `ghcr.io/taylorwilsdon/google_workspace_mcp` | Self-hosted Google Workspace MCP server backing the per-user **Google Workspace** connector (Gmail/Calendar/Drive/Docs/…). Optional. |
 | **gitlab-mcp** | `docker.io/zereight050/gitlab-mcp` | Community bridge backing the per-user **GitLab (self-managed / CE)** connector; forwards each request's bearer as that user's GitLab PAT. Optional. |
-| **discord-mcp** | built locally from `barryyip0625/mcp-discord` (no published image) | Discord bot bridge — an operator-level `[[mcp.servers]]` tool, not a per-user connector (see below). Optional. |
+| **discord-mcp** | `docker.io/barryy625/mcp-discord` | Discord bot bridge backing the seeded **global** Discord connector (enabled + pointed at this bridge in `/admin/connectors`, see below). Optional. |
 | **sandbox-runner** | `ghcr.io/croit/llm-gateway-sandbox-runner` | Code-execution runner (`run_in_sandbox` etc.). Optional; needs gVisor. |
 | **egress-proxy** | `docker.io/ubuntu/squid` | Allowlisting proxy for networked sandbox runs. Optional. |
 | sandbox workload | `ghcr.io/croit/llm-gateway-sandbox` | The "gold image" the runner spawns per job (pulled by the runner, not run directly). |
@@ -176,15 +176,16 @@ connects at **/integrations** and pastes a GitLab **personal access token**
 
 ## Discord
 
-Unlike every other connector in this doc, Discord is **not** wired through
-`/admin/connectors` — it's an operator-level tool configured via
-`gateway.toml`'s `[[mcp.servers]]` block (see `gateway.example.toml`). The
-reason is the credential shape: Discord bots authenticate with a single **bot
-token** for the whole server/guild, not a per-user OAuth account, so there's
-no "each user connects their own Discord account" flow the way there is for
-Slack, GitHub, or Atlassian. One bot, shared by everyone the gateway's RBAC
+Discord is a **global** connector: a Discord bot authenticates with a single
+**bot token** for the whole server/guild, not a per-user OAuth account, so
+there's no "each user connects their own Discord account" flow the way there is
+for Slack, GitHub, or Atlassian. One bot, shared by everyone the gateway's RBAC
 grants the `mcp__discord__*` tools to (still individually toggleable
 always/ask/off on `/tools`, same as any other tool).
+
+It ships as a seeded, disabled connector in the catalog. There are two moving
+parts: run the sidecar **bridge** (below), then **enable + point it** at the
+bridge in `/admin/connectors` — no `gateway.toml` edit, no restart.
 
 **Create the bot** (once, in the [Discord Developer Portal](https://discord.com/developers/applications)):
 
@@ -198,8 +199,13 @@ always/ask/off on `/tools`, same as any other tool).
    just `Administrator` for simplicity) → open the generated URL and invite
    the bot to your server.
 
-**Run the bridge** ([`barryyip0625/mcp-discord`](https://github.com/barryyip0625/mcp-discord) —
-no published registry image, so it's built from source):
+**Run the bridge** — the [`barryyip0625/mcp-discord`](https://github.com/barryyip0625/mcp-discord)
+project publishes a ready HTTP image at
+[`barryy625/mcp-discord`](https://hub.docker.com/r/barryy625/mcp-discord)
+(streamable HTTP on :8080, endpoint `/mcp`), so no local build is needed. (Do
+*not* use the `mcp/mcp-discord` verified image — it's a different, stdio-only
+project meant for the Docker MCP gateway, and the gateway can't reach it over
+HTTP.)
 
 Compose (`discord` profile):
 
@@ -209,12 +215,9 @@ $EDITOR deploy/discord-mcp.env                       # DISCORD_TOKEN=...
 docker compose -f deploy/compose.example.yml --profile discord up -d
 ```
 
-Quadlet ([`quadlet/discord-mcp.container`](quadlet/discord-mcp.container)) —
-build the image first since none is published:
+Quadlet ([`quadlet/discord-mcp.container`](quadlet/discord-mcp.container)):
 
 ```bash
-git clone https://github.com/barryyip0625/mcp-discord.git /tmp/mcp-discord
-sudo podman build -t localhost/discord-mcp:latest /tmp/mcp-discord
 sudo cp deploy/quadlet/discord-mcp.container /etc/containers/systemd/
 sudo install -m 0600 deploy/quadlet/discord-mcp.example.env /etc/gateway/discord-mcp.env
 sudo $EDITOR /etc/gateway/discord-mcp.env            # DISCORD_TOKEN=...
@@ -222,17 +225,17 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now discord-mcp.service
 ```
 
-Endpoint: `/mcp` (container port 8080). Then in `gateway.toml`:
+Endpoint: `/mcp` (container port 8080). Keep it internal-only (loopback /
+private network), never exposed publicly: the bot token is baked into the
+container and grants full bot access with no per-caller scoping.
 
-```toml
-[[mcp.servers]]
-name = "discord"                          # → tools mcp__discord__*
-url  = "http://discord-mcp:8080/mcp"      # full-stack; native gateway: http://localhost:3334/mcp
-```
-
-No `bearer_token_env` needed — the bot token is baked into the container, and
-the endpoint must stay internal-only (loopback / private network), never
-exposed publicly: it grants full bot access with no per-caller scoping.
+**Enable it** in the gateway UI (as an admin): open **`/admin/connectors`**,
+find **Discord**, click **Edit**, set the **URL** to
+`http://discord-mcp:8080/mcp` (full-stack compose) or
+`http://127.0.0.1:3334/mcp` (native gateway + Quadlet loopback port), and save,
+then **Enable**. The connector's auth is **No auth** (the gateway sends no
+credentials — the bot token lives in the bridge), and its scope is **Global**,
+so its tools are immediately available to everyone the connector's role allows.
 
 ## Sandbox (code execution)
 

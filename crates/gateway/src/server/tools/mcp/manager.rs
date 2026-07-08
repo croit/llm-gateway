@@ -22,13 +22,16 @@ use jiff::Timestamp;
 use shared::api::ToolDef;
 use tokio::sync::Mutex;
 
+use serde_json::Value;
+
 use super::{ConnectedServer, McpTool, connect_http_server};
 use crate::server::auth::mcp_oauth;
 use crate::server::crypto::Crypto;
 use crate::server::db::Pool;
+use crate::server::db::mcp_audit;
 use crate::server::db::mcp_catalog::{self, Connector};
 use crate::server::db::user_mcp::{self, Connection, ToolMode};
-use crate::server::tools::{Tool, ToolRegistry, ToolSource};
+use crate::server::tools::{Tool, ToolContext, ToolFuture, ToolRegistry, ToolSource};
 
 /// How long a live connection (and its tool listing) is reused before a
 /// refresh. Keeps active conversations warm without holding sockets forever.
@@ -96,11 +99,53 @@ impl McpConnectionManager {
         format!("{user_id}\u{1f}{connector_key}")
     }
 
+    /// Cache key for a `global` connector: keyed by the connector alone (no
+    /// user) so the single shared connection is reused across every user. The
+    /// leading unit separator can't collide with a per-user key, which always
+    /// starts with a (non-empty) user id.
+    fn global_cache_key(connector_key: &str) -> String {
+        format!("\u{1f}global\u{1f}{connector_key}")
+    }
+
     /// Drop any cached connection for a user+connector (e.g. on disconnect or
     /// after an auth error) so the next use reconnects fresh.
     pub async fn invalidate(&self, user_id: &str, connector_key: &str) {
         let mut cache = self.cache.lock().await;
         cache.remove(&Self::cache_key(user_id, connector_key));
+    }
+
+    /// Return the cached tools for `ck` if still within [`CACHE_TTL`].
+    async fn cache_lookup(&self, ck: &str) -> Option<Vec<Arc<McpTool>>> {
+        let cache = self.cache.lock().await;
+        cache
+            .get(ck)
+            .filter(|c| c.fetched_at.elapsed() < CACHE_TTL)
+            .map(|c| c.tools.clone())
+    }
+
+    /// Insert `tools` under `ck`, bounding the cache: when full and this is a
+    /// new key, evict stale entries first (dropping them closes their MCP
+    /// sockets), then the oldest.
+    async fn cache_store(&self, ck: String, tools: Vec<Arc<McpTool>>) {
+        let mut cache = self.cache.lock().await;
+        if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(&ck) {
+            cache.retain(|_, c| c.fetched_at.elapsed() < CACHE_TTL);
+            if cache.len() >= MAX_CACHE_ENTRIES
+                && let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, c)| c.fetched_at)
+                    .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(
+            ck,
+            Cached {
+                tools,
+                fetched_at: Instant::now(),
+            },
+        );
     }
 
     /// Build the per-request tool overlay for `user_id`: every connected,
@@ -118,36 +163,21 @@ impl McpConnectionManager {
         let keys = user_mcp::connected_keys(&self.db, user_id)
             .await
             .unwrap_or_default();
-        // Resolve every connector concurrently — one slow/unreachable server
-        // can't serialise the whole turn behind it.
+        // Per-user connectors the user has connected. Resolve concurrently —
+        // one slow/unreachable server can't serialise the whole turn behind it.
         let futs = keys.into_iter().map(|key| async move {
             let connector = match mcp_catalog::get(&self.db, &key).await {
-                Ok(Some(c)) if c.enabled => c,
-                // Connector gone or disabled by the admin → hide its tools.
+                Ok(Some(c)) if c.enabled && !c.is_global() => c,
+                // Connector gone, disabled by the admin, or flipped to global
+                // (no per-user connection applies) → hide its tools.
                 _ => return None,
             };
-            // Re-check the RBAC gate at exposure time: a role removed (or a
-            // `required_role` added) after connecting must drop the tools.
-            if let Some(required) = &connector.required_role
-                && !role_ids.iter().any(|r| r == required)
-            {
+            if !self.role_allows(&connector, role_ids) {
                 return None;
             }
-            // Resolve whether `ask` tools are exposed for this connector.
-            let allow_ask = match ask {
-                AskContext::Chat => false,
-                AskContext::Api { token_id } => matches!(
-                    user_mcp::token_ask_policy(&self.db, token_id, &key)
-                        .await
-                        .unwrap_or(user_mcp::AskOverApi::Block),
-                    user_mcp::AskOverApi::Allow
-                ),
-            };
-            let modes = user_mcp::tool_modes(&self.db, user_id, &key)
-                .await
-                .unwrap_or_default();
+            let (allow_ask, modes) = self.ask_and_modes(user_id, &key, ask).await;
             match self.ensure(user_id, &connector).await {
-                Ok(tools) => Some((key, tools, modes, allow_ask)),
+                Ok(tools) => Some((key, tools, modes, allow_ask, connector.audit)),
                 Err(err) => {
                     tracing::warn!(user = %user_id, connector = %key, error = %err,
                         "MCP connector unavailable this turn");
@@ -155,12 +185,81 @@ impl McpConnectionManager {
                 }
             }
         });
-        let resolved = rama::futures::future::join_all(futs).await;
+
+        // Global connectors: one shared identity for the whole gateway, exposed
+        // to everyone RBAC allows with no per-user connection step. Their tools
+        // still respect the user's own always/ask/off prefs and the per-token
+        // ask policy, so they slot into the same overlay.
+        let globals: Vec<Connector> = mcp_catalog::list_enabled(&self.db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.is_global())
+            .collect();
+        let global_futs = globals.into_iter().map(|connector| async move {
+            let key = connector.key.clone();
+            if !self.role_allows(&connector, role_ids) {
+                return None;
+            }
+            let (allow_ask, modes) = self.ask_and_modes(user_id, &key, ask).await;
+            match self.ensure_global(&connector).await {
+                Ok(tools) => Some((key, tools, modes, allow_ask, connector.audit)),
+                Err(err) => {
+                    tracing::warn!(connector = %key, error = %err,
+                        "global MCP connector unavailable this turn");
+                    None
+                }
+            }
+        });
+
+        let (resolved, global_resolved) = rama::futures::future::join(
+            rama::futures::future::join_all(futs),
+            rama::futures::future::join_all(global_futs),
+        )
+        .await;
         let mut layer = UserMcpLayer::default();
-        for (key, tools, modes, allow_ask) in resolved.into_iter().flatten() {
-            layer.add(&key, &tools, &modes, allow_ask);
+        for (key, tools, modes, allow_ask, audit) in resolved
+            .into_iter()
+            .flatten()
+            .chain(global_resolved.into_iter().flatten())
+        {
+            let audit_db = audit.then(|| self.db.clone());
+            layer.add(&key, &tools, &modes, allow_ask, audit_db.as_ref());
         }
         layer
+    }
+
+    /// RBAC gate at exposure time: a connector with a `required_role` is only
+    /// exposed to users holding that role (re-checked every turn, so revoking a
+    /// role or adding a `required_role` drops the tools immediately).
+    fn role_allows(&self, connector: &Connector, role_ids: &[String]) -> bool {
+        match &connector.required_role {
+            Some(required) => role_ids.iter().any(|r| r == required),
+            None => true,
+        }
+    }
+
+    /// Resolve, for one connector, whether `ask`-mode tools are exposed in this
+    /// context and the user's per-tool mode overrides.
+    async fn ask_and_modes(
+        &self,
+        user_id: &str,
+        key: &str,
+        ask: AskContext<'_>,
+    ) -> (bool, HashMap<String, ToolMode>) {
+        let allow_ask = match ask {
+            AskContext::Chat => false,
+            AskContext::Api { token_id } => matches!(
+                user_mcp::token_ask_policy(&self.db, token_id, key)
+                    .await
+                    .unwrap_or(user_mcp::AskOverApi::Block),
+                user_mcp::AskOverApi::Allow
+            ),
+        };
+        let modes = user_mcp::tool_modes(&self.db, user_id, key)
+            .await
+            .unwrap_or_default();
+        (allow_ask, modes)
     }
 
     /// Ensure a live connection for `(user, connector)`, returning its tools.
@@ -172,13 +271,8 @@ impl McpConnectionManager {
         connector: &Connector,
     ) -> Result<Vec<Arc<McpTool>>, String> {
         let ck = Self::cache_key(user_id, &connector.key);
-        {
-            let cache = self.cache.lock().await;
-            if let Some(c) = cache.get(&ck)
-                && c.fetched_at.elapsed() < CACHE_TTL
-            {
-                return Ok(c.tools.clone());
-            }
+        if let Some(tools) = self.cache_lookup(&ck).await {
+            return Ok(tools);
         }
 
         let conn = user_mcp::get_connection(&self.db, user_id, &connector.key)
@@ -214,28 +308,39 @@ impl McpConnectionManager {
         };
         let ConnectedServer { conn: _live, tools } = connected;
         let tools: Vec<Arc<McpTool>> = tools.into_iter().map(Arc::new).collect();
+        self.cache_store(ck, tools.clone()).await;
+        Ok(tools)
+    }
 
-        let mut cache = self.cache.lock().await;
-        // Bound the cache: when full and this is a new key, evict stale entries
-        // first (dropping them closes their MCP sockets), then the oldest.
-        if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(&ck) {
-            cache.retain(|_, c| c.fetched_at.elapsed() < CACHE_TTL);
-            if cache.len() >= MAX_CACHE_ENTRIES
-                && let Some(oldest) = cache
-                    .iter()
-                    .min_by_key(|(_, c)| c.fetched_at)
-                    .map(|(k, _)| k.clone())
-            {
-                cache.remove(&oldest);
-            }
+    /// Ensure the single shared connection for a `global` connector, returning
+    /// its tools. Unlike [`Self::ensure`] there is no per-user connection row
+    /// and the connection is cached per-connector (shared across users). Auth
+    /// comes from the connector row: `None` sends no credentials (e.g. Discord,
+    /// whose bot token is baked into the sidecar behind a loopback endpoint);
+    /// `StaticBearer` sends the shared token stored (encrypted) on the row.
+    /// `OAuth2` is inherently per-user and rejected here (and at admin save).
+    async fn ensure_global(&self, connector: &Connector) -> Result<Vec<Arc<McpTool>>, String> {
+        let ck = Self::global_cache_key(&connector.key);
+        if let Some(tools) = self.cache_lookup(&ck).await {
+            return Ok(tools);
         }
-        cache.insert(
-            ck,
-            Cached {
-                tools: tools.clone(),
-                fetched_at: Instant::now(),
-            },
-        );
+        let connected = match connector.auth {
+            mcp_catalog::AuthKind::None => {
+                connect_http_server(&connector.key, &connector.url, None).await?
+            }
+            mcp_catalog::AuthKind::StaticBearer => {
+                let token = self.decrypt_connector_secret(connector)?.ok_or_else(|| {
+                    "global static_bearer connector has no bearer token configured".to_string()
+                })?;
+                connect_http_server(&connector.key, &connector.url, Some(&token)).await?
+            }
+            mcp_catalog::AuthKind::OAuth2 => {
+                return Err("OAuth2 is per-user and not valid for a global connector".to_string());
+            }
+        };
+        let ConnectedServer { conn: _live, tools } = connected;
+        let tools: Vec<Arc<McpTool>> = tools.into_iter().map(Arc::new).collect();
+        self.cache_store(ck, tools.clone()).await;
         Ok(tools)
     }
 
@@ -447,7 +552,11 @@ impl McpConnectionManager {
         user_id: &str,
         connector: &Connector,
     ) -> Result<Vec<ToolInfo>, String> {
-        let tools = self.ensure(user_id, connector).await?;
+        let tools = if connector.is_global() {
+            self.ensure_global(connector).await?
+        } else {
+            self.ensure(user_id, connector).await?
+        };
         let modes = user_mcp::tool_modes(&self.db, user_id, &connector.key)
             .await
             .unwrap_or_default();
@@ -511,6 +620,64 @@ fn expose(mode: ToolMode, allow_ask: bool) -> bool {
     }
 }
 
+/// A [`Tool`] wrapper that records every call to [`mcp_audit`]. Used for
+/// connectors whose `audit` flag is on — the model-facing schema and behaviour
+/// are unchanged; a best-effort audit row (acting user, connector, tool,
+/// truncated args, outcome) is written after the inner tool runs. A failed
+/// audit write is logged, never propagated — auditing must not break the call.
+struct AuditedTool {
+    inner: Arc<dyn Tool>,
+    connector_key: String,
+    db: Pool,
+}
+
+impl Tool for AuditedTool {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn schema(&self) -> ToolDef {
+        self.inner.schema()
+    }
+
+    fn max_duration(&self) -> Option<Duration> {
+        self.inner.max_duration()
+    }
+
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        let db = self.db.clone();
+        let connector = self.connector_key.clone();
+        let tool_id = self.inner.id().to_string();
+        let user_id = ctx.user_id.clone();
+        let session = ctx.session_id.clone();
+        let args_summary = serde_json::to_string(&args).ok();
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let res = inner.run(ctx, args).await;
+            let (outcome, error) = match &res {
+                Ok(_) => ("ok", None),
+                Err(e) => ("error", Some(e.to_string())),
+            };
+            if let Err(e) = mcp_audit::record(
+                &db,
+                &user_id,
+                &connector,
+                &tool_id,
+                args_summary.as_deref(),
+                outcome,
+                error.as_deref(),
+                session.as_deref(),
+            )
+            .await
+            {
+                tracing::warn!(error = %e, connector = %connector, tool = %tool_id,
+                    "MCP tool audit write failed");
+            }
+            res
+        })
+    }
+}
+
 /// Per-request overlay of a user's connected-connector MCP tools.
 #[derive(Default)]
 pub struct UserMcpLayer {
@@ -530,6 +697,7 @@ impl UserMcpLayer {
         tools: &[Arc<McpTool>],
         modes: &HashMap<String, ToolMode>,
         allow_ask: bool,
+        audit_db: Option<&Pool>,
     ) {
         for tool in tools {
             let mode = modes
@@ -540,7 +708,17 @@ impl UserMcpLayer {
                 continue;
             }
             let id = tool.def().function.name.clone();
-            self.tools.insert(id.clone(), tool.clone() as Arc<dyn Tool>);
+            // When the connector is audited, store an audit-wrapping tool in
+            // place of the raw one; it delegates everything and records the call.
+            let stored: Arc<dyn Tool> = match audit_db {
+                Some(db) => Arc::new(AuditedTool {
+                    inner: tool.clone() as Arc<dyn Tool>,
+                    connector_key: connector_key.to_string(),
+                    db: db.clone(),
+                }),
+                None => tool.clone() as Arc<dyn Tool>,
+            };
+            self.tools.insert(id.clone(), stored);
             self.defs.push(tool.def().clone());
             self.modes.insert(id.clone(), mode);
             self.connector_of.insert(id, connector_key.to_string());
@@ -686,7 +864,133 @@ impl UserMcpLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::crypto::Crypto;
+    use crate::server::db;
+    use crate::server::db::mcp_catalog::{AuthKind, Scope};
     use crate::server::tools::echo::Echo;
+
+    async fn manager() -> Arc<McpConnectionManager> {
+        let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+        McpConnectionManager::new(pool, Arc::new(Crypto::from_key([7u8; 32])))
+    }
+
+    fn global_connector(auth: AuthKind) -> Connector {
+        let now = Timestamp::now();
+        Connector {
+            key: "discord".into(),
+            name: "Discord".into(),
+            description: None,
+            icon: None,
+            category: None,
+            url: "http://127.0.0.1:1/mcp".into(),
+            auth,
+            scope: Scope::Global,
+            audit: false,
+            use_dcr: false,
+            client_id: None,
+            client_secret_ct: None,
+            client_secret_nonce: None,
+            authorize_url: None,
+            token_url: None,
+            registration_url: None,
+            scopes: vec![],
+            required_role: None,
+            enabled: true,
+            seeded: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn global_oauth2_is_rejected_without_touching_network() {
+        // OAuth2 is per-user; a global connector can't use it. ensure_global
+        // must reject it up front (defensive — admin save also blocks it).
+        let mgr = manager().await;
+        let err = match mgr.ensure_global(&global_connector(AuthKind::OAuth2)).await {
+            Ok(_) => panic!("expected OAuth2 global to be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains("OAuth2"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn global_static_bearer_without_token_errors() {
+        // StaticBearer global connector needs its shared token on the row.
+        let mgr = manager().await;
+        let err = match mgr
+            .ensure_global(&global_connector(AuthKind::StaticBearer))
+            .await
+        {
+            Ok(_) => panic!("expected static_bearer-without-token to error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("bearer token"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn role_allows_gates_on_required_role() {
+        let mgr = manager().await;
+        let mut c = global_connector(AuthKind::None);
+        assert!(mgr.role_allows(&c, &[]), "no required_role → everyone");
+        c.required_role = Some("staff".into());
+        assert!(!mgr.role_allows(&c, &["user".into()]));
+        assert!(mgr.role_allows(&c, &["user".into(), "staff".into()]));
+    }
+
+    #[tokio::test]
+    async fn audited_tool_records_ok_and_error() {
+        let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+        let ctx = |db: Pool| ToolContext {
+            user_id: "u".into(),
+            roles: vec![],
+            db,
+            s3: None,
+            assistant_turn_id: None,
+            session_id: Some("sess".into()),
+            client_ip: None,
+            geoip: None,
+            chat_feedback: None,
+            attachment_reservations: None,
+            indexer: None,
+            image_gen: None,
+        };
+        let audited = AuditedTool {
+            inner: Arc::new(Echo) as Arc<dyn Tool>,
+            connector_key: "discord".into(),
+            db: pool.clone(),
+        };
+        // Success path (Echo returns the message).
+        audited
+            .run(ctx(pool.clone()), serde_json::json!({"message": "hi"}))
+            .await
+            .unwrap();
+        // Error path (Echo rejects a missing message) — still audited.
+        let _ = audited.run(ctx(pool.clone()), serde_json::json!({})).await;
+
+        let ev = mcp_audit::recent(&pool, 10).await.unwrap();
+        assert_eq!(ev.len(), 2, "both calls recorded");
+        assert!(ev.iter().any(|e| e.outcome == "ok"));
+        assert!(ev.iter().any(|e| e.outcome == "error" && e.error.is_some()));
+        assert!(ev.iter().all(|e| e.connector_key == "discord"
+            && e.user_id == "u"
+            && e.tool_id == "company_echo"
+            && e.session_id.as_deref() == Some("sess")));
+    }
+
+    #[test]
+    fn global_cache_key_is_user_independent() {
+        // The shared connection is keyed by connector alone, and can't collide
+        // with any per-user key (those start with a non-empty user id).
+        assert_eq!(
+            McpConnectionManager::global_cache_key("discord"),
+            McpConnectionManager::global_cache_key("discord")
+        );
+        assert_ne!(
+            McpConnectionManager::global_cache_key("discord"),
+            McpConnectionManager::cache_key("discord", "discord")
+        );
+    }
 
     #[test]
     fn default_mode_only_gates_destructive_writes() {

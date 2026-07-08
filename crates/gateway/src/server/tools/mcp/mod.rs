@@ -4,39 +4,39 @@
 //! MCP (Model Context Protocol) client bridge.
 //!
 //! Lets the gateway act as an MCP *host*: connect to external MCP servers
-//! declared in `[mcp]` config (over stdio — a spawned subprocess — or
-//! streamable HTTP), enumerate their tools, and surface each one to the
-//! model as an ordinary [`Tool`] in the registry. Tool calls the model
-//! emits are routed back over MCP via [`rmcp`]; everything downstream (the
-//! tool runner, RBAC, the `/tools` toggles, result feedback) treats them
+//! (streamable HTTP) from the admin-managed connector catalog, enumerate their
+//! tools, and surface each one to the model as an ordinary [`Tool`]. Tool calls
+//! the model emits are routed back over MCP via [`rmcp`]; everything downstream
+//! (the tool runner, RBAC, the `/tools` toggles, result feedback) treats them
 //! exactly like a built-in tool.
 //!
-//! Adding an integration is then config, not code: point the gateway at any
-//! MCP server and its tools show up in chat. The one piece of plumbing that
-//! lives here is the adapter — id namespacing, schema mapping, and turning
-//! an MCP `CallToolResult` (text / image / structured content) back into the
-//! gateway's tool-result shape.
+//! Adding an integration is then admin config, not code: an operator adds an
+//! MCP server in `/admin/connectors` — as a `global` (one shared identity) or
+//! `per_user` (each user connects their own account) connector — and its tools
+//! show up in chat. Connections are established by [`manager`] (shared for
+//! global, per-user otherwise). The one piece of plumbing that lives here is
+//! the adapter — id namespacing, schema mapping, and turning an MCP
+//! `CallToolResult` (text / image / structured content) back into the gateway's
+//! tool-result shape.
 //!
 //! Each tool's name is namespaced `mcp__<server>__<tool>` so two servers
 //! can't collide and MCP tools stay visually distinct from built-ins. The
 //! original (un-namespaced) name is what we actually call on the server.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::RoleClient;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::serve_client;
 use rmcp::service::RunningService;
+use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
 use super::{Tool, ToolContext, ToolError, ToolFuture, ToolResult, tool_content_parts};
-use crate::server::config::{McpConfig, McpServerConfig};
 
 pub mod manager;
 pub mod worker;
@@ -46,9 +46,9 @@ pub mod worker;
 /// `catalog::entry_key_for`.
 pub const MCP_ID_PREFIX: &str = "mcp__";
 
-/// How long to wait for one server to connect + enumerate its tools at
-/// startup before giving up on it. Non-fatal: boot continues without that
-/// server (mirrors the typst-discovery / OIDC-retry "never block boot" rule).
+/// How long to wait for one server to connect + enumerate its tools before
+/// giving up. A failure is non-fatal: the connector's tools are simply absent
+/// for that request (logged and skipped), never blocking the turn.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Per-call ceiling. Kept under the tool runner's own per-tool timeout so a
@@ -144,72 +144,11 @@ impl Tool for McpTool {
     }
 }
 
-/// Connect to every enabled server in `cfg`, concurrently and non-fatally,
-/// and return the flattened set of bridged tools. A server that fails to
-/// connect (or times out) is logged and skipped — it never blocks boot.
-pub async fn connect_all(cfg: &McpConfig) -> Vec<McpTool> {
-    let attempts = cfg.servers.iter().filter_map(|server| {
-        if !server.enabled {
-            tracing::info!(server = %server.name, "MCP server disabled in config — skipping");
-            return None;
-        }
-        Some(connect_server(server))
-    });
-
-    let results = rama::futures::future::join_all(attempts).await;
-    let mut tools = Vec::new();
-    for r in results {
-        match r {
-            Ok(mut t) => tools.append(&mut t),
-            Err((name, err)) => tracing::warn!(
-                server = %name, error = %err,
-                "MCP server connect failed — its tools won't be available this run"
-            ),
-        }
-    }
-    tools
-}
-
-/// Connect one server with a bounded timeout. `Err((name, reason))` on any
-/// failure so the caller can log which server dropped out.
-async fn connect_server(server: &McpServerConfig) -> Result<Vec<McpTool>, (String, String)> {
-    match tokio::time::timeout(CONNECT_TIMEOUT, connect_and_list(server)).await {
-        Ok(Ok(tools)) => Ok(tools),
-        Ok(Err(reason)) => Err((server.name.clone(), reason)),
-        Err(_) => Err((
-            server.name.clone(),
-            format!("timed out after {}s", CONNECT_TIMEOUT.as_secs()),
-        )),
-    }
-}
-
-/// Establish the session, list its tools, and build one [`McpTool`] each.
-async fn connect_and_list(server: &McpServerConfig) -> Result<Vec<McpTool>, String> {
-    let service = connect_transport(server).await?;
-    let conn = Arc::new(McpConnection {
-        name: server.name.clone(),
-        service,
-    });
-
-    let remote_tools = conn
-        .service
-        .list_all_tools()
-        .await
-        .map_err(|e| format!("tools/list failed: {e}"))?;
-
-    let out = build_tools(&server.name, &conn, remote_tools, Some(server));
-    tracing::info!(server = %server.name, tools = out.len(), "connected MCP server");
-    Ok(out)
-}
-
-/// Build [`McpTool`]s from a connection's listed tools. `server` (when set)
-/// supplies the description fallback for the boot/config path; per-user
-/// connections pass `None` and fall back to a generic line.
+/// Build [`McpTool`]s from a connection's listed tools.
 fn build_tools(
     name: &str,
     conn: &Arc<McpConnection>,
     remote_tools: Vec<rmcp::model::Tool>,
-    server: Option<&McpServerConfig>,
 ) -> Vec<McpTool> {
     let mut out = Vec::with_capacity(remote_tools.len());
     let mut seen = HashSet::new();
@@ -222,21 +161,20 @@ fn build_tools(
             );
             continue;
         }
-        let description = match server {
-            Some(s) => tool_description(s, &t),
-            None => t
-                .description
-                .as_deref()
-                .filter(|d| !d.is_empty())
-                .map(str::to_owned)
-                .or_else(|| {
-                    t.title
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| format!("`{}` tool from the `{name}` MCP server.", t.name)),
-        };
+        // MCP servers should ship a description; fall back to the title, then a
+        // generic line, so the model-facing schema is never blank.
+        let description = t
+            .description
+            .as_deref()
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                t.title
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| format!("`{}` tool from the `{name}` MCP server.", t.name));
         let read_only = t
             .annotations
             .as_ref()
@@ -293,88 +231,8 @@ pub(crate) async fn connect_http_server(
         .await
         .map_err(|_| format!("tools/list on `{name}` timed out"))?
         .map_err(|e| format!("tools/list on `{name}` failed: {e}"))?;
-    let tools = build_tools(name, &conn, remote_tools, None);
+    let tools = build_tools(name, &conn, remote_tools);
     Ok(ConnectedServer { conn, tools })
-}
-
-/// Open the transport the config asks for and run the MCP handshake. Exactly
-/// one of `command` (stdio) / `url` (http) must be set.
-async fn connect_transport(
-    server: &McpServerConfig,
-) -> Result<RunningService<RoleClient, ()>, String> {
-    match (server.command.as_deref(), server.url.as_deref()) {
-        (Some(command), None) => {
-            // The child inherits the gateway's environment (so secrets already
-            // in the process env reach it); `env` adds/overrides on top.
-            let args = server.args.clone();
-            let env = server.env.clone();
-            let transport =
-                TokioChildProcess::new(tokio::process::Command::new(command).configure(|cmd| {
-                    cmd.args(&args);
-                    for (k, v) in &env {
-                        cmd.env(k, v);
-                    }
-                }))
-                .map_err(|e| format!("spawning `{command}`: {e}"))?;
-            serve_client((), transport)
-                .await
-                .map_err(|e| format!("MCP handshake over stdio failed: {e}"))
-        }
-        (None, Some(url)) => {
-            // Build the config with optional auth, then let rmcp's default
-            // client drive it (`from_config` uses a reqwest client with idle
-            // pooling disabled — suited to long-lived SSE). We don't build the
-            // client ourselves: rmcp pins a different reqwest major than the
-            // gateway, so its `from_config` is the seam that stays version-safe.
-            let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
-            // rmcp sends this via reqwest's `bearer_auth`, i.e. as
-            // `Authorization: Bearer <value>` — so the env holds the raw token,
-            // not the scheme.
-            if let Some(token) = server.bearer_token() {
-                config = config.auth_header(token);
-            }
-            if !server.headers.is_empty() {
-                config = config.custom_headers(parse_headers(&server.headers)?);
-            }
-            let transport = StreamableHttpClientTransport::from_config(config);
-            serve_client((), transport)
-                .await
-                .map_err(|e| format!("MCP handshake over http failed: {e}"))
-        }
-        (Some(_), Some(_)) => {
-            Err("set either `command` (stdio) or `url` (http), not both".to_string())
-        }
-        (None, None) => Err("set `command` (stdio) or `url` (http)".to_string()),
-    }
-}
-
-/// Validate + convert the configured `headers` map into typed HTTP headers.
-/// A malformed name or value fails the whole server (logged + skipped) rather
-/// than silently dropping a credential header.
-fn parse_headers(
-    headers: &HashMap<String, String>,
-) -> Result<HashMap<HeaderName, HeaderValue>, String> {
-    let mut out = HashMap::with_capacity(headers.len());
-    for (name, value) in headers {
-        let header = HeaderName::from_bytes(name.as_bytes())
-            .map_err(|e| format!("invalid header name `{name}`: {e}"))?;
-        let val = HeaderValue::from_str(value)
-            .map_err(|e| format!("invalid value for header `{name}`: {e}"))?;
-        out.insert(header, val);
-    }
-    Ok(out)
-}
-
-/// Model-facing description for a bridged tool. MCP servers should ship one;
-/// fall back to the title, then a generic line, so the schema is never blank.
-fn tool_description(server: &McpServerConfig, t: &rmcp::model::Tool) -> String {
-    if let Some(d) = t.description.as_deref().filter(|d| !d.is_empty()) {
-        return d.to_string();
-    }
-    if let Some(title) = t.title.as_deref().filter(|s| !s.is_empty()) {
-        return title.to_string();
-    }
-    format!("`{}` tool from the `{}` MCP server.", t.name, server.name)
 }
 
 /// Build the namespaced, OpenAI-function-name-safe id for a bridged tool.
@@ -464,7 +322,7 @@ fn map_call_result(res: CallToolResult) -> ToolResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_call_result, parse_headers, sanitize_tool_id};
+    use super::{map_call_result, sanitize_tool_id};
     use crate::server::tools::{ToolError, extract_content_parts};
     use rmcp::model::{CallToolResult, Content};
 
@@ -527,18 +385,5 @@ mod tests {
             ToolError::Failed(msg) => assert!(msg.contains("boom"), "{msg}"),
             other => panic!("expected Failed, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn parse_headers_accepts_valid_and_rejects_malformed() {
-        let ok =
-            std::collections::HashMap::from([("X-Api-Key".to_string(), "secret-123".to_string())]);
-        let parsed = parse_headers(&ok).expect("valid header parses");
-        assert_eq!(parsed.len(), 1);
-
-        // A space isn't allowed in a header name — must error, not silently
-        // drop a (possibly credential-bearing) header.
-        let bad = std::collections::HashMap::from([("bad name".to_string(), "v".to_string())]);
-        assert!(parse_headers(&bad).is_err());
     }
 }

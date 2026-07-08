@@ -157,6 +157,10 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
             "/admin/connectors/{key}/delete",
             pages::admin_connectors_delete,
         )
+        .with_get(
+            "/admin/connectors/{key}/audit",
+            pages::admin_connectors_audit,
+        )
         .with_get("/admin/skills", pages::admin_skills_index)
         .with_get("/admin/skills/download", pages::admin_skills_download)
         .with_post("/admin/skills/upload", pages::admin_skills_upload)
