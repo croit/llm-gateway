@@ -24,10 +24,12 @@ pub mod catalog;
 pub mod currency;
 pub mod document;
 pub mod echo;
+pub mod edit_image;
 pub mod enable_tools;
 pub mod feedback;
 pub mod fetch_attachment;
 pub mod fetch_url;
+pub mod generate_image;
 pub mod json_patch;
 pub mod location;
 pub mod lookup_ip;
@@ -111,6 +113,11 @@ pub struct ToolContext {
     /// in-memory test scaffolding); the tools degrade to a clear
     /// `Failed("RAG not configured")` error in that case.
     pub indexer: Option<crate::server::rag::worker::Indexer>,
+    /// Image-generation handle, built from `AppState`'s upstream registry +
+    /// HTTP client + usage sink. `generate_image` reaches it here; `None` on
+    /// paths (tests) that never wired one up, where the tool degrades to a
+    /// clear `Failed("image generation not configured")`.
+    pub image_gen: Option<crate::server::image_gen::ImageGenerator>,
 }
 
 /// Chat-only handles a tool needs to run an interactive prompt while a
@@ -155,6 +162,10 @@ impl std::fmt::Debug for ToolContext {
                     .map(|_| "<Reservations>"),
             )
             .field("indexer", &self.indexer.as_ref().map(|_| "<Indexer>"))
+            .field(
+                "image_gen",
+                &self.image_gen.as_ref().map(|_| "<ImageGenerator>"),
+            )
             .finish()
     }
 }

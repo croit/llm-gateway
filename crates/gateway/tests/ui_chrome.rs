@@ -395,6 +395,8 @@ async fn transcription_models_lists_discovered_models() {
             models: Vec::new(),
             backend: vec![BackendConfig {
                 alias: None,
+                probe_models: true,
+                supports_edit: false,
                 name: "whisper".into(),
                 base_url: "http://unused.invalid".into(),
                 api_key_env: None,
@@ -474,6 +476,8 @@ async fn session_transcribe_forwards_multipart_to_upstream() {
             models: Vec::new(),
             backend: vec![BackendConfig {
                 alias: None,
+                probe_models: true,
+                supports_edit: false,
                 name: "whisper".into(),
                 base_url: upstream.uri(),
                 api_key_env: None,
@@ -598,6 +602,8 @@ async fn session_transcribe_rejects_too_short_audio() {
             models: Vec::new(),
             backend: vec![BackendConfig {
                 alias: None,
+                probe_models: true,
+                supports_edit: false,
                 name: "voxtral".into(),
                 base_url: "http://unused.invalid".into(),
                 api_key_env: None,

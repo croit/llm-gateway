@@ -55,7 +55,7 @@ The single gateway binary. Split into two modules at the top level:
 - `router.rs` — builds the `rama::http::service::web::Router`.
 - `auth.rs` — `require_bearer` helper for the `/v1/*` routes.
 - `session.rs` — hand-rolled signed-cookie + sqlite session store (replaces `tower-sessions`).
-- `proxy.rs` — `/v1/{models,chat/completions,audio/transcriptions}` handlers. The chat path branches between a streaming fast-path (no tool grants) and the buffered tool-call loop.
+- `proxy.rs` — `/v1/{models,chat/completions,audio/transcriptions,embeddings,images/generations,images/edits}` handlers. The chat path branches between a streaming fast-path (no tool grants) and the buffered tool-call loop; embeddings and images are byte-dumb relays to their pool kind.
 - `api.rs` — session-authed JSON at `/api/v0/{me,tokens,tokens/{id}/revoke,tokens/{id}}`.
 - `pages/` — plait-rendered HTML, split per route. `mod.rs` carries the shared chrome (layout, nav, theme, SSE framing helpers, `Flash`, the session gate, `/login`, `/theme/toggle`); `chat/` is a directory module for the multi-conversation chat (handlers in `mod.rs`, streaming worker in `worker.rs`, renderers in `render.rs`); `tokens.rs` owns `/tokens` CRUD; `dashboard.rs` owns `/`.
 - `chat_workers.rs` — per-user registry of in-flight chat workers (cancel flag + `broadcast::Sender<TurnUpdate>`). One worker per user max; the messages handler refuses concurrent submits, the tail handler attaches to the existing worker for reconnects.

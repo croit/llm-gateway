@@ -719,6 +719,7 @@ mod tests {
             chat_feedback: None,
             attachment_reservations: None,
             indexer: None,
+            image_gen: None,
         };
         let err = FetchAttachment::new(None)
             .run(ctx, json!({"id": "t-1/x.csv"}))
@@ -756,6 +757,7 @@ mod tests {
             chat_feedback: None,
             attachment_reservations: None,
             indexer: None,
+            image_gen: None,
         };
         let err = FetchAttachment::new(None)
             .run(ctx, json!({"id": "nope"}))

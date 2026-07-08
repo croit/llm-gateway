@@ -152,6 +152,11 @@ pub fn build_tool_context(
         // a unique S3 key — see ToolContext docs.
         attachment_reservations: Some(crate::server::chat_attachments::new_reservation_set()),
         indexer: state.indexer.clone(),
+        image_gen: Some(crate::server::image_gen::ImageGenerator::new(
+            state.upstreams.clone(),
+            state.http.clone(),
+            state.usage.clone(),
+        )),
     }
 }
 

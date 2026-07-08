@@ -123,6 +123,7 @@ fn ctx(pool: db::Pool, asst_turn: &str) -> ToolContext {
         chat_feedback: None,
         attachment_reservations: Some(chat_attachments::new_reservation_set()),
         indexer: None,
+        image_gen: None,
     }
 }
 

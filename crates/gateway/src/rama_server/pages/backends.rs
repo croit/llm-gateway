@@ -94,16 +94,20 @@ pub async fn backends_index(State(state): State<Arc<RamaState>>, req: Request) -
 
     // Global unknown-model fallbacks (`[fallback]`), per kind — shown once in
     // the page header since they're not pool-scoped.
-    let unknown_fallbacks: Vec<(&'static str, String)> =
-        [PoolKind::Chat, PoolKind::Transcription, PoolKind::Embedding]
-            .into_iter()
-            .filter_map(|k| {
-                state
-                    .upstreams
-                    .fallback_model(k)
-                    .map(|m| (kind_label(k), m.to_string()))
-            })
-            .collect();
+    let unknown_fallbacks: Vec<(&'static str, String)> = [
+        PoolKind::Chat,
+        PoolKind::Transcription,
+        PoolKind::Embedding,
+        PoolKind::Image,
+    ]
+    .into_iter()
+    .filter_map(|k| {
+        state
+            .upstreams
+            .fallback_model(k)
+            .map(|m| (kind_label(k), m.to_string()))
+    })
+    .collect();
 
     let body = render_backends_body(lang, &pools, &unknown_fallbacks);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
@@ -163,6 +167,7 @@ fn kind_label(kind: PoolKind) -> &'static str {
         PoolKind::Chat => "chat",
         PoolKind::Transcription => "transcription",
         PoolKind::Embedding => "embedding",
+        PoolKind::Image => "image",
     }
 }
 

@@ -405,6 +405,8 @@ mod tests {
                     health_path: "/models".into(),
                     models: Vec::new(),
                     alias: None,
+                    probe_models: true,
+                    supports_edit: false,
                 }],
             },
         );
@@ -427,6 +429,7 @@ mod tests {
             chat_feedback: None,
             attachment_reservations: None,
             indexer: Some(indexer),
+            image_gen: None,
         }
     }
 
@@ -443,6 +446,7 @@ mod tests {
             chat_feedback: None,
             attachment_reservations: None,
             indexer: None,
+            image_gen: None,
         }
     }
 

@@ -135,6 +135,31 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::info!("no [geoip] config — lookup_ip tool not registered");
     }
+    // generate_image only when an `kind = "image"` upstream pool exists —
+    // same rationale as lookup_ip: don't offer the model a tool whose every
+    // call would fail with "no image backend configured".
+    if config
+        .upstream_pools
+        .values()
+        .any(|p| p.kind == srv::upstreams::PoolKind::Image)
+    {
+        tool_registry = tool_registry.with(srv::tools::generate_image::GenerateImage);
+        tracing::info!(tool = "generate_image", "registered image-generation tool");
+    } else {
+        tracing::info!("no image-kind upstream pool — generate_image tool not registered");
+    }
+    // edit_image only when an image backend advertises edit support — same
+    // "don't offer a tool that can only fail" rule. z.AI's GLM-Image is
+    // generation-only (supports_edit = false); a self-hosted Qwen-Image-Edit
+    // sets it true.
+    if config.upstream_pools.values().any(|p| {
+        p.kind == srv::upstreams::PoolKind::Image && p.backend.iter().any(|b| b.supports_edit)
+    }) {
+        tool_registry = tool_registry.with(srv::tools::edit_image::EditImage);
+        tracing::info!(tool = "edit_image", "registered image-editing tool");
+    } else {
+        tracing::info!("no edit-capable image backend — edit_image tool not registered");
+    }
     // Display metadata for the discovered templates, for the per-template
     // toggle rows in the tool menu / `/tools` page (the human title isn't in
     // the tool schema). Stays empty when `[typst]` isn't configured.

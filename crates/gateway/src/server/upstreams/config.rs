@@ -85,6 +85,10 @@ pub enum PoolKind {
     Chat,
     Transcription,
     Embedding,
+    /// Image generation (OpenAI `/images/generations`-shaped). Routed like any
+    /// other pool; backends that don't expose `/models` declare their model ids
+    /// statically and set `probe_models = false` (see [`BackendConfig`]).
+    Image,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -140,6 +144,24 @@ pub struct BackendConfig {
     /// See [`AliasSpec`] and `docs/upstreams.md`.
     #[serde(default)]
     pub alias: Option<AliasSpec>,
+    /// Whether the health probe may *discover* this backend's model set from a
+    /// `/models` response. Default `true` (the OpenAI-compat norm). Set `false`
+    /// for a backend whose `/models` endpoint lists a *different* capability
+    /// than this pool serves — notably an image backend (z.AI's general
+    /// endpoint answers `/models` with its **chat** catalog): with `true` the
+    /// probe would overwrite the configured image model ids and make them
+    /// unroutable. When `false` the probe still tracks liveness but never
+    /// touches the model set, so the configured [`models`](Self::models) /
+    /// [`pool models`](UpstreamPoolConfig::models) stay authoritative.
+    #[serde(default = "default_true")]
+    pub probe_models: bool,
+    /// Whether this backend supports image *editing* (image-to-image), not just
+    /// text-to-image generation. Only meaningful on `kind = "image"` pools.
+    /// Default `false` (text→image only, e.g. z.AI GLM-Image). A self-hosted
+    /// edit-capable model (e.g. Qwen-Image-Edit) sets `true`, which is what
+    /// lights up the `edit_image` tool / `/v1/images/edits` surface.
+    #[serde(default)]
+    pub supports_edit: bool,
 }
 
 /// How a backend's [`alias`](BackendConfig::alias) is written in TOML — either a
@@ -187,6 +209,8 @@ pub struct FallbackConfig {
     pub embedding: Option<String>,
     #[serde(default)]
     pub transcription: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 impl FallbackConfig {
@@ -196,6 +220,7 @@ impl FallbackConfig {
             PoolKind::Chat => self.chat.as_deref(),
             PoolKind::Embedding => self.embedding.as_deref(),
             PoolKind::Transcription => self.transcription.as_deref(),
+            PoolKind::Image => self.image.as_deref(),
         }
     }
 }

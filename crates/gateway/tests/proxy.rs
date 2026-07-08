@@ -185,6 +185,114 @@ async fn v1_embeddings_relays_through_upstream() {
 }
 
 #[tokio::test]
+async fn v1_images_generations_relays_through_upstream() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/images/generations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "created": 0,
+            "data": [{"url": "https://cdn.example/img.png"}],
+        })))
+        .mount(&upstream)
+        .await;
+
+    let state = common::state_with_pool(&upstream.uri(), PoolKind::Image, "glm-image").await;
+    let bearer = common::seed_user_with_token(&state, "alice").await;
+    let app = common::app(state);
+
+    let body = json!({"model": "glm-image", "prompt": "a blue cloud"}).to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/images/generations")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Byte-dumb relay: the provider's exact response reaches the client.
+    let bytes = common::read_body(resp).await;
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["data"][0]["url"], "https://cdn.example/img.png");
+}
+
+#[tokio::test]
+async fn v1_images_generations_without_bearer_is_401() {
+    let state =
+        common::state_with_pool("http://unused.invalid", PoolKind::Image, "glm-image").await;
+    let app = common::app(state);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/images/generations")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"glm-image","prompt":"x"}"#))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn v1_images_generations_records_image_usage_row() {
+    use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
+    use jiff::Timestamp;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/images/generations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"url": "https://cdn.example/img.png"}],
+        })))
+        .mount(&upstream)
+        .await;
+
+    let state = common::state_with_pool(&upstream.uri(), PoolKind::Image, "glm-image").await;
+    let metered = gateway::server::usage::spawn(state.db.clone(), 90);
+    let state = state.with_usage(metered);
+    let db = state.db.clone();
+    let bearer = common::seed_user_with_token(&state, "alice").await;
+    let app = common::app(state);
+
+    let body = json!({"model": "glm-image", "prompt": "a blue cloud"}).to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/images/generations")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = common::read_body(resp).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    let now = Timestamp::now();
+    let bounds = period_bounds(Period::Today, "UTC", now);
+    let agg = aggregate(&db, bounds, &Filter::default(), 90, now, true)
+        .await
+        .unwrap();
+    assert_eq!(agg.summary.requests, 1, "one image call recorded");
+    assert_eq!(agg.by_model[0].key, "glm-image");
+    // Images carry no token counts.
+    assert_eq!(agg.summary.total_tokens, 0);
+}
+
+#[tokio::test]
+async fn v1_images_edits_without_bearer_is_401() {
+    let state =
+        common::state_with_pool("http://unused.invalid", PoolKind::Image, "glm-image").await;
+    let app = common::app(state);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/images/edits")
+        .header("content-type", "multipart/form-data; boundary=x")
+        .body(Body::from("--x--\r\n"))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn v1_embeddings_without_bearer_is_401() {
     let state =
         common::state_with_pool("http://unused.invalid", PoolKind::Embedding, "embed-model").await;
@@ -567,6 +675,8 @@ async fn state_with_backend_api_key(
             models: Vec::new(),
             backend: vec![BackendConfig {
                 alias: None,
+                probe_models: true,
+                supports_edit: false,
                 name: "mock".into(),
                 base_url: upstream_url.into(),
                 api_key_env: Some(ENV_KEY.into()),
@@ -617,6 +727,8 @@ async fn state_with_alias_pool(upstream_url: &str) -> gateway::rama_server::Rama
             models: Vec::new(),
             backend: vec![BackendConfig {
                 alias: Some(AliasSpec::Names(vec!["qwen".into()])),
+                probe_models: true,
+                supports_edit: false,
                 name: "mock".into(),
                 base_url: upstream_url.into(),
                 api_key_env: None,

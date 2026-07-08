@@ -95,6 +95,40 @@ weight = 1
 # health_path = "/models"   # Whisper-only servers may need a different path
 # # models = ["whisper-1"]  # per-backend fallback; overrides the pool list
 
+# Image generation + editing. POST /v1/images/generations (and, for editing,
+# POST /v1/images/edits) route here when the request's `model` is advertised by
+# a backend in an image-kind pool; the chat `generate_image` / `edit_image`
+# tools use the same pool. Point it at any OpenAI `/images/*`-compatible
+# endpoint — a hosted provider (below) or a self-hosted image model (e.g.
+# Qwen-Image / Qwen-Image-Edit) behind an OpenAI-compatible server.
+#
+# The example wires z.AI's GLM-Image. IMPORTANT knobs:
+#   * base_url is the GENERAL endpoint (…/api/paas/v4), NOT the /coding/ one a
+#     GLM *chat* pool uses.
+#   * probe_models = false: z.AI's /models lists its CHAT catalog, which would
+#     otherwise clobber the image model ids and make them unroutable. With it
+#     off, the probe is a pure liveness check and the `models` list below is
+#     authoritative.
+#   * [compliance] gdpr = false surfaces the usual non-EU-provider warning.
+#   * supports_edit = false: GLM-Image is text→image only, so the `edit_image`
+#     tool stays hidden. A self-hosted edit-capable model (Qwen-Image-Edit)
+#     sets this true — and editing is *additionally* refused against any
+#     gdpr=false backend (it would ship existing user images off-site), so an
+#     edit backend should be on-prem / GDPR-compliant.
+# [upstream_pools.zai_image]
+# kind = "image"
+# strategy = "round_robin"
+# models = ["glm-image"]   # the image model ids your z.AI plan actually serves
+#   [upstream_pools.zai_image.compliance]
+#   gdpr = false
+#
+# [[upstream_pools.zai_image.backend]]
+# name = "zai-image"
+# base_url = "https://api.z.ai/api/paas/v4"
+# api_key_env = "ZAI_API_KEY"
+# probe_models = false
+# supports_edit = false
+
 # ---- Model → pool routing --------------------------------------------------
 # No static route table. The health probe hits each backend's `/models`
 # endpoint every 5 s, parses the OpenAI envelope (`{"data":[{"id":...}]}`),
@@ -111,7 +145,7 @@ weight = 1
 # can't self-report — not a supplement to a live probe.
 #
 # /v1/models lists EVERY model across ALL pools/kinds (chat + transcription +
-# embedding), de-duplicated by id — OpenAI parity; clients select by id.
+# embedding + image), de-duplicated by id — OpenAI parity; clients select by id.
 
 # ---- Model aliases + fallback ---------------------------------------------
 # Aliases (the per-backend `alias` key above) give clients a STABLE name that
@@ -174,7 +208,8 @@ weight = 1
 # # Grant `enable_tools` (always-on core) so the model can turn on extra
 # # tool groups mid-conversation — see docs/tool-context-optimization.md.
 # tools = ["enable_tools", "get_current_timestamp", "get_user_location", "remember", "recall",
-#          "create_document", "edit_document", "read_document", "list_documents"]
+#          "create_document", "edit_document", "read_document", "list_documents",
+#          "generate_image"]  # image gen; only offered when an image-kind pool is configured
 # # Skill names this role may load (see [skills] below). "*" = all loaded
 # # skills; omit/empty to grant none. Requires the `read_skill` tool too,
 # # which `tools = ["*"]` covers.

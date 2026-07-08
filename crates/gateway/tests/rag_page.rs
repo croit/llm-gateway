@@ -272,6 +272,8 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
             models: Vec::new(),
             backend: vec![BackendConfig {
                 alias: None,
+                probe_models: true,
+                supports_edit: false,
                 name: "mock".into(),
                 base_url: "http://unused.invalid".into(),
                 api_key_env: None,
@@ -292,6 +294,8 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
             models: Vec::new(),
             backend: vec![BackendConfig {
                 alias: None,
+                probe_models: true,
+                supports_edit: false,
                 name: "chat".into(),
                 base_url: "http://unused.invalid".into(),
                 api_key_env: None,

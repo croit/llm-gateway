@@ -297,6 +297,11 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
         // `assistant_turn_id`), so this branch never fires.
         attachment_reservations: None,
         indexer: state.indexer.clone(),
+        image_gen: Some(crate::server::image_gen::ImageGenerator::new(
+            state.upstreams.clone(),
+            state.http.clone(),
+            state.usage.clone(),
+        )),
     };
     let state_clone = state.clone();
     let model_clone = real_model.clone();
@@ -785,6 +790,118 @@ pub async fn embeddings(State(state): State<Arc<RamaState>>, req: Request) -> Re
     with_resolved_model_header(resp, &model, &real_model)
 }
 
+/// `POST /v1/images/generations` — OpenAI-compatible image generation.
+/// Byte-dumb proxy, exactly like [`embeddings`]: authenticate, read the
+/// `model`, pick a healthy backend from the **Image** pool, and relay the
+/// request/response 1:1. The client gets the provider's response verbatim
+/// (a `b64_json` payload or a `url`), which is the correct OpenAI-compatible
+/// behaviour — we don't server-side-fetch a URL the client asked us to proxy.
+/// (The chat `generate_image` tool takes a different path — it needs the
+/// bytes in hand to re-host in S3 — via `server::image_gen`.)
+pub async fn images_generations(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let user = match require_bearer(&state, &parts.headers).await {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
+    };
+    let Some(model) = parse_model_field(&body) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "request body is missing a string `model` field",
+        );
+    };
+    let acquired = match state.upstreams.route(&model, PoolKind::Image) {
+        Ok(a) => a,
+        Err(e) => return route_error_response(e),
+    };
+    let real_model = acquired.resolved_model().to_string();
+    let body = rewrite_model_in_bytes(body, &real_model);
+    let rec = RecordParams::v1(&user, UsageKind::Image, real_model.clone());
+    let resp = forward(
+        &state,
+        acquired,
+        Method::POST,
+        "images/generations",
+        parts.headers,
+        body,
+        rec,
+    )
+    .await;
+    with_resolved_model_header(resp, &model, &real_model)
+}
+
+/// `POST /v1/images/edits` — OpenAI-compatible image editing (multipart:
+/// `image` file + `prompt` + `model`). Mirrors [`transcribe`]'s multipart
+/// relay: parse fields, resolve the `model` alias, rewrite that field to the
+/// real id, rebuild the body, and forward 1:1 to the Image pool. Whether the
+/// chosen backend actually supports editing is the upstream's concern here
+/// (the chat `edit_image` tool gates on `supports_edit`; this raw API surface
+/// stays a thin proxy).
+pub async fn images_edits(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let user = match require_bearer(&state, &parts.headers).await {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    let mut headers = parts.headers;
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
+    };
+    let mut fields = match parse_multipart_fields(&headers, body).await {
+        Ok(f) => f,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
+    };
+    let Some(model) = fields
+        .iter()
+        .find(|f| f.name == "model")
+        .and_then(|f| std::str::from_utf8(&f.bytes).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "multipart body missing required `model` field",
+        );
+    };
+    let acquired = match state.upstreams.route(&model, PoolKind::Image) {
+        Ok(a) => a,
+        Err(e) => return route_error_response(e),
+    };
+    let real_model = acquired.resolved_model().to_string();
+    if real_model != model
+        && let Some(field) = fields.iter_mut().find(|f| f.name == "model")
+    {
+        field.bytes = Bytes::from(real_model.clone());
+    }
+    let (new_body, content_type) = match build_multipart(&fields) {
+        Ok(v) => v,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
+    };
+    headers.remove(rama::http::header::CONTENT_TYPE);
+    if let Ok(val) = rama::http::HeaderValue::from_str(&content_type) {
+        headers.insert(rama::http::header::CONTENT_TYPE, val);
+    }
+    let rec = RecordParams::v1(&user, UsageKind::Image, real_model.clone());
+    let resp = forward(
+        &state,
+        acquired,
+        Method::POST,
+        "images/edits",
+        headers,
+        new_body,
+        rec,
+    )
+    .await;
+    with_resolved_model_header(resp, &model, &real_model)
+}
+
 /// `GET /v1/models` — lists *every* model served by any healthy backend in
 /// any pool, de-duplicated by id, in OpenAI envelope shape. Synthesised from
 /// the registry's cached model sets (probe-reported, with the configured
@@ -1264,6 +1381,11 @@ async fn forward_streaming_with_tools(
         // No turn → no reservations needed. See sibling site above.
         attachment_reservations: None,
         indexer: state.indexer.clone(),
+        image_gen: Some(crate::server::image_gen::ImageGenerator::new(
+            state.upstreams.clone(),
+            state.http.clone(),
+            state.usage.clone(),
+        )),
     };
 
     // One usage row per upstream round; built here where the bearer's

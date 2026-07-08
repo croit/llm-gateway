@@ -26,7 +26,7 @@ jiff = { version = "0.2", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
 
 # TLS handshake helper for the `tls_cert` gateway tool — a raw rustls
 # connect with verification disabled so we can inspect the presented

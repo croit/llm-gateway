@@ -965,6 +965,7 @@ mod tests {
             chat_feedback: None,
             attachment_reservations: None,
             indexer: None,
+            image_gen: None,
         }
     }
 

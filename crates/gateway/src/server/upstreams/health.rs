@@ -198,6 +198,15 @@ async fn probe_once(http: &reqwest::Client, pool_name: &str, backend: &Backend) 
         ));
     }
 
+    // Model discovery disabled for this backend: the probe is a pure liveness
+    // check, and the configured model set is authoritative. We reached a 2xx,
+    // so the backend is up — but we deliberately do NOT read/parse `/models`,
+    // because on an image backend (e.g. z.AI's general endpoint) that response
+    // is the *chat* catalog and would clobber the configured image model ids.
+    if !backend.probe_models_enabled() {
+        return ProbeOutcome::AliveNoData;
+    }
+
     // Parse the OpenAI `/models` envelope. A backend that returns 200
     // with a different shape (or non-JSON entirely — e.g. plain
     // whisper.cpp) is alive but unparseable: we mark it healthy and
@@ -378,5 +387,106 @@ mod tests {
         );
         // And it must include the full source chain.
         assert!(desc.contains("chain:"), "missing source chain: {desc}");
+    }
+
+    // --- probe_models gate ---------------------------------------------------
+
+    use std::collections::HashMap;
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::server::upstreams::UpstreamRegistry;
+    use crate::server::upstreams::config::{
+        BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig,
+    };
+
+    fn image_backend(base_url: &str, probe_models: bool) -> BackendConfig {
+        BackendConfig {
+            name: "img".into(),
+            base_url: base_url.into(),
+            api_key_env: None,
+            weight: 1,
+            max_inflight: 16,
+            health_path: "/models".into(),
+            models: vec!["glm-image".into()],
+            alias: None,
+            probe_models,
+            supports_edit: false,
+        }
+    }
+
+    /// A `/models` endpoint that (like z.AI's general endpoint) answers 200 with
+    /// a *chat* catalog — the exact shape that would clobber a static image
+    /// model set if the probe were allowed to discover it.
+    async fn chat_catalog_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{ "id": "glm-4.6" }]
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn backend_arc(base_url: &str, probe_models: bool) -> std::sync::Arc<Backend> {
+        let mut pools = HashMap::new();
+        pools.insert(
+            "images".to_string(),
+            UpstreamPoolConfig {
+                compliance: Default::default(),
+                kind: PoolKind::Image,
+                strategy: PickerStrategy::RoundRobin,
+                models: Vec::new(),
+                fallback_offline: None,
+                backend: vec![image_backend(base_url, probe_models)],
+            },
+        );
+        let reg = UpstreamRegistry::new(&pools).unwrap();
+        reg.pools().find(|p| p.name == "images").unwrap().backends[0].clone()
+    }
+
+    #[tokio::test]
+    async fn probe_models_false_keeps_config_models_over_chat_catalog() {
+        let server = chat_catalog_server().await;
+        let backend = backend_arc(&server.uri(), false);
+
+        let outcome = probe_once(&reqwest::Client::new(), "images", &backend).await;
+        // Reachable, but no discovery: config model set is untouched.
+        assert!(
+            matches!(outcome, ProbeOutcome::AliveNoData),
+            "expected AliveNoData, got {outcome:?}"
+        );
+        assert!(
+            backend.probe_models().is_empty(),
+            "probe must not populate the live set when probe_models = false"
+        );
+        assert_eq!(
+            backend.models_snapshot(),
+            std::collections::HashSet::from(["glm-image".to_string()]),
+            "configured image model must remain authoritative"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_models_true_would_clobber_with_chat_catalog() {
+        // The contrast case: with discovery on, the same server's chat catalog
+        // overwrites the model set — which is exactly why image backends set
+        // probe_models = false.
+        let server = chat_catalog_server().await;
+        let backend = backend_arc(&server.uri(), true);
+
+        let outcome = probe_once(&reqwest::Client::new(), "images", &backend).await;
+        assert!(
+            matches!(outcome, ProbeOutcome::AliveWithModels),
+            "expected AliveWithModels, got {outcome:?}"
+        );
+        assert_eq!(
+            backend.models_snapshot(),
+            std::collections::HashSet::from(["glm-4.6".to_string()]),
+        );
     }
 }

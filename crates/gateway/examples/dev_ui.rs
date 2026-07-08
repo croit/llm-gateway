@@ -175,6 +175,8 @@ async fn main() -> anyhow::Result<()> {
             models: Vec::new(),
             backend: vec![BackendConfig {
                 alias: None,
+                probe_models: true,
+                supports_edit: false,
                 name: "wiremock-chat".into(),
                 base_url: chat_mock.uri(),
                 api_key_env: None,
@@ -195,6 +197,8 @@ async fn main() -> anyhow::Result<()> {
             models: Vec::new(),
             backend: vec![BackendConfig {
                 alias: None,
+                probe_models: true,
+                supports_edit: false,
                 name: "wiremock-voice".into(),
                 base_url: voice_mock.uri(),
                 api_key_env: None,

@@ -10,7 +10,9 @@ The gateway exposes an OpenAI-compatible API so any standard SDK works against i
 | POST | `/v1/audio/transcriptions` | Phase 4 | multipart/form-data, Whisper-compatible |
 | POST | `/v1/audio/translations`   | Not implemented | No route registered yet |
 | POST | `/v1/embeddings`           | Implemented | Single + batch; byte-dumb relay to the `embedding` pool, non-streaming |
-| GET  | `/v1/models`               | Phase 2 | Lists every model across all pools (chat, transcription, embedding) **plus configured aliases**; clients select by id or alias |
+| POST | `/v1/images/generations`   | Implemented | Byte-dumb relay to the `image` pool; JSON `{model, prompt, size, …}` in, OpenAI images envelope (`data[].b64_json` or `.url`) out |
+| POST | `/v1/images/edits`         | Implemented | multipart/form-data (`image` + `prompt` + `model`); byte-dumb relay to the `image` pool |
+| GET  | `/v1/models`               | Phase 2 | Lists every model across all pools (chat, transcription, embedding, image) **plus configured aliases**; clients select by id or alias |
 | GET  | `/healthz`                 | Phase 1 | Liveness; no auth |
 | GET  | `/readyz`                  | Phase 1 | Readiness — checks DB + at least one upstream healthy |
 

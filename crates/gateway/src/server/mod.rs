@@ -16,6 +16,7 @@ pub mod db;
 pub mod embeddings;
 pub mod geoip;
 pub mod github;
+pub mod image_gen;
 pub mod model_defaults;
 pub mod pdf;
 pub mod rag;

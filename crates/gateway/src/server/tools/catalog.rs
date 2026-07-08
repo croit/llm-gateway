@@ -63,6 +63,8 @@ const HIDDEN: &[&str] = &["company_echo"];
 pub enum Category {
     Web,
     Documents,
+    /// Image generation / editing (`generate_image`, `edit_image`).
+    Media,
     /// Per-template typst document tools (`typst_<id>`) — one row per
     /// operator-installed template, individually selectable.
     Templates,
@@ -83,6 +85,7 @@ impl Category {
         match self {
             Category::Web => "Web & Network",
             Category::Documents => "Attachments & Documents",
+            Category::Media => "Images & Media",
             Category::Templates => "Document templates",
             Category::Knowledge => "Knowledge base",
             Category::Code => "Code & Sandbox",
@@ -97,12 +100,13 @@ impl Category {
         match self {
             Category::Web => 0,
             Category::Documents => 1,
-            Category::Templates => 2,
-            Category::Knowledge => 3,
-            Category::Code => 4,
-            Category::Memory => 5,
-            Category::Integrations => 6,
-            Category::Utility => 7,
+            Category::Media => 2,
+            Category::Templates => 3,
+            Category::Knowledge => 4,
+            Category::Code => 5,
+            Category::Memory => 6,
+            Category::Integrations => 7,
+            Category::Utility => 8,
         }
     }
 }
@@ -189,7 +193,8 @@ pub fn is_hidden(tool_id: &str) -> bool {
 /// (`"… only available inside a chat session"`) off the chat path because
 /// there is no assistant turn / conversation to attach their output to:
 /// the per-template typst render family (`typst_*`), the document-canvas
-/// tools (incl. `export_document`), and `upload_attachment`. The `/v1`
+/// tools (incl. `export_document`), `upload_attachment`, and the image tools
+/// (`generate_image` / `edit_image`). The `/v1`
 /// proxy paths have no session, so they must NOT advertise these — else the
 /// model picks one and gets an error instead of a completion. Single source
 /// of truth so the advertise filter can't drift from the runtime gate.
@@ -197,6 +202,8 @@ pub fn requires_chat_session(tool_id: &str) -> bool {
     tool_id.starts_with(TYPST_PREFIX)
         || DOCUMENT_IDS.contains(&tool_id)
         || tool_id == "upload_attachment"
+        || tool_id == "generate_image"
+        || tool_id == "edit_image"
 }
 
 /// `mcp__<server>__<tool>` → `mcp__<server>` (the per-server toggle key).
@@ -218,6 +225,7 @@ fn category_for(tool_id: &str) -> Category {
         "search_web" | "fetch_url" | "lookup_ip" | "dns_lookup" | "whois_lookup" | "tls_cert"
         | "wikipedia" => Category::Web,
         "fetch_attachment" | "upload_attachment" | "read_skill" => Category::Documents,
+        "generate_image" | "edit_image" => Category::Media,
         "rag_search" | "rag_list_collections" => Category::Knowledge,
         "run_in_sandbox"
         | "generate_document"
@@ -311,6 +319,18 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Wikipedia lookup",
             "Fetches the summary of the best-matching Wikipedia article for encyclopedic \
              \"who/what/where is X\" questions, with a link to the full page.",
+        ),
+        "generate_image" => (
+            "Image generation",
+            "Lets the assistant create an image from a text description — diagrams, mockups, \
+             illustrations, or marketing visuals — and drop it straight into its reply for you \
+             to download or reuse.",
+        ),
+        "edit_image" => (
+            "Image editing",
+            "Lets the assistant edit an image already in the conversation from a text \
+             instruction — change the background, add or remove an element, restyle it — and \
+             return the edited version inline.",
         ),
         "convert_currency" => (
             "Currency conversion",
@@ -604,6 +624,9 @@ mod tests {
             "edit_document_section",
             "export_document",
             "upload_attachment",
+            // generate_image splices an attachment marker into the turn, so it
+            // also needs a live chat session.
+            "generate_image",
         ] {
             assert!(requires_chat_session(id), "{id} should be session-only");
         }

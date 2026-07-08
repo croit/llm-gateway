@@ -59,6 +59,7 @@ pub enum UsageKind {
     Chat,
     Embedding,
     Transcription,
+    Image,
 }
 
 impl UsageKind {
@@ -67,6 +68,7 @@ impl UsageKind {
             UsageKind::Chat => "chat",
             UsageKind::Embedding => "embedding",
             UsageKind::Transcription => "transcription",
+            UsageKind::Image => "image",
         }
     }
 }

@@ -12,7 +12,7 @@
 //!     in-page nav and CRUD.
 //!   - **OpenAI-compatible proxy**: `/v1/models`,
 //!     `/v1/chat/completions`, `/v1/audio/transcriptions`,
-//!     `/v1/embeddings` — token-
+//!     `/v1/embeddings`, `/v1/images/generations` — token-
 //!     authenticated, forwarded to the upstream pool selected by
 //!     model.
 //!   - **Auth + session API**: `/auth/*` (OIDC + CLI device flow) and
@@ -191,6 +191,8 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/v1/chat/completions", proxy::chat_completions)
         .with_post("/v1/audio/transcriptions", proxy::transcribe)
         .with_post("/v1/embeddings", proxy::embeddings)
+        .with_post("/v1/images/generations", proxy::images_generations)
+        .with_post("/v1/images/edits", proxy::images_edits)
         // Bearer-authed identity + self-revoke for the `gw` CLI
         // (`whoami`/`tools` and `logout`).
         .with_get("/v1/me", proxy::me)

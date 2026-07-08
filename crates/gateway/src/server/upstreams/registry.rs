@@ -52,6 +52,14 @@ pub struct Backend {
     pub weight: u32,
     pub max_inflight: u32,
     pub health_path: String,
+    /// Whether the probe may overwrite [`models`](Self::models) from a
+    /// `/models` response. `false` pins the model set to `config_models`
+    /// (see [`BackendConfig::probe_models`]).
+    probe_models: bool,
+    /// Whether this backend can edit images (image-to-image), not just
+    /// generate. Only meaningful on image pools; see
+    /// [`BackendConfig::supports_edit`].
+    supports_edit: bool,
     inflight: AtomicU32,
     healthy: AtomicBool,
     /// The set of model IDs this backend currently advertises, as reported
@@ -98,6 +106,8 @@ impl Backend {
             weight: cfg.weight.max(1),
             max_inflight: cfg.max_inflight.max(1),
             health_path: cfg.health_path.clone(),
+            probe_models: cfg.probe_models,
+            supports_edit: cfg.supports_edit,
             inflight: AtomicU32::new(0),
             healthy: AtomicBool::new(true),
             models: RwLock::new(HashSet::new()),
@@ -201,6 +211,19 @@ impl Backend {
             Some(None) => !self.alias_disabled(model) && self.sole_model().is_some(),
             None => false,
         }
+    }
+
+    /// Whether the probe is allowed to discover this backend's model set from
+    /// `/models`. `false` pins the set to `config_models` — see
+    /// [`BackendConfig::probe_models`].
+    pub fn probe_models_enabled(&self) -> bool {
+        self.probe_models
+    }
+
+    /// Whether this backend advertises image-editing support. Only meaningful
+    /// on image pools.
+    pub fn supports_edit(&self) -> bool {
+        self.supports_edit
     }
 
     /// Replace the advertised-model set wholesale. Probe-only path —
@@ -823,6 +846,8 @@ mod tests {
             health_path: "/models".into(),
             models: Vec::new(),
             alias: None,
+            probe_models: true,
+            supports_edit: false,
         }
     }
 
@@ -1231,6 +1256,22 @@ mod tests {
         assert_eq!(g.backend().name, "a");
         assert_eq!(reg.all_models(), vec!["voxtral-realtime"]);
         assert!(reg.knows_model("voxtral-realtime", PoolKind::Transcription));
+    }
+
+    #[test]
+    fn image_pool_routes_by_config_models() {
+        // An image backend whose `/models` isn't discovered (probe off, or no
+        // such endpoint) is still routable via its static model ids — the same
+        // mechanism transcription relies on, now for PoolKind::Image.
+        let reg = build(vec![(
+            "images",
+            pool_config_with_models(PoolKind::Image, &["glm-image"], vec![backend("a", 16)]),
+        )]);
+        let g = reg.acquire_for("glm-image", PoolKind::Image).unwrap();
+        assert_eq!(g.backend().name, "a");
+        assert!(reg.knows_model("glm-image", PoolKind::Image));
+        // Wrong kind must not match an image model.
+        assert!(reg.acquire_for("glm-image", PoolKind::Chat).is_err());
     }
 
     #[test]

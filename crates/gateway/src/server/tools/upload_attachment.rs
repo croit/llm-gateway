@@ -177,79 +177,13 @@ fn decode_payload(args: &UploadArgs) -> Result<Vec<u8>, ToolError> {
             "missing file contents (need `content` or `content_base64`)".into(),
         )),
         (Some(s), None) => Ok(s.as_bytes().to_vec()),
-        (None, Some(b64)) => decode_base64(b64),
+        (None, Some(b64)) => chat_attachments::decode_base64(b64).map_err(ToolError::InvalidArgs),
     }
-}
-
-/// Strict RFC 4648 base64 decoder (no URL-safe alphabet, no whitespace
-/// tolerance other than ASCII whitespace stripping — the LLM JSON
-/// string may have line breaks). Padding (`=`) is optional. Hand-rolled
-/// to avoid pulling in `base64` as a direct workspace dep just for one
-/// caller.
-fn decode_base64(s: &str) -> Result<Vec<u8>, ToolError> {
-    let clean: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    let bytes = clean.as_bytes();
-    // Strip optional padding from the end; we infer length from the
-    // un-padded count.
-    let trimmed = bytes.iter().rposition(|b| *b != b'=').map_or(0, |i| i + 1);
-    let body = &bytes[..trimmed];
-
-    let mut out = Vec::with_capacity(body.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut acc_bits: u8 = 0;
-    for (idx, &c) in body.iter().enumerate() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => {
-                return Err(ToolError::InvalidArgs(format!(
-                    "invalid base64 character at position {idx}"
-                )));
-            }
-        };
-        acc = (acc << 6) | (v as u32);
-        acc_bits += 6;
-        if acc_bits >= 8 {
-            acc_bits -= 8;
-            out.push((acc >> acc_bits) as u8);
-            acc &= (1 << acc_bits) - 1;
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn decode_base64_round_trip_simple() {
-        // "hello world" → base64
-        let bytes = decode_base64("aGVsbG8gd29ybGQ=").unwrap();
-        assert_eq!(bytes, b"hello world");
-    }
-
-    #[test]
-    fn decode_base64_accepts_unpadded() {
-        let bytes = decode_base64("aGVsbG8gd29ybGQ").unwrap();
-        assert_eq!(bytes, b"hello world");
-    }
-
-    #[test]
-    fn decode_base64_tolerates_embedded_whitespace() {
-        // The LLM might newline-wrap a long string.
-        let bytes = decode_base64("aGVs\nbG8g\nd29ybGQ=").unwrap();
-        assert_eq!(bytes, b"hello world");
-    }
-
-    #[test]
-    fn decode_base64_rejects_invalid_char() {
-        let err = decode_base64("aGVs!bG8=").unwrap_err();
-        assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
-    }
 
     #[test]
     fn decode_payload_rejects_both_fields() {
@@ -311,6 +245,7 @@ mod tests {
             chat_feedback: None,
             attachment_reservations: None,
             indexer: None,
+            image_gen: None,
         };
         let err = UploadAttachment
             .run(
@@ -346,6 +281,7 @@ mod tests {
             chat_feedback: None,
             attachment_reservations: None,
             indexer: None,
+            image_gen: None,
         };
         let err = UploadAttachment
             .run(

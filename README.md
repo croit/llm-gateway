@@ -28,8 +28,8 @@ Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests acro
 
 ## What it does
 
-- **OpenAI-compatible API** — `POST /v1/chat/completions` (streaming + non-streaming), `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, and `GET /v1/models`. Point any OpenAI SDK at it.
-- **Multi-backend routing** — named upstream pools (`chat` / `transcription` / `embedding` kinds). Each pool load-balances across its backends (round-robin or least-in-flight) with per-backend health probes. Models are discovered live from each backend's `/models` endpoint, so loading a model on a backend makes it routable with no config change.
+- **OpenAI-compatible API** — `POST /v1/chat/completions` (streaming + non-streaming), `POST /v1/embeddings`, `POST /v1/images/generations` + `POST /v1/images/edits`, `POST /v1/audio/transcriptions`, and `GET /v1/models`. Point any OpenAI SDK at it.
+- **Multi-backend routing** — named upstream pools (`chat` / `transcription` / `embedding` / `image` kinds). Each pool load-balances across its backends (round-robin or least-in-flight) with per-backend health probes. Models are discovered live from each backend's `/models` endpoint, so loading a model on a backend makes it routable with no config change.
 - **Model aliases + fallback** — give clients a stable name (`alias = ["qwen"]` on a backend) that routes to whatever real model is loaded, so swapping the model needs no client change; the same alias on several backends is a load-balanced group. Optional fallbacks cover an unknown model name (`[fallback].<kind>`) or a known model whose backends are all down (`fallback_offline`). See [`docs/upstreams.md`](docs/upstreams.md#model-aliases).
 - **OIDC login** — browser sign-in against your identity provider; the gateway then issues its own `gwk_…` API tokens. Provider secrets come only from the environment.
 - **Per-user tokens + RBAC** — tokens are SHA-256-hashed at rest and revocable. Roles (mapped from OIDC claims) gate which models and server-side tools each user may use.
@@ -53,6 +53,7 @@ Every tool is **RBAC-gated per role**, and each user can flip their own grants o
 | **Web & retrieval** | `search_web`, `fetch_url`, `wikipedia` | Search the web (SearXNG or Brave), fetch any URL (text → UTF-8, images → viewable, other binary → metadata), and pull encyclopedic summaries. |
 | **Documents** | `fetch_attachment`, `upload_attachment`, `typst_*` | Read files the user attached — including **two-tier PDF** reading (extract the text layer first; rasterize scanned pages for a vision model if that comes back empty) — attach files back into its own reply, and render **PDF/PNG documents** from operator-defined Typst templates (invoices, letters, reports). |
 | **Document canvas** | `create_document`, `edit_document`, … | Build up a long document (report, spec, article) across turns and edit it section-by-section in a live side panel, then export it to PDF/DOCX/PPTX — instead of regenerating the whole thing every reply. See [`docs/file-conversions.md`](docs/file-conversions.md). |
+| **Images** | `generate_image`, `edit_image` | Generate an image from a text prompt (diagrams, mockups, marketing visuals) and, where the backend supports it, edit an existing image (image-to-image) — rendered inline in the reply. Routes to an `image`-kind upstream pool (any OpenAI `/images/*`-compatible backend: a hosted provider or a self-hosted model). `edit_image` appears only when a backend advertises edit support, and is refused against non-GDPR-compliant backends. |
 | **Code & sandbox** *(opt-in)* | `run_in_sandbox`, `generate_document`, `convert_document`, `capture_webpage`, `render_typst`, … | Run Python/shell in an isolated, single-use VM (data crunching, format conversion, plotting), turn Markdown into PDF/DOCX/PPTX, convert between office/PDF/image formats, screenshot a web page, and render Typst or Excalidraw. Enabled by the `[sandbox]` block — see [`docs/sandbox.md`](docs/sandbox.md) and [`docs/file-conversions.md`](docs/file-conversions.md). |
 | **Memory** | `remember`, `recall` | Persist durable facts about the user (preferences, projects) and recall them in later conversations. |
 | **Network & ops** | `dns_lookup`, `whois_lookup`, `tls_cert`, `lookup_ip` | DNS-over-HTTPS records, RDAP domain registration, TLS-certificate inspection ("is this cert about to expire?"), and GeoIP for any IP or hostname. |
@@ -167,7 +168,7 @@ token_ttl_days      = 90
 session_key_env     = "GATEWAY_SESSION_KEY"          # names the env var holding a 64-hex (32-byte) key
 allow_impersonation = false                          # opt-in admin impersonation (default false); see below
 
-# At least one upstream pool. `kind` is chat | transcription | embedding.
+# At least one upstream pool. `kind` is chat | transcription | embedding | image.
 [upstream_pools.local_chat]
 kind     = "chat"
 strategy = "least_inflight"                        # or "round_robin"
@@ -317,6 +318,8 @@ In a clone, run it via `mise run cli -- <args>`; a release build produces a stan
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer token | Chat completions (streaming + non-streaming). |
 | `POST /v1/embeddings` | Bearer token | Embeddings. |
+| `POST /v1/images/generations` | Bearer token | Image generation (routes to an `image`-kind pool). |
+| `POST /v1/images/edits` | Bearer token | Image editing (multipart: `image` + `prompt`); routes to an `image`-kind pool. |
 | `POST /v1/audio/transcriptions` | Bearer token | Whisper-style transcription (multipart upload). |
 | `GET /v1/models` | Bearer token | All discovered models across pools (deduplicated by id). |
 | `GET /v1/me` | Bearer token | Caller identity + the tools your role(s) grant (backs `gw auth whoami` / `gw auth tools`). |

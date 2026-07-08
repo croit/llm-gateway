@@ -10,7 +10,7 @@ request.model ──► [walk pools matching kind] ──► [pool whose backend
 ```
 
 - A **`Backend`** is a single addressable upstream: base URL, optional API key, weight, `max_inflight`, plus a runtime-populated set of advertised model IDs.
-- A **`Pool`** is an ordered set of backends sharing a `kind` (`chat` | `transcription` | `embedding`) and a picker strategy. Pools own:
+- A **`Pool`** is an ordered set of backends sharing a `kind` (`chat` | `transcription` | `embedding` | `image`) and a picker strategy. Pools own:
     - A health-check loop per backend.
     - A picker strategy (`round_robin`, `least_inflight`). Default: `least_inflight`.
     - Implicit "what we serve" — the union of all backends' advertised-model sets.
@@ -45,9 +45,28 @@ strategy = "round_robin"
 [[upstream_pools.local_whisper.backend]]
 name = "whisper-01"
 base_url = "http://whisper-01.internal:9000/v1"
+
+# Image generation / editing (OpenAI /images/* shape). Backs
+# POST /v1/images/generations + /v1/images/edits and the chat
+# generate_image / edit_image tools.
+[upstream_pools.images]
+kind = "image"
+models = ["gpt-image-1"]   # advertised statically; see probe_models below
+
+[[upstream_pools.images.backend]]
+name = "openai-image"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+probe_models = false       # don't let the provider's /models catalog clobber the image ids
+supports_edit = true       # backend serves /images/edits (image-to-image)
 ```
 
 No `[[models]]` table. Each backend's `/models` response is the source of truth for what it serves.
+
+Two backend flags matter for image pools (and any backend whose `/models` catalog doesn't match what the pool serves):
+
+- **`probe_models`** (default `true`). When `false`, the health probe is a pure liveness check and never overwrites the configured `models`. Set it on image backends whose `/models` returns a *chat* catalog (z.AI's general endpoint, OpenAI) — otherwise the probe would replace the image model ids with chat models and make them unroutable, and pollute `/v1/models`.
+- **`supports_edit`** (default `false`). Marks a backend as capable of image *editing*. The `edit_image` tool is only registered when some image backend sets this, and editing is additionally refused against a backend whose pool is `gdpr = false` (it would ship existing user images off-site).
 
 Secret material (`api_key_env`) is **only** sourced from env vars.
 

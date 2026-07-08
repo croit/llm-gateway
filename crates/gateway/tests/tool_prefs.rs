@@ -51,6 +51,8 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
             models: Vec::new(),
             backend: vec![BackendConfig {
                 alias: None,
+                probe_models: true,
+                supports_edit: false,
                 name: "mock".into(),
                 base_url: upstream_uri.into(),
                 api_key_env: None,

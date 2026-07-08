@@ -92,6 +92,8 @@ fn registry_pointed_at(upstream_url: &str) -> Arc<UpstreamRegistry> {
             models: Vec::new(),
             backend: vec![BackendConfig {
                 alias: None,
+                probe_models: true,
+                supports_edit: false,
                 name: "mock".into(),
                 base_url: upstream_url.into(),
                 api_key_env: None,

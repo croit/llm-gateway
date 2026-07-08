@@ -42,6 +42,8 @@ pub const TEST_SECRET: [u8; 32] = [7u8; 32];
 fn mock_backend(name: &str, base_url: &str) -> BackendConfig {
     BackendConfig {
         alias: None,
+        probe_models: true,
+        supports_edit: false,
         name: name.into(),
         base_url: base_url.into(),
         api_key_env: None,
@@ -205,6 +207,8 @@ async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool
             models: Vec::new(),
             backend: vec![BackendConfig {
                 alias: None,
+                probe_models: true,
+                supports_edit: false,
                 name: "mock".into(),
                 base_url: upstream_url.into(),
                 api_key_env: None,
