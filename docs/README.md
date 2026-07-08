@@ -9,16 +9,15 @@ This directory holds the design docs for the LLM gateway. The agent-facing entry
 | [`architecture.md`](architecture.md) | High-level system diagram, request flow, crate boundaries |
 | [`dev-workflow.md`](dev-workflow.md) | mise tasks, two-terminal dev loop (cargo + tailwind --watch) |
 | [`dependencies.md`](dependencies.md) | Dep policy + the current allowed list and rationale |
-| [`auth.md`](auth.md) | OIDC discovery, CLI loopback handoff, gateway-minted tokens, sessions |
+| [`auth.md`](auth.md) | OIDC discovery, gateway-minted tokens, sessions |
 | [`gateway-api.md`](gateway-api.md) | OpenAI-compatible HTTP API, streaming, transcription |
 | [`upstreams.md`](upstreams.md) | Provider config, model→backend routing, load balancing, health |
 | [`tools-rbac.md`](tools-rbac.md) | Tool registry, role→tool mapping, server-side execution loop |
 | [`file-conversions.md`](file-conversions.md) | How uploads are read and documents produced/converted — tools, formats, expectations, limitations, gaps |
 | [`connectors.md`](connectors.md) | Per-user MCP connector catalog — operator setup for Google/GitHub/Atlassian/GitLab + troubleshooting |
-| [`cli.md`](cli.md) | `gw` CLI commands, UX, on-disk config |
 | [`ui.md`](ui.md) | Server-rendered HTML with plait + daisyUI + datastar (SSE-patch CRUD pattern) |
 | [`testing.md`](testing.md) | Test layers, mocking strategy, coverage targets |
-| [`errors.md`](errors.md) | Error type tiers, message anatomy, OpenAI mapping, CLI formatting |
+| [`errors.md`](errors.md) | Error type tiers, message anatomy, OpenAI mapping |
 
 ## Editing rules
 

@@ -30,7 +30,7 @@ use rama::net::address::SocketAddress;
 use serde_json::json;
 
 use crate::rama_server::RamaState;
-use crate::rama_server::{api, cli_handlers, oidc_handlers, pages, proxy, rag_api, sandbox_api};
+use crate::rama_server::{api, oidc_handlers, pages, proxy, rag_api, sandbox_api};
 use session_core::assets;
 
 /// Builds the rama router. State is shared via `Arc` since handlers
@@ -195,21 +195,12 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/v1/embeddings", proxy::embeddings)
         .with_post("/v1/images/generations", proxy::images_generations)
         .with_post("/v1/images/edits", proxy::images_edits)
-        // Bearer-authed identity + self-revoke for the `gw` CLI
-        // (`whoami`/`tools` and `logout`).
-        .with_get("/v1/me", proxy::me)
-        .with_post("/v1/auth/logout", proxy::logout)
         // Bearer-authed download of a file a sandbox run produced for an
         // API caller (scoped to the caller's user; see `sandbox_api`).
         .with_get("/v1/sandbox/files/{run}/{filename}", sandbox_api::download)
         .with_get("/auth/login", oidc_handlers::login)
         .with_get("/auth/callback", oidc_handlers::callback)
         .with_post("/auth/logout", oidc_handlers::logout)
-        .with_post("/auth/cli/start", cli_handlers::start)
-        .with_get("/auth/cli/begin", cli_handlers::begin)
-        .with_post("/auth/cli/poll", cli_handlers::poll)
-        .with_post("/auth/cli/approve", cli_handlers::approve)
-        .with_post("/auth/cli/deny", cli_handlers::deny)
         .with_get("/api/v0/me", api::me)
         .with_get("/api/v0/tokens", api::list_tokens)
         .with_post("/api/v0/tokens", api::create_token)

@@ -2,7 +2,7 @@
 
 ## One-paragraph summary
 
-The gateway is a single Rust binary built on **rama 0.3**, which is a proxy-native HTTP framework. The same process serves the OpenAI-compatible API (`/v1/*`), the OIDC browser flow (`/auth/*`), the session-authed JSON admin API (`/api/v0/*`), and a server-rendered HTML UI (`/`, `/login`, `/tokens`, `/chat`). HTML templates use the **plait** macro inline in handlers; client-side reactivity is **datastar** (self-hosted, ~34 KB JS) — chat replies stream over SSE and token CRUD uses the same SSE-patch pattern for surgical updates; styling is **daisyUI v5 + Tailwind v4** with a shadcn-flavoured neutral palette. A separate `cli` crate ships as `gw`, talks to the gateway over HTTP, and uses a loopback-handoff flow to acquire a gateway-minted API token.
+The gateway is a single Rust binary built on **rama 0.3**, which is a proxy-native HTTP framework. The same process serves the OpenAI-compatible API (`/v1/*`), the OIDC browser flow (`/auth/*`), the session-authed JSON admin API (`/api/v0/*`), and a server-rendered HTML UI (`/`, `/login`, `/tokens`, `/chat`). HTML templates use the **plait** macro inline in handlers; client-side reactivity is **datastar** (self-hosted, ~34 KB JS) — chat replies stream over SSE and token CRUD uses the same SSE-patch pattern for surgical updates; styling is **daisyUI v5 + Tailwind v4** with a shadcn-flavoured neutral palette.
 
 ## Diagram
 
@@ -16,7 +16,7 @@ The gateway is a single Rust binary built on **rama 0.3**, which is a proxy-nati
                                 │  └─────────────────────┘  └───────────────┘  │
                                 │                                              │
    OpenAI SDK ── HTTPS ────────►│  ┌────────────────────────────────────────┐  │
-   or `gw` CLI                  │  │  /v1/chat/completions, /v1/audio/...   │──┼──► Upstream pool A (chat)
+                                │  │  /v1/chat/completions, /v1/audio/...   │──┼──► Upstream pool A (chat)
                                 │  │  [bearer auth][rbac][tool injection]   │──┼──► Upstream pool B (whisper)
                                 │  │  [tool-call loop]    [model routing]   │──┼──► …
                                 │  └────────────────────────────────────────┘  │
@@ -44,7 +44,7 @@ The single gateway binary. Split into two modules at the top level:
 - `auth/oidc.rs` — hand-rolled OIDC client (discovery + JWKS-verified ID tokens, runs on reqwest).
 - `auth/token.rs` — gateway-token mint/hash helpers.
 - `config.rs` — typed `[upstream_pools]`, `[[models]]`, `[oidc]`, `[rbac]` schema.
-- `db/` — sqlx, tables for users / tokens / sessions / pending_logins / cli_logins.
+- `db/` — sqlx, tables for users / tokens / sessions / pending_logins.
 - `rbac/` — role lookup + per-user allowed-tool computation.
 - `state.rs` — `AppState` (`Arc<UpstreamRegistry>`, `Arc<ToolRegistry>`, `Arc<Resolver>`, db pool, optional `Arc<OidcClient>`, the `reqwest::Client`).
 - `tools/` — `Tool` trait, `ToolRegistry`, the round-loop runner.
@@ -60,18 +60,9 @@ The single gateway binary. Split into two modules at the top level:
 - `pages/` — plait-rendered HTML, split per route. `mod.rs` carries the shared chrome (layout, nav, theme, SSE framing helpers, `Flash`, the session gate, `/login`, `/theme/toggle`); `chat/` is a directory module for the multi-conversation chat (handlers in `mod.rs`, streaming worker in `worker.rs`, renderers in `render.rs`); `tokens.rs` owns `/tokens` CRUD; `dashboard.rs` owns `/`.
 - `chat_workers.rs` — per-user registry of in-flight chat workers (cancel flag + `broadcast::Sender<TurnUpdate>`). One worker per user max; the messages handler refuses concurrent submits, the tail handler attaches to the existing worker for reconnects.
 - `oidc_handlers.rs` — `/auth/{login,callback,logout}`. Replaces the tower-sessions key/value bag with a `pending_logins` row keyed by the OIDC `state` parameter.
-- `cli_handlers.rs` — `/auth/cli/{start,begin,poll}` for the `gw auth login` loopback.
 - `assets.rs` — `include_bytes!`'d `app.css` (Tailwind + daisyUI bundle) + `datastar.js` + `app.js` + `pcm-recorder.js`. Each is served at a `?v=<sha256-prefix>` versioned URL with `Cache-Control: immutable`.
 
 `main.rs` wires it all: config → db → upstreams → tools → rbac → SessionStore → OIDC → `rama_server::router::serve`.
-
-### `crates/cli`
-Ships as the `gw` binary. Modules:
-- `cmd::auth` — `login`, `logout`, `whoami`. Implements the loopback handoff: posts `pkce_challenge` to `/auth/cli/start`, opens the browser at the returned URL, polls `/auth/cli/poll` until the gateway has stashed the freshly-minted token plaintext.
-- `cmd::ping`, `cmd::models`, `cmd::tools` — list-only, useful for debugging RBAC config.
-- `client` — thin HTTP client over reqwest, sets `Authorization: Bearer …`.
-
-Depends on `shared` for response types, never on `gateway`.
 
 ## Request flow: `POST /v1/chat/completions`
 

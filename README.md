@@ -19,7 +19,6 @@ Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests acro
   - [RAG (codebase search)](#rag-codebase-search)
   - [Agent Skills](#agent-skills)
 - [Using the gateway](#using-the-gateway)
-  - [CLI (`gw`)](#cli-gw)
   - [HTTP endpoints](#http-endpoints)
 - [Production deployment (container + systemd)](#production-deployment-container--systemd)
   - [Docker Compose](#docker-compose)
@@ -207,7 +206,7 @@ base_url = "http://gpu-01.internal:8000/v1"
 # api_key_env = "GPU01_KEY"                         # if the backend itself needs a bearer token
 # alias    = ["qwen", "fast"]                       # stable client-facing names → this backend's model
 
-# Needed for sign-in + token minting. Without it, /auth/login and `gw auth login` don't work.
+# Needed for sign-in + token minting. Without it, /auth/login and the /login page don't work.
 [oidc]
 issuer            = "https://id.example.com/realms/company"
 client_id         = "llm-gateway"
@@ -312,9 +311,7 @@ As an admin, open `/admin/skills` to **upload** a `.skill` archive (a zip of a `
 
 ## Using the gateway
 
-**1 — Get an API token.** Either:
-- **CLI:** `gw auth login` opens your browser, authenticates via OIDC, and saves a `gwk_…` token locally; or
-- **UI:** sign in at `/login`, then create a token on the `/tokens` page.
+**1 — Get an API token.** Sign in at `/login`, then create a `gwk_…` token on the `/tokens` page.
 
 **2 — Call it like the OpenAI API:**
 
@@ -328,18 +325,6 @@ openai api chat_completions.create -m <model-id> -g user "Hello"
 
 **3 — Or just use the chat UI** at `/chat`: pick a model, attach files, and chat with streaming replies. Conversations persist server-side and resume on reconnect.
 
-### CLI (`gw`)
-
-In a clone, run it via `mise run cli -- <args>`; a release build produces a standalone `gw` binary. Target a non-default gateway with `--gateway <url>` (default `http://localhost:8080`).
-
-| Command | What it does |
-|---|---|
-| `gw ping` | Check the gateway is reachable (`GET /healthz`). |
-| `gw auth login` | Browser OIDC login; saves a token locally. `--no-browser` prints the URL instead; `--profile <name>` keeps multiple identities. |
-| `gw auth whoami` | Show the authenticated user. |
-| `gw auth logout` | Revoke the local token on the gateway and forget it locally. |
-| `gw auth tools` | List the tools your role(s) grant. |
-
 ### HTTP endpoints
 
 | Endpoint | Auth | Purpose |
@@ -351,8 +336,6 @@ In a clone, run it via `mise run cli -- <args>`; a release build produces a stan
 | `POST /v1/audio/transcriptions` | Bearer token | Whisper-style transcription (multipart upload). |
 | `POST /v1/audio/speech` | Bearer token | Text-to-speech (OpenAI-shaped). Only served when a `speech` upstream pool is configured. |
 | `GET /v1/models` | Bearer token | All discovered models across pools (deduplicated by id). |
-| `GET /v1/me` | Bearer token | Caller identity + the tools your role(s) grant (backs `gw auth whoami` / `gw auth tools`). |
-| `POST /v1/auth/logout` | Bearer token | Revoke the bearer token used for the call (backs `gw auth logout`). |
 | `GET /v1/sandbox/files/{run}/{filename}` | Bearer token | Download a file a sandbox run produced for the caller (scoped to your user). |
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness probes. |
 | `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled`, `/integrations`, `/usage` | session cookie | Web UI (`/integrations` is the per-user MCP connector store; `/usage` shows your own request/token usage; admins get an in-page "All users" toggle). |

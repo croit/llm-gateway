@@ -10,7 +10,6 @@
 
 pub mod api;
 pub mod auth;
-pub mod cli_handlers;
 pub mod oidc_handlers;
 pub mod pages;
 pub mod proxy;

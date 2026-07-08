@@ -34,7 +34,7 @@ const METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPT
 /// documented patterns (a `/*` suffix is a prefix glob).
 const UNDOCUMENTED: &[&str] = &[
     "/assets/*",     // static bundles baked in via include_bytes
-    "/auth/*",       // OIDC browser flow + CLI device-flow handoff (covered in prose)
+    "/auth/*",       // OIDC browser flow (covered in prose)
     "/theme/toggle", // UI affordance, not an API surface
     "/nav/toggle",   // UI affordance — collapse/expand a sidebar nav-group
     "/lang",         // UI affordance — sets the language-preference cookie

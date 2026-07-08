@@ -70,9 +70,8 @@ pub async fn me(State(state): State<Arc<RamaState>>, req: Request) -> Response {
 }
 
 /// Build the identity response (`Me` JSON, or a 5xx envelope if the user row
-/// has vanished) for an already-authenticated `user_id`. Shared by the
-/// session-gated `GET /api/v0/me` (web UI) and the bearer-gated `GET /v1/me`
-/// (the `gw` CLI), so both surfaces return byte-identical payloads.
+/// has vanished) for an already-authenticated `user_id`. Backs the
+/// session-gated `GET /api/v0/me` (web UI).
 pub(crate) async fn me_response(state: &RamaState, user_id: &str) -> Response {
     let user = match users::find_by_id(&state.db, user_id).await {
         Ok(Some(u)) => u,

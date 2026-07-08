@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
 use rama::http::service::web::extract::{Query, State};
-use rama::http::service::web::response::IntoResponse;
 use rama::http::{HeaderMap, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::json;
@@ -41,9 +40,6 @@ const OIDC_BINDING_COOKIE: &str = "gw_oidc";
 pub struct LoginParams {
     /// Where to send the user after login. Optional; defaults to `/`.
     pub return_to: Option<String>,
-    /// CLI handoff: if /auth/cli/begin already dropped us a state, the
-    /// callback finishes that flow instead of redirecting normally.
-    pub cli_state: Option<String>,
 }
 
 /// GET /auth/login — starts the OIDC dance.
@@ -61,18 +57,16 @@ pub async fn login(
     let start = oidc.begin();
     let now = Timestamp::now();
     let return_to = params.return_to.filter(|rt| is_safe_return_to(rt));
-    let cli_state = params.cli_state.filter(|s| !s.is_empty());
 
     let res = sqlx::query(
         "INSERT INTO pending_logins
-           (state, pkce_verifier, nonce, return_to, cli_state, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+           (state, pkce_verifier, nonce, return_to, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&start.csrf)
     .bind(&start.pkce_verifier)
     .bind(&start.nonce)
     .bind(return_to.as_deref())
-    .bind(cli_state.as_deref())
     .bind(now.to_string())
     .bind((now + PENDING_LOGIN_TTL).to_string())
     .execute(&state.db)
@@ -135,9 +129,9 @@ pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Resp
 
     // Pull the in-flight row. Missing → either expired, already consumed,
     // or never started — all "go back to /auth/login" from the user POV.
-    type PendingRow = (String, String, Option<String>, Option<String>, String);
+    type PendingRow = (String, String, Option<String>, String);
     let pending: Option<PendingRow> = match sqlx::query_as(
-        "SELECT pkce_verifier, nonce, return_to, cli_state, expires_at
+        "SELECT pkce_verifier, nonce, return_to, expires_at
              FROM pending_logins WHERE state = ?",
     )
     .bind(&state_param)
@@ -150,7 +144,7 @@ pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Resp
             return error_html(StatusCode::INTERNAL_SERVER_ERROR, "session lookup failed");
         }
     };
-    let Some((verifier, nonce, return_to, cli_state, expires_at_raw)) = pending else {
+    let Some((verifier, nonce, return_to, expires_at_raw)) = pending else {
         return error_html(
             StatusCode::BAD_REQUEST,
             "OIDC callback without an in-flight session — restart at /auth/login",
@@ -215,13 +209,6 @@ pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Resp
         return error_html(StatusCode::INTERNAL_SERVER_ERROR, "could not persist user");
     }
 
-    // CLI handoff branch — finishes a `gw auth login` flow. The browser
-    // gets a "you can close this tab" page; the polling CLI picks up the
-    // freshly-minted token from cli_logins.
-    if let Some(cli_state) = cli_state {
-        return finish_cli_login(&state, &cli_state, &claims.subject).await;
-    }
-
     // Browser flow: mint a session, set the signed cookie, redirect.
     let session = match state.sessions.create(&claims.subject).await {
         Ok(s) => s,
@@ -269,96 +256,6 @@ pub async fn logout(State(state): State<Arc<RamaState>>, req: Request) -> Respon
         .body("".into())
         .unwrap()
 }
-
-async fn finish_cli_login(state: &RamaState, cli_state: &str, subject: &str) -> Response {
-    use crate::server::db::cli_logins;
-
-    let row = match cli_logins::find(&state.db, cli_state).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return error_html(
-                StatusCode::BAD_REQUEST,
-                "CLI login state has expired — re-run `gw auth login`",
-            );
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "cli_logins lookup");
-            return error_html(StatusCode::INTERNAL_SERVER_ERROR, "cli_login lookup failed");
-        }
-    };
-    if row.expires_at < Timestamp::now() {
-        return error_html(StatusCode::BAD_REQUEST, "CLI login state has expired");
-    }
-
-    // Do NOT mint a token here. Render a consent page instead — the token
-    // is only minted when the authenticated user explicitly authorizes
-    // (POST /auth/cli/approve). This is what defeats the phishing case:
-    // completing OIDC alone (which a tricked user might) no longer hands a
-    // token to whoever initiated the CLI flow. The confirmation code lets
-    // the user check the prompt matches the code shown in *their* terminal.
-    let email = users::find_by_id(&state.db, subject)
-        .await
-        .ok()
-        .flatten()
-        .map(|u| u.email)
-        .unwrap_or_else(|| subject.to_string());
-    let code = shared::cli_login_code(cli_state);
-    let approval =
-        crate::rama_server::cli_handlers::approval_token(&state.sessions, cli_state, subject);
-
-    let html = CLI_CONSENT_HTML
-        .replace("%%EMAIL%%", &escape_html(&email))
-        .replace("%%CODE%%", &escape_html(&code))
-        .replace("%%APPROVAL%%", &escape_html(&approval));
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        html,
-    )
-        .into_response()
-}
-
-/// Consent page shown after a successful OIDC login that was started by
-/// the CLI. `%%EMAIL%%` / `%%CODE%%` / `%%APPROVAL%%` are substituted
-/// (HTML-escaped) per request. Both buttons POST the signed approval token
-/// so the server can act without a browser session.
-const CLI_CONSENT_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>Authorize CLI sign-in</title>
-<style>
- body{font:15px/1.5 system-ui;background:#0f1115;color:#e6e8eb;display:flex;min-height:100vh;margin:0;align-items:center;justify-content:center}
- .card{max-width:30rem;padding:2rem;border:1px solid #2a2f3a;border-radius:12px;background:#151923}
- h1{font-size:1.2rem;margin:0 0 .5rem}
- .code{font:600 1.6rem ui-monospace,monospace;letter-spacing:.15em;background:#0f1115;border:1px solid #2a2f3a;border-radius:8px;padding:.6rem 1rem;text-align:center;margin:1rem 0}
- .warn{color:#f0b429;font-size:.85rem}
- .muted{color:#8a93a6;font-size:.85rem}
- .row{display:flex;gap:.75rem;margin-top:1.5rem}
- .row form{flex:1;margin:0}
- button{width:100%;padding:.6rem 1rem;border-radius:8px;border:0;font:600 1rem system-ui;cursor:pointer}
- .approve{background:#3b82f6;color:#fff}
- .deny{background:#2a2f3a;color:#e6e8eb}
-</style></head><body>
-<div class="card">
- <h1>Authorize command-line sign-in</h1>
- <p>A command-line application is requesting an API token for <strong>%%EMAIL%%</strong>.</p>
- <p class="muted">Confirm this matches the code shown in your terminal:</p>
- <div class="code">%%CODE%%</div>
- <p class="warn">⚠ Only authorize if you just ran <code>gw auth login</code> yourself and the code matches. If you didn't start this, click Deny.</p>
- <div class="row">
-  <form method="post" action="/auth/cli/approve">
-    <input type="hidden" name="approval" value="%%APPROVAL%%">
-    <button class="approve" type="submit">Authorize</button>
-  </form>
-  <form method="post" action="/auth/cli/deny">
-    <input type="hidden" name="approval" value="%%APPROVAL%%">
-    <button class="deny" type="submit">Deny</button>
-  </form>
- </div>
-</div>
-</body></html>"#;
-
-// HTML escaping shares one implementation with the rest of the app
-// (session-core) so the escape set can't drift between copies.
-use session_core::chrome::escape_html;
 
 /// 303 to the IdP while dropping the browser-binding cookie (see
 /// [`OIDC_BINDING_COOKIE`]). `state` is the CSRF/state value the callback

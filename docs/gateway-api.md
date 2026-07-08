@@ -16,8 +16,6 @@ The routes are wired in `crates/gateway/src/rama_server/router.rs`; the `/v1/*` 
 | POST | `/v1/audio/speech`         | Bearer | Text-to-speech (OpenAI-shaped: `{model, input, voice, response_format}`). Byte-dumb relay to the `speech` pool; audio bytes out. Returns a routing error if no `speech` backend serves the model (i.e. no `speech` pool configured). |
 | GET  | `/v1/models`               | Bearer | Lists every model served by any healthy backend across all pools (chat, transcription, embedding, image, speech), de-duplicated by id. Synthesised from the registry's cached model sets — no upstream round-trip. |
 | GET  | `/v1/models/{id}`          | Bearer | Retrieve a single model object, or `404 model_not_found` if no backend serves the id. `{id}` is a catch-all because model ids contain `/`. |
-| GET  | `/v1/me`                   | Bearer | Caller identity + roles + the tools their role(s) grant. Backs `gw auth whoami` / `gw auth tools`. Same payload as the session-gated `GET /api/v0/me`. |
-| POST | `/v1/auth/logout`          | Bearer | Revokes the bearer token used for the call (server-side). Backs `gw auth logout`. Returns `{"revoked": <bool>}`. |
 | GET  | `/v1/sandbox/files/{run}/{filename}` | Bearer | Downloads a file a sandbox run produced for the caller, scoped to the caller's user (see `sandbox_api`). |
 | GET  | `/healthz`                 | none | Liveness. Returns `{"status":"ok"}`. |
 | GET  | `/readyz`                  | none | Readiness. Returns `{"status":"ok"}`. |

@@ -34,7 +34,6 @@ The gateway binary `include_bytes!`s its static assets (`app.css`, `datastar.js`
 | TypeScript type-check only (`tsc --noEmit`) | `mise run typecheck` |
 | Everything CI runs (lint + test + release build) | `mise run ci` |
 | Enable the version-controlled git hooks (pre-push CI gate) | `mise run setup-hooks` |
-| Run the CLI | `mise run cli -- auth login` |
 
 **Debug vs release.** `mise run build` (release) takes ~12 s cold-incremental and ~70 s from clean — only use it when you actually want optimised output (deploys, perf measurement). For day-to-day iteration (running locally, screenshotting pages, smoke-testing changes) use `mise run dev` or `mise run dev-build`; those produce a debug binary in ~2 s incremental (vs ~11 s for a release build). Runtime perf is identical for any UX you'd interact with; only synthetic benchmarks notice the difference.
 
@@ -62,13 +61,11 @@ mise run dev
 
 There's no WASM step, no `dx`, no hot reload of HTML — the rama server serves plain server-rendered HTML and reloads happen via the browser's refresh button. The asset bundles rebuild live if you run `mise run watch-css` and/or `mise run watch-js` in separate terminals, so style/JS changes appear after one refresh. (The committed bundles mean the watchers are optional for plain backend work.)
 
-The CLI is run independently via `mise run cli -- <args>`. It currently supports `ping` and `auth` (`login` / `whoami` / `logout`). It needs a gateway running somewhere — point it at the dev server with the `--gateway` flag or the `$GW_GATEWAY_URL` env var (default `http://localhost:8080`).
-
 ## Environment
 
 Env config is layered through mise, not a `.env` file:
 
-- **`mise.toml` `[env]`** holds the non-secret defaults committed to the repo (`RUST_BACKTRACE=1`, `RUST_LOG=info,gateway=debug,cli=debug`).
+- **`mise.toml` `[env]`** holds the non-secret defaults committed to the repo (`RUST_BACKTRACE=1`, `RUST_LOG=info,gateway=debug`).
 - **`mise.local.toml` `[env]`** holds secrets and machine-local overrides — it is **gitignored**. This is where local dev keys go: `GATEWAY_SESSION_KEY`, `GATEWAY_OIDC_CLIENT_SECRET`, provider keys (`OPENAI_API_KEY`, `ZAI_API_KEY`, …), `BRAVE_SEARCH_API_KEY`, `SEARCH_PROVIDER`, etc.
 
 Secrets never live in `gateway.toml`. The config holds only the *names* of environment variables (e.g. `api_key_env = "GPU01_KEY"`, `session_key_env = "GATEWAY_SESSION_KEY"`); the gateway reads the actual values from its environment at startup.

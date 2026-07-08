@@ -18,7 +18,7 @@ pub struct User {
     pub updated_at: Timestamp,
     /// IANA timezone (e.g. `Europe/Berlin`). Captured from the browser
     /// on first authed page load — see `set_timezone`. None for users
-    /// who only hit the gateway through `gw` CLI / external API calls,
+    /// who only hit the gateway through external API calls,
     /// or who haven't navigated the UI since the column was added.
     /// Tools that care about wall-clock time fall back to UTC when
     /// this is null.

@@ -4,7 +4,6 @@ members = [
     "crates/shared",
     "crates/session-core",
     "crates/gateway",
-    "crates/cli",
     "crates/sandbox-runner",
 ]
 
@@ -81,7 +80,6 @@ sha2 = "0.10"
 hmac = "0.12"
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
-webbrowser = "1"
 # Pinned to the `rust_crypto` (pure-Rust) backend: v10 dropped the bundled
 # crypto provider, so a backend must be selected explicitly. `rust_crypto`
 # avoids the aws-lc-sys C/cmake build the alternative would add. v10.3+ also

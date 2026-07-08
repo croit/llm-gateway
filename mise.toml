@@ -32,7 +32,7 @@ typst = "0.15.0"
 
 [env]
 RUST_BACKTRACE = "1"
-RUST_LOG = "info,gateway=debug,cli=debug"
+RUST_LOG = "info,gateway=debug"
 # Secrets (API keys, tokens) go in the gitignored `mise.local.toml`, not
 # here — see `BRAVE_SEARCH_API_KEY` there. For the optional GeoIP
 # auto-updater (the `get_user_location` tool), set the IP2Location LITE
@@ -191,9 +191,5 @@ run = "git config core.hooksPath .githooks"
 [tasks.check]
 description = "Fast type-check across the workspace (no codegen)."
 run = "cargo check --workspace --all-targets"
-
-[tasks.cli]
-description = "Run the CLI from source. Pass args after `--`: `mise run cli -- auth login`."
-run = "cargo run --package cli --"
 
 

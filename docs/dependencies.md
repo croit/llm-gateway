@@ -27,12 +27,11 @@ These are pre-approved; just add them to the relevant crate's `Cargo.toml` (refe
 | `sqlx` (sqlite, runtime-tokio-rustls, macros, migrate) | `gateway` | Persistence for users, gateway tokens, sessions, pending_logins, audit log. |
 | `hmac` + `sha2` | `gateway` | HMAC-SHA256 for the signed session cookie; SHA-256 for indexed bearer-token lookup. Tokens are 256-bit OS-random opaque strings, so argon2id would only add CPU cost without security gain. |
 | `rand` (with OsRng) | `gateway` | Session IDs and new gateway tokens from the OS RNG. |
-| `uuid` (v4, serde) | `gateway` | Stable IDs for tokens, CLI handoff state. |
+| `uuid` (v4, serde) | `gateway` | Stable IDs for tokens. |
 | `url` | `gateway` | OIDC redirect-URI construction and parsing. |
-| `webbrowser` | `cli` | Opens the OIDC login URL when the user runs `gw auth login`. Trivially small. |
-| `clap` (derive) | `cli` | Argument parsing. The standard. |
-| `toml` | `gateway`, `cli` | Config and credentials file. |
-| `anyhow` | `gateway`, `cli` (binaries only) | Error chains in binary code paths. **Not** allowed in `shared` or any code whose errors cross an API boundary — those use `thiserror`. See `docs/errors.md`. |
+| `clap` (derive) | `sandbox-runner` | Argument parsing. The standard. |
+| `toml` | `gateway` | Config file. |
+| `anyhow` | `gateway`, `sandbox-runner` (binaries only) | Error chains in binary code paths. **Not** allowed in `shared` or any code whose errors cross an API boundary — those use `thiserror`. See `docs/errors.md`. |
 | `jiff` | `gateway`, `shared` | Timestamps, durations, TTLs (token expiry, health-check intervals, audit-log times). Chosen over `chrono` and `time` for the cleaner API and serde support. |
 | `jsonwebtoken` | `gateway` | RS256 verification of OIDC ID tokens (via `openidconnect`'s plumbing) and signing of test-only ID tokens in `tests/oidc_integration.rs`. |
 | `multer` | `gateway` | Streaming multipart parser for `/v1/audio/transcriptions`, `/v1/audio/translations`, and the chat composer's attachment submit (`POST /chat/{id}/messages` is `multipart/form-data` so each file lands as a `name=attachment` part alongside the `model` + `message` text fields). |

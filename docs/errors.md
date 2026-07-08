@@ -29,7 +29,7 @@ Good:
 ```
 Error: cannot call /v1/chat/completions
 Caused by: model `gpt-4o` is not granted to your role `finance`.
-Help: ask an admin to add the model to your role, or list available models with `gw models`.
+Help: ask an admin to add the model to your role, or list available models with `GET /v1/models`.
 ```
 
 In code that uses `anyhow`, build it with `.context()`:
@@ -57,25 +57,10 @@ The HTTP boundary in the gateway converts the internal error tree to:
 
 The mapping lives in **one** place: `gateway::server::api::error`. Don't sprinkle `IntoResponse` impls across handlers.
 
-## CLI errors
-
-The `gw` CLI prints errors to stderr in this format:
-
-```
-gw auth login: failed
-  caused by: gateway returned 502 Bad Gateway
-  caused by: connection refused (tcp 127.0.0.1:8080)
-
-Help: is the gateway running? Try `mise run dev` or set --gateway <url>.
-```
-
-Implemented via `anyhow::Error`'s `{:#}` formatter plus a tail "Help:" line built per command. Exit codes per `docs/cli.md`.
-
 ## Logging vs returning
 
 Don't log inside library code. Log at the boundary:
 - Gateway: the request middleware logs every `5xx` with the full error chain at WARN.
-- CLI: the top-level `main()` prints to stderr.
 
 Re-logging the same error at every level of a call stack produces noise. One log per error chain.
 

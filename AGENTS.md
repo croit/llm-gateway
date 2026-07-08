@@ -6,12 +6,11 @@ This file is the canonical entry point for any AI agent (or new human contributo
 
 A single Rust binary plus the supporting crates it lives on:
 
-- **`gateway`** — authenticated, OpenAI-compatible LLM proxy. Speaks `/v1/chat/completions`, `/v1/audio/transcriptions`, `/v1/models` so any OpenAI SDK talks to it. OIDC + `gw auth login` CLI loopback. Routes across **multiple upstream LLM backends** with health checks + RAII in-flight accounting. Injects **company-specific tools** gated by **RBAC**. Server-rendered HTML UI (dashboard / tokens / persisted multi-conversation chat).
+- **`gateway`** — authenticated, OpenAI-compatible LLM proxy. Speaks `/v1/chat/completions`, `/v1/audio/transcriptions`, `/v1/models` so any OpenAI SDK talks to it. OIDC browser login + gateway-minted bearer tokens. Routes across **multiple upstream LLM backends** with health checks + RAII in-flight accounting. Injects **company-specific tools** gated by **RBAC**. Server-rendered HTML UI (dashboard / tokens / persisted multi-conversation chat).
 
 Shared crates:
 - **`session-core`** — chat-style UI substrate (Plait renderers + SSE primitives + DB schema + worker registry + `SessionDriver` trait). The gateway plugs in an `OpenAiDriver`; the trait keeps the renderers driver-agnostic so a future second consumer can paint the same chat surface without forking.
-- **`shared`** — OpenAI wire types, reused by the `cli` crate.
-- **`cli`** — `gw auth login`, `gw ping`, … the OpenAI-flavoured client.
+- **`shared`** — OpenAI wire types shared across the workspace.
 
 Built on **rama 0.3** (HTTP server + router + middleware), **plait** (inline-in-handler HTML), **datastar** (client-side reactivity over `datastar-patch-elements` SSE events), and **daisyUI v5 + Tailwind v4** (styling tokens).
 
@@ -34,8 +33,7 @@ Built on **rama 0.3** (HTTP server + router + middleware), **plait** (inline-in-
     │   │                            tables), Plait renderers (markdown + lumis-highlighted
     │   │                            code), SSE primitives, icons
     │   └── ui/ts/                   composer + scroll TS
-    ├── gateway/                 # the OpenAI-compatible proxy
-    └── cli/                     # `gw auth login`, `gw ping`, …
+    └── gateway/                 # the OpenAI-compatible proxy
 ```
 
 Inside `crates/gateway/src/`:
@@ -68,7 +66,6 @@ rama_server/              # rama-flavoured I/O surface (routes, middleware, page
       tokens.rs               /tokens CRUD + row / minted-banner renderers
       dashboard.rs            /  handler + body
     oidc_handlers.rs          /auth/{login,callback,logout}
-    cli_handlers.rs           /auth/cli/{start,begin,poll}
     assets.rs                 include_bytes! for app.css + datastar.js + app.js + pcm-recorder.js
 ```
 
@@ -100,7 +97,6 @@ mise run build-css         # one-shot CSS build
 mise run test              # cargo test --workspace
 mise run lint              # cargo fmt --check + clippy -D warnings
 mise run fmt               # cargo fmt
-mise run cli -- auth login # run the CLI from source
 
 # Browser-driven UI debugging (no OIDC required)
 mise run dev-ui            # real rama server on :8080 + wiremock chat &
@@ -131,11 +127,10 @@ Start in [`docs/README.md`](docs/README.md) for the index. The topical docs:
 | System architecture, request flow, component boundaries | [`docs/architecture.md`](docs/architecture.md) |
 | Toolchain, mise tasks, dev loop | [`docs/dev-workflow.md`](docs/dev-workflow.md) |
 | Dependency policy + the current allowed list | [`docs/dependencies.md`](docs/dependencies.md) |
-| OIDC login + CLI loopback handoff + gateway-minted tokens | [`docs/auth.md`](docs/auth.md) |
+| OIDC login + gateway-minted tokens | [`docs/auth.md`](docs/auth.md) |
 | OpenAI-compat endpoints, streaming, transcription | [`docs/gateway-api.md`](docs/gateway-api.md) |
 | Multi-provider routing, load balancing, health checks | [`docs/upstreams.md`](docs/upstreams.md) |
 | Tool registry, role→tool mapping, execution loop | [`docs/tools-rbac.md`](docs/tools-rbac.md) |
-| `gw` CLI commands, UX, config file | [`docs/cli.md`](docs/cli.md) |
 | Web UI — plait + daisyUI + datastar SSE patterns | [`docs/ui.md`](docs/ui.md) |
 | Testing strategy and required coverage | [`docs/testing.md`](docs/testing.md) |
 | Error handling — types, messages, OpenAI mapping | [`docs/errors.md`](docs/errors.md) |

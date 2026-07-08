@@ -18,7 +18,6 @@ pub mod chat_compactions;
 pub mod chat_session_settings;
 pub mod chat_session_skills;
 pub mod chat_session_tools;
-pub mod cli_logins;
 pub mod documents;
 pub mod mcp_catalog;
 pub mod model_defaults;

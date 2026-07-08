@@ -1260,45 +1260,6 @@ fn model_object(id: String) -> Value {
     })
 }
 
-/// `GET /v1/me` — caller identity + the tools their role(s) grant. Bearer-authed
-/// sibling of the session-gated `GET /api/v0/me`; backs `gw auth whoami` and
-/// `gw auth tools`, and returns the identical `Me` payload so the CLI and the
-/// web UI never disagree.
-pub async fn me(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let user = match require_bearer(&state, req.headers()).await {
-        Ok(u) => u,
-        Err(resp) => return resp,
-    };
-    crate::rama_server::api::me_response(&state, &user.user_id).await
-}
-
-/// `POST /v1/auth/logout` — revoke the bearer token used to make this call, so
-/// it stops working server-side (not just locally). Backs `gw auth logout`. The
-/// token identifies itself via the presented bearer, so no id is needed;
-/// revocation is scoped to the caller's own user + token.
-pub async fn logout(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let user = match require_bearer(&state, req.headers()).await {
-        Ok(u) => u,
-        Err(resp) => return resp,
-    };
-    match crate::server::db::tokens::revoke(&state.db, &user.user_id, &user.token_id).await {
-        Ok(revoked) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            json!({ "revoked": revoked }).to_string(),
-        )
-            .into_response(),
-        Err(err) => {
-            tracing::warn!(error = %err, token_id = %user.token_id, "self-revoke via /v1/auth/logout");
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "revoke failed",
-            )
-        }
-    }
-}
-
 /// Forwards a request body to the chosen upstream backend and relays the
 /// response. Reads the *full* upstream body into memory before responding
 /// — for the SSE-streaming chat path we'll need a different shape (next

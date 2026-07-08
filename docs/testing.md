@@ -6,10 +6,9 @@
 
 | Layer | Lives in | What it covers |
 |---|---|---|
-| **Unit** | `#[cfg(test)] mod tests` next to the code | Pure functions, parsers, picker strategies, config validation, credentials round-trips |
+| **Unit** | `#[cfg(test)] mod tests` next to the code | Pure functions, parsers, picker strategies, config validation |
 | **Integration (in-process)** | `crates/gateway/tests/` | Build a `RamaState` against an in-memory SQLite + wiremock upstreams, then call `router(state).serve(req)` directly — no socket binding, since `rama`'s service is a plain async function. Shared setup lives in `tests/common/mod.rs`. |
-| **Integration (mocked upstreams)** | `crates/gateway/tests/` | `wiremock` instances stand in for LLM backends; verify routing, the tool-call loop, streaming, the OIDC dance, and the datastar SSE wire shape. |
-| **CLI ↔ server contract** | `crates/gateway/tests/cli_identity.rs`, `oidc_integration.rs` | The `/v1/me` + `/v1/auth/logout` routes the `gw` CLI hard-codes, plus the full OIDC login flow, exercised in-process against the router. `crates/cli/tests/readme_cli.rs` separately pins the clap command tree to the README's CLI table. There is no child-process-spawn E2E for the CLI. |
+| **Integration (mocked upstreams)** | `crates/gateway/tests/` | `wiremock` instances stand in for LLM backends; verify routing, the tool-call loop, streaming, the full OIDC login flow (`oidc_integration.rs`), and the datastar SSE wire shape. |
 | **E2E (browser ↔ gateway)** | `e2e/*.test.mjs` | Playwright + Node's `node:test` against a running `mise run dev`. Anonymous page flows, authenticated flows (session seeded via the debug-only `/__dev/seed-session` endpoint), and plain-`fetch` checks of the public HTTP surface. See `e2e/README.md`. |
 
 ## Style: test-first, Chicago / Classicist

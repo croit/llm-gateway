@@ -36,45 +36,7 @@ Standard server-side OIDC:
 4. Gateway verifies state, exchanges code for ID/access tokens, validates the ID token signature, extracts subject + email + roles claim.
 5. Gateway upserts the user in SQLite, attaches the user id to the session, redirects to the originally requested page.
 
-Sessions are a hand-rolled `SessionStore` (see `rama_server::session`): an HMAC-SHA256-signed cookie `id=<session_id>.<hmac-b64url>` plus a row in the `sessions` table. The pending OIDC handshake (PKCE verifier + nonce + return_to + cli_state) lives in `pending_logins`, keyed by the OIDC `state` parameter. Cookie attributes: `HttpOnly; Secure; SameSite=Lax`.
-
-### CLI flow (loopback redirect)
-
-This is the Claude-Code-style flow. The CLI never sees the OIDC client secret and the OIDC provider doesn't need to know about loopback URIs — only the gateway is registered.
-
-```
-┌──────┐                      ┌─────────┐                   ┌──────────┐
-│ CLI  │                      │ Gateway │                   │ Browser  │
-└───┬──┘                      └────┬────┘                   └─────┬────┘
-    │ 1. POST /auth/cli/start      │                              │
-    │    {challenge: pkce-challenge}                              │
-    ├─────────────────────────────►│                              │
-    │ 2. {state, login_url}        │                              │
-    │◄─────────────────────────────│                              │
-    │                              │                              │
-    │ 3. open(login_url)           │ login_url points to /auth/cli/begin?state=…
-    ├──────────────────────────────┼─────────────────────────────►│
-    │                              │                              │
-    │                              │ 4. OIDC dance (redirect chain through provider)
-    │                              │◄─────────────────────────────┤
-    │                              │                              │
-    │                              │ 5. mint gateway token bound to state │
-    │                              │    render success page                │
-    │                              │─────────────────────────────►│
-    │                              │                              │
-    │ 6. POST /auth/cli/poll       │                              │
-    │    {state, pkce-verifier}    │                              │
-    ├─────────────────────────────►│                              │
-    │ 7. {gateway_token, user}     │                              │
-    │◄─────────────────────────────│                              │
-```
-
-Notes:
-- **PKCE between CLI and gateway** — even though OIDC PKCE is between gateway and provider, we add a second PKCE between CLI and gateway so the gateway only releases the token to the process that initiated the login.
-- **Polling, not loopback HTTP server**. Several alternatives considered:
-    - *Loopback HTTP server in the CLI*: complex on Windows, awkward port allocation, requires the gateway to know a localhost URL. We avoid it.
-    - *Polling* (chosen): CLI calls `/auth/cli/start`, gets a `state` id, opens the browser, then polls `/auth/cli/poll` every ~1s for up to 5 min. State expires server-side. Simpler, no localhost socket.
-- **Token TTL**: gateway tokens default to 90 days. Refresh isn't automatic — users re-run `gw auth login`. The gateway has a `/auth/cli/refresh` endpoint that's a no-op today, reserved for later if we want silent renewal.
+Sessions are a hand-rolled `SessionStore` (see `rama_server::session`): an HMAC-SHA256-signed cookie `id=<session_id>.<hmac-b64url>` plus a row in the `sessions` table. The pending OIDC handshake (PKCE verifier + nonce + return_to) lives in `pending_logins`, keyed by the OIDC `state` parameter. Cookie attributes: `HttpOnly; Secure; SameSite=Lax`.
 
 ### Endpoints
 
@@ -83,14 +45,10 @@ Notes:
 | GET  | `/auth/login`        | none | Start browser OIDC flow |
 | GET  | `/auth/callback`     | state cookie | OIDC redirect target |
 | POST | `/auth/logout`       | session | Clear session, revoke gateway tokens (optional) |
-| POST | `/auth/cli/start`    | none | CLI initiates login; returns `{state, login_url}` |
-| GET  | `/auth/cli/begin`    | state qs | Server-side: kicks the OIDC dance, binds the resulting user to `state` |
-| POST | `/auth/cli/poll`     | none | CLI polls with `{state, verifier}`; returns `{token, user}` once ready |
-| POST | `/auth/cli/refresh`  | bearer | Reserved. Returns the same token today. |
 
 ## Ongoing API auth (gateway tokens)
 
-After login, the CLI (or any OpenAI SDK pointed at us) sends `Authorization: Bearer <gateway-token>` on every `/v1/*` call.
+After login, any OpenAI SDK pointed at us sends `Authorization: Bearer <gateway-token>` on every `/v1/*` call.
 
 ### Token format
 
