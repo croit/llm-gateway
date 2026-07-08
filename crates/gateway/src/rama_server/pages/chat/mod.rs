@@ -1618,13 +1618,20 @@ fn first_message_title(msg: &str) -> String {
 }
 
 async fn list_transcription_models(state: &RamaState) -> Vec<String> {
-    state
+    use crate::server::feature_defaults::{self, Feature};
+    let mut models = state
         .upstreams
-        .models_for_kind(crate::server::upstreams::PoolKind::Transcription)
+        .models_for_kind(crate::server::upstreams::PoolKind::Transcription);
+    // Move the operator-configured default (if still served) to the front so
+    // the voice picker's first-option-wins default pre-selects it.
+    let configured = feature_defaults::get(&state.db, Feature::Transcription).await;
+    feature_defaults::promote(configured.as_deref(), &mut models, |m| m.as_str());
+    models
 }
 
 async fn list_chat_models(state: &RamaState) -> Vec<render::ChatModelOption> {
-    state
+    use crate::server::feature_defaults::{self, Feature};
+    let mut models: Vec<render::ChatModelOption> = state
         .upstreams
         .models_with_compliance_for_kind(crate::server::upstreams::PoolKind::Chat)
         .into_iter()
@@ -1633,7 +1640,13 @@ async fn list_chat_models(state: &RamaState) -> Vec<render::ChatModelOption> {
             gdpr: c.gdpr,
             nda: c.nda,
         })
-        .collect()
+        .collect();
+    // The chat picker (and the compliance banner it seeds) treats the first
+    // option as the default; promoting the configured model there pre-selects
+    // it without a separate `selected` concept. Unset / unavailable → no-op.
+    let configured = feature_defaults::get(&state.db, Feature::Chat).await;
+    feature_defaults::promote(configured.as_deref(), &mut models, |m| m.id.as_str());
+    models
 }
 
 // ---------------------------------------------------------------------------

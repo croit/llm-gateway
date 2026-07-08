@@ -55,3 +55,16 @@ admin-context-window-aria = Fenêtre de contexte (jetons)
 admin-context-window-invalid = la fenêtre de contexte `{ $value }` doit être un entier positif
 admin-context-window-saved = fenêtre de contexte définie pour `{ $model }`
 admin-context-window-cleared = fenêtre de contexte effacée pour `{ $model }`
+
+# Modèles par défaut par fonctionnalité (présélectionné dans les sélecteurs
+# chat/voix, et repli de l'API quand un appel n'indique pas de modèle).
+admin-defaults-heading = Modèles par défaut
+admin-defaults-intro = Choisissez le modèle présélectionné pour chaque fonctionnalité. Vide = le premier modèle disponible (comportement précédent).
+admin-defaults-chat-label = Chat
+admin-defaults-voice-label = Voix (transcription)
+admin-defaults-image-label = Génération d'images
+admin-defaults-embedding-label = Embedding (RAG)
+admin-defaults-first-option = Premier disponible
+admin-defaults-saved = modèle par défaut défini sur `{ $model }`
+admin-defaults-cleared = modèle par défaut réinitialisé
+admin-defaults-unknown-feature = fonctionnalité inconnue `{ $feature }`

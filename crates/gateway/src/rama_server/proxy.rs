@@ -301,6 +301,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
             state.upstreams.clone(),
             state.http.clone(),
             state.usage.clone(),
+            state.db.clone(),
         )),
     };
     let state_clone = state.clone();
@@ -1385,6 +1386,7 @@ async fn forward_streaming_with_tools(
             state.upstreams.clone(),
             state.http.clone(),
             state.usage.clone(),
+            state.db.clone(),
         )),
     };
 

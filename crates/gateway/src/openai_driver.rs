@@ -156,6 +156,7 @@ pub fn build_tool_context(
             state.upstreams.clone(),
             state.http.clone(),
             state.usage.clone(),
+            state.db.clone(),
         )),
     }
 }

@@ -12,6 +12,7 @@ use std::str::FromStr;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use thiserror::Error;
 
+pub mod app_settings;
 pub mod audit;
 pub mod chat_compactions;
 pub mod chat_session_settings;

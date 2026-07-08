@@ -14,6 +14,7 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod embeddings;
+pub mod feature_defaults;
 pub mod geoip;
 pub mod github;
 pub mod image_gen;

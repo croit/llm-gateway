@@ -55,3 +55,15 @@ admin-context-window-aria = 上下文窗口（词元）
 admin-context-window-invalid = 上下文窗口 `{ $value }` 必须为正整数
 admin-context-window-saved = 已为 `{ $model }` 设置上下文窗口
 admin-context-window-cleared = 已清除 `{ $model }` 的上下文窗口
+
+# 各功能的默认模型（在聊天/语音选择器中预先选中，以及调用未指定模型时的 API 回退）。
+admin-defaults-heading = 默认模型
+admin-defaults-intro = 选择每项功能预先选中的模型。留空 = 第一个可用模型（旧行为）。
+admin-defaults-chat-label = 聊天
+admin-defaults-voice-label = 语音（转录）
+admin-defaults-image-label = 图像生成
+admin-defaults-embedding-label = 嵌入（RAG）
+admin-defaults-first-option = 第一个可用
+admin-defaults-saved = 默认模型已设置为 `{ $model }`
+admin-defaults-cleared = 默认模型已清除
+admin-defaults-unknown-feature = 未知功能 `{ $feature }`

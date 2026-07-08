@@ -53,3 +53,16 @@ admin-context-window-aria = Context window (tokens)
 admin-context-window-invalid = context window `{ $value }` must be a positive integer
 admin-context-window-saved = set context window for `{ $model }`
 admin-context-window-cleared = cleared context window for `{ $model }`
+
+# Per-feature default models (the model pre-selected in the chat/voice
+# pickers, and the API fallback when a call omits a model).
+admin-defaults-heading = Default models
+admin-defaults-intro = Pick the model pre-selected for each feature. Blank = the first available model (the previous behaviour).
+admin-defaults-chat-label = Chat
+admin-defaults-voice-label = Voice (transcription)
+admin-defaults-image-label = Image generation
+admin-defaults-embedding-label = Embedding (RAG)
+admin-defaults-first-option = First available
+admin-defaults-saved = default model set to `{ $model }`
+admin-defaults-cleared = default model cleared
+admin-defaults-unknown-feature = unknown feature `{ $feature }`

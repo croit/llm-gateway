@@ -55,3 +55,16 @@ admin-context-window-aria = Ventana de contexto (tokens)
 admin-context-window-invalid = la ventana de contexto `{ $value }` debe ser un entero positivo
 admin-context-window-saved = ventana de contexto establecida para `{ $model }`
 admin-context-window-cleared = ventana de contexto borrada para `{ $model }`
+
+# Modelos predeterminados por función (preseleccionado en los selectores de
+# chat/voz, y alternativa de la API cuando una llamada omite el modelo).
+admin-defaults-heading = Modelos predeterminados
+admin-defaults-intro = Elige el modelo preseleccionado para cada función. Vacío = el primer modelo disponible (comportamiento anterior).
+admin-defaults-chat-label = Chat
+admin-defaults-voice-label = Voz (transcripción)
+admin-defaults-image-label = Generación de imágenes
+admin-defaults-embedding-label = Embedding (RAG)
+admin-defaults-first-option = Primero disponible
+admin-defaults-saved = modelo predeterminado establecido en `{ $model }`
+admin-defaults-cleared = modelo predeterminado restablecido
+admin-defaults-unknown-feature = función desconocida `{ $feature }`

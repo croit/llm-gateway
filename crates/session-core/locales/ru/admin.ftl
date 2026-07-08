@@ -55,3 +55,16 @@ admin-context-window-aria = Окно контекста (токены)
 admin-context-window-invalid = окно контекста `{ $value }` должно быть положительным целым
 admin-context-window-saved = окно контекста задано для `{ $model }`
 admin-context-window-cleared = окно контекста очищено для `{ $model }`
+
+# Модели по умолчанию для функций (предварительно выбираются в списках
+# чата/голоса и как резерв API, когда вызов не указывает модель).
+admin-defaults-heading = Модели по умолчанию
+admin-defaults-intro = Выберите модель, предварительно выбранную для каждой функции. Пусто = первая доступная модель (прежнее поведение).
+admin-defaults-chat-label = Чат
+admin-defaults-voice-label = Голос (транскрипция)
+admin-defaults-image-label = Генерация изображений
+admin-defaults-embedding-label = Эмбеддинги (RAG)
+admin-defaults-first-option = Первая доступная
+admin-defaults-saved = модель по умолчанию установлена: `{ $model }`
+admin-defaults-cleared = модель по умолчанию сброшена
+admin-defaults-unknown-feature = неизвестная функция `{ $feature }`

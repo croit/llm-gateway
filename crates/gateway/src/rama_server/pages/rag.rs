@@ -87,7 +87,17 @@ pub async fn rag_index(State(state): State<Arc<RamaState>>, req: Request) -> Res
         m.sort();
         m
     };
-    let body = render_body(lang, &rows, &embedding_models);
+    // Operator-configured default embedding model, but only when it's still
+    // advertised — a stale/unset value leaves the create form on its "choose a
+    // model" placeholder (we never *fall back* to a model for embeddings, since
+    // committing the wrong one would corrupt a collection's vector space).
+    let default_embedding = crate::server::feature_defaults::get(
+        &state.db,
+        crate::server::feature_defaults::Feature::Embedding,
+    )
+    .await
+    .filter(|m| embedding_models.iter().any(|a| a == m));
+    let body = render_body(lang, &rows, &embedding_models, default_embedding.as_deref());
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "rag-page-title");
     nav_or_html_page(
@@ -1551,7 +1561,11 @@ async fn row_html(state: &RamaState, lang: Lang, collection_id: i64) -> Option<S
     Some(render_row(lang, &c, &refs).to_string())
 }
 
-fn render_create_form(lang: Lang, embedding_models: &[String]) -> Html {
+fn render_create_form(
+    lang: Lang,
+    embedding_models: &[String],
+    default_embedding: Option<&str>,
+) -> Html {
     html! {
         form(
             id: "rag-create-form",
@@ -1576,7 +1590,7 @@ fn render_create_form(lang: Lang, embedding_models: &[String]) -> Html {
                             class: "input input-bordered w-full"
                         );
                     }
-                    (embedding_model_field(lang, embedding_models, None))
+                    (embedding_model_field(lang, embedding_models, default_embedding))
                     label(class: "form-control w-full md:col-span-2") {
                         div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-description-optional")) } }
                         input(
@@ -1925,6 +1939,7 @@ fn render_body(
     lang: Lang,
     list: &[(rag_db::Collection, Vec<rag_db::CollectionRef>)],
     embedding_models: &[String],
+    default_embedding: Option<&str>,
 ) -> Html {
     html! {
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
@@ -1938,7 +1953,7 @@ fn render_body(
                 " " (t(lang, "rag-description-suffix"))
             }
 
-            (render_create_form(lang, embedding_models))
+            (render_create_form(lang, embedding_models, default_embedding))
 
             section(class: "card border border-base-300") {
                 div(class: "card-body") {
@@ -2171,7 +2186,7 @@ mod tests {
     fn render_body_arms_status_poll_and_log_container() {
         let c = collection();
         let refs = vec![cref(42, rag_db::CollectionStatus::Cloning, None)];
-        let html = render_body(Lang::En, &[(c, refs)], &["embed".into()]).to_string();
+        let html = render_body(Lang::En, &[(c, refs)], &["embed".into()], None).to_string();
         assert!(html.contains("data-on-interval__duration.4s"), "{html}");
         assert!(html.contains("/rag/status"), "{html}");
         assert!(html.contains("rag-reflog-42"), "{html}");
@@ -2180,8 +2195,28 @@ mod tests {
     /// An empty list must NOT arm the poll (nothing to watch → no traffic).
     #[test]
     fn render_body_empty_list_does_not_poll() {
-        let html = render_body(Lang::En, &[], &["embed".into()]).to_string();
+        let html = render_body(Lang::En, &[], &["embed".into()], None).to_string();
         assert!(!html.contains("/rag/status"), "{html}");
+    }
+
+    /// The configured default embedding model pre-selects the create form's
+    /// `<select>` (so the operator doesn't re-pick it every time), while an
+    /// unset default leaves the "choose a model" placeholder in place.
+    #[test]
+    fn create_form_preselects_configured_default_embedding() {
+        let models: Vec<String> = vec!["embed-a".into(), "embed-b".into()];
+        // Configured + advertised → that option is selected.
+        let with = render_create_form(Lang::En, &models, Some("embed-b")).to_string();
+        assert!(
+            with.contains(r#"value="embed-b" selected="selected""#),
+            "configured default must be pre-selected: {with}"
+        );
+        // No default → the disabled placeholder is the selected option.
+        let without = render_create_form(Lang::En, &models, None).to_string();
+        assert!(
+            without.contains(r#"disabled="disabled" selected="selected""#),
+            "unset default must keep the choose-a-model placeholder: {without}"
+        );
     }
 
     #[test]

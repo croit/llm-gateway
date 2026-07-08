@@ -28,7 +28,9 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::server::chat_attachments;
+use crate::server::db::Pool;
 use crate::server::db::usage::{UsageKind, UsageRecord, UsageSource};
+use crate::server::feature_defaults::{self, Feature};
 use crate::server::upstreams::{PoolKind, UpstreamRegistry, registry::RouteError};
 use crate::server::usage::UsageHandle;
 
@@ -115,6 +117,9 @@ pub struct ImageGenerator {
     upstreams: Arc<UpstreamRegistry>,
     http: reqwest::Client,
     usage: UsageHandle,
+    /// Read-only handle for the operator-configured default image model
+    /// (`app_settings` → `default_model.image`). See [`Self::default_model`].
+    db: Pool,
 }
 
 impl ImageGenerator {
@@ -122,11 +127,13 @@ impl ImageGenerator {
         upstreams: Arc<UpstreamRegistry>,
         http: reqwest::Client,
         usage: UsageHandle,
+        db: Pool,
     ) -> Self {
         Self {
             upstreams,
             http,
             usage,
+            db,
         }
     }
 
@@ -149,10 +156,13 @@ impl ImageGenerator {
         size: Option<&str>,
         meta: &UsageMeta,
     ) -> Result<GeneratedImage, ImageGenError> {
-        let requested = model
-            .map(str::to_string)
-            .or_else(|| self.default_model())
-            .ok_or_else(|| ImageGenError::NoBackend(String::new()))?;
+        let requested = match model {
+            Some(m) => m.to_string(),
+            None => self
+                .default_model()
+                .await
+                .ok_or_else(|| ImageGenError::NoBackend(String::new()))?,
+        };
 
         // Route + hold an inflight slot for the duration of the call, exactly
         // like the proxy paths.
@@ -209,10 +219,13 @@ impl ImageGenerator {
         size: Option<&str>,
         meta: &UsageMeta,
     ) -> Result<GeneratedImage, ImageGenError> {
-        let requested = model
-            .map(str::to_string)
-            .or_else(|| self.default_model())
-            .ok_or_else(|| ImageGenError::NoBackend(String::new()))?;
+        let requested = match model {
+            Some(m) => m.to_string(),
+            None => self
+                .default_model()
+                .await
+                .ok_or_else(|| ImageGenError::NoBackend(String::new()))?,
+        };
 
         let acquired = self
             .upstreams
@@ -332,14 +345,14 @@ impl ImageGenerator {
     /// The model id the image pool advertises, if exactly one is discoverable.
     /// Lets `generate_image` be called without an explicit `model` on the
     /// common single-model deployment.
-    fn default_model(&self) -> Option<String> {
-        let mut models: Vec<String> = self
-            .upstreams
-            .models_for_kind(PoolKind::Image)
-            .into_iter()
-            .collect();
+    async fn default_model(&self) -> Option<String> {
+        let mut models: Vec<String> = self.upstreams.models_for_kind(PoolKind::Image);
         models.sort();
-        models.into_iter().next()
+        // Honour the operator-configured default when it's still being served;
+        // otherwise fall back to the alphabetically-first model (the historical
+        // behaviour) so a single-model deployment still needs no config.
+        let configured = feature_defaults::get(&self.db, Feature::Image).await;
+        feature_defaults::resolve(configured.as_deref(), &models)
     }
 
     /// GET an upstream-returned image URL server-side and validate it's an
@@ -495,13 +508,16 @@ mod tests {
         }
     }
 
-    fn generator(pool: Option<UpstreamPoolConfig>) -> ImageGenerator {
+    async fn generator(pool: Option<UpstreamPoolConfig>) -> ImageGenerator {
         let mut pools = HashMap::new();
         if let Some(p) = pool {
             pools.insert("img".to_string(), p);
         }
         let reg = UpstreamRegistry::new(&pools).unwrap();
-        ImageGenerator::new(reg, reqwest::Client::new(), UsageHandle::disabled())
+        let db = crate::server::db::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        ImageGenerator::new(reg, reqwest::Client::new(), UsageHandle::disabled(), db)
     }
 
     fn image_pool(base_url: &str) -> UpstreamPoolConfig {
@@ -560,7 +576,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let imggen = generator(Some(image_pool(&server.uri())));
+        let imggen = generator(Some(image_pool(&server.uri()))).await;
         let img = imggen
             .generate(Some("test-image"), "a cat", None, &meta())
             .await
@@ -589,7 +605,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let imggen = generator(Some(image_pool(&server.uri())));
+        let imggen = generator(Some(image_pool(&server.uri()))).await;
         let img = imggen
             .generate(Some("test-image"), "a dog", None, &meta())
             .await
@@ -606,7 +622,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(j!({ "data": [{}] })))
             .mount(&server)
             .await;
-        let imggen = generator(Some(image_pool(&server.uri())));
+        let imggen = generator(Some(image_pool(&server.uri()))).await;
         let err = imggen
             .generate(Some("test-image"), "x", None, &meta())
             .await
@@ -633,7 +649,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let imggen = generator(Some(image_pool(&server.uri())));
+        let imggen = generator(Some(image_pool(&server.uri()))).await;
         let err = imggen
             .generate(Some("test-image"), "x", None, &meta())
             .await
@@ -643,7 +659,7 @@ mod tests {
 
     #[tokio::test]
     async fn errors_when_no_image_pool_configured() {
-        let imggen = generator(None);
+        let imggen = generator(None).await;
         let err = imggen
             .generate(Some("test-image"), "x", None, &meta())
             .await
@@ -659,7 +675,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
             .mount(&server)
             .await;
-        let imggen = generator(Some(image_pool(&server.uri())));
+        let imggen = generator(Some(image_pool(&server.uri()))).await;
         let err = imggen
             .generate(Some("test-image"), "x", None, &meta())
             .await
@@ -678,7 +694,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let imggen = generator(Some(edit_pool(&server.uri(), true)));
+        let imggen = generator(Some(edit_pool(&server.uri(), true))).await;
         let img = imggen
             .edit(
                 Some("test-image"),
@@ -697,7 +713,7 @@ mod tests {
     #[tokio::test]
     async fn edit_rejected_when_backend_lacks_edit_support() {
         // Plain image_pool → supports_edit = false.
-        let imggen = generator(Some(image_pool("http://unused.invalid")));
+        let imggen = generator(Some(image_pool("http://unused.invalid"))).await;
         let err = imggen
             .edit(
                 Some("test-image"),
@@ -715,7 +731,7 @@ mod tests {
     #[tokio::test]
     async fn edit_blocked_on_non_gdpr_backend() {
         // Edit-capable but non-GDPR-compliant → refuse to ship user image.
-        let imggen = generator(Some(edit_pool("http://unused.invalid", false)));
+        let imggen = generator(Some(edit_pool("http://unused.invalid", false))).await;
         let err = imggen
             .edit(
                 Some("test-image"),
@@ -730,10 +746,18 @@ mod tests {
         assert!(matches!(err, ImageGenError::ComplianceBlocked), "{err:?}");
     }
 
-    #[test]
-    fn edit_available_reflects_backend_flag() {
-        assert!(!generator(Some(image_pool("http://x"))).edit_available());
-        assert!(generator(Some(edit_pool("http://x", true))).edit_available());
-        assert!(!generator(None).edit_available());
+    #[tokio::test]
+    async fn edit_available_reflects_backend_flag() {
+        assert!(
+            !generator(Some(image_pool("http://x")))
+                .await
+                .edit_available()
+        );
+        assert!(
+            generator(Some(edit_pool("http://x", true)))
+                .await
+                .edit_available()
+        );
+        assert!(!generator(None).await.edit_available());
     }
 }

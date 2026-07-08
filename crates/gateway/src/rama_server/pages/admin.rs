@@ -30,6 +30,7 @@ use session_core::icons;
 
 use crate::rama_server::state::RamaState;
 use crate::server::db::model_defaults as db;
+use crate::server::feature_defaults::{self, Feature};
 use crate::server::model_defaults as merge;
 use crate::server::upstreams::PoolKind;
 
@@ -87,7 +88,8 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         });
     }
 
-    let body = render_models_body(lang, &rows);
+    let defaults = defaults_rows(&state).await;
+    let body = render_models_body(lang, &defaults, &rows);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "admin-page-title");
     nav_or_html_page(
@@ -436,6 +438,75 @@ pub async fn models_context_window_save(
     toast(FlashKind::Success, msg)
 }
 
+/// POST /admin/models/defaults — set (or clear) the default model pre-selected
+/// for a feature (chat / voice-transcription / image). An empty `model` clears
+/// the override, restoring the "first advertised model" behaviour. The stored
+/// id is only *resolved* against the live set at use-time (see
+/// [`crate::server::feature_defaults`]), so saving a model that later stops
+/// being served degrades gracefully rather than erroring.
+pub async fn models_defaults_save(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let form: DefaultsForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(err) => {
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-malformed-form",
+                    &i18n::args([("err", err.to_string().into())]),
+                ),
+            );
+        }
+    };
+    let Some(feature) = Feature::from_wire(&form.feature) else {
+        return toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-defaults-unknown-feature",
+                &i18n::args([("feature", form.feature.clone().into())]),
+            ),
+        );
+    };
+    let trimmed = form.model.trim();
+    let model = (!trimmed.is_empty()).then_some(trimmed);
+    if let Err(err) = feature_defaults::set(&state.db, feature, model).await {
+        return toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-db-error",
+                &i18n::args([("err", err.to_string().into())]),
+            ),
+        );
+    }
+    let msg = match model {
+        Some(m) => t_args(
+            lang,
+            "admin-defaults-saved",
+            &i18n::args([("model", m.to_string().into())]),
+        ),
+        None => t(lang, "admin-defaults-cleared"),
+    };
+    toast(FlashKind::Success, msg)
+}
+
+#[derive(serde::Deserialize)]
+struct DefaultsForm {
+    feature: String,
+    #[serde(default)]
+    model: String,
+}
+
 #[derive(serde::Deserialize)]
 struct SaveForm {
     model_name: String,
@@ -495,7 +566,114 @@ struct ModelRow {
     context_window: Option<i64>,
 }
 
-fn render_models_body(lang: Lang, rows: &[ModelRow]) -> Html {
+/// One row of the "Default models" card: the feature, its label, the models
+/// its pool advertises (sorted), and the currently-stored override (raw — not
+/// yet resolved against `available`).
+struct FeatureDefaultRow {
+    feature: Feature,
+    label_key: &'static str,
+    available: Vec<String>,
+    current: Option<String>,
+}
+
+/// Build the per-feature default-model rows for the admin card. A feature with
+/// no advertised models is omitted (nothing to pick from).
+async fn defaults_rows(state: &RamaState) -> Vec<FeatureDefaultRow> {
+    let mut out = Vec::new();
+    for (feature, label_key) in [
+        (Feature::Chat, "admin-defaults-chat-label"),
+        (Feature::Transcription, "admin-defaults-voice-label"),
+        (Feature::Image, "admin-defaults-image-label"),
+        (Feature::Embedding, "admin-defaults-embedding-label"),
+    ] {
+        let mut available = state.upstreams.models_for_kind(feature.pool_kind());
+        available.sort();
+        if available.is_empty() {
+            continue;
+        }
+        let current = feature_defaults::get(&state.db, feature).await;
+        out.push(FeatureDefaultRow {
+            feature,
+            label_key,
+            available,
+            current,
+        });
+    }
+    out
+}
+
+/// The "Default models" card: one auto-saving `<select>` per feature that picks
+/// which model is pre-selected in the chat/voice pickers (and the API fallback
+/// when a call omits a model). Renders nothing when no feature has any models.
+fn render_defaults_card(lang: Lang, rows: &[FeatureDefaultRow]) -> Html {
+    if rows.is_empty() {
+        return html! { (String::new()) }.to_html();
+    }
+    let action = "/admin/models/defaults";
+    let selects: Vec<Html> = rows
+        .iter()
+        .map(|row| {
+            // "First available" (empty value) is selected when nothing is
+            // stored, or the stored id is no longer advertised.
+            let current_served = row
+                .current
+                .as_deref()
+                .filter(|c| row.available.iter().any(|a| a == c));
+            let mut opts: Vec<Html> = Vec::with_capacity(row.available.len() + 1);
+            let first_label = t(lang, "admin-defaults-first-option");
+            opts.push(if current_served.is_none() {
+                html! { option(value: "", selected: "selected") { (first_label) } }.to_html()
+            } else {
+                html! { option(value: "") { (first_label) } }.to_html()
+            });
+            for m in &row.available {
+                opts.push(if current_served == Some(m.as_str()) {
+                    html! { option(value: (m.clone()), selected: "selected") { (m.clone()) } }
+                        .to_html()
+                } else {
+                    html! { option(value: (m.clone())) { (m.clone()) } }.to_html()
+                });
+            }
+            html! {
+                form(
+                    method: "post",
+                    action: (action),
+                    class: "form-control m-0"
+                ) {
+                    input(type: "hidden", name: "feature", value: (row.feature.as_str()));
+                    span(class: "label-text text-xs mb-1") { (t(lang, row.label_key)) }
+                    select(
+                        name: "model",
+                        "aria-label": (t(lang, row.label_key)),
+                        "data-on:change": (format!("@post('{action}', {{contentType: 'form'}})")),
+                        class: "select select-bordered select-sm w-full"
+                    ) {
+                        for o in opts.iter() { (o.clone()) }
+                    }
+                }
+            }
+            .to_html()
+        })
+        .collect();
+    html! {
+        article(class: "card border border-base-300 bg-base-100") {
+            div(class: "card-body gap-3") {
+                header(class: "flex flex-col gap-1") {
+                    h2(class: "card-title text-base") { (t(lang, "admin-defaults-heading")) }
+                    p(class: "text-base-content/70 text-sm") { (t(lang, "admin-defaults-intro")) }
+                }
+                // Uniform half-width columns: a 2-up grid so every picker is the
+                // same width and rows line up (single column on narrow screens).
+                div(class: "grid grid-cols-1 md:grid-cols-2 gap-4") {
+                    for s in selects.iter() { (s.clone()) }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+fn render_models_body(lang: Lang, defaults: &[FeatureDefaultRow], rows: &[ModelRow]) -> Html {
     let cards: Vec<Html> = rows
         .iter()
         .map(|row| render_model_card(lang, row))
@@ -515,6 +693,7 @@ fn render_models_body(lang: Lang, rows: &[ModelRow]) -> Html {
                     (t(lang, "admin-intro-suffix"))
                 }
             }
+            (render_defaults_card(lang, defaults))
             if rows.is_empty() {
                 div(class: "alert") {
                     (icons::info(18))
@@ -575,7 +754,7 @@ fn render_model_card(lang: Lang, row: &ModelRow) -> Html {
                         id: (format!("toml-{}", row.name)),
                         name: "defaults_toml",
                         class: "textarea textarea-bordered font-mono text-sm w-full leading-relaxed",
-                        rows: "16",
+                        rows: "11",
                         spellcheck: "false",
                         placeholder: (placeholder)
                     ) { (row.toml.clone()) }
@@ -771,4 +950,74 @@ fn toast(kind: FlashKind, message: impl Into<String>) -> Response {
         kind,
         message: message.into(),
     })])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(available: &[&str], current: Option<&str>) -> FeatureDefaultRow {
+        FeatureDefaultRow {
+            feature: Feature::Chat,
+            label_key: "admin-defaults-chat-label",
+            available: available.iter().map(|s| s.to_string()).collect(),
+            current: current.map(str::to_string),
+        }
+    }
+
+    /// The card's `<select>` must post to the exact route the router registers,
+    /// carry the feature discriminator, and mark the stored model selected — the
+    /// UI-directive ↔ endpoint contract.
+    #[test]
+    fn defaults_card_wires_select_to_endpoint_and_marks_current() {
+        let rows = vec![row(&["glm-4.5", "glm-4.7"], Some("glm-4.7"))];
+        let html = render_defaults_card(Lang::En, &rows).to_string();
+        assert!(
+            html.contains(r#"action="/admin/models/defaults""#),
+            "form must post to the defaults route: {html}"
+        );
+        assert!(
+            html.contains("@post(") && html.contains("/admin/models/defaults"),
+            "select must auto-save to the defaults route on change: {html}"
+        );
+        assert!(
+            html.contains(r#"name="feature" value="chat""#),
+            "hidden feature field must identify the feature: {html}"
+        );
+        assert!(
+            html.contains(r#"value="glm-4.7" selected="selected""#),
+            "the stored default must be the selected option: {html}"
+        );
+    }
+
+    /// With nothing stored, or a stored id that's no longer advertised, the
+    /// "First available" option is the selected one (graceful fallback) and no
+    /// concrete model is pre-selected.
+    #[test]
+    fn defaults_card_selects_first_available_when_unset_or_stale() {
+        for current in [None, Some("no-longer-served")] {
+            let rows = vec![row(&["a", "b"], current)];
+            let html = render_defaults_card(Lang::En, &rows).to_string();
+            assert!(
+                html.contains(r#"value="" selected="selected""#),
+                "first-available must be selected ({current:?}): {html}"
+            );
+            assert_eq!(
+                html.matches(r#"selected="selected""#).count(),
+                1,
+                "exactly one option selected ({current:?}): {html}"
+            );
+        }
+    }
+
+    /// No advertised models for any feature → the card renders nothing (no
+    /// stray form pointing at the endpoint).
+    #[test]
+    fn defaults_card_empty_when_no_features() {
+        let html = render_defaults_card(Lang::En, &[]).to_string();
+        assert!(
+            !html.contains("/admin/models/defaults"),
+            "empty card must not render the form: {html}"
+        );
+    }
 }

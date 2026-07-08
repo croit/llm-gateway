@@ -55,3 +55,16 @@ admin-context-window-aria = Kontextfenster (Tokens)
 admin-context-window-invalid = Kontextfenster `{ $value }` muss eine positive Ganzzahl sein
 admin-context-window-saved = Kontextfenster für `{ $model }` gesetzt
 admin-context-window-cleared = Kontextfenster für `{ $model }` gelöscht
+
+# Standardmodelle pro Funktion (im Chat/Sprach-Auswahlmenü vorausgewählt und
+# als API-Fallback, wenn ein Aufruf kein Modell angibt).
+admin-defaults-heading = Standardmodelle
+admin-defaults-intro = Wählen Sie das Modell, das für jede Funktion vorausgewählt ist. Leer = das erste verfügbare Modell (bisheriges Verhalten).
+admin-defaults-chat-label = Chat
+admin-defaults-voice-label = Sprache (Transkription)
+admin-defaults-image-label = Bildgenerierung
+admin-defaults-embedding-label = Embedding (RAG)
+admin-defaults-first-option = Erstes verfügbares
+admin-defaults-saved = Standardmodell auf `{ $model }` gesetzt
+admin-defaults-cleared = Standardmodell zurückgesetzt
+admin-defaults-unknown-feature = unbekannte Funktion `{ $feature }`

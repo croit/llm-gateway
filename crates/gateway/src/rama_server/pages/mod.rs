@@ -1114,7 +1114,7 @@ pub use connectors::{
 mod admin;
 pub use admin::{
     models_context_window_save as admin_models_context_window_save,
-    models_index as admin_models_index,
+    models_defaults_save as admin_models_defaults_save, models_index as admin_models_index,
     models_reasoning_budget_save as admin_models_reasoning_budget_save,
     models_reasoning_save as admin_models_reasoning_save, models_save as admin_models_save,
 };
