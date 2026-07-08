@@ -66,6 +66,8 @@ Every tool is **RBAC-gated per role**, and each user can flip their own grants o
 
 **Tools turn themselves on.** Tools start *off* to keep the model's tool list short — short lists are cheaper and the model picks tools more accurately. When a request needs a capability the model doesn't currently have, it calls a built-in `enable_tools` tool to switch the relevant ones on; their real schemas appear on the next turn and stay on for the rest of the conversation. So the model reaches for exactly what it needs, when it needs it, without the operator wiring per-conversation tool lists — all still bounded by what the user's role permits.
 
+![The chat rendering a generated image inline — the model called `generate_image` from a text prompt and the result appears directly in the reply.](docs/img/image-generation.png)
+
 ## The built-in web UI
 
 Beyond `/chat`, the gateway ships a small operator and account UI — no separate dashboard to deploy. Admin pages are gated to the `admin` role.
@@ -79,7 +81,20 @@ The UI is fully localized — English, German, French, Spanish, Russian, and Chi
 
 There's also `/tokens` (mint, rotate, and revoke your `gwk_…` API tokens — and scope each token to a subset of your tools), `/usage` (your own request/token usage), `/memory` (view and edit what the assistant has remembered about you), `/scheduled` (prompts that run on a cron schedule — see [Scheduled actions](#scheduled-actions)), `/admin/models` (server-wide sampling defaults, per-model reasoning budgets, per-model context windows that drive [conversation compaction](#conversation-compaction), and the per-feature **default model** pre-selected for chat, voice, image generation, and the RAG embedding picker), and `/admin/users` (registered users with their resolved roles). The users page can also let an admin **impersonate** another user for debugging — every impersonation is audited and shows a persistent banner. Impersonation is **opt-in**: it's off unless you set `[gateway].allow_impersonation = true` (default `false`), in which case the Impersonate buttons appear and `POST /admin/users/impersonate` is accepted; otherwise the buttons are hidden and that endpoint returns 403.
 
+| | |
+|---|---|
+| ![The /tokens page: mint a bearer token with a name and TTL, then a list of your tokens — each showing active/revoked status, created / last-used / expiry dates, a per-token tool-use toggle, and Rotate/Revoke actions.](docs/img/tokens.png) | ![The /usage page: request volume and token usage for the selected period, with headline Requests / Tokens / Errors counters and breakdowns by backend, source, and model — plus a Mine / All users toggle for admins.](docs/img/usage.png) |
+| **API tokens** (`/tokens`) — mint, rotate, revoke, and per-token tool scoping. | **Usage** (`/usage`) — your own request/token volume, broken down by backend, source, and model. |
+
+![The /admin/users page: everyone who has signed in, each row showing their identity-provider groups, the gateway roles those resolve to, when they joined, and an Impersonate action — plus a recent-impersonation audit log below.](docs/img/users.png)
+
 The `/chat` page itself does more than stream replies: **fork** a conversation, **share** it via a public link, **pin** favourites, **export** to Markdown or PDF, **edit-and-retry** a turn, **dictate** with the voice button, and set **per-conversation reasoning effort**. See [`docs/ui.md`](docs/ui.md).
+
+**Mobile.** The whole UI is responsive — on a phone the sidebar collapses into a hamburger drawer and the chat, composer, and admin pages reflow to a single column, so the gateway is fully usable from a browser on the go.
+
+| | |
+|---|---|
+| ![The chat UI on a phone-width screen: the sidebar is collapsed behind a hamburger and the conversation, tool calls, and composer reflow to a single column.](docs/img/mobile-chat.png) | ![The mobile navigation drawer slid open over the dimmed chat, showing the Workspace / Account / Admin nav groups and the conversation list.](docs/img/mobile-nav.png) |
 
 ## Scheduled actions
 
@@ -108,6 +123,8 @@ It appears in the chat composer **only when a `speech` upstream pool is configur
 **Configure it** by adding a pool with `kind = "speech"` — self-hosted (Qwen3-TTS, Kokoro, XTTS via openedai-speech, LocalAI) or cloud (**OpenAI** `api.openai.com/v1`, or any provider that speaks OpenAI's `/v1/audio/speech`). An optional `[upstream_pools.<name>.voices]` map picks a voice per spoken language (`de`, `en`, …; the `""` key is the default). Flag `compliance` on a non-EU pool (e.g. OpenAI) — voice mode sends the spoken text there. See `gateway.example.toml`.
 
 **How it works:** push-to-talk (hold the mic) → release → the transcript is submitted with the voice directive → as the reply streams, complete sentences are spoken one at a time. Non-speakable bits (code, tables) become a short spoken marker like "the code is shown on screen." It's **half-duplex** — while the assistant speaks, the mic is inert (no echo loop). The reply's language follows what you *spoke*; only the opening greeting uses the UI language. Always-listening (voice-activity) mode and barge-in are a planned next phase.
+
+![The voice conversation modal: a large push-to-talk button with a "Tap to talk" prompt, a running YOU / AI transcript, and a "recording to chat" indicator — everything said is also saved as an ordinary chat turn.](docs/img/voice.png)
 
 - **Rust** (edition 2024, toolchain pinned to 1.95 via [mise](https://mise.jdx.dev/)) — a workspace of 5 crates: `gateway`, `session-core`, `cli`, `shared`, and `sandbox-runner`.
 - **[rama 0.3.0-rc1](https://ramaproxy.org/)** — HTTP server, router, middleware, and proxying.

@@ -28,9 +28,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gateway::rama_server::{RamaState, SessionStore, router};
-use gateway::server::config::{FeedbackConfig, SkillsConfig};
+use gateway::server::config::{FeedbackConfig, GatewayConfig, SkillsConfig};
 use gateway::server::rbac::RoleConfig;
-use gateway::server::rbac::{Resolver, config::RbacConfig};
+use gateway::server::rbac::{Resolver, config::RbacConfig, config::RoleMapping};
 use gateway::server::skills::SkillStore;
 use gateway::server::tools::{ToolRegistry, echo, fetch_url, read_skill, search_web, time};
 use gateway::server::upstreams::{
@@ -38,7 +38,7 @@ use gateway::server::upstreams::{
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
 use gateway::server::{AppState, Config, db};
-use jiff::Timestamp;
+use jiff::{Timestamp, ToSpan};
 use rama::net::address::SocketAddress;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -211,6 +211,59 @@ async fn main() -> anyhow::Result<()> {
             }],
         },
     );
+    // Speech (TTS) pool — its mere presence flips `voice_available` on so the
+    // chat composer renders the live-voice button (and modal). Points at the
+    // chat mock's URL (never actually called just to render the button);
+    // `probe_models: false` + an explicit pool model keeps it out of the
+    // /models discovery path.
+    pools.insert(
+        "speech".to_string(),
+        UpstreamPoolConfig {
+            voices: Default::default(),
+            fallback_offline: None,
+            compliance: Default::default(),
+            kind: PoolKind::Speech,
+            strategy: PickerStrategy::RoundRobin,
+            models: vec!["demo-tts".into()],
+            backend: vec![BackendConfig {
+                alias: None,
+                probe_models: false,
+                supports_edit: false,
+                name: "wiremock-speech".into(),
+                base_url: chat_mock.uri(),
+                api_key_env: None,
+                weight: 1,
+                max_inflight: 16,
+                health_path: "/models".into(),
+                models: vec!["demo-tts".into()],
+            }],
+        },
+    );
+    // Image-generation pool — advertises an image model so the chat's
+    // image-generation affordance is present. Static model id; no discovery.
+    pools.insert(
+        "image".to_string(),
+        UpstreamPoolConfig {
+            voices: Default::default(),
+            fallback_offline: None,
+            compliance: Default::default(),
+            kind: PoolKind::Image,
+            strategy: PickerStrategy::RoundRobin,
+            models: vec!["demo-image".into()],
+            backend: vec![BackendConfig {
+                alias: None,
+                probe_models: false,
+                supports_edit: true,
+                name: "wiremock-image".into(),
+                base_url: chat_mock.uri(),
+                api_key_env: None,
+                weight: 1,
+                max_inflight: 16,
+                health_path: "/models".into(),
+                models: vec!["demo-image".into()],
+            }],
+        },
+    );
     let registry = upstreams::UpstreamRegistry::new(&pools)?;
     // Run the initial probe round so each backend's `/models` set is
     // populated before we start serving requests. Without this, the
@@ -221,19 +274,52 @@ async fn main() -> anyhow::Result<()> {
     // repo's `data/skills` bundles into a hot-reloadable store, grant the dev
     // role every skill, and register `read_skill`. Mirrors `main.rs`.
     //
-    // A single `admin` role granting every tool + skill to the seed user, so
-    // the operator/admin pages (/admin/*, /rag) are reachable and the skills
-    // pages show content. Set on `config.roles` too (not just the Resolver) so
-    // the skills page's "Granted to" column resolves it. The wiremock backend
-    // doesn't actually invoke tools — the gateway-side path is what we want
-    // for playwright / local-browser debugging.
-    let roles = vec![RoleConfig {
-        id: "admin".into(),
-        admin: true,
-        models: vec!["*".into()],
-        tools: vec!["*".into()],
-        skills: vec!["*".into()],
-    }];
+    // A small, realistic role set so the operator pages look like a real
+    // deployment: a privileged `admin`, a baseline `user` (the default role
+    // every signed-in user gets), and a few team roles resolved from OIDC
+    // groups. `admin` grants every tool + skill so the seed `dev` user (mapped
+    // to it via the `platform-admins` group) can reach /admin/*, /rag, and the
+    // skills content. Set on `config.roles` too (not just the Resolver) so the
+    // skills page's "Granted to" column and the users page's role columns
+    // resolve. The wiremock backend doesn't actually invoke tools — the
+    // gateway-side path is what we want for playwright / local-browser work.
+    let roles = vec![
+        RoleConfig {
+            id: "admin".into(),
+            admin: true,
+            models: vec!["*".into()],
+            tools: vec!["*".into()],
+            skills: vec!["*".into()],
+        },
+        RoleConfig {
+            id: "user".into(),
+            admin: false,
+            models: vec!["*".into()],
+            tools: vec!["*".into()],
+            skills: vec![],
+        },
+        RoleConfig {
+            id: "engineering".into(),
+            admin: false,
+            models: vec!["*".into()],
+            tools: vec!["*".into()],
+            skills: vec![],
+        },
+        RoleConfig {
+            id: "finance".into(),
+            admin: false,
+            models: vec!["demo-model".into()],
+            tools: vec![],
+            skills: vec![],
+        },
+        RoleConfig {
+            id: "support".into(),
+            admin: false,
+            models: vec!["demo-model".into()],
+            tools: vec!["search_web".into()],
+            skills: vec![],
+        },
+    ];
     // Generic, non-croit demo skills shipped beside this example (the real
     // `data/skills` is gitignored local data) — keeps README screenshots clean.
     // Absolute, CARGO_MANIFEST_DIR-anchored so it resolves regardless of cwd.
@@ -242,6 +328,12 @@ async fn main() -> anyhow::Result<()> {
         skills: Some(SkillsConfig {
             dir: skills_dir.clone(),
         }),
+        // Turn on impersonation so the /admin/users page renders its
+        // Impersonate action column (audited in production; harmless here).
+        gateway: GatewayConfig {
+            allow_impersonation: true,
+            ..Default::default()
+        },
         roles: roles.clone(),
         // Seed a feedback config so the floating feedback button + dialog
         // render in local UI debugging. The token is a dummy — recording,
@@ -268,8 +360,32 @@ async fn main() -> anyhow::Result<()> {
     let rbac = Arc::new(
         Resolver::build(
             RbacConfig {
-                default_role: Some("admin".into()),
-                mappings: vec![],
+                // Every signed-in user gets `user` as a baseline; team/admin
+                // roles come from their OIDC groups. `dev` carries the
+                // `platform-admins` group (below) → resolves to admin.
+                default_role: Some("user".into()),
+                mappings: vec![
+                    RoleMapping {
+                        oidc_claim: "groups".into(),
+                        oidc_value: "platform-admins".into(),
+                        role: "admin".into(),
+                    },
+                    RoleMapping {
+                        oidc_claim: "groups".into(),
+                        oidc_value: "engineering".into(),
+                        role: "engineering".into(),
+                    },
+                    RoleMapping {
+                        oidc_claim: "groups".into(),
+                        oidc_value: "finance".into(),
+                        role: "finance".into(),
+                    },
+                    RoleMapping {
+                        oidc_claim: "groups".into(),
+                        oidc_value: "support".into(),
+                        role: "support".into(),
+                    },
+                ],
             },
             roles,
         )
@@ -288,12 +404,12 @@ async fn main() -> anyhow::Result<()> {
             )),
     );
     let app = AppState::new(config, pool.clone(), registry, tools, rbac).with_skills(skill_store);
+    // Enabled usage handle (90-day retention) so the /usage page renders real
+    // aggregates instead of the "metrics disabled" banner. Spawn before the
+    // pool is moved into the session store.
+    let usage = gateway::server::usage::spawn(pool.clone(), 90);
     let sessions = SessionStore::new(pool, SESSION_SECRET);
-    let state = RamaState::new(
-        app,
-        sessions,
-        gateway::server::usage::UsageHandle::disabled(),
-    );
+    let state = RamaState::new(app, sessions, usage);
 
     // --- Seed a user + session so the authed UI is reachable ---------
     use gateway::server::db::users;
@@ -304,7 +420,8 @@ async fn main() -> anyhow::Result<()> {
             id: "dev".into(),
             email: "dev@example.com".into(),
             name: Some("Dev User".into()),
-            roles: vec![],
+            // Maps to the admin role via the RBAC mapping above.
+            roles: vec!["platform-admins".into()],
             created_at: now,
             updated_at: now,
             timezone: None,
@@ -320,15 +437,20 @@ async fn main() -> anyhow::Result<()> {
     let cookie = state.sessions.sign(&session.id);
 
     eprintln!("---------------------------------------------------------------");
-    eprintln!("dev gateway listening on http://127.0.0.1:8080");
+    eprintln!(
+        "dev gateway listening on http://{}",
+        std::env::var("DEV_UI_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+    );
     eprintln!("authed pages: /, /tokens, /chat, /theme/toggle, /api/v0/*");
     eprintln!("seed cookie (paste into playwright / curl):");
     eprintln!("    id={cookie}");
     eprintln!("---------------------------------------------------------------");
 
     // rc1's `SocketAddress: FromStr` yields a boxed error that anyhow can't
-    // absorb via `?`; stringify it.
-    let addr: SocketAddress = "127.0.0.1:8080"
+    // absorb via `?`; stringify it. `DEV_UI_BIND` overrides the default bind
+    // (e.g. to run alongside a real gateway already on :8080).
+    let bind = std::env::var("DEV_UI_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let addr: SocketAddress = bind
         .parse()
         .map_err(|e| anyhow::anyhow!("parse bind address: {e}"))?;
     // `router::serve` binds the socket and listens until SIGINT / panic.
@@ -345,7 +467,43 @@ async fn main() -> anyhow::Result<()> {
 async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
     use gateway::server::db::rag;
     use gateway::server::scheduled::{self, NewAction};
+    use session_core::attachments;
     use session_core::db::{self as chatdb, ToolCallStatus, TurnStatus};
+
+    // --- An image-generation conversation (seeded FIRST so the gzip chat
+    // below stays the most-recent session and `/chat` still lands on it).
+    // The generated image is a self-contained SVG data URI carried via a
+    // `gw-attachment` marker — the exact mechanism the image-gen tool uses,
+    // minus S3 — so it renders inline like a real generated image.
+    const DEMO_IMAGE_DATA_URI: &str = concat!(
+        "data:image/svg+xml;base64,",
+        include_str!("demo-genimg.b64")
+    );
+    let img = chatdb::create_session(&state.db, "dev").await?;
+    chatdb::set_session_title(&state.db, &img.id, "Generate a hero image").await?;
+    let iu = uuid::Uuid::new_v4().to_string();
+    chatdb::create_user_turn(
+        &state.db,
+        &img.id,
+        &iu,
+        "Generate a wide hero image: a serene mountain lake at sunset, warm colors, digital art.",
+    )
+    .await?;
+    let ia = uuid::Uuid::new_v4().to_string();
+    chatdb::create_assistant_turn_in_progress(&state.db, &img.id, &ia, "demo-image").await?;
+    let img_marker = attachments::marker_line(
+        "mountain-lake-sunset.svg",
+        "image/svg+xml",
+        DEMO_IMAGE_DATA_URI,
+        4096,
+    );
+    chatdb::append_content(
+        &state.db,
+        &ia,
+        &format!("Here's your hero image — a serene mountain lake at sunset in a warm, painterly style.\n\n{img_marker}"),
+    )
+    .await?;
+    chatdb::finalize_turn(&state.db, &ia, TurnStatus::Completed, None).await?;
 
     // --- A finished chat conversation showcasing the tool-call loop:
     // reasoning → web search → page fetch → a markdown answer with a source.
@@ -525,6 +683,278 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
     ] {
         mcp_catalog::set_enabled(&state.db, key, true).await?;
     }
+
+    // --- API tokens (for the /tokens screenshot) — a mix of active (one
+    // recently used, one never) and a revoked one, all owned by `dev`. The
+    // `hash` is a throwaway string: the page only lists tokens, it doesn't
+    // authenticate with them. `created_at` is backdated; `touch`/`revoke`
+    // stamp last-used / revoked-at to "now".
+    use gateway::server::db::tokens;
+    use gateway::server::db::users;
+    let tnow = Timestamp::now();
+    // (name, created N days ago, then: "used" | "unused" | "revoked")
+    let seed_tokens = [
+        ("Production API", 42i64, "used"),
+        ("CI pipeline", 15i64, "revoked"),
+        ("Local laptop", 4i64, "unused"),
+    ];
+    for (name, age_days, state_kind) in seed_tokens {
+        let id = uuid::Uuid::new_v4().to_string();
+        tokens::insert(
+            &state.db,
+            &tokens::Token {
+                id: id.clone(),
+                user_id: "dev".into(),
+                name: name.into(),
+                hash: format!("seed-hash-{id}"),
+                created_at: tnow - (age_days * 24).hours(),
+                last_used_at: None,
+                expires_at: tnow + (90i64 * 24).hours(),
+                revoked_at: None,
+                tools_enabled: true,
+            },
+        )
+        .await?;
+        match state_kind {
+            "used" => tokens::touch(&state.db, &id).await?,
+            "revoked" => {
+                tokens::revoke(&state.db, "dev", &id).await?;
+            }
+            _ => {}
+        }
+    }
+
+    // --- Additional users (for /admin/users) with distinct OIDC groups so the
+    // resolved gateway-role column varies (via the RBAC mappings in `main`).
+    // Impersonation is enabled in config, so the action column populates.
+    let unow = Timestamp::now();
+    let seed_users = [
+        (
+            "u-anna",
+            "anna.schmidt@example.com",
+            "Anna Schmidt",
+            vec!["engineering", "platform-admins"],
+        ),
+        (
+            "u-ben",
+            "ben.carter@example.com",
+            "Ben Carter",
+            vec!["engineering"],
+        ),
+        (
+            "u-clara",
+            "clara.novak@example.com",
+            "Clara Novak",
+            vec!["finance"],
+        ),
+        (
+            "u-david",
+            "david.kim@example.com",
+            "David Kim",
+            vec!["support"],
+        ),
+    ];
+    for (id, email, name, groups) in seed_users {
+        users::upsert(
+            &state.db,
+            &users::User {
+                id: id.into(),
+                email: email.into(),
+                name: Some(name.into()),
+                roles: groups.into_iter().map(String::from).collect(),
+                created_at: unow,
+                updated_at: unow,
+                timezone: None,
+            },
+        )
+        .await?;
+    }
+
+    // --- Usage events (for /usage). The page defaults to "Today" in the
+    // viewer's timezone (dev = UTC), so we seed several of today's rows plus a
+    // week of history across a couple of models, sources, and kinds — with a
+    // few 4xx/5xx so the "errors" stat is non-zero. `insert_batch` writes both
+    // the raw event and the daily rollup, so any period renders.
+    use gateway::server::db::usage as usage_db;
+    use usage_db::{UsageKind, UsageRecord, UsageSource};
+    let mut usage_rows: Vec<UsageRecord> = Vec::new();
+    // (hours-ago, source, kind, model, status, prompt, completion)
+    let events: &[(i64, UsageSource, UsageKind, &str, u16, i64, i64)] = &[
+        (
+            1,
+            UsageSource::Chat,
+            UsageKind::Chat,
+            "demo-model",
+            200,
+            820,
+            240,
+        ),
+        (
+            2,
+            UsageSource::Chat,
+            UsageKind::Chat,
+            "demo-model-pro",
+            200,
+            1450,
+            610,
+        ),
+        (
+            3,
+            UsageSource::V1Api,
+            UsageKind::Chat,
+            "demo-model",
+            200,
+            320,
+            110,
+        ),
+        (
+            4,
+            UsageSource::Chat,
+            UsageKind::Image,
+            "demo-image",
+            200,
+            0,
+            0,
+        ),
+        (
+            5,
+            UsageSource::V1Api,
+            UsageKind::Chat,
+            "demo-model-pro",
+            429,
+            0,
+            0,
+        ),
+        (
+            7,
+            UsageSource::Scheduled,
+            UsageKind::Chat,
+            "demo-model",
+            200,
+            2100,
+            540,
+        ),
+        (
+            9,
+            UsageSource::Chat,
+            UsageKind::Transcription,
+            "demo-whisper",
+            200,
+            0,
+            0,
+        ),
+        (
+            26,
+            UsageSource::Chat,
+            UsageKind::Chat,
+            "demo-model",
+            200,
+            640,
+            180,
+        ),
+        (
+            28,
+            UsageSource::V1Api,
+            UsageKind::Chat,
+            "demo-model",
+            500,
+            0,
+            0,
+        ),
+        (
+            50,
+            UsageSource::Chat,
+            UsageKind::Chat,
+            "demo-model-pro",
+            200,
+            1720,
+            690,
+        ),
+        (
+            74,
+            UsageSource::Scheduled,
+            UsageKind::Chat,
+            "demo-model",
+            200,
+            1980,
+            500,
+        ),
+        (
+            99,
+            UsageSource::Chat,
+            UsageKind::Speech,
+            "demo-tts",
+            200,
+            0,
+            0,
+        ),
+        (
+            122,
+            UsageSource::V1Api,
+            UsageKind::Chat,
+            "demo-model",
+            200,
+            410,
+            150,
+        ),
+        (
+            146,
+            UsageSource::Chat,
+            UsageKind::Chat,
+            "demo-model-pro",
+            200,
+            1300,
+            520,
+        ),
+    ];
+    let unow2 = Timestamp::now();
+    for (h, source, kind, model, status, prompt, completion) in events.iter().copied() {
+        let backend = match kind {
+            UsageKind::Transcription | UsageKind::Speech => "wiremock-voice",
+            UsageKind::Image => "wiremock-image",
+            _ => "wiremock-chat",
+        };
+        usage_rows.push(UsageRecord {
+            created_at: unow2 - h.hours(),
+            user_id: "dev".into(),
+            user_email: Some("dev@example.com".into()),
+            token_id: None,
+            token_name: (source == UsageSource::V1Api).then(|| "Production API".to_string()),
+            source,
+            kind,
+            backend: backend.into(),
+            model: model.into(),
+            status,
+            duration_ms: 400 + (h % 7) * 130,
+            prompt_tokens: (prompt > 0).then_some(prompt),
+            completion_tokens: (completion > 0).then_some(completion),
+            total_tokens: (prompt + completion > 0).then_some(prompt + completion),
+        });
+    }
+    // A couple of rows from other users so the admin "All users" view has more
+    // than one row.
+    for (uid, email, model, h) in [
+        ("u-anna", "anna.schmidt@example.com", "demo-model-pro", 6i64),
+        ("u-ben", "ben.carter@example.com", "demo-model", 20i64),
+    ] {
+        usage_rows.push(UsageRecord {
+            created_at: unow2 - h.hours(),
+            user_id: uid.into(),
+            user_email: Some(email.into()),
+            token_id: None,
+            token_name: None,
+            source: UsageSource::Chat,
+            kind: UsageKind::Chat,
+            backend: "wiremock-chat".into(),
+            model: model.into(),
+            status: 200,
+            duration_ms: 620,
+            prompt_tokens: Some(900),
+            completion_tokens: Some(280),
+            total_tokens: Some(1180),
+        });
+    }
+    usage_db::insert_batch(&state.db, &usage_rows).await?;
 
     Ok(())
 }

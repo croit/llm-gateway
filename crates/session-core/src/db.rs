@@ -554,9 +554,16 @@ fn highlight_snippet(raw: &str) -> String {
     out
 }
 
-/// Full-text search across a user's conversations. Matches against
-/// user prompts and assistant responses (excluding reasoning/thinking).
-/// Returns a ranked list of conversations with highlighted snippets.
+/// Full-text search across a user's conversations. Matches against the
+/// conversation *title* and against user prompts and assistant responses
+/// (excluding reasoning/thinking). Returns a ranked list of conversations
+/// with highlighted snippets.
+///
+/// Title matches come first: the FTS index only covers turn text, so a term
+/// that appears only in a (usually LLM-generated) title — e.g. searching
+/// "E2E" for a chat named "E2E" — would otherwise never surface. Titles are
+/// matched with a case-insensitive `LIKE` per whitespace token (all tokens
+/// must be present), then the FTS content matches fill in the rest.
 ///
 /// The raw query is normalised into a safe FTS5 MATCH expression by
 /// [`to_fts_match_query`]. A blank / punctuation-only query returns the
@@ -639,7 +646,8 @@ pub async fn search_sessions(
     .fetch_all(pool)
     .await?;
 
-    rows.iter()
+    let content_hits = rows
+        .iter()
         .map(|row| {
             Ok(SearchHit {
                 session_id: row.try_get("session_id")?,
@@ -647,6 +655,106 @@ pub async fn search_sessions(
                 updated_at: parse_ts(row.try_get("updated_at")?, "updated_at")?,
                 pinned: row.try_get::<i64, _>("pinned")? != 0,
                 snippet: highlight_snippet(&row.try_get::<String, _>("snippet")?),
+            })
+        })
+        .collect::<Result<Vec<SearchHit>, DbError>>()?;
+
+    let title_hits = search_titles(pool, user_id, query, limit).await?;
+
+    // Merge title matches ahead of content matches, deduplicated by session.
+    // Title matches carry no snippet, so if the same conversation also matched
+    // on content we graft that snippet on for context. `limit` counts distinct
+    // conversations across both sources.
+    let content_snippets: std::collections::HashMap<&str, &str> = content_hits
+        .iter()
+        .map(|h| (h.session_id.as_str(), h.snippet.as_str()))
+        .collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<SearchHit> =
+        Vec::with_capacity(limit.min(title_hits.len() + content_hits.len()));
+    for mut h in title_hits {
+        if h.snippet.is_empty()
+            && let Some(sn) = content_snippets.get(h.session_id.as_str())
+        {
+            h.snippet = sn.to_string();
+        }
+        if seen.insert(h.session_id.clone()) {
+            out.push(h);
+            if out.len() >= limit {
+                return Ok(out);
+            }
+        }
+    }
+    for h in content_hits {
+        if out.len() >= limit {
+            break;
+        }
+        if seen.insert(h.session_id.clone()) {
+            out.push(h);
+        }
+    }
+    Ok(out)
+}
+
+/// Escape a raw token for use inside a SQL `LIKE` pattern with `ESCAPE '\'`.
+/// The wildcards `%` and `_` (and the escape char itself) become literals so a
+/// user searching for e.g. `a_b` matches only `a_b`, not `axb`.
+fn like_escape(tok: &str) -> String {
+    let mut s = String::with_capacity(tok.len());
+    for c in tok.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            s.push('\\');
+        }
+        s.push(c);
+    }
+    s
+}
+
+/// Find a user's conversations whose *title* contains every whitespace token of
+/// `query` (case-insensitive). Complements the FTS content search in
+/// [`search_sessions`], since the FTS index does not cover titles. Returned
+/// hits carry an empty snippet (the title itself is the match). Ordered pinned
+/// first, then most-recently-updated.
+async fn search_titles(
+    pool: &Pool,
+    user_id: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>, DbError> {
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("%{}%", like_escape(t)))
+        .collect();
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let conditions = vec!["title LIKE ? ESCAPE '\\'"; tokens.len()].join(" AND ");
+    let sql = format!(
+        r#"
+        SELECT id AS session_id, title, updated_at, pinned
+        FROM chat_sessions
+        WHERE user_id = ? AND title IS NOT NULL AND {conditions}
+        ORDER BY pinned DESC, updated_at DESC
+        LIMIT ?
+        "#
+    );
+
+    let mut q = sqlx::query(&sql).bind(user_id);
+    for pat in &tokens {
+        q = q.bind(pat);
+    }
+    let rows = q.bind(limit as i64).fetch_all(pool).await?;
+
+    rows.iter()
+        .map(|row| {
+            Ok(SearchHit {
+                session_id: row.try_get("session_id")?,
+                title: row.try_get("title")?,
+                updated_at: parse_ts(row.try_get("updated_at")?, "updated_at")?,
+                pinned: row.try_get::<i64, _>("pinned")? != 0,
+                snippet: String::new(),
             })
         })
         .collect()
@@ -2473,6 +2581,68 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, s.id);
         assert!(hits[0].snippet.contains("<b>ceph</b>") || hits[0].snippet.contains("<b>osd</b>"));
+    }
+
+    #[tokio::test]
+    async fn search_sessions_finds_title_match() {
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        // The title carries the term; the turn text does NOT — so this only
+        // passes if titles are searched (the FTS index covers only turns).
+        set_session_title(&pool, &s.id, "E2E smoke run")
+            .await
+            .unwrap();
+        create_user_turn(&pool, &s.id, "t0", "unrelated body text")
+            .await
+            .unwrap();
+
+        let hits = search_sessions(&pool, "u1", "E2E", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "title-only match must surface");
+        assert_eq!(hits[0].session_id, s.id);
+        assert_eq!(hits[0].title.as_deref(), Some("E2E smoke run"));
+    }
+
+    #[tokio::test]
+    async fn search_sessions_title_match_ranks_first() {
+        let pool = pool().await;
+        // A conversation matching only on content.
+        let content = create_session(&pool, "u1").await.unwrap();
+        create_user_turn(&pool, &content.id, "c0", "widget deployment notes")
+            .await
+            .unwrap();
+        // A conversation matching on title.
+        let titled = create_session(&pool, "u1").await.unwrap();
+        set_session_title(&pool, &titled.id, "widget plan")
+            .await
+            .unwrap();
+        create_user_turn(&pool, &titled.id, "t0", "nothing relevant here")
+            .await
+            .unwrap();
+
+        let hits = search_sessions(&pool, "u1", "widget", 10).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].session_id, titled.id, "title hit ranks first");
+        assert_eq!(hits[1].session_id, content.id);
+    }
+
+    #[tokio::test]
+    async fn search_sessions_title_and_content_dedupes_keeping_snippet() {
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        set_session_title(&pool, &s.id, "ceph tuning")
+            .await
+            .unwrap();
+        create_user_turn(&pool, &s.id, "t0", "ceph osd config")
+            .await
+            .unwrap();
+
+        let hits = search_sessions(&pool, "u1", "ceph", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "one row when title and content both match");
+        assert_eq!(hits[0].session_id, s.id);
+        assert!(
+            hits[0].snippet.contains("<b>ceph</b>"),
+            "content snippet grafted onto the deduped title hit"
+        );
     }
 
     #[tokio::test]

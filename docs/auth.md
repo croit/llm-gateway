@@ -127,7 +127,7 @@ The rama proxy router resolves auth inline at the top of each handler (no middle
 4. Bump `last_used_at` on bearer hits (debounced — at most once per minute per token).
 5. Build a `UserContext` with `user_id`, role set, and the allowed-tools set derived from `Resolver::allowed_tools`.
 
-The distinction between API routes (`/v1/*`, `/api/v0/*`) and page routes (`/`, `/tokens`, `/chat/stream`) only matters for the *failure* mode: API routes return 401 JSON, page routes 303 to `/login`. The lookup itself is the same.
+The distinction between API routes (`/v1/*`, `/api/v0/*`) and page routes (`/`, `/tokens`, `/chat`) only matters for the *failure* mode: API routes return 401 JSON, page routes 303 to `/login`. The lookup itself is the same.
 
 ## What's intentionally out of scope (for now)
 

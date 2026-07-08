@@ -16,8 +16,14 @@ cargo-binstall = "latest"
 # CI does not use sccache; GitHub Actions caches the cargo registry + target/
 # via Swatinem/rust-cache instead.
 "cargo:sccache" = "latest"
-# Node is here for the Tailwind v4 + daisyUI CSS build in `ui/`.
+# Node is here for the Tailwind v4 + daisyUI CSS build in `ui/`, and for the
+# `node:test`-driven e2e suite in `e2e/`.
 node = "24"
+# Playwright, used only by the `e2e` task (browser-driven end-to-end tests).
+# Installed as a mise tool so there's no project-local node_modules; the e2e
+# task points `PLAYWRIGHT_DIR` at this install via `mise where`. Pinned to
+# match the fallback path baked into `e2e/helpers.mjs`.
+"npm:@playwright/cli" = "0.1.13"
 # `typst` CLI for the `typst_<template>` tools. Resolved through
 # mise's registry (aqua → GitHub releases), so platform detection
 # is mise's problem. `mise run fetch-typst-cli` then copies the
@@ -161,6 +167,18 @@ run = [
 [tasks.ci]
 description = "Everything CI runs: lint + test + release build of the gateway binary. mise fans out via the DAG."
 depends = ["lint", "test", "build"]
+
+[tasks.e2e]
+description = "Browser + HTTP end-to-end tests (Playwright via node:test). Needs `mise run dev` running in another terminal. Not part of `ci`. Set CHROMIUM_HEADED=1 to watch the browser, GATEWAY_URL=… to target a remote gateway. See e2e/README.md for first-time Chromium setup."
+dir = "{{ config_root }}"
+run = """
+set -eu
+# Point the tests at the mise-installed playwright regardless of where mise
+# put it (the hardcoded fallback in e2e/helpers.mjs is the CI host's path).
+# Honour a pre-set PLAYWRIGHT_DIR so a caller can override it.
+export PLAYWRIGHT_DIR="${PLAYWRIGHT_DIR:-$(mise where 'npm:@playwright/cli')/lib/node_modules/@playwright/cli/node_modules/playwright}"
+node --test e2e/*.test.mjs
+"""
 
 [tasks.fmt]
 description = "Apply rustfmt across the workspace."

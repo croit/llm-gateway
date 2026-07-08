@@ -17,7 +17,7 @@ These are pre-approved; just add them to the relevant crate's `Cargo.toml` (refe
 |---|---|---|
 | `rama` | `gateway` | HTTP framework + proxying primitives. Features `http-full` + `tower`; rustls deliberately off (aws-lc-sys is cmake-only). |
 | `plait` | `gateway` | `html! { ... }` macro for server-rendered HTML in the rama page handlers. Type-checked, auto-escaping. |
-| `serde_urlencoded` | `gateway` | Form-body parsing for the page-level POST handlers (`/chat/stream`, etc.). |
+| `serde_urlencoded` | `gateway` | Form-body parsing for the page-level POST handlers (`/chat/{id}/messages`, etc.). |
 | `tokio` | `gateway`, `cli` | Async runtime. |
 | `serde`, `serde_json` | all | Data interchange (OpenAI schema, config). |
 | `thiserror` | all | Library-style error types. |
@@ -84,7 +84,7 @@ Pinned in `mise.toml`:
 
 Used by:
 - `e2e/*.test.mjs` — Playwright-driven browser tests for the page UI + plain-fetch tests for the public HTTP surface. Run via `mise run e2e`.
-- `docs/images/take-screenshots.mjs` — generates the README screenshots. Run via `mise run screenshots`.
+- `.claude/skills/take-screenshots/screenshot.mjs` — generates the README screenshots (`docs/img/*.png`) against the seeded `dev_ui` example. See that skill for the flow.
 
 Neither file pulls in a project-level `package.json` or `node_modules` — both scripts `import` Playwright directly out of the mise tool's install directory (path overridable via `$PLAYWRIGHT_DIR`). Adding any other Node tool needs the same justification step as a Cargo dep.
 

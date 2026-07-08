@@ -55,7 +55,7 @@ The single gateway binary. Split into two modules at the top level:
 - `router.rs` — builds the `rama::http::service::web::Router`.
 - `auth.rs` — `require_bearer` helper for the `/v1/*` routes.
 - `session.rs` — hand-rolled signed-cookie + sqlite session store (replaces `tower-sessions`).
-- `proxy.rs` — `/v1/{models,chat/completions,audio/transcriptions,embeddings,images/generations,images/edits}` handlers. The chat path branches between a streaming fast-path (no tool grants) and the buffered tool-call loop; embeddings and images are byte-dumb relays to their pool kind.
+- `proxy.rs` — `/v1/{models,chat/completions,audio/transcriptions,audio/speech,embeddings,images/generations,images/edits}` handlers. The chat path branches between a streaming fast-path (no tool grants) and the buffered tool-call loop; embeddings, images, and speech are byte-dumb relays to their pool kind. `speech.rs` holds the markdown→spoken sanitiser the session voice path (`/api/v0/speech`) uses before TTS.
 - `api.rs` — session-authed JSON at `/api/v0/{me,tokens,tokens/{id}/revoke,tokens/{id}}`.
 - `pages/` — plait-rendered HTML, split per route. `mod.rs` carries the shared chrome (layout, nav, theme, SSE framing helpers, `Flash`, the session gate, `/login`, `/theme/toggle`); `chat/` is a directory module for the multi-conversation chat (handlers in `mod.rs`, streaming worker in `worker.rs`, renderers in `render.rs`); `tokens.rs` owns `/tokens` CRUD; `dashboard.rs` owns `/`.
 - `chat_workers.rs` — per-user registry of in-flight chat workers (cancel flag + `broadcast::Sender<TurnUpdate>`). One worker per user max; the messages handler refuses concurrent submits, the tail handler attaches to the existing worker for reconnects.
@@ -82,17 +82,17 @@ Depends on `shared` for response types, never on `gateway`.
    - *Tool path* — taken whenever the user has tool grants, including when the client brought its own `tools` (unioned in, de-duped by name). The runner in `server::tools::runner` injects tool defs, forces `stream: false`, and loops: acquire pool → forward → if the turn's `tool_calls` are gateway-owned *only*, execute them concurrently and feed the results back as `role: "tool"` messages → re-POST. A turn that calls any client-owned tool is returned to the client unchanged (it drives its own tools). Bounded at 10 rounds. Final response carries an `x-gateway-tool-rounds` header.
 4. **`Acquired::drop`** releases the in-flight slot. The pool's atomic counter decrements on the next pick.
 
-## Request flow: `/chat/stream` (datastar SSE)
+## Request flow: chat page (datastar SSE)
 
-1. Browser submits the chat composer form with `data-on-submit__prevent="@post('/chat/stream', {contentType: 'form'})"`.
-2. Datastar's client runtime sends `application/x-www-form-urlencoded`, expects `text/event-stream` back.
-3. `pages::chat_stream` validates the form, resolves the user (session cookie), acquires a chat-pool backend, and starts an upstream `stream: true` request.
-4. First SSE event from the gateway: `datastar-patch-elements` with `mode append` — drops a user bubble + an empty `#active-reply` bubble into `#conversation`.
-5. Each upstream `delta.content` triggers another `datastar-patch-elements` event with `mode outer` targeting `#active-reply`, carrying the running accumulated text.
-6. On upstream's `data: [DONE]`, a final event swaps off the `id="active-reply"` so the next submission can spawn a fresh bubble. The `Acquired` guard releases.
+1. The browser submits the chat composer form with `@post('/chat/{id}/messages', {contentType: 'form'})` — datastar sends `application/x-www-form-urlencoded` and expects `text/event-stream` back.
+2. `pages::chat_message_send` validates the form, resolves the user (session cookie), and confirms they own the session.
+3. It registers a per-user **worker** slot (a broadcast channel keyed by the user id). A second concurrent submit for the same user gets a "still streaming" error rather than a parallel stream.
+4. It persists the user turn + an `in_progress` assistant turn, auto-titles the session (a heuristic title synchronously, then a background LLM-generated one), and spawns the assistant worker. The worker drives the model — including the tool-call loop and reasoning — and pushes `TurnUpdate`s onto its broadcast.
+5. The handler returns an SSE response subscribed to that broadcast. The first event appends a user bubble + an empty assistant bubble to `#conversation`; subsequent `datastar-patch-elements` events patch the assistant turn with the accumulated content, reasoning, and tool-call state, plus sidebar-row updates. The stream closes when the worker finalizes the turn.
+6. `GET /chat/{id}/tail` (`pages::chat_tail`) lets a client that reconnected or reloaded mid-stream re-attach to a live worker's broadcast. If no worker is live for the session it signals `chatStreaming:false` and closes, so the viewer just sees the static snapshot.
 
 ## Configuration
 
-Single TOML file. Location resolved in this order: `$GATEWAY_CONFIG` env var → `./gateway.toml`. Secret material (OIDC client secret, session HMAC key) is **only** read from env vars referenced *by name* in the TOML (`api_key_env = "GPU01_KEY"`), never inline in the config file.
+Single TOML file. Location resolved in this order: `$GATEWAY_CONFIG` env var → `./gateway.toml` → `/etc/gateway/config.toml`. Secret material (OIDC client secret, session HMAC key) is **only** read from env vars referenced *by name* in the TOML (`api_key_env = "GPU01_KEY"`), never inline in the config file.
 
 See the per-subsystem docs for the exact config shape.

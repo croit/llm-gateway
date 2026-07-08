@@ -259,22 +259,60 @@ fn render_app_sidebar(
                     }.to_html()))
                 }
             }
-            div(class: "app-sidebar__sessions-section") {
+            div(class: "app-sidebar__sessions-section", "data-signals": "{searchQuery: '', searchOpen: false}") {
                 div(class: "app-sidebar__sessions-header") {
                     span(class: "app-sidebar__sessions-label") { (t(lang, "nav-conversations-label")) }
-                    // Conversation search. Submitting fires a Datastar `@get`
-                    // (NOT a native GET) so the server sees `Datastar-Request:
-                    // true` and answers with an SSE patch of `#session-list`
-                    // rather than a full-page navigation. The query rides in
-                    // `$searchQuery`, url-encoded into the request path. On the
-                    // no-JS path the plain `action`/`method` still submit, and
-                    // the handler serves a full results page.
+                    div(class: "app-sidebar__sessions-actions") {
+                        // Search toggle. Clicking reveals the input row below
+                        // the header and focuses it; the icon alone lives in
+                        // the header. No-JS clients fall back to the always-
+                        // visible input (the `data-show` below does nothing
+                        // without Datastar).
+                        button(
+                            type: "button",
+                            class: "app-sidebar__search-toggle",
+                            "aria-label": (t(lang, "nav-search-aria")),
+                            title: (t(lang, "nav-search-title")),
+                            "data-on:click":
+                                "$searchOpen = !$searchOpen; $searchOpen && requestAnimationFrame(() => el.closest('.app-sidebar__sessions-section').querySelector('.app-sidebar__search-input').focus())"
+                        ) {
+                            (icons::search(14))
+                        }
+                        form(
+                            method: "post",
+                            action: "/chat/sessions",
+                            "data-on:submit__prevent":
+                                "document.getElementById('app-sidebar-toggle').checked = false; @post('/chat/sessions', {contentType: 'form'})",
+                            class: "m-0"
+                        ) {
+                            button(
+                                type: "submit",
+                                class: "app-sidebar__new-btn",
+                                "aria-label": (t(lang, "nav-new-conversation-aria")),
+                                title: (t(lang, "nav-new-conversation-title"))
+                            ) {
+                                (icons::plus(14))
+                            }
+                        }
+                    }
+                }
+                // Conversation search input, hidden until the toggle above
+                // opens it. Typing searches live: `data-on:input` fires the
+                // same Datastar `@get` after a 500ms debounce, so results
+                // stream in without pressing Enter (submit still works as a
+                // fallback and for the no-JS path). The `@get` (NOT a native
+                // GET) makes the server see `Datastar-Request: true` and answer
+                // with an SSE patch of `#session-list` rather than a full-page
+                // navigation. The query rides in `$searchQuery`, url-encoded
+                // into the request path. On the no-JS path the plain
+                // `action`/`method` still submit, and the handler serves a
+                // full results page. Escape closes the input.
+                div(class: "app-sidebar__search-row", "data-show": "$searchOpen") {
                     form(
                         id: "sidebar-search-form",
                         method: "get",
                         action: "/chat/search",
                         class: "app-sidebar__search-form m-0",
-                        "data-signals": "{searchQuery: ''}",
                         "data-on:submit__prevent":
                             "@get('/chat/search?q=' + encodeURIComponent($searchQuery))"
                     ) {
@@ -283,32 +321,11 @@ fn render_app_sidebar(
                             name: "q",
                             placeholder: (t(lang, "nav-search-placeholder")),
                             class: "input input-sm app-sidebar__search-input",
-                            "data-bind": "searchQuery"
+                            "data-bind": "searchQuery",
+                            "data-on:input__debounce.500ms":
+                                "@get('/chat/search?q=' + encodeURIComponent($searchQuery))",
+                            "data-on:keydown": "evt.key === 'Escape' && ($searchOpen = false)"
                         );
-                        button(
-                            type: "submit",
-                            class: "btn btn-ghost btn-sm app-sidebar__search-btn",
-                            "aria-label": (t(lang, "nav-search-aria")),
-                            title: (t(lang, "nav-search-title"))
-                        ) {
-                            (icons::search(14))
-                        }
-                    }
-                    form(
-                        method: "post",
-                        action: "/chat/sessions",
-                        "data-on:submit__prevent":
-                            "document.getElementById('app-sidebar-toggle').checked = false; @post('/chat/sessions', {contentType: 'form'})",
-                        class: "m-0"
-                    ) {
-                        button(
-                            type: "submit",
-                            class: "app-sidebar__new-btn",
-                            "aria-label": (t(lang, "nav-new-conversation-aria")),
-                            title: (t(lang, "nav-new-conversation-title"))
-                        ) {
-                            (icons::plus(14))
-                        }
                     }
                 }
                 (render_session_list(&sessions, active_sess.as_deref(), lang))
@@ -1024,7 +1041,7 @@ struct LoginPageQuery {
 // ---------------------------------------------------------------------------
 // Chat
 //
-// Composer, /chat/stream SSE endpoint, tool-call loop, and the bubble
+// Composer, message-send + tail SSE endpoints, tool-call loop, and the bubble
 // renderers all live in `chat.rs`. We pub-re-export the four handler
 // entry points so the router (which calls `pages::chat_index` etc.)
 // doesn't have to know about the split.

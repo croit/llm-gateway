@@ -407,6 +407,18 @@ The worker doesn't care if anyone's listening — it runs to completion either w
 
 `ui/ts/chat/composer.ts` no longer collects history client-side — the server reconstructs the upstream message list from `chat_turns`. The composer just validates non-empty, flips `$chatStreaming`, and clears the textarea once the server's initial SSE event lands.
 
+### Voice conversation mode
+
+Distinct from the composer's **dictation** button (`chat/mic.ts`, which just drops a transcript into the textarea), voice mode is a hands-free spoken conversation. A waveform button in the composer opens `#voice-modal` (a native `<dialog>` rendered by `render_voice_modal`); the modal shows a control button, a status line, live captions, and a `<canvas>` audio-frequency visualiser. It's client-orchestrated in `ui/ts/chat/voice.ts` (`window.chatVoice = { open, close, talk }`) over the existing chat streaming machinery — no new server worker.
+
+The turn pipeline is **half-duplex, push-to-talk**:
+
+1. Tap the control (`talk()`) to start recording via the shared `VoiceRecorder` (`ui/ts/voice-recorder.ts` — same PCM→WAV capture as dictation, plus an `AnalyserNode` tap feeding the visualiser). Tap again to stop.
+2. The WAV posts to `POST /api/v0/transcriptions`; the transcript is submitted as an ordinary chat turn with the hidden `voice` flag set, so the server injects the *voice directive* (short spoken replies, no tool-use narration — see [`gateway-api.md`](gateway-api.md) / the driver's `VOICE_DIRECTIVE`).
+3. As the reply streams, `voice.ts` watches the assistant bubble and, sentence by sentence, posts each completed sentence to `POST /api/v0/speech` and plays the returned audio in order. Non-speakable spans (code, tables) are replaced with a short spoken marker. While the assistant speaks, the mic stays inert (no echo loop).
+
+Everything persists as normal `chat_turns`, so the conversation is fully readable/continuable in text. The opening greeting is a fixed string spoken in the UI language and its TTS is server-side cached (identical `model|voice|text` ⇒ cached bytes), so reopening the modal costs no tokens. The reply's language otherwise follows what the user *spoke*. The composer button — and thus the whole feature — renders only when a `speech` upstream pool **and** a transcription model are both available (`voice_available` in `render.rs`), mirroring how dictation degrades away.
+
 ## TypeScript glue
 
 Anything genuinely interactive that doesn't fit in a `data-on:*` expression lives in TypeScript under `ui/ts/`. esbuild bundles each entry into the same `crates/gateway/assets/*.js` paths the server's `include_bytes!` already pointed at. `tsc --strict` runs as a separate type-check step (esbuild strips types without checking).
@@ -424,7 +436,9 @@ ui/
     ├── chat/
     │   ├── composer.ts      # window.chatComposer (Enter / submit / history)
     │   ├── mic.ts           # window.chatMic   (AudioWorklet → WAV → /transcriptions)
+    │   ├── voice.ts         # window.chatVoice (voice conversation modal orchestration)
     │   └── scroll.ts        # window.chatScroll (autoscroll observer)
+    ├── voice-recorder.ts    # shared PCM→WAV recorder + analyser (mic.ts + voice.ts + feedback)
     └── pcm-recorder.ts      # AudioWorklet processor, separate bundle
 ```
 
@@ -460,7 +474,7 @@ button(
 ) { (icons::copy(16)) }
 ```
 
-The `window.*` surface is declared in `ui/ts/global.d.ts` (`interface Window { uiCopy(btn: HTMLElement): Promise<void>; chatComposer: { … }; chatMic: { … }; chatScroll: { … }; }`) so call sites stay type-checked.
+The `window.*` surface is declared in `ui/ts/global.d.ts` (`interface Window { uiCopy(btn: HTMLElement): Promise<void>; chatComposer: { … }; chatMic: { … }; chatVoice: { … }; chatScroll: { … }; }`) so call sites stay type-checked.
 
 ### When to reach for what
 

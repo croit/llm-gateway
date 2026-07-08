@@ -12,7 +12,12 @@ mise run dev
 mise run e2e
 ```
 
-That runs both `e2e/api.test.mjs` (plain fetch against the public HTTP surface) and `e2e/anonymous.test.mjs` (Playwright-driven browser flows for the anonymous UI).
+That runs every `e2e/*.test.mjs`:
+- `api.test.mjs` — plain `fetch` against the public HTTP surface.
+- `anonymous.test.mjs` — Playwright-driven browser flows for the anonymous UI.
+- `authed.test.mjs` — Playwright flows on an authenticated page, seeding a session per test via the debug-only `/__dev/seed-session` endpoint (no OIDC needed; the endpoint only exists in a `cfg(debug_assertions)` build such as `mise run dev`).
+
+The `e2e` mise task points `PLAYWRIGHT_DIR` at the mise-installed `npm:@playwright/cli` tool automatically; export it yourself only to override.
 
 Set `CHROMIUM_HEADED=1` to watch the browser locally:
 
@@ -28,11 +33,11 @@ Set `GATEWAY_URL=https://gw.dev` to point at a remote gateway.
 - `/api/v0/me`, `/api/v0/tokens`: 401 OpenAI envelope when anonymous.
 - `/v1/chat/completions`: 401 with no bearer / malformed bearer.
 - Dashboard, `/login`, `/tokens` anonymous renders + nav links.
+- Authenticated UI interactions on the populated `/tokens` page (Toast / Dialog / Skeleton), each on a fresh seeded session.
 
 ## What's not covered yet
 
-- **Authenticated flows** — minting / listing / revoking tokens needs a session, which today requires a real OIDC provider. The follow-up is either a mock-OIDC test fixture or a `--dev-login` flag on the gateway that seeds a session without OIDC. The session-routes integration tests in `crates/gateway/tests/session_routes.rs` already cover the API side with an inline seed endpoint; the browser side would just replay that.
-- **Tool-call loop end-to-end** — Phase 6's runner is fully unit-tested in isolation, but driving the full proxy + wiremock-upstream + injection path from the browser belongs here too.
+- **Tool-call loop end-to-end** — the runner is fully unit-tested in isolation, but driving the full proxy + wiremock-upstream + injection path from the browser belongs here too.
 
 ## First-time setup notes
 
@@ -44,11 +49,10 @@ sudo apt-get install -y libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 \
     libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64
 ```
 
-And a one-time browser download (uses the `npm:@playwright/cli` we already have):
+And a one-time Chromium download (uses the mise-installed `npm:@playwright/cli`, located via `mise where` so it works wherever mise put it):
 
 ```bash
-PLAYWRIGHT_BROWSERS_PATH=/var/host-cache/playwright/browsers \
-  node /var/host-cache/mise/installs/npm-playwright-cli/0.1.13/lib/node_modules/@playwright/cli/node_modules/playwright/cli.js install chromium
+node "$(mise where 'npm:@playwright/cli')/lib/node_modules/@playwright/cli/node_modules/playwright/cli.js" install chromium
 ```
 
-(The cache path lines up with `MISE_CACHE_DIR` so it survives across project builds.)
+This downloads into Playwright's default browser cache (`~/.cache/ms-playwright` on Linux, `~/Library/Caches/ms-playwright` on macOS). On the shared CI/dev host, set `PLAYWRIGHT_BROWSERS_PATH=/var/host-cache/playwright/browsers` on both the download command and `mise run e2e` so the browser survives across project builds (the path lines up with `MISE_CACHE_DIR`).

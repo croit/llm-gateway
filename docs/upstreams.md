@@ -59,6 +59,24 @@ base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 probe_models = false       # don't let the provider's /models catalog clobber the image ids
 supports_edit = true       # backend serves /images/edits (image-to-image)
+
+# Text-to-speech (OpenAI /v1/audio/speech shape). Backs POST /v1/audio/speech
+# and, together with a transcription pool, unlocks the chat UI's voice mode.
+[upstream_pools.tts]
+kind = "speech"
+models = ["gpt-4o-mini-tts"]   # required: most TTS servers have no usable /models probe
+
+  # Optional voice per spoken language (lowercase ISO-639-1). "" is the default
+  # when no language matches; omit the table to use the backend's own voice.
+  [upstream_pools.tts.voices]
+  "" = "alloy"
+  de = "nova"
+
+[[upstream_pools.tts.backend]]
+name = "openai-tts"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+probe_models = false       # OpenAI's /models lists its whole catalog, not TTS ids
 ```
 
 No `[[models]]` table. Each backend's `/models` response is the source of truth for what it serves.
@@ -67,6 +85,8 @@ Two backend flags matter for image pools (and any backend whose `/models` catalo
 
 - **`probe_models`** (default `true`). When `false`, the health probe is a pure liveness check and never overwrites the configured `models`. Set it on image backends whose `/models` returns a *chat* catalog (z.AI's general endpoint, OpenAI) — otherwise the probe would replace the image model ids with chat models and make them unroutable, and pollute `/v1/models`.
 - **`supports_edit`** (default `false`). Marks a backend as capable of image *editing*. The `edit_image` tool is only registered when some image backend sets this, and editing is additionally refused against a backend whose pool is `gdpr = false` (it would ship existing user images off-site).
+
+For a `speech` pool, `models` is likewise required (set `probe_models = false` — most TTS servers have no usable `/models`, and cloud providers return their whole catalog). The optional `[upstream_pools.<name>.voices]` table maps a spoken language (lowercase ISO-639-1) to a backend voice id, with `""` as the default; voice mode resolves the voice from the language the STT detected. Unlike other kinds, a speech pool has **no unknown-model fallback** — a mistyped model or voice just surfaces the backend's own error. The chat UI's voice mode appears only when both a `speech` pool and a transcription model exist (see [`ui.md`](ui.md)).
 
 Secret material (`api_key_env`) is **only** sourced from env vars.
 
