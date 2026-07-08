@@ -225,6 +225,7 @@ async fn try_run_action(
         tool_ctx,
         source: crate::server::db::usage::UsageSource::Scheduled,
         history_limit,
+        voice_mode: false,
     });
 
     // No registry slot and a throwaway broadcast channel: a scheduled run

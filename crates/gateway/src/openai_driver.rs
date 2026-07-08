@@ -108,6 +108,11 @@ pub struct OpenAiDriver {
     /// `Some(n)` keeps only the most recent `n` turns — used by reuse-mode
     /// scheduled runs to bound a long-lived conversation's context.
     pub history_limit: Option<usize>,
+    /// Voice-conversation turn: inject a brevity/spoken-style directive so the
+    /// reply is short, plain prose the TTS can speak (no markdown/lists/code/
+    /// tables). Never stored in `user_content` — it's a per-turn request-time
+    /// overlay, so continuing the same thread in text mode is unaffected.
+    pub voice_mode: bool,
 }
 
 /// Build the per-turn [`ToolContext`] for a persisted chat session. This
@@ -276,7 +281,9 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
     // request with more than one leading system message ("System message must be
     // at the beginning"). See `leading_system_message`.
     let request_context = build_request_context(d, &user_mcp).await;
+    let voice_directive = d.voice_mode.then_some(VOICE_DIRECTIVE);
     if let Some(system) = leading_system_message(
+        voice_directive,
         request_context,
         compaction.as_ref().map(|c| c.summary.as_str()),
     ) {
@@ -1266,19 +1273,44 @@ fn build_history_messages(
         .collect()
 }
 
-/// Compose the single leading `system` message from the optional request
-/// context and the optional compaction summary. Returns `None` when neither is
-/// present (so no empty system message is sent).
+/// Voice-conversation brevity/format directive. Injected only for voice-mode
+/// turns (see [`OpenAiDriver::voice_mode`]) so the reply is short spoken prose
+/// the TTS can read. Instructs the model to answer in the user's spoken
+/// language — the gateway shapes the *format*, not the content.
+const VOICE_DIRECTIVE: &str = "You are in a live VOICE conversation. Everything you write is \
+read aloud to the user, so it must sound like a person speaking, not a written article.\n\
+- Be extremely brief: normally ONE or TWO spoken sentences, under about 40 words. Answer the \
+question directly, then stop. Do not pad, recap, or list.\n\
+- Never narrate what you are about to do or how you got the answer. Do NOT say things like \
+\"I'll search for that\", \"Let me look that up\", \"Sure, here's what I found\", or mention \
+your tools, steps, or sources. Any such planning belongs in your private reasoning, never in \
+the spoken reply — the user only wants the answer itself.\n\
+- If you use a tool or search, do it silently and speak only the conclusion. NEVER read search \
+results, pages, or documents back word for word; distil them to one or two sentences in your own \
+words.\n\
+- Plain spoken prose only: no Markdown, no bullet or numbered lists, no headings, no code \
+blocks, no tables, no emoji, and never read out URLs.\n\
+- Reply in the same language the user just spoke.\n\
+- If a complete answer would genuinely be long or need code or a table, give a one-sentence \
+spoken summary, say the details are on screen, and offer to go deeper only if they ask.";
+
+/// Compose the single leading `system` message from the optional voice
+/// directive, request context, and compaction summary. Returns `None` when all
+/// are absent (so no empty system message is sent).
 ///
-/// Both must live in ONE system message: some backends (notably the Qwen3 vLLM
+/// All must live in ONE system message: some backends (notably the Qwen3 vLLM
 /// chat template) reject a request carrying more than one leading system turn
-/// ("System message must be at the beginning"). Merging them keeps a single
-/// system turn regardless of which parts are present. Pure so it's unit-tested.
+/// ("System message must be at the beginning"). Merging keeps a single system
+/// turn regardless of which parts are present. Pure so it's unit-tested.
 fn leading_system_message(
+    voice_directive: Option<&str>,
     request_context: Option<String>,
     summary: Option<&str>,
 ) -> Option<serde_json::Value> {
     let mut parts: Vec<String> = Vec::new();
+    if let Some(directive) = voice_directive {
+        parts.push(directive.to_string());
+    }
     if let Some(ctx) = request_context {
         parts.push(ctx);
     }
@@ -1564,25 +1596,29 @@ mod tests {
             );
         }
 
-        /// Request context + summary collapse into exactly ONE system message
-        /// (backends reject multiple leading system turns).
+        /// Voice directive + request context + summary collapse into exactly ONE
+        /// system message (backends reject multiple leading system turns).
         #[test]
         fn system_message_merges_context_and_summary() {
-            let m = leading_system_message(Some("CONTEXT".into()), Some("SUMMARY")).expect("some");
+            let m = leading_system_message(None, Some("CONTEXT".into()), Some("SUMMARY"))
+                .expect("some");
             assert_eq!(m["role"], "system");
             let content = m["content"].as_str().unwrap();
             assert!(content.contains("CONTEXT"));
             assert!(content.contains("SUMMARY"));
         }
 
-        /// Each part is optional; absent both → no system message at all.
+        /// Each part is optional; absent all three → no system message at all.
         #[test]
         fn system_message_optional_parts() {
-            assert!(leading_system_message(None, None).is_none());
-            let only_ctx = leading_system_message(Some("C".into()), None).unwrap();
+            assert!(leading_system_message(None, None, None).is_none());
+            let only_ctx = leading_system_message(None, Some("C".into()), None).unwrap();
             assert!(only_ctx["content"].as_str().unwrap().contains('C'));
-            let only_sum = leading_system_message(None, Some("S")).unwrap();
+            let only_sum = leading_system_message(None, None, Some("S")).unwrap();
             assert!(only_sum["content"].as_str().unwrap().contains('S'));
+            // Voice directive alone still yields a system message.
+            let only_voice = leading_system_message(Some("VOICE"), None, None).unwrap();
+            assert!(only_voice["content"].as_str().unwrap().contains("VOICE"));
         }
 
         /// `history_limit` caps the verbatim tail *after* compaction folding.

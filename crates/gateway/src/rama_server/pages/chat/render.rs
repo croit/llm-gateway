@@ -156,6 +156,10 @@ pub(super) struct ChatPage<'a> {
     /// `None` if the session has never been compacted. Drives the transcript's
     /// "earlier messages condensed" divider.
     pub compacted_up_to_seq: Option<i64>,
+    /// Voice-conversation mode is offered: a `speech` (TTS) pool is configured
+    /// *and* the user has a transcription model (the full loop needs both).
+    /// Shows the composer's voice toggle + push-to-talk control.
+    pub voice_available: bool,
     /// UI language for this render's own chrome (header pickers, composer
     /// toolbar, popovers) — threaded down into `session_core::render` too.
     pub lang: Lang,
@@ -385,6 +389,7 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                 cancel_url: &cancel_url,
                 placeholder: &t(lang, "chat-render-composer-placeholder"),
                 has_voice,
+                voice_out: page.voice_available,
                 // A turn already in flight seeds the Stop control server-side,
                 // so a reload mid-stream still offers a way to stop it.
                 streaming: page.in_flight_turn_id.is_some(),
@@ -1400,6 +1405,7 @@ mod tests {
             capabilities: &[],
             document_canvas_html: None,
             compacted_up_to_seq: None,
+            voice_available: false,
             lang: Lang::En,
         })
         .to_string()
@@ -1420,6 +1426,7 @@ mod tests {
             capabilities: &[],
             document_canvas_html: None,
             compacted_up_to_seq: None,
+            voice_available: false,
             lang: Lang::En,
         })
         .to_string()

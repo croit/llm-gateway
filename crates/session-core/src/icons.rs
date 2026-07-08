@@ -43,6 +43,15 @@ pub fn mic(size: u32) -> Html {
     ))
 }
 
+/// Waveform / audio-lines — the voice-conversation-mode toggle. Reads as
+/// "live voice", distinct from the dictation mic (input) and the speaker.
+pub fn waveform(size: u32) -> Html {
+    raw(render(
+        size,
+        r#"<path d="M2 10v4"/><path d="M6 7v10"/><path d="M10 4v16"/><path d="M14 7v10"/><path d="M18 9v6"/><path d="M22 11v2"/>"#,
+    ))
+}
+
 /// Stop (filled square) — voice button when actively recording.
 pub fn stop(size: u32) -> Html {
     raw(render(

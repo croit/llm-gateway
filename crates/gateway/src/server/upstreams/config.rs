@@ -39,7 +39,27 @@ pub struct UpstreamPoolConfig {
     /// endpoint, not the individual model id.
     #[serde(default)]
     pub compliance: Compliance,
+    /// Language → voice name map, only meaningful for `kind = "speech"` pools.
+    /// The voice-conversation flow picks the voice whose key matches the
+    /// language the user spoke (from STT), falling back to the `""` (empty-key)
+    /// entry as the default voice, then to no explicit voice at all. Keys are
+    /// lowercase ISO-639-1 codes (`"de"`, `"en"`, …); values are backend voice
+    /// ids. Empty ⇒ always send the backend/default voice.
+    #[serde(default)]
+    pub voices: HashMap<String, String>,
     pub backend: Vec<BackendConfig>,
+}
+
+impl UpstreamPoolConfig {
+    /// Resolve the TTS voice for a spoken `language` (lowercase ISO-639-1).
+    /// Exact match wins; then the default (`""`) entry; then `None` (let the
+    /// backend use its own default voice). Pure so it's unit-tested.
+    pub fn voice_for_language(&self, language: &str) -> Option<&str> {
+        self.voices
+            .get(language)
+            .or_else(|| self.voices.get(""))
+            .map(String::as_str)
+    }
 }
 
 /// Per-pool data-handling attributes, surfaced to the user as chat-UI warnings
@@ -89,6 +109,11 @@ pub enum PoolKind {
     /// other pool; backends that don't expose `/models` declare their model ids
     /// statically and set `probe_models = false` (see [`BackendConfig`]).
     Image,
+    /// Text-to-speech. Backs `POST /v1/audio/speech` (OpenAI-shaped) and the
+    /// session `POST /api/v0/speech` the voice-conversation UI calls. Dormant
+    /// unless an operator configures a `kind = "speech"` pool — voice mode only
+    /// appears when one exists, mirroring how transcription degrades.
+    Speech,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -221,6 +246,9 @@ impl FallbackConfig {
             PoolKind::Embedding => self.embedding.as_deref(),
             PoolKind::Transcription => self.transcription.as_deref(),
             PoolKind::Image => self.image.as_deref(),
+            // Speech has no unknown-model fallback: a mistyped voice/model just
+            // surfaces the backend's own error. No sensible cross-substitution.
+            PoolKind::Speech => None,
         }
     }
 }
@@ -249,6 +277,43 @@ impl BackendConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_speech_pool_with_voices() {
+        let s = r#"
+            kind = "speech"
+
+            [voices]
+            de = "de-voice"
+            en = "en-voice"
+            "" = "fallback-voice"
+
+            [[backend]]
+            name = "tts"
+            base_url = "http://tts:8000/v1"
+            models = ["tts-1"]
+        "#;
+        let p: UpstreamPoolConfig = toml::from_str(s).unwrap();
+        assert_eq!(p.kind, PoolKind::Speech);
+        // Exact match wins.
+        assert_eq!(p.voice_for_language("de"), Some("de-voice"));
+        assert_eq!(p.voice_for_language("en"), Some("en-voice"));
+        // Unknown language falls back to the "" default entry.
+        assert_eq!(p.voice_for_language("fr"), Some("fallback-voice"));
+    }
+
+    #[test]
+    fn voice_for_language_none_without_map() {
+        let s = r#"
+            kind = "speech"
+            [[backend]]
+            name = "tts"
+            base_url = "http://tts:8000/v1"
+        "#;
+        let p: UpstreamPoolConfig = toml::from_str(s).unwrap();
+        // No voices map + no default → let the backend pick its own voice.
+        assert_eq!(p.voice_for_language("de"), None);
+    }
 
     #[test]
     fn parses_full_pool() {

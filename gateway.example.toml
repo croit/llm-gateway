@@ -128,6 +128,54 @@ weight = 1
 # api_key_env = "ZAI_API_KEY"
 # probe_models = false
 # supports_edit = false
+# ---- Text-to-speech (voice conversation) -----------------------------------
+# A `kind = "speech"` pool backs POST /v1/audio/speech (OpenAI-shaped) and,
+# together with a transcription pool, unlocks the chat UI's voice-conversation
+# mode. Point it at any OpenAI-compatible TTS server — self-hosted (Qwen3-TTS,
+# Kokoro, XTTS via openedai-speech, LocalAI) or a cloud provider. Omit the whole
+# block and voice mode simply doesn't appear.
+#
+# [upstream_pools.local_tts]
+# kind = "speech"
+# # Fallback model id if the backend has no usable /models probe (most TTS
+# # servers don't). Required so the UI has a default model to call.
+# models = ["tts-1"]
+# # Optional: pick a voice per spoken language (lowercase ISO-639-1). The voice
+# # mode resolves the voice from the language the user spoke (detected by STT).
+# # The "" key is the default when no language-specific voice matches; omit the
+# # whole table to always use the backend's own default voice.
+# [upstream_pools.local_tts.voices]
+# "" = "af_heart"     # default voice
+# en = "af_heart"
+# de = "bf_emma"
+#
+# [[upstream_pools.local_tts.backend]]
+# name = "tts-01"
+# base_url = "http://tts-01.internal:8880/v1"
+# health_path = "/models"
+#
+# --- Cloud TTS (OpenAI) ---
+# OpenAI's own /v1/audio/speech is the reference for this shape, so it drops
+# straight in — point a speech pool at api.openai.com with an API key. Voices
+# are alloy/echo/fable/onyx/nova/shimmer (multilingual, one voice covers many
+# languages, so a per-language map is optional). NOTE: this sends the spoken
+# text OUTSIDE the EU — flag `compliance` so the posture matches z.AI etc.
+#
+# [upstream_pools.openai_tts]
+# kind = "speech"
+# # REQUIRED for cloud providers: pins the TTS model. OpenAI's /models probe
+# # lists its whole catalogue, so voice mode uses this configured id rather than
+# # guessing from the probe. One of tts-1 / tts-1-hd / gpt-4o-mini-tts.
+# models = ["gpt-4o-mini-tts"]
+# [upstream_pools.openai_tts.compliance]
+# gdpr = false
+# nda = false
+# [upstream_pools.openai_tts.voices]
+# "" = "alloy"
+# [[upstream_pools.openai_tts.backend]]
+# name = "openai"
+# base_url = "https://api.openai.com/v1"
+# api_key_env = "OPENAI_API_KEY"
 
 # ---- Model → pool routing --------------------------------------------------
 # No static route table. The health probe hits each backend's `/models`

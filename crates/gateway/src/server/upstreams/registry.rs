@@ -339,6 +339,14 @@ pub struct Pool {
     /// Data-handling attributes for every model this pool serves (default
     /// all-clear). Drives advisory chat-UI warnings; never affects routing.
     pub compliance: Compliance,
+    /// Language → voice-id map (speech pools only). See
+    /// [`UpstreamPoolConfig::voices`] / [`UpstreamPoolConfig::voice_for_language`].
+    pub voices: std::collections::HashMap<String, String>,
+    /// Pool-level configured model ids (the `models` TOML list). Retained so
+    /// the speech default-model pick can prefer the operator's declared TTS
+    /// model over the `/models` probe — a cloud provider like OpenAI reports
+    /// its whole catalogue on `/models`, which would otherwise swamp the pick.
+    pub configured_models: Vec<String>,
     /// Backup model when a model this pool *knows* has no healthy backend
     /// (every replica down). `UpstreamRegistry::route` re-resolves the request
     /// to this instead of returning `503`. See [`UpstreamPoolConfig::fallback_offline`].
@@ -368,6 +376,8 @@ impl Pool {
             strategy: cfg.strategy,
             backends,
             compliance: cfg.compliance,
+            voices: cfg.voices.clone(),
+            configured_models: cfg.models.clone(),
             fallback_offline: cfg.fallback_offline.clone(),
             rr_cursor: AtomicUsize::new(0),
         }
@@ -618,6 +628,38 @@ impl UpstreamRegistry {
         self.collect_models(|p| p.kind == kind)
     }
 
+    /// True when at least one `speech` pool is configured — the switch that
+    /// makes voice mode (and `POST /api/v0/speech`) available in the UI.
+    pub fn has_speech(&self) -> bool {
+        self.pools.values().any(|p| p.kind == PoolKind::Speech)
+    }
+
+    /// Resolve the voice-mode TTS target for a spoken `language` (lowercase
+    /// ISO-639-1): the default speech model (first advertised across speech
+    /// pools) plus the voice from the speech pool's language→voice map (exact
+    /// match, then the `""` default entry, then `None` = backend default voice).
+    /// `None` when no speech pool advertises a model. Used by the session
+    /// `POST /api/v0/speech`; the raw `/v1/audio/speech` proxy takes an explicit
+    /// model/voice from the caller instead.
+    pub fn speech_target(&self, language: &str) -> Option<(String, Option<String>)> {
+        let pool = self.pools.values().find(|p| p.kind == PoolKind::Speech)?;
+        // Prefer the operator's declared model (`models = ["tts-1"]`): a cloud
+        // provider's `/models` probe lists its whole catalogue, so the probe
+        // union can't identify *the* TTS model. Fall back to the probe union
+        // for self-hosted servers that correctly advertise only their voice.
+        let model = pool
+            .configured_models
+            .first()
+            .cloned()
+            .or_else(|| self.models_for_kind(PoolKind::Speech).into_iter().next())?;
+        let voice = pool
+            .voices
+            .get(language)
+            .or_else(|| pool.voices.get(""))
+            .cloned();
+        Some((model, voice))
+    }
+
     /// Every advertised model across *all* pools and kinds, de-duplicated by
     /// id (replicas serving the same id collapse to one) and sorted. Backs
     /// the OpenAI-parity `GET /v1/models`, which lists every usable model
@@ -865,6 +907,7 @@ mod tests {
         backends: Vec<BackendConfig>,
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
+            voices: Default::default(),
             compliance: Default::default(),
             kind,
             strategy,
@@ -881,6 +924,7 @@ mod tests {
         backends: Vec<BackendConfig>,
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
+            voices: Default::default(),
             compliance,
             kind,
             strategy: PickerStrategy::RoundRobin,
@@ -897,6 +941,7 @@ mod tests {
         backends: Vec<BackendConfig>,
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
+            voices: Default::default(),
             compliance: Default::default(),
             kind,
             strategy: PickerStrategy::RoundRobin,
@@ -919,6 +964,60 @@ mod tests {
         let pool = reg.pools.get(pool).expect("pool exists");
         let set: HashSet<String> = models.iter().map(|s| (*s).to_string()).collect();
         pool.backends[backend_idx].set_models(set);
+    }
+
+    #[test]
+    fn speech_target_prefers_configured_model_over_probe_flood() {
+        // Regression: a cloud provider's /models probe reports its whole
+        // catalogue. speech_target must return the operator's declared TTS
+        // model, not the alphabetically-first of the flood.
+        let cfg: UpstreamPoolConfig = toml::from_str(
+            r#"
+            kind = "speech"
+            models = ["tts-1"]
+            [voices]
+            "" = "alloy"
+            de = "nova"
+            [[backend]]
+            name = "openai"
+            base_url = "https://api.openai.com/v1"
+        "#,
+        )
+        .unwrap();
+        let reg = build(vec![("openai_tts", cfg)]);
+        // Simulate the OpenAI /models flood.
+        seed_models(
+            &reg,
+            "openai_tts",
+            0,
+            &["babbage-002", "gpt-4o", "tts-1", "whisper-1"],
+        );
+
+        assert!(reg.has_speech());
+        // Configured model wins over the flood; voice resolves by language.
+        assert_eq!(
+            reg.speech_target("de"),
+            Some(("tts-1".to_string(), Some("nova".to_string())))
+        );
+        // Unknown language → the "" default voice.
+        assert_eq!(
+            reg.speech_target("fr"),
+            Some(("tts-1".to_string(), Some("alloy".to_string())))
+        );
+    }
+
+    #[test]
+    fn speech_target_none_without_speech_pool() {
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![backend("a", 16)],
+            ),
+        )]);
+        assert!(!reg.has_speech());
+        assert_eq!(reg.speech_target("en"), None);
     }
 
     #[test]
@@ -1422,6 +1521,7 @@ mod tests {
         backends: Vec<BackendConfig>,
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
+            voices: Default::default(),
             compliance: Default::default(),
             kind,
             strategy: PickerStrategy::RoundRobin,

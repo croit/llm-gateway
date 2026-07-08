@@ -55,6 +55,7 @@ async fn state_with_streaming_chat(upstream_uri: &str) -> RamaState {
     pools.insert(
         "pool".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
@@ -356,17 +357,44 @@ async fn reasoning_timer_advances_while_reasoning_streams() {
         while let Ok((sock, _)) = listener.accept().await {
             tokio::spawn(async move {
                 let (mut rd, mut wr) = sock.into_split();
-                // Keep draining the request side for the whole
-                // connection so the client's body write never hits a
-                // half-closed socket ("error sending request").
-                tokio::spawn(async move {
+                // Read the ENTIRE request (headers + Content-Length body)
+                // before writing a byte of the response. Responding while
+                // the client is still uploading its POST body — then having
+                // the writer finish and drop the socket — is what surfaced as
+                // a flaky "error sending request" (a non-idempotent POST hyper
+                // won't retry). Draining the read half concurrently wasn't
+                // enough; the server must not "answer early".
+                {
+                    let mut buf = Vec::with_capacity(2048);
                     let mut b = [0u8; 1024];
-                    while let Ok(n) = rd.read(&mut b).await {
-                        if n == 0 {
+                    let mut content_len: usize = 0;
+                    let mut header_end: Option<usize> = None;
+                    loop {
+                        // Headers complete yet?
+                        if header_end.is_none()
+                            && let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            header_end = Some(p + 4);
+                            let head = String::from_utf8_lossy(&buf[..p]).to_ascii_lowercase();
+                            content_len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse().ok())
+                                .unwrap_or(0);
+                        }
+                        // Once headers are in, stop as soon as the whole body
+                        // has arrived.
+                        if let Some(end) = header_end
+                            && buf.len() >= end + content_len
+                        {
                             break;
                         }
+                        match rd.read(&mut b).await {
+                            Ok(0) | Err(_) => break, // client hung up / socket error
+                            Ok(n) => buf.extend_from_slice(&b[..n]),
+                        }
                     }
-                });
+                }
                 if wr
                     .write_all(
                         b"HTTP/1.1 200 OK\r\n\

@@ -84,6 +84,7 @@ pub async fn state_with_pool(upstream_url: &str, kind: PoolKind, model_name: &st
     pools.insert(
         "pool".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind,
@@ -111,6 +112,7 @@ pub async fn state_with_chat_and_config_transcription(
     pools.insert(
         "chat".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
@@ -125,6 +127,7 @@ pub async fn state_with_chat_and_config_transcription(
     pools.insert(
         "voice".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Transcription,
@@ -152,6 +155,7 @@ pub async fn state_with_chat_and_embed(chat_model: &str, embed_model: &str) -> R
     pools.insert(
         "chat".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
@@ -163,6 +167,7 @@ pub async fn state_with_chat_and_embed(chat_model: &str, embed_model: &str) -> R
     pools.insert(
         "embed".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Embedding,
@@ -200,6 +205,7 @@ async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool
     pools.insert(
         "pool".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,

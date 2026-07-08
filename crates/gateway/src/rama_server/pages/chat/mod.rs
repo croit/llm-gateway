@@ -246,6 +246,12 @@ async fn render_chat_response(
         capabilities: &capabilities,
         document_canvas_html: document_canvas_html.as_deref(),
         compacted_up_to_seq,
+        // The full voice loop needs both a TTS (speech) pool and a
+        // transcription model. Owner only — a read-only shared viewer has no
+        // composer to attach it to.
+        voice_available: !read_only
+            && state.upstreams.has_speech()
+            && !transcription_models.is_empty(),
         lang,
     });
     let chat_sidebar = SidebarChat {
@@ -995,6 +1001,9 @@ pub async fn chat_message_send(
     // (and an inlined fenced block for `text/*`-like attachments so
     // the model reads the bytes directly on the current turn).
     let user_msg = augment_user_text(&user_turn_id, &submit);
+    // Per-turn voice-mode flag (drives the brevity directive in the driver).
+    // Captured before `submit` is consumed below.
+    let voice_mode = submit.voice;
 
     // Reserve the per-user worker slot BEFORE persisting anything.
     // The old order (create turns → register) leaked orphaned
@@ -1085,7 +1094,11 @@ pub async fn chat_message_send(
         &assistant_turn_id,
         &submit.model,
         &worker,
-        RequestCtx { client_ip, secure },
+        RequestCtx {
+            client_ip,
+            secure,
+            voice_mode,
+        },
     )
     .await;
 
@@ -1342,7 +1355,11 @@ pub async fn chat_retry(
         user,
         id,
         form.model,
-        RequestCtx { client_ip, secure },
+        RequestCtx {
+            client_ip,
+            secure,
+            voice_mode: false,
+        },
         lang,
     )
     .await
@@ -1395,7 +1412,11 @@ pub async fn chat_edit(
         user,
         id,
         form.model,
-        RequestCtx { client_ip, secure },
+        RequestCtx {
+            client_ip,
+            secure,
+            voice_mode: false,
+        },
         lang,
     )
     .await
@@ -1408,6 +1429,9 @@ pub async fn chat_edit(
 struct RequestCtx {
     client_ip: Option<String>,
     secure: bool,
+    /// This turn came from voice-conversation mode → the driver injects the
+    /// brevity/spoken-style directive. False for retry/edit regeneration.
+    voice_mode: bool,
 }
 
 /// Build the caller's tool context + allowed-tool set and spawn the
@@ -1454,6 +1478,7 @@ async fn spawn_assistant_worker(
         tool_ctx,
         source: crate::server::db::usage::UsageSource::Chat,
         history_limit: None,
+        voice_mode: req.voice_mode,
     });
     let driver_ctx = session_core::driver::SessionContext {
         user_id: Some(user.id.clone()),
@@ -1666,6 +1691,9 @@ struct ChatSubmit {
     model: String,
     user_text: String,
     attachments: Vec<UploadedAttachment>,
+    /// This turn was submitted from voice-conversation mode — the worker
+    /// injects the brevity/spoken-style directive. Per-turn only; not persisted.
+    voice: bool,
 }
 
 struct UploadedAttachment {
@@ -1691,6 +1719,7 @@ async fn parse_chat_submit(
     let mut model: Option<String> = None;
     let mut user_text = String::new();
     let mut attachments: Vec<UploadedAttachment> = Vec::new();
+    let mut voice = false;
 
     while let Some(field) = mp.next_field().await.map_err(|e| e.to_string())? {
         let name = field.name().unwrap_or("").to_string();
@@ -1700,6 +1729,10 @@ async fn parse_chat_submit(
             }
             "message" => {
                 user_text = field.text().await.map_err(|e| e.to_string())?;
+            }
+            "voice" => {
+                let v = field.text().await.map_err(|e| e.to_string())?;
+                voice = matches!(v.trim(), "true" | "1" | "on");
             }
             "attachment" => {
                 // Browsers always emit the `attachment` part for the
@@ -1740,6 +1773,7 @@ async fn parse_chat_submit(
         model,
         user_text: user_text.trim().to_string(),
         attachments,
+        voice,
     })
 }
 

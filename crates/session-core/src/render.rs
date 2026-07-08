@@ -1011,6 +1011,10 @@ pub struct ComposerOpts<'a> {
     /// Voice-input mic button. The gateway shows this when the user
     /// has a transcription model available.
     pub has_voice: bool,
+    /// Voice-conversation mode: show the speak-back toggle + push-to-talk
+    /// control. The gateway sets this only when a `speech` (TTS) pool is
+    /// configured *and* transcription is available (the full loop needs both).
+    pub voice_out: bool,
     /// Initial value of the `$chatStreaming` signal. `true` when a turn is
     /// already in flight at render time, so the Stop control shows on a
     /// fresh load / reload — not just after a submit set the signal in JS.
@@ -1032,6 +1036,7 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
         cancel_url,
         placeholder,
         has_voice,
+        voice_out,
         streaming,
         toolbar,
         lang,
@@ -1042,6 +1047,7 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
     let record_title = t(lang, "render-composer-record-title");
     let send_label = t(lang, "render-composer-send");
     let stop_label = t(lang, "render-composer-stop");
+    let voice_toggle_title = t(lang, "voice-toggle-title");
     let submit_directive = format!(
         "window.chatComposer.onSubmit(evt) && ($chatStreaming = true, \
          @post('{post_url}', {{contentType: 'form'}}))"
@@ -1054,6 +1060,14 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
     // Pre-render the optional toolbar (empty fragment when absent) so it can be
     // interpolated by value inside the macro's `Fn` closure.
     let toolbar_html = toolbar.unwrap_or_else(|| html! { "" }.to_html());
+    // The voice-conversation modal (the whole call surface). Emitted as a
+    // sibling after the form; hidden until `window.chatVoice.open()`. Empty
+    // fragment when the voice loop isn't available.
+    let voice_modal_html = if voice_out {
+        render_voice_modal(lang)
+    } else {
+        html! { "" }.to_html()
+    };
     html! {
         form(
             id: "chat-form",
@@ -1081,6 +1095,13 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
                 hidden: "hidden",
                 "data-on:change": "window.chatComposer.onFilesPicked(evt)"
             );
+            // Voice-conversation flag: `voice.ts` flips it to "true" before
+            // auto-submitting a spoken turn so the worker injects the brevity
+            // directive. Serialised with the form's `@post`; harmless "false"
+            // otherwise. Only present when the full voice loop is available.
+            if voice_out {
+                input(id: "chat-voice-flag", name: "voice", type: "hidden", value: "false");
+            }
             // Host-app toolbar row (gateway: the "+" tools/integrations/skills
             // menu + active chips). Rendered above the field; contains no form.
             // Empty fragment when none was supplied.
@@ -1138,6 +1159,20 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
                             }
                         }
                     }
+                    // Voice-conversation entry: one button that opens the voice
+                    // modal (the whole call — PTT, status, captions — lives
+                    // there). The dictation mic above stays for text dictation.
+                    if voice_out {
+                        button(
+                            type: "button",
+                            "data-on:click": "window.chatVoice.open()",
+                            "aria-label": (voice_toggle_title.clone()),
+                            title: (voice_toggle_title),
+                            class: "btn btn-sm btn-circle btn-ghost chat-voice-toggle"
+                        ) {
+                            (icons::waveform(16))
+                        }
+                    }
                     button(
                         type: "submit",
                         class: "btn btn-sm btn-circle btn-primary chat-composer__send",
@@ -1155,6 +1190,80 @@ pub fn render_composer(opts: ComposerOpts<'_>) -> Html {
                     ) {
                         (icons::stop(16))
                     }
+                }
+            }
+        }
+        (voice_modal_html)
+    }
+    .to_html()
+}
+
+/// The voice-conversation modal — a native `<dialog>` (opened via
+/// `showModal()`, same pattern as the feedback widget) that hosts the whole
+/// call: a state-reflecting talk control, a status line, live You/AI captions,
+/// and a "recording to chat" reassurance. Backend/persistence are unchanged —
+/// turns still flow through the normal chat path and land in the transcript
+/// behind. Driven by `voice.ts`; `data-voice-state` (idle|listening|working|
+/// speaking) drives the control + status via CSS.
+fn render_voice_modal(lang: Lang) -> Html {
+    let title = t(lang, "voice-modal-title");
+    let close_label = t(lang, "voice-exit-title");
+    let talk_label = t(lang, "voice-ptt-title");
+    html! {
+        dialog(
+            id: "voice-modal",
+            class: "voice-modal",
+            "data-voice-state": "idle",
+            "data-voice-greeting": (t(lang, "voice-greeting")),
+            // Status strings for each state, so `voice.ts` sets them client-side
+            // while the i18n stays server-owned.
+            "data-txt-idle": (t(lang, "voice-hint-tap-to-talk")),
+            "data-txt-listening": (t(lang, "voice-status-listening")),
+            "data-txt-send": (t(lang, "voice-hint-tap-to-send")),
+            "data-txt-working": (t(lang, "voice-status-working")),
+            "data-txt-speaking": (t(lang, "voice-status-speaking")),
+            "data-txt-interrupt": (t(lang, "voice-hint-tap-to-interrupt")),
+            "data-txt-notcaught": (t(lang, "voice-not-caught"))
+        ) {
+            div(class: "voice-modal__box") {
+                header(class: "voice-modal__header") {
+                    span(class: "voice-modal__title") { (title) }
+                    button(
+                        type: "button",
+                        "data-on:click": "window.chatVoice.close()",
+                        "aria-label": (close_label),
+                        class: "btn btn-sm btn-circle btn-ghost"
+                    ) { "✕" }
+                }
+                button(
+                    type: "button",
+                    id: "voice-control",
+                    "data-on:click": "window.chatVoice.talk(el)",
+                    "aria-label": (talk_label),
+                    class: "voice-modal__control"
+                ) {
+                    // Live frequency-bars visualizer — driven by `voice.ts` off
+                    // the mic (listening) and the TTS audio (speaking) via Web
+                    // Audio analysers; a calm idle animation otherwise.
+                    canvas(id: "voice-viz", class: "voice-modal__viz", width: "180", height: "180") {}
+                    span(class: "voice-modal__spin") { (icons::spinner(44)) }
+                }
+                p(id: "voice-status", class: "voice-modal__status") {
+                    (t(lang, "voice-hint-tap-to-talk"))
+                }
+                div(class: "voice-modal__captions") {
+                    p(class: "voice-cap") {
+                        span(class: "voice-cap__who") { (t(lang, "voice-caption-you")) }
+                        span(id: "voice-cap-user", class: "voice-cap__text") {}
+                    }
+                    p(class: "voice-cap") {
+                        span(class: "voice-cap__who") { (t(lang, "voice-caption-ai")) }
+                        span(id: "voice-cap-ai", class: "voice-cap__text") {}
+                    }
+                }
+                p(class: "voice-modal__note") {
+                    span(class: "voice-rec-dot") {}
+                    (t(lang, "voice-recording-to-chat"))
                 }
             }
         }
@@ -1353,6 +1462,7 @@ mod tests {
             cancel_url: "/chat/s1/cancel",
             placeholder: "msg",
             has_voice: false,
+            voice_out: false,
             streaming,
             toolbar: None,
             lang: Lang::En,

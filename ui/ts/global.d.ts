@@ -31,6 +31,17 @@ declare global {
             toggle(btn: HTMLElement): Promise<void>;
         };
         /**
+         * Voice-conversation mode. `toggle(btn)` enters/exits (and speaks the
+         * greeting); `pttDown`/`pttUp` are the push-to-talk press/release that
+         * record → transcribe → submit a spoken turn. Owned by
+         * `ui/ts/chat/voice.ts`.
+         */
+        chatVoice: {
+            open(): void;
+            close(): void;
+            talk(btn: HTMLElement): Promise<void>;
+        };
+        /**
          * Per-message retry/edit glue for the chat page. Called from
          * the bubbles' `data-on:*` directives. Owned by
          * `ui/ts/chat/actions.ts`.

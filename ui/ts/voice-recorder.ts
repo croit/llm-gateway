@@ -88,6 +88,9 @@ export class VoiceRecorder {
         private readonly node: AudioWorkletNode,
         private readonly sink: GainNode,
         private readonly meterEl: HTMLElement | null,
+        // Live frequency tap on the mic source, for the voice-mode visualizer.
+        // Reuses this capture — no second getUserMedia.
+        readonly analyser: AnalyserNode,
     ) {
         this.captureRate = ctx.sampleRate;
         this.node.port.onmessage = (e: MessageEvent): void => {
@@ -110,6 +113,7 @@ export class VoiceRecorder {
         try {
             this.node.port.onmessage = null;
             this.source.disconnect();
+            this.analyser.disconnect();
             this.node.disconnect();
             this.sink.disconnect();
             this.stream.getTracks().forEach((t) => t.stop());
@@ -173,6 +177,11 @@ export const startRecording = async (
         throw err;
     }
     const source = ctx.createMediaStreamSource(stream);
+    // Parallel frequency tap for the visualizer (reads only; no output path).
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 64;
+    analyser.smoothingTimeConstant = 0.7;
+    source.connect(analyser);
     const node = new AudioWorkletNode(ctx, 'pcm-recorder');
     // The processor only runs when there's an active path from a source to
     // the destination. Route `source → node → muted_gain → destination` so
@@ -181,7 +190,7 @@ export const startRecording = async (
     const muted = ctx.createGain();
     muted.gain.value = 0;
     node.connect(muted).connect(ctx.destination);
-    return new VoiceRecorder(ctx, stream, source, node, muted, meterEl);
+    return new VoiceRecorder(ctx, stream, source, node, muted, meterEl, analyser);
 };
 
 /**

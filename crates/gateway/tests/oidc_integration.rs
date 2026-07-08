@@ -158,6 +158,7 @@ async fn state_with_oidc(idp_uri: &str, roles_claim: Option<&str>) -> RamaState 
     let _: UpstreamPoolConfig = UpstreamPoolConfig {
         fallback_offline: None,
         compliance: Default::default(),
+        voices: Default::default(),
         kind: PoolKind::Chat,
         strategy: upstreams::config::PickerStrategy::RoundRobin,
         models: Vec::new(),

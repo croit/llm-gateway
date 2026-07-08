@@ -60,6 +60,7 @@ pub enum UsageKind {
     Embedding,
     Transcription,
     Image,
+    Speech,
 }
 
 impl UsageKind {
@@ -69,6 +70,7 @@ impl UsageKind {
             UsageKind::Embedding => "embedding",
             UsageKind::Transcription => "transcription",
             UsageKind::Image => "image",
+            UsageKind::Speech => "speech",
         }
     }
 }

@@ -11,6 +11,7 @@ Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests acro
 - [The built-in web UI](#the-built-in-web-ui)
 - [Scheduled actions](#scheduled-actions)
 - [Conversation compaction](#conversation-compaction)
+- [Voice conversation](#voice-conversation)
 - [Integrations (per-user MCP connectors)](#integrations-per-user-mcp-connectors)
 - [Quick start (local development)](#quick-start-local-development)
 - [Configuration](#configuration)
@@ -28,8 +29,8 @@ Authenticated, OpenAI-API-compatible reverse proxy that routes LLM requests acro
 
 ## What it does
 
-- **OpenAI-compatible API** — `POST /v1/chat/completions` (streaming + non-streaming), `POST /v1/embeddings`, `POST /v1/images/generations` + `POST /v1/images/edits`, `POST /v1/audio/transcriptions`, and `GET /v1/models`. Point any OpenAI SDK at it.
-- **Multi-backend routing** — named upstream pools (`chat` / `transcription` / `embedding` / `image` kinds). Each pool load-balances across its backends (round-robin or least-in-flight) with per-backend health probes. Models are discovered live from each backend's `/models` endpoint, so loading a model on a backend makes it routable with no config change.
+- **OpenAI-compatible API** — `POST /v1/chat/completions` (streaming + non-streaming), `POST /v1/embeddings`, `POST /v1/images/generations` + `POST /v1/images/edits`, `POST /v1/audio/transcriptions`, `POST /v1/audio/speech` (text-to-speech, when a speech pool is configured), and `GET /v1/models`. Point any OpenAI SDK at it.
+- **Multi-backend routing** — named upstream pools (`chat` / `transcription` / `embedding` / `image` / `speech` kinds). Each pool load-balances across its backends (round-robin or least-in-flight) with per-backend health probes. Models are discovered live from each backend's `/models` endpoint, so loading a model on a backend makes it routable with no config change.
 - **Model aliases + fallback** — give clients a stable name (`alias = ["qwen"]` on a backend) that routes to whatever real model is loaded, so swapping the model needs no client change; the same alias on several backends is a load-balanced group. Optional fallbacks cover an unknown model name (`[fallback].<kind>`) or a known model whose backends are all down (`fallback_offline`). See [`docs/upstreams.md`](docs/upstreams.md#model-aliases).
 - **OIDC login** — browser sign-in against your identity provider; the gateway then issues its own `gwk_…` API tokens. Provider secrets come only from the environment.
 - **Per-user tokens + RBAC** — tokens are SHA-256-hashed at rest and revocable. Roles (mapped from OIDC claims) gate which models and server-side tools each user may use.
@@ -97,6 +98,16 @@ A chat replays its whole history to the model on every turn, so a long conversat
 Nothing is lost from the UI — the summarised turns stay in the transcript, scrollable above an "earlier messages condensed" divider; they're just not sent upstream. Tool results from the folded turns are fed into the summariser (they're never replayed as normal history, yet are often the load-bearing context).
 
 Tuning lives in `[chat.compaction]` (all optional): `enabled` (default `true`), `trigger_ratio` (fraction of the window at which it fires, default `0.7`), `default_context_window` (fallback window in tokens for models without a per-model value, default `32768`), `keep_recent_turns` (how many recent turns stay verbatim, default `6`), `min_turns_to_compact` (anti-thrash floor, default `4`), and `summary_max_tokens` (default `1024`). Per-model context windows are set in `/admin/models`; a blank field falls back to `default_context_window`.
+
+## Voice conversation
+
+Talk to the assistant and hear it answer. Voice mode is a **pipeline** — the gateway is not the AI, it wires access to one: your speech is transcribed (Voxtral, the existing transcription pool), sent to the normal chat model with a *voice directive* that keeps replies to a spoken sentence or two, and the reply is spoken back through a **text-to-speech pool** you configure. Every exchange persists as an ordinary chat turn in plain text, so you can scroll back and read (or continue in text) any time.
+
+It appears in the chat composer **only when a `speech` upstream pool is configured** *and* a transcription model is available — otherwise the toggle is simply absent (like transcription, it degrades away). Same access layer as everything else: TTS is also exposed to API callers at `POST /v1/audio/speech`.
+
+**Configure it** by adding a pool with `kind = "speech"` — self-hosted (Qwen3-TTS, Kokoro, XTTS via openedai-speech, LocalAI) or cloud (**OpenAI** `api.openai.com/v1`, or any provider that speaks OpenAI's `/v1/audio/speech`). An optional `[upstream_pools.<name>.voices]` map picks a voice per spoken language (`de`, `en`, …; the `""` key is the default). Flag `compliance` on a non-EU pool (e.g. OpenAI) — voice mode sends the spoken text there. See `gateway.example.toml`.
+
+**How it works:** push-to-talk (hold the mic) → release → the transcript is submitted with the voice directive → as the reply streams, complete sentences are spoken one at a time. Non-speakable bits (code, tables) become a short spoken marker like "the code is shown on screen." It's **half-duplex** — while the assistant speaks, the mic is inert (no echo loop). The reply's language follows what you *spoke*; only the opening greeting uses the UI language. Always-listening (voice-activity) mode and barge-in are a planned next phase.
 
 - **Rust** (edition 2024, toolchain pinned to 1.95 via [mise](https://mise.jdx.dev/)) — a workspace of 5 crates: `gateway`, `session-core`, `cli`, `shared`, and `sandbox-runner`.
 - **[rama 0.3.0-rc1](https://ramaproxy.org/)** — HTTP server, router, middleware, and proxying.
@@ -321,6 +332,7 @@ In a clone, run it via `mise run cli -- <args>`; a release build produces a stan
 | `POST /v1/images/generations` | Bearer token | Image generation (routes to an `image`-kind pool). |
 | `POST /v1/images/edits` | Bearer token | Image editing (multipart: `image` + `prompt`); routes to an `image`-kind pool. |
 | `POST /v1/audio/transcriptions` | Bearer token | Whisper-style transcription (multipart upload). |
+| `POST /v1/audio/speech` | Bearer token | Text-to-speech (OpenAI-shaped). Only served when a `speech` upstream pool is configured. |
 | `GET /v1/models` | Bearer token | All discovered models across pools (deduplicated by id). |
 | `GET /v1/me` | Bearer token | Caller identity + the tools your role(s) grant (backs `gw auth whoami` / `gw auth tools`). |
 | `POST /v1/auth/logout` | Bearer token | Revoke the bearer token used for the call (backs `gw auth logout`). |

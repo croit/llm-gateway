@@ -523,6 +523,142 @@
     [data-transcribing="1"] > .mic-recording { display: none; }
     [data-transcribing="1"] > .mic-transcribing { display: inline-flex; }
 
+    /* Voice-conversation modal.
+     *
+     * A native <dialog> (opened via showModal(), like the feedback widget) that
+     * hosts the whole call. `data-voice-state` on the dialog drives the control
+     * animation + status; the chat transcript builds behind it and is revealed
+     * on close. */
+    .voice-modal {
+        border: none;
+        border-radius: 1rem;
+        padding: 0;
+        background: transparent;
+        max-width: min(28rem, 92vw);
+    }
+    .voice-modal::backdrop {
+        background: color-mix(in oklch, var(--color-base-300) 55%, transparent);
+        backdrop-filter: blur(2px);
+    }
+    .voice-modal__box {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1rem;
+        padding: 1.5rem 1.75rem 1.25rem;
+        background: var(--color-base-100);
+        border: 1px solid var(--color-base-300);
+        border-radius: 1rem;
+        min-width: 22rem;
+    }
+    .voice-modal__header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+    }
+    .voice-modal__title { font-weight: 600; }
+    /* The central control: a big circle. Waveform by default; spinner while
+     * working. State-driven ring + pulse. */
+    .voice-modal__control {
+        --ring: var(--color-base-300);
+        display: grid;
+        place-items: center;
+        width: 6.5rem;
+        height: 6.5rem;
+        margin: 0.5rem 0;
+        border-radius: 9999px;
+        border: 2px solid var(--ring);
+        background: color-mix(in oklch, var(--color-base-200) 60%, transparent);
+        color: var(--color-base-content);
+        cursor: pointer;
+        transition: border-color 0.2s, transform 0.1s, background 0.2s;
+    }
+    .voice-modal__control:active { transform: scale(0.96); }
+    /* The canvas visualizer and the working-spinner share the circle; the
+     * canvas's `color` (set per state) is the bar colour read by voice.ts. */
+    .voice-modal__control > .voice-modal__viz,
+    .voice-modal__control > .voice-modal__spin { grid-area: 1 / 1; }
+    .voice-modal__viz {
+        width: 5rem;
+        height: 5rem;
+        color: color-mix(in oklch, var(--color-base-content) 55%, transparent);
+    }
+    .voice-modal__spin { display: none; place-self: center; }
+    /* Idle: muted bars. Listening: primary ring + pulse + primary bars.
+     * Working: spinner (canvas hidden). Speaking: accent ring + accent bars. */
+    .voice-modal[data-voice-state="listening"] .voice-modal__control {
+        --ring: var(--color-primary);
+        background: color-mix(in oklch, var(--color-primary) 18%, transparent);
+        animation: voice-pulse 1.1s ease-in-out infinite;
+    }
+    .voice-modal[data-voice-state="listening"] .voice-modal__viz { color: var(--color-primary); }
+    .voice-modal[data-voice-state="working"] .voice-modal__control { --ring: var(--color-primary); }
+    .voice-modal[data-voice-state="working"] .voice-modal__viz { display: none; }
+    .voice-modal[data-voice-state="working"] .voice-modal__spin { display: inline-flex; }
+    .voice-modal[data-voice-state="speaking"] .voice-modal__control {
+        --ring: var(--color-secondary, var(--color-primary));
+        background: color-mix(in oklch, var(--color-secondary, var(--color-primary)) 16%, transparent);
+    }
+    .voice-modal[data-voice-state="speaking"] .voice-modal__viz {
+        color: var(--color-secondary, var(--color-primary));
+    }
+    @keyframes voice-pulse {
+        0%, 100% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--color-primary) 40%, transparent); }
+        50% { box-shadow: 0 0 0 0.6rem color-mix(in oklch, var(--color-primary) 0%, transparent); }
+    }
+    @keyframes voice-bob {
+        0%, 100% { transform: scaleY(1); }
+        50% { transform: scaleY(1.25); }
+    }
+    .voice-modal__status {
+        font-size: 0.9rem;
+        color: var(--color-base-content);
+        opacity: 0.8;
+        text-align: center;
+        min-height: 1.25rem;
+    }
+    .voice-modal__captions {
+        width: 100%;
+        display: flex;
+        flex-direction: column;
+        gap: 0.4rem;
+        padding: 0.75rem;
+        border-radius: 0.75rem;
+        background: color-mix(in oklch, var(--color-base-200) 50%, transparent);
+        min-height: 3.5rem;
+        font-size: 0.9rem;
+    }
+    .voice-cap { display: flex; gap: 0.5rem; align-items: baseline; margin: 0; }
+    .voice-cap__who {
+        flex: 0 0 auto;
+        font-size: 0.7rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        opacity: 0.55;
+        min-width: 2rem;
+    }
+    .voice-cap__text { min-width: 0; }
+    .voice-modal__note {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        font-size: 0.75rem;
+        opacity: 0.6;
+        margin: 0;
+    }
+    .voice-rec-dot {
+        width: 0.5rem;
+        height: 0.5rem;
+        border-radius: 9999px;
+        background: var(--color-error);
+        animation: voice-pulse-dot 1.4s ease-in-out infinite;
+    }
+    @keyframes voice-pulse-dot {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.3; }
+    }
+
     /* Thinking indicator. The chat stream's initial event renders a
      * `.thinking` sibling next to `<div id="active-text">`. Once a
      * delta lands and `#active-text` is no longer empty, the

@@ -42,6 +42,7 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
     pools.insert(
         "pool".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,

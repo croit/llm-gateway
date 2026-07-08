@@ -25,6 +25,7 @@ pub mod rbac;
 pub mod reasoning;
 pub mod scheduled;
 pub mod skills;
+pub mod speech;
 pub mod state;
 pub mod tools;
 pub mod typst;

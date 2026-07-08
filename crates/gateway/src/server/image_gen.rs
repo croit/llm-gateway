@@ -522,6 +522,7 @@ mod tests {
 
     fn image_pool(base_url: &str) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
+            voices: Default::default(),
             compliance: Default::default(),
             kind: PoolKind::Image,
             strategy: PickerStrategy::RoundRobin,
@@ -538,6 +539,7 @@ mod tests {
         let mut backend = image_backend(base_url);
         backend.supports_edit = true;
         UpstreamPoolConfig {
+            voices: Default::default(),
             compliance: Compliance { gdpr, nda: true },
             kind: PoolKind::Image,
             strategy: PickerStrategy::RoundRobin,

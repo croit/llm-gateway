@@ -85,6 +85,7 @@ fn registry_pointed_at(upstream_url: &str) -> Arc<UpstreamRegistry> {
     pools.insert(
         "embed".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Embedding,

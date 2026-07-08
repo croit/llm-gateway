@@ -391,6 +391,7 @@ mod tests {
         pools.insert(
             "embed".to_string(),
             UpstreamPoolConfig {
+                voices: Default::default(),
                 compliance: Default::default(),
                 kind: PoolKind::Embedding,
                 strategy: PickerStrategy::RoundRobin,

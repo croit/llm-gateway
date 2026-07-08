@@ -23,6 +23,7 @@
 import '../../crates/session-core/ui/ts/composer.js';
 import '../../crates/session-core/ui/ts/scroll.js';
 import './chat/mic.js';
+import './chat/voice.js';
 import './chat/actions.js';
 import './clipboard.js';
 import './canvas.js';

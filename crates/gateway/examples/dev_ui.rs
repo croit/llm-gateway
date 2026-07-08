@@ -168,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
     pools.insert(
         "chat".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
@@ -190,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
     pools.insert(
         "voice".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Transcription,

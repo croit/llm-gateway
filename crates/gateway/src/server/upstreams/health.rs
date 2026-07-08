@@ -437,6 +437,7 @@ mod tests {
         pools.insert(
             "images".to_string(),
             UpstreamPoolConfig {
+                voices: Default::default(),
                 compliance: Default::default(),
                 kind: PoolKind::Image,
                 strategy: PickerStrategy::RoundRobin,

@@ -168,6 +168,7 @@ fn kind_label(kind: PoolKind) -> &'static str {
         PoolKind::Transcription => "transcription",
         PoolKind::Embedding => "embedding",
         PoolKind::Image => "image",
+        PoolKind::Speech => "speech",
     }
 }
 

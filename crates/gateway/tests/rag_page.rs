@@ -265,6 +265,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
     pools.insert(
         "embed".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Embedding,
@@ -287,6 +288,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
     pools.insert(
         "chat".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,

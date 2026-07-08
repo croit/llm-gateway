@@ -31,12 +31,14 @@ use crate::rama_server::state::RamaState;
 use crate::rama_server::vad;
 use crate::server::auth::UserCtx;
 use crate::server::db::usage::{self, UsageKind, UsageRecord, UsageSource};
+use crate::server::speech::{self, SpokenMarkers};
 use crate::server::tools::ToolContext;
 use crate::server::tools::ToolSource;
 use crate::server::tools::runner::{self, LoopError};
 use crate::server::upstreams::registry::{Acquired, RouteError};
 use crate::server::upstreams::{AcquireError, PoolKind};
 use crate::server::usage::UsageHandle;
+use session_core::i18n::{Lang, t};
 
 /// Identity + classification for a usage measurement, built once per
 /// request and finished off (backend, status, latency, tokens) at each
@@ -901,6 +903,259 @@ pub async fn images_edits(State(state): State<Arc<RamaState>>, req: Request) -> 
     )
     .await;
     with_resolved_model_header(resp, &model, &real_model)
+}
+
+/// Bounded in-memory TTS cache for the voice-mode session path. Identical
+/// `(model, voice, text)` always synthesises to identical audio, so repeats —
+/// above all the fixed greeting spoken on *every* modal open — are served from
+/// memory instead of re-billing the TTS backend. Keyed `model|voice|text`; only
+/// short inputs (greetings + single sentences) are cached, and the map is
+/// capped so a long session can't grow it without bound. Not used by the raw
+/// `/v1/audio/speech` proxy, which stays a 1:1 passthrough.
+static TTS_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Bytes>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const TTS_CACHE_MAX_ENTRIES: usize = 256;
+const TTS_CACHE_MAX_TEXT_CHARS: usize = 400;
+
+fn tts_cache_get(key: &str) -> Option<Bytes> {
+    TTS_CACHE.lock().ok()?.get(key).cloned()
+}
+
+fn tts_cache_put(key: String, bytes: Bytes) {
+    if let Ok(mut m) = TTS_CACHE.lock() {
+        // Crude cap: clear when full. The greeting + common sentences re-cache
+        // on their next use, so this is cheap and keeps memory bounded.
+        if m.len() >= TTS_CACHE_MAX_ENTRIES {
+            m.clear();
+        }
+        m.insert(key, bytes);
+    }
+}
+
+/// A cached-audio response: 200 + `audio/mpeg` (voice mode always requests mp3)
+/// + a private browser cache so a reopen in the same session is free too.
+fn audio_response(bytes: Bytes) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(rama::http::header::CONTENT_TYPE, "audio/mpeg")
+        .header(rama::http::header::CACHE_CONTROL, "private, max-age=86400")
+        .body(bytes.into())
+        .unwrap_or_else(|_| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "building audio response",
+            )
+        })
+}
+
+/// `POST /v1/audio/speech` — OpenAI-compatible text-to-speech. Byte-dumb
+/// proxy: authenticate, read the `model`, pick a healthy backend from the
+/// **Speech** pool, relay request/response 1:1 (the response body is audio).
+/// No sanitising — `/v1` callers get exactly what they sent, matching every
+/// other `/v1` endpoint. Voice mode's own sanitised, voice-mapped path is
+/// `POST /api/v0/speech`.
+pub async fn speech(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let user = match require_bearer(&state, &parts.headers).await {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
+    };
+    let Some(model) = parse_model_field(&body) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "request body is missing a string `model` field",
+        );
+    };
+    let acquired = match state.upstreams.route(&model, PoolKind::Speech) {
+        Ok(a) => a,
+        Err(e) => return route_error_response(e),
+    };
+    let real_model = acquired.resolved_model().to_string();
+    let body = rewrite_model_in_bytes(body, &real_model);
+    let rec = RecordParams::v1(&user, UsageKind::Speech, real_model.clone());
+    let resp = forward(
+        &state,
+        acquired,
+        Method::POST,
+        "audio/speech",
+        parts.headers,
+        body,
+        rec,
+    )
+    .await;
+    with_resolved_model_header(resp, &model, &real_model)
+}
+
+/// `POST /api/v0/speech` — session-authed voice-mode TTS. Body:
+/// `{"text": "...", "language": "de"}`. The text (a sentence, for streaming) is
+/// sanitised to speakable prose (Markdown/code/tables → localised spoken
+/// markers), the voice is resolved from the operator's language→voice map, and
+/// the request is forwarded to the speech pool. Returns audio bytes for the
+/// browser to play; `204 No Content` when nothing speakable remains.
+pub async fn speech_session(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let session = match state.sessions.lookup_from_headers(&parts.headers).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "no active session — sign in at /auth/login",
+            );
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "session lookup");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "session lookup failed",
+            );
+        }
+    };
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
+    };
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("body must be JSON: {e}"),
+            );
+        }
+    };
+    let text = parsed
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "missing `text` field",
+        );
+    }
+    let language = parsed
+        .get("language")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Markers are spoken, so localise them to the spoken language (fall back to
+    // the request's UI language, then English). Bound to locals so the
+    // SpokenMarkers borrows outlive the `to_spoken` call.
+    let marker_lang =
+        Lang::from_code(&language).unwrap_or_else(|| Lang::from_headers(&parts.headers));
+    let code_marker = t(marker_lang, "voice-code-marker");
+    let table_marker = t(marker_lang, "voice-table-marker");
+    let spoken = speech::to_spoken(
+        &text,
+        &SpokenMarkers {
+            code: &code_marker,
+            table: &table_marker,
+        },
+    );
+    if spoken.trim().is_empty() {
+        // Chunk was entirely non-speakable (e.g. a bare code fence). Nothing to
+        // synthesize — tell the client to skip it.
+        return (StatusCode::NO_CONTENT, "").into_response();
+    }
+
+    let Some((model, voice)) = state.upstreams.speech_target(&language) else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_speech_backend",
+            "no speech (TTS) pool is configured",
+        );
+    };
+    // Cache lookup BEFORE routing, so a hit costs no inflight slot and no TTS
+    // spend. Key on the pre-resolution model + voice + spoken text.
+    let cache_key = format!("{model}|{}|{spoken}", voice.as_deref().unwrap_or(""));
+    if let Some(bytes) = tts_cache_get(&cache_key) {
+        return audio_response(bytes);
+    }
+    let spoken_len = spoken.chars().count();
+    let acquired = match state.upstreams.route(&model, PoolKind::Speech) {
+        Ok(a) => a,
+        Err(e) => return route_error_response(e),
+    };
+    let real_model = acquired.resolved_model().to_string();
+    let mut req_body = json!({
+        "model": real_model,
+        "input": spoken,
+        "response_format": "mp3",
+    });
+    if let Some(v) = voice {
+        req_body["voice"] = json!(v);
+    }
+
+    let user_email = if state.usage.is_enabled() {
+        crate::server::db::users::find_by_id(&state.db, &session.user_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.email)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let rec = RecordParams {
+        user_id: session.user_id.clone(),
+        user_email,
+        token_id: None,
+        token_name: None,
+        source: UsageSource::Chat,
+        kind: UsageKind::Speech,
+        model: real_model.clone(),
+    };
+    let serialized = match serde_json::to_vec(&req_body) {
+        Ok(v) => Bytes::from(v),
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                &format!("serialising speech request: {e}"),
+            );
+        }
+    };
+    // JSON body — set Content-Type accordingly (the inbound one is already
+    // application/json for our own UI, but be explicit).
+    let mut headers = parts.headers;
+    headers.remove(rama::http::header::CONTENT_TYPE);
+    headers.insert(
+        rama::http::header::CONTENT_TYPE,
+        rama::http::HeaderValue::from_static("application/json"),
+    );
+    let resp = forward(
+        &state,
+        acquired,
+        Method::POST,
+        "audio/speech",
+        headers,
+        serialized,
+        rec,
+    )
+    .await;
+    // Buffer the audio so a successful, short synthesis is cached for next time
+    // (the greeting + repeated sentences). Non-2xx / oversized inputs pass
+    // through uncached. Small clips, so buffering is cheap.
+    let (parts, body) = resp.into_parts();
+    let cacheable = parts.status.as_u16() == 200 && spoken_len <= TTS_CACHE_MAX_TEXT_CHARS;
+    let bytes = read_body_to_bytes(body).await.unwrap_or_default();
+    if cacheable {
+        tts_cache_put(cache_key, bytes.clone());
+    }
+    Response::from_parts(parts, bytes.into())
 }
 
 /// `GET /v1/models` — lists *every* model served by any healthy backend in

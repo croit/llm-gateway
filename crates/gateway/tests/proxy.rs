@@ -668,6 +668,7 @@ async fn state_with_backend_api_key(
     pools.insert(
         "pool".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
@@ -720,6 +721,7 @@ async fn state_with_alias_pool(upstream_url: &str) -> gateway::rama_server::Rama
     pools.insert(
         "pool".to_string(),
         UpstreamPoolConfig {
+            voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
             kind: PoolKind::Chat,
