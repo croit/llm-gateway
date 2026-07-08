@@ -777,7 +777,10 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                 "type": "function",
                 "function": {
                     "name": acc.name.clone(),
-                    "arguments": acc.arguments.clone(),
+                    // Normalise before replaying upstream: an empty/garbage
+                    // args string (common for no-arg tools like
+                    // `rag_list_collections`) 400s a strict re-parse.
+                    "arguments": runner::normalize_tool_arguments(&acc.arguments),
                 }
             }));
             if crate::server::tools::ToolSource::contains(&tool_source, &acc.name) {

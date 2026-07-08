@@ -333,6 +333,60 @@ fn split_tool_calls(response: &Value, tools: &dyn ToolSource) -> ToolCallSplit {
     }
 }
 
+/// Coerce a model-supplied tool-call `arguments` payload into a valid JSON
+/// **object** value. Returns an empty object when the payload is missing,
+/// empty/whitespace, non-JSON (a truncated `{`, a Python-`repr` dict with
+/// single quotes, …), or a JSON value that isn't an object.
+///
+/// `arguments` is spec'd as a JSON-encoded object, but real models emit all
+/// of the above — especially an empty string for a no-argument tool. Both
+/// executing the call and *replaying it into history* must survive that, and
+/// must agree: a strict upstream re-parses this field when it applies its
+/// chat template (Mistral/Voxtral via `mistral_common` runs
+/// `json.loads(arguments)`), and a non-JSON value there is a hard
+/// `400 Bad Request` — "Expecting property name enclosed in double quotes:
+/// line 1 column 2 (char 1)" for a bare `{`, the char-0 variant for `""`.
+pub(crate) fn tool_arguments_object(raw: &str) -> Value {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(v @ Value::Object(_)) => v,
+        _ => Value::Object(serde_json::Map::new()),
+    }
+}
+
+/// String form of [`tool_arguments_object`] — the canonical JSON-object text
+/// to embed in a `tool_calls[].function.arguments` field we replay upstream.
+/// Always valid JSON, so it can't 400 a strict re-parse; identical to the
+/// value [`execute_tool_calls`] runs the tool with, so history never diverges
+/// from what actually happened.
+pub(crate) fn normalize_tool_arguments(raw: &str) -> String {
+    tool_arguments_object(raw).to_string()
+}
+
+/// Rewrite every `tool_calls[].function.arguments` inside an assistant message
+/// to its [`normalize_tool_arguments`] form, in place. Used on the buffered
+/// path, which replays the upstream's own assistant message verbatim — so a
+/// model that emitted empty/garbage args for a no-arg tool can't 400 the next
+/// round. Also collapses a structured-object `arguments` (some backends emit
+/// one) back to the spec'd string form.
+pub(crate) fn normalize_assistant_tool_call_args(message: &mut Value) {
+    let Some(tool_calls) = message.get_mut("tool_calls").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for tc in tool_calls {
+        let raw = match tc.pointer("/function/arguments") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Null) | None => String::new(),
+            Some(other) => other.to_string(),
+        };
+        if let Some(func) = tc.pointer_mut("/function").and_then(|f| f.as_object_mut()) {
+            func.insert(
+                "arguments".into(),
+                Value::String(normalize_tool_arguments(&raw)),
+            );
+        }
+    }
+}
+
 pub(crate) async fn execute_tool_calls(
     tools: &dyn ToolSource,
     ctx: &ToolContext,
@@ -355,8 +409,7 @@ pub(crate) async fn execute_tool_calls(
                     )),
                 };
             };
-            let args: Value = serde_json::from_str(&call.arguments_raw)
-                .unwrap_or(Value::Object(Default::default()));
+            let args: Value = tool_arguments_object(&call.arguments_raw);
             // Trace each tool call with timing + the args we sent. Lets
             // operators grep the journal when a specific tool (e.g.
             // search_web against the brave API) hangs — the
@@ -463,7 +516,12 @@ fn append_round_to_messages(
         .and_then(|v| v.as_array_mut())
         .ok_or_else(|| LoopError::MalformedRequest("missing `messages` array".into()))?;
 
-    messages.push(assistant_message.clone());
+    // Replay the upstream assistant message verbatim, but normalise its
+    // tool-call arguments first: a model that emitted empty/garbage args for a
+    // no-arg tool would otherwise 400 a strict upstream on the next round.
+    let mut assistant_message = assistant_message.clone();
+    normalize_assistant_tool_call_args(&mut assistant_message);
+    messages.push(assistant_message);
 
     // For each gateway tool_call we executed, emit a matching role:"tool"
     // message. OpenAI's contract: each tool_call_id must be answered.
@@ -1015,5 +1073,142 @@ mod tests {
             .to_string();
         assert!(stub.contains("read_sandbox_output"), "{stub}");
         assert!(stub.contains("t-1/stdout.txt"), "{stub}");
+    }
+
+    #[test]
+    fn normalize_tool_arguments_coerces_non_json_to_empty_object() {
+        // The strings a model actually emits for a no-arg tool that then 400 a
+        // strict upstream re-parse (Mistral/`mistral_common`'s `json.loads`):
+        // an empty string, a truncated brace, a Python-`repr` dict, plain
+        // garbage, and valid-but-non-object JSON. All must become an object.
+        for raw in [
+            "",
+            "   ",
+            "{",
+            "{'keys': ['rag']}",
+            "not json",
+            "null",
+            "[]",
+            "\"x\"",
+            "42",
+        ] {
+            let out = normalize_tool_arguments(raw);
+            let parsed: Value = serde_json::from_str(&out)
+                .unwrap_or_else(|e| panic!("normalized {raw:?} -> {out:?} not valid JSON: {e}"));
+            assert!(parsed.is_object(), "{raw:?} -> {out:?} is not an object");
+        }
+    }
+
+    #[test]
+    fn normalize_tool_arguments_preserves_valid_object() {
+        let out = normalize_tool_arguments(r#"{"query":"nfs","k":3}"#);
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            json!({"query": "nfs", "k": 3})
+        );
+    }
+
+    #[test]
+    fn normalize_assistant_tool_call_args_fixes_every_call() {
+        let mut msg = json!({
+            "role": "assistant",
+            "content": Value::Null,
+            "tool_calls": [
+                // empty string (no-arg tool) — the crash trigger
+                {"id": "a", "type": "function", "function": {"name": "rag_list_collections", "arguments": ""}},
+                // already valid — re-canonicalised, still valid
+                {"id": "b", "type": "function", "function": {"name": "rag_search", "arguments": "{\"query\":\"x\"}"}},
+                // structured object instead of a string — some backends do this
+                {"id": "c", "type": "function", "function": {"name": "t", "arguments": {"k": 1}}},
+            ]
+        });
+        normalize_assistant_tool_call_args(&mut msg);
+        for tc in msg["tool_calls"].as_array().unwrap() {
+            let args = tc["function"]["arguments"]
+                .as_str()
+                .expect("arguments must be a string");
+            let parsed: Value = serde_json::from_str(args).expect("arguments must be valid JSON");
+            assert!(parsed.is_object());
+        }
+        assert_eq!(msg["tool_calls"][0]["function"]["arguments"], json!("{}"));
+        assert_eq!(
+            msg["tool_calls"][2]["function"]["arguments"],
+            json!("{\"k\":1}")
+        );
+    }
+
+    #[test]
+    fn normalize_assistant_tool_call_args_ignores_plain_message() {
+        let mut msg = json!({"role": "assistant", "content": "just text"});
+        let before = msg.clone();
+        normalize_assistant_tool_call_args(&mut msg);
+        assert_eq!(msg, before);
+    }
+
+    #[tokio::test]
+    async fn run_with_tools_normalizes_empty_args_before_replay() {
+        // Regression: a no-arg tool whose upstream streamed `arguments: ""`
+        // must be replayed to the *next* round as valid JSON — otherwise a
+        // strict upstream 400s with "Expecting property name enclosed in
+        // double quotes: line 1 column 2 (char 1)".
+        let reg = registry();
+        let ctx = ctx().await;
+        let request = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "time?"}],
+        });
+        let round1_body: Arc<std::sync::Mutex<Option<Value>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_c = counter.clone();
+        let capture = round1_body.clone();
+        let upstream = move |body: Value| {
+            let counter = counter_c.clone();
+            let capture = capture.clone();
+            async move {
+                let round = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if round == 0 {
+                    let response = json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "id": "call_0",
+                                    "type": "function",
+                                    "function": {"name": "get_current_timestamp", "arguments": ""}
+                                }]
+                            }
+                        }]
+                    });
+                    Ok::<_, LoopError>((200, Bytes::from(serde_json::to_vec(&response).unwrap())))
+                } else {
+                    *capture.lock().unwrap() = Some(body);
+                    let response =
+                        json!({"choices": [{"message": {"role": "assistant", "content": "done"}}]});
+                    Ok::<_, LoopError>((200, Bytes::from(serde_json::to_vec(&response).unwrap())))
+                }
+            }
+        };
+        run_with_tools(
+            &reg,
+            &["get_current_timestamp".into()],
+            &ctx,
+            request,
+            upstream,
+        )
+        .await
+        .unwrap();
+        let body = round1_body.lock().unwrap().clone().expect("round 1 ran");
+        let assistant = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .expect("replayed assistant turn present");
+        let args = assistant["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("replayed arguments is a string");
+        serde_json::from_str::<Value>(args).expect("replayed arguments are valid JSON");
+        assert_eq!(args, "{}");
     }
 }

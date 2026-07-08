@@ -1380,7 +1380,7 @@ fn synth_client_tool_call_chunks(
                 "index": index,
                 "id": acc.id,
                 "type": "function",
-                "function": {"name": acc.name, "arguments": acc.arguments},
+                "function": {"name": acc.name, "arguments": runner::normalize_tool_arguments(&acc.arguments)},
             })
         })
         .collect();
@@ -1650,7 +1650,10 @@ async fn drive_streaming_tool_loop(
                     "type": "function",
                     "function": {
                         "name": call.name.clone(),
-                        "arguments": call.arguments_raw.clone(),
+                        // Normalise before replaying upstream: an empty/garbage
+                        // args string (common for no-arg tools) 400s a strict
+                        // re-parse (Mistral/`mistral_common`'s `json.loads`).
+                        "arguments": runner::normalize_tool_arguments(&call.arguments_raw),
                     }
                 })
             })
