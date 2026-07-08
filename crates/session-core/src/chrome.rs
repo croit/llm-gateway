@@ -517,7 +517,7 @@ impl FlashKind {
 /// `.toast-item` children to it.
 pub fn toast_container() -> Html {
     html! {
-        div(id: "toasts", class: "toast toast-bottom toast-end") {}
+        div(id: "toasts", class: "toast toast-top toast-end") {}
     }
     .to_html()
 }

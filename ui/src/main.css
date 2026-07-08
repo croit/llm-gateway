@@ -409,10 +409,10 @@
     }
 
     /* Sonner-flavoured toasts. The container is daisyUI's
-     * `.toast.toast-bottom.toast-end` (already a fixed-positioned
+     * `.toast.toast-top.toast-end` (already a fixed-positioned
      * stack); each `.toast-item` is a neutral card with a 4 px
      * status-tinted left rule and a pronounced drop shadow so it
-     * lifts off the page. Slide-up entrance keeps the motion gentle. */
+     * lifts off the page. Slide-down entrance keeps the motion gentle. */
     .toast-item {
         background: var(--color-base-100);
         color: var(--color-base-content);
@@ -431,7 +431,7 @@
     @keyframes toast-enter {
         from {
             opacity: 0;
-            transform: translateY(8px);
+            transform: translateY(-8px);
         }
         to {
             opacity: 1;
@@ -2227,17 +2227,21 @@
         border-inline-start: 2px solid var(--color-base-300);
     }
 
-    /* Phone: the composer floats over the bottom of the conversation
-     * (z-index 20), so a `toast-bottom` stack lands behind it and its
-     * text is unreadable. Dock toasts to the top on phones and lift the
-     * stack above the composer. Lives in `@layer utilities` (with an
-     * id+class selector) so it outranks daisyUI's own `.toast*` rules,
-     * which ship in daisyUI's utilities sub-layer. */
+    /* Toasts dock top-end on every viewport. The chat composer floats
+     * over the bottom of the conversation (z-index 20), so a bottom
+     * stack lands behind it and its text is unreadable; top-end clears
+     * the composer entirely. `z-index: 70` lifts the stack above the
+     * composer and the sticky header so a toast is never occluded.
+     * Lives in `@layer utilities` (with an id+class selector) so it
+     * outranks daisyUI's own `.toast*` rules, which ship in daisyUI's
+     * utilities sub-layer. */
+    #toasts.toast {
+        z-index: 70;
+    }
+    /* Phone: nudge the stack down past the notch / status bar. */
     @media (max-width: 639px) {
         #toasts.toast {
             top: calc(env(safe-area-inset-top) + 0.75rem);
-            bottom: auto;
-            z-index: 70;
         }
     }
 }
