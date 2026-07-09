@@ -77,6 +77,23 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/scheduled/{id}", pages::scheduled_update)
         .with_post("/scheduled/{id}/toggle", pages::scheduled_toggle)
         .with_post("/scheduled/{id}/delete", pages::scheduled_delete)
+        // Webhooks: per-user prompts fired by an inbound HTTP call. The
+        // management pages are session-gated; the public trigger
+        // `/hooks/{secret}` authenticates by the secret in the URL.
+        .with_get("/webhooks", pages::webhooks_index)
+        .with_post("/webhooks", pages::webhooks_create)
+        .with_get("/webhooks/{id}/edit", pages::webhooks_edit_form)
+        .with_get("/webhooks/{id}/runs", pages::webhooks_runs)
+        .with_get("/webhooks/{id}/rerun", pages::webhooks_rerun_form)
+        .with_post("/webhooks/{id}/rerun", pages::webhooks_rerun)
+        .with_post("/webhooks/{id}", pages::webhooks_update)
+        .with_post("/webhooks/{id}/toggle", pages::webhooks_toggle)
+        .with_post("/webhooks/{id}/rotate", pages::webhooks_rotate)
+        .with_post("/webhooks/{id}/delete", pages::webhooks_delete)
+        // Public trigger (no session; the secret is the credential). Accepts
+        // GET and POST so simple senders and JSON POSTers both work.
+        .with_get("/hooks/{secret}", pages::webhook_trigger)
+        .with_post("/hooks/{secret}", pages::webhook_trigger)
         .with_get("/integrations", pages::integrations_index)
         .with_get("/integrations/callback", pages::integrations_callback)
         .with_post("/integrations/{key}/connect", pages::integrations_connect)

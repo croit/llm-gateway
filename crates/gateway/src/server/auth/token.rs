@@ -14,33 +14,57 @@ use rand::TryRngCore;
 use rand::rngs::OsRng;
 
 pub const TOKEN_PREFIX: &str = "gwk_";
+/// Webhook trigger secrets share the token construction but carry their own
+/// prefix so the two namespaces can't be confused. The `gwh_<64 hex>` string
+/// is the credential in a webhook's trigger URL; only its hash is persisted.
+pub const WEBHOOK_PREFIX: &str = "gwh_";
 pub const TOKEN_BYTES: usize = 32;
 pub const TOKEN_HEX_LEN: usize = TOKEN_BYTES * 2;
 
-/// Mints a fresh token. Returns `(plaintext, sha256_hex)`. The plaintext is
-/// shown to the user exactly once; the hash is what gets persisted.
+/// Mints a fresh API token (`gwk_…`). Returns `(plaintext, sha256_hex)`. The
+/// plaintext is shown to the user exactly once; the hash is what gets persisted.
 pub fn mint() -> (String, String) {
-    let mut bytes = [0u8; TOKEN_BYTES];
-    OsRng
-        .try_fill_bytes(&mut bytes)
-        .expect("OS RNG must succeed");
-    let plaintext = format!("{TOKEN_PREFIX}{}", hex_encode(&bytes));
-    let hash = sha256_hex(plaintext.as_bytes());
-    (plaintext, hash)
+    mint_with_prefix(TOKEN_PREFIX)
+}
+
+/// Mints a fresh webhook trigger secret (`gwh_…`). Same construction as
+/// [`mint`], different prefix. Returns `(plaintext, sha256_hex)`.
+pub fn mint_webhook() -> (String, String) {
+    mint_with_prefix(WEBHOOK_PREFIX)
 }
 
 /// Validates the surface shape of a bearer string and returns its SHA-256 hex
 /// for DB lookup. Rejects anything that doesn't look like our format so we
 /// never run a hash + DB query on obvious garbage.
 pub fn hash_bearer(bearer: &str) -> Option<String> {
-    if !bearer.starts_with(TOKEN_PREFIX) {
+    hash_with_prefix(TOKEN_PREFIX, bearer)
+}
+
+/// Validates a webhook trigger secret (`gwh_…`) and returns its SHA-256 hex for
+/// DB lookup. Same gate as [`hash_bearer`], different prefix.
+pub fn hash_webhook_secret(secret: &str) -> Option<String> {
+    hash_with_prefix(WEBHOOK_PREFIX, secret)
+}
+
+fn mint_with_prefix(prefix: &str) -> (String, String) {
+    let mut bytes = [0u8; TOKEN_BYTES];
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS RNG must succeed");
+    let plaintext = format!("{prefix}{}", hex_encode(&bytes));
+    let hash = sha256_hex(plaintext.as_bytes());
+    (plaintext, hash)
+}
+
+fn hash_with_prefix(prefix: &str, s: &str) -> Option<String> {
+    if !s.starts_with(prefix) {
         return None;
     }
-    let tail = &bearer[TOKEN_PREFIX.len()..];
+    let tail = &s[prefix.len()..];
     if tail.len() != TOKEN_HEX_LEN || !tail.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    Some(sha256_hex(bearer.as_bytes()))
+    Some(sha256_hex(s.as_bytes()))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -104,5 +128,17 @@ mod tests {
         let (plaintext, hash) = mint();
         assert_eq!(hash_bearer(&plaintext).unwrap(), hash);
         assert_eq!(hash_bearer(&plaintext).unwrap(), hash);
+    }
+
+    #[test]
+    fn webhook_secret_round_trips_and_is_namespaced() {
+        let (plaintext, hash) = mint_webhook();
+        assert!(plaintext.starts_with(WEBHOOK_PREFIX));
+        assert_eq!(plaintext.len(), WEBHOOK_PREFIX.len() + TOKEN_HEX_LEN);
+        assert_eq!(hash_webhook_secret(&plaintext).unwrap(), hash);
+        // The two namespaces must not validate each other's strings.
+        assert!(hash_bearer(&plaintext).is_none());
+        let (api, _) = mint();
+        assert!(hash_webhook_secret(&api).is_none());
     }
 }

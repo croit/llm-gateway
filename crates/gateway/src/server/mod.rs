@@ -17,6 +17,7 @@ pub mod embeddings;
 pub mod feature_defaults;
 pub mod geoip;
 pub mod github;
+pub mod headless;
 pub mod image_gen;
 pub mod model_defaults;
 pub mod pdf;
@@ -31,6 +32,7 @@ pub mod tools;
 pub mod typst;
 pub mod upstreams;
 pub mod usage;
+pub mod webhooks;
 
 pub use config::Config;
 pub use state::AppState;

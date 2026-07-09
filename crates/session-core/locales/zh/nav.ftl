@@ -3,6 +3,7 @@
 nav-chat = 聊天
 nav-memory = 记忆
 nav-scheduled = 计划任务
+nav-webhooks = Webhook
 nav-integrations = 集成
 nav-tools = 工具
 nav-tokens = 令牌

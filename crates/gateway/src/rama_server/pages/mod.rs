@@ -55,6 +55,9 @@ enum NavItem {
     /// Per-user scheduled-actions page (`/scheduled`). Shown to every
     /// signed-in user; each manages their own schedules.
     Scheduled,
+    /// Per-user webhooks page (`/webhooks`). Shown to every signed-in user;
+    /// each manages their own inbound triggers.
+    Webhooks,
     /// Per-user MCP connector store (`/integrations`). Shown to every
     /// signed-in user; each connects their own accounts (Google, GitHub, …).
     Integrations,
@@ -241,6 +244,7 @@ fn render_app_sidebar(
                 (nav_group(lang, "workspace", &t(lang, "nav-group-workspace"), html! {
                     (sidebar_nav_link("/memory", NavItem::Memory, active, icons::folder(16), &t(lang, "nav-memory")))
                     (sidebar_nav_link("/scheduled", NavItem::Scheduled, active, icons::clock(16), &t(lang, "nav-scheduled")))
+                    (sidebar_nav_link("/webhooks", NavItem::Webhooks, active, icons::send(16), &t(lang, "nav-webhooks")))
                     (sidebar_nav_link("/integrations", NavItem::Integrations, active, icons::plug(16), &t(lang, "nav-integrations")))
                     (sidebar_nav_link("/tools", NavItem::Tools, active, icons::sliders(16), &t(lang, "nav-tools")))
                 }.to_html()))
@@ -1105,6 +1109,21 @@ mod scheduled;
 pub use scheduled::{
     scheduled_create, scheduled_delete, scheduled_edit_form, scheduled_index, scheduled_preview,
     scheduled_toggle, scheduled_update,
+};
+
+// ---------------------------------------------------------------------------
+// Webhooks
+//
+// Per-user prompts fired by an inbound HTTP call (`/webhooks` + create /
+// update / toggle / rotate / delete, plus the edit sub-page). The public
+// trigger `webhook_trigger` (on `/hooks/{secret}`) has no session — the
+// secret in the URL is the credential. Available to every signed-in user;
+// scoped to the owner in the data layer.
+mod webhooks;
+pub use webhooks::{
+    webhook_trigger, webhooks_create, webhooks_delete, webhooks_edit_form, webhooks_index,
+    webhooks_rerun, webhooks_rerun_form, webhooks_rotate, webhooks_runs, webhooks_toggle,
+    webhooks_update,
 };
 
 // Per-user MCP connector store (`/integrations`). OAuth connect/callback +

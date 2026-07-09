@@ -40,6 +40,8 @@ pub enum UsageSource {
     Chat,
     /// A cron-fired scheduled action (headless).
     Scheduled,
+    /// An inbound-webhook fire (headless; triggered by `/hooks/{secret}`).
+    Webhook,
 }
 
 impl UsageSource {
@@ -48,6 +50,7 @@ impl UsageSource {
             UsageSource::V1Api => "v1_api",
             UsageSource::Chat => "chat",
             UsageSource::Scheduled => "scheduled",
+            UsageSource::Webhook => "webhook",
         }
     }
 }
