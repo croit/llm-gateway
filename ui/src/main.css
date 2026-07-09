@@ -1919,8 +1919,17 @@
             color: var(--color-error);
         }
     }
+    /* Flex row: the textarea flexes to fill, the action cluster is a
+     * flow sibling to its right. This *reserves* the buttons' horizontal
+     * space by layout rather than guessing a `padding-right` number —
+     * so typed text can never run under the buttons no matter how many
+     * render (attach / mic / voice / send vary per build + i18n).
+     * `align-items: flex-start` keeps the fixed-height action cluster
+     * pinned to the first line as the textarea grows. */
     .chat-composer__field {
         position: relative;
+        display: flex;
+        align-items: flex-start;
     }
     /* Textarea autosizes between min-height and max-height. We use
      * the native `field-sizing: content` (Chrome 123+, Edge 123+,
@@ -1942,10 +1951,13 @@
         field-sizing: content;
         min-height: 3rem;
         max-height: 14rem;
-        width: 100%;
-        /* Right padding leaves room for the absolute mic/send button so
-         * typed text doesn't run under it. */
-        padding: 0.75rem 3rem 0.75rem 1.125rem;
+        /* Flex child: fill the row beside the action cluster. `min-width:
+         * 0` lets it shrink so long words wrap instead of pushing the
+         * buttons off-screen. The action cluster reserves the right-side
+         * space itself, so only a small gutter is needed here. */
+        flex: 1 1 auto;
+        min-width: 0;
+        padding: 0.75rem 0.5rem 0.75rem 1.125rem;
         color: inherit;
         outline: none;
         font: inherit;
@@ -1956,15 +1968,16 @@
         outline: none;
         box-shadow: none;
     }
-    /* Absolute overlay holding the mic / send buttons. `height: 3rem`
-     * matches the textarea's single-line min-height; `align-items:
-     * center` then lands the button vertical center on the first
-     * line of text — regardless of whether the textarea has grown. */
+    /* Flow sibling holding the mic / send buttons. `height: 3rem`
+     * matches the textarea's single-line min-height; combined with the
+     * field's `align-items: flex-start` and its own `align-items:
+     * center`, the buttons' vertical center lands on the first line of
+     * text — regardless of whether the textarea has grown. `flex-shrink:
+     * 0` keeps the cluster at full width so text always wraps before it. */
     .chat-composer__action {
-        position: absolute;
-        top: 0;
-        right: 0.5rem;
+        flex: 0 0 auto;
         height: 3rem;
+        padding-right: 0.5rem;
         display: flex;
         align-items: center;
         gap: 0.25rem;
