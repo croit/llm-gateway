@@ -3,6 +3,7 @@
 nav-chat = Chat
 nav-memory = Memoria
 nav-scheduled = Programado
+nav-webhooks = Webhooks
 nav-integrations = Integraciones
 nav-tools = Herramientas
 nav-tokens = Tokens

@@ -18,14 +18,12 @@
 //! the first tick after startup rather than a backlog burst.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use session_core::db as chat;
 use session_core::db::TurnStatus;
-use uuid::Uuid;
 
 use super::{ScheduledAction, cron::Cron};
 use crate::rama_server::state::RamaState;
@@ -134,7 +132,9 @@ async fn run_action(state: Arc<RamaState>, action: ScheduledAction, next: Option
 }
 
 /// Open the chat session for one run and append the prompt + an in-progress
-/// assistant turn. Returns `(session_id, assistant_turn_id)`.
+/// assistant turn. Returns `(session_id, assistant_turn_id)`. Delegates the
+/// generic session-opening to [`crate::server::headless::open_session`]; this
+/// wrapper only decides *which* session (fresh vs. reused).
 ///
 /// In the default mode every call mints a brand-new session, so repeated
 /// runs of the *same* action never collide — reusing the action id as the
@@ -149,22 +149,18 @@ async fn open_run_session(
     db: &crate::server::db::Pool,
     action: &ScheduledAction,
 ) -> Result<(String, String), super::DbError> {
-    let session_id = match reusable_session(db, action).await {
-        Some(id) => id,
-        None => {
-            let session = chat::create_session(db, &action.user_id).await?;
-            chat::set_session_title(db, &session.id, &action.name).await?;
-            session.id
-        }
-    };
-
-    let user_turn_id = Uuid::new_v4().to_string();
-    chat::create_user_turn(db, &session_id, &user_turn_id, &action.prompt).await?;
-
-    let assistant_turn_id = Uuid::new_v4().to_string();
-    chat::create_assistant_turn_in_progress(db, &session_id, &assistant_turn_id, &action.model)
-        .await?;
-    Ok((session_id, assistant_turn_id))
+    let existing_session = reusable_session(db, action).await;
+    crate::server::headless::open_session(
+        db,
+        crate::server::headless::OpenParams {
+            user_id: &action.user_id,
+            title: &action.name,
+            prompt: &action.prompt,
+            model: &action.model,
+            existing_session,
+        },
+    )
+    .await
 }
 
 /// The previous run's session id, but only when reuse is enabled *and* that
@@ -203,15 +199,6 @@ async fn try_run_action(
     } else {
         Vec::new()
     };
-    let tool_ctx = crate::openai_driver::build_tool_context(
-        state,
-        action.user_id.clone(),
-        roles,
-        session_id.clone(),
-        assistant_turn_id.clone(),
-        None, // headless: no client IP
-        None, // headless: no interactive feedback channel
-    );
     // In reuse mode, replay only the most recent `reuse_rounds` rounds
     // (one round = the run's prompt + reply = 2 turns) so a long-lived
     // action's context can't grow without bound. `None` = no cap, which is
@@ -220,27 +207,19 @@ async fn try_run_action(
     let history_limit = action
         .reuse_conversation
         .then(|| (action.reuse_rounds.max(0) as usize).saturating_mul(2));
-    let driver = Box::new(crate::openai_driver::OpenAiDriver {
-        state: state.clone(),
-        tool_ctx,
-        source: crate::server::db::usage::UsageSource::Scheduled,
-        history_limit,
-        voice_mode: false,
-    });
-
-    // No registry slot and a throwaway broadcast channel: a scheduled run
-    // has no live viewer to tail or cancel it. The DB is the source of
-    // truth, so dropping every frame is fine.
-    let (broadcast, _rx) = tokio::sync::broadcast::channel(16);
-    let ctx = session_core::driver::SessionContext {
-        user_id: Some(action.user_id.clone()),
-        session_id: session_id.clone(),
-        assistant_turn_id: assistant_turn_id.clone(),
-        model: action.model.clone(),
-        cancel: Arc::new(AtomicBool::new(false)),
-        broadcast,
-    };
-    session_core::worker::run_session_turn(state.db.clone(), driver, ctx).await;
+    crate::server::headless::drive(
+        state,
+        crate::server::headless::DriveParams {
+            user_id: action.user_id.clone(),
+            roles,
+            session_id: session_id.clone(),
+            assistant_turn_id: assistant_turn_id.clone(),
+            model: action.model.clone(),
+            source: crate::server::db::usage::UsageSource::Scheduled,
+            history_limit,
+        },
+    )
+    .await;
     Ok((session_id, assistant_turn_id))
 }
 

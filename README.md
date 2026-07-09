@@ -105,6 +105,18 @@ Every signed-in user can have prompts run **automatically on a schedule** at `/s
 
 **How runs fire.** A background worker polls every 30 seconds and runs every action whose next occurrence is due, claiming each one atomically first so a slow run or a restart can't double-fire. If the gateway was down across one or more scheduled slots, the missed occurrences **collapse into a single catch-up run** on the first poll after startup rather than replaying as a backlog. Actions can be **paused** (the worker skips them) and resumed, edited, or deleted from the same page.
 
+## Webhooks
+
+The event-driven twin of scheduled actions: instead of a clock, an **inbound HTTP call** fires the run. At `/webhooks` a signed-in user saves a prompt plus a model, gets back a secret trigger URL (`/hooks/gwh_…`), and points any external service at it — a CI pipeline, a GitHub or Discord webhook, a monitoring alert, a form handler, or a quick `curl`. When something calls the URL, the gateway appends **whatever the caller sends in the request body** (JSON or plain text) to the saved prompt as a clearly delimited *untrusted* block, then runs it through the same engine as `/chat`, so the result lands as an ordinary conversation you can open afterward.
+
+**Sync or async.** A per-webhook checkbox picks the behaviour: an **async** webhook returns `202 Accepted` immediately and runs in the background; a **synchronous** webhook makes the caller wait and returns the model's answer as a JSON envelope (`{"status","session_id","output"}`) — handy for integrations that want the reply inline.
+
+**Fresh chat or reuse.** Like scheduled actions, a webhook either opens a **fresh chat per fire** (the default) or **reuses** the previous fire's chat so the model sees prior fires as history (a running incident log, a rolling digest) — with a replay-rounds cap so the context can't grow without bound.
+
+**Run history.** Every fire — and every rerun — is logged. Each webhook has a **Runs** page listing its most recent runs (up to 50), each showing when it fired, whether it succeeded, and a link to **its generated chat** for the full details. From there you can **rerun any past run**: its exact payload is replayed with a prompt you can tweak, into a fresh chat you watch live. So you can iterate on the prompt without asking the external service to re-send anything.
+
+**Security.** The secret in the URL is the credential — only its hash is stored, so the full URL is shown **once** on create (rotate to mint a new one; the old URL stops working immediately). Tools default **off**: because a webhook is triggered by an anonymous external caller feeding attacker-controllable text to a model that would run *as you*, granting it your tools (web search, RAG, connectors) is a deliberate, warned opt-in. Webhooks are per-user and private, and can be paused, edited, rotated, or deleted from the same page. (Rate limiting and quotas are handled separately, across all request surfaces.)
+
 ## Conversation compaction
 
 A chat replays its whole history to the model on every turn, so a long conversation's prompt grows until it crowds the model's context window. The gateway **compacts automatically**: once a turn's measured prompt size (the upstream's own `prompt_tokens`) crosses a fraction of the model's context window, a background task — off the turn's critical path, like title generation — summarises the oldest turns into a single dense summary. The next turn then replays `[request context] + [summary] + [most recent turns verbatim]` instead of the full history. As the conversation keeps growing it's **re-compacted**: the previous summary plus the newly-aged turns fold into a fresh summary, so context stays bounded across an arbitrarily long chat.
@@ -337,7 +349,8 @@ openai api chat_completions.create -m <model-id> -g user "Hello"
 | `GET /v1/models` | Bearer token | All discovered models across pools (deduplicated by id). |
 | `GET /v1/sandbox/files/{run}/{filename}` | Bearer token | Download a file a sandbox run produced for the caller (scoped to your user). |
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness probes. |
-| `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled`, `/integrations`, `/usage` | session cookie | Web UI (`/integrations` is the per-user MCP connector store; `/usage` shows your own request/token usage; admins get an in-page "All users" toggle). |
+| `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled`, `/webhooks`, `/integrations`, `/usage` | session cookie | Web UI (`/integrations` is the per-user MCP connector store; `/webhooks` manages your inbound triggers; `/usage` shows your own request/token usage; admins get an in-page "All users" toggle). |
+| `/hooks/{secret}` | secret in URL | Fire a webhook: runs the owner's saved prompt with the request body appended as an untrusted block. Accepts GET and POST; sync webhooks return the model output as a JSON envelope, async ones return `202`. |
 | `/admin/users`, `/rag`, `/admin/models`, `/admin/backends`, `/admin/skills`, `/admin/connectors` | admin role | Admin UI (the users page lists registered users and starts impersonation; connectors curates the MCP catalog — see [`docs/connectors.md`](docs/connectors.md) for provider setup). |
 | `POST /impersonate/stop` | session cookie | End an active impersonation and return to your own account. |
 | `/feedback`, `/feedback/extract`, `/feedback/config` | session cookie | Feedback widget: file a GitHub issue, turn a voice transcript into structured fields, and report whether the feature is configured. Enabled by the `[feedback]` config block. |
