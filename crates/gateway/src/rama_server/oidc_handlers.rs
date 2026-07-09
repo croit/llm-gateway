@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use jiff::{SignedDuration, Timestamp};
 use rama::http::service::web::extract::{Query, State};
-use rama::http::{HeaderMap, Request, Response, StatusCode, header};
+use rama::http::{Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -296,8 +296,6 @@ fn error_html(status: StatusCode, message: &str) -> Response {
             "code": "auth_error",
         }
     });
-    let mut h = HeaderMap::new();
-    h.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")

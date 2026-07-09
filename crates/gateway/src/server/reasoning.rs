@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 croit GmbH
 
-//! The "Denkaufwand" (effort) control: one user-chosen level that drives both
-//! the upstream reasoning budget *and* the per-turn tool-round cap.
+//! The "Denkaufwand" (German for "thinking effort") control: one user-chosen
+//! level that drives both the upstream reasoning budget *and* the per-turn
+//! tool-round cap.
 //!
 //! A single knob keeps the UI simple (mirrors ChatGPT's "Denkaufwand"): the
 //! user picks Fast / Standard / Deep / Max, and we translate that into
 //!
 //!   - a backend-specific reasoning parameter ([`apply_effort`]), because the
 //!     five backends we target express "think harder" differently:
-//!     `Qwen` → `chat_template_kwargs.enable_thinking` (bool) + optional
-//!     `thinking_token_budget` (token cap); `OpenAI` → `reasoning_effort`
-//!     ("low"|"medium"|"high"); `GLM`/z.AI → `thinking.type`
-//!     ("enabled"|"disabled") + `reasoning_effort` ("none"…"max") intensity;
-//!     `Anthropic` → `thinking.{type,budget_tokens}`; everything else →
-//!     nothing. The per-effort budgets/levels have built-in defaults but can
-//!     be tuned per model on `/admin/models` via [`ReasoningOverrides`].
+//!       - `Qwen` → `chat_template_kwargs.enable_thinking` (bool) + optional
+//!         `thinking_token_budget` (token cap)
+//!       - `OpenAI` → `reasoning_effort` ("low"|"medium"|"high")
+//!       - `GLM`/z.AI → `thinking.type` ("enabled"|"disabled") +
+//!         `reasoning_effort` ("none"…"max") intensity
+//!       - `Anthropic` → `thinking.{type,budget_tokens}`
+//!       - everything else → nothing
+//!
+//!     The per-effort budgets/levels have built-in defaults but can be tuned
+//!     per model on `/admin/models` via [`ReasoningOverrides`].
 //!   - a tool-round cap ([`Effort::max_rounds`]), so an agentic task that
 //!     needs many tool calls can be given more headroom without a second knob.
 //!
@@ -30,6 +34,18 @@ use serde_json::{Value, json};
 /// the most-headroom effort level ([`Effort::Max`]) and bounds the blast radius
 /// of a runaway tool loop.
 pub const HARD_ROUND_CAP: u32 = 64;
+
+/// Qwen exposes reasoning through `chat_template_kwargs.enable_thinking`; these
+/// name the exact wire keys so the request-shaping code has a single source of
+/// truth and can't drift on a typo.
+const QWEN_CHAT_TEMPLATE_KWARGS: &str = "chat_template_kwargs";
+const QWEN_ENABLE_THINKING: &str = "enable_thinking";
+
+/// Anthropic thinking-token budgets per level (see [`anthropic_budget`]). Kept
+/// modest so `max_tokens` (which must exceed the budget) stays reasonable.
+const ANTHROPIC_BUDGET_STANDARD: u32 = 4_096;
+const ANTHROPIC_BUDGET_DEEP: u32 = 16_384;
+const ANTHROPIC_BUDGET_MAX: u32 = 32_768;
 
 /// The user-chosen effort level for a conversation. Persisted as the lowercase
 /// string in `chat_session_settings.effort`; [`Effort::Standard`] is the
@@ -207,9 +223,9 @@ impl ReasoningStyle {
 fn anthropic_budget(effort: Effort) -> Option<u32> {
     match effort {
         Effort::Fast => None,
-        Effort::Standard => Some(4_096),
-        Effort::Deep => Some(16_384),
-        Effort::Max => Some(32_768),
+        Effort::Standard => Some(ANTHROPIC_BUDGET_STANDARD),
+        Effort::Deep => Some(ANTHROPIC_BUDGET_DEEP),
+        Effort::Max => Some(ANTHROPIC_BUDGET_MAX),
     }
 }
 
@@ -229,7 +245,11 @@ fn openai_effort(effort: Effort) -> &'static str {
 /// a lower intensity is what makes the effort knob actually rein GLM in.
 fn glm_effort(effort: Effort) -> &'static str {
     match effort {
-        // Unused (Fast → thinking disabled), kept total for exhaustiveness.
+        // In practice callers gate on `reasoning_on()` before reaching here, so
+        // Fast never actually produces a `reasoning_effort` on the wire — but the
+        // arm is reachable (called via `unwrap_or(glm_effort(effort))`), so this
+        // is a plain fallback, NOT a `debug_assert!(unreachable)`: a spurious
+        // "low" is harmless, a panic on a live request is not.
         Effort::Fast => "low",
         Effort::Standard => "medium",
         Effort::Deep => "high",
@@ -302,12 +322,15 @@ pub fn apply_effort(
             // chat_template_kwargs is a nested object; merge the flag without
             // clobbering other kwargs the client may have set.
             let kwargs = obj
-                .entry("chat_template_kwargs")
+                .entry(QWEN_CHAT_TEMPLATE_KWARGS)
                 .or_insert_with(|| json!({}));
             if let Some(k) = kwargs.as_object_mut()
-                && !k.contains_key("enable_thinking")
+                && !k.contains_key(QWEN_ENABLE_THINKING)
             {
-                k.insert("enable_thinking".into(), Value::Bool(effort.reasoning_on()));
+                k.insert(
+                    QWEN_ENABLE_THINKING.into(),
+                    Value::Bool(effort.reasoning_on()),
+                );
             }
             // vLLM caps reasoning at `thinking_token_budget` tokens (forces the
             // reasoning-end token once hit). Only meaningful when thinking is on.

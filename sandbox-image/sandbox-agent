@@ -119,6 +119,9 @@ def main():
     try:
         req = json.load(sys.stdin)
     except Exception as e:  # noqa: BLE001
+        # Intentionally broad: any malformed stdin (bad JSON, wrong type, empty
+        # pipe, decode error) should exit with one clean "bad request" message
+        # rather than a traceback. fail() exits, so nothing leaks past here.
         fail(f"sandbox-agent: bad request json: {e}")
 
     language = req.get("language")
@@ -135,8 +138,14 @@ def main():
         if not safe_name(name):
             fail(f"sandbox-agent: unsafe input filename {name!r}")
         try:
+            # validate=False: the encoder is our own gateway, and it may wrap
+            # long payloads with newlines. Discarding non-alphabet chars matches
+            # what the gateway emits; this is not a trust boundary (the sandbox
+            # is), so strict validation would only reject legitimate input.
             data = base64.b64decode(f.get("content_b64", ""), validate=False)
         except Exception as e:  # noqa: BLE001
+            # Broad on purpose: any decode failure becomes one clean error via
+            # fail() (which exits) instead of a traceback.
             fail(f"sandbox-agent: bad base64 for {name!r}: {e}")
         with open(os.path.join(WORK, name), "wb") as fh:
             fh.write(data)
@@ -183,6 +192,7 @@ def main():
     try:
         os.remove(script)
     except OSError:
+        # Best-effort cleanup: the temp script may already be gone; nothing to do.
         pass
 
     truncated = False

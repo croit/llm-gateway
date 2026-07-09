@@ -38,6 +38,10 @@ gateway.sqlite*
 # CSS bundle convention), but the maps are dev-only and large.
 crates/session-core/assets/*.js.map
 
-# GeoIP database 
+# GeoIP database
 IP2LOCATION-LITE-DB11.BIN
+
+# Python bytecode cache (e.g. from running/importing sandbox-image/sandbox-agent)
+__pycache__/
+*.pyc
 

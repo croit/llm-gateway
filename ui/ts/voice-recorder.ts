@@ -116,11 +116,19 @@ export class VoiceRecorder {
             this.analyser.disconnect();
             this.node.disconnect();
             this.sink.disconnect();
-            this.stream.getTracks().forEach((t) => t.stop());
-            await this.ctx.close();
-        } catch (_) { /* tear-down is best-effort */ }
+        } catch (_) { /* tear-down is best-effort */ } finally {
+            // Releasing the mic and closing the AudioContext must happen even if
+            // a disconnect() above threw — otherwise the mic stays hot and the
+            // context leaks. Each is independently guarded for the same reason.
+            try { this.stream.getTracks().forEach((t) => t.stop()); } catch (_) { /* best-effort */ }
+            try { await this.ctx.close(); } catch (_) { /* best-effort */ }
+        }
         let total = 0;
         for (const c of this.chunks) total += c.length;
+        // No samples captured (e.g. stop() right after start()): return an
+        // empty blob so callers' `if (wav.size)` guard skips a pointless
+        // transcription of a header-only WAV.
+        if (total === 0) return new Blob([], { type: 'audio/wav' });
         const flat = new Float32Array(total);
         let off = 0;
         for (const c of this.chunks) {

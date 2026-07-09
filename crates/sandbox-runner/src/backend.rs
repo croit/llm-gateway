@@ -681,7 +681,7 @@ mod local_tests {
         }
         let be = LocalBackend::new().unwrap();
         let id = be.create(Network::None).await.unwrap();
-        // Print ~300 KB (> the agent's 128 KB preserve threshold).
+        // Print ~300 KB (> the agent's 32 KiB preserve threshold).
         let req = RunRequest {
             language: Language::Python,
             code: "print('X' * 300000)".into(),
