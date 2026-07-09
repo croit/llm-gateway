@@ -143,19 +143,23 @@ services:
   # bot token authenticates one shared bot for the whole gateway (there's no
   # per-user Discord account to connect, unlike Slack/GitHub/Atlassian), so the
   # connector's scope is "global": an admin enables it and points it at this
-  # bridge's URL in /admin/connectors. The barryyip0625/mcp-discord project
-  # publishes a ready HTTP image (streamable HTTP on :8080). Profile: discord.
+  # bridge's URL in /admin/connectors. The SaseQ/discord-mcp image (channel +
+  # DM tools) defaults to stdio; SPRING_PROFILES_ACTIVE=http (below) makes it
+  # serve streamable HTTP on :8085 at /mcp. Profile: discord.
   discord-mcp:
-    image: docker.io/barryy625/mcp-discord:latest
+    image: docker.io/saseq/discord-mcp:latest
     profiles:
       - discord
     restart: unless-stopped
+    # SaseQ defaults to stdio; this makes it serve streamable HTTP on :8085.
+    environment:
+      SPRING_PROFILES_ACTIVE: http
     # Loopback publish is only for a native (mise run dev) gateway to reach it
-    # at http://localhost:3334/mcp; the full-stack gateway uses
-    # http://discord-mcp:8080/mcp. Never expose this port publicly — the bot
-    # token grants full bot access, not scoped per caller.
+    # at http://localhost:3334/mcp; the full-stack gateway reaches it by service
+    # name at http://discord-mcp:8085/mcp. Never expose this port publicly — the
+    # bot token grants full bot access, not scoped per caller.
     ports:
-      - "127.0.0.1:3334:8080"
+      - "127.0.0.1:3334:8085"
     env_file:
       - discord-mcp.env
     security_opt:

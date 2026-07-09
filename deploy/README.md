@@ -15,7 +15,7 @@ deployment methods are provided — pick one:
 | **gateway** | `ghcr.io/croit/llm-gateway` | The OpenAI-compatible proxy + web UI. The only one that's mandatory. |
 | **google-workspace-mcp** | `ghcr.io/taylorwilsdon/google_workspace_mcp` | Self-hosted Google Workspace MCP server backing the per-user **Google Workspace** connector (Gmail/Calendar/Drive/Docs/…). Optional. |
 | **gitlab-mcp** | `docker.io/zereight050/gitlab-mcp` | Community bridge backing the per-user **GitLab (self-managed / CE)** connector; forwards each request's bearer as that user's GitLab PAT. Optional. |
-| **discord-mcp** | `docker.io/barryy625/mcp-discord` | Discord bot bridge backing the seeded **global** Discord connector (enabled + pointed at this bridge in `/admin/connectors`, see below). Optional. |
+| **discord-mcp** | `docker.io/saseq/discord-mcp` | Discord bot bridge (channel + DM tools) backing the seeded **global** Discord connector (enabled + pointed at this bridge in `/admin/connectors`, see below). Optional. |
 | **sandbox-runner** | `ghcr.io/croit/llm-gateway-sandbox-runner` | Code-execution runner (`run_in_sandbox` etc.). Optional; needs gVisor. |
 | **egress-proxy** | `docker.io/ubuntu/squid` | Allowlisting proxy for networked sandbox runs. Optional. |
 | sandbox workload | `ghcr.io/croit/llm-gateway-sandbox` | The "gold image" the runner spawns per job (pulled by the runner, not run directly). |
@@ -199,13 +199,15 @@ bridge in `/admin/connectors` — no `gateway.toml` edit, no restart.
    just `Administrator` for simplicity) → open the generated URL and invite
    the bot to your server.
 
-**Run the bridge** — the [`barryyip0625/mcp-discord`](https://github.com/barryyip0625/mcp-discord)
-project publishes a ready HTTP image at
-[`barryy625/mcp-discord`](https://hub.docker.com/r/barryy625/mcp-discord)
-(streamable HTTP on :8080, endpoint `/mcp`), so no local build is needed. (Do
-*not* use the `mcp/mcp-discord` verified image — it's a different, stdio-only
-project meant for the Docker MCP gateway, and the gateway can't reach it over
-HTTP.)
+**Run the bridge** — [`SaseQ/discord-mcp`](https://github.com/SaseQ/discord-mcp)
+(image [`docker.io/saseq/discord-mcp`](https://hub.docker.com/r/saseq/discord-mcp)).
+We use it because it exposes **DM tools** (`send_private_message`) plus channel
+messaging and a `get_user_id_by_name` lookup. It defaults to stdio, so set
+**`SPRING_PROFILES_ACTIVE=http`** to make it serve streamable HTTP on **:8085**
+at `/mcp` (the compose/Quadlet configs below already do this). Optionally set
+`DISCORD_GUILD_ID` as a default server. (Do *not* use the `mcp/mcp-discord`
+verified image — it's a different, stdio-only project the gateway can't reach
+over HTTP.)
 
 Compose (`discord` profile):
 
@@ -215,7 +217,8 @@ $EDITOR deploy/discord-mcp.env                       # DISCORD_TOKEN=...
 docker compose -f deploy/compose.example.yml --profile discord up -d
 ```
 
-Quadlet ([`quadlet/discord-mcp.container`](quadlet/discord-mcp.container)):
+Quadlet ([`quadlet/discord-mcp.container`](quadlet/discord-mcp.container)) — it
+joins the gateway's `llm` network so the gateway resolves it by name:
 
 ```bash
 sudo cp deploy/quadlet/discord-mcp.container /etc/containers/systemd/
@@ -225,17 +228,20 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now discord-mcp.service
 ```
 
-Endpoint: `/mcp` (container port 8080). Keep it internal-only (loopback /
-private network), never exposed publicly: the bot token is baked into the
-container and grants full bot access with no per-caller scoping.
+Endpoint: `/mcp` (container port 8085). Keep it internal-only (private network),
+never exposed publicly: the bot token grants full bot access with no per-caller
+scoping. **The bridge must share a DNS-enabled network with the gateway** — the
+`llm` network for Quadlet, the compose network by service name — or the gateway
+can't resolve `discord-mcp`.
 
 **Enable it** in the gateway UI (as an admin): open **`/admin/connectors`**,
 find **Discord**, click **Edit**, set the **URL** to
-`http://discord-mcp:8080/mcp` (full-stack compose) or
-`http://127.0.0.1:3334/mcp` (native gateway + Quadlet loopback port), and save,
-then **Enable**. The connector's auth is **No auth** (the gateway sends no
-credentials — the bot token lives in the bridge), and its scope is **Global**,
-so its tools are immediately available to everyone the connector's role allows.
+`http://discord-mcp:8085/mcp` (compose service name or Quadlet `llm` network) or
+`http://127.0.0.1:3334/mcp` (native gateway + the loopback port published above),
+save, then **Enable**. The connector's auth is **No auth** (the gateway sends no
+credentials — the bot token lives in the bridge), its scope is **Global**, and
+it ships **audited** — every tool call is logged (the **Audit log** button on
+its row). Its tools are then available to everyone the connector's role allows.
 
 ## Sandbox (code execution)
 

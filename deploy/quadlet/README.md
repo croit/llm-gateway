@@ -156,8 +156,10 @@ equivalent: [`../README.md`](../README.md#gitlab-self-managed--community-edition
 Discord is a **global** connector — a Discord bot token authenticates one shared
 bot for the whole server, not a per-user OAuth account. It ships seeded (and
 disabled) in the catalog; an admin enables it and points it at this bridge in
-`/admin/connectors`. The bridge, [`barryyip0625/mcp-discord`](https://github.com/barryyip0625/mcp-discord),
-publishes a ready HTTP image, so no local build is needed:
+`/admin/connectors`. The bridge, [`SaseQ/discord-mcp`](https://github.com/SaseQ/discord-mcp)
+(channel + DM tools), is a published image — no local build needed. The unit
+sets `SPRING_PROFILES_ACTIVE=http` (streamable HTTP on :8085) and joins the
+gateway's `llm` network so it's reachable by name:
 
 ```bash
 sudo cp deploy/quadlet/discord-mcp.container /etc/containers/systemd/
@@ -168,10 +170,10 @@ sudo systemctl enable --now discord-mcp.service
 ```
 
 Then, as a gateway admin, open **`/admin/connectors`**, **Enable** Discord and
-set its **URL** to `http://localhost:3334/mcp` (the loopback port published by
-the unit) — no `gateway.toml` edit, no restart. No credential is configured on
-the connector (the bot token is baked into the container), and the endpoint must
-stay internal-only — it grants full bot access with no per-caller scoping. Bot
+set its **URL** to `http://discord-mcp:8085/mcp` (resolved over the `llm`
+network) — no `gateway.toml` edit, no restart. No credential is configured on
+the connector (the bot token lives in the container), and the endpoint stays
+internal-only — it grants full bot access with no per-caller scoping. Bot
 creation steps (intents, permissions, invite URL) and the compose equivalent:
 [`../README.md`](../README.md#discord).
 

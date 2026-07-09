@@ -12,7 +12,7 @@ connector has a **scope**:
   live for everyone the connector's role allows. See [Scope](#scope-per-user-vs-global)
   and [Discord](#discord-a-global-connector) below.
 
-![The /admin/connectors page: the connector catalog — Atlassian, GitHub, GitLab (SaaS and self-managed), Google Workspace — each row showing its key, endpoint, auth badges (Default / DCR), and Enable / Edit / Delete controls.](img/connectors.png)
+![The /admin/connectors page: the connector catalog — Atlassian, Discord, GitHub, GitLab, Google Workspace — each row showing its key, endpoint, and badges (Enabled, Global, Audited, Default, DCR). Discord (a global, audited connector) carries an "Audit log" button next to Disable / Delete.](img/connectors.png)
 
 This doc is the **operator setup guide**. Connecting a server is one click for
 the user, but getting a provider's OAuth app into a state where that click
@@ -81,12 +81,20 @@ Discord is the shipped example of a global connector: a bot token authenticates
 one shared bot for the whole server, so there's no per-user Discord account to
 connect. It's seeded (disabled) in the catalog. Setup is two steps — run the
 sidecar bridge, then enable + point the connector at it — and is documented in
-full (bot creation, intents, invite URL, running the bridge, and the loopback
+full (bot creation, intents, invite URL, running the bridge, and the connector
 URL to enter) in [`deploy/README.md`](../deploy/README.md#discord).
 
 The connector's auth is **None** (the gateway sends no credential — the bot
-token lives in the bridge container behind a private/loopback endpoint) and its
-scope is **Global**. Its tools surface as `mcp__discord__*`.
+token lives in the bridge container, reached only over the gateway's private
+network) and its scope is **Global**. Its tools surface as `mcp__discord__*`,
+including DMs (`send_private_message`) since the bridge is
+[SaseQ/discord-mcp](https://github.com/SaseQ/discord-mcp).
+
+Discord ships with **auditing on by default** — every tool call (who ran what,
+with which arguments, and the outcome) is recorded, viewable via the **Audit
+log** button on its row:
+
+![The per-connector audit log for Discord: a table of tool calls, newest first, with columns When / User / Tool / Outcome / Detail — showing send_private_message and send_message succeeding and a create_webhook call denied for lack of the MANAGE_WEBHOOKS permission.](img/connector-audit.png)
 
 ---
 

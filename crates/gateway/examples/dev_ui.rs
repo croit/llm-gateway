@@ -683,6 +683,53 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
     ] {
         mcp_catalog::set_enabled(&state.db, key, true).await?;
     }
+    // The global, audited Discord connector (shared bot) — configured + enabled
+    // and given a few sample tool-call audit rows so /admin/connectors shows the
+    // Global/Audited badges + "Audit log" button and the audit page renders
+    // populated. Generic data only.
+    sqlx::query("UPDATE mcp_catalog_connectors SET url = ? WHERE key = 'discord'")
+        .bind("http://discord-mcp:8085/mcp")
+        .execute(&state.db)
+        .await?;
+    mcp_catalog::set_enabled(&state.db, "discord", true).await?;
+    {
+        use gateway::server::db::mcp_audit;
+        mcp_audit::record(
+            &state.db,
+            "dev",
+            "discord",
+            "mcp__discord__send_private_message",
+            Some(
+                r#"{"userId":"826733236931526666","message":"Standup reminder in 10 minutes 🕙"}"#,
+            ),
+            "ok",
+            None,
+            Some("chat-a1"),
+        )
+        .await?;
+        mcp_audit::record(
+            &state.db,
+            "dev",
+            "discord",
+            "mcp__discord__send_message",
+            Some(r#"{"channelId":"826729434073530409","message":"Deploy v1.4.2 finished ✅"}"#),
+            "ok",
+            None,
+            Some("chat-a1"),
+        )
+        .await?;
+        mcp_audit::record(
+            &state.db,
+            "dev",
+            "discord",
+            "mcp__discord__create_webhook",
+            Some(r#"{"channelId":"826729434073530409","name":"ci-bot"}"#),
+            "error",
+            Some("Missing permission: MANAGE_WEBHOOKS"),
+            Some("chat-b2"),
+        )
+        .await?;
+    }
 
     // --- API tokens (for the /tokens screenshot) — a mix of active (one
     // recently used, one never) and a revoked one, all owned by `dev`. The

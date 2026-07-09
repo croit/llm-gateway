@@ -1,13 +1,14 @@
-# systemd-podman Quadlet for the Discord MCP bridge (barryyip0625/mcp-discord).
+# systemd-podman Quadlet for the Discord MCP bridge (SaseQ/discord-mcp).
 # Backs the seeded *global* Discord connector: a Discord bot authenticates with
 # a single bot token for the whole server/guild, not a per-user OAuth account,
 # so there's no "each user connects their own Discord account" flow the way
 # there is for Slack/GitHub/Atlassian. One bot, shared by everyone the gateway's
 # RBAC grants the tool to — see deploy/README.md.
 #
-# The project publishes a ready HTTP image (streamable HTTP on :8080), so no
-# local build is needed. (Not the `mcp/mcp-discord` verified image — that one
-# is stdio-only, for the Docker MCP gateway, and unreachable over HTTP.)
+# We use SaseQ/discord-mcp (a Spring-Boot server) because it exposes DM tools
+# (`send_private_message`, …) that the alternative bridges lack. It defaults to
+# stdio; `SPRING_PROFILES_ACTIVE=http` (set below) makes it serve streamable
+# HTTP on :8085 at `/mcp` — the transport the gateway's MCP client speaks.
 #
 # Install:
 #   sudo cp deploy/quadlet/discord-mcp.container /etc/containers/systemd/
@@ -18,10 +19,9 @@
 #   sudo systemctl enable --now discord-mcp.service
 #
 # Then, as a gateway admin, open /admin/connectors, enable Discord, and set its
-# URL to http://127.0.0.1:3334/mcp (the loopback port published below). No
-# credential is configured on the connector — the bot token is baked into this
-# container, and the endpoint is loopback-only / internal, never exposed
-# publicly.
+# URL to http://discord-mcp:8085/mcp. No credential is configured on the
+# connector — the bot token lives in this container, reached only over the
+# gateway's private `llm` network, never exposed publicly.
 
 [Unit]
 Description=Discord MCP bridge (shared bot, global gateway connector)
@@ -30,16 +30,18 @@ After=network-online.target
 
 [Container]
 ContainerName=discord-mcp
-Image=docker.io/barryy625/mcp-discord:latest
+Image=docker.io/saseq/discord-mcp:latest
+# Same private network as the gateway + the other MCP sidecars, so the gateway
+# resolves it by name at http://discord-mcp:8085/mcp (this network has DNS).
+Network=llm.network
 
-# Loopback only — internal service, reached by the gateway. Never expose it
-# publicly (the bot token grants full bot access, not scoped per caller).
-PublishPort=127.0.0.1:3334:8080
-
+# Serve streamable HTTP on :8085 (instead of the default stdio transport).
+Environment=SPRING_PROFILES_ACTIVE=http
+# DISCORD_TOKEN (+ optional DISCORD_GUILD_ID) — secret, kept out of the unit.
 EnvironmentFile=/etc/gateway/discord-mcp.env
 
-# The image's default CMD already runs `node build/app.js --transport http
-# --port 8080` — do not override Exec=.
+# No published host port: the gateway reaches it internally over `llm`. The bot
+# token grants full bot access with no per-caller scoping, so keep it internal.
 
 NoNewPrivileges=true
 DropCapability=ALL

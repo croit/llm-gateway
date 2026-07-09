@@ -519,14 +519,14 @@ pub const DEFAULT_CONNECTORS: &[DefaultConnector] = &[
         scope: Scope::Global,
         audit: true,
         name: "Discord",
-        description: "Send and read messages, and manage channels, threads, roles, and webhooks via a shared Discord bot. Available to everyone the operator's roles allow — no per-user sign-in.",
+        description: "Send and read messages (including DMs), and manage channels, threads, and webhooks via a shared Discord bot. Available to everyone the operator's roles allow — no per-user sign-in.",
         icon: "discord",
         category: "Communication",
-        // Self-hosted HTTP bridge (barryy625/mcp-discord, streamable HTTP on
-        // :8080 → `/mcp`). Deployment-specific, so the admin sets the URL
-        // (typically http://discord-mcp:8080/mcp). The bot token is baked into
-        // the bridge container and the endpoint is loopback/internal-only, so
-        // the gateway sends no auth. See deploy/README.md.
+        // Self-hosted HTTP bridge (SaseQ/discord-mcp, streamable HTTP on :8085
+        // → `/mcp`). Deployment-specific, so the admin sets the URL (typically
+        // http://discord-mcp:8085/mcp). The bot token lives in the bridge
+        // container, reached only over the gateway's private network, so the
+        // gateway sends no auth. See deploy/README.md.
         url: "",
         auth: AuthKind::None,
         use_dcr: false,
