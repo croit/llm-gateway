@@ -87,8 +87,11 @@ URL to enter) in [`deploy/README.md`](../deploy/README.md#discord).
 The connector's auth is **None** (the gateway sends no credential — the bot
 token lives in the bridge container, reached only over the gateway's private
 network) and its scope is **Global**. Its tools surface as `mcp__discord__*`,
-including DMs (`send_private_message`) since the bridge is
-[SaseQ/discord-mcp](https://github.com/SaseQ/discord-mcp).
+including DMs (`send_private_message`) and fuzzy member lookup
+(`fuzz_search_members`, matching nickname/username/display name) since the bridge
+is [croit/discord-mcp](https://github.com/croit/discord-mcp), our fork of
+SaseQ/discord-mcp with full-roster caching. Member lookup requires the **Server
+Members Intent** to be enabled on the bot in the Discord Developer Portal.
 
 Discord ships with **auditing on by default** — every tool call (who ran what,
 with which arguments, and the outcome) is recorded, viewable via the **Audit

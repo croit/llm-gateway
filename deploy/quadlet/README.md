@@ -145,8 +145,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now gitlab-mcp.service
 ```
 
+The unit joins `llm.network` (same as the gateway + other MCP sidecars) with no
+published host port, so the gateway resolves it by name. It sets
+`MCP_ALLOWED_HOSTS=gitlab-mcp:3002` — without it the bridge's DNS-rebinding guard
+403s (`Host header is not allowed`) on any non-loopback host, and that network
+name is non-loopback.
+
 Then in the gateway's `/admin/connectors`, point **GitLab (self-managed / CE)**
-at `http://localhost:3333/mcp` → Save → Enable. Each user connects at
+at `http://gitlab-mcp:3002/mcp` → Save → Enable. Each user connects at
 `/integrations` and pastes their own GitLab personal access token (scope
 `api`, or `read_api` for read-only). Full details, including the compose
 equivalent: [`../README.md`](../README.md#gitlab-self-managed--community-edition).
@@ -156,10 +162,12 @@ equivalent: [`../README.md`](../README.md#gitlab-self-managed--community-edition
 Discord is a **global** connector — a Discord bot token authenticates one shared
 bot for the whole server, not a per-user OAuth account. It ships seeded (and
 disabled) in the catalog; an admin enables it and points it at this bridge in
-`/admin/connectors`. The bridge, [`SaseQ/discord-mcp`](https://github.com/SaseQ/discord-mcp)
-(channel + DM tools), is a published image — no local build needed. The unit
-sets `SPRING_PROFILES_ACTIVE=http` (streamable HTTP on :8085) and joins the
-gateway's `llm` network so it's reachable by name:
+`/admin/connectors`. The bridge, [`croit/discord-mcp`](https://github.com/croit/discord-mcp)
+(our fork of `SaseQ/discord-mcp` — channel + DM tools plus full-roster cache and
+`fuzz_search_members`), is a published GHCR image — no local build needed.
+Member lookup needs the **Server Members Intent** enabled in the Discord
+Developer Portal. The unit sets `SPRING_PROFILES_ACTIVE=http` (streamable HTTP on
+:8085) and joins the gateway's `llm` network so it's reachable by name:
 
 ```bash
 sudo cp deploy/quadlet/discord-mcp.container /etc/containers/systemd/

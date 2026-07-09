@@ -1,14 +1,24 @@
-# systemd-podman Quadlet for the Discord MCP bridge (SaseQ/discord-mcp).
+# systemd-podman Quadlet for the Discord MCP bridge (croit/discord-mcp).
 # Backs the seeded *global* Discord connector: a Discord bot authenticates with
 # a single bot token for the whole server/guild, not a per-user OAuth account,
 # so there's no "each user connects their own Discord account" flow the way
 # there is for Slack/GitHub/Atlassian. One bot, shared by everyone the gateway's
 # RBAC grants the tool to — see deploy/README.md.
 #
-# We use SaseQ/discord-mcp (a Spring-Boot server) because it exposes DM tools
-# (`send_private_message`, …) that the alternative bridges lack. It defaults to
-# stdio; `SPRING_PROFILES_ACTIVE=http` (set below) makes it serve streamable
-# HTTP on :8085 at `/mcp` — the transport the gateway's MCP client speaks.
+# We run croit/discord-mcp (https://github.com/croit/discord-mcp), our fork of
+# the upstream SaseQ/discord-mcp Spring-Boot server. Upstream exposes DM tools
+# (`send_private_message`, …) the alternative bridges lack, but its member
+# lookup reliably fails: it never chunks the guild roster into cache, and it
+# matches the account username only — never the nickname or display name. Our
+# fork caches the full roster and adds `fuzz_search_members` (fuzzy match across
+# nickname + username + global display name). It defaults to stdio;
+# `SPRING_PROFILES_ACTIVE=http` (set below) makes it serve streamable HTTP on
+# :8085 at `/mcp` — the transport the gateway's MCP client speaks.
+#
+# REQUIRED for member lookup: enable the "Server Members Intent" (a privileged
+# gateway intent) in the Discord Developer Portal → your application → Bot →
+# Privileged Gateway Intents. Without it the roster never loads and every
+# fuzz_search_members / get_user_id_by_name call comes back empty.
 #
 # Install:
 #   sudo cp deploy/quadlet/discord-mcp.container /etc/containers/systemd/
@@ -30,7 +40,9 @@ After=network-online.target
 
 [Container]
 ContainerName=discord-mcp
-Image=docker.io/saseq/discord-mcp:latest
+# Our fork's image, built + published to GHCR by croit/discord-mcp CI. The
+# package is public, so no registry login is needed to pull it.
+Image=ghcr.io/croit/discord-mcp:latest
 # Same private network as the gateway + the other MCP sidecars, so the gateway
 # resolves it by name at http://discord-mcp:8085/mcp (this network has DNS).
 Network=llm.network

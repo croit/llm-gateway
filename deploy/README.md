@@ -15,7 +15,7 @@ deployment methods are provided — pick one:
 | **gateway** | `ghcr.io/croit/llm-gateway` | The OpenAI-compatible proxy + web UI. The only one that's mandatory. |
 | **google-workspace-mcp** | `ghcr.io/taylorwilsdon/google_workspace_mcp` | Self-hosted Google Workspace MCP server backing the per-user **Google Workspace** connector (Gmail/Calendar/Drive/Docs/…). Optional. |
 | **gitlab-mcp** | `docker.io/zereight050/gitlab-mcp` | Community bridge backing the per-user **GitLab (self-managed / CE)** connector; forwards each request's bearer as that user's GitLab PAT. Optional. |
-| **discord-mcp** | `docker.io/saseq/discord-mcp` | Discord bot bridge (channel + DM tools) backing the seeded **global** Discord connector (enabled + pointed at this bridge in `/admin/connectors`, see below). Optional. |
+| **discord-mcp** | `ghcr.io/croit/discord-mcp` | Discord bot bridge (channel + DM tools, plus full-roster cache + `fuzz_search_members`) backing the seeded **global** Discord connector (enabled + pointed at this bridge in `/admin/connectors`, see below). Our fork of `SaseQ/discord-mcp`. Optional. |
 | **sandbox-runner** | `ghcr.io/croit/llm-gateway-sandbox-runner` | Code-execution runner (`run_in_sandbox` etc.). Optional; needs gVisor. |
 | **egress-proxy** | `docker.io/ubuntu/squid` | Allowlisting proxy for networked sandbox runs. Optional. |
 | sandbox workload | `ghcr.io/croit/llm-gateway-sandbox` | The "gold image" the runner spawns per job (pulled by the runner, not run directly). |
@@ -163,8 +163,15 @@ docker compose -f deploy/compose.example.yml --profile gitlab up -d
 
 Key env: `STREAMABLE_HTTP=true`, `REMOTE_AUTHORIZATION=true` (per-request token,
 not a fixed PAT), `GITLAB_API_URL=https://<your-gitlab>/api/v4`,
-`GITLAB_READ_ONLY_MODE=true` (set `false` to allow writes). Endpoint: `/mcp`
-(container port 3002).
+`GITLAB_PERMISSION_MODE=readonly` (or `modify` / `full` to allow writes).
+Endpoint: `/mcp` (container port 3002).
+
+**DNS-rebinding guard:** the bridge auto-allows only **loopback** hosts + its
+bound address, so when the full-stack gateway reaches it by its network name it
+returns `HTTP 403 "Host header is not allowed"`. Set `MCP_ALLOWED_HOSTS` to that
+`host:port` (matching the connector URL's authority) — the compose/Quadlet units
+ship `MCP_ALLOWED_HOSTS=gitlab-mcp:3002`. The native-gateway loopback URL below
+needs nothing, as loopback is always allowed.
 
 Then in the gateway: **/admin/connectors → GitLab (self-managed / CE)** → set the
 MCP server URL (`http://gitlab-mcp:3002/mcp` full-stack, or
@@ -199,10 +206,17 @@ bridge in `/admin/connectors` — no `gateway.toml` edit, no restart.
    just `Administrator` for simplicity) → open the generated URL and invite
    the bot to your server.
 
-**Run the bridge** — [`SaseQ/discord-mcp`](https://github.com/SaseQ/discord-mcp)
-(image [`docker.io/saseq/discord-mcp`](https://hub.docker.com/r/saseq/discord-mcp)).
-We use it because it exposes **DM tools** (`send_private_message`) plus channel
-messaging and a `get_user_id_by_name` lookup. It defaults to stdio, so set
+**Run the bridge** — [`croit/discord-mcp`](https://github.com/croit/discord-mcp)
+(image `ghcr.io/croit/discord-mcp:latest`), our fork of
+[`SaseQ/discord-mcp`](https://github.com/SaseQ/discord-mcp). We use it because it
+exposes **DM tools** (`send_private_message`) plus channel messaging. The fork
+adds what upstream lacks for day-to-day use: it caches the full guild roster
+(upstream never chunks it, so member search hit a near-empty cache) and adds
+**`fuzz_search_members`** — a fuzzy lookup across server nickname, account
+username *and* global display name, so you can resolve a person by their real
+name instead of guessing their exact `@handle`. This needs the **Server Members
+Intent** (step 2 above) enabled — without it the roster never loads. It defaults
+to stdio, so set
 **`SPRING_PROFILES_ACTIVE=http`** to make it serve streamable HTTP on **:8085**
 at `/mcp` (the compose/Quadlet configs below already do this). Optionally set
 `DISCORD_GUILD_ID` as a default server. (Do *not* use the `mcp/mcp-discord`

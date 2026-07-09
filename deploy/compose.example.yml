@@ -135,7 +135,12 @@ services:
       HOST: "0.0.0.0"
       STREAMABLE_HTTP: "true" # serves /mcp; required for remote-authorization
       REMOTE_AUTHORIZATION: "true" # per-request token: each user's PAT, not a fixed one
-      GITLAB_READ_ONLY_MODE: "true" # flip to false to allow writes (create MR/issue/…)
+      # DNS-rebinding guard: the bridge auto-allows only loopback + its bound
+      # address, so it 403s ("Host header is not allowed") when the full-stack
+      # gateway reaches it by service name. Allow that Host (must match the
+      # connector URL authority). Loopback (native-dev :3333) is always allowed.
+      MCP_ALLOWED_HOSTS: "gitlab-mcp:3002"
+      GITLAB_PERMISSION_MODE: "readonly" # or `modify` (no deletes) / `full` (read+write)
     security_opt:
       - "no-new-privileges:true"
 
@@ -143,15 +148,19 @@ services:
   # bot token authenticates one shared bot for the whole gateway (there's no
   # per-user Discord account to connect, unlike Slack/GitHub/Atlassian), so the
   # connector's scope is "global": an admin enables it and points it at this
-  # bridge's URL in /admin/connectors. The SaseQ/discord-mcp image (channel +
-  # DM tools) defaults to stdio; SPRING_PROFILES_ACTIVE=http (below) makes it
+  # bridge's URL in /admin/connectors. The croit/discord-mcp image (our fork of
+  # SaseQ/discord-mcp — full member-roster cache + fuzzy member search; channel
+  # + DM tools) defaults to stdio; SPRING_PROFILES_ACTIVE=http (below) makes it
   # serve streamable HTTP on :8085 at /mcp. Profile: discord.
+  # Member lookup needs the "Server Members Intent" enabled in the Discord
+  # Developer Portal (Bot → Privileged Gateway Intents), else the roster never
+  # loads and searches come back empty.
   discord-mcp:
-    image: docker.io/saseq/discord-mcp:latest
+    image: ghcr.io/croit/discord-mcp:latest
     profiles:
       - discord
     restart: unless-stopped
-    # SaseQ defaults to stdio; this makes it serve streamable HTTP on :8085.
+    # Defaults to stdio; this makes it serve streamable HTTP on :8085.
     environment:
       SPRING_PROFILES_ACTIVE: http
     # Loopback publish is only for a native (mise run dev) gateway to reach it

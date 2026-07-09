@@ -16,7 +16,7 @@
 #   sudo systemctl enable --now gitlab-mcp.service
 #
 # Then in the gateway: /admin/connectors → "GitLab (self-managed / CE)" → set the
-# MCP server URL to http://<this-host>:3333/mcp → Save → Enable. Each user pastes
+# MCP server URL to http://gitlab-mcp:3002/mcp → Save → Enable. Each user pastes
 # their GitLab PAT (scope `api`, or `read_api` for read-only) at /integrations.
 
 [Unit]
@@ -27,10 +27,10 @@ After=network-online.target
 [Container]
 ContainerName=gitlab-mcp
 Image=docker.io/zereight050/gitlab-mcp:latest
-
-# Loopback only — internal service, reached by the gateway. Never expose it
-# publicly. (Container listens on 3002.)
-PublishPort=127.0.0.1:3333:3002
+# Same private network as the gateway + the other MCP sidecars, so the gateway
+# resolves it by name at http://gitlab-mcp:3002/mcp (this network has DNS). No
+# published host port: internal-only, never exposed publicly. (Listens on 3002.)
+Network=llm.network
 
 # GITLAB_API_URL=https://<your-gitlab>/api/v4
 EnvironmentFile=/etc/gateway/gitlab-mcp.env
@@ -40,8 +40,14 @@ Environment=HOST=0.0.0.0
 Environment=STREAMABLE_HTTP=true
 # Each request's bearer is used as that user's GitLab token (no fixed PAT).
 Environment=REMOTE_AUTHORIZATION=true
-# Read-only by default; set false to allow writes (create MR/issue/comment/…).
-Environment=GITLAB_READ_ONLY_MODE=true
+# DNS-rebinding guard: the bridge auto-allows only loopback + its bound address,
+# so it 403s ("Host header is not allowed") when the gateway reaches it by the
+# non-loopback network name. Allow that Host (comma-separated host[:port] list;
+# must match the connector URL's authority, so keep the :3002).
+Environment=MCP_ALLOWED_HOSTS=gitlab-mcp:3002
+# Read-only by default. Values: `readonly`, `modify` (create/update, no deletes),
+# or `full` (read+write incl. deletes). (Older GITLAB_READ_ONLY_MODE is deprecated.)
+Environment=GITLAB_PERMISSION_MODE=readonly
 
 NoNewPrivileges=true
 DropCapability=ALL
