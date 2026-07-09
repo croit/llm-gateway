@@ -54,6 +54,20 @@ admin-context-window-invalid = context window `{ $value }` must be a positive in
 admin-context-window-saved = set context window for `{ $model }`
 admin-context-window-cleared = cleared context window for `{ $model }`
 
+# Per-model pricing for cost accounting (price per 1M tokens, input / output).
+admin-price-label = Price ({ $cur })
+admin-price-in-placeholder = in
+admin-price-out-placeholder = out
+admin-price-in-aria = Input price per 1M tokens
+admin-price-out-aria = Output price per 1M tokens
+admin-price-unit = /1M
+admin-price-invalid = price `{ $value }` must be a non-negative number
+admin-price-saved = set prices for `{ $model }`
+
+# Pricing-only card for non-chat models (embedding / image / speech / STT).
+admin-other-heading = Other models (pricing)
+admin-other-intro = Embedding, image, speech, and transcription models. Sampling and reasoning settings don't apply, but set per-1M-token prices so their usage counts toward cost accounting and cost limits.
+
 # Per-feature default models (the model pre-selected in the chat/voice
 # pickers, and the API fallback when a call omits a model).
 admin-defaults-heading = Default models

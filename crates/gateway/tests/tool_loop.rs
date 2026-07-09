@@ -45,6 +45,7 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
             voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
+            enforce_limits: true,
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),

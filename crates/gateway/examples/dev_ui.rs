@@ -171,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
             voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
+            enforce_limits: true,
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
@@ -194,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
             voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
+            enforce_limits: true,
             kind: PoolKind::Transcription,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
@@ -222,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
             voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
+            enforce_limits: true,
             kind: PoolKind::Speech,
             strategy: PickerStrategy::RoundRobin,
             models: vec!["demo-tts".into()],
@@ -247,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
             voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
+            enforce_limits: true,
             kind: PoolKind::Image,
             strategy: PickerStrategy::RoundRobin,
             models: vec!["demo-image".into()],
@@ -976,6 +980,7 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
             prompt_tokens: (prompt > 0).then_some(prompt),
             completion_tokens: (completion > 0).then_some(completion),
             total_tokens: (prompt + completion > 0).then_some(prompt + completion),
+            enforce_limits: true,
         });
     }
     // A couple of rows from other users so the admin "All users" view has more
@@ -999,9 +1004,71 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
             prompt_tokens: Some(900),
             completion_tokens: Some(280),
             total_tokens: Some(1180),
+            enforce_limits: true,
         });
     }
+    // Price the two demo chat models BEFORE inserting usage, so the batched
+    // writer computes a real `cost` on each seeded row (→ the /usage cost
+    // column + the cost limit bar show non-zero spend).
+    use gateway::server::db::model_defaults;
+    model_defaults::set_pricing(&state.db, "demo-model", Some(0.5), Some(1.5)).await?;
+    model_defaults::set_pricing(&state.db, "demo-model-pro", Some(3.0), Some(15.0)).await?;
+
     usage_db::insert_batch(&state.db, &usage_rows).await?;
+
+    // A spread of demo limit rules so /admin/limits shows a populated table and
+    // the /usage "Your limits" bars render (global rules apply to `dev`).
+    use gateway::server::db::limits::{self, Dimension, SubjectType, Window};
+    limits::upsert(
+        &state.db,
+        SubjectType::Global,
+        "",
+        None,
+        Dimension::Requests,
+        Window::Day,
+        5_000.0,
+    )
+    .await?;
+    limits::upsert(
+        &state.db,
+        SubjectType::Global,
+        "",
+        None,
+        Dimension::Tokens,
+        Window::Week,
+        5_000_000.0,
+    )
+    .await?;
+    limits::upsert(
+        &state.db,
+        SubjectType::Global,
+        "",
+        None,
+        Dimension::Cost,
+        Window::Month,
+        50.0,
+    )
+    .await?;
+    limits::upsert(
+        &state.db,
+        SubjectType::Global,
+        "",
+        Some("demo-model-pro"),
+        Dimension::Tokens,
+        Window::Week,
+        1_000_000.0,
+    )
+    .await?;
+    limits::upsert(
+        &state.db,
+        SubjectType::Role,
+        "engineering",
+        None,
+        Dimension::Requests,
+        Window::Hour,
+        600.0,
+    )
+    .await?;
 
     Ok(())
 }

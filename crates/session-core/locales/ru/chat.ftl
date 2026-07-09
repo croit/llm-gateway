@@ -32,3 +32,4 @@ chat-error-db-error = ошибка базы данных
 chat-error-attachments-not-configured = вложения чата не настроены
 chat-error-bad-filename = недопустимое имя файла
 chat-error-attachment-not-found = не найдено
+chat-error-rate-limited = Достигнут лимит использования. Подробности и время сброса — на /usage.

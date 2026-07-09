@@ -83,6 +83,9 @@ enum NavItem {
     /// Admin-only MCP connector catalog management (`/admin/connectors`).
     /// Same `admin`-role gate as the other operator pages.
     Connectors,
+    /// Admin-only rate-limit / quota editor (`/admin/limits`). Same
+    /// `admin`-role gate as the other operator pages.
+    Limits,
 }
 
 /// Datastar directive that intercepts the click and triggers an
@@ -260,6 +263,7 @@ fn render_app_sidebar(
                         (sidebar_nav_link("/rag", NavItem::Rag, active, icons::database(16), &t(lang, "nav-rag")))
                         (sidebar_nav_link("/admin/skills", NavItem::Skills, active, icons::sparkles(16), &t(lang, "nav-skills")))
                         (sidebar_nav_link("/admin/connectors", NavItem::Connectors, active, icons::plug(16), &t(lang, "nav-connectors")))
+                        (sidebar_nav_link("/admin/limits", NavItem::Limits, active, icons::sliders(16), &t(lang, "nav-limits")))
                     }.to_html()))
                 }
             }
@@ -1151,6 +1155,7 @@ mod admin;
 pub use admin::{
     models_context_window_save as admin_models_context_window_save,
     models_defaults_save as admin_models_defaults_save, models_index as admin_models_index,
+    models_pricing_save as admin_models_pricing_save,
     models_reasoning_budget_save as admin_models_reasoning_budget_save,
     models_reasoning_save as admin_models_reasoning_save, models_save as admin_models_save,
 };
@@ -1159,6 +1164,13 @@ pub use admin::{
 // same `admin`-role gate as the model-defaults page.
 mod backends;
 pub use backends::backends_index as admin_backends_index;
+
+// Admin rate-limit / quota editor (`/admin/limits`). Same admin gate.
+mod limits;
+pub use limits::{
+    limits_delete as admin_limits_delete, limits_index as admin_limits_index,
+    limits_save as admin_limits_save,
+};
 
 // Admin skills viewer + manager (`/admin/skills`, upload, delete, grants).
 // Same admin gate.

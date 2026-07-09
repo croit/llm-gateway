@@ -19,6 +19,7 @@ chat-error-conversation-not-found = Conversation not found.
 chat-error-message-not-found = Message not found.
 chat-error-message-empty = message can't be empty
 chat-error-message-must-not-be-empty = Message must not be empty.
+chat-error-rate-limited = You've reached a usage limit. See /usage for details and when it resets.
 chat-error-still-streaming = A response is still streaming for this user — wait for it or hit stop.
 chat-error-retry-assistant-only = Retry applies to assistant replies.
 chat-error-edit-own-messages-only = Edit applies to your own messages.

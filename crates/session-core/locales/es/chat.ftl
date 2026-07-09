@@ -32,3 +32,4 @@ chat-error-db-error = error de base de datos
 chat-error-attachments-not-configured = los adjuntos del chat no están configurados
 chat-error-bad-filename = nombre de archivo no válido
 chat-error-attachment-not-found = no encontrado
+chat-error-rate-limited = Has alcanzado un límite de uso. Consulta /usage para ver los detalles y cuándo se restablece.

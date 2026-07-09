@@ -33,6 +33,8 @@ usage-stat-requests-title = 请求数
 usage-stat-requests-desc = 对上游后端的调用
 usage-stat-tokens-title = 令牌数
 usage-stat-tokens-desc = 提示 + 补全
+usage-stat-cost-title = 成本
+usage-stat-cost-desc = 按配置的模型价格计算
 usage-stat-users-title = 用户数
 usage-stat-users-desc = 该时间段内活跃
 usage-stat-errors-title = 错误数
@@ -50,6 +52,12 @@ usage-key-model = 模型
 
 usage-col-requests = 请求数
 usage-col-tokens = 令牌数
+usage-col-cost = 成本
 usage-col-errors = 错误数
 
 usage-no-activity = 此时间段内无活动。
+
+usage-limits-heading = 你的限额
+usage-limit-used = 已使用 { $percent }%
+usage-limit-refreshes = { $time } 刷新
+usage-unpriced-warning = 支出不包含未定价的模型：{ $models }。请在 /admin/models 中设置价格以计入。

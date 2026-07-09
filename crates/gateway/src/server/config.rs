@@ -102,6 +102,13 @@ pub struct Config {
     /// `retention_days` to bound the raw-event window. See `server::usage`.
     #[serde(default)]
     pub usage: UsageConfig,
+    /// Rate limits & quotas. Always present; the only knob is a kill switch
+    /// (`[limits] enabled`, default true). Limits themselves are data — set
+    /// per global/role/user in `/admin/limits`, not in the config file — so
+    /// with no rules configured every caller is unlimited. See
+    /// `server::limits`.
+    #[serde(default)]
+    pub limits: LimitsConfig,
     /// Code-execution sandbox. Optional — with no `[sandbox]` block the
     /// `run_in_sandbox` tool family is not registered and the gateway
     /// boots fine. When set, `runner_url` points at the standalone
@@ -266,6 +273,12 @@ pub struct UsageConfig {
     /// ~62 days back) so those queries stay on the precise raw path. Default
     /// 90.
     pub retention_days: i64,
+    /// Display currency for cost accounting — a short label (ISO code or
+    /// symbol) shown next to spend figures on `/usage` and `/admin/models`.
+    /// Purely cosmetic: per-model prices (set in `/admin/models`) are plain
+    /// numbers per 1M tokens and are assumed to share this one currency.
+    /// Default `"USD"`.
+    pub currency: String,
 }
 
 impl Default for UsageConfig {
@@ -273,7 +286,27 @@ impl Default for UsageConfig {
         Self {
             enabled: true,
             retention_days: 90,
+            currency: "USD".to_string(),
         }
+    }
+}
+
+/// Rate-limit / quota enforcement. Limits themselves live in the DB (set via
+/// `/admin/limits`); this block only carries the deployment-wide kill switch.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Master switch. When `false`, the [`crate::server::limits::Enforcer`]
+    /// never blocks (and skips its per-request read) regardless of configured
+    /// rules — a production escape hatch. Default `true`. Note that with no
+    /// rules configured everyone is unlimited anyway, so leaving this on costs
+    /// nothing until you set a limit.
+    pub enabled: bool,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 

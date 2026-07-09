@@ -19,6 +19,7 @@ pub mod chat_session_settings;
 pub mod chat_session_skills;
 pub mod chat_session_tools;
 pub mod documents;
+pub mod limits;
 pub mod mcp_audit;
 pub mod mcp_catalog;
 pub mod model_defaults;

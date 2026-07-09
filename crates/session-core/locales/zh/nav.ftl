@@ -14,6 +14,7 @@ nav-backends = 后端
 nav-rag = RAG
 nav-skills = 技能
 nav-connectors = 连接器
+nav-limits = 限额
 
 nav-group-workspace = 工作区
 nav-group-account = 账户

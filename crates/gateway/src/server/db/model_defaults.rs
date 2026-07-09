@@ -18,7 +18,7 @@ use sqlx::sqlite::SqliteRow;
 use super::{DbError, Pool};
 
 /// One stored row, surface-exposed to the admin UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelDefaults {
     pub model_name: String,
     /// Raw TOML — what the admin typed. Round-tripped verbatim on
@@ -46,6 +46,12 @@ pub struct ModelDefaults {
     /// to the global `[chat.compaction] default_context_window`. See
     /// migration 0032.
     pub context_window: Option<i64>,
+    /// Price per 1,000,000 prompt tokens, in the deployment currency.
+    /// `None` = unpriced (contributes 0 cost — the default for self-hosted
+    /// models). Drives the `cost` column on usage rows. See migration 0037.
+    pub input_price: Option<f64>,
+    /// Price per 1,000,000 completion tokens. `None` = unpriced.
+    pub output_price: Option<f64>,
     pub updated_at: Timestamp,
 }
 
@@ -60,6 +66,8 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
     let reasoning_effort_deep: Option<String> = row.try_get("reasoning_effort_deep")?;
     let reasoning_effort_max: Option<String> = row.try_get("reasoning_effort_max")?;
     let context_window: Option<i64> = row.try_get("context_window")?;
+    let input_price: Option<f64> = row.try_get("input_price")?;
+    let output_price: Option<f64> = row.try_get("output_price")?;
     let updated_at_s: String = row.try_get("updated_at")?;
     let updated_at: Timestamp = updated_at_s
         .parse()
@@ -78,6 +86,8 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
         reasoning_effort_deep,
         reasoning_effort_max,
         context_window,
+        input_price,
+        output_price,
         updated_at,
     })
 }
@@ -89,7 +99,7 @@ pub async fn get(pool: &Pool, model_name: &str) -> Result<Option<ModelDefaults>,
         r#"SELECT model_name, defaults_toml, reasoning_style,
                   thinking_budget_standard, thinking_budget_deep, thinking_budget_max,
                   reasoning_effort_standard, reasoning_effort_deep, reasoning_effort_max,
-                  context_window, updated_at
+                  context_window, input_price, output_price, updated_at
            FROM model_defaults
            WHERE model_name = ?"#,
     )
@@ -144,6 +154,35 @@ pub async fn set_context_window(
     )
     .bind(model_name)
     .bind(context_window)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Set (or clear, with `None`) the per-1M-token prices for a model without
+/// touching its sampling defaults, reasoning config, or context window.
+/// Inserts a row with empty defaults if none exists yet; on conflict only the
+/// two price columns are updated, so it composes with the other setters in any
+/// order. `None` clears a price (the model becomes unpriced → 0 cost).
+pub async fn set_pricing(
+    pool: &Pool,
+    model_name: &str,
+    input_price: Option<f64>,
+    output_price: Option<f64>,
+) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    sqlx::query(
+        r#"INSERT INTO model_defaults (model_name, defaults_toml, input_price, output_price, updated_at)
+           VALUES (?, '', ?, ?, ?)
+           ON CONFLICT(model_name) DO UPDATE SET
+             input_price  = excluded.input_price,
+             output_price = excluded.output_price,
+             updated_at   = excluded.updated_at"#,
+    )
+    .bind(model_name)
+    .bind(input_price)
+    .bind(output_price)
     .bind(now)
     .execute(pool)
     .await?;
@@ -221,6 +260,41 @@ pub async fn upsert(pool: &Pool, model_name: &str, defaults_toml: &str) -> Resul
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// A model's per-1M-token prices. Either side may be `None` (unpriced →
+/// that side contributes 0 cost).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ModelPrice {
+    pub input_price: Option<f64>,
+    pub output_price: Option<f64>,
+}
+
+/// Load every priced model's prices into a map, keyed by model name. Rows
+/// with no price on either side are skipped. Called once per flush by the
+/// usage writer to turn token counts into `cost` without a per-row query —
+/// `model_defaults` is small (a handful of rows), so this is cheap.
+pub async fn all_prices(
+    pool: &Pool,
+) -> Result<std::collections::HashMap<String, ModelPrice>, DbError> {
+    let rows = sqlx::query(
+        "SELECT model_name, input_price, output_price FROM model_defaults \
+         WHERE input_price IS NOT NULL OR output_price IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut map = std::collections::HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let name: String = row.try_get("model_name")?;
+        map.insert(
+            name,
+            ModelPrice {
+                input_price: row.try_get("input_price")?,
+                output_price: row.try_get("output_price")?,
+            },
+        );
+    }
+    Ok(map)
 }
 
 /// Drop the row entirely. No-op if it didn't exist — callers don't
@@ -315,5 +389,48 @@ mod tests {
         assert_eq!(row.thinking_budget_deep, Some(8_192));
         assert_eq!(row.reasoning_style.as_deref(), Some("qwen"));
         assert_eq!(row.defaults_toml, "temperature = 0.5");
+    }
+
+    #[tokio::test]
+    async fn pricing_round_trips_and_composes() {
+        let pool = fresh().await;
+        // Prices set on a model that already has TOML defaults — the setter
+        // touches only the two price columns.
+        upsert(&pool, "m", "temperature = 0.5").await.unwrap();
+        set_pricing(&pool, "m", Some(3.0), Some(15.0))
+            .await
+            .unwrap();
+        let row = get(&pool, "m").await.unwrap().unwrap();
+        assert_eq!(row.input_price, Some(3.0));
+        assert_eq!(row.output_price, Some(15.0));
+        assert_eq!(row.defaults_toml, "temperature = 0.5");
+
+        // Clearing one side leaves the other intact.
+        set_pricing(&pool, "m", None, Some(15.0)).await.unwrap();
+        let row = get(&pool, "m").await.unwrap().unwrap();
+        assert_eq!(row.input_price, None);
+        assert_eq!(row.output_price, Some(15.0));
+    }
+
+    #[tokio::test]
+    async fn all_prices_skips_unpriced_models() {
+        let pool = fresh().await;
+        set_pricing(&pool, "cloud", Some(3.0), Some(15.0))
+            .await
+            .unwrap();
+        // Priced on one side only — still included.
+        set_pricing(&pool, "half", Some(1.0), None).await.unwrap();
+        // A row that exists but was never priced — excluded from the map.
+        upsert(&pool, "gpu-local", "temperature = 0.7")
+            .await
+            .unwrap();
+
+        let map = all_prices(&pool).await.unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["cloud"].input_price, Some(3.0));
+        assert_eq!(map["cloud"].output_price, Some(15.0));
+        assert_eq!(map["half"].input_price, Some(1.0));
+        assert_eq!(map["half"].output_price, None);
+        assert!(!map.contains_key("gpu-local"));
     }
 }

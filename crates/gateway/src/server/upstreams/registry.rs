@@ -339,6 +339,10 @@ pub struct Pool {
     /// Data-handling attributes for every model this pool serves (default
     /// all-clear). Drives advisory chat-UI warnings; never affects routing.
     pub compliance: Compliance,
+    /// Whether calls served by this pool count toward rate limits / quotas
+    /// (default `true`; self-hosted pools set `false`). See
+    /// [`UpstreamPoolConfig::enforce_limits`] and [`UpstreamRegistry::enforce_limits_for_model`].
+    pub enforce_limits: bool,
     /// Language → voice-id map (speech pools only). See
     /// [`UpstreamPoolConfig::voices`] / [`UpstreamPoolConfig::voice_for_language`].
     pub voices: std::collections::HashMap<String, String>,
@@ -376,6 +380,7 @@ impl Pool {
             strategy: cfg.strategy,
             backends,
             compliance: cfg.compliance,
+            enforce_limits: cfg.enforce_limits,
             voices: cfg.voices.clone(),
             configured_models: cfg.models.clone(),
             fallback_offline: cfg.fallback_offline.clone(),
@@ -708,6 +713,27 @@ impl UpstreamRegistry {
         self.pools.values().any(|p| p.knows_model(model))
     }
 
+    /// Whether calls to `model` (of `kind`) count toward rate limits / quotas.
+    /// Limits apply if *any* pool of that kind that knows it has
+    /// `enforce_limits = true` (so a model available on a paid cloud pool is
+    /// always counted, even if also mirrored on a free self-hosted one).
+    /// Exempt only when every serving pool sets `enforce_limits = false` — i.e.
+    /// a purely self-hosted model. An unknown model defaults to enforced (fail
+    /// toward counting). See `server::limits`.
+    pub fn enforce_limits_for_model(&self, model: &str, kind: PoolKind) -> bool {
+        let mut known = false;
+        let mut any_enforced = false;
+        for pool in self
+            .pools
+            .values()
+            .filter(|p| p.kind == kind && p.knows_model(model))
+        {
+            known = true;
+            any_enforced |= pool.enforce_limits;
+        }
+        !known || any_enforced
+    }
+
     /// Find a pool of the given kind whose backends advertise `model` and
     /// acquire a slot on one of those backends. If two pools of the same
     /// kind both advertise the model, the first one we iterate wins —
@@ -909,6 +935,7 @@ mod tests {
         UpstreamPoolConfig {
             voices: Default::default(),
             compliance: Default::default(),
+            enforce_limits: true,
             kind,
             strategy,
             models: Vec::new(),
@@ -930,6 +957,7 @@ mod tests {
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
             fallback_offline: None,
+            enforce_limits: true,
             backend: backends,
         }
     }
@@ -943,6 +971,7 @@ mod tests {
         UpstreamPoolConfig {
             voices: Default::default(),
             compliance: Default::default(),
+            enforce_limits: true,
             kind,
             strategy: PickerStrategy::RoundRobin,
             models: models.iter().map(|s| (*s).to_string()).collect(),
@@ -1523,6 +1552,7 @@ mod tests {
         UpstreamPoolConfig {
             voices: Default::default(),
             compliance: Default::default(),
+            enforce_limits: true,
             kind,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),

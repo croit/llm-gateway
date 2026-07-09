@@ -18,6 +18,7 @@ nav-backends = Backends
 nav-rag = RAG
 nav-skills = Skills
 nav-connectors = Connectors
+nav-limits = Limits
 
 nav-group-workspace = Workspace
 nav-group-account = Account

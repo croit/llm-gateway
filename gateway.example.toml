@@ -33,6 +33,22 @@ enabled = true
 # Days of raw per-request rows to keep (pruned hourly); daily rollups are kept
 # forever regardless. Keep this above ~62 so the "last month" view stays exact.
 retention_days = 90
+# Display currency for cost accounting — a short label shown next to spend
+# figures on /usage and /admin/models. Cosmetic only: per-model prices (set in
+# /admin/models, as a price per 1M input/output tokens) are plain numbers
+# assumed to share this one currency. Unpriced models cost 0 (e.g. self-hosted
+# GPUs you never price). Default "USD".
+currency = "USD"
+
+# Rate limits & quotas. The actual limits are DATA, not config — set them per
+# global / role / user at /admin/limits (requests, tokens, or cost, over a
+# rolling hour / day / week / month; over-budget callers get a 429). With no
+# rules configured everyone is unlimited, so this block only carries the
+# kill switch. The block is optional; this is the default.
+[limits]
+# Master switch. false → the enforcer never blocks (and skips its per-request
+# read) regardless of configured rules — a production escape hatch.
+enabled = true
 
 # ---- Upstream pools --------------------------------------------------------
 # Each [upstream_pools.<name>] block defines a logical pool of backends that
@@ -49,6 +65,11 @@ strategy = "least_inflight"
 # typically a different tier. Single hop; may itself be an alias. See the
 # "Model aliases + fallback" note below and docs/upstreams.md.
 # fallback_offline = "glm-4.6"
+# Whether calls to this pool count toward users' rate limits / quotas
+# (see [limits] and /admin/limits). Default true. Set false for your own
+# self-hosted GPU pools — their usage still shows on /usage, but it's free,
+# so it should never consume a user's budget (only cloud pools do).
+# enforce_limits = false
 
 [[upstream_pools.local_chat.backend]]
 name = "gpu-01"

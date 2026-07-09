@@ -102,6 +102,29 @@ async fn run_action(state: Arc<RamaState>, action: ScheduledAction, next: Option
             return;
         }
     };
+    // A scheduled fire draws from the owner's budget like any other call. If
+    // they're over a limit, skip this fire and record it as an error (visible
+    // in the schedule's run history) rather than running it for free.
+    {
+        let role_ids = state.role_ids_for(&user.roles);
+        if state
+            .enforcer
+            .check(&action.user_id, &role_ids)
+            .await
+            .is_err()
+        {
+            let _ = super::mark_ran(
+                &state.db,
+                &action.id,
+                "error",
+                None,
+                next,
+                Some("usage limit reached — run skipped"),
+            )
+            .await;
+            return;
+        }
+    }
     match try_run_action(&state, &action, &user).await {
         Ok((session_id, assistant_turn_id)) => {
             // Read the run's assistant turn to classify the outcome.

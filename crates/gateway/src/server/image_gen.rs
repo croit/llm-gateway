@@ -442,6 +442,9 @@ impl ImageGenerator {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            enforce_limits: self
+                .upstreams
+                .enforce_limits_for_model(model, crate::server::upstreams::PoolKind::Image),
         });
     }
 }
@@ -524,6 +527,7 @@ mod tests {
         UpstreamPoolConfig {
             voices: Default::default(),
             compliance: Default::default(),
+            enforce_limits: true,
             kind: PoolKind::Image,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
@@ -541,6 +545,7 @@ mod tests {
         UpstreamPoolConfig {
             voices: Default::default(),
             compliance: Compliance { gdpr, nda: true },
+            enforce_limits: true,
             kind: PoolKind::Image,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),

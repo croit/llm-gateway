@@ -31,6 +31,12 @@ usage-stat-requests-title = Requests
 usage-stat-requests-desc = upstream backend calls
 usage-stat-tokens-title = Tokens
 usage-stat-tokens-desc = prompt + completion
+usage-stat-cost-title = Cost
+usage-stat-cost-desc = at configured model prices
+usage-limits-heading = Your limits
+usage-limit-used = { $percent }% used
+usage-limit-refreshes = refreshes { $time }
+usage-unpriced-warning = Spend excludes unpriced model(s): { $models }. Set prices in /admin/models to count them.
 usage-stat-users-title = Users
 usage-stat-users-desc = active in range
 usage-stat-errors-title = Errors
@@ -48,6 +54,7 @@ usage-key-model = Model
 
 usage-col-requests = Requests
 usage-col-tokens = Tokens
+usage-col-cost = Cost
 usage-col-errors = Errors
 
 usage-no-activity = No activity in this range.

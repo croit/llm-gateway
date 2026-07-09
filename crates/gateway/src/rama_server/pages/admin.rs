@@ -85,11 +85,42 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
                 .and_then(|r| r.reasoning_effort_max.clone())
                 .unwrap_or_default(),
             context_window: row.as_ref().and_then(|r| r.context_window),
+            input_price: row.as_ref().and_then(|r| r.input_price),
+            output_price: row.as_ref().and_then(|r| r.output_price),
         });
     }
 
+    // Non-chat models (embedding / image / speech / transcription) get a
+    // pricing-only row — sampling/reasoning/context don't apply, but cost
+    // accounting does. Dedup by id; a model already shown as chat is skipped.
+    let chat_names: std::collections::HashSet<&str> = models.iter().map(String::as_str).collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut other: Vec<OtherModelRow> = Vec::new();
+    for (kind, kind_label) in [
+        (PoolKind::Embedding, "embedding"),
+        (PoolKind::Image, "image"),
+        (PoolKind::Speech, "speech"),
+        (PoolKind::Transcription, "transcription"),
+    ] {
+        let mut ms = state.upstreams.models_for_kind(kind);
+        ms.sort();
+        for name in ms {
+            if chat_names.contains(name.as_str()) || !seen.insert(name.clone()) {
+                continue;
+            }
+            let row = db::get(&state.db, &name).await.ok().flatten();
+            other.push(OtherModelRow {
+                kind_label,
+                input_price: row.as_ref().and_then(|r| r.input_price),
+                output_price: row.as_ref().and_then(|r| r.output_price),
+                name,
+            });
+        }
+    }
+
     let defaults = defaults_rows(&state).await;
-    let body = render_models_body(lang, &defaults, &rows);
+    let currency = &state.config.usage.currency;
+    let body = render_models_body(lang, currency, &defaults, &rows, &other);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "admin-page-title");
     nav_or_html_page(
@@ -438,6 +469,95 @@ pub async fn models_context_window_save(
     toast(FlashKind::Success, msg)
 }
 
+/// POST /admin/models/pricing — save a model's per-1M-token prices for cost
+/// accounting. Touches only the two price columns so it composes with the
+/// TOML/style/budget/context-window saves. Either field blank clears that
+/// side (the model becomes unpriced on that side → 0 cost). A negative or
+/// non-numeric value is rejected.
+pub async fn models_pricing_save(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let form: PricingForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(err) => {
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-malformed-form",
+                    &i18n::args([("err", err.to_string().into())]),
+                ),
+            );
+        }
+    };
+    if form.model_name.is_empty() {
+        return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
+    }
+    // A blank field clears that side; a present one must parse to a finite,
+    // non-negative price.
+    let parse_price = |s: &str| -> Result<Option<f64>, String> {
+        match s.trim() {
+            "" => Ok(None),
+            v => match v.parse::<f64>() {
+                Ok(n) if n.is_finite() && n >= 0.0 => Ok(Some(n)),
+                _ => Err(v.to_string()),
+            },
+        }
+    };
+    let input_price = match parse_price(&form.input_price) {
+        Ok(p) => p,
+        Err(v) => {
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-price-invalid",
+                    &i18n::args([("value", v.into())]),
+                ),
+            );
+        }
+    };
+    let output_price = match parse_price(&form.output_price) {
+        Ok(p) => p,
+        Err(v) => {
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-price-invalid",
+                    &i18n::args([("value", v.into())]),
+                ),
+            );
+        }
+    };
+    if let Err(err) = db::set_pricing(&state.db, &form.model_name, input_price, output_price).await
+    {
+        return toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-db-upsert-error",
+                &i18n::args([("err", err.to_string().into())]),
+            ),
+        );
+    }
+    toast(
+        FlashKind::Success,
+        t_args(
+            lang,
+            "admin-price-saved",
+            &i18n::args([("model", form.model_name.clone().into())]),
+        ),
+    )
+}
+
 /// POST /admin/models/defaults — set (or clear) the default model pre-selected
 /// for a feature (chat / voice-transcription / image). An empty `model` clears
 /// the override, restoring the "first advertised model" behaviour. The stored
@@ -521,6 +641,15 @@ struct ContextWindowForm {
 }
 
 #[derive(serde::Deserialize)]
+struct PricingForm {
+    model_name: String,
+    #[serde(default)]
+    input_price: String,
+    #[serde(default)]
+    output_price: String,
+}
+
+#[derive(serde::Deserialize)]
 struct ReasoningForm {
     model_name: String,
     reasoning_style: String,
@@ -564,6 +693,20 @@ struct ModelRow {
     /// Model context window in tokens; `None` = fall back to the global
     /// `[chat.compaction] default_context_window`. Drives auto-compaction.
     context_window: Option<i64>,
+    /// Per-1M-token prices for cost accounting; `None` = unpriced (0 cost).
+    input_price: Option<f64>,
+    output_price: Option<f64>,
+}
+
+/// A non-chat model (embedding / image / speech / transcription) shown in the
+/// pricing-only section: sampling, reasoning, and context settings don't apply
+/// to it, but per-model cost pricing does.
+struct OtherModelRow {
+    name: String,
+    /// The pool kind that serves it (`embedding` / `image` / …), for the badge.
+    kind_label: &'static str,
+    input_price: Option<f64>,
+    output_price: Option<f64>,
 }
 
 /// One row of the "Default models" card: the feature, its label, the models
@@ -673,10 +816,16 @@ fn render_defaults_card(lang: Lang, rows: &[FeatureDefaultRow]) -> Html {
     .to_html()
 }
 
-fn render_models_body(lang: Lang, defaults: &[FeatureDefaultRow], rows: &[ModelRow]) -> Html {
+fn render_models_body(
+    lang: Lang,
+    currency: &str,
+    defaults: &[FeatureDefaultRow],
+    rows: &[ModelRow],
+    other: &[OtherModelRow],
+) -> Html {
     let cards: Vec<Html> = rows
         .iter()
-        .map(|row| render_model_card(lang, row))
+        .map(|row| render_model_card(lang, currency, row))
         .collect();
     html! {
         section(class: "max-w-5xl mx-auto p-4 sm:p-6 flex flex-col gap-4") {
@@ -708,12 +857,52 @@ fn render_models_body(lang: Lang, defaults: &[FeatureDefaultRow], rows: &[ModelR
                     }
                 }
             }
+            (render_other_models_card(lang, currency, other))
         }
     }
     .to_html()
 }
 
-fn render_model_card(lang: Lang, row: &ModelRow) -> Html {
+/// Pricing-only card for non-chat models (embedding / image / speech /
+/// transcription). Those pools serve no sampling/reasoning/context settings,
+/// but their calls still cost money, so each gets just the price control.
+/// Renders nothing when there are no such models.
+fn render_other_models_card(lang: Lang, currency: &str, other: &[OtherModelRow]) -> Html {
+    if other.is_empty() {
+        return html! {}.to_html();
+    }
+    let rows: Vec<Html> = other
+        .iter()
+        .map(|m| {
+            html! {
+                div(class: "flex items-center justify-between gap-3 flex-wrap py-1") {
+                    div(class: "flex items-center gap-2 min-w-0") {
+                        span(class: "badge badge-ghost badge-sm") { (m.kind_label) }
+                        span(class: "font-mono text-sm break-all") { (m.name.clone()) }
+                    }
+                    (render_pricing(lang, currency, &m.name, m.input_price, m.output_price))
+                }
+            }
+            .to_html()
+        })
+        .collect();
+    html! {
+        article(class: "card border border-base-300 bg-base-100") {
+            div(class: "card-body gap-3") {
+                header(class: "flex flex-col gap-1") {
+                    h2(class: "card-title text-base") { (t(lang, "admin-other-heading")) }
+                    p(class: "text-base-content/70 text-sm") { (t(lang, "admin-other-intro")) }
+                }
+                div(class: "flex flex-col divide-y divide-base-200") {
+                    for r in rows.iter() { (r.clone()) }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+fn render_model_card(lang: Lang, currency: &str, row: &ModelRow) -> Html {
     let action = "/admin/models";
     let placeholder = format!(
         "{}\n\
@@ -734,6 +923,7 @@ fn render_model_card(lang: Lang, row: &ModelRow) -> Html {
                 header(class: "flex items-center justify-between gap-3 flex-wrap") {
                     h2(class: "card-title text-base font-mono break-all") { (row.name.clone()) }
                     div(class: "flex items-center gap-2 flex-wrap") {
+                        (render_pricing(lang, currency, &row.name, row.input_price, row.output_price))
                         (render_context_window(lang, row))
                         (render_reasoning_select(lang, row))
                     }
@@ -795,6 +985,57 @@ fn render_context_window(lang: Lang, row: &ModelRow) -> Html {
                     placeholder: (placeholder), "aria-label": (aria),
                     "data-on:change": (format!("@post('{action}', {{contentType: 'form'}})")),
                     class: "w-24"
+                );
+                span(class: "text-xs opacity-70") { (unit_text) }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// The per-model pricing field: two tiny number inputs (input / output price
+/// per 1M tokens) in one auto-saving form. Both are posted together on any
+/// change to `/admin/models/pricing`, so editing either side never clears the
+/// other. Blank = unpriced (0 cost). The `currency` label is cosmetic.
+fn render_pricing(
+    lang: Lang,
+    currency: &str,
+    model_name: &str,
+    input_price: Option<f64>,
+    output_price: Option<f64>,
+) -> Html {
+    let action = "/admin/models/pricing";
+    let fmt = |p: Option<f64>| p.map(|n| n.to_string()).unwrap_or_default();
+    let in_val = fmt(input_price);
+    let out_val = fmt(output_price);
+    let label_text = t_args(
+        lang,
+        "admin-price-label",
+        &i18n::args([("cur", currency.to_string().into())]),
+    );
+    let in_ph = t(lang, "admin-price-in-placeholder");
+    let out_ph = t(lang, "admin-price-out-placeholder");
+    let in_aria = t(lang, "admin-price-in-aria");
+    let out_aria = t(lang, "admin-price-out-aria");
+    let unit_text = t(lang, "admin-price-unit");
+    let post = format!("@post('{action}', {{contentType: 'form'}})");
+    html! {
+        form(method: "post", action: (action), class: "m-0") {
+            input(type: "hidden", name: "model_name", value: (model_name.to_string()));
+            label(class: "input input-bordered input-xs flex items-center gap-1") {
+                span(class: "text-xs opacity-70") { (label_text) }
+                input(
+                    type: "number", name: "input_price", value: (in_val), min: "0", step: "any",
+                    placeholder: (in_ph), "aria-label": (in_aria),
+                    "data-on:change": (post.clone()),
+                    class: "w-16"
+                );
+                span(class: "text-xs opacity-50") { "/" }
+                input(
+                    type: "number", name: "output_price", value: (out_val), min: "0", step: "any",
+                    placeholder: (out_ph), "aria-label": (out_aria),
+                    "data-on:change": (post),
+                    class: "w-16"
                 );
                 span(class: "text-xs opacity-70") { (unit_text) }
             }

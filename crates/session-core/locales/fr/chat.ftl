@@ -32,3 +32,4 @@ chat-error-db-error = erreur de base de données
 chat-error-attachments-not-configured = les pièces jointes du chat ne sont pas configurées
 chat-error-bad-filename = nom de fichier invalide
 chat-error-attachment-not-found = introuvable
+chat-error-rate-limited = Vous avez atteint une limite d'utilisation. Voir /usage pour les détails et la réinitialisation.

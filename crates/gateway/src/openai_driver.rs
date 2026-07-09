@@ -1384,6 +1384,10 @@ fn emit_usage(
         prompt_tokens,
         completion_tokens,
         total_tokens,
+        enforce_limits: d
+            .state
+            .upstreams
+            .enforce_limits_for_model(model, crate::server::upstreams::PoolKind::Chat),
     });
 }
 

@@ -961,6 +961,15 @@ pub async fn chat_message_send(
         Err(err) => return sse_error_response(&err.to_string()),
     };
 
+    // Rate-limit / quota gate — before reserving a worker or touching the DB,
+    // so an over-budget user is turned away cleanly (details on `/usage`).
+    {
+        let role_ids = state.role_ids_for(&user.roles);
+        if state.enforcer.check(&user.id, &role_ids).await.is_err() {
+            return sse_error_response(&t(lang, "chat-error-rate-limited"));
+        }
+    }
+
     // Snapshot the request's content-type header before consuming
     // the request — we need it to find the multipart boundary.
     let content_type = req

@@ -39,6 +39,15 @@ pub struct UpstreamPoolConfig {
     /// endpoint, not the individual model id.
     #[serde(default)]
     pub compliance: Compliance,
+    /// Whether calls served by this pool count toward users' rate limits and
+    /// quotas. Default `true`. Set `false` for pools whose usage should be
+    /// recorded (it still shows on `/usage`) but never consume a budget —
+    /// typically your own self-hosted GPU pools, which are free, while cloud
+    /// pools stay enforced. Like [`compliance`](Self::compliance), it lives at
+    /// the pool level because "is this endpoint billable" is a property of the
+    /// upstream, not the individual model id. See `server::limits`.
+    #[serde(default = "default_true")]
+    pub enforce_limits: bool,
     /// Language → voice name map, only meaningful for `kind = "speech"` pools.
     /// The voice-conversation flow picks the voice whose key matches the
     /// language the user spoke (from STT), falling back to the `""` (empty-key)

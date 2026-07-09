@@ -56,6 +56,16 @@ admin-context-window-invalid = окно контекста `{ $value }` долж
 admin-context-window-saved = окно контекста задано для `{ $model }`
 admin-context-window-cleared = окно контекста очищено для `{ $model }`
 
+# Цены по каждой модели для учёта расходов (цена за 1 млн токенов, ввод / вывод).
+admin-price-label = Цена ({ $cur })
+admin-price-in-placeholder = вх
+admin-price-out-placeholder = вых
+admin-price-in-aria = Цена ввода за 1 млн токенов
+admin-price-out-aria = Цена вывода за 1 млн токенов
+admin-price-unit = /1M
+admin-price-invalid = цена `{ $value }` должна быть неотрицательным числом
+admin-price-saved = цены заданы для `{ $model }`
+
 # Модели по умолчанию для функций (предварительно выбираются в списках
 # чата/голоса и как резерв API, когда вызов не указывает модель).
 admin-defaults-heading = Модели по умолчанию
@@ -68,3 +78,5 @@ admin-defaults-first-option = Первая доступная
 admin-defaults-saved = модель по умолчанию установлена: `{ $model }`
 admin-defaults-cleared = модель по умолчанию сброшена
 admin-defaults-unknown-feature = неизвестная функция `{ $feature }`
+admin-other-heading = Другие модели (цены)
+admin-other-intro = Модели эмбеддингов, изображений, синтеза речи и транскрипции. Настройки сэмплирования и рассуждений не применяются, но задайте цены за 1 млн токенов, чтобы их использование учитывалось в стоимости и лимитах стоимости.

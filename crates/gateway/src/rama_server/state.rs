@@ -34,16 +34,26 @@ pub struct RamaState {
     /// task batches the writes. `disabled()` when `[usage] enabled = false`,
     /// where `emit` is a no-op. See `server::usage`.
     pub usage: UsageHandle,
+    /// Rate-limit / quota gate, consulted by the `/v1` proxy, the chat send
+    /// path, and the scheduler before a call runs. Reads the same DB; a no-op
+    /// when `[limits] enabled = false` or the caller has no rules. See
+    /// `server::limits`.
+    pub enforcer: Arc<crate::server::limits::Enforcer>,
 }
 
 impl RamaState {
     pub fn new(inner: AppState, sessions: SessionStore, usage: UsageHandle) -> Self {
+        let enforcer = Arc::new(crate::server::limits::Enforcer::new(
+            inner.db.clone(),
+            inner.config.limits.enabled,
+        ));
         Self {
             inner,
             sessions,
             chats: Arc::new(SessionWorkers::default()),
             location_feedback: Arc::new(crate::server::tools::feedback::FeedbackHub::default()),
             usage,
+            enforcer,
         }
     }
 

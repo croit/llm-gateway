@@ -33,6 +33,8 @@ usage-stat-requests-title = Запросы
 usage-stat-requests-desc = обращения к бэкенду
 usage-stat-tokens-title = Токены
 usage-stat-tokens-desc = запрос + ответ
+usage-stat-cost-title = Стоимость
+usage-stat-cost-desc = по настроенным ценам моделей
 usage-stat-users-title = Пользователи
 usage-stat-users-desc = активны за период
 usage-stat-errors-title = Ошибки
@@ -50,6 +52,12 @@ usage-key-model = Модель
 
 usage-col-requests = Запросы
 usage-col-tokens = Токены
+usage-col-cost = Стоимость
 usage-col-errors = Ошибки
 
 usage-no-activity = Нет активности за этот период.
+
+usage-limits-heading = Ваши лимиты
+usage-limit-used = использовано { $percent } %
+usage-limit-refreshes = обновится { $time }
+usage-unpriced-warning = Расходы не включают модели без цены: { $models }. Задайте цены в /admin/models, чтобы учитывать их.

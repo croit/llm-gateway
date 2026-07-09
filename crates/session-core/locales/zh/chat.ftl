@@ -32,3 +32,4 @@ chat-error-db-error = 数据库错误
 chat-error-attachments-not-configured = 聊天附件未配置
 chat-error-bad-filename = 文件名无效
 chat-error-attachment-not-found = 未找到
+chat-error-rate-limited = 您已达到使用限制。详情及重置时间请见 /usage。

@@ -19,6 +19,7 @@ pub mod geoip;
 pub mod github;
 pub mod headless;
 pub mod image_gen;
+pub mod limits;
 pub mod model_defaults;
 pub mod pdf;
 pub mod rag;

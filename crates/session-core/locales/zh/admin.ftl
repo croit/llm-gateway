@@ -56,6 +56,16 @@ admin-context-window-invalid = 上下文窗口 `{ $value }` 必须为正整数
 admin-context-window-saved = 已为 `{ $model }` 设置上下文窗口
 admin-context-window-cleared = 已清除 `{ $model }` 的上下文窗口
 
+# 各模型的成本核算价格（每 100 万 token 的价格，输入 / 输出）。
+admin-price-label = 价格（{ $cur }）
+admin-price-in-placeholder = 入
+admin-price-out-placeholder = 出
+admin-price-in-aria = 每 100 万 token 的输入价格
+admin-price-out-aria = 每 100 万 token 的输出价格
+admin-price-unit = /1M
+admin-price-invalid = 价格 `{ $value }` 必须为非负数
+admin-price-saved = 已为 `{ $model }` 设置价格
+
 # 各功能的默认模型（在聊天/语音选择器中预先选中，以及调用未指定模型时的 API 回退）。
 admin-defaults-heading = 默认模型
 admin-defaults-intro = 选择每项功能预先选中的模型。留空 = 第一个可用模型（旧行为）。
@@ -67,3 +77,5 @@ admin-defaults-first-option = 第一个可用
 admin-defaults-saved = 默认模型已设置为 `{ $model }`
 admin-defaults-cleared = 默认模型已清除
 admin-defaults-unknown-feature = 未知功能 `{ $feature }`
+admin-other-heading = 其他模型（定价）
+admin-other-intro = 嵌入、图像、语音和转录模型。采样与推理设置不适用，但可设置每 100 万 tokens 的价格，使其用量计入成本核算与成本限额。

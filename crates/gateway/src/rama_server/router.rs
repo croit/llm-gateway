@@ -153,7 +153,11 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
             "/admin/models/context-window",
             pages::admin_models_context_window_save,
         )
+        .with_post("/admin/models/pricing", pages::admin_models_pricing_save)
         .with_post("/admin/models/defaults", pages::admin_models_defaults_save)
+        .with_get("/admin/limits", pages::admin_limits_index)
+        .with_post("/admin/limits", pages::admin_limits_save)
+        .with_post("/admin/limits/delete", pages::admin_limits_delete)
         .with_get("/admin/backends", pages::admin_backends_index)
         .with_get("/admin/users", pages::admin_users_index)
         // Target id rides in the POST body (not the path) — rama lowercases

@@ -53,12 +53,17 @@ struct RecordParams {
     source: UsageSource,
     kind: UsageKind,
     model: String,
+    /// Whether the serving pool is metered (counts toward limits). Resolved
+    /// from the registry once the real model id is known, and stamped onto
+    /// every emitted row.
+    enforce_limits: bool,
 }
 
 impl RecordParams {
     /// A `/v1` (bearer) measurement: the access method is `v1_api` and the
-    /// token id/name carry through for the per-token breakdown.
-    fn v1(user: &UserCtx, kind: UsageKind, model: String) -> Self {
+    /// token id/name carry through for the per-token breakdown. `enforce_limits` is
+    /// the serving pool's flag (resolve via `upstreams.enforce_limits_for_model`).
+    fn v1(user: &UserCtx, kind: UsageKind, model: String, enforce_limits: bool) -> Self {
         Self {
             user_id: user.user_id.clone(),
             user_email: user.user_email.clone(),
@@ -67,6 +72,7 @@ impl RecordParams {
             source: UsageSource::V1Api,
             kind,
             model,
+            enforce_limits,
         }
     }
 
@@ -97,8 +103,65 @@ impl RecordParams {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            enforce_limits: self.enforce_limits,
         });
     }
+}
+
+/// Pre-flight rate-limit / quota gate for a bearer (`/v1`) call. Returns the
+/// `429` to send when the caller is over a limit, else `None`. Resolves the
+/// caller's role ids and consults the shared [`crate::server::limits::Enforcer`].
+async fn limit_check(state: &RamaState, user: &UserCtx) -> Option<Response> {
+    let role_ids = state.role_ids_for(&user.roles);
+    match state.enforcer.check(&user.user_id, &role_ids).await {
+        Ok(()) => None,
+        Err(exceeded) => Some(limit_exceeded_response(&exceeded)),
+    }
+}
+
+/// Compact number for limit messages: whole values without a trailing `.0`,
+/// otherwise two decimals (cost).
+fn fmt_limit_num(n: f64) -> String {
+    if n.fract() == 0.0 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n:.2}")
+    }
+}
+
+/// A `429 Too Many Requests` with an OpenAI-shaped error envelope and a
+/// `Retry-After` header, naming the breached limit.
+fn limit_exceeded_response(e: &crate::server::limits::LimitExceeded) -> Response {
+    let scope = e
+        .model
+        .as_deref()
+        .map(|m| format!(" for model `{m}`"))
+        .unwrap_or_default();
+    let msg = format!(
+        "{} limit reached{scope}: {} per {} (used {}). Try again later.",
+        e.dimension.as_str(),
+        fmt_limit_num(e.limit),
+        e.window.as_str(),
+        fmt_limit_num(e.used),
+    );
+    let body = json!({
+        "error": {
+            "message": msg,
+            "type": "rate_limit_exceeded",
+            "code": "rate_limit_exceeded",
+        }
+    });
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(rama::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            rama::http::header::RETRY_AFTER,
+            e.retry_after_secs.to_string(),
+        )
+        .body(body.to_string().into())
+        .unwrap_or_else(|_| {
+            error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded", &msg)
+        })
 }
 
 /// Token counts from a buffered JSON body (or `(None, None, None)` if it
@@ -141,6 +204,9 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
         Ok(u) => u,
         Err(resp) => return resp,
     };
+    if let Some(resp) = limit_check(&state, &user).await {
+        return resp;
+    }
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
@@ -215,7 +281,14 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
             crate::server::model_defaults::apply_defaults_to_bytes(&state.db, &real_model, body)
                 .await;
         let body = rewrite_model_in_bytes(body, &real_model);
-        let rec = RecordParams::v1(&user, UsageKind::Chat, real_model.clone());
+        let rec = RecordParams::v1(
+            &user,
+            UsageKind::Chat,
+            real_model.clone(),
+            state
+                .upstreams
+                .enforce_limits_for_model(&real_model, PoolKind::Chat),
+        );
         let resp = forward_streaming(
             &state,
             acquired,
@@ -311,7 +384,14 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     let headers_clone = parts.headers.clone();
     // One usage row per upstream round — built per request, finished off
     // with backend/status/latency/tokens inside the loop closure.
-    let rec = RecordParams::v1(&user, UsageKind::Chat, real_model.clone());
+    let rec = RecordParams::v1(
+        &user,
+        UsageKind::Chat,
+        real_model.clone(),
+        state
+            .upstreams
+            .enforce_limits_for_model(&real_model, PoolKind::Chat),
+    );
 
     // Reuse the layer built once above (same ids we advertised) for dispatch.
     let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
@@ -447,12 +527,16 @@ pub async fn transcribe(State(state): State<Arc<RamaState>>, req: Request) -> Re
         Ok(u) => u,
         Err(resp) => return resp,
     };
+    if let Some(resp) = limit_check(&state, &user).await {
+        return resp;
+    }
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
     };
-    // Model is parsed inside; `handle_transcription` fills it into `rec`.
-    let rec = RecordParams::v1(&user, UsageKind::Transcription, String::new());
+    // Model is parsed inside; `handle_transcription` fills the real model id
+    // and the resolved `enforce_limits` flag into `rec` once routing has run.
+    let rec = RecordParams::v1(&user, UsageKind::Transcription, String::new(), true);
     handle_transcription(state, parts.headers, body, rec).await
 }
 
@@ -503,6 +587,8 @@ pub async fn transcribe_session(State(state): State<Arc<RamaState>>, req: Reques
         source: UsageSource::Chat,
         kind: UsageKind::Transcription,
         model: String::new(),
+        // Overwritten in `handle_transcription` once the real model resolves.
+        enforce_limits: true,
     };
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
@@ -597,6 +683,9 @@ async fn handle_transcription(
     }
 
     rec.model = real_model.clone();
+    rec.enforce_limits = state
+        .upstreams
+        .enforce_limits_for_model(&real_model, PoolKind::Transcription);
     let resp = forward(
         &state,
         acquired,
@@ -760,6 +849,9 @@ pub async fn embeddings(State(state): State<Arc<RamaState>>, req: Request) -> Re
         Ok(u) => u,
         Err(resp) => return resp,
     };
+    if let Some(resp) = limit_check(&state, &user).await {
+        return resp;
+    }
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
@@ -779,7 +871,14 @@ pub async fn embeddings(State(state): State<Arc<RamaState>>, req: Request) -> Re
     };
     let real_model = acquired.resolved_model().to_string();
     let body = rewrite_model_in_bytes(body, &real_model);
-    let rec = RecordParams::v1(&user, UsageKind::Embedding, real_model.clone());
+    let rec = RecordParams::v1(
+        &user,
+        UsageKind::Embedding,
+        real_model.clone(),
+        state
+            .upstreams
+            .enforce_limits_for_model(&real_model, PoolKind::Embedding),
+    );
     let resp = forward(
         &state,
         acquired,
@@ -807,6 +906,9 @@ pub async fn images_generations(State(state): State<Arc<RamaState>>, req: Reques
         Ok(u) => u,
         Err(resp) => return resp,
     };
+    if let Some(resp) = limit_check(&state, &user).await {
+        return resp;
+    }
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
@@ -824,7 +926,14 @@ pub async fn images_generations(State(state): State<Arc<RamaState>>, req: Reques
     };
     let real_model = acquired.resolved_model().to_string();
     let body = rewrite_model_in_bytes(body, &real_model);
-    let rec = RecordParams::v1(&user, UsageKind::Image, real_model.clone());
+    let rec = RecordParams::v1(
+        &user,
+        UsageKind::Image,
+        real_model.clone(),
+        state
+            .upstreams
+            .enforce_limits_for_model(&real_model, PoolKind::Image),
+    );
     let resp = forward(
         &state,
         acquired,
@@ -851,6 +960,9 @@ pub async fn images_edits(State(state): State<Arc<RamaState>>, req: Request) -> 
         Ok(u) => u,
         Err(resp) => return resp,
     };
+    if let Some(resp) = limit_check(&state, &user).await {
+        return resp;
+    }
     let mut headers = parts.headers;
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
@@ -891,7 +1003,14 @@ pub async fn images_edits(State(state): State<Arc<RamaState>>, req: Request) -> 
     if let Ok(val) = rama::http::HeaderValue::from_str(&content_type) {
         headers.insert(rama::http::header::CONTENT_TYPE, val);
     }
-    let rec = RecordParams::v1(&user, UsageKind::Image, real_model.clone());
+    let rec = RecordParams::v1(
+        &user,
+        UsageKind::Image,
+        real_model.clone(),
+        state
+            .upstreams
+            .enforce_limits_for_model(&real_model, PoolKind::Image),
+    );
     let resp = forward(
         &state,
         acquired,
@@ -961,6 +1080,9 @@ pub async fn speech(State(state): State<Arc<RamaState>>, req: Request) -> Respon
         Ok(u) => u,
         Err(resp) => return resp,
     };
+    if let Some(resp) = limit_check(&state, &user).await {
+        return resp;
+    }
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
@@ -978,7 +1100,14 @@ pub async fn speech(State(state): State<Arc<RamaState>>, req: Request) -> Respon
     };
     let real_model = acquired.resolved_model().to_string();
     let body = rewrite_model_in_bytes(body, &real_model);
-    let rec = RecordParams::v1(&user, UsageKind::Speech, real_model.clone());
+    let rec = RecordParams::v1(
+        &user,
+        UsageKind::Speech,
+        real_model.clone(),
+        state
+            .upstreams
+            .enforce_limits_for_model(&real_model, PoolKind::Speech),
+    );
     let resp = forward(
         &state,
         acquired,
@@ -1117,6 +1246,9 @@ pub async fn speech_session(State(state): State<Arc<RamaState>>, req: Request) -
         source: UsageSource::Chat,
         kind: UsageKind::Speech,
         model: real_model.clone(),
+        enforce_limits: state
+            .upstreams
+            .enforce_limits_for_model(&real_model, PoolKind::Speech),
     };
     let serialized = match serde_json::to_vec(&req_body) {
         Ok(v) => Bytes::from(v),
@@ -1373,6 +1505,40 @@ fn loop_error_chunk() -> Bytes {
     ))
 }
 
+/// Force a streaming chat request to ask the upstream for a trailing `usage`
+/// frame (`stream_options.include_usage = true`), so token/cost accounting
+/// works even when the client didn't opt in — otherwise a streamed `/v1` call
+/// records zero tokens (and thus zero cost), a silent hole in spend tracking.
+///
+/// Returns the (possibly rewritten) body plus `suppress_usage_frame`: `true`
+/// when we injected the option the client hadn't asked for, so the relay taps
+/// the usage frame for accounting but drops it from the client-facing stream
+/// (keeping the passthrough byte-faithful). Non-streaming bodies are returned
+/// untouched (`stream_options` is invalid without `stream:true`), as are
+/// bodies that don't parse as JSON.
+fn force_usage_in_body(body: Bytes) -> (Bytes, bool) {
+    let Ok(mut v) = serde_json::from_slice::<Value>(&body) else {
+        return (body, false);
+    };
+    if !v.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        return (body, false);
+    }
+    let client_opted = v
+        .pointer("/stream_options/include_usage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if let Some(obj) = v.as_object_mut() {
+        let so = obj.entry("stream_options").or_insert_with(|| json!({}));
+        if let Some(m) = so.as_object_mut() {
+            m.insert("include_usage".into(), Value::Bool(true));
+        }
+    }
+    match serde_json::to_vec(&v) {
+        Ok(b) => (Bytes::from(b), !client_opted),
+        Err(_) => (body, false),
+    }
+}
+
 /// Streaming variant of `forward` — used by /v1/chat/completions so SSE
 /// (`stream: true`) responses unfold token-by-token to the client
 /// instead of buffering. Relays each upstream frame 1:1 while tapping the
@@ -1394,6 +1560,10 @@ async fn forward_streaming(
     let backend_name = backend.name.clone();
     let url = format!("{}/{}", backend.base_url, upstream_path);
     let started = Instant::now();
+
+    // Ensure streaming calls report a trailing usage frame (else zero
+    // tokens/cost); hide it from the client if they didn't opt in.
+    let (body, suppress_usage_frame) = force_usage_in_body(body);
 
     let mut req = state.http.request(method, &url);
     for (name, value) in &client_headers {
@@ -1448,24 +1618,22 @@ async fn forward_streaming(
         let mut content_guard = crate::loop_guard::LoopGuard::new();
         let mut reasoning_guard = crate::loop_guard::LoopGuard::new();
         let mut looped = false;
-        // Token counts ride the trailing `usage` frame — present only when
-        // the *client* asked for `stream_options.include_usage`. We tap it
-        // passively (never inject the option) so a passthrough client's
-        // stream is unchanged; callers who don't opt in get NULL tokens.
+        // Token counts ride the trailing `usage` frame, which we forced on via
+        // `force_usage_in_body`. We forward at SSE-event granularity (not raw
+        // network chunks) so that, when `suppress_usage_frame` is set (the
+        // client didn't ask for usage), we can tap that frame for accounting
+        // but drop it from the relayed stream — keeping the passthrough
+        // byte-faithful. Re-assembled event bytes are identical to the
+        // upstream's, just re-chunked on `\n\n` boundaries.
         let mut tokens: (Option<i64>, Option<i64>, Option<i64>) = (None, None, None);
         'frames: while let Some(frame) = upstream_stream.next().await {
             let Ok(frame) = frame else { break };
-            // Forward first so the client gets output with no added latency.
-            if tx.unbounded_send(Ok(frame.clone())).is_err() {
-                // Client disconnected — still record the call (partial).
-                rec.emit(&usage_sink, &backend_name, status.as_u16(), started, tokens);
-                return;
-            }
             buf.extend_from_slice(&frame);
             while let Some(idx) = buf.windows(2).position(|w| w == b"\n\n") {
                 let event: Vec<u8> = buf.drain(..idx + 2).collect();
-                let event = String::from_utf8_lossy(&event);
-                for line in event.lines() {
+                let text = String::from_utf8_lossy(&event);
+                let mut is_usage_only = false;
+                for line in text.lines() {
                     let Some(payload) = line.strip_prefix("data:").map(str::trim_start) else {
                         continue;
                     };
@@ -1477,6 +1645,9 @@ async fn forward_streaming(
                     };
                     if v.get("usage").is_some_and(|u| !u.is_null()) {
                         tokens = usage::usage_from_value(&v);
+                        // OpenAI's trailing usage frame carries empty `choices`;
+                        // a usage riding a content chunk keeps its choice.
+                        is_usage_only = v.pointer("/choices/0").is_none();
                     }
                     if let Some(t) = v
                         .pointer("/choices/0/delta/content")
@@ -1484,7 +1655,6 @@ async fn forward_streaming(
                         && content_guard.push(t)
                     {
                         looped = true;
-                        break 'frames;
                     }
                     if let Some(t) = v
                         .pointer("/choices/0/delta/reasoning_content")
@@ -1496,24 +1666,36 @@ async fn forward_streaming(
                         && reasoning_guard.push(t)
                     {
                         looped = true;
-                        break 'frames;
                     }
+                }
+                // Relay the event verbatim, unless it's the usage frame we're
+                // hiding from a client that didn't opt in.
+                if !(suppress_usage_frame && is_usage_only)
+                    && tx.unbounded_send(Ok(Bytes::from(event))).is_err()
+                {
+                    // Client disconnected — still record the call (partial).
+                    rec.emit(&usage_sink, &backend_name, status.as_u16(), started, tokens);
+                    return;
+                }
+                if looped {
+                    break 'frames;
                 }
             }
         }
         if looped {
             let _ = tx.unbounded_send(Ok(loop_error_chunk()));
             let _ = tx.unbounded_send(Ok(Bytes::from("data: [DONE]\n\n")));
-        }
-        // Non-streaming requests also take this path: the upstream replies
-        // with one plain JSON body (no `data:` frames), so `buf` holds it
-        // whole at the end. If we never saw an SSE usage frame, try parsing
-        // that body for the `usage` block. For real SSE streams `buf` is
-        // drained frame-by-frame and empty here, so this is a no-op.
-        if tokens == (None, None, None)
-            && let Ok(v) = serde_json::from_slice::<Value>(&buf)
-        {
-            tokens = usage::usage_from_value(&v);
+        } else if !buf.is_empty() {
+            // Non-streaming requests also take this path: the upstream replies
+            // with one plain JSON body (no `\n\n`-framed events), so `buf`
+            // holds it whole here. Parse it for the `usage` block (if we
+            // haven't already) and forward it verbatim.
+            if tokens == (None, None, None)
+                && let Ok(v) = serde_json::from_slice::<Value>(&buf)
+            {
+                tokens = usage::usage_from_value(&v);
+            }
+            let _ = tx.unbounded_send(Ok(Bytes::from(std::mem::take(&mut buf))));
         }
         rec.emit(&usage_sink, &backend_name, status.as_u16(), started, tokens);
     });
@@ -1608,7 +1790,14 @@ async fn forward_streaming_with_tools(
 
     // One usage row per upstream round; built here where the bearer's
     // identity + token are known, finished off inside the loop.
-    let rec = RecordParams::v1(&user, UsageKind::Chat, model.clone());
+    let rec = RecordParams::v1(
+        &user,
+        UsageKind::Chat,
+        model.clone(),
+        state
+            .upstreams
+            .enforce_limits_for_model(&model, PoolKind::Chat),
+    );
 
     // rama::futures::channel::mpsc::unbounded matches the pattern used by
     // the chat-page SSE producer (`pages/chat/mod.rs`).
@@ -1762,6 +1951,21 @@ async fn drive_streaming_tool_loop(
         &user_mcp,
     );
 
+    // Force a trailing usage frame each round so token/cost accounting works
+    // even when the client didn't opt in; hide it from the client stream
+    // unless they asked (fits the existing per-round hide policy below).
+    let client_wants_usage = request_body
+        .pointer("/stream_options/include_usage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if let Some(obj) = request_body.as_object_mut() {
+        let so = obj.entry("stream_options").or_insert_with(|| json!({}));
+        if let Some(m) = so.as_object_mut() {
+            m.insert("include_usage".into(), Value::Bool(true));
+        }
+    }
+    let suppress_usage_frame = !client_wants_usage;
+
     for _round in 0..STREAM_TOOL_LOOP_MAX_ROUNDS {
         let acquired = state
             .upstreams
@@ -1869,6 +2073,11 @@ async fn drive_streaming_tool_loop(
                     chunk_meta.absorb(&v);
                     if v.get("usage").is_some_and(|u| !u.is_null()) {
                         round_tokens = usage::usage_from_value(&v);
+                        // Hide the trailing usage-only frame (empty `choices`)
+                        // from a client that didn't opt into it.
+                        if suppress_usage_frame && v.pointer("/choices/0").is_none() {
+                            hide_event = true;
+                        }
                     }
                     if let Some(t) = v
                         .pointer("/choices/0/delta/content")
@@ -2210,6 +2419,37 @@ mod tests {
 
     fn parse(body: &Bytes) -> serde_json::Value {
         serde_json::from_slice(body).unwrap()
+    }
+
+    #[test]
+    fn force_usage_injects_on_streaming_and_reports_client_opt_in() {
+        // Streaming client that DIDN'T ask for usage → we inject it and flag
+        // suppression (tap-but-hide the frame).
+        let body = Bytes::from(r#"{"model":"m","stream":true,"messages":[]}"#);
+        let (out, suppress) = force_usage_in_body(body);
+        assert_eq!(parse(&out)["stream_options"]["include_usage"], json!(true));
+        assert!(
+            suppress,
+            "client didn't opt in → hide the injected usage frame"
+        );
+
+        // Streaming client that DID ask → keep it, don't suppress.
+        let body = Bytes::from(
+            r#"{"model":"m","stream":true,"stream_options":{"include_usage":true},"messages":[]}"#,
+        );
+        let (out, suppress) = force_usage_in_body(body);
+        assert_eq!(parse(&out)["stream_options"]["include_usage"], json!(true));
+        assert!(!suppress, "client opted in → forward the usage frame");
+    }
+
+    #[test]
+    fn force_usage_leaves_non_streaming_untouched() {
+        // `stream_options` is invalid without `stream:true`, so a non-streaming
+        // body must pass through unchanged (no injection, no suppression).
+        let body = Bytes::from(r#"{"model":"m","messages":[]}"#);
+        let (out, suppress) = force_usage_in_body(body);
+        assert!(parse(&out).get("stream_options").is_none());
+        assert!(!suppress);
     }
 
     #[test]

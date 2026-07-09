@@ -33,6 +33,8 @@ usage-stat-requests-title = Anfragen
 usage-stat-requests-desc = Aufrufe an vorgelagerte Backends
 usage-stat-tokens-title = Token
 usage-stat-tokens-desc = Prompt + Vervollständigung
+usage-stat-cost-title = Kosten
+usage-stat-cost-desc = zu den konfigurierten Modellpreisen
 usage-stat-users-title = Benutzer
 usage-stat-users-desc = aktiv im Zeitraum
 usage-stat-errors-title = Fehler
@@ -50,6 +52,12 @@ usage-key-model = Modell
 
 usage-col-requests = Anfragen
 usage-col-tokens = Token
+usage-col-cost = Kosten
 usage-col-errors = Fehler
 
 usage-no-activity = Keine Aktivität in diesem Zeitraum.
+
+usage-limits-heading = Deine Limits
+usage-limit-used = { $percent } % genutzt
+usage-limit-refreshes = wird { $time } zurückgesetzt
+usage-unpriced-warning = Ausgaben schließen nicht bepreiste Modelle aus: { $models }. Preise in /admin/models setzen, um sie zu erfassen.

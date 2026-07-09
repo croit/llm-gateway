@@ -154,6 +154,7 @@ mod tests {
             UpstreamPoolConfig {
                 voices: Default::default(),
                 compliance: Default::default(),
+                enforce_limits: true,
                 kind: PoolKind::Embedding,
                 strategy: PickerStrategy::RoundRobin,
                 models: Vec::new(),

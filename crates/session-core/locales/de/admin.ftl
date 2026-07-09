@@ -56,6 +56,16 @@ admin-context-window-invalid = Kontextfenster `{ $value }` muss eine positive Ga
 admin-context-window-saved = Kontextfenster für `{ $model }` gesetzt
 admin-context-window-cleared = Kontextfenster für `{ $model }` gelöscht
 
+# Preise pro Modell für die Kostenabrechnung (Preis pro 1 Mio. Tokens, Eingabe / Ausgabe).
+admin-price-label = Preis ({ $cur })
+admin-price-in-placeholder = ein
+admin-price-out-placeholder = aus
+admin-price-in-aria = Eingabepreis pro 1 Mio. Tokens
+admin-price-out-aria = Ausgabepreis pro 1 Mio. Tokens
+admin-price-unit = /1M
+admin-price-invalid = Preis `{ $value }` muss eine nicht-negative Zahl sein
+admin-price-saved = Preise für `{ $model }` gesetzt
+
 # Standardmodelle pro Funktion (im Chat/Sprach-Auswahlmenü vorausgewählt und
 # als API-Fallback, wenn ein Aufruf kein Modell angibt).
 admin-defaults-heading = Standardmodelle
@@ -68,3 +78,5 @@ admin-defaults-first-option = Erstes verfügbares
 admin-defaults-saved = Standardmodell auf `{ $model }` gesetzt
 admin-defaults-cleared = Standardmodell zurückgesetzt
 admin-defaults-unknown-feature = unbekannte Funktion `{ $feature }`
+admin-other-heading = Weitere Modelle (Preise)
+admin-other-intro = Embedding-, Bild-, Sprach- und Transkriptionsmodelle. Sampling- und Reasoning-Einstellungen gelten nicht, aber setze Preise pro 1 Mio. Tokens, damit ihre Nutzung in die Kostenabrechnung und Kostenlimits einfließt.

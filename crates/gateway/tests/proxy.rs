@@ -98,6 +98,47 @@ async fn v1_chat_completions_relays_through_upstream() {
 }
 
 #[tokio::test]
+async fn v1_chat_blocked_by_quota_returns_429() {
+    use gateway::server::db::limits::{self, Dimension, SubjectType, Window};
+
+    let upstream = MockServer::start().await;
+    // The backend never needs to answer — enforcement fires before routing.
+    let state = common::state_with_chat_pool(&upstream.uri()).await;
+    let bearer = common::seed_user_with_token(&state, "alice").await;
+    // A global 0-requests/hour rule puts every caller over budget immediately.
+    limits::upsert(
+        &state.db,
+        SubjectType::Global,
+        "",
+        None,
+        Dimension::Requests,
+        Window::Hour,
+        0.0,
+    )
+    .await
+    .unwrap();
+    let app = common::app(state);
+
+    let body = json!({"model": "model-a", "messages": []}).to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        resp.headers().get("retry-after").is_some(),
+        "429 must carry a Retry-After header"
+    );
+    let bytes = common::read_body(resp).await;
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed["error"]["type"], "rate_limit_exceeded");
+}
+
+#[tokio::test]
 async fn v1_chat_completion_records_a_usage_row() {
     use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
     use jiff::Timestamp;
@@ -671,6 +712,7 @@ async fn state_with_backend_api_key(
             voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
+            enforce_limits: true,
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
@@ -724,6 +766,7 @@ async fn state_with_alias_pool(upstream_url: &str) -> gateway::rama_server::Rama
             voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
+            enforce_limits: true,
             kind: PoolKind::Chat,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),

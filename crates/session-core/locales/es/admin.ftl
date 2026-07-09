@@ -56,6 +56,16 @@ admin-context-window-invalid = la ventana de contexto `{ $value }` debe ser un e
 admin-context-window-saved = ventana de contexto establecida para `{ $model }`
 admin-context-window-cleared = ventana de contexto borrada para `{ $model }`
 
+# Precios por modelo para la contabilidad de costes (precio por 1 M de tokens, entrada / salida).
+admin-price-label = Precio ({ $cur })
+admin-price-in-placeholder = ent
+admin-price-out-placeholder = sal
+admin-price-in-aria = Precio de entrada por 1 M de tokens
+admin-price-out-aria = Precio de salida por 1 M de tokens
+admin-price-unit = /1M
+admin-price-invalid = el precio `{ $value }` debe ser un número no negativo
+admin-price-saved = precios establecidos para `{ $model }`
+
 # Modelos predeterminados por función (preseleccionado en los selectores de
 # chat/voz, y alternativa de la API cuando una llamada omite el modelo).
 admin-defaults-heading = Modelos predeterminados
@@ -68,3 +78,5 @@ admin-defaults-first-option = Primero disponible
 admin-defaults-saved = modelo predeterminado establecido en `{ $model }`
 admin-defaults-cleared = modelo predeterminado restablecido
 admin-defaults-unknown-feature = función desconocida `{ $feature }`
+admin-other-heading = Otros modelos (precios)
+admin-other-intro = Modelos de embedding, imagen, voz y transcripción. Los ajustes de muestreo y razonamiento no se aplican, pero fija precios por 1 M de tokens para que su uso cuente en el coste y los límites de coste.

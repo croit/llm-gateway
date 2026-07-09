@@ -97,6 +97,11 @@ pub struct UsageRecord {
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
+    /// Whether this call counts toward the caller's rate limits / quotas —
+    /// the serving pool's `enforce_limits` flag, resolved at the call site (self-
+    /// hosted pools are exempt). Recorded on every row so the dashboards still
+    /// show exempt traffic while enforcement (`server::limits`) ignores it.
+    pub enforce_limits: bool,
 }
 
 /// Pull the OpenAI `usage` token counts out of a completion body or a
@@ -111,6 +116,24 @@ pub fn usage_from_value(v: &Value) -> (Option<i64>, Option<i64>, Option<i64>) {
         get("completion_tokens"),
         get("total_tokens"),
     )
+}
+
+/// Monetary cost of one call from its model's prices (per 1M tokens) and its
+/// token counts. An unpriced model (`None`) or an unpriced side costs 0, as do
+/// missing token counts — so transcription/speech rows (no `usage`) and
+/// self-hosted models the operator never priced settle to 0 cost.
+fn compute_cost(
+    price: Option<&super::model_defaults::ModelPrice>,
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+) -> f64 {
+    let Some(p) = price else {
+        return 0.0;
+    };
+    let per_million = |rate: Option<f64>, tokens: Option<i64>| -> f64 {
+        rate.unwrap_or(0.0) * (tokens.unwrap_or(0) as f64) / 1_000_000.0
+    };
+    per_million(p.input_price, prompt_tokens) + per_million(p.output_price, completion_tokens)
 }
 
 fn fmt_ts(ts: Timestamp) -> String {
@@ -129,16 +152,22 @@ pub async fn insert_batch(pool: &Pool, recs: &[UsageRecord]) -> Result<(), DbErr
     if recs.is_empty() {
         return Ok(());
     }
+    // One small read per flush turns token counts into money without a
+    // per-row query (`model_defaults` holds only a handful of rows). Prices
+    // are resolved here, at settle time, and the resulting `cost` is stored
+    // immutably — a later price change never rewrites historical spend.
+    let prices = super::model_defaults::all_prices(pool).await?;
     let mut tx = pool.begin().await?;
     for r in recs {
         let created = fmt_ts(r.created_at);
         let day = fmt_day(r.created_at);
+        let cost = compute_cost(prices.get(&r.model), r.prompt_tokens, r.completion_tokens);
         sqlx::query(
             "INSERT INTO usage_events
                (id, created_at, user_id, user_email, token_id, token_name,
                 source, kind, backend, model, status, duration_ms,
-                prompt_tokens, completion_tokens, total_tokens)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                prompt_tokens, completion_tokens, total_tokens, cost, enforce_limits)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(&created)
@@ -155,6 +184,8 @@ pub async fn insert_batch(pool: &Pool, recs: &[UsageRecord]) -> Result<(), DbErr
         .bind(r.prompt_tokens)
         .bind(r.completion_tokens)
         .bind(r.total_tokens)
+        .bind(cost)
+        .bind(i64::from(r.enforce_limits))
         .execute(&mut *tx)
         .await?;
 
@@ -162,14 +193,15 @@ pub async fn insert_batch(pool: &Pool, recs: &[UsageRecord]) -> Result<(), DbErr
         sqlx::query(
             "INSERT INTO usage_daily
                (day, user_id, user_email, source, kind, backend, model,
-                req_count, error_count, prompt_tokens, completion_tokens, total_tokens)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                req_count, error_count, prompt_tokens, completion_tokens, total_tokens, cost)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
              ON CONFLICT(day, user_id, source, kind, backend, model) DO UPDATE SET
                 req_count         = req_count         + 1,
                 error_count       = error_count       + excluded.error_count,
                 prompt_tokens     = prompt_tokens     + excluded.prompt_tokens,
                 completion_tokens = completion_tokens + excluded.completion_tokens,
-                total_tokens      = total_tokens      + excluded.total_tokens",
+                total_tokens      = total_tokens      + excluded.total_tokens,
+                cost              = cost              + excluded.cost",
         )
         .bind(&day)
         .bind(&r.user_id)
@@ -182,6 +214,7 @@ pub async fn insert_batch(pool: &Pool, recs: &[UsageRecord]) -> Result<(), DbErr
         .bind(r.prompt_tokens.unwrap_or(0))
         .bind(r.completion_tokens.unwrap_or(0))
         .bind(r.total_tokens.unwrap_or(0))
+        .bind(cost)
         .execute(&mut *tx)
         .await?;
     }
@@ -359,17 +392,19 @@ impl Filter {
     }
 }
 
-/// Top-line totals for a window.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Top-line totals for a window. `total_cost` is in the deployment currency
+/// (`[usage] currency`), summed from the immutable per-row `cost`.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Summary {
     pub requests: i64,
     pub total_tokens: i64,
+    pub total_cost: f64,
     pub unique_users: i64,
     pub errors: i64,
 }
 
 /// One grouped breakdown row (by user / backend / source / model).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GroupCount {
     /// The grouping key (user_id, backend name, source, or model).
     pub key: String,
@@ -377,6 +412,7 @@ pub struct GroupCount {
     pub label: String,
     pub requests: i64,
     pub total_tokens: i64,
+    pub cost: f64,
     pub errors: i64,
 }
 
@@ -479,6 +515,7 @@ async fn query_summary(pool: &Pool, plan: &ReadPlan, filter: &Filter) -> Result<
     let (fsql, binds) = filter.where_sql();
     let sql = format!(
         "SELECT {req} AS requests, COALESCE(SUM(total_tokens), 0) AS total_tokens, \
+                COALESCE(SUM(cost), 0) AS total_cost, \
                 COUNT(DISTINCT user_id) AS unique_users, {err} AS errors \
          FROM {table} WHERE {col} >= ? AND {col} < ?{fsql}",
         req = plan.req_expr(),
@@ -494,6 +531,7 @@ async fn query_summary(pool: &Pool, plan: &ReadPlan, filter: &Filter) -> Result<
     Ok(Summary {
         requests: row.try_get("requests")?,
         total_tokens: row.try_get("total_tokens")?,
+        total_cost: row.try_get("total_cost")?,
         unique_users: row.try_get("unique_users")?,
         errors: row.try_get("errors")?,
     })
@@ -509,7 +547,8 @@ async fn query_group(
     let (fsql, binds) = filter.where_sql();
     let sql = format!(
         "SELECT {key} AS k, {label} AS label, {req} AS requests, \
-                COALESCE(SUM(total_tokens), 0) AS total_tokens, {err} AS errors \
+                COALESCE(SUM(total_tokens), 0) AS total_tokens, \
+                COALESCE(SUM(cost), 0) AS cost, {err} AS errors \
          FROM {table} WHERE {col} >= ? AND {col} < ?{fsql} \
          GROUP BY {key} ORDER BY requests DESC, k ASC",
         key = key_col,
@@ -533,6 +572,7 @@ async fn query_group(
                 key,
                 requests: row.try_get("requests")?,
                 total_tokens: row.try_get("total_tokens")?,
+                cost: row.try_get("cost")?,
                 errors: row.try_get("errors")?,
             })
         })
@@ -609,6 +649,45 @@ pub async fn distinct_backends(pool: &Pool, bounds: Bounds) -> Result<Vec<String
     rows.iter().map(|r| Ok(r.try_get("backend")?)).collect()
 }
 
+/// One user's usage accumulated since an instant — the read behind limit
+/// enforcement (`server::limits`). Counts only `enforce_limits = 1` rows (exempt
+/// pools never consume a budget) and, when `model` is set, narrows to that
+/// single model; `None` sums across all metered models. Token-agnostic: a
+/// user's whole budget spans every API token + chat + scheduled call.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WindowUsage {
+    pub requests: i64,
+    pub tokens: i64,
+    pub cost: f64,
+}
+
+pub async fn usage_in_window(
+    pool: &Pool,
+    user_id: &str,
+    since: Timestamp,
+    model: Option<&str>,
+) -> Result<WindowUsage, DbError> {
+    let mut sql = String::from(
+        "SELECT COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens, \
+                COALESCE(SUM(cost), 0) AS cost \
+         FROM usage_events \
+         WHERE user_id = ? AND created_at >= ? AND enforce_limits = 1",
+    );
+    if model.is_some() {
+        sql.push_str(" AND model = ?");
+    }
+    let mut q = sqlx::query(&sql).bind(user_id).bind(fmt_ts(since));
+    if let Some(m) = model {
+        q = q.bind(m);
+    }
+    let row = q.fetch_one(pool).await?;
+    Ok(WindowUsage {
+        requests: row.try_get("requests")?,
+        tokens: row.try_get("tokens")?,
+        cost: row.try_get("cost")?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +720,7 @@ mod tests {
             prompt_tokens: Some(total / 2),
             completion_tokens: Some(total / 2),
             total_tokens: Some(total),
+            enforce_limits: true,
         }
     }
 
@@ -716,6 +796,60 @@ mod tests {
         let gpu01 = agg.by_backend.iter().find(|g| g.key == "gpu-01").unwrap();
         assert_eq!(gpu01.requests, 2);
         assert_eq!(gpu01.total_tokens, 150);
+    }
+
+    #[tokio::test]
+    async fn cost_is_computed_from_model_prices_at_settle() {
+        use crate::server::db::model_defaults;
+        let pool = pool().await;
+        let now: Timestamp = "2026-06-20T12:00:00Z".parse().unwrap();
+        // $3 / 1M prompt tokens, $15 / 1M completion tokens.
+        model_defaults::set_pricing(&pool, "qwen", Some(3.0), Some(15.0))
+            .await
+            .unwrap();
+        // `rec` splits `total` evenly across prompt/completion, so total=200 →
+        // 100 prompt + 100 completion → 100/1e6*3 + 100/1e6*15 = 0.0018.
+        insert_batch(
+            &pool,
+            &[rec("alice", "gpu-01", UsageSource::V1Api, 200, now)],
+        )
+        .await
+        .unwrap();
+
+        let bounds = period_bounds(Period::Today, "UTC", now);
+        let agg = aggregate(&pool, bounds, &Filter::default(), 90, now, true)
+            .await
+            .unwrap();
+        assert!((agg.summary.total_cost - 0.0018).abs() < 1e-9);
+        assert!((agg.by_model[0].cost - 0.0018).abs() < 1e-9);
+
+        // The per-row cost is stored immutably, so re-pricing doesn't move it.
+        model_defaults::set_pricing(&pool, "qwen", Some(999.0), Some(999.0))
+            .await
+            .unwrap();
+        let stored: f64 = sqlx::query_scalar("SELECT SUM(cost) FROM usage_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!((stored - 0.0018).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn unpriced_model_settles_to_zero_cost() {
+        let pool = pool().await;
+        let now: Timestamp = "2026-06-20T12:00:00Z".parse().unwrap();
+        // No price set for "qwen" → self-hosted-style 0 cost.
+        insert_batch(
+            &pool,
+            &[rec("alice", "gpu-01", UsageSource::V1Api, 500, now)],
+        )
+        .await
+        .unwrap();
+        let bounds = period_bounds(Period::Today, "UTC", now);
+        let agg = aggregate(&pool, bounds, &Filter::default(), 90, now, true)
+            .await
+            .unwrap();
+        assert_eq!(agg.summary.total_cost, 0.0);
     }
 
     #[tokio::test]

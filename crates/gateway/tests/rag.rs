@@ -86,6 +86,7 @@ fn registry_pointed_at(upstream_url: &str) -> Arc<UpstreamRegistry> {
             voices: Default::default(),
             fallback_offline: None,
             compliance: Default::default(),
+            enforce_limits: true,
             kind: PoolKind::Embedding,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),

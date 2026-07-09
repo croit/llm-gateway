@@ -27,11 +27,13 @@ use serde::Deserialize;
 
 use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_session_or_redirect};
 use session_core::chrome::{NavSections, Theme, is_datastar_request};
-use session_core::i18n::{Lang, t};
+use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use crate::rama_server::state::RamaState;
+use crate::server::db::limits::{Dimension, Window};
 use crate::server::db::usage::{self, Aggregates, Filter, GroupCount, Period};
+use crate::server::limits::LimitStatus;
 
 /// Query string for the filter bar. All optional; empty strings collapse to
 /// "no filter". `scope=all` is the admin "all users" view (ignored for
@@ -92,6 +94,24 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
         .await
         .unwrap_or_default();
 
+    // The viewer's own in-force limits + current usage, for the progress bars.
+    // Always about the caller (not the whole roster), so shown only in the
+    // self view. Empty when unlimited or enforcement is off.
+    let role_ids = state.role_ids_for(&user.roles);
+    let limit_status = state.enforcer.statuses(&user.id, &role_ids).await;
+
+    // Models that saw traffic this window but have no configured price → their
+    // spend is silently under-counted. Surface them so the gap is visible.
+    let priced = crate::server::db::model_defaults::all_prices(&state.db)
+        .await
+        .unwrap_or_default();
+    let unpriced: Vec<String> = agg
+        .by_model
+        .iter()
+        .filter(|g| g.total_tokens > 0 && !priced.contains_key(&g.key))
+        .map(|g| g.key.clone())
+        .collect();
+
     let title = if show_all {
         t(lang, "usage-title-all")
     } else {
@@ -102,10 +122,14 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
         admin,
         show_all,
         state.usage.is_enabled(),
+        &state.config.usage.currency,
+        &tz,
         period,
         &filter,
         &backends,
         &agg,
+        &limit_status,
+        &unpriced,
     );
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     nav_or_html_page(
@@ -142,11 +166,43 @@ fn render_body(
     admin: bool,
     show_all: bool,
     metrics_on: bool,
+    currency: &str,
+    tz: &str,
     period: Period,
     filter: &Filter,
     backends: &[String],
     agg: &Aggregates,
+    limit_status: &[LimitStatus],
+    unpriced: &[String],
 ) -> Html {
+    // Only surface money once there's priced spend in this window, so
+    // deployments that never set per-model prices see the page unchanged.
+    let show_cost = agg.summary.total_cost > 0.0;
+    // The caller's own limit bars (self view only — the all-users view is
+    // about the whole roster, not the admin's personal budget).
+    let bars = if show_all || limit_status.is_empty() {
+        html! {}.to_html()
+    } else {
+        render_limit_bars(lang, currency, tz, limit_status)
+    };
+    // Warn when some traffic this window hit an unpriced model — its spend is
+    // missing from the cost figures until a price is set in /admin/models.
+    let unpriced_notice = if unpriced.is_empty() {
+        html! {}.to_html()
+    } else {
+        let warn = t_args(
+            lang,
+            "usage-unpriced-warning",
+            &i18n::args([("models", unpriced.join(", ").into())]),
+        );
+        html! {
+            div(class: "alert alert-warning") {
+                (icons::alert(18))
+                span { (warn) }
+            }
+        }
+        .to_html()
+    };
     let heading = if show_all {
         t(lang, "usage-heading-all")
     } else {
@@ -184,7 +240,7 @@ fn render_body(
     } else {
         html! {}.to_html()
     };
-    let stats = render_stats(lang, show_all, &agg.summary);
+    let stats = render_stats(lang, show_all, show_cost, currency, &agg.summary);
 
     // The all-users view gets a leading per-user table; everyone gets the
     // dimension splits.
@@ -194,6 +250,8 @@ fn render_body(
             lang,
             "usage-table-by-user",
             "usage-key-user",
+            show_cost,
+            currency,
             &agg.by_user,
         ));
     }
@@ -201,18 +259,24 @@ fn render_body(
         lang,
         "usage-table-by-backend",
         "usage-key-backend",
+        show_cost,
+        currency,
         &agg.by_backend,
     ));
     tables.push(render_table(
         lang,
         "usage-table-by-source",
         "usage-key-source",
+        show_cost,
+        currency,
         &agg.by_source,
     ));
     tables.push(render_table(
         lang,
         "usage-table-by-model",
         "usage-key-model",
+        show_cost,
+        currency,
         &agg.by_model,
     ));
 
@@ -226,6 +290,8 @@ fn render_body(
                 p(class: "text-base-content/70 text-sm") { (blurb) }
             }
             (disabled_notice)
+            (unpriced_notice)
+            (bars)
             (filter_bar)
             (stats)
             div(class: "grid grid-cols-1 lg:grid-cols-2 gap-4") {
@@ -359,15 +425,24 @@ fn render_filter_bar(
     .to_html()
 }
 
-fn render_stats(lang: Lang, show_all: bool, s: &usage::Summary) -> Html {
+fn render_stats(
+    lang: Lang,
+    show_all: bool,
+    show_cost: bool,
+    currency: &str,
+    s: &usage::Summary,
+) -> Html {
     let requests = fmt_int(s.requests);
     let tokens = fmt_int(s.total_tokens);
     let errors = fmt_int(s.errors);
     let users = fmt_int(s.unique_users);
+    let cost = fmt_cost(s.total_cost, currency);
     let requests_title = t(lang, "usage-stat-requests-title");
     let requests_desc = t(lang, "usage-stat-requests-desc");
     let tokens_title = t(lang, "usage-stat-tokens-title");
     let tokens_desc = t(lang, "usage-stat-tokens-desc");
+    let cost_title = t(lang, "usage-stat-cost-title");
+    let cost_desc = t(lang, "usage-stat-cost-desc");
     let users_title = t(lang, "usage-stat-users-title");
     let users_desc = t(lang, "usage-stat-users-desc");
     let errors_title = t(lang, "usage-stat-errors-title");
@@ -383,6 +458,13 @@ fn render_stats(lang: Lang, show_all: bool, s: &usage::Summary) -> Html {
                 div(class: "stat-title") { (tokens_title) }
                 div(class: "stat-value text-2xl tabular-nums") { (tokens) }
                 div(class: "stat-desc") { (tokens_desc) }
+            }
+            if show_cost {
+                div(class: "stat") {
+                    div(class: "stat-title") { (cost_title) }
+                    div(class: "stat-value text-2xl tabular-nums") { (cost) }
+                    div(class: "stat-desc") { (cost_desc) }
+                }
             }
             if show_all {
                 div(class: "stat") {
@@ -401,14 +483,134 @@ fn render_stats(lang: Lang, show_all: bool, s: &usage::Summary) -> Html {
     .to_html()
 }
 
-fn render_table(lang: Lang, title_key: &str, key_header_key: &str, rows: &[GroupCount]) -> Html {
+/// The caller's own limit bars — Claude-style: a filled track per in-force
+/// limit, with `used / limit`, percent, and the next refresh time.
+fn render_limit_bars(lang: Lang, currency: &str, tz: &str, statuses: &[LimitStatus]) -> Html {
+    let zone = jiff::tz::TimeZone::get(tz).unwrap_or(jiff::tz::TimeZone::UTC);
+    let bars: Vec<Html> = statuses
+        .iter()
+        .map(|s| render_limit_bar(lang, currency, &zone, s))
+        .collect();
+    html! {
+        div(class: "card border border-base-300 bg-base-100") {
+            div(class: "card-body gap-3 p-4") {
+                h2(class: "card-title text-base") { (t(lang, "usage-limits-heading")) }
+                div(class: "flex flex-col gap-3") {
+                    for b in bars.iter() { (b.clone()) }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+fn render_limit_bar(
+    lang: Lang,
+    currency: &str,
+    zone: &jiff::tz::TimeZone,
+    s: &LimitStatus,
+) -> Html {
+    let width = (s.fraction() * 100.0).round() as i64;
+    let bar_class = if s.exceeded() {
+        "bg-error"
+    } else if s.fraction() >= 0.9 {
+        "bg-warning"
+    } else {
+        "bg-primary"
+    };
+    let scope = s
+        .model
+        .clone()
+        .unwrap_or_else(|| t(lang, "limits-all-models"));
+    let title = format!(
+        "{} · {} · {}",
+        dim_label(lang, s.dimension),
+        scope,
+        win_label(lang, s.window),
+    );
+    let amounts = format!(
+        "{} / {}",
+        fmt_amount(s.dimension, s.used, currency),
+        fmt_amount(s.dimension, s.limit, currency),
+    );
+    let refresh = s
+        .refreshes_at
+        .to_zoned(zone.clone())
+        .strftime("%b %-d, %H:%M")
+        .to_string();
+    let used_label = t_args(
+        lang,
+        "usage-limit-used",
+        &i18n::args([("percent", s.percent().to_string().into())]),
+    );
+    let refresh_label = t_args(
+        lang,
+        "usage-limit-refreshes",
+        &i18n::args([("time", refresh.into())]),
+    );
+    html! {
+        div(class: "flex flex-col gap-1") {
+            div(class: "flex items-baseline justify-between gap-2 text-sm") {
+                span(class: "font-medium") { (title) }
+                span(class: "opacity-70 tabular-nums") { (amounts) }
+            }
+            div(class: "h-2 w-full rounded bg-base-300 overflow-hidden") {
+                div(class: (format!("h-full {bar_class}")), style: (format!("width: {width}%"))) {}
+            }
+            div(class: "flex items-baseline justify-between gap-2 text-xs opacity-60") {
+                span { (used_label) }
+                span { (refresh_label) }
+            }
+        }
+    }
+    .to_html()
+}
+
+fn dim_label(lang: Lang, d: Dimension) -> String {
+    match d {
+        Dimension::Requests => t(lang, "limits-dim-requests"),
+        Dimension::Tokens => t(lang, "limits-dim-tokens"),
+        Dimension::Cost => t(lang, "limits-dim-cost-short"),
+    }
+}
+
+fn win_label(lang: Lang, w: Window) -> String {
+    match w {
+        Window::Hour => t(lang, "limits-win-hour"),
+        Window::Day => t(lang, "limits-win-day"),
+        Window::Week => t(lang, "limits-win-week"),
+        Window::Month => t(lang, "limits-win-month"),
+    }
+}
+
+/// Format a limit amount for its dimension: cost with currency, else a
+/// grouped integer.
+fn fmt_amount(dim: Dimension, v: f64, currency: &str) -> String {
+    match dim {
+        Dimension::Cost => fmt_cost(v, currency),
+        _ => fmt_int(v as i64),
+    }
+}
+
+fn render_table(
+    lang: Lang,
+    title_key: &str,
+    key_header_key: &str,
+    show_cost: bool,
+    currency: &str,
+    rows: &[GroupCount],
+) -> Html {
     let title = t(lang, title_key);
     let key_header = t(lang, key_header_key);
     let no_activity = t(lang, "usage-no-activity");
     let col_requests = t(lang, "usage-col-requests");
     let col_tokens = t(lang, "usage-col-tokens");
+    let col_cost = t(lang, "usage-col-cost");
     let col_errors = t(lang, "usage-col-errors");
-    let body: Vec<Html> = rows.iter().map(render_row).collect();
+    let body: Vec<Html> = rows
+        .iter()
+        .map(|r| render_row(r, show_cost, currency))
+        .collect();
     html! {
         div(class: "card border border-base-300 bg-base-100") {
             div(class: "card-body gap-2 p-4") {
@@ -423,6 +625,9 @@ fn render_table(lang: Lang, title_key: &str, key_header_key: &str, rows: &[Group
                                     th { (key_header) }
                                     th(class: "text-right") { (col_requests) }
                                     th(class: "text-right") { (col_tokens) }
+                                    if show_cost {
+                                        th(class: "text-right") { (col_cost) }
+                                    }
                                     th(class: "text-right") { (col_errors) }
                                 }
                             }
@@ -438,7 +643,7 @@ fn render_table(lang: Lang, title_key: &str, key_header_key: &str, rows: &[Group
     .to_html()
 }
 
-fn render_row(r: &GroupCount) -> Html {
+fn render_row(r: &GroupCount, show_cost: bool, currency: &str) -> Html {
     let label = if r.label.is_empty() {
         "—".to_string()
     } else {
@@ -446,6 +651,7 @@ fn render_row(r: &GroupCount) -> Html {
     };
     let requests = fmt_int(r.requests);
     let tokens = fmt_int(r.total_tokens);
+    let cost = fmt_cost(r.cost, currency);
     let errors = fmt_int(r.errors);
     let err_class = if r.errors > 0 {
         "text-right tabular-nums text-error"
@@ -457,6 +663,9 @@ fn render_row(r: &GroupCount) -> Html {
             td(class: "font-mono break-all max-w-xs") { (label) }
             td(class: "text-right tabular-nums") { (requests) }
             td(class: "text-right tabular-nums") { (tokens) }
+            if show_cost {
+                td(class: "text-right tabular-nums") { (cost) }
+            }
             td(class: (err_class)) { (errors) }
         }
     }
@@ -481,9 +690,26 @@ fn fmt_int(n: i64) -> String {
     out
 }
 
+/// Money display: integer part grouped like [`fmt_int`], two decimals, and
+/// the deployment currency label appended (e.g. `1 234.56 USD`). Cost is
+/// always ≥ 0, so no sign handling is needed.
+fn fmt_cost(cost: f64, currency: &str) -> String {
+    let cents = (cost * 100.0).round() as i64;
+    let int_part = cents / 100;
+    let frac = (cents % 100).abs();
+    format!("{}.{:02}\u{202f}{}", fmt_int(int_part), frac, currency)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::fmt_int;
+    use super::{fmt_cost, fmt_int};
+
+    #[test]
+    fn fmt_cost_two_decimals_grouped_with_currency() {
+        assert_eq!(fmt_cost(0.0, "USD"), "0.00\u{202f}USD");
+        assert_eq!(fmt_cost(1234.5, "USD"), "1\u{202f}234.50\u{202f}USD");
+        assert_eq!(fmt_cost(0.019, "EUR"), "0.02\u{202f}EUR");
+    }
 
     #[test]
     fn fmt_int_groups_thousands() {

@@ -56,6 +56,16 @@ admin-context-window-invalid = la fenêtre de contexte `{ $value }` doit être u
 admin-context-window-saved = fenêtre de contexte définie pour `{ $model }`
 admin-context-window-cleared = fenêtre de contexte effacée pour `{ $model }`
 
+# Tarifs par modèle pour la comptabilité des coûts (prix par 1 M de jetons, entrée / sortie).
+admin-price-label = Prix ({ $cur })
+admin-price-in-placeholder = ent
+admin-price-out-placeholder = sor
+admin-price-in-aria = Prix d'entrée par 1 M de jetons
+admin-price-out-aria = Prix de sortie par 1 M de jetons
+admin-price-unit = /1M
+admin-price-invalid = le prix `{ $value }` doit être un nombre non négatif
+admin-price-saved = prix définis pour `{ $model }`
+
 # Modèles par défaut par fonctionnalité (présélectionné dans les sélecteurs
 # chat/voix, et repli de l'API quand un appel n'indique pas de modèle).
 admin-defaults-heading = Modèles par défaut
@@ -68,3 +78,5 @@ admin-defaults-first-option = Premier disponible
 admin-defaults-saved = modèle par défaut défini sur `{ $model }`
 admin-defaults-cleared = modèle par défaut réinitialisé
 admin-defaults-unknown-feature = fonctionnalité inconnue `{ $feature }`
+admin-other-heading = Autres modèles (tarifs)
+admin-other-intro = Modèles d’embedding, d’image, de synthèse vocale et de transcription. Les réglages d’échantillonnage et de raisonnement ne s’appliquent pas, mais définissez des prix par 1 M de tokens pour que leur usage compte dans le coût et les limites de coût.
