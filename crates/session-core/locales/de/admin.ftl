@@ -80,3 +80,8 @@ admin-defaults-cleared = Standardmodell zurückgesetzt
 admin-defaults-unknown-feature = unbekannte Funktion `{ $feature }`
 admin-other-heading = Weitere Modelle (Preise)
 admin-other-intro = Embedding-, Bild-, Sprach- und Transkriptionsmodelle. Sampling- und Reasoning-Einstellungen gelten nicht, aber setze Preise pro 1 Mio. Tokens, damit ihre Nutzung in die Kostenabrechnung und Kostenlimits einfließt.
+
+# Alias-Karte: Modellnamen, die Aliase für ein anderes (echtes) Modell sind.
+admin-aliases-heading = Aliase
+admin-aliases-intro = Diese Namen sind Aliase für ein anderes Modell. Sie haben keine eigenen Einstellungen oder Preise — jede Anfrage wird als das aufgelöste Zielmodell konfiguriert und abgerechnet.
+admin-alias-chip = Alias

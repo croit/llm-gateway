@@ -633,6 +633,43 @@ impl UpstreamRegistry {
         self.collect_models(|p| p.kind == kind)
     }
 
+    /// Every listed model of `kind`, each paired with the real id it resolves to
+    /// when the name is an **alias** (`None` = a real model that owns its own
+    /// settings). Real ids win over an alias of the same spelling. Sorted by
+    /// name. Backs the admin pricing/defaults page, which renders aliases
+    /// read-only: an alias carries no price or defaults of its own — requests are
+    /// configured and metered as the model it resolves to.
+    pub fn models_with_alias_target(&self, kind: PoolKind) -> Vec<(String, Option<String>)> {
+        // Real advertised ids across pools of this kind own their settings even
+        // when another backend aliases the same spelling — collect them first so
+        // a real id always classifies as real regardless of iteration order.
+        let mut real: HashSet<String> = HashSet::new();
+        for pool in self.pools.values().filter(|p| p.kind == kind) {
+            for backend in &pool.backends {
+                real.extend(backend.models_snapshot());
+            }
+        }
+        let mut out: HashMap<String, Option<String>> = HashMap::new();
+        for name in &real {
+            out.insert(name.clone(), None);
+        }
+        for pool in self.pools.values().filter(|p| p.kind == kind) {
+            for backend in &pool.backends {
+                for name in backend.listed_models() {
+                    if out.contains_key(&name) {
+                        continue; // already a real id, or an alias we've mapped
+                    }
+                    if let Some(target) = backend.resolve(&name) {
+                        out.insert(name, Some(target));
+                    }
+                }
+            }
+        }
+        let mut rows: Vec<(String, Option<String>)> = out.into_iter().collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
     /// True when at least one `speech` pool is configured — the switch that
     /// makes voice mode (and `POST /api/v0/speech`) available in the UI.
     pub fn has_speech(&self) -> bool {
@@ -1171,6 +1208,31 @@ mod tests {
             vec!["whisper-1"]
         );
         assert!(reg.models_for_kind(PoolKind::Embedding).is_empty());
+    }
+
+    #[test]
+    fn models_with_alias_target_marks_aliases_and_real_ids() {
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![backend_alias("a", targets(&[("smart", "glm-4.6")]))],
+            ),
+        )]);
+        seed_models(&reg, "chat", 0, &["glm-4.6", "glm-4.5-air"]);
+
+        let map: std::collections::HashMap<String, Option<String>> = reg
+            .models_with_alias_target(PoolKind::Chat)
+            .into_iter()
+            .collect();
+        // Real ids own their settings — no alias target.
+        assert_eq!(map["glm-4.6"], None);
+        assert_eq!(map["glm-4.5-air"], None);
+        // The alias resolves to its real target and carries no row of its own.
+        assert_eq!(map["smart"], Some("glm-4.6".to_string()));
+        // Exactly the two reals plus the one alias, nothing else.
+        assert_eq!(map.len(), 3);
     }
 
     #[test]

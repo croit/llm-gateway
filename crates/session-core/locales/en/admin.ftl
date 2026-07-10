@@ -68,6 +68,11 @@ admin-price-saved = set prices for `{ $model }`
 admin-other-heading = Other models (pricing)
 admin-other-intro = Embedding, image, speech, and transcription models. Sampling and reasoning settings don't apply, but set per-1M-token prices so their usage counts toward cost accounting and cost limits.
 
+# Aliases card: model names that are aliases for another (real) model.
+admin-aliases-heading = Aliases
+admin-aliases-intro = These names are aliases for another model. They carry no settings or price of their own — each request is configured and metered as the model it resolves to.
+admin-alias-chip = alias
+
 # Per-feature default models (the model pre-selected in the chat/voice
 # pickers, and the API fallback when a call omits a model).
 admin-defaults-heading = Default models

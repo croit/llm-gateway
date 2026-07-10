@@ -79,3 +79,8 @@ admin-defaults-cleared = 默认模型已清除
 admin-defaults-unknown-feature = 未知功能 `{ $feature }`
 admin-other-heading = 其他模型（定价）
 admin-other-intro = 嵌入、图像、语音和转录模型。采样与推理设置不适用，但可设置每 100 万 tokens 的价格，使其用量计入成本核算与成本限额。
+
+# 别名卡片：作为其他（真实）模型别名的模型名称。
+admin-aliases-heading = 别名
+admin-aliases-intro = 这些名称是其他模型的别名。它们没有自己的设置或价格——每个请求都会按其解析到的模型进行配置和计费。
+admin-alias-chip = 别名

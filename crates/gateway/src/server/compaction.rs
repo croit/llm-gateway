@@ -59,8 +59,8 @@ summary\" — output only the summary itself.\n\
 /// every failure path logs and returns without touching the conversation.
 ///
 /// Called (spawned) by the driver after an assistant turn finalises. `model`
-/// is the conversation's selected model — used both to resolve the context
-/// window and to route the summariser call.
+/// is the **resolved real model** (the driver maps any alias first) — used both
+/// to resolve the context window and to route the summariser call.
 pub async fn maybe_autocompact(state: &RamaState, session_id: &str, model: &str) {
     let cfg = &state.config.chat.compaction;
     if !cfg.enabled {
@@ -107,8 +107,9 @@ pub async fn maybe_autocompact(state: &RamaState, session_id: &str, model: &str)
 
 /// Resolve the model's context window from `model_defaults`. `None` when the
 /// model has no row or no `context_window` set — the caller falls back to the
-/// global default. Keyed on the conversation's model name (possibly an alias),
-/// matching how reasoning config is looked up in `run_one_turn`.
+/// global default. Keyed on the resolved real model id (the caller maps any
+/// alias first), matching how reasoning config and cost accounting key on it —
+/// an alias carries no settings of its own.
 async fn model_context_window(state: &RamaState, model: &str) -> Option<i64> {
     model_defaults::get(&state.db, model)
         .await

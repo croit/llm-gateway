@@ -48,10 +48,22 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         Err(resp) => return resp,
     };
 
-    let mut models = state.upstreams.models_for_kind(PoolKind::Chat);
-    models.sort();
-    let mut rows: Vec<ModelRow> = Vec::with_capacity(models.len());
-    for name in &models {
+    // Aliases carry no settings or price of their own — requests are configured
+    // and metered as the model they resolve to (see `openai_driver`/cost
+    // accounting). So split them out: real models get the full editor, aliases
+    // get a read-only "→ target" row.
+    let chat_models = state.upstreams.models_with_alias_target(PoolKind::Chat);
+    let mut rows: Vec<ModelRow> = Vec::new();
+    let mut aliases: Vec<AliasRow> = Vec::new();
+    for (name, alias_target) in &chat_models {
+        if let Some(target) = alias_target {
+            aliases.push(AliasRow {
+                name: name.clone(),
+                target: target.clone(),
+                kind_label: "chat",
+            });
+            continue;
+        }
         let row = match db::get(&state.db, name).await {
             Ok(r) => r,
             Err(err) => {
@@ -92,8 +104,10 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
 
     // Non-chat models (embedding / image / speech / transcription) get a
     // pricing-only row — sampling/reasoning/context don't apply, but cost
-    // accounting does. Dedup by id; a model already shown as chat is skipped.
-    let chat_names: std::collections::HashSet<&str> = models.iter().map(String::as_str).collect();
+    // accounting does. Their aliases join the read-only alias list. Dedup by id;
+    // a model already shown as chat is skipped.
+    let chat_names: std::collections::HashSet<&str> =
+        chat_models.iter().map(|(n, _)| n.as_str()).collect();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut other: Vec<OtherModelRow> = Vec::new();
     for (kind, kind_label) in [
@@ -102,10 +116,16 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         (PoolKind::Speech, "speech"),
         (PoolKind::Transcription, "transcription"),
     ] {
-        let mut ms = state.upstreams.models_for_kind(kind);
-        ms.sort();
-        for name in ms {
+        for (name, alias_target) in state.upstreams.models_with_alias_target(kind) {
             if chat_names.contains(name.as_str()) || !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(target) = alias_target {
+                aliases.push(AliasRow {
+                    name,
+                    target,
+                    kind_label,
+                });
                 continue;
             }
             let row = db::get(&state.db, &name).await.ok().flatten();
@@ -120,7 +140,7 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
 
     let defaults = defaults_rows(&state).await;
     let currency = &state.config.usage.currency;
-    let body = render_models_body(lang, currency, &defaults, &rows, &other);
+    let body = render_models_body(lang, currency, &defaults, &rows, &aliases, &other);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "admin-page-title");
     nav_or_html_page(
@@ -709,6 +729,17 @@ struct OtherModelRow {
     output_price: Option<f64>,
 }
 
+/// A model name that is an alias for another (real) model. Rendered read-only:
+/// aliases carry no settings or price of their own — each request is configured
+/// and metered as the model it resolves to (`target`).
+struct AliasRow {
+    name: String,
+    /// The real model id this alias resolves to.
+    target: String,
+    /// The pool kind that serves it (`chat` / `embedding` / …), for the badge.
+    kind_label: &'static str,
+}
+
 /// One row of the "Default models" card: the feature, its label, the models
 /// its pool advertises (sorted), and the currently-stored override (raw — not
 /// yet resolved against `available`).
@@ -821,6 +852,7 @@ fn render_models_body(
     currency: &str,
     defaults: &[FeatureDefaultRow],
     rows: &[ModelRow],
+    aliases: &[AliasRow],
     other: &[OtherModelRow],
 ) -> Html {
     let cards: Vec<Html> = rows
@@ -857,7 +889,50 @@ fn render_models_body(
                     }
                 }
             }
+            (render_alias_card(lang, aliases))
             (render_other_models_card(lang, currency, other))
+        }
+    }
+    .to_html()
+}
+
+/// Read-only card listing alias model names and the real model each resolves to.
+/// Aliases carry no settings or price of their own — they inherit the target's,
+/// and cost accounting meters the resolved id — so they get no editors here,
+/// just an `(alias)` chip and the "→ target" mapping. Renders nothing when there
+/// are no aliases.
+fn render_alias_card(lang: Lang, aliases: &[AliasRow]) -> Html {
+    if aliases.is_empty() {
+        return html! {}.to_html();
+    }
+    let rows: Vec<Html> = aliases
+        .iter()
+        .map(|a| {
+            html! {
+                div(class: "flex items-center gap-2 flex-wrap py-1") {
+                    span(class: "badge badge-ghost badge-sm") { (a.kind_label) }
+                    span(class: "font-mono text-sm break-all") { (a.name.clone()) }
+                    span(class: "badge badge-info badge-sm") { (t(lang, "admin-alias-chip")) }
+                    span(class: "text-base-content/40") { "→" }
+                    span(class: "font-mono text-sm break-all text-base-content/70") {
+                        (a.target.clone())
+                    }
+                }
+            }
+            .to_html()
+        })
+        .collect();
+    html! {
+        article(class: "card border border-base-300 bg-base-100") {
+            div(class: "card-body gap-3") {
+                header(class: "flex flex-col gap-1") {
+                    h2(class: "card-title text-base") { (t(lang, "admin-aliases-heading")) }
+                    p(class: "text-base-content/70 text-sm") { (t(lang, "admin-aliases-intro")) }
+                }
+                div(class: "flex flex-col divide-y divide-base-200") {
+                    for r in rows.iter() { (r.clone()) }
+                }
+            }
         }
     }
     .to_html()

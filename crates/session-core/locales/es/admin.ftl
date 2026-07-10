@@ -80,3 +80,8 @@ admin-defaults-cleared = modelo predeterminado restablecido
 admin-defaults-unknown-feature = función desconocida `{ $feature }`
 admin-other-heading = Otros modelos (precios)
 admin-other-intro = Modelos de embedding, imagen, voz y transcripción. Los ajustes de muestreo y razonamiento no se aplican, pero fija precios por 1 M de tokens para que su uso cuente en el coste y los límites de coste.
+
+# Tarjeta de alias: nombres de modelo que son alias de otro modelo (real).
+admin-aliases-heading = Alias
+admin-aliases-intro = Estos nombres son alias de otro modelo. No tienen ajustes ni precio propios: cada solicitud se configura y contabiliza como el modelo al que se resuelve.
+admin-alias-chip = alias

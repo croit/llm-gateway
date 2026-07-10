@@ -179,7 +179,14 @@ impl SessionDriver for OpenAiDriver {
         if result.is_ok() && !ctx.cancel.load(Ordering::SeqCst) {
             let state = self.state.clone();
             let session_id = ctx.session_id.clone();
-            let model = ctx.model.clone();
+            // Resolve any alias to the real id so the context window (and thus the
+            // auto-compaction trigger) keys on the model that actually ran — an
+            // alias carries no settings of its own.
+            let model = self
+                .state
+                .upstreams
+                .resolve_model(&ctx.model, crate::server::upstreams::PoolKind::Chat)
+                .unwrap_or_else(|| ctx.model.clone());
             tokio::spawn(async move {
                 crate::server::compaction::maybe_autocompact(&state, &session_id, &model).await;
             });
@@ -224,6 +231,19 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         &user_mcp,
     );
 
+    // The conversation's model may be an alias (the picker lists them). Resolve
+    // it to the real upstream id ONCE per turn and key every per-model lookup
+    // below on it — reasoning style/budgets, sampling defaults, and the outgoing
+    // `model` field. An alias therefore carries no settings of its own: it
+    // inherits the target's, exactly like cost accounting, which meters the
+    // resolved id. Falls through to the requested name when it isn't an alias
+    // (or isn't currently served — `route` below then maps the error).
+    let real_model = d
+        .state
+        .upstreams
+        .resolve_model(&ctx.model, crate::server::upstreams::PoolKind::Chat)
+        .unwrap_or_else(|| ctx.model.clone());
+
     // The conversation's effort level ("Denkaufwand") and the selected model's
     // reasoning style drive both the upstream reasoning parameter and the
     // tool-round cap. Loaded once per turn (sticky per conversation).
@@ -235,12 +255,12 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             .as_deref(),
     );
     let (reasoning_style, reasoning_overrides) = {
-        let row = crate::server::db::model_defaults::get(&d.state.db, &ctx.model)
+        let row = crate::server::db::model_defaults::get(&d.state.db, &real_model)
             .await
             .ok()
             .flatten();
         let explicit = row.as_ref().and_then(|r| r.reasoning_style.as_deref());
-        let style = crate::server::reasoning::ReasoningStyle::resolve(explicit, &ctx.model);
+        let style = crate::server::reasoning::ReasoningStyle::resolve(explicit, &real_model);
         let overrides = row
             .as_ref()
             .map(reasoning_overrides_from_row)
@@ -368,18 +388,10 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                 serde_json::json!({"include_usage": true}),
             );
         }
-        // The chat model may be an alias (the picker lists them). Resolve it to
-        // the real id up front so admin defaults + reasoning key on the real
-        // model, and the upstream receives an id it knows. Falls through to the
-        // requested name when it isn't an alias (or isn't currently served —
-        // `route` below then maps the error).
-        let real_model = d
-            .state
-            .upstreams
-            .resolve_model(&ctx.model, crate::server::upstreams::PoolKind::Chat)
-            .unwrap_or_else(|| ctx.model.clone());
+        // Send the resolved real id upstream (resolved once per turn, above); the
+        // picker may have handed us an alias, which the backend won't recognise.
         if let Some(obj) = request_body.as_object_mut() {
-            obj.insert("model".into(), serde_json::json!(real_model));
+            obj.insert("model".into(), serde_json::json!(real_model.clone()));
         }
         // Re-resolve the per-conversation tool overlay each round so a
         // mid-turn `enable_tools` call surfaces the newly-enabled schemas
