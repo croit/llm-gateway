@@ -1480,12 +1480,31 @@
             color: var(--color-base-content);
         }
     }
+    /* Always-visible, muted per-message timestamp. The `<time>` ships a
+     * UTC `HH:MM` fallback; scroll.ts localizes the text to the viewer's
+     * zone and sets a full date+time title on mount. Right-aligned under
+     * the user pill (flex column), block+left under the assistant reply. */
+    .chat-msg__time {
+        font-size: 0.6875rem;
+        line-height: 1;
+        color: color-mix(in oklch, var(--color-base-content) 45%, transparent);
+        user-select: none;
+        cursor: default;
+    }
+    #conversation > .chat-msg--user .chat-msg__time {
+        align-self: flex-end;
+    }
+    #conversation > .chat-msg--assistant .chat-msg__time {
+        display: block;
+        margin-top: 0.375rem;
+    }
     /* Inline edit form, revealed by toggling `.editing` on the bubble. */
     .chat-msg__edit {
         display: none;
     }
     .chat-msg--user.editing .chat-msg__body,
-    .chat-msg--user.editing .chat-msg__actions {
+    .chat-msg--user.editing .chat-msg__actions,
+    .chat-msg--user.editing .chat-msg__time {
         display: none;
     }
     .chat-msg--user.editing {

@@ -53,6 +53,42 @@ let armed = false;
 const prefersReducedMotion = (): boolean =>
     window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+// Per-message timestamps. The server renders each `<time class=
+// "chat-msg__time" datetime="<rfc3339-utc>">` with a UTC `HH:MM`
+// fallback so the time is meaningful even without JS. Here we localize
+// the visible text to the viewer's own locale/timezone and hang the
+// full date+time off the `title` for the hover tooltip.
+//
+// This runs on mount AND from the conversation MutationObserver:
+// streaming re-emits the whole turn (mode `outer` on `#turn-<id>`),
+// which morphs our localized text back to the server's UTC fallback and
+// strips the `data-localized` marker. The observer fires on that morph
+// and we re-localize — as a microtask before paint, so no flash. The
+// `:not([data-localized])` guard keeps the common (already-localized)
+// case a no-op, so calling this on every mutation is cheap.
+const timeFmt = new Intl.DateTimeFormat(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+});
+const titleFmt = new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'full',
+    timeStyle: 'medium',
+});
+const localizeTimes = (root: ParentNode): void => {
+    const times = root.querySelectorAll<HTMLTimeElement>(
+        'time.chat-msg__time:not([data-localized])',
+    );
+    for (const el of times) {
+        const iso = el.getAttribute('datetime');
+        if (!iso) continue;
+        const when = new Date(iso);
+        if (Number.isNaN(when.getTime())) continue;
+        el.textContent = timeFmt.format(when);
+        el.title = titleFmt.format(when);
+        el.setAttribute('data-localized', '');
+    }
+};
+
 const SCROLL_MS = 350;
 const easeOutCubic = (x: number): number => 1 - Math.pow(1 - x, 3);
 
@@ -195,6 +231,10 @@ const init = (conversation: HTMLElement): void => {
     }
 
     const observer = new MutationObserver(() => {
+        // Re-localize any timestamps the latest morph reverted to their
+        // server UTC fallback (idempotent — skips already-localized ones).
+        localizeTimes(conversation);
+
         // First mutation after submit = server's SSE response
         // arrived; tell the composer it can drain `pendingClear`.
         window.chatComposer.notifyConversationMutated();
@@ -270,6 +310,11 @@ const init = (conversation: HTMLElement): void => {
     if (conversation.firstElementChild) {
         conversation.scrollTop = conversation.scrollHeight;
     }
+
+    // Localize the timestamps already present on this fresh mount (page
+    // load / nav-land / in-flight attach). Later turns are handled by
+    // the observer above.
+    localizeTimes(conversation);
 };
 
 // Arm the scroll-to-top for the message about to be appended. Called

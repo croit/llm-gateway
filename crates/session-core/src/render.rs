@@ -252,6 +252,23 @@ pub fn render_turn(turn: &TurnWithTools, actions: Option<&str>, lang: Lang) -> H
     }
 }
 
+/// A muted, always-visible per-message timestamp. Server-renders a UTC
+/// `HH:MM` fallback inside `<time datetime=…>`; the client (`scroll.ts`)
+/// localizes the visible text to the viewer's own locale/timezone and
+/// sets a full date+time `title` on mount. Because streaming re-emits
+/// the whole turn (mode `outer` on `#turn-<id>`), the server fallback
+/// is written on every tick — `scroll.ts` re-applies the localized
+/// text idempotently from the conversation `MutationObserver`, before
+/// paint, so there's no flash.
+fn render_msg_time(ts: jiff::Timestamp) -> Html {
+    let iso = ts.to_string();
+    let fallback = ts.strftime("%H:%M").to_string();
+    html! {
+        time(class: "chat-msg__time", datetime: (iso)) { (fallback) }
+    }
+    .to_html()
+}
+
 pub fn render_user_turn(turn: &Turn, actions: Option<&str>, lang: Lang) -> Html {
     let content = turn.user_content.clone().unwrap_or_default();
     let dom_id = format!("turn-{}", turn.id);
@@ -291,6 +308,7 @@ pub fn render_user_turn(turn: &Turn, actions: Option<&str>, lang: Lang) -> Html 
     html! {
         div(id: (dom_id), class: "chat-msg--user") {
             (body)
+            (render_msg_time(turn.created_at))
             if show_actions {
                 (edit_block)
             }
@@ -591,6 +609,7 @@ pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: La
                     span { (error_msg) }
                 }
             }
+            (render_msg_time(turn.created_at))
             // Retry — only on a settled turn (never mid-stream). Drops
             // this reply + everything below and regenerates from the
             // preceding user message with the currently-selected model.
@@ -1552,6 +1571,39 @@ mod tests {
         ];
         let html = render_conversation(&turns, None, Some("/chat"), Some(1), Lang::En).to_string();
         assert!(!html.contains("Earlier messages condensed"));
+    }
+
+    #[test]
+    fn every_turn_carries_a_localizable_timestamp() {
+        // Each message renders a `<time class="chat-msg__time">` whose
+        // `datetime` is the RFC3339 UTC instant (so scroll.ts can
+        // localize it to the viewer's zone) with a UTC `HH:MM` fallback
+        // as the visible text for the no-JS / pre-mount case.
+        let fixed = "2026-07-10T14:32:07Z".parse::<jiff::Timestamp>().unwrap();
+        let mut user = conv_turn(0, TurnRole::User, "q1");
+        let mut assistant = conv_turn(1, TurnRole::Assistant, "a1");
+        user.turn.created_at = fixed;
+        assistant.turn.created_at = fixed;
+
+        let html = render_conversation(&[user, assistant], None, Some("/chat"), None, Lang::En)
+            .to_string();
+
+        // One timestamp per message.
+        assert_eq!(
+            html.matches(r#"class="chat-msg__time""#).count(),
+            2,
+            "both the user and assistant bubbles must carry a timestamp: {html}"
+        );
+        // The machine-readable instant scroll.ts localizes from.
+        assert!(
+            html.contains(r#"datetime="2026-07-10T14:32:07Z""#),
+            "the <time> must expose the RFC3339 UTC instant: {html}"
+        );
+        // The UTC fallback shown before (and without) JS localization.
+        assert!(
+            html.contains(">14:32<"),
+            "the <time> must render a UTC HH:MM fallback: {html}"
+        );
     }
 
     fn tool_call(id: &str, name: &str, status: ToolCallStatus) -> ToolCall {
