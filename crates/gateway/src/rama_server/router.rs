@@ -30,6 +30,7 @@ use rama::net::address::SocketAddress;
 use serde_json::json;
 
 use crate::rama_server::RamaState;
+use crate::rama_server::cors::V1CorsLayer;
 use crate::rama_server::{api, oidc_handlers, pages, proxy, rag_api, sandbox_api};
 use session_core::assets;
 
@@ -261,6 +262,12 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
 /// `ErrorHandlerLayer` renders any `RouterError` (e.g. an unmatched path)
 /// into a `Response`. Both `serve` and the tests build the service through
 /// here so they exercise the same stack (notably the 404 handling).
+///
+/// `V1CorsLayer` sits *outside* the error handler so it decorates every
+/// `/v1` response — including the 404/405 a `RouterError` renders (a
+/// browser preflight `OPTIONS /v1/…` hits no registered route) and the
+/// bearer-auth 401 — with the CORS headers browser SPAs require. It is
+/// scoped to `/v1`, so the same-origin HTML UI and `/api/v0` are untouched.
 pub fn service(
     state: Arc<RamaState>,
 ) -> impl rama::Service<
@@ -269,7 +276,7 @@ pub fn service(
     Error = std::convert::Infallible,
 > + Clone {
     let router = router(state);
-    (ArcLayer::new(), ErrorHandlerLayer::default()).into_layer(router)
+    (V1CorsLayer, ArcLayer::new(), ErrorHandlerLayer::default()).into_layer(router)
 }
 
 /// Convenience: build the service and start serving on `addr`.
