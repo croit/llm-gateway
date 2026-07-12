@@ -84,3 +84,19 @@ admin-other-intro = 嵌入、图像、语音和转录模型。采样与推理设
 admin-aliases-heading = 别名
 admin-aliases-intro = 这些名称是其他模型的别名。它们没有自己的设置或价格——每个请求都会按其解析到的模型进行配置和计费。
 admin-alias-chip = 别名
+
+# Model capabilities (vision, tools, structured output) + fallback model refs.
+admin-capabilities-heading = Capabilities
+admin-cap-unknown = Unknown
+admin-cap-enabled = Enabled
+admin-cap-disabled = Disabled
+admin-cap-structured-output = Structured output
+admin-cap-no-fallback = (none)
+admin-cap-fallback-vision = Fallback for vision
+admin-cap-fallback-tools = Fallback for tools
+admin-capabilities-saved = saved capabilities for `{ $model }`
+admin-capabilities-error = failed to save capabilities: { $err }
+
+# Upstream topology reload ("Apply changes" button).
+admin-reloaded = reloaded { $pools } pools, { $backends } backends
+admin-reload-error = reload failed: { $err }

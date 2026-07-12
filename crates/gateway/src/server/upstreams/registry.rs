@@ -22,9 +22,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+use arc_swap::ArcSwap;
 use thiserror::Error;
 
 use super::config::{
@@ -243,6 +244,13 @@ impl Backend {
     /// request hot path (which uses `serves_model`).
     pub fn models_snapshot(&self) -> HashSet<String> {
         self.with_effective_models(|set| set.clone())
+    }
+
+    /// The *live* probe set only (never the config fallback), empty until the
+    /// first successful probe. Used by [`UpstreamRegistry::reload`] to carry a
+    /// backend's discovered models across a topology swap so routing doesn't gap.
+    pub fn live_models(&self) -> HashSet<String> {
+        self.models.read().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Names a listing surface should advertise: the effective real set plus
@@ -534,7 +542,21 @@ impl Drop for Acquired {
 
 /// Top-level pool registry. Routes are computed on demand from each
 /// backend's advertised-model set; no compiled route table.
+///
+/// The pool/fallback data lives behind an [`ArcSwap`] so the admin UI can
+/// hot-swap the entire topology via [`Self::reload`] without restarting.
+/// Every method call is a single lock-free atomic load.
 pub struct UpstreamRegistry {
+    inner: ArcSwap<RegistryData>,
+    /// Bumped on every [`Self::reload`]. Each health-probe loop is tagged with
+    /// the generation it was spawned for and retires itself once this moves past
+    /// it, so a reload doesn't leak the previous generation's infinite probe
+    /// loops (which hold detached `Backend` Arcs and would keep hammering the old
+    /// URLs forever). See `health::spawn` / `health::run_probe`.
+    generation: AtomicU64,
+}
+
+struct RegistryData {
     pools: HashMap<String, Arc<Pool>>,
     /// Unknown-model fallback per kind (`[fallback]`). Applied by `route` when
     /// a requested name is neither a real id nor an alias.
@@ -544,7 +566,7 @@ pub struct UpstreamRegistry {
 impl std::fmt::Debug for UpstreamRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpstreamRegistry")
-            .field("pools", &self.pools.keys().collect::<Vec<_>>())
+            .field("pools", &self.data().pools.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -573,6 +595,23 @@ pub enum BuildError {
     },
 }
 
+/// Construct the internal data from config structs. Shared by the
+/// constructors and [`UpstreamRegistry::reload`].
+fn build_data(
+    pool_configs: &HashMap<String, UpstreamPoolConfig>,
+    fallback: FallbackConfig,
+) -> Result<RegistryData, BuildError> {
+    validate_aliases(pool_configs)?;
+    let mut pools: HashMap<String, Arc<Pool>> = HashMap::new();
+    for (name, cfg) in pool_configs {
+        if pools.contains_key(name) {
+            return Err(BuildError::DuplicatePool(name.clone()));
+        }
+        pools.insert(name.clone(), Arc::new(Pool::new(name.clone(), cfg)));
+    }
+    Ok(RegistryData { pools, fallback })
+}
+
 impl UpstreamRegistry {
     /// Build with no unknown-model fallback. Used by tests and any caller that
     /// doesn't route `[fallback]` (RAG embeddings, etc.).
@@ -591,23 +630,91 @@ impl UpstreamRegistry {
         Self::build(pool_configs, fallback)
     }
 
+    /// Build from a DB topology snapshot (loaded by
+    /// [`crate::server::db::upstreams_config::load_snapshot`]). Converts the
+    /// snapshot into the same config structs that TOML parsing produces, then
+    /// delegates to [`build`]. Used on startup and on every "Apply changes"
+    /// reload from the admin UI.
+    pub fn from_snapshot(
+        snap: &crate::server::db::upstreams_config::UpstreamConfigSnapshot,
+        crypto: &crate::server::crypto::Crypto,
+    ) -> Result<Arc<Self>, BuildError> {
+        let (pool_configs, fallback) =
+            crate::server::upstreams::db_bridge::snapshot_to_configs(snap, crypto);
+        Self::build(&pool_configs, fallback)
+    }
+
     fn build(
         pool_configs: &HashMap<String, UpstreamPoolConfig>,
         fallback: FallbackConfig,
     ) -> Result<Arc<Self>, BuildError> {
-        validate_aliases(pool_configs)?;
-        let mut pools: HashMap<String, Arc<Pool>> = HashMap::new();
-        for (name, cfg) in pool_configs {
-            if pools.contains_key(name) {
-                return Err(BuildError::DuplicatePool(name.clone()));
-            }
-            pools.insert(name.clone(), Arc::new(Pool::new(name.clone(), cfg)));
-        }
-        Ok(Arc::new(Self { pools, fallback }))
+        let data = build_data(pool_configs, fallback)?;
+        Ok(Arc::new(Self {
+            inner: ArcSwap::new(Arc::new(data)),
+            generation: AtomicU64::new(0),
+        }))
     }
 
-    pub fn pools(&self) -> impl Iterator<Item = &Arc<Pool>> {
-        self.pools.values()
+    /// The current topology generation — bumped on every [`Self::reload`]. A
+    /// health-probe loop reads this to know when it has been superseded.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Hot-swap the entire topology from a DB snapshot. Validates aliases
+    /// before swapping; on success the old pools are replaced atomically and the
+    /// generation is bumped so stale probe loops retire. Fresh probes must be
+    /// re-spawned after reload (see `health::spawn`).
+    ///
+    /// To avoid a routing gap during the swap, the *live* probed model set of
+    /// each unchanged backend (same name + base_url) is carried over onto its
+    /// freshly-built replacement. Without this, the new backends start with an
+    /// empty live set and every request 404s until the first re-probe completes.
+    pub fn reload(
+        &self,
+        snap: &crate::server::db::upstreams_config::UpstreamConfigSnapshot,
+        crypto: &crate::server::crypto::Crypto,
+    ) -> Result<(), BuildError> {
+        let (pool_configs, fallback) =
+            crate::server::upstreams::db_bridge::snapshot_to_configs(snap, crypto);
+        let data = build_data(&pool_configs, fallback)?;
+
+        // Snapshot the outgoing live model sets, keyed by identity (name +
+        // base_url). Only carry over when both match — an edited base_url points
+        // at a possibly-different upstream, so its set must be re-probed.
+        // `old` (an `Arc<RegistryData>`) is held for this whole block, so the
+        // map can borrow the outgoing backends' names/urls as keys — no clones
+        // on either insert or lookup.
+        let old = self.data();
+        let mut prior: HashMap<(&str, &str), HashSet<String>> = HashMap::new();
+        for pool in old.pools.values() {
+            for b in &pool.backends {
+                let live = b.live_models();
+                if !live.is_empty() {
+                    prior.insert((b.name.as_str(), b.base_url.as_str()), live);
+                }
+            }
+        }
+        for pool in data.pools.values() {
+            for b in &pool.backends {
+                if let Some(live) = prior.get(&(b.name.as_str(), b.base_url.as_str())) {
+                    b.set_models(live.clone());
+                }
+            }
+        }
+
+        self.inner.store(Arc::new(data));
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Load the current data snapshot. Lock-free read + one atomic Arc clone.
+    fn data(&self) -> Arc<RegistryData> {
+        self.inner.load_full()
+    }
+
+    pub fn pools(&self) -> Vec<Arc<Pool>> {
+        self.data().pools.values().cloned().collect()
     }
 
     /// Sorted, de-duplicated union of the effective model sets of every
@@ -615,8 +722,9 @@ impl UpstreamRegistry {
     /// (so `/v1/models` and the pickers advertise alias names too). Shared by
     /// `models_for_kind` and `all_models`.
     fn collect_models(&self, pred: impl Fn(&Pool) -> bool) -> Vec<String> {
+        let d = self.data();
         let mut all: HashSet<String> = HashSet::new();
-        for pool in self.pools.values().filter(|p| pred(p)) {
+        for pool in d.pools.values().filter(|p| pred(p)) {
             for backend in &pool.backends {
                 all.extend(backend.listed_models());
             }
@@ -640,11 +748,9 @@ impl UpstreamRegistry {
     /// read-only: an alias carries no price or defaults of its own — requests are
     /// configured and metered as the model it resolves to.
     pub fn models_with_alias_target(&self, kind: PoolKind) -> Vec<(String, Option<String>)> {
-        // Real advertised ids across pools of this kind own their settings even
-        // when another backend aliases the same spelling — collect them first so
-        // a real id always classifies as real regardless of iteration order.
+        let d = self.data();
         let mut real: HashSet<String> = HashSet::new();
-        for pool in self.pools.values().filter(|p| p.kind == kind) {
+        for pool in d.pools.values().filter(|p| p.kind == kind) {
             for backend in &pool.backends {
                 real.extend(backend.models_snapshot());
             }
@@ -653,7 +759,7 @@ impl UpstreamRegistry {
         for name in &real {
             out.insert(name.clone(), None);
         }
-        for pool in self.pools.values().filter(|p| p.kind == kind) {
+        for pool in d.pools.values().filter(|p| p.kind == kind) {
             for backend in &pool.backends {
                 for name in backend.listed_models() {
                     if out.contains_key(&name) {
@@ -673,7 +779,10 @@ impl UpstreamRegistry {
     /// True when at least one `speech` pool is configured — the switch that
     /// makes voice mode (and `POST /api/v0/speech`) available in the UI.
     pub fn has_speech(&self) -> bool {
-        self.pools.values().any(|p| p.kind == PoolKind::Speech)
+        self.data()
+            .pools
+            .values()
+            .any(|p| p.kind == PoolKind::Speech)
     }
 
     /// Resolve the voice-mode TTS target for a spoken `language` (lowercase
@@ -684,7 +793,8 @@ impl UpstreamRegistry {
     /// `POST /api/v0/speech`; the raw `/v1/audio/speech` proxy takes an explicit
     /// model/voice from the caller instead.
     pub fn speech_target(&self, language: &str) -> Option<(String, Option<String>)> {
-        let pool = self.pools.values().find(|p| p.kind == PoolKind::Speech)?;
+        let d = self.data();
+        let pool = d.pools.values().find(|p| p.kind == PoolKind::Speech)?;
         // Prefer the operator's declared model (`models = ["tts-1"]`): a cloud
         // provider's `/models` probe lists its whole catalogue, so the probe
         // union can't identify *the* TTS model. Fall back to the probe union
@@ -717,8 +827,9 @@ impl UpstreamRegistry {
     /// upstream but not another is treated as not-safe. Backs the chat-UI
     /// model dropdown labels and the per-conversation warning banner.
     pub fn models_with_compliance_for_kind(&self, kind: PoolKind) -> Vec<(String, Compliance)> {
+        let d = self.data();
         let mut merged: HashMap<String, Compliance> = HashMap::new();
-        for pool in self.pools.values().filter(|p| p.kind == kind) {
+        for pool in d.pools.values().filter(|p| p.kind == kind) {
             for backend in &pool.backends {
                 // Alias names inherit the pool's compliance flags, same as the
                 // real ids — clients pick either, so both must carry the warning.
@@ -739,7 +850,8 @@ impl UpstreamRegistry {
     /// regardless of backend health. Used to decide 404 (`model_not_found`)
     /// vs 503 before routing — see `acquire_for`.
     pub fn knows_model(&self, model: &str, kind: PoolKind) -> bool {
-        self.pools
+        self.data()
+            .pools
             .values()
             .any(|p| p.kind == kind && p.knows_model(model))
     }
@@ -747,7 +859,7 @@ impl UpstreamRegistry {
     /// True if any pool of *any* kind knows `model`. Backs `GET
     /// /v1/models/{id}`, which (like the list) is capability-agnostic.
     pub fn knows_any(&self, model: &str) -> bool {
-        self.pools.values().any(|p| p.knows_model(model))
+        self.data().pools.values().any(|p| p.knows_model(model))
     }
 
     /// Whether calls to `model` (of `kind`) count toward rate limits / quotas.
@@ -758,9 +870,10 @@ impl UpstreamRegistry {
     /// a purely self-hosted model. An unknown model defaults to enforced (fail
     /// toward counting). See `server::limits`.
     pub fn enforce_limits_for_model(&self, model: &str, kind: PoolKind) -> bool {
+        let d = self.data();
         let mut known = false;
         let mut any_enforced = false;
-        for pool in self
+        for pool in d
             .pools
             .values()
             .filter(|p| p.kind == kind && p.knows_model(model))
@@ -784,8 +897,9 @@ impl UpstreamRegistry {
     ///   - the model *is* known but no healthy backend can serve it right
     ///     now → [`AcquireError::NoHealthyBackend`] / `Saturated` (`503`).
     pub fn acquire_for(&self, model: &str, kind: PoolKind) -> Result<Acquired, RouteError> {
+        let d = self.data();
         // First, a pool with a healthy backend that serves the model.
-        if let Some(pool) = self
+        if let Some(pool) = d
             .pools
             .values()
             .find(|p| p.kind == kind && p.serves_model(model))
@@ -795,7 +909,7 @@ impl UpstreamRegistry {
         // No healthy serving backend. If the model is nonetheless known to a
         // pool of this kind, it's a transient outage (all replicas down) —
         // surface 503, not 404.
-        if let Some(pool) = self
+        if let Some(pool) = d
             .pools
             .values()
             .find(|p| p.kind == kind && p.knows_model(model))
@@ -823,13 +937,15 @@ impl UpstreamRegistry {
     pub fn route(&self, model: &str, kind: PoolKind) -> Result<Acquired, RouteError> {
         match self.acquire_for(model, kind) {
             Ok(acquired) => Ok(acquired),
-            Err(RouteError::UnknownModel(orig)) => match self.fallback.for_kind(kind) {
-                Some(fallback) => self.acquire_for(fallback, kind).map_err(|_| {
-                    // Keep the client-facing error about the model they asked for.
-                    RouteError::UnknownModel(orig)
-                }),
-                None => Err(RouteError::UnknownModel(orig)),
-            },
+            Err(RouteError::UnknownModel(orig)) => {
+                let fb = self.data().fallback.for_kind(kind).map(str::to_owned);
+                match fb {
+                    Some(fallback) => self
+                        .acquire_for(&fallback, kind)
+                        .map_err(|_| RouteError::UnknownModel(orig)),
+                    None => Err(RouteError::UnknownModel(orig)),
+                }
+            }
             Err(RouteError::Acquire(AcquireError::NoHealthyBackend { pool })) => {
                 match self.pool_fallback_offline(&pool) {
                     Some(fallback) => self
@@ -845,15 +961,16 @@ impl UpstreamRegistry {
 
     /// The `fallback_offline` model configured on the named pool, if any.
     fn pool_fallback_offline(&self, pool_name: &str) -> Option<String> {
-        self.pools
+        self.data()
+            .pools
             .get(pool_name)
             .and_then(|p| p.fallback_offline.clone())
     }
 
     /// The configured unknown-model fallback for `kind` (`[fallback]`), if any.
     /// Read-only admin view.
-    pub fn fallback_model(&self, kind: PoolKind) -> Option<&str> {
-        self.fallback.for_kind(kind)
+    pub fn fallback_model(&self, kind: PoolKind) -> Option<String> {
+        self.data().fallback.for_kind(kind).map(str::to_owned)
     }
 
     /// Resolve a requested name to the real model id a healthy backend of
@@ -863,7 +980,8 @@ impl UpstreamRegistry {
     /// taken (the chat-UI driver serialises before acquiring). Does not apply
     /// fallback — that's `route`'s job at acquire time.
     pub fn resolve_model(&self, model: &str, kind: PoolKind) -> Option<String> {
-        self.pools
+        self.data()
+            .pools
             .values()
             .filter(|p| p.kind == kind)
             .find_map(|p| p.resolve_healthy(model))
@@ -946,6 +1064,7 @@ mod tests {
             name: name.into(),
             base_url: format!("http://{name}:8000/v1"),
             api_key_env: None,
+            api_key: None,
             weight: 1,
             max_inflight,
             health_path: "/models".into(),
@@ -1027,7 +1146,8 @@ mod tests {
     /// for a single backend. Real code calls `Backend::set_models` from
     /// the health probe; tests use this to bypass the network entirely.
     fn seed_models(reg: &UpstreamRegistry, pool: &str, backend_idx: usize, models: &[&str]) {
-        let pool = reg.pools.get(pool).expect("pool exists");
+        let d = reg.data();
+        let pool = d.pools.get(pool).expect("pool exists");
         let set: HashSet<String> = models.iter().map(|s| (*s).to_string()).collect();
         pool.backends[backend_idx].set_models(set);
     }
@@ -1355,7 +1475,7 @@ mod tests {
         seed_models(&reg, "chat", 0, &["m"]);
         seed_models(&reg, "chat", 1, &["m"]);
         // Mark `a` unhealthy — every acquire should land on `b`.
-        reg.pools.get("chat").unwrap().backends[0].set_healthy(false);
+        reg.data().pools.get("chat").unwrap().backends[0].set_healthy(false);
         for _ in 0..5 {
             let g = reg.acquire_for("m", PoolKind::Chat).unwrap();
             assert_eq!(g.backend().name, "b");
@@ -1374,7 +1494,8 @@ mod tests {
         )]);
         seed_models(&reg, "chat", 0, &["m"]);
         seed_models(&reg, "chat", 1, &["m"]);
-        let pool = reg.pools.get("chat").unwrap();
+        let d = reg.data();
+        let pool = d.pools.get("chat").unwrap();
         // Hold one slot via Pool API directly — exercising the inflight counter.
         let _a1 = pool.acquire_for_model("m").unwrap();
         // Force a's inflight up so the picker prefers b.
@@ -1551,7 +1672,7 @@ mod tests {
             ),
         )]);
         seed_models(&reg, "chat", 0, &["m"]);
-        reg.pools.get("chat").unwrap().backends[0].set_healthy(false);
+        reg.data().pools.get("chat").unwrap().backends[0].set_healthy(false);
 
         // Still "known" (health-agnostic)…
         assert!(reg.knows_model("m", PoolKind::Chat));
@@ -1641,7 +1762,7 @@ mod tests {
     }
 
     fn set_health(reg: &UpstreamRegistry, pool: &str, idx: usize, healthy: bool) {
-        reg.pools.get(pool).unwrap().backends[idx].set_healthy(healthy);
+        reg.data().pools.get(pool).unwrap().backends[idx].set_healthy(healthy);
     }
 
     #[test]
@@ -1964,6 +2085,79 @@ mod tests {
         );
         assert_eq!(reg.resolve_model("nope", PoolKind::Chat), None);
         // No inflight slot consumed — the backend is still at 0.
-        assert_eq!(reg.pools.get("chat").unwrap().backends[0].inflight(), 0);
+        assert_eq!(
+            reg.data().pools.get("chat").unwrap().backends[0].inflight(),
+            0
+        );
+    }
+
+    /// A reload bumps the generation and carries an unchanged backend's live
+    /// (probed) model set onto its freshly-built replacement, so routing never
+    /// 404s during the re-probe window.
+    #[test]
+    fn reload_carries_over_live_models_and_bumps_generation() {
+        use crate::server::db::upstreams_config::{BackendRow, PoolRow, UpstreamConfigSnapshot};
+        use jiff::Timestamp;
+
+        let mk_snap = || {
+            let mut snap = UpstreamConfigSnapshot::default();
+            snap.backends.insert(
+                "b".into(),
+                BackendRow {
+                    name: "b".into(),
+                    base_url: "http://b".into(),
+                    api_key_env: None,
+                    api_key_ct: None,
+                    api_key_nonce: None,
+                    weight: 1,
+                    max_inflight: 16,
+                    health_path: "/models".into(),
+                    probe_models: true,
+                    supports_edit: false,
+                    models: vec![],
+                    aliases: vec![],
+                    created_at: Timestamp::now(),
+                    updated_at: Timestamp::now(),
+                },
+            );
+            snap.pools.push(PoolRow {
+                name: "chat".into(),
+                kind: "chat".into(),
+                strategy: "least_inflight".into(),
+                fallback_offline: None,
+                compliance_gdpr: true,
+                compliance_nda: true,
+                enforce_limits: true,
+                sort_order: 0,
+                backends: vec!["b".into()],
+                models: vec![],
+                voices: vec![],
+                created_at: Timestamp::now(),
+                updated_at: Timestamp::now(),
+            });
+            snap
+        };
+
+        let reg = UpstreamRegistry::from_snapshot(
+            &mk_snap(),
+            &crate::server::crypto::Crypto::ephemeral(),
+        )
+        .unwrap();
+        assert_eq!(reg.generation(), 0);
+
+        // Simulate a successful probe populating the live model set.
+        reg.data().pools.get("chat").unwrap().backends[0]
+            .set_models(HashSet::from(["live-model".to_string()]));
+        assert!(reg.knows_model("live-model", PoolKind::Chat));
+
+        // Reload the same topology: the rebuilt backend starts with an empty
+        // live set, but the carry-over must keep "live-model" routable.
+        reg.reload(&mk_snap(), &crate::server::crypto::Crypto::ephemeral())
+            .unwrap();
+        assert_eq!(reg.generation(), 1);
+        assert!(
+            reg.knows_model("live-model", PoolKind::Chat),
+            "reload must carry over the live model set for an unchanged backend"
+        );
     }
 }

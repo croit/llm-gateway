@@ -99,6 +99,7 @@ fn registry_pointed_at(upstream_url: &str) -> Arc<UpstreamRegistry> {
                 name: "mock".into(),
                 base_url: upstream_url.into(),
                 api_key_env: None,
+                api_key: None,
                 weight: 1,
                 max_inflight: 16,
                 health_path: "/models".into(),
@@ -109,6 +110,7 @@ fn registry_pointed_at(upstream_url: &str) -> Arc<UpstreamRegistry> {
     let registry = UpstreamRegistry::new(&pools).unwrap();
     registry
         .pools()
+        .into_iter()
         .find(|p| p.name == "embed")
         .unwrap()
         .backends[0]

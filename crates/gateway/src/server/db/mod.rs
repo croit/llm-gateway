@@ -27,6 +27,7 @@ pub mod rag;
 pub mod skill_grants;
 pub mod token_tool_prefs;
 pub mod tokens;
+pub mod upstreams_config;
 pub mod usage;
 pub mod user_mcp;
 pub mod user_memories;
@@ -61,6 +62,9 @@ pub enum DbError {
     /// `Decode`) so the call site is obvious in logs.
     #[error("session-core: {0}")]
     Session(#[from] session_core::db::DbError),
+    /// Sealing/unsealing an at-rest secret (e.g. a backend API key) failed.
+    #[error("crypto")]
+    Crypto(#[from] crate::server::crypto::CryptoError),
 }
 
 /// Opens (or creates) a SQLite database at `path` and runs migrations.

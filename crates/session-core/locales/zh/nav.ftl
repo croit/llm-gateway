@@ -11,6 +11,7 @@ nav-usage = 用量
 nav-users = 用户
 nav-models = 模型
 nav-backends = 后端
+nav-pools = 池
 nav-rag = RAG
 nav-skills = 技能
 nav-connectors = 连接器

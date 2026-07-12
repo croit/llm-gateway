@@ -52,7 +52,32 @@ pub struct ModelDefaults {
     pub input_price: Option<f64>,
     /// Price per 1,000,000 completion tokens. `None` = unpriced.
     pub output_price: Option<f64>,
+    /// What this model can/cannot do (vision, tools, …). Tri-state per field:
+    /// `None` = unknown, `Some(true)` = supported, `Some(false)` = confirmed
+    /// unsupported. See [`ModelCapabilities`].
+    pub capabilities: ModelCapabilities,
     pub updated_at: Timestamp,
+}
+
+/// Per-model capability flags and fallback references.
+///
+/// Each flag is tri-state: `None` = unknown (try and learn from upstream
+/// errors), `Some(true)` = confirmed supported, `Some(false)` = confirmed
+/// unsupported (either learned via [`mark_unsupported`] or set by an admin).
+///
+/// `fallback_*` holds the model id to use for transparent describe-and-inject
+/// when the primary model lacks that capability. `None` = no fallback
+/// configured (the request is rejected with a clear message instead).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelCapabilities {
+    pub vision: Option<bool>,
+    pub audio_input: Option<bool>,
+    pub pdf_input: Option<bool>,
+    pub tools: Option<bool>,
+    pub parallel_tools: Option<bool>,
+    pub structured_output: Option<bool>,
+    pub fallback_vision: Option<String>,
+    pub fallback_tools: Option<String>,
 }
 
 fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
@@ -68,6 +93,7 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
     let context_window: Option<i64> = row.try_get("context_window")?;
     let input_price: Option<f64> = row.try_get("input_price")?;
     let output_price: Option<f64> = row.try_get("output_price")?;
+    let capabilities = map_capabilities(row)?;
     let updated_at_s: String = row.try_get("updated_at")?;
     let updated_at: Timestamp = updated_at_s
         .parse()
@@ -88,7 +114,25 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
         context_window,
         input_price,
         output_price,
+        capabilities,
         updated_at,
+    })
+}
+
+fn map_capabilities(row: &SqliteRow) -> Result<ModelCapabilities, DbError> {
+    fn nb(row: &SqliteRow, col: &str) -> Result<Option<bool>, DbError> {
+        let v: Option<i64> = row.try_get(col)?;
+        Ok(v.map(|x| x != 0))
+    }
+    Ok(ModelCapabilities {
+        vision: nb(row, "cap_vision")?,
+        audio_input: nb(row, "cap_audio_input")?,
+        pdf_input: nb(row, "cap_pdf_input")?,
+        tools: nb(row, "cap_tools")?,
+        parallel_tools: nb(row, "cap_parallel_tools")?,
+        structured_output: nb(row, "cap_structured_output")?,
+        fallback_vision: row.try_get("fallback_vision")?,
+        fallback_tools: row.try_get("fallback_tools")?,
     })
 }
 
@@ -99,7 +143,11 @@ pub async fn get(pool: &Pool, model_name: &str) -> Result<Option<ModelDefaults>,
         r#"SELECT model_name, defaults_toml, reasoning_style,
                   thinking_budget_standard, thinking_budget_deep, thinking_budget_max,
                   reasoning_effort_standard, reasoning_effort_deep, reasoning_effort_max,
-                  context_window, input_price, output_price, updated_at
+                  context_window, input_price, output_price,
+                  cap_vision, cap_audio_input, cap_pdf_input,
+                  cap_tools, cap_parallel_tools, cap_structured_output,
+                  fallback_vision, fallback_tools,
+                  updated_at
            FROM model_defaults
            WHERE model_name = ?"#,
     )
@@ -187,6 +235,103 @@ pub async fn set_pricing(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Set all capability flags + fallback references for a model. Admin-UI path.
+/// Inserts a row with empty defaults if none exists yet; on conflict only the
+/// capability columns are updated, composing with the other setters.
+pub async fn set_capabilities(
+    pool: &Pool,
+    model_name: &str,
+    caps: &ModelCapabilities,
+) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    sqlx::query(
+        r#"INSERT INTO model_defaults
+              (model_name, defaults_toml,
+               cap_vision, cap_audio_input, cap_pdf_input,
+               cap_tools, cap_parallel_tools, cap_structured_output,
+               fallback_vision, fallback_tools,
+               cap_updated_at, updated_at)
+           VALUES (?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(model_name) DO UPDATE SET
+               cap_vision            = excluded.cap_vision,
+               cap_audio_input       = excluded.cap_audio_input,
+               cap_pdf_input         = excluded.cap_pdf_input,
+               cap_tools             = excluded.cap_tools,
+               cap_parallel_tools    = excluded.cap_parallel_tools,
+               cap_structured_output = excluded.cap_structured_output,
+               fallback_vision       = excluded.fallback_vision,
+               fallback_tools        = excluded.fallback_tools,
+               cap_updated_at        = excluded.cap_updated_at,
+               updated_at            = excluded.updated_at"#,
+    )
+    .bind(model_name)
+    .bind(caps.vision.map(|b| b as i64))
+    .bind(caps.audio_input.map(|b| b as i64))
+    .bind(caps.pdf_input.map(|b| b as i64))
+    .bind(caps.tools.map(|b| b as i64))
+    .bind(caps.parallel_tools.map(|b| b as i64))
+    .bind(caps.structured_output.map(|b| b as i64))
+    .bind(&caps.fallback_vision)
+    .bind(&caps.fallback_tools)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Mark a single capability as unsupported. Used by auto-learning when the
+/// gateway observes a rejection error from the upstream (e.g. a vision 400).
+/// Only writes the one column — other capabilities and admin-set values are
+/// preserved. Does NOT overwrite an existing `Some(true)` set by an admin.
+pub async fn mark_unsupported(
+    pool: &Pool,
+    model_name: &str,
+    field: CapabilityField,
+) -> Result<(), DbError> {
+    let col = field.column();
+    let now = Timestamp::now().to_string();
+    let sql = format!(
+        r#"INSERT INTO model_defaults (model_name, defaults_toml, {col}, cap_updated_at, updated_at)
+           VALUES (?, '', 0, ?, ?)
+           ON CONFLICT(model_name) DO UPDATE SET
+               {col} = CASE WHEN {col} = 1 THEN 1 ELSE 0 END,
+               cap_updated_at = excluded.cap_updated_at,
+               updated_at     = excluded.updated_at"#,
+    );
+    sqlx::query(&sql)
+        .bind(model_name)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Which capability column to mark in [`mark_unsupported`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityField {
+    Vision,
+    AudioInput,
+    PdfInput,
+    Tools,
+    ParallelTools,
+    StructuredOutput,
+}
+
+impl CapabilityField {
+    pub fn column(self) -> &'static str {
+        match self {
+            Self::Vision => "cap_vision",
+            Self::AudioInput => "cap_audio_input",
+            Self::PdfInput => "cap_pdf_input",
+            Self::Tools => "cap_tools",
+            Self::ParallelTools => "cap_parallel_tools",
+            Self::StructuredOutput => "cap_structured_output",
+        }
+    }
 }
 
 /// The six per-effort override columns, grouped so the setter signature stays
@@ -432,5 +577,57 @@ mod tests {
         assert_eq!(map["half"].input_price, Some(1.0));
         assert_eq!(map["half"].output_price, None);
         assert!(!map.contains_key("gpu-local"));
+    }
+
+    #[tokio::test]
+    async fn capabilities_round_trip() {
+        let pool = fresh().await;
+        let caps = ModelCapabilities {
+            vision: Some(false),
+            tools: Some(true),
+            structured_output: Some(false),
+            fallback_vision: Some("qwen-vl".into()),
+            ..Default::default()
+        };
+        set_capabilities(&pool, "m", &caps).await.unwrap();
+        let row = get(&pool, "m").await.unwrap().unwrap();
+        assert_eq!(row.capabilities.vision, Some(false));
+        assert_eq!(row.capabilities.tools, Some(true));
+        assert_eq!(row.capabilities.structured_output, Some(false));
+        assert_eq!(row.capabilities.audio_input, None);
+        assert_eq!(row.capabilities.fallback_vision.as_deref(), Some("qwen-vl"));
+    }
+
+    #[tokio::test]
+    async fn mark_unsupported_does_not_overwrite_admin_true() {
+        let pool = fresh().await;
+        // Admin sets vision = true.
+        let caps = ModelCapabilities {
+            vision: Some(true),
+            ..Default::default()
+        };
+        set_capabilities(&pool, "m", &caps).await.unwrap();
+
+        // Auto-learning tries to mark vision as unsupported — must NOT
+        // overwrite the admin's explicit Some(true).
+        mark_unsupported(&pool, "m", CapabilityField::Vision)
+            .await
+            .unwrap();
+        let row = get(&pool, "m").await.unwrap().unwrap();
+        assert_eq!(row.capabilities.vision, Some(true));
+    }
+
+    #[tokio::test]
+    async fn mark_unsupported_sets_false_on_unknown() {
+        let pool = fresh().await;
+        upsert(&pool, "m", "temperature = 0.5").await.unwrap();
+
+        // Vision is None (unknown) → auto-learning sets it to Some(false).
+        mark_unsupported(&pool, "m", CapabilityField::Vision)
+            .await
+            .unwrap();
+        let row = get(&pool, "m").await.unwrap().unwrap();
+        assert_eq!(row.capabilities.vision, Some(false));
+        assert_eq!(row.defaults_toml, "temperature = 0.5");
     }
 }

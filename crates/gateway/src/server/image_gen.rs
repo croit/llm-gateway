@@ -142,9 +142,8 @@ impl ImageGenerator {
     pub fn edit_available(&self) -> bool {
         self.upstreams
             .pools()
-            .filter(|p| p.kind == PoolKind::Image)
-            .flat_map(|p| p.backends.iter())
-            .any(|b| b.supports_edit())
+            .into_iter()
+            .any(|p| p.kind == PoolKind::Image && p.backends.iter().any(|b| b.supports_edit()))
     }
 
     /// Generate an image from a text prompt. `model` selects a specific image
@@ -501,6 +500,7 @@ mod tests {
             name: "img".into(),
             base_url: base_url.into(),
             api_key_env: None,
+            api_key: None,
             weight: 1,
             max_inflight: 16,
             health_path: "/models".into(),

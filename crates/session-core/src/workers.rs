@@ -37,28 +37,14 @@ use tokio::sync::broadcast;
 /// clone is just a refcount bump.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnUpdate {
-    /// Assistant-turn state changed. Subscribers should re-read the
-    /// turn from the DB and patch the bubble. The variant carries no
-    /// payload because the DB is the source of truth — keeping data
-    /// out of the channel means subscribers and the persisted state
-    /// can't drift.
     Tick,
-    /// Worker has finished (completed / cancelled / errored). After
-    /// the next DB read subscribers should send their final patch and
-    /// close the SSE response.
     Finalized,
-    /// Session metadata (currently: title) was just updated by a side
-    /// task — subscribers should re-render the session row in the
-    /// sidebar so the rename lands live without waiting for a nav.
     SidebarChanged,
-    /// Pre-framed SSE bytes to forward to subscribers verbatim, *outside*
-    /// the DB-is-source-of-truth flow. Used for transient UI a Tick
-    /// re-render would clobber — e.g. a tool prompting the browser to
-    /// share its location mid-turn (see the gateway's `get_user_location`
-    /// feedback loop). The payload is a complete datastar SSE event
-    /// (`chrome::sse_patch` / `sse_script` output), so subscribers relay
-    /// the bytes straight to the client and do not touch the DB.
     Inject(Arc<rama::bytes::Bytes>),
+    /// Transient info banner shown in the chat bubble (e.g. "vision fallback
+    /// activated — image described by {model}"). Subscribers render it as a
+    /// daisyUI alert via a datastar patch.
+    InfoMessage(String),
 }
 
 /// One live session worker, indexed by user id in `SessionWorkers`.

@@ -942,7 +942,22 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             // back). Otherwise fall back to stringified JSON — the
             // pre-existing contract.
             let content = match crate::server::tools::extract_content_parts(&result.body) {
-                Some(parts) => serde_json::Value::Array(parts.clone()),
+                Some(parts) => {
+                    let (replaced, notification) =
+                        crate::server::capabilities::maybe_replace_image_content(
+                            parts,
+                            &real_model,
+                            &d.state.db,
+                            &d.state.http,
+                            d.state.upstreams.as_ref(),
+                        )
+                        .await;
+                    if let Some(msg) = notification {
+                        tracing::info!(model = %real_model, "vision fallback activated");
+                        let _ = ctx.broadcast.send(TurnUpdate::InfoMessage(msg));
+                    }
+                    serde_json::Value::Array(replaced)
+                }
                 None => serde_json::Value::String(output_str),
             };
             messages.push(serde_json::json!({

@@ -58,6 +58,7 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
                 name: "mock".into(),
                 base_url: upstream_uri.into(),
                 api_key_env: None,
+                api_key: None,
                 weight: 1,
                 max_inflight: 16,
                 health_path: "/models".into(),

@@ -215,6 +215,15 @@ pub fn spawn_session_stream_response(
                         return;
                     }
                 }
+                Ok(TurnUpdate::InfoMessage(msg)) => {
+                    let html = format!(
+                        r#"<div class="alert alert-info my-2 text-sm" role="alert">{msg}</div>"#
+                    );
+                    let sse = crate::chrome::sse_patch(None, None, &html);
+                    if tx.send(Ok(sse)).await.is_err() {
+                        return;
+                    }
+                }
                 Ok(TurnUpdate::Finalized) => {
                     let _ = emit_current_state(
                         &pool,

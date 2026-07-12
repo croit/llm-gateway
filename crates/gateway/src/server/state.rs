@@ -41,11 +41,12 @@ pub struct AppState {
     /// restart). RBAC narrows which skills each caller sees (see
     /// [`Self::allowed_skills_for`]).
     pub skills: Option<Arc<SkillStore>>,
-    /// At-rest encryption for per-user MCP OAuth tokens + admin-stored
-    /// connector client secrets. `new()` installs an ephemeral key; production
-    /// overrides it via [`Self::with_mcp_crypto`] with a key derived from
-    /// `$GATEWAY_MCP_KEY` / the session secret.
-    pub mcp_crypto: Arc<Crypto>,
+    /// At-rest encryption for the gateway's database-stored secrets: per-user
+    /// MCP OAuth tokens, admin-stored connector client secrets, and upstream
+    /// backend API keys. `new()` installs an ephemeral key; production overrides
+    /// it via [`Self::with_crypto`] with a key derived from
+    /// `$GATEWAY_ENCRYPTION_KEY` / the session secret.
+    pub crypto: Arc<Crypto>,
     /// Per-user MCP connection manager: live connections to each user's
     /// connected connectors + the per-request tool overlay. `new()` installs
     /// one bound to the same pool + ephemeral crypto; production overrides via
@@ -66,10 +67,10 @@ impl AppState {
         tools: Arc<ToolRegistry>,
         rbac: Arc<Resolver>,
     ) -> Self {
-        let mcp_crypto = Arc::new(Crypto::ephemeral());
+        let crypto = Arc::new(Crypto::ephemeral());
         let mcp = crate::server::tools::mcp::manager::McpConnectionManager::new(
             db.clone(),
-            mcp_crypto.clone(),
+            crypto.clone(),
         );
         Self {
             http: reqwest::Client::new(),
@@ -82,7 +83,7 @@ impl AppState {
             geoip: None,
             indexer: None,
             skills: None,
-            mcp_crypto,
+            crypto,
             mcp,
             typst_templates: Arc::new(Vec::new()),
         }
@@ -242,14 +243,14 @@ impl AppState {
         self
     }
 
-    /// Install the production MCP encryption key, rebuilding the connection
-    /// manager so it seals/opens tokens under the same key.
-    pub fn with_mcp_crypto(mut self, crypto: Arc<Crypto>) -> Self {
+    /// Install the production at-rest encryption key, rebuilding the MCP
+    /// connection manager so it seals/opens its tokens under the same key.
+    pub fn with_crypto(mut self, crypto: Arc<Crypto>) -> Self {
         self.mcp = crate::server::tools::mcp::manager::McpConnectionManager::new(
             self.db.clone(),
             crypto.clone(),
         );
-        self.mcp_crypto = crypto;
+        self.crypto = crypto;
         self
     }
 

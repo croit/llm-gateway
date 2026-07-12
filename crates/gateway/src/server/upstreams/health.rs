@@ -90,14 +90,19 @@ pub async fn spawn(registry: Arc<UpstreamRegistry>) {
     // Now arm the looping probe per backend. Each loop owns its own
     // failure counter — the bootstrap probe above doesn't pre-seed it
     // because mid-startup flaps shouldn't permanently mark a backend
-    // unhealthy.
+    // unhealthy. Each loop is tagged with the topology generation it was
+    // spawned for; a `reload()` bumps the generation and the loop retires
+    // itself, so re-spawning here after a reload doesn't leak the previous
+    // generation's loops (which hold detached `Backend` Arcs).
+    let generation = registry.generation();
     for pool in registry.pools() {
         for backend in &pool.backends {
             let backend = Arc::clone(backend);
             let pool_name = pool.name.clone();
             let http = http.clone();
+            let registry = Arc::clone(&registry);
             tokio::spawn(async move {
-                run_probe(http, pool_name, backend).await;
+                run_probe(http, pool_name, backend, registry, generation).await;
             });
         }
     }
@@ -310,7 +315,13 @@ fn describe_transport_error(err: &reqwest::Error) -> String {
     format!("{headline} (chain: {})", chain.join(" ⇐ "))
 }
 
-async fn run_probe(http: reqwest::Client, pool_name: String, backend: Arc<Backend>) {
+async fn run_probe(
+    http: reqwest::Client,
+    pool_name: String,
+    backend: Arc<Backend>,
+    registry: Arc<UpstreamRegistry>,
+    generation: u64,
+) {
     tracing::debug!(
         pool = %pool_name,
         backend = %backend.name,
@@ -319,6 +330,16 @@ async fn run_probe(http: reqwest::Client, pool_name: String, backend: Arc<Backen
     );
     let mut consecutive_failures = 0u32;
     loop {
+        // Retire once a `reload()` has superseded this generation, so a stale
+        // loop doesn't keep probing a detached (possibly removed/re-pointed)
+        // backend forever.
+        if registry.generation() != generation {
+            tracing::debug!(
+                pool = %pool_name, backend = %backend.name,
+                "health probe loop retiring — topology reloaded"
+            );
+            return;
+        }
         match probe_once(&http, &pool_name, &backend).await {
             ProbeOutcome::AliveWithModels | ProbeOutcome::AliveNoData => {
                 if !backend.is_healthy() {
@@ -406,6 +427,7 @@ mod tests {
             name: "img".into(),
             base_url: base_url.into(),
             api_key_env: None,
+            api_key: None,
             weight: 1,
             max_inflight: 16,
             health_path: "/models".into(),
@@ -448,7 +470,12 @@ mod tests {
             },
         );
         let reg = UpstreamRegistry::new(&pools).unwrap();
-        reg.pools().find(|p| p.name == "images").unwrap().backends[0].clone()
+        reg.pools()
+            .into_iter()
+            .find(|p| p.name == "images")
+            .unwrap()
+            .backends[0]
+            .clone()
     }
 
     #[tokio::test]

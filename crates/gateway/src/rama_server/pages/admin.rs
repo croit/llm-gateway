@@ -20,10 +20,9 @@ use plait::{Html, ToHtml, html};
 use rama::http::service::web::extract::State;
 use rama::http::{Request, Response};
 
-use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_admin_or_403};
+use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_admin_or_403, toast};
 use session_core::chrome::{
-    Flash, FlashKind, NavSections, Theme, is_datastar_request, read_body_to_bytes, sse_response,
-    sse_toast,
+    FlashKind, NavSections, Theme, is_datastar_request, read_body_to_bytes,
 };
 use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
@@ -99,6 +98,15 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
             context_window: row.as_ref().and_then(|r| r.context_window),
             input_price: row.as_ref().and_then(|r| r.input_price),
             output_price: row.as_ref().and_then(|r| r.output_price),
+            cap_vision: row.as_ref().and_then(|r| r.capabilities.vision),
+            cap_tools: row.as_ref().and_then(|r| r.capabilities.tools),
+            cap_structured_output: row.as_ref().and_then(|r| r.capabilities.structured_output),
+            fallback_vision: row
+                .as_ref()
+                .and_then(|r| r.capabilities.fallback_vision.clone()),
+            fallback_tools: row
+                .as_ref()
+                .and_then(|r| r.capabilities.fallback_tools.clone()),
         });
     }
 
@@ -140,7 +148,16 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
 
     let defaults = defaults_rows(&state).await;
     let currency = &state.config.usage.currency;
-    let body = render_models_body(lang, currency, &defaults, &rows, &aliases, &other);
+    let all_models = state.upstreams.all_models();
+    let body = render_models_body(
+        lang,
+        currency,
+        &defaults,
+        &rows,
+        &aliases,
+        &other,
+        &all_models,
+    );
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "admin-page-title");
     nav_or_html_page(
@@ -640,6 +657,173 @@ pub async fn models_defaults_save(State(state): State<Arc<RamaState>>, req: Requ
     toast(FlashKind::Success, msg)
 }
 
+/// POST /admin/models/capabilities — save a model's capability flags (tri-state)
+/// and fallback model references. Each capability field is "" (unknown/clear),
+/// "true", or "false". Fallback fields are a model id or "" (no fallback).
+pub async fn models_capabilities_save(
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let form: CapabilitiesForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(err) => {
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-malformed-form",
+                    &i18n::args([("err", err.to_string().into())]),
+                ),
+            );
+        }
+    };
+    if form.model_name.is_empty() {
+        return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
+    }
+
+    let parse_tri = |s: &str| -> Option<bool> {
+        match s.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    };
+    let parse_fb = |s: &str| -> Option<String> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+
+    let caps = crate::server::db::model_defaults::ModelCapabilities {
+        vision: parse_tri(&form.cap_vision),
+        audio_input: parse_tri(&form.cap_audio_input),
+        pdf_input: parse_tri(&form.cap_pdf_input),
+        tools: parse_tri(&form.cap_tools),
+        parallel_tools: parse_tri(&form.cap_parallel_tools),
+        structured_output: parse_tri(&form.cap_structured_output),
+        fallback_vision: parse_fb(&form.fallback_vision),
+        fallback_tools: parse_fb(&form.fallback_tools),
+    };
+
+    match crate::server::db::model_defaults::set_capabilities(&state.db, &form.model_name, &caps)
+        .await
+    {
+        Ok(()) => toast(
+            FlashKind::Success,
+            t_args(
+                lang,
+                "admin-capabilities-saved",
+                &i18n::args([("model", form.model_name.into())]),
+            ),
+        ),
+        Err(e) => toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-capabilities-error",
+                &i18n::args([("err", e.to_string().into())]),
+            ),
+        ),
+    }
+}
+
+/// POST /admin/upstreams/reload — rebuild the upstream registry from the DB
+/// topology (pools, backends, fallbacks) and re-spawn health probes for the
+/// new/changed backends. The "Apply changes" button after editing pools or
+/// backends in the admin UI.
+pub async fn upstreams_reload(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+
+    let snapshot = match crate::server::db::upstreams_config::load_snapshot(&state.db).await {
+        Ok(s) => s,
+        Err(e) => {
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-reload-error",
+                    &i18n::args([("err", e.to_string().into())]),
+                ),
+            );
+        }
+    };
+
+    match state.upstreams.reload(&snapshot, &state.crypto) {
+        Ok(()) => {
+            // Await the initial probe round (bounded by the 2s probe timeout)
+            // before responding, so a brand-new backend has its model set
+            // populated before "Apply changes" reports success. Unchanged
+            // backends already carried their live set across the swap in
+            // `reload`, so existing traffic never sees an empty-model window.
+            // `spawn` also arms the new generation's probe loops; the old
+            // generation's loops retire themselves (see `health::run_probe`).
+            crate::server::upstreams::health::spawn(state.upstreams.clone()).await;
+            let pool_count = snapshot.pools.len();
+            let backend_count = snapshot.backends.len();
+            tracing::info!(
+                pools = pool_count,
+                backends = backend_count,
+                "upstream registry reloaded from DB"
+            );
+            toast(
+                FlashKind::Success,
+                t_args(
+                    lang,
+                    "admin-reloaded",
+                    &i18n::args([
+                        ("pools", pool_count.to_string().into()),
+                        ("backends", backend_count.to_string().into()),
+                    ]),
+                ),
+            )
+        }
+        Err(e) => toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-reload-error",
+                &i18n::args([("err", e.to_string().into())]),
+            ),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CapabilitiesForm {
+    model_name: String,
+    #[serde(default)]
+    cap_vision: String,
+    #[serde(default)]
+    cap_audio_input: String,
+    #[serde(default)]
+    cap_pdf_input: String,
+    #[serde(default)]
+    cap_tools: String,
+    #[serde(default)]
+    cap_parallel_tools: String,
+    #[serde(default)]
+    cap_structured_output: String,
+    #[serde(default)]
+    fallback_vision: String,
+    #[serde(default)]
+    fallback_tools: String,
+}
+
 #[derive(serde::Deserialize)]
 struct DefaultsForm {
     feature: String,
@@ -700,22 +884,22 @@ struct ReasoningBudgetForm {
 struct ModelRow {
     name: String,
     toml: String,
-    /// Stored reasoning style, or empty string for "auto" (name-detected).
     reasoning_style: String,
-    /// Per-effort token budgets (token-budget styles); `None` = built-in default.
     budget_standard: Option<i64>,
     budget_deep: Option<i64>,
     budget_max: Option<i64>,
-    /// Per-effort `reasoning_effort` levels (effort-level styles); empty = default.
     effort_standard: String,
     effort_deep: String,
     effort_max: String,
-    /// Model context window in tokens; `None` = fall back to the global
-    /// `[chat.compaction] default_context_window`. Drives auto-compaction.
     context_window: Option<i64>,
-    /// Per-1M-token prices for cost accounting; `None` = unpriced (0 cost).
     input_price: Option<f64>,
     output_price: Option<f64>,
+    /// Model capabilities for the capability editor. `None` = unknown.
+    cap_vision: Option<bool>,
+    cap_tools: Option<bool>,
+    cap_structured_output: Option<bool>,
+    fallback_vision: Option<String>,
+    fallback_tools: Option<String>,
 }
 
 /// A non-chat model (embedding / image / speech / transcription) shown in the
@@ -854,10 +1038,11 @@ fn render_models_body(
     rows: &[ModelRow],
     aliases: &[AliasRow],
     other: &[OtherModelRow],
+    all_models: &[String],
 ) -> Html {
     let cards: Vec<Html> = rows
         .iter()
-        .map(|row| render_model_card(lang, currency, row))
+        .map(|row| render_model_card(lang, currency, row, all_models))
         .collect();
     html! {
         section(class: "max-w-5xl mx-auto p-4 sm:p-6 flex flex-col gap-4") {
@@ -977,7 +1162,7 @@ fn render_other_models_card(lang: Lang, currency: &str, other: &[OtherModelRow])
     .to_html()
 }
 
-fn render_model_card(lang: Lang, currency: &str, row: &ModelRow) -> Html {
+fn render_model_card(lang: Lang, currency: &str, row: &ModelRow, all_models: &[String]) -> Html {
     let action = "/admin/models";
     let placeholder = format!(
         "{}\n\
@@ -1004,6 +1189,7 @@ fn render_model_card(lang: Lang, currency: &str, row: &ModelRow) -> Html {
                     }
                 }
                 (render_reasoning_budget(lang, row))
+                (render_capabilities(lang, row, all_models))
                 form(
                     method: "post",
                     action: (action),
@@ -1030,6 +1216,85 @@ fn render_model_card(lang: Lang, currency: &str, row: &ModelRow) -> Html {
                         }
                     }
                 }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// Capabilities editor: tri-state selects (Unknown/Enabled/Disabled) for each
+/// capability + fallback model dropdowns. One auto-saving form posts all fields
+/// to `/admin/models/capabilities` on any change.
+fn render_capabilities(lang: Lang, row: &ModelRow, all_models: &[String]) -> Html {
+    let action = "/admin/models/capabilities";
+    let post = format!("@post('{action}', {{contentType: 'form'}})");
+    html! {
+        form(method: "post", action: (action), class: "m-0") {
+            input(type: "hidden", name: "model_name", value: (row.name.clone()));
+            div(class: "collapse collapse-arrow bg-base-200/50") {
+                input(type: "checkbox");
+                div(class: "collapse-title font-medium text-sm py-2 min-h-0") {
+                    (t(lang, "admin-capabilities-heading"))
+                }
+                div(class: "collapse-content") {
+                    div(class: "grid grid-cols-1 sm:grid-cols-3 gap-2 mt-1") {
+                        (cap_tri_select(lang, "cap_vision", "Vision", row.cap_vision, &post))
+                        (cap_tri_select(lang, "cap_tools", "Tools", row.cap_tools, &post))
+                        (cap_tri_select(lang, "cap_structured_output", &t(lang, "admin-cap-structured-output"), row.cap_structured_output, &post))
+                    }
+                    div(class: "grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2") {
+                        (cap_fb_select(lang, "fallback_vision", &t(lang, "admin-cap-fallback-vision"), &row.fallback_vision, all_models, &post))
+                        (cap_fb_select(lang, "fallback_tools", &t(lang, "admin-cap-fallback-tools"), &row.fallback_tools, all_models, &post))
+                    }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+fn cap_tri_select(lang: Lang, name: &str, label: &str, val: Option<bool>, post: &str) -> Html {
+    let opts = [
+        super::select_option("", &t(lang, "admin-cap-unknown"), val.is_none()),
+        super::select_option("true", &t(lang, "admin-cap-enabled"), val == Some(true)),
+        super::select_option("false", &t(lang, "admin-cap-disabled"), val == Some(false)),
+    ];
+    html! {
+        label(class: "form-control gap-1") {
+            span(class: "text-xs opacity-70") { (label) }
+            select(name: (name), class: "select select-bordered select-sm", "data-on:change": (post)) {
+                for o in opts.iter() { (o.clone()) }
+            }
+        }
+    }
+    .to_html()
+}
+
+fn cap_fb_select(
+    lang: Lang,
+    name: &str,
+    label: &str,
+    current: &Option<String>,
+    all_models: &[String],
+    post: &str,
+) -> Html {
+    let mut opts: Vec<Html> = vec![super::select_option(
+        "",
+        &t(lang, "admin-cap-no-fallback"),
+        false,
+    )];
+    for m in all_models {
+        opts.push(super::select_option(
+            m,
+            m,
+            current.as_deref() == Some(m.as_str()),
+        ));
+    }
+    html! {
+        label(class: "form-control gap-1") {
+            span(class: "text-xs opacity-70") { (label) }
+            select(name: (name), class: "select select-bordered select-sm", "data-on:change": (post)) {
+                for o in opts.iter() { (o.clone()) }
             }
         }
     }
@@ -1259,13 +1524,6 @@ fn render_reasoning_budget(lang: Lang, row: &ModelRow) -> Html {
         }
     }
     .to_html()
-}
-
-fn toast(kind: FlashKind, message: impl Into<String>) -> Response {
-    sse_response(&[sse_toast(&Flash {
-        kind,
-        message: message.into(),
-    })])
 }
 
 #[cfg(test)]

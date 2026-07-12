@@ -11,6 +11,7 @@ nav-usage = Использование
 nav-users = Пользователи
 nav-models = Модели
 nav-backends = Бэкенды
+nav-pools = Пулы
 nav-rag = RAG
 nav-skills = Навыки
 nav-connectors = Коннекторы

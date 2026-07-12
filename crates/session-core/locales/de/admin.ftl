@@ -85,3 +85,19 @@ admin-other-intro = Embedding-, Bild-, Sprach- und Transkriptionsmodelle. Sampli
 admin-aliases-heading = Aliase
 admin-aliases-intro = Diese Namen sind Aliase für ein anderes Modell. Sie haben keine eigenen Einstellungen oder Preise — jede Anfrage wird als das aufgelöste Zielmodell konfiguriert und abgerechnet.
 admin-alias-chip = Alias
+
+# Modell-Fähigkeiten (Vision, Tools, Structured Output) + Fallback-Modelle.
+admin-capabilities-heading = Fähigkeiten
+admin-cap-unknown = Unbekannt
+admin-cap-enabled = Aktiviert
+admin-cap-disabled = Deaktiviert
+admin-cap-structured-output = Strukturierte Ausgabe
+admin-cap-no-fallback = (keiner)
+admin-cap-fallback-vision = Fallback für Vision
+admin-cap-fallback-tools = Fallback für Tools
+admin-capabilities-saved = Fähigkeiten gespeichert für `{ $model }`
+admin-capabilities-error = Fähigkeiten konnten nicht gespeichert werden: { $err }
+
+# Upstream-Topologie neu laden ("Apply changes"-Button).
+admin-reloaded = { $pools } Pools, { $backends } Backends neu geladen
+admin-reload-error = Neuladen fehlgeschlagen: { $err }

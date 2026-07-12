@@ -85,3 +85,19 @@ admin-other-intro = Modelos de embedding, imagen, voz y transcripción. Los ajus
 admin-aliases-heading = Alias
 admin-aliases-intro = Estos nombres son alias de otro modelo. No tienen ajustes ni precio propios: cada solicitud se configura y contabiliza como el modelo al que se resuelve.
 admin-alias-chip = alias
+
+# Model capabilities (vision, tools, structured output) + fallback model refs.
+admin-capabilities-heading = Capabilities
+admin-cap-unknown = Unknown
+admin-cap-enabled = Enabled
+admin-cap-disabled = Disabled
+admin-cap-structured-output = Structured output
+admin-cap-no-fallback = (none)
+admin-cap-fallback-vision = Fallback for vision
+admin-cap-fallback-tools = Fallback for tools
+admin-capabilities-saved = saved capabilities for `{ $model }`
+admin-capabilities-error = failed to save capabilities: { $err }
+
+# Upstream topology reload ("Apply changes" button).
+admin-reloaded = reloaded { $pools } pools, { $backends } backends
+admin-reload-error = reload failed: { $err }

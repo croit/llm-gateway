@@ -26,3 +26,30 @@ backends-alias-target-title = алиас → { $target }
 backends-alias-disabled-label = { $name } (отключён)
 backends-alias-disabled-title = простой алиас отключён — этот бэкенд обслуживает несколько моделей; укажите явную цель (форма сопоставления)
 backends-alias-bare-title = алиас → модель этого бэкенда
+
+# Backend CRUD editor (add/edit/delete backends stored in the DB topology).
+backends-manage-heading = Управление бэкендами
+backends-manage-description = Добавляйте, редактируйте или удаляйте восходящие бэкенды. Изменения сохраняются в базе данных, но вступают в силу только после нажатия «Применить изменения».
+backends-apply-changes = Применить изменения
+backends-add-heading = Добавить бэкенд
+backends-field-name = Название
+backends-field-base-url = Базовый URL
+backends-field-api-key-env = Переменная окружения с API-ключом
+backends-field-health-path = Путь проверки состояния
+backends-field-weight = Вес
+backends-field-max-inflight = Макс. одновременных
+backends-field-models = Модели (через запятую)
+backends-field-aliases = Алиасы (name=target по одному в строке)
+backends-field-probe-models = Определять модели через проверочный запрос /models
+backends-field-supports-edit = Поддерживает редактирование изображений
+backends-save-backend = Сохранить бэкенд
+backends-add-backend = Добавить бэкенд
+backends-delete-backend = Удалить
+backends-error-name-required = требуется название бэкенда
+backends-error-base-url-required = требуется базовый URL
+backends-saved = бэкенд `{ $name }` сохранён — нажмите «Применить изменения» для перезагрузки
+backends-deleted = бэкенд `{ $name }` удалён — нажмите «Применить изменения» для перезагрузки
+
+backends-field-api-key = Ключ API
+backends-field-api-key-placeholder = Ключ API (хранится в зашифрованном виде)
+backends-field-api-key-keep = оставьте пустым, чтобы сохранить текущий ключ

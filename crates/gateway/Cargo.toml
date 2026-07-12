@@ -78,6 +78,9 @@ rmcp = { version = "1.7", default-features = false, features = [
 # directly so the build doesn't rely on feature unification).
 tokio = { workspace = true, features = ["net"] }
 reqwest = { workspace = true }
+# Lock-free hot-reload for the upstream registry. Already a transitive dep
+# via rama; listed directly so we can `use arc_swap` without feature luck.
+arc-swap = "1"
 # `bytes`, `futures-util` and `futures-channel` are used via rama's
 # re-exports (`rama::bytes`, `rama::futures{,::channel}`) — same crates,
 # no separate pin.
@@ -100,7 +103,7 @@ rand = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
 # AES-256-GCM at-rest encryption for per-user MCP OAuth tokens + admin-stored
-# connector client secrets (see `server::crypto`). Key from $GATEWAY_MCP_KEY,
+# connector client secrets (see `server::crypto`). Key from $GATEWAY_ENCRYPTION_KEY,
 # else derived from the session secret.
 aes-gcm = "0.10"
 # typst compile scratch dirs (one per render); tiny, no native deps.

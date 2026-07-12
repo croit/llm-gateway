@@ -26,3 +26,30 @@ backends-alias-target-title = alias → { $target }
 backends-alias-disabled-label = { $name } (désactivé)
 backends-alias-disabled-title = alias simple désactivé — ce backend propose plusieurs modèles ; indiquez-lui une cible explicite (formulaire de correspondance)
 backends-alias-bare-title = alias → modèle de ce backend
+
+# Éditeur CRUD des backends (ajout/modification/suppression de backends stockés dans la topologie en base).
+backends-manage-heading = Gérer les backends
+backends-manage-description = Ajoutez, modifiez ou supprimez des backends en amont. Les modifications sont enregistrées en base mais ne prennent effet qu'une fois que vous cliquez sur « Appliquer les modifications ».
+backends-apply-changes = Appliquer les modifications
+backends-add-heading = Ajouter un backend
+backends-field-name = Nom
+backends-field-base-url = URL de base
+backends-field-api-key-env = Variable d'env de la clé API
+backends-field-health-path = Chemin de santé
+backends-field-weight = Poids
+backends-field-max-inflight = Max en cours
+backends-field-models = Modèles (séparés par des virgules)
+backends-field-aliases = Alias (name=target par ligne)
+backends-field-probe-models = Découvrir les modèles via la sonde /models
+backends-field-supports-edit = Prend en charge l'édition d'images
+backends-save-backend = Enregistrer le backend
+backends-add-backend = Ajouter un backend
+backends-delete-backend = Supprimer
+backends-error-name-required = le nom du backend est requis
+backends-error-base-url-required = l'URL de base est requise
+backends-saved = backend `{ $name }` enregistré — cliquez sur « Appliquer les modifications » pour recharger
+backends-deleted = backend `{ $name }` supprimé — cliquez sur « Appliquer les modifications » pour recharger
+
+backends-field-api-key = Clé API
+backends-field-api-key-placeholder = Clé API (stockée chiffrée)
+backends-field-api-key-keep = laisser vide pour conserver la clé actuelle

@@ -26,3 +26,30 @@ backends-alias-target-title = alias → { $target }
 backends-alias-disabled-label = { $name } (desactivado)
 backends-alias-disabled-title = alias simple desactivado — este backend sirve varios modelos; asígnele un destino explícito (formulario de mapeo)
 backends-alias-bare-title = alias → modelo de este backend
+
+# Editor CRUD de backends (añadir/editar/eliminar backends almacenados en la topología de la base de datos).
+backends-manage-heading = Gestionar backends
+backends-manage-description = Añada, edite o elimine backends de origen. Los cambios se guardan en la base de datos, pero solo surten efecto una vez que haga clic en «Aplicar cambios».
+backends-apply-changes = Aplicar cambios
+backends-add-heading = Añadir backend
+backends-field-name = Nombre
+backends-field-base-url = URL base
+backends-field-api-key-env = Variable de entorno de clave de API
+backends-field-health-path = Ruta de estado
+backends-field-weight = Peso
+backends-field-max-inflight = Máximo en curso
+backends-field-models = Modelos (separados por comas)
+backends-field-aliases = Alias (name=target por línea)
+backends-field-probe-models = Descubrir modelos mediante la sonda /models
+backends-field-supports-edit = Admite edición de imágenes
+backends-save-backend = Guardar backend
+backends-add-backend = Añadir backend
+backends-delete-backend = Eliminar
+backends-error-name-required = el nombre del backend es obligatorio
+backends-error-base-url-required = la URL base es obligatoria
+backends-saved = backend `{ $name }` guardado — haga clic en «Aplicar cambios» para recargar
+backends-deleted = backend `{ $name }` eliminado — haga clic en «Aplicar cambios» para recargar
+
+backends-field-api-key = Clave API
+backends-field-api-key-placeholder = Clave API (almacenada cifrada)
+backends-field-api-key-keep = dejar en blanco para conservar la clave actual

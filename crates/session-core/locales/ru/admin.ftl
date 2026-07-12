@@ -85,3 +85,19 @@ admin-other-intro = Модели эмбеддингов, изображений,
 admin-aliases-heading = Псевдонимы
 admin-aliases-intro = Эти имена — псевдонимы другой модели. У них нет собственных настроек или цены: каждый запрос настраивается и учитывается как модель, в которую он разрешается.
 admin-alias-chip = псевдоним
+
+# Model capabilities (vision, tools, structured output) + fallback model refs.
+admin-capabilities-heading = Capabilities
+admin-cap-unknown = Unknown
+admin-cap-enabled = Enabled
+admin-cap-disabled = Disabled
+admin-cap-structured-output = Structured output
+admin-cap-no-fallback = (none)
+admin-cap-fallback-vision = Fallback for vision
+admin-cap-fallback-tools = Fallback for tools
+admin-capabilities-saved = saved capabilities for `{ $model }`
+admin-capabilities-error = failed to save capabilities: { $err }
+
+# Upstream topology reload ("Apply changes" button).
+admin-reloaded = reloaded { $pools } pools, { $backends } backends
+admin-reload-error = reload failed: { $err }

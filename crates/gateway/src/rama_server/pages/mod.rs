@@ -72,6 +72,9 @@ enum NavItem {
     /// Same `admin`-role gate as [`NavItem::Admin`]; its own variant so
     /// the sidebar highlight lands on it rather than on Models.
     Backends,
+    /// Admin-only upstream pools CRUD page (`/admin/pools`). Same
+    /// `admin`-role gate; its own variant for the sidebar highlight.
+    Pools,
     /// Admin-only RAG collection management page (`/rag`).
     Rag,
     /// Admin-only registered-users roster + impersonation (`/admin/users`).
@@ -106,6 +109,107 @@ fn sidebar_nav_directive(href: &str) -> String {
         "document.getElementById('app-sidebar-toggle').checked = false; {}",
         nav_get_directive(href)
     )
+}
+
+/// Render one `<option>`, marking it selected only when `selected` is true.
+///
+/// `selected`/`checked`/`readonly` are *presence-based* boolean HTML attributes:
+/// a browser treats `selected="false"` as selected. plait's `attr: (bool)`
+/// renders the literal `="false"` form, so it can't express "unselected" — the
+/// attribute must be omitted entirely. These helpers do that, keeping the two
+/// admin CRUD pages (backends/pools) and the capability selects correct.
+pub(super) fn select_option(value: &str, label: &str, selected: bool) -> plait::Html {
+    use plait::{ToHtml, html};
+    if selected {
+        html! { option(value: (value.to_string()), selected: "selected") { (label.to_string()) } }
+            .to_html()
+    } else {
+        html! { option(value: (value.to_string())) { (label.to_string()) } }.to_html()
+    }
+}
+
+/// Render a labelled `<input type=checkbox>`, emitting `checked` only when set
+/// (see [`select_option`] for why the attribute is omitted rather than
+/// `="false"`). `mono` renders the label in a monospace font (backend ids).
+/// A standalone helper so the `html!` never captures the caller's locals — the
+/// plait macro would otherwise move them into per-attribute closures.
+pub(super) fn bool_checkbox(
+    name: &str,
+    value: &str,
+    label: &str,
+    checked: bool,
+    mono: bool,
+) -> plait::Html {
+    use plait::{ToHtml, html};
+    let span_class = if mono {
+        "label-text text-sm font-mono"
+    } else {
+        "label-text text-sm"
+    };
+    let name = name.to_string();
+    let value = value.to_string();
+    let label = label.to_string();
+    if checked {
+        html! {
+            label(class: "label cursor-pointer gap-2 justify-start") {
+                input(type: "checkbox", name: (name), value: (value), checked: "checked", class: "checkbox checkbox-sm");
+                span(class: (span_class)) { (label) }
+            }
+        }
+        .to_html()
+    } else {
+        html! {
+            label(class: "label cursor-pointer gap-2 justify-start") {
+                input(type: "checkbox", name: (name), value: (value), class: "checkbox checkbox-sm");
+                span(class: (span_class)) { (label) }
+            }
+        }
+        .to_html()
+    }
+}
+
+/// A datastar-submitting delete form for one CRUD row: a hidden `name` field
+/// plus a small ghost/error button, posting to `action`. Shared by the admin
+/// backends/pools editors, which otherwise duplicate this markup verbatim.
+pub(super) fn render_delete_form(action: &str, name: &str, label: &str) -> plait::Html {
+    use plait::{ToHtml, html};
+    let post = format!("@post('{action}', {{contentType: 'form'}})");
+    let action = action.to_string();
+    let name = name.to_string();
+    let label = label.to_string();
+    html! {
+        form(
+            method: "post", action: (action), "data-on:submit__prevent": (post),
+            class: "flex justify-end m-0"
+        ) {
+            input(type: "hidden", name: "name", value: (name));
+            button(type: "submit", class: "btn btn-ghost btn-xs text-error") {
+                (icons::trash(12))
+                span { (label) }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// Render a `name` text input (the primary key of a CRUD row): read-only when
+/// `readonly` (rename = delete + re-add), otherwise editable with a
+/// `placeholder`. Standalone for the same reason as [`bool_checkbox`].
+pub(super) fn pk_name_input(value: &str, placeholder: &str, readonly: bool) -> plait::Html {
+    use plait::{ToHtml, html};
+    let value = value.to_string();
+    let placeholder = placeholder.to_string();
+    if readonly {
+        html! {
+            input(type: "text", name: "name", value: (value), required: "required", readonly: "readonly", class: "input input-bordered input-sm font-mono");
+        }
+        .to_html()
+    } else {
+        html! {
+            input(type: "text", name: "name", value: (value), required: "required", placeholder: (placeholder), class: "input input-bordered input-sm font-mono");
+        }
+        .to_html()
+    }
 }
 
 /// One conversation in the sidebar list. Sourced from the persisted
@@ -200,6 +304,48 @@ pub(super) async fn read_form<T: serde::de::DeserializeOwned>(body: Body) -> Res
         .map_err(|err| toast(FlashKind::Error, format!("malformed form: {err}")))
 }
 
+/// The first value for `key` in a `Vec<(String, String)>` form body (parsed via
+/// `read_form::<Vec<_>>`), or `""` if absent. The pairs form is the general one:
+/// unlike a serde struct it preserves repeated keys — see [`fields_all`] for
+/// multi-valued checkbox groups. Shared by the admin CRUD pages.
+pub(super) fn field<'a>(pairs: &'a [(String, String)], key: &str) -> &'a str {
+    pairs
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("")
+}
+
+/// Every value submitted for `key` (a multi-valued checkbox group, e.g. a pool's
+/// `backends`), in submission order.
+pub(super) fn fields_all(pairs: &[(String, String)], key: &str) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
+        .collect()
+}
+
+/// An unchecked HTML checkbox isn't submitted at all; a checked one submits its
+/// value (`"on"` by default). Treat any present truthy value as checked.
+pub(super) fn checkbox_on(v: &str) -> bool {
+    matches!(v.trim(), "on" | "true" | "1" | "yes")
+}
+
+/// Parse a numeric form field, falling back to `default` on blank/invalid input.
+pub(super) fn parse_u32(v: &str, default: u32) -> u32 {
+    v.trim().parse().unwrap_or(default)
+}
+
+/// Split a comma-separated field into trimmed, non-empty entries.
+pub(super) fn parse_csv(v: &str) -> Vec<String> {
+    v.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
 fn render_app_sidebar(
     active: Option<NavItem>,
     user_email: &str,
@@ -260,6 +406,7 @@ fn render_app_sidebar(
                         (sidebar_nav_link("/admin/users", NavItem::Users, active, icons::users(16), &t(lang, "nav-users")))
                         (sidebar_nav_link("/admin/models", NavItem::Admin, active, icons::cpu(16), &t(lang, "nav-models")))
                         (sidebar_nav_link("/admin/backends", NavItem::Backends, active, icons::cube(16), &t(lang, "nav-backends")))
+                        (sidebar_nav_link("/admin/pools", NavItem::Pools, active, icons::sliders(16), &t(lang, "nav-pools")))
                         (sidebar_nav_link("/rag", NavItem::Rag, active, icons::database(16), &t(lang, "nav-rag")))
                         (sidebar_nav_link("/admin/skills", NavItem::Skills, active, icons::sparkles(16), &t(lang, "nav-skills")))
                         (sidebar_nav_link("/admin/connectors", NavItem::Connectors, active, icons::plug(16), &t(lang, "nav-connectors")))
@@ -1153,17 +1300,29 @@ pub use connectors::{
 // sidebar entry either.
 mod admin;
 pub use admin::{
+    models_capabilities_save as admin_models_capabilities_save,
     models_context_window_save as admin_models_context_window_save,
     models_defaults_save as admin_models_defaults_save, models_index as admin_models_index,
     models_pricing_save as admin_models_pricing_save,
     models_reasoning_budget_save as admin_models_reasoning_budget_save,
     models_reasoning_save as admin_models_reasoning_save, models_save as admin_models_save,
+    upstreams_reload as admin_upstreams_reload,
 };
 
 // Admin upstream-backends status page (`/admin/backends`). Read-only;
 // same `admin`-role gate as the model-defaults page.
 mod backends;
-pub use backends::backends_index as admin_backends_index;
+pub use backends::{
+    backends_delete as admin_backends_delete, backends_index as admin_backends_index,
+    backends_save as admin_backends_save,
+};
+
+// Admin upstream-pools CRUD page (`/admin/pools`). Same `admin`-role gate.
+mod pools;
+pub use pools::{
+    pools_delete as admin_pools_delete, pools_fallback_save as admin_pools_fallback_save,
+    pools_index as admin_pools_index, pools_save as admin_pools_save,
+};
 
 // Admin rate-limit / quota editor (`/admin/limits`). Same admin gate.
 mod limits;

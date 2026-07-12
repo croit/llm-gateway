@@ -68,7 +68,7 @@ enable --now gateway.service`.
 - **State:** point `[db].path` (and `[rag].data_dir`, if used) at the named
   volume (`/var/lib/gateway`) so they survive image swaps.
 - **Secrets** (`gateway.env`): `GATEWAY_SESSION_KEY`, `GATEWAY_OIDC_CLIENT_SECRET`,
-  optional `GATEWAY_MCP_KEY` (encrypts per-user connector tokens at rest), and any
+  optional `GATEWAY_ENCRYPTION_KEY` (encrypts per-user connector tokens at rest), and any
   per-upstream `<POOL>_API_KEY`.
 
 ---

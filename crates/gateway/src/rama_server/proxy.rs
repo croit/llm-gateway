@@ -480,6 +480,10 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
         Err(err) => return loop_error_response(err),
     };
 
+    if outcome.status >= 400 {
+        maybe_learn_capability(&state, &real_model, outcome.status, &outcome.body);
+    }
+
     let resp = Response::builder()
         .status(StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::OK))
         .header(rama::http::header::CONTENT_TYPE, "application/json")
@@ -1396,6 +1400,51 @@ fn model_object(id: String) -> Value {
 /// response. Reads the *full* upstream body into memory before responding
 /// — for the SSE-streaming chat path we'll need a different shape (next
 /// slice). This works for `/v1/models` and any non-streaming response.
+/// Fire-and-forget auto-learning: if an upstream error (`status` + `body`)
+/// pattern-matches a rejected capability (image / tool / `response_format`),
+/// record it against `model` so the gateway stops sending that content type to
+/// it. `model` is the *resolved* real id — the same key the capability read
+/// path uses (see [`crate::server::capabilities`]) — so a learned flag is found
+/// again. Admin-set `Enabled` values are never overwritten (see
+/// [`crate::server::db::model_defaults::mark_unsupported`]). No-op when the
+/// error doesn't classify.
+fn maybe_learn_capability(state: &RamaState, model: &str, status: u16, body: &[u8]) {
+    // Only 400/422 carry capability rejections. Gate on status *before* touching
+    // the body so the common error statuses (429/5xx) don't allocate a String
+    // that classify_error would immediately discard — this runs on every failed
+    // upstream response.
+    if status != 400 && status != 422 {
+        return;
+    }
+    // Classify a generous prefix, not a tiny 500-char one: providers often lead
+    // with a long error object and put the actual rejection phrase further in,
+    // so a 500-char cap misses it. 16 KiB comfortably covers any real error body
+    // while still bounding work on a pathological one.
+    let body_str = String::from_utf8_lossy(body)
+        .chars()
+        .take(16 * 1024)
+        .collect::<String>();
+    let Some(cap) = crate::server::upstreams::error_classify::classify_error(status, &body_str)
+    else {
+        return;
+    };
+    let model_key = model.to_string();
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            crate::server::db::model_defaults::mark_unsupported(&db, &model_key, cap).await
+        {
+            tracing::warn!(error = %e, "auto-learning: failed to record capability");
+        } else {
+            tracing::info!(
+                model = %model_key,
+                capability = cap.column(),
+                "auto-learning: marked capability as unsupported"
+            );
+        }
+    });
+}
+
 async fn forward(
     state: &RamaState,
     acquired: Acquired,
@@ -1413,6 +1462,7 @@ async fn forward(
     // struct field that the maintenance cost doesn't pay for itself.
     let backend = acquired.backend();
     let backend_name = backend.name.clone();
+    let model_key = acquired.resolved_model().to_string();
     let url = format!("{}/{}", backend.base_url, upstream_path);
     let started = Instant::now();
 
@@ -1480,6 +1530,11 @@ async fn forward(
         started,
         tokens_from_bytes(&bytes),
     );
+
+    // Auto-learn a rejected capability before relaying the error verbatim.
+    if !status.is_success() {
+        maybe_learn_capability(state, &model_key, status.as_u16(), &bytes);
+    }
 
     let mut builder = Response::builder()
         .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
@@ -1558,6 +1613,7 @@ async fn forward_streaming(
 
     let backend = acquired.backend();
     let backend_name = backend.name.clone();
+    let model_key = acquired.resolved_model().to_string();
     let url = format!("{}/{}", backend.base_url, upstream_path);
     let started = Instant::now();
 
@@ -1600,6 +1656,37 @@ async fn forward_streaming(
         .filter(|(n, _)| is_response_header_forwarded(n))
         .map(|(n, v)| (n.clone(), v.clone()))
         .collect();
+
+    // An upstream error on a streaming request isn't SSE — it's a plain JSON
+    // error body. Buffer it so we can classify a rejected capability (the
+    // byte-dumb stream relay below never inspects status), then relay the same
+    // status + body verbatim. Auto-learning fires before the client sees it.
+    if !status.is_success() {
+        let bytes = upstream.bytes().await.unwrap_or_default();
+        drop(acquired);
+        rec.emit(
+            &state.usage,
+            &backend_name,
+            status.as_u16(),
+            started,
+            tokens_from_bytes(&bytes),
+        );
+        maybe_learn_capability(state, &model_key, status.as_u16(), &bytes);
+        let mut builder = Response::builder().status(
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        );
+        for (name, value) in forwarded_headers {
+            builder = builder.header(name, value);
+        }
+        return builder.body(bytes.into()).unwrap_or_else(|err| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                &format!("building response: {err}"),
+            )
+        });
+    }
+
     let usage_sink = state.usage.clone();
 
     // Relay each upstream SSE frame 1:1, but tap the deltas through a
@@ -2021,13 +2108,12 @@ async fn drive_streaming_tool_loop(
                 started,
                 (None, None, None),
             );
-            return Err(format!(
-                "upstream {status}: {}",
-                String::from_utf8_lossy(&bytes)
-                    .chars()
-                    .take(500)
-                    .collect::<String>()
-            ));
+            let body_str = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(500)
+                .collect::<String>();
+            maybe_learn_capability(&state, &model, status.as_u16(), &bytes);
+            return Err(format!("upstream {status}: {body_str}"));
         }
         let status_code = upstream.status().as_u16();
 

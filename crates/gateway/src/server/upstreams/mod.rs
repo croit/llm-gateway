@@ -25,6 +25,8 @@
 //! See `docs/upstreams.md` for the wire/config shape and rationale.
 
 pub mod config;
+pub mod db_bridge;
+pub mod error_classify;
 pub mod health;
 pub mod registry;
 

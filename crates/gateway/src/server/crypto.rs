@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 croit GmbH
 
-//! At-rest encryption for per-user MCP OAuth tokens and admin-stored connector
-//! client secrets.
+//! At-rest encryption for per-user MCP OAuth tokens, admin-stored connector
+//! client secrets, and upstream backend API keys.
 //!
-//! These are dynamic, per-user/per-connector secrets that can't live in env
-//! vars the way the gateway's other credentials do, so they're stored in the
-//! database as AES-256-GCM ciphertext. Each value is encrypted under a fresh
+//! These are dynamic, admin/per-user-managed secrets that can't live in env
+//! vars the way the gateway's other credentials do — an operator adds a backend
+//! (with its key) through the admin UI at runtime, so the key must persist in
+//! the database as AES-256-GCM ciphertext rather than a process env var. Each value is encrypted under a fresh
 //! random 96-bit nonce; the DB layer keeps the `(nonce, ciphertext)` pair
 //! opaquely and never sees plaintext.
 //!
-//! Key material comes from `$GATEWAY_MCP_KEY` (64 hex chars = 32 bytes) when
-//! set; otherwise it is derived from the session secret via HMAC-SHA256 so a
-//! deployment that already configured `$GATEWAY_SESSION_KEY` gets stable,
+//! Key material comes from `$GATEWAY_ENCRYPTION_KEY` (64 hex chars = 32 bytes)
+//! when set; otherwise it is derived from the session secret via HMAC-SHA256 so
+//! a deployment that already configured `$GATEWAY_SESSION_KEY` gets stable,
 //! restart-surviving encryption for free. With neither configured (dev), an
-//! ephemeral key is used and a warning logged — stored connections won't
-//! decrypt after a restart and the user simply reconnects.
+//! ephemeral key is used and a warning logged — stored secrets won't decrypt
+//! after a restart (reconnect / re-enter them).
 
 // `aes-gcm` 0.10 pulls `generic-array` 0.14 via `aead`/`crypto-common`, whose
 // `GenericArray` re-export carries an "upgrade to generic-array 1.x"
@@ -84,12 +85,12 @@ impl Crypto {
         Self { key }
     }
 
-    /// Resolve the key: `$GATEWAY_MCP_KEY` (64 hex chars) wins; otherwise
+    /// Resolve the key: `$GATEWAY_ENCRYPTION_KEY` (64 hex chars) wins; otherwise
     /// derive a stable key from the session secret; if that's all-zero
     /// (ephemeral session key path) we still derive deterministically from it
     /// so the process is internally consistent for its lifetime.
     pub fn from_env_or_session(session_secret: &[u8; 32]) -> Self {
-        if let Ok(raw) = std::env::var("GATEWAY_MCP_KEY")
+        if let Ok(raw) = std::env::var("GATEWAY_ENCRYPTION_KEY")
             && !raw.is_empty()
         {
             match hex_decode(&raw) {
@@ -100,16 +101,20 @@ impl Crypto {
                 }
                 _ => {
                     tracing::warn!(
-                        "GATEWAY_MCP_KEY must be 64 hex chars (32 bytes); ignoring it and \
-                         deriving the MCP encryption key from the session secret instead"
+                        "GATEWAY_ENCRYPTION_KEY must be 64 hex chars (32 bytes); ignoring it and \
+                         deriving the at-rest encryption key from the session secret instead"
                     );
                 }
             }
         }
-        // HKDF-lite: HMAC-SHA256(session_secret, domain-separation label).
+        // HKDF-lite: HMAC-SHA256(session_secret, domain-separation label). The
+        // label names this key's purpose (general at-rest encryption) and is
+        // what separates it from any other key derived from the same session
+        // secret; changing it derives a different key, so bump the version
+        // suffix if the derivation ever needs to be rotated deliberately.
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(session_secret)
             .expect("HMAC accepts any key length");
-        mac.update(b"croit-llm-gateway/mcp-token-encryption/v1");
+        mac.update(b"croit-llm-gateway/at-rest-encryption/v1");
         let derived = mac.finalize().into_bytes();
         let mut key = [0u8; 32];
         key.copy_from_slice(&derived);

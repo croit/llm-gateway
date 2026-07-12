@@ -15,6 +15,7 @@ nav-usage = Usage
 nav-users = Users
 nav-models = Models
 nav-backends = Backends
+nav-pools = Pools
 nav-rag = RAG
 nav-skills = Skills
 nav-connectors = Connectors

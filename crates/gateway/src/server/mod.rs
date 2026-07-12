@@ -8,6 +8,7 @@
 //! reused by tests, a CLI tool, or a future second binding.
 
 pub mod auth;
+pub mod capabilities;
 pub mod chat_attachments;
 pub mod compaction;
 pub mod config;

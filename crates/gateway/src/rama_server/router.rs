@@ -155,10 +155,21 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         )
         .with_post("/admin/models/pricing", pages::admin_models_pricing_save)
         .with_post("/admin/models/defaults", pages::admin_models_defaults_save)
+        .with_post(
+            "/admin/models/capabilities",
+            pages::admin_models_capabilities_save,
+        )
+        .with_post("/admin/upstreams/reload", pages::admin_upstreams_reload)
         .with_get("/admin/limits", pages::admin_limits_index)
         .with_post("/admin/limits", pages::admin_limits_save)
         .with_post("/admin/limits/delete", pages::admin_limits_delete)
         .with_get("/admin/backends", pages::admin_backends_index)
+        .with_post("/admin/backends/save", pages::admin_backends_save)
+        .with_post("/admin/backends/delete", pages::admin_backends_delete)
+        .with_get("/admin/pools", pages::admin_pools_index)
+        .with_post("/admin/pools/save", pages::admin_pools_save)
+        .with_post("/admin/pools/delete", pages::admin_pools_delete)
+        .with_post("/admin/pools/fallback", pages::admin_pools_fallback_save)
         .with_get("/admin/users", pages::admin_users_index)
         // Target id rides in the POST body (not the path) — rama lowercases
         // path segments, which would mangle case-sensitive OIDC subjects.

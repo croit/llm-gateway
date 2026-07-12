@@ -41,11 +41,53 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("opening database: {e:#}"))?;
 
-    let upstreams = srv::upstreams::UpstreamRegistry::with_fallback(
-        &config.upstream_pools,
-        config.fallback.clone(),
-    )
-    .map_err(|e| anyhow::anyhow!("building upstream registry: {e}"))?;
+    // Session HMAC key + at-rest crypto, built up front (before topology seeding
+    // and the registry build): the first-boot seed seals backend API keys into
+    // the DB, and building the registry unseals them. `session_secret` is reused
+    // for the SessionStore below.
+    let session_secret = load_session_secret(&state_session_key())?;
+    let crypto = std::sync::Arc::new(srv::crypto::Crypto::from_env_or_session(&session_secret));
+
+    // On first boot (or after migrating from config-managed topology), seed
+    // the DB from config.toml. After that the DB is the source of truth and
+    // the TOML sections are ignored — admins manage topology via the UI.
+    //
+    // Gated on a persistent marker, NOT on the pool table being empty: once an
+    // admin has (re)configured topology through the UI — including deleting
+    // every pool to start over — we must not resurrect the config.toml pools on
+    // the next restart. The marker is set exactly once, after the first boot's
+    // seed succeeds. A seed failure is fatal (aborts boot) rather than logged
+    // and forgotten, so we never start serving a half-seeded topology; upserts
+    // are idempotent, so the next boot retries cleanly.
+    const SEED_MARKER: &str = "topology.seeded";
+    let already_seeded = srv::db::app_settings::get(&db, SEED_MARKER)
+        .await
+        .map_err(|e| anyhow::anyhow!("reading topology seed marker: {e:#}"))?
+        .is_some();
+    if !already_seeded {
+        if !config.upstream_pools.is_empty() {
+            tracing::info!("first boot: seeding upstream topology from config.toml to DB");
+            srv::db::upstreams_config::seed_from_config(
+                &db,
+                &config.upstream_pools,
+                &config.fallback,
+                &crypto,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("seeding upstream topology from config.toml: {e:#}"))?;
+        }
+        srv::db::app_settings::set(&db, SEED_MARKER, "1")
+            .await
+            .map_err(|e| anyhow::anyhow!("recording topology seed marker: {e:#}"))?;
+    }
+
+    // Build the registry from the DB snapshot (falls back to empty if the DB
+    // has no pools — e.g. a fresh install the admin hasn't configured yet).
+    let snapshot = srv::db::upstreams_config::load_snapshot(&db)
+        .await
+        .map_err(|e| anyhow::anyhow!("loading upstream topology from DB: {e:#}"))?;
+    let upstreams = srv::upstreams::UpstreamRegistry::from_snapshot(&snapshot, &crypto)
+        .map_err(|e| anyhow::anyhow!("building upstream registry: {e}"))?;
     // `spawn` does an initial parallel probe round before returning, so
     // the first request lands on a registry that already knows which
     // model lives where. Worst case: every backend is unreachable, in
@@ -144,12 +186,15 @@ async fn main() -> anyhow::Result<()> {
     }
     // generate_image only when an `kind = "image"` upstream pool exists —
     // same rationale as lookup_ip: don't offer the model a tool whose every
-    // call would fail with "no image backend configured".
-    if config
-        .upstream_pools
-        .values()
-        .any(|p| p.kind == srv::upstreams::PoolKind::Image)
-    {
+    // call would fail with "no image backend configured". Keyed off the live
+    // DB-backed registry (not config.toml), so the tool surface matches the
+    // topology the admin actually configured through the UI.
+    let image_pools: Vec<_> = upstreams
+        .pools()
+        .into_iter()
+        .filter(|p| p.kind == srv::upstreams::PoolKind::Image)
+        .collect();
+    if !image_pools.is_empty() {
         tool_registry = tool_registry.with(srv::tools::generate_image::GenerateImage);
         tracing::info!(tool = "generate_image", "registered image-generation tool");
     } else {
@@ -159,9 +204,10 @@ async fn main() -> anyhow::Result<()> {
     // "don't offer a tool that can only fail" rule. z.AI's GLM-Image is
     // generation-only (supports_edit = false); a self-hosted Qwen-Image-Edit
     // sets it true.
-    if config.upstream_pools.values().any(|p| {
-        p.kind == srv::upstreams::PoolKind::Image && p.backend.iter().any(|b| b.supports_edit)
-    }) {
+    if image_pools
+        .iter()
+        .any(|p| p.backends.iter().any(|b| b.supports_edit()))
+    {
         tool_registry = tool_registry.with(srv::tools::edit_image::EditImage);
         tracing::info!(tool = "edit_image", "registered image-editing tool");
     } else {
@@ -289,9 +335,9 @@ async fn main() -> anyhow::Result<()> {
     }
     let tools = Arc::new(tool_registry);
 
-    // Session HMAC key, read from $GATEWAY_SESSION_KEY — a single 64-hex
-    // value (32 bytes) so an operator only has to configure one knob.
-    let session_secret = load_session_secret(&state_session_key())?;
+    // Session store reuses the HMAC key derived up top. `crypto` (also built
+    // up top) is the same at-rest key used for per-user MCP OAuth tokens,
+    // connector client secrets, and backend API keys.
     let sessions = SessionStore::new(db.clone(), session_secret);
 
     // Seed the built-in MCP connector catalog (all disabled) so an admin only
@@ -301,8 +347,6 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = srv::db::mcp_catalog::seed_defaults(&db).await {
         tracing::warn!(error = %err, "seeding default MCP connectors failed");
     }
-    // At-rest key for per-user MCP OAuth tokens + connector client secrets.
-    let mcp_crypto = std::sync::Arc::new(srv::crypto::Crypto::from_env_or_session(&session_secret));
 
     // Retry OIDC discovery so transient failures don't crash the
     // gateway. After exhaustion we boot
@@ -310,7 +354,7 @@ async fn main() -> anyhow::Result<()> {
     let oidc = build_oidc_with_retry(&config).await;
 
     let mut state = AppState::new(config, db, upstreams, tools, rbac)
-        .with_mcp_crypto(mcp_crypto)
+        .with_crypto(crypto)
         .with_typst_templates(typst_metas);
     if let Some(client) = oidc {
         state = state.with_oidc(client);

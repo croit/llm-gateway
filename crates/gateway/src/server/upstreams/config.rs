@@ -139,6 +139,11 @@ pub struct BackendConfig {
     pub name: String,
     pub base_url: String,
     pub api_key_env: Option<String>,
+    /// The API key value itself. Normally left unset in TOML (use `api_key_env`
+    /// there); the DB topology path populates it with the decrypted stored key
+    /// (see `db_bridge`). When present it takes precedence over `api_key_env`.
+    #[serde(default)]
+    pub api_key: Option<String>,
     #[serde(default = "default_weight")]
     pub weight: u32,
     #[serde(default = "default_max_inflight")]
@@ -208,12 +213,19 @@ pub struct BackendConfig {
 pub enum AliasSpec {
     Names(Vec<String>),
     Targets(HashMap<String, String>),
+    /// Per-alias optional targets — a mix of bare (`None`) and explicitly
+    /// targeted (`Some`) aliases on one backend. TOML can't express this (it's
+    /// either an array or a table), so it never deserialises to this variant;
+    /// it exists only for the DB topology path (see `db_bridge`), where each
+    /// alias row carries its own `Option<target>`. Listed last so the untagged
+    /// deserializer always prefers `Names`/`Targets` for TOML input.
+    Mixed(HashMap<String, Option<String>>),
 }
 
 impl AliasSpec {
     /// Normalise to `alias name → optional explicit target`. A list entry maps
     /// to `None` (resolve to the backend's sole model at request time); a map
-    /// entry maps to `Some(real_id)`.
+    /// entry maps to `Some(real_id)`; a mixed entry is already in this shape.
     pub fn into_map(&self) -> HashMap<String, Option<String>> {
         match self {
             AliasSpec::Names(names) => names.iter().map(|n| (n.clone(), None)).collect(),
@@ -221,6 +233,7 @@ impl AliasSpec {
                 .iter()
                 .map(|(k, v)| (k.clone(), Some(v.clone())))
                 .collect(),
+            AliasSpec::Mixed(m) => m.clone(),
         }
     }
 }
@@ -273,13 +286,16 @@ fn default_health_path() -> String {
 }
 
 impl BackendConfig {
-    /// Reads `api_key_env`'s env var, if any. Returns `None` when the var is
-    /// unset or empty.
+    /// The effective API key: the direct [`api_key`](Self::api_key) value (from
+    /// the DB, decrypted) wins; otherwise the referenced `api_key_env` var is
+    /// read from the environment. `None` when neither yields a non-empty value.
     pub fn api_key(&self) -> Option<String> {
-        self.api_key_env
-            .as_deref()
-            .and_then(|name| std::env::var(name).ok())
-            .filter(|v| !v.is_empty())
+        self.api_key.clone().filter(|v| !v.is_empty()).or_else(|| {
+            self.api_key_env
+                .as_deref()
+                .and_then(|name| std::env::var(name).ok())
+                .filter(|v| !v.is_empty())
+        })
     }
 }
 

@@ -19,7 +19,7 @@ the user, but getting a provider's OAuth app into a state where that click
 works is fiddly and provider-specific. The painful parts (Google especially)
 are documented here so you don't have to rediscover them.
 
-> Tokens are encrypted with `GATEWAY_MCP_KEY` (AES-256-GCM). See the main
+> Tokens are encrypted with `GATEWAY_ENCRYPTION_KEY` (AES-256-GCM). See the main
 > [`README`](../README.md) for how the key is derived if unset. In dev with no
 > key, connections don't survive a restart — users just reconnect.
 

@@ -60,7 +60,7 @@ services:
     # Loopback only — front with a TLS-terminating reverse proxy in production.
     ports:
       - "127.0.0.1:8080:8080"
-    # GATEWAY_SESSION_KEY, GATEWAY_OIDC_CLIENT_SECRET, GATEWAY_MCP_KEY, and any
+    # GATEWAY_SESSION_KEY, GATEWAY_OIDC_CLIENT_SECRET, GATEWAY_ENCRYPTION_KEY, and any
     # per-upstream <POOL>_API_KEY referenced from gateway.toml.
     env_file:
       - gateway.env

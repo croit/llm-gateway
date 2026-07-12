@@ -26,3 +26,30 @@ backends-alias-target-title = Alias → { $target }
 backends-alias-disabled-label = { $name } (deaktiviert)
 backends-alias-disabled-title = Bare-Alias deaktiviert — dieses Backend bedient mehrere Modelle; geben Sie ihm ein explizites Ziel (Zuordnungsformular)
 backends-alias-bare-title = Alias → Modell dieses Backends
+
+# Backend-CRUD-Editor (Backends in der DB-Topologie hinzufügen/bearbeiten/löschen).
+backends-manage-heading = Backends verwalten
+backends-manage-description = Upstream-Backends hinzufügen, bearbeiten oder entfernen. Änderungen werden in der Datenbank gespeichert, werden aber erst wirksam, wenn Sie auf „Änderungen anwenden“ klicken.
+backends-apply-changes = Änderungen anwenden
+backends-add-heading = Backend hinzufügen
+backends-field-name = Name
+backends-field-base-url = Basis-URL
+backends-field-api-key-env = API-Schlüssel-Umgebungsvariable
+backends-field-health-path = Health-Pfad
+backends-field-weight = Gewichtung
+backends-field-max-inflight = Max. gleichzeitig
+backends-field-models = Modelle (kommagetrennt)
+backends-field-aliases = Aliase (name=target pro Zeile)
+backends-field-probe-models = Modelle über /models-Probe erkennen
+backends-field-supports-edit = Unterstützt Bildbearbeitung
+backends-save-backend = Backend speichern
+backends-add-backend = Backend hinzufügen
+backends-delete-backend = Löschen
+backends-error-name-required = Backend-Name ist erforderlich
+backends-error-base-url-required = Basis-URL ist erforderlich
+backends-saved = Backend `{ $name }` gespeichert — klicken Sie auf „Änderungen anwenden“, um neu zu laden
+backends-deleted = Backend `{ $name }` gelöscht — klicken Sie auf „Änderungen anwenden“, um neu zu laden
+
+backends-field-api-key = API-Schlüssel
+backends-field-api-key-placeholder = API-Schlüssel (verschlüsselt gespeichert)
+backends-field-api-key-keep = leer lassen, um den aktuellen Schlüssel zu behalten

@@ -78,7 +78,7 @@ The UI is fully localized — English, German, French, Spanish, Russian, and Chi
 | | |
 |---|---|
 | ![The backends page: each upstream pool with its kind, load-balancing strategy, per-backend health, in-flight load against capacity, and the models each one currently advertises.](docs/img/backends.png) | ![The RAG page: a form to index a new collection from a git repo (embedding model, branch, include/exclude globs, chunk size) and a list of existing collections with their indexing status.](docs/img/rag.png) |
-| **Backends** (`/admin/backends`) — live health, in-flight load, and discovered models for every upstream pool. | **RAG** (`/rag`) — index a codebase from a git URL and watch it go from *pending* to *ready*. |
+| **Backends** (`/admin/backends`) — live health, in-flight load, and discovered models for every upstream pool, plus add/edit/delete of the backends themselves (API key stored encrypted, so a new backend goes live on "Apply changes" without a restart); **Pools** (`/admin/pools`) groups them by kind. | **RAG** (`/rag`) — index a codebase from a git URL and watch it go from *pending* to *ready*. |
 
 There's also `/tokens` (mint, rotate, and revoke your `gwk_…` API tokens — and scope each token to a subset of your tools), `/usage` (your own request/token usage, plus spend when per-model prices are set), `/memory` (view and edit what the assistant has remembered about you), `/scheduled` (prompts that run on a cron schedule — see [Scheduled actions](#scheduled-actions)), `/admin/models` (server-wide sampling defaults, per-model reasoning budgets, per-model context windows that drive [conversation compaction](#conversation-compaction), per-model **prices** (input/output per 1M tokens) that turn token usage into spend on `/usage`, and the per-feature **default model** pre-selected for chat, voice, image generation, and the RAG embedding picker), `/admin/limits` (rate limits & quotas — see below), and `/admin/users` (registered users with their resolved roles). The users page can also let an admin **impersonate** another user for debugging — every impersonation is audited and shows a persistent banner. Impersonation is **opt-in**: it's off unless you set `[gateway].allow_impersonation = true` (default `false`), in which case the Impersonate buttons appear and `POST /admin/users/impersonate` is accepted; otherwise the buttons are hidden and that endpoint returns 403.
 
@@ -224,7 +224,7 @@ strategy = "least_inflight"                        # or "round_robin"
 [[upstream_pools.local_chat.backend]]
 name     = "gpu-01"
 base_url = "http://gpu-01.internal:8000/v1"
-# api_key_env = "GPU01_KEY"                         # if the backend itself needs a bearer token
+# api_key_env = "GPU01_KEY"                         # if the backend needs a bearer token (env-var fallback)
 # alias    = ["qwen", "fast"]                       # stable client-facing names → this backend's model
 
 # Needed for sign-in + token minting. Without it, /auth/login and the /login page don't work.
@@ -241,10 +241,10 @@ The environment variables that config refers to:
 ```bash
 export GATEWAY_SESSION_KEY=$(openssl rand -hex 32)   # 32 random bytes, hex-encoded
 export GATEWAY_OIDC_CLIENT_SECRET=…                  # from your OIDC provider
-export GATEWAY_MCP_KEY=$(openssl rand -hex 32)       # optional: 32-byte key encrypting per-user MCP connector OAuth tokens at rest
+export GATEWAY_ENCRYPTION_KEY=$(openssl rand -hex 32) # optional: 32-byte key encrypting the DB's at-rest secrets
 ```
 
-`GATEWAY_MCP_KEY` is optional: it's the AES-256-GCM key under which each user's MCP-connector OAuth tokens (and admin-stored connector client secrets) are encrypted in the database. If unset, the gateway derives a stable key from `GATEWAY_SESSION_KEY`; if *that's* also unset (dev), an ephemeral key is used and stored connections won't survive a restart (users simply reconnect). Set it explicitly if you want connector encryption decoupled from session-cookie signing.
+`GATEWAY_ENCRYPTION_KEY` is optional: it's the AES-256-GCM key under which the gateway's database-stored secrets are encrypted — each user's MCP-connector OAuth tokens, admin-stored connector client secrets, and **upstream backend API keys entered through the admin UI**. If unset, the gateway derives a stable key from `GATEWAY_SESSION_KEY`; if *that's* also unset (dev), an ephemeral key is used and stored secrets won't survive a restart (users reconnect; re-enter backend keys). Set it explicitly if you want at-rest encryption decoupled from session-cookie signing. **Rotating this key invalidates already-stored ciphertext** — re-enter backend keys (or keep them in env vars via `api_key_env`) after a change. *(Formerly `GATEWAY_MCP_KEY`. If you set it explicitly, rename the env var to the same value and nothing else changes. If you relied on the key derived from `GATEWAY_SESSION_KEY` (env unset), the derivation changed in this release — reconnect MCP connectors and re-enter backend keys once after upgrading.)*
 
 Optional blocks, each documented inline in `gateway.example.toml`:
 
@@ -360,7 +360,7 @@ openai api chat_completions.create -m <model-id> -g user "Hello"
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness probes. |
 | `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled`, `/webhooks`, `/integrations`, `/usage` | session cookie | Web UI (`/integrations` is the per-user MCP connector store; `/webhooks` manages your inbound triggers; `/usage` shows your own request/token usage; admins get an in-page "All users" toggle). |
 | `/hooks/{secret}` | secret in URL | Fire a webhook: runs the owner's saved prompt with the request body appended as an untrusted block. Accepts GET and POST; sync webhooks return the model output as a JSON envelope, async ones return `202`. |
-| `/admin/users`, `/rag`, `/admin/models`, `/admin/backends`, `/admin/skills`, `/admin/connectors`, `/admin/limits` | admin role | Admin UI (the users page lists registered users and starts impersonation; connectors curates the MCP catalog — see [`docs/connectors.md`](docs/connectors.md) for provider setup; limits sets per-global/role/user rate limits & quotas). |
+| `/admin/users`, `/rag`, `/admin/models`, `/admin/backends`, `/admin/pools`, `/admin/skills`, `/admin/connectors`, `/admin/limits` | admin role | Admin UI (the users page lists registered users and starts impersonation; backends/pools edit the upstream topology in the DB and hot-reload it via "Apply changes"; connectors curates the MCP catalog — see [`docs/connectors.md`](docs/connectors.md) for provider setup; limits sets per-global/role/user rate limits & quotas). |
 | `POST /impersonate/stop` | session cookie | End an active impersonation and return to your own account. |
 | `/feedback`, `/feedback/extract`, `/feedback/config` | session cookie | Feedback widget: file a GitHub issue, turn a voice transcript into structured fields, and report whether the feature is configured. Enabled by the `[feedback]` config block. |
 | `/api/v0/*` | session cookie | JSON APIs backing the UI. |

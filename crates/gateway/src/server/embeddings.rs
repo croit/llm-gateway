@@ -163,6 +163,7 @@ mod tests {
                     name: "mock".into(),
                     base_url: upstream_url.into(),
                     api_key_env: None,
+                    api_key: None,
                     weight: 1,
                     max_inflight: 16,
                     health_path: "/models".into(),
@@ -175,7 +176,11 @@ mod tests {
         );
         let registry = UpstreamRegistry::new(&pools).unwrap();
         // Skip the health probe in tests — seed the advertised set directly.
-        let pool = registry.pools().find(|p| p.name == "embed").unwrap();
+        let pool = registry
+            .pools()
+            .into_iter()
+            .find(|p| p.name == "embed")
+            .unwrap();
         pool.backends[0].set_models(HashSet::from([model.to_string()]));
         registry
     }

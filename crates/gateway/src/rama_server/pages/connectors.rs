@@ -162,7 +162,7 @@ pub async fn connectors_save(State(state): State<Arc<RamaState>>, req: Request) 
     // otherwise leave the stored value untouched (edit) or unset (create).
     let secret_plain = parsed.client_secret.or_else(|| clean(form.client_secret));
     let sealed = match secret_plain {
-        Some(secret) => match state.mcp_crypto.seal_str(&secret) {
+        Some(secret) => match state.crypto.seal_str(&secret) {
             Ok(s) => Some(s),
             Err(err) => {
                 return internal_error_html(

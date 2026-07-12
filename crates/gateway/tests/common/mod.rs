@@ -47,6 +47,7 @@ fn mock_backend(name: &str, base_url: &str) -> BackendConfig {
         name: name.into(),
         base_url: base_url.into(),
         api_key_env: None,
+        api_key: None,
         weight: 1,
         max_inflight: 16,
         health_path: "/models".into(),
@@ -224,6 +225,7 @@ async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool
                 name: "mock".into(),
                 base_url: upstream_url.into(),
                 api_key_env: None,
+                api_key: None,
                 weight: 1,
                 max_inflight: 16,
                 health_path: "/models".into(),
@@ -276,6 +278,7 @@ pub fn seed_pool_models(
     use std::collections::HashSet;
     let pool = registry
         .pools()
+        .into_iter()
         .find(|p| p.name == pool_name)
         .expect("seed_pool_models: pool not found");
     let set: HashSet<String> = models.iter().map(|s| (*s).to_string()).collect();

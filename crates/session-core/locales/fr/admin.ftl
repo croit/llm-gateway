@@ -85,3 +85,19 @@ admin-other-intro = Modèles d’embedding, d’image, de synthèse vocale et de
 admin-aliases-heading = Alias
 admin-aliases-intro = Ces noms sont des alias d’un autre modèle. Ils n’ont ni réglages ni tarif propres — chaque requête est configurée et facturée comme le modèle vers lequel elle est résolue.
 admin-alias-chip = alias
+
+# Model capabilities (vision, tools, structured output) + fallback model refs.
+admin-capabilities-heading = Capabilities
+admin-cap-unknown = Unknown
+admin-cap-enabled = Enabled
+admin-cap-disabled = Disabled
+admin-cap-structured-output = Structured output
+admin-cap-no-fallback = (none)
+admin-cap-fallback-vision = Fallback for vision
+admin-cap-fallback-tools = Fallback for tools
+admin-capabilities-saved = saved capabilities for `{ $model }`
+admin-capabilities-error = failed to save capabilities: { $err }
+
+# Upstream topology reload ("Apply changes" button).
+admin-reloaded = reloaded { $pools } pools, { $backends } backends
+admin-reload-error = reload failed: { $err }

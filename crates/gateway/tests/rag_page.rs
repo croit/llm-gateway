@@ -279,6 +279,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
                 name: "mock".into(),
                 base_url: "http://unused.invalid".into(),
                 api_key_env: None,
+                api_key: None,
                 weight: 1,
                 max_inflight: 16,
                 health_path: "/models".into(),
@@ -303,6 +304,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
                 name: "chat".into(),
                 base_url: "http://unused.invalid".into(),
                 api_key_env: None,
+                api_key: None,
                 weight: 1,
                 max_inflight: 16,
                 health_path: "/models".into(),
@@ -312,7 +314,11 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
     );
     let registry = UpstreamRegistry::new(&pools).unwrap();
     // Seed two embedding models on the embedding pool.
-    let embed = registry.pools().find(|p| p.name == "embed").unwrap();
+    let embed = registry
+        .pools()
+        .into_iter()
+        .find(|p| p.name == "embed")
+        .unwrap();
     embed.backends[0].set_models(HashSet::from([
         "bge-small-en-v1.5".to_string(),
         "voyage-3".to_string(),
