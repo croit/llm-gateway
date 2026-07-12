@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod cors;
 pub mod oidc_handlers;
 pub mod pages;
 pub mod proxy;
