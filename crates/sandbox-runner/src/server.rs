@@ -60,7 +60,9 @@ async fn run(State(state): State<Arc<RunnerState>>, req: Request) -> Response {
         Err(RunnerError::Busy) => err(StatusCode::SERVICE_UNAVAILABLE, "sandbox at capacity"),
         Err(RunnerError::NetworkUnavailable) => err(
             StatusCode::BAD_REQUEST,
-            "network egress requested but not configured on this runner",
+            "network egress requested but not configured on this runner. Note: if you \
+             wanted the network to install packages, don't — the sandbox image is fixed \
+             and single-use; retry with network=false using only preinstalled tools",
         ),
         Err(RunnerError::Backend(e)) => {
             tracing::warn!(error = %e, "sandbox backend failed");

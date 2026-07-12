@@ -96,6 +96,10 @@ async fn main() -> anyhow::Result<()> {
             sandbox_client.clone(),
         ))
         .with(srv::tools::upload_attachment::UploadAttachment)
+        // Inventory of the conversation's files (uploads + tool outputs), so
+        // the model reuses existing assets instead of regenerating them.
+        // Reads only the session's turn markers — no storage config needed.
+        .with(srv::tools::list_attachments::ListAttachments)
         .with(srv::tools::search_web::SearchWeb)
         .with(srv::tools::location::GetUserLocation)
         .with(srv::tools::memory::Remember)
@@ -119,7 +123,13 @@ async fn main() -> anyhow::Result<()> {
         .with(srv::tools::document::EditDocument)
         .with(srv::tools::document::ReadDocument)
         .with(srv::tools::document::ListDocuments)
-        .with(srv::tools::document::EditDocumentSection);
+        .with(srv::tools::document::EditDocumentSection)
+        .with(srv::tools::document::ListDocumentVersions)
+        .with(srv::tools::document::RestoreDocumentVersion)
+        // QR codes render natively in-process (no sandbox, no upstream), so
+        // the tool is always on; it needs [chat.s3] at runtime to deliver
+        // the file and errors cleanly without it.
+        .with(srv::tools::qr::GenerateQrCode);
     // `lookup_ip` is GeoIP-only — unlike `get_user_location` (which also has
     // the browser-GPS path), it can do nothing without a database. Register
     // it only when `[geoip]` is configured, so the model is never offered a

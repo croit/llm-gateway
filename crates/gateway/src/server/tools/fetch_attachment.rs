@@ -325,7 +325,9 @@ impl Tool for FetchAttachment {
                         "type": "string",
                         "description": "Opaque attachment id of the form \
                                         `<turn_id>/<filename>` exactly as it \
-                                        appeared in the replay stub."
+                                        appeared in the replay stub — or just a \
+                                        filename from this conversation (newest \
+                                        match wins; chat sessions only)."
                     },
                     "max_bytes": {
                         "type": "integer",
@@ -353,9 +355,34 @@ impl Tool for FetchAttachment {
     fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
         let sandbox = self.sandbox.clone();
         Box::pin(async move {
-            let args: FetchArgs = serde_json::from_value(args)
+            let mut args: FetchArgs = serde_json::from_value(args)
                 .map_err(|e| ToolError::InvalidArgs(format!("expected {{id, max_bytes?}}: {e}")))?;
 
+            // A bare filename (no `/`) resolves against the session's
+            // attachments, newest match first — so the model can re-read a
+            // file it produced earlier without tracking turn ids. Only the
+            // chat path has a session to resolve against.
+            if !args.id.contains('/') {
+                let Some(session_id) = ctx.session_id.as_deref() else {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "`{}` is not a `<turn_id>/<filename>` id — bare filenames resolve \
+                         only inside a chat session",
+                        args.id
+                    )));
+                };
+                let atts = chat_attachments::list_session_attachments(&ctx.db, session_id)
+                    .await
+                    .map_err(|e| ToolError::Failed(format!("listing session attachments: {e}")))?;
+                args.id = chat_attachments::resolve_attachment(&atts, &args.id)
+                    .map(|a| a.id.clone())
+                    .ok_or_else(|| {
+                        ToolError::InvalidArgs(format!(
+                            "no attachment named `{}` in this conversation — call \
+                             `list_attachments` to see what exists",
+                            args.id
+                        ))
+                    })?;
+            }
             let (turn_id, filename) = split_id(&args.id)?;
             let s3 = ctx.s3.as_ref().ok_or_else(|| {
                 ToolError::Failed(

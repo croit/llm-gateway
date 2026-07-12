@@ -64,12 +64,17 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 #     are pre-generated (no bindgen/clang at build time) and `pdfium` itself
 #     is loaded *dynamically at runtime* — the build never needs the native
 #     library, and when it's absent at runtime the tool returns a clean
-#     "renderer unavailable" note instead of crashing. `image` (MIT/Apache-2.0,
-#     png-only to keep the codec set minimal) encodes the rendered bitmaps to
-#     PNG for the vision `image_url` content parts.
+#     "renderer unavailable" note instead of crashing. `image` (MIT/Apache-2.0)
+#     encodes the rendered bitmaps to PNG for the vision `image_url` content
+#     parts; jpeg/webp are enabled so `generate_qr_code` can decode uploaded
+#     logo images — the codec set stays deliberately small.
 pdf-extract = "0.10"
 pdfium-render = "0.9"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# QR code generation for the native `generate_qr_code` tool. Encoder only
+# (default features off — we render SVG/PNG ourselves via `image` so the
+# tool controls colors and logo overlay).
+qrcode = { version = "0.14", default-features = false }
 
 async-trait = "0.1"
 

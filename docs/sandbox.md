@@ -102,7 +102,9 @@ handle office files, and convert formats without runtime network:
 - **PDF:** poppler-utils, ghostscript, qpdf, pypdf, pdfplumber, **pymupdf**,
   reportlab, img2pdf.
 - **Images/OCR/media:** ffmpeg, imagemagick (PDF/PS coders enabled), libvips,
-  pillow, opencv, **tesseract OCR** (eng+deu) via pytesseract.
+  pillow, opencv, **tesseract OCR** (eng+deu) via pytesseract; **segno** +
+  qrcode for QR codes (png/svg, WiFi/vCard/EPC helpers) — offline, no network
+  needed.
 - **Docs/diagrams:** pandoc, typst (0.15, with the offline-cached
   `@preview/gribouille` ggplot-style charts package + its cetz backend),
   **excalirender** (`.excalidraw` → svg/png/pdf, bundles its own fonts),
@@ -139,6 +141,27 @@ Because gateway↔runner is just HTTP, the runner tier can live on separate
 hosts and scale independently (each runner uses its own host's local podman) —
 but then the channel MUST be mTLS-protected and the runner MUST NOT be publicly
 reachable (it's arbitrary-code-execution as a service).
+
+### Files across runs: attachments ARE the persistent store
+
+Runs are stateless by design, but files still persist *across* runs — through
+the conversation's attachment store, not a shared volume:
+
+- every artifact a run produces is uploaded as a chat attachment (S3) and
+  stays addressable for the rest of the conversation;
+- a later run pulls any of them back into `/work` by listing it in
+  `attachments` — by exact `<turn>/<file>` id **or just its filename**
+  (newest match wins), so the model doesn't have to track turn ids;
+- `list_attachments` gives the model an inventory of everything available.
+
+A runner-side persistent directory (a per-conversation `shared/` mount) was
+considered and rejected: it would break the single-use container model (state
+bleeding across runs is exactly what the destroy-after-use design rules out),
+it doesn't survive a multi-runner deployment without a shared filesystem, and
+the staging path above already delivers the same UX (persist + reuse) through
+storage that's session-scoped and already access-controlled. If run-to-run
+state ever becomes a real need, stage-in/stage-out through S3 under a
+`shared/` prefix — not a mount — is the compatible shape.
 
 ## Pieces in this repo
 

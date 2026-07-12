@@ -112,6 +112,11 @@ RUN pip install --no-cache-dir \
         pdf2docx \
         # images / computer vision / OCR
         pillow opencv-python-headless imageio pytesseract \
+        # QR codes — segno (pure python, SVG/PNG built in, WiFi/vCard/EPC
+        # helpers in segno.helpers) + qrcode (the classic API; PNG via the
+        # pillow above). Both tiny; two libs so whichever API the model
+        # reaches for just works offline.
+        segno qrcode \
         # parsing + http (in-sandbox fetching when egress is on)
         lxml beautifulsoup4 requests python-dateutil regex \
         # databases + network/ops clients (runtime use still egress-gated)

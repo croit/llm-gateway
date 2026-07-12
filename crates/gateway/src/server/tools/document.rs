@@ -2,7 +2,8 @@
 // Copyright (C) 2026 croit GmbH
 
 //! The document canvas tools — `create_document`, `edit_document`,
-//! `read_document`, `list_documents`.
+//! `read_document`, `list_documents`, `edit_document_section`,
+//! `list_document_versions`, `restore_document_version`.
 //!
 //! Let the model build up a long document (a guide, a spec, a config) over
 //! many turns and change one passage at a time, instead of regenerating
@@ -205,13 +206,18 @@ impl Tool for CreateDocument {
             self.id(),
             "Start a new long-form document that you can then grow and edit \
              one passage at a time across turns — WITHOUT rewriting the whole \
-             thing each round. Use this for anything substantial you build up \
-             with the user: a guide, a spec, an article, a config file. It \
-             appears in a live canvas panel beside the chat. Returns a \
-             `document_id`; pass it to `edit_document` to change a passage, \
-             `read_document` to re-read it, `list_documents` to find it later. \
-             Prefer this over pasting a growing document back into chat every \
-             turn.",
+             thing each round. This is the DEFAULT home for anything \
+             substantial you write for the user: a guide, a spec, an article, \
+             a letter, a config file. It appears in a live canvas panel \
+             beside the chat, every change becomes a new version (roll back \
+             any time with `restore_document_version`), and several documents \
+             can coexist in one conversation. Returns a `document_id`; pass \
+             it to `edit_document` to change a passage, `read_document` to \
+             re-read it, `list_documents` to find it later, and \
+             `export_document` to hand the user a finished PDF/Word/PowerPoint. \
+             Prefer this over pasting a growing document into chat each turn \
+             or one-shot rendering (`generate_document`/`render_typst`) — \
+             those can't be revised passage by passage.",
             serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -623,6 +629,158 @@ impl Tool for ListDocuments {
 }
 
 // ---------------------------------------------------------------------------
+// list_document_versions
+
+pub struct ListDocumentVersions;
+
+impl Tool for ListDocumentVersions {
+    fn id(&self) -> &str {
+        "list_document_versions"
+    }
+
+    fn schema(&self) -> ToolDef {
+        ToolDef::function(
+            self.id(),
+            "List a document's version history — every revision's number, edit \
+             summary, timestamp, and size (newest first). Use it to find the \
+             version to inspect (`read_document` with `version`) or to roll \
+             back to (`restore_document_version`).",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["document_id"],
+                "properties": {
+                    "document_id": { "type": "string", "description": "The id from `create_document`." }
+                }
+            }),
+        )
+    }
+
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let session_id = require_session(&ctx)?.to_string();
+            let document_id = args
+                .get("document_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::InvalidArgs("`document_id` is required".into()))?;
+            let versions = documents::list_versions(&ctx.db, &session_id, document_id)
+                .await
+                .map_err(|e| ToolError::Failed(format!("listing versions: {e}")))?;
+            if versions.is_empty() {
+                return Err(ToolError::InvalidArgs(format!(
+                    "no document `{document_id}` in this conversation — \
+                     call `list_documents` to see the ids"
+                )));
+            }
+            let items: Vec<Value> = versions
+                .iter()
+                .map(|v| {
+                    serde_json::json!({
+                        "version": v.version,
+                        "summary": v.summary,
+                        "created_at": v.created_at.to_string(),
+                        "chars": v.chars,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "document_id": document_id,
+                "current_version": items[0]["version"],
+                "versions": items,
+            }))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// restore_document_version
+
+pub struct RestoreDocumentVersion;
+
+impl Tool for RestoreDocumentVersion {
+    fn id(&self) -> &str {
+        "restore_document_version"
+    }
+
+    fn schema(&self) -> ToolDef {
+        ToolDef::function(
+            self.id(),
+            "Roll a document back to an earlier version. Non-destructive: the \
+             old content is re-applied as a NEW version, so the history stays \
+             intact and even the rollback can be rolled back. Find version \
+             numbers with `list_document_versions`.",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["document_id", "version"],
+                "properties": {
+                    "document_id": { "type": "string", "description": "The id from `create_document`." },
+                    "version": { "type": "integer", "description": "The version number to restore." }
+                }
+            }),
+        )
+    }
+
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let session_id = require_session(&ctx)?.to_string();
+            let obj = args
+                .as_object()
+                .ok_or_else(|| ToolError::InvalidArgs("expected an object".into()))?;
+            let document_id = obj
+                .get("document_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::InvalidArgs("`document_id` is required".into()))?;
+            let version = obj.get("version").and_then(Value::as_i64).ok_or_else(|| {
+                ToolError::InvalidArgs("`version` (an integer) is required".into())
+            })?;
+
+            let (doc, ver) =
+                documents::get_version(&ctx.db, &session_id, document_id, Some(version))
+                    .await
+                    .map_err(|e| ToolError::Failed(format!("reading document: {e}")))?
+                    .ok_or_else(|| {
+                        ToolError::InvalidArgs(format!(
+                            "no version {version} of document `{document_id}` in this \
+                             conversation — call `list_document_versions` to see the history"
+                        ))
+                    })?;
+            if version == doc.current_ver {
+                return Err(ToolError::InvalidArgs(format!(
+                    "version {version} is already the current version — nothing to restore"
+                )));
+            }
+
+            let note = format!("Restored version {version}");
+            let updated = documents::append_version(
+                &ctx.db,
+                &session_id,
+                document_id,
+                &ver.content,
+                Some(&note),
+                ctx.assistant_turn_id.as_deref(),
+            )
+            .await
+            .map_err(|e| ToolError::Failed(format!("saving restore: {e}")))?
+            .ok_or_else(|| ToolError::Failed("document vanished mid-restore".into()))?;
+
+            live_update(&ctx, &session_id, document_id).await;
+
+            Ok(serde_json::json!({
+                "document_id": document_id,
+                "restored_version": version,
+                "version": updated.current_ver,
+                "status": format!(
+                    "Version {version} is now the current content (saved as version {}); \
+                     the canvas refreshed.",
+                    updated.current_ver
+                ),
+            }))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // edit_document_section (markdown)
 
 pub struct EditDocumentSection;
@@ -1019,6 +1177,77 @@ mod tests {
                     "edits": [{"find": "nowhere", "replace": "x"}]
                 }),
             )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn tool_runtime_version_history_and_rollback() {
+        let pool = seeded_pool().await;
+        let c = ctx(pool, "s1");
+        let created = CreateDocument
+            .run(
+                c.clone(),
+                serde_json::json!({
+                    "title": "Guide", "format": "markdown", "content": "v1 body"
+                }),
+            )
+            .await
+            .unwrap();
+        let id = created["document_id"].as_str().unwrap().to_string();
+        EditDocument
+            .run(
+                c.clone(),
+                serde_json::json!({
+                    "document_id": id,
+                    "edits": [{"find": "v1 body", "replace": "v2 body"}],
+                    "summary": "rewrote body"
+                }),
+            )
+            .await
+            .unwrap();
+
+        // History lists both versions, newest first, with summaries.
+        let hist = ListDocumentVersions
+            .run(c.clone(), serde_json::json!({"document_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(hist["current_version"], 2);
+        let versions = hist["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0]["version"], 2);
+        assert_eq!(versions[0]["summary"], "rewrote body");
+        assert_eq!(versions[1]["summary"], "Created");
+
+        // Rollback to v1 appends a NEW version 3 with v1's content.
+        let restored = RestoreDocumentVersion
+            .run(
+                c.clone(),
+                serde_json::json!({"document_id": id, "version": 1}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored["version"], 3);
+        let read = ReadDocument
+            .run(c.clone(), serde_json::json!({"document_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(read["content"], "v1 body");
+        assert_eq!(read["version"], 3);
+
+        // Restoring the current version is a clean error, as is an
+        // unknown version.
+        let err = RestoreDocumentVersion
+            .run(
+                c.clone(),
+                serde_json::json!({"document_id": id, "version": 3}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
+        let err = RestoreDocumentVersion
+            .run(c, serde_json::json!({"document_id": id, "version": 99}))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");

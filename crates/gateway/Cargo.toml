@@ -130,7 +130,15 @@ pdf-extract = { workspace = true }
 pdfium-render = { workspace = true }
 image = { workspace = true }
 
+# QR encoding for the `generate_qr_code` tool (rendering is done in-tree
+# via `image`, so this stays a pure encoder dependency).
+qrcode = { workspace = true }
+
 [dev-dependencies]
+# QR *decoder* for the generate_qr_code tests: every rendered code is decoded
+# back and compared to the input, so a rendering regression (colors, logo
+# overlay, quiet zone) that breaks scannability fails the suite.
+rqrr = "0.10"
 # wiremock spins up an in-process HTTP mock that stands in for upstream
 # LLM backends. Used by the integration tests in tests/ to exercise the
 # proxy path end-to-end without needing a real model server.

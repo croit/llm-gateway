@@ -152,7 +152,10 @@ impl SandboxClient {
         if any_attached {
             out["note"] = json!(
                 "Produced files are now attached inline in your message — do NOT \
-                 repeat any marker/URL text in your prose."
+                 repeat any marker/URL text in your prose. They are saved to this \
+                 conversation permanently: to use one in a LATER tool call, pass \
+                 its `id` (or just its filename) in `attachments` instead of \
+                 regenerating it."
             );
         }
         Ok(out)
@@ -499,18 +502,26 @@ async fn stage_attachments(
     }
     let mut notes: Vec<String> = Vec::new();
     for arg in explicit {
-        if !chat_attachments::attachment_in_session(&session_atts, &arg.id) {
+        // Accept an exact `<turn>/<file>` id OR a bare filename (newest
+        // match wins) — models lose track of turn ids across rounds and
+        // would otherwise regenerate assets they already produced.
+        let Some(resolved) = chat_attachments::resolve_attachment(&session_atts, &arg.id) else {
             notes.push(format!(
-                "Ignored attachment id `{}`: not found in this conversation.",
+                "Ignored attachment `{}`: no attachment with that id or filename in \
+                 this conversation (see `available_attachments`).",
                 arg.id,
             ));
             continue;
+        };
+        let id = resolved.id.clone();
+        if id != arg.id {
+            notes.push(format!("Resolved `{}` to attachment `{id}`.", arg.id));
         }
-        if seen_ids.insert(arg.id.clone()) {
-            want.push((arg.id.clone(), arg.name.clone()));
+        if seen_ids.insert(id.clone()) {
+            want.push((id, arg.name.clone()));
         } else if let Some(n) = &arg.name {
             // Already queued (it's a round file); honor a rename request.
-            if let Some(slot) = want.iter_mut().find(|(id, _)| id == &arg.id) {
+            if let Some(slot) = want.iter_mut().find(|(qid, _)| qid == &id) {
                 slot.1 = Some(n.clone());
             }
         }
@@ -651,7 +662,10 @@ impl Tool for RunInSandbox {
              if the deck's font comes out as Consolas, set the run typeface to \
              the real font name in ppt/slides/*.xml), \
              pypdf/pdfplumber/pymupdf, reportlab, img2pdf, pillow, opencv, \
-             pytesseract (OCR), sqlalchemy/psycopg/pymysql, scapy, lxml, \
+             pytesseract (OCR), segno + qrcode (QR codes in generated \
+             documents; for a standalone QR code prefer the faster \
+             `generate_qr_code` tool), \
+             sqlalchemy/psycopg/pymysql, scapy, lxml, \
              beautifulsoup4, requests. \
              CLI tools: ripgrep (rg), jq, yq, jc, awk/sed, duckdb + sqlite3 \
              (SQL over CSV/JSON/Parquet/large logs), ffmpeg, imagemagick, vips, \
@@ -667,14 +681,21 @@ impl Tool for RunInSandbox {
              multi-step pipelines) in a SINGLE call rather than spreading it \
              across calls. Files a user uploaded this turn are ALREADY waiting \
              in the working directory under their original names — just open \
-             them. To also work on a file from earlier in the conversation, \
-             pass its id (from an `[attached … id=\"<turn>/<file>\"]` stub) in \
-             `attachments`; it gets fetched into the working directory too. \
+             them. To also work on a file from earlier in the conversation — \
+             including files a previous sandbox/render call produced — pass \
+             its id (from an `[attached … id=\"<turn>/<file>\"]` stub) or \
+             simply its filename in `attachments`; it gets fetched into the \
+             working directory too. REUSE existing files this way instead of \
+             regenerating them. \
              The result's `staged_files` lists what's in the directory and \
              `available_attachments` lists other files you can pull in by id. \
-             Network \
+             The environment is a FIXED image: everything listed above is \
+             preinstalled, and NOTHING can be installed — never try \
+             pip/apt/npm install (the sandbox is destroyed after the call, so \
+             even a successful install would be wasted). If a library is \
+             missing, solve the task with the preinstalled ones. Network \
              is OFF unless you set `network: true` (and the operator enabled \
-             egress); without it pip install and web access fail. Write files \
+             egress); without it web access fails. Write files \
              to the current working directory to return them to the user. \
              When stdout/stderr is large you get a small preview plus a \
              `full_output_ref` — call read_sandbox_output with that ref to \
@@ -725,7 +746,9 @@ impl Tool for RunInSandbox {
                             "required": ["id"],
                             "properties": {
                                 "id": {"type": "string", "description": "Attachment id \
-                                       `<turn>/<file>` from an attachment stub."},
+                                       `<turn>/<file>` from an attachment stub, or just the \
+                                       filename of a file from earlier in this conversation \
+                                       (newest match wins)."},
                                 "name": {"type": "string", "description": "Optional filename \
                                          to give the file in the working directory."}
                             }
@@ -733,9 +756,10 @@ impl Tool for RunInSandbox {
                     },
                     "network": {
                         "type": "boolean",
-                        "description": "Request network egress for this run (pip / web). \
-                                        Default false; only honored if the operator \
-                                        configured an egress allowlist."
+                        "description": "Request network egress for this run (web access, \
+                                        NOT for installing packages). Default false; only \
+                                        honored if the operator configured an egress \
+                                        allowlist."
                     }
                 }
             }),
@@ -823,7 +847,11 @@ impl Tool for GenerateDocument {
             "Turn Markdown into a finished PDF, Word (.docx), or PowerPoint \
              (.pptx) document and return it to the user. Write normal Markdown; \
              for slides, separate them with `---`. This is the easy path for \
-             document generation — no code required. For anything Markdown can't \
+             ONE-OFF document generation — no code required. If the user is \
+             likely to iterate on the wording, draft the document in the \
+             canvas instead (`create_document`, then `export_document` when \
+             it's final): the user sees it live and you can edit single \
+             passages across turns. For anything Markdown can't \
              express, use `run_in_sandbox` directly.",
             json!({
                 "type": "object",
@@ -1184,12 +1212,13 @@ async fn resolve_one_attachment(
 
     let chosen: AttachmentRef = match explicit_id {
         Some(id) => {
-            let a = session_atts
-                .iter()
-                .find(|a| a.id == id)
+            // Exact id or bare filename (newest match wins) — same loose
+            // resolution as `stage_attachments`, so reuse never depends on
+            // the model remembering a turn id.
+            let a = chat_attachments::resolve_attachment(&session_atts, id)
                 .ok_or_else(|| {
                     ToolError::InvalidArgs(format!(
-                        "attachment id `{id}` is not in this conversation"
+                        "no attachment with id or filename `{id}` in this conversation"
                     ))
                 })?
                 .clone();
@@ -1324,8 +1353,9 @@ impl Tool for ConvertDocument {
                 "properties": {
                     "attachment_id": {
                         "type": "string",
-                        "description": "Optional `<turn>/<file>` id of the file to convert. \
-                                        Defaults to the file uploaded in the current message."
+                        "description": "Optional id (`<turn>/<file>`) or filename of the file \
+                                        to convert (newest match wins). Defaults to the file \
+                                        uploaded in the current message."
                     },
                     "target": {
                         "type": "string",
@@ -1417,8 +1447,9 @@ impl Tool for EditPresentation {
                 "properties": {
                     "attachment_id": {
                         "type": "string",
-                        "description": "Optional `<turn>/<file>` id of the .pptx to edit. \
-                                        Defaults to the deck uploaded in the current message."
+                        "description": "Optional id (`<turn>/<file>`) or filename of the \
+                                        .pptx to edit (newest match wins). Defaults to the \
+                                        deck uploaded in the current message."
                     },
                     "code": {
                         "type": "string",
@@ -1753,7 +1784,12 @@ impl Tool for RenderTypst {
              multi-page documents/decks), `png`, or `svg` (single page; use \
              `pdf` if the document has multiple pages). The result is attached \
              to your reply. For the company-branded letter/deck templates, use \
-             the dedicated `typst_<template>` tools instead. No network is used.",
+             the dedicated `typst_<template>` tools instead. For a document \
+             whose TEXT the user will read and iterate on (a letter, guide, \
+             article), draft the content in the document canvas FIRST \
+             (`create_document` — live panel, passage-level edits, version \
+             history) and use render_typst only for the final visual layout; \
+             a one-shot render is hard to revise. No network is used.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -1775,7 +1811,8 @@ impl Tool for RenderTypst {
                             "required": ["id"],
                             "properties": {
                                 "id": {"type": "string", "description": "Attachment id \
-                                       `<turn>/<file>`."},
+                                       `<turn>/<file>`, or just a filename from earlier in \
+                                       this conversation (newest match wins)."},
                                 "name": {"type": "string", "description": "Filename to give \
                                          the file in the working directory — match what the \
                                          source references, e.g. `diagram.svg`."}
@@ -2333,7 +2370,18 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(
-            matches!(err, ToolError::InvalidArgs(ref m) if m.contains("not in this conversation")),
+            matches!(err, ToolError::InvalidArgs(ref m) if m.contains("no attachment with id or filename")),
+            "{err:?}"
+        );
+
+        // A bare filename resolves to the session attachment with that name
+        // (the fetch then fails on the dead S3 stub, which proves resolution
+        // got as far as fetching the right id).
+        let err = resolve_one_attachment(&c, Some("b.pptx"), "PowerPoint (.pptx) file", is_pptx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed(ref m) if m.contains("t-u1/b.pptx")),
             "{err:?}"
         );
 
@@ -2412,7 +2460,41 @@ mod tests {
         assert!(
             s.notes
                 .iter()
-                .any(|n| n.contains("not found in this conversation")),
+                .any(|n| n.contains("no attachment with that id or filename")),
+            "{:?}",
+            s.notes
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_attachments_resolves_bare_filenames_to_the_newest_match() {
+        let mut c = ctx().await;
+        let m = chat_attachments::marker_line(
+            "t-u1",
+            &chat_attachments::UploadOutcome {
+                filename: "qr.png".into(),
+                mime: "image/png".into(),
+                bytes: 1,
+            },
+        );
+        seed_session_with_upload(&c.db, "t-u1", &m).await;
+        c.session_id = Some("s1".into());
+        c.s3 = Some(dead_s3());
+        let s = stage_attachments(
+            &c,
+            &[AttachmentArg {
+                id: "qr.png".into(),
+                name: None,
+            }],
+        )
+        .await
+        .unwrap();
+        // Resolution happened (and is surfaced); only the fetch fails on the
+        // dead S3 stub.
+        assert!(
+            s.notes
+                .iter()
+                .any(|n| n.contains("Resolved `qr.png` to attachment `t-u1/qr.png`")),
             "{:?}",
             s.notes
         );

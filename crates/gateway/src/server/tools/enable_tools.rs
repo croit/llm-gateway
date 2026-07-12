@@ -270,8 +270,9 @@ fn target_for_key(key: &str) -> EnableTarget {
         ),
         "document" => (
             "Document canvas",
-            "build up a long document (guide, spec, config) in a live side panel and edit it \
-             one passage at a time across turns — without rewriting the whole thing",
+            "THE default for drafting anything substantial (guide, letter, spec, article): \
+             a live side panel with passage-level edits across turns, full version history \
+             with rollback, several documents per conversation, and PDF/Word export",
         ),
         "fetch_attachment" => (
             "Read an attachment",
@@ -281,6 +282,11 @@ fn target_for_key(key: &str) -> EnableTarget {
             "Attach a file to your reply",
             "attach a generated file (PDF/PNG/text) for the user to download",
         ),
+        "list_attachments" => (
+            "List conversation files",
+            "inventory of every file in this conversation (uploads + files you produced) \
+             with ids — reuse them instead of regenerating",
+        ),
         "rag_search" => (
             "Knowledge-base search",
             "semantic search over this gateway's indexed repositories & documents — \
@@ -289,6 +295,11 @@ fn target_for_key(key: &str) -> EnableTarget {
         "rag_list_collections" => (
             "List knowledge bases",
             "list the indexed collections available to rag_search (call this first)",
+        ),
+        "generate_qr_code" => (
+            "QR codes",
+            "generate a QR code (link, WiFi, vCard, SEPA payment, …) as PNG/SVG, \
+             with colors and an optional centered logo",
         ),
         "run_in_sandbox" => (
             "Code sandbox",

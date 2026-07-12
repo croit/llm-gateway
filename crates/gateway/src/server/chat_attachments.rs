@@ -334,6 +334,24 @@ pub fn attachment_in_session(session: &[AttachmentRef], id: &str) -> bool {
     session.iter().any(|a| a.id == id)
 }
 
+/// Resolve a model-supplied attachment reference against the session's
+/// enumerated set: an exact `<turn>/<file>` id wins; failing that, a bare
+/// filename matches the NEWEST attachment with that name (the session
+/// list is oldest-first). The looser filename form exists because models
+/// lose track of turn ids across rounds and then regenerate assets they
+/// already have — matching by name makes reuse the path of least
+/// resistance. `None` when nothing matches; session scoping is inherited
+/// from the enumerated set, same as [`attachment_in_session`].
+pub fn resolve_attachment<'a>(
+    session: &'a [AttachmentRef],
+    given: &str,
+) -> Option<&'a AttachmentRef> {
+    session
+        .iter()
+        .find(|a| a.id == given)
+        .or_else(|| session.iter().rev().find(|a| a.filename == given))
+}
+
 /// Three-way classification of bytes-with-a-mime, shared between
 /// `fetch_attachment` and `fetch_url`. The model sees one of three
 /// shapes regardless of which tool produced the bytes:
@@ -677,6 +695,38 @@ mod tests {
     #[test]
     fn object_key_handles_empty_prefix() {
         assert_eq!(object_key("", "t-1", "data.csv"), "t-1/data.csv");
+    }
+
+    fn att(id: &str, filename: &str) -> AttachmentRef {
+        let (turn, _) = id.split_once('/').unwrap();
+        AttachmentRef {
+            id: id.to_string(),
+            turn_id: turn.to_string(),
+            filename: filename.to_string(),
+            mime: "image/png".to_string(),
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn resolve_attachment_prefers_exact_id() {
+        let session = vec![att("t1/qr.png", "qr.png"), att("t2/qr.png", "qr.png")];
+        let hit = resolve_attachment(&session, "t1/qr.png").unwrap();
+        assert_eq!(hit.id, "t1/qr.png");
+    }
+
+    #[test]
+    fn resolve_attachment_falls_back_to_newest_filename_match() {
+        // Two generations of the same filename: a bare-name reference must
+        // resolve to the NEWEST one (the list is oldest-first).
+        let session = vec![
+            att("t1/qr.png", "qr.png"),
+            att("t2/other.png", "other.png"),
+            att("t3/qr.png", "qr.png"),
+        ];
+        let hit = resolve_attachment(&session, "qr.png").unwrap();
+        assert_eq!(hit.id, "t3/qr.png");
+        assert!(resolve_attachment(&session, "missing.png").is_none());
     }
 
     // Marker parsing / strip / inline-text tests live in

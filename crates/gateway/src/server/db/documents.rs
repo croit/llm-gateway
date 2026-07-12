@@ -297,6 +297,48 @@ pub async fn append_version(
     }))
 }
 
+/// Version-history metadata for one document: everything but the content,
+/// plus the content's size, so a listing never drags whole revisions into
+/// memory (or the model's context).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionMeta {
+    pub version: i64,
+    pub summary: Option<String>,
+    pub created_at: Timestamp,
+    /// Content length in characters (SQLite `LENGTH()` on TEXT).
+    pub chars: i64,
+}
+
+/// All versions of a document, newest first — metadata only. Scoped to the
+/// session; an unknown/foreign document yields an empty list.
+pub async fn list_versions(
+    pool: &Pool,
+    session_id: &str,
+    id: &str,
+) -> Result<Vec<VersionMeta>, DbError> {
+    let rows = sqlx::query(
+        r#"SELECT v.version, v.summary, v.created_at, LENGTH(v.content) AS chars
+           FROM document_versions v
+           JOIN documents d ON d.id = v.document_id
+           WHERE v.document_id = ? AND d.session_id = ?
+           ORDER BY v.version DESC"#,
+    )
+    .bind(id)
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(VersionMeta {
+                version: row.try_get("version")?,
+                summary: row.try_get("summary")?,
+                created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
+                chars: row.try_get("chars")?,
+            })
+        })
+        .collect()
+}
+
 /// All documents in a session, most recently updated first.
 pub async fn list_for_session(pool: &Pool, session_id: &str) -> Result<Vec<Document>, DbError> {
     let rows = sqlx::query(
@@ -398,6 +440,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.content, "v1");
+    }
+
+    #[tokio::test]
+    async fn list_versions_is_newest_first_and_session_scoped() {
+        let pool = open(Path::new(":memory:")).await.unwrap();
+        seed_session(&pool, "s1").await;
+        seed_session(&pool, "s2").await;
+        let id = new_id();
+        create(
+            &pool,
+            &id,
+            "s1",
+            "u1",
+            "Doc",
+            DocumentFormat::Text,
+            "v1",
+            None,
+        )
+        .await
+        .unwrap();
+        append_version(&pool, "s1", &id, "v2 longer", Some("edited"), None)
+            .await
+            .unwrap();
+
+        let versions = list_versions(&pool, "s1", &id).await.unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].version, 2);
+        assert_eq!(versions[0].summary.as_deref(), Some("edited"));
+        assert_eq!(versions[0].chars, 9);
+        assert_eq!(versions[1].version, 1);
+        assert_eq!(versions[1].summary.as_deref(), Some("Created"));
+        // Foreign session sees nothing.
+        assert!(list_versions(&pool, "s2", &id).await.unwrap().is_empty());
     }
 
     #[tokio::test]

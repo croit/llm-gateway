@@ -49,6 +49,8 @@ const DOCUMENT_IDS: &[&str] = &[
     "list_documents",
     "export_document",
     "edit_document_section",
+    "list_document_versions",
+    "restore_document_version",
 ];
 const DOCUMENT_KEY: &str = "document";
 
@@ -202,8 +204,10 @@ pub fn requires_chat_session(tool_id: &str) -> bool {
     tool_id.starts_with(TYPST_PREFIX)
         || DOCUMENT_IDS.contains(&tool_id)
         || tool_id == "upload_attachment"
+        || tool_id == "list_attachments"
         || tool_id == "generate_image"
         || tool_id == "edit_image"
+        || tool_id == "generate_qr_code"
 }
 
 /// `mcp__<server>__<tool>` → `mcp__<server>` (the per-server toggle key).
@@ -224,8 +228,10 @@ fn category_for(tool_id: &str) -> Category {
     match tool_id {
         "search_web" | "fetch_url" | "lookup_ip" | "dns_lookup" | "whois_lookup" | "tls_cert"
         | "wikipedia" => Category::Web,
-        "fetch_attachment" | "upload_attachment" | "read_skill" => Category::Documents,
-        "generate_image" | "edit_image" => Category::Media,
+        "fetch_attachment" | "upload_attachment" | "list_attachments" | "read_skill" => {
+            Category::Documents
+        }
+        "generate_image" | "edit_image" | "generate_qr_code" => Category::Media,
         "rag_search" | "rag_list_collections" => Category::Knowledge,
         "run_in_sandbox"
         | "generate_document"
@@ -282,6 +288,12 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Lets the assistant attach a file it generated — a document, image, or data export — \
              to its answer so you can download it.",
         ),
+        "list_attachments" => (
+            "List conversation files",
+            "Lets the assistant see every file in the conversation — your uploads and files it \
+             produced earlier — so it can reuse an existing document or image instead of \
+             generating it again.",
+        ),
         "get_current_timestamp" => (
             "Current date & time",
             "Gives the assistant today's date and the current time in your timezone — for \
@@ -331,6 +343,12 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Lets the assistant edit an image already in the conversation from a text \
              instruction — change the background, add or remove an element, restyle it — and \
              return the edited version inline.",
+        ),
+        "generate_qr_code" => (
+            "QR codes",
+            "Lets the assistant generate QR codes — for links, WiFi access, contact cards, \
+             or SEPA payments — as PNG or SVG, with custom colors and an optional centered \
+             logo, delivered straight into its reply.",
         ),
         "convert_currency" => (
             "Currency conversion",
@@ -450,7 +468,8 @@ pub fn entries(
                     tech: "create/edit/read/list_document".to_string(),
                     description: "Lets the assistant build up a long document (a guide, spec, or \
                                   config) in a live side panel and edit it one passage at a time \
-                                  across turns — instead of rewriting the whole thing each reply."
+                                  across turns — instead of rewriting the whole thing each reply. \
+                                  Keeps a full version history the assistant can roll back to."
                         .to_string(),
                     category: Category::Documents,
                 });
@@ -623,10 +642,14 @@ mod tests {
             "list_documents",
             "edit_document_section",
             "export_document",
+            "list_document_versions",
+            "restore_document_version",
             "upload_attachment",
-            // generate_image splices an attachment marker into the turn, so it
-            // also needs a live chat session.
+            "list_attachments",
+            // generate_image / generate_qr_code splice an attachment marker
+            // into the turn, so they also need a live chat session.
             "generate_image",
+            "generate_qr_code",
         ] {
             assert!(requires_chat_session(id), "{id} should be session-only");
         }
@@ -780,6 +803,8 @@ mod tests {
             "list_documents",
             "export_document",
             "edit_document_section",
+            "list_document_versions",
+            "restore_document_version",
         ] {
             assert_eq!(entry_key_for(id), "document", "{id}");
         }

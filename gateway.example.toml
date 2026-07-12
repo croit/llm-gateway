@@ -278,6 +278,9 @@ weight = 1
 # # tool groups mid-conversation — see docs/tool-context-optimization.md.
 # tools = ["enable_tools", "get_current_timestamp", "get_user_location", "remember", "recall",
 #          "create_document", "edit_document", "read_document", "list_documents",
+#          "list_document_versions", "restore_document_version",
+#          "list_attachments",   # conversation file inventory (reuse instead of regenerate)
+#          "generate_qr_code",   # native QR codes (PNG/SVG, colors, optional logo)
 #          "generate_image"]  # image gen; only offered when an image-kind pool is configured
 # # Skill names this role may load (see [skills] below). "*" = all loaded
 # # skills; omit/empty to grant none. Requires the `read_skill` tool too,
