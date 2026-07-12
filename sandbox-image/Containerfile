@@ -64,7 +64,58 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu graphviz libmagic1 \
         # fonts for document/chart rendering (Latin + CJK + emoji)
         fonts-dejavu fonts-liberation fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji \
+        # metric-compatible substitutes for the proprietary Office defaults
+        # (Liberation above covers Arial/Times/Courier): Carlito = Calibri,
+        # Caladea = Cambria, Comic Neue = Comic Sans
+        fonts-crosextra-carlito fonts-crosextra-caladea fonts-comic-neue \
+        # the most-used free document/brand fonts (Google-Fonts top list),
+        # so generated PDFs/decks can match common corporate styles offline
+        fonts-inter fonts-inter-variable fonts-roboto fonts-roboto-slab \
+        fonts-open-sans fonts-lato fonts-montserrat fonts-quicksand fonts-cabin \
+        fonts-ebgaramond fonts-ibm-plex fonts-paratype \
+        # code fonts for listings in documents
+        fonts-jetbrains-mono fonts-firacode \
+        # fc-cache/fc-list for the google-fonts layer below (not guaranteed
+        # via recommends with --no-install-recommends)
+        fontconfig \
     && rm -rf /var/lib/apt/lists/*
+
+# Fonts fetched from the google/fonts repo (all OFL) — families Debian
+# doesn't package but that top every most-used list (decks, marketing,
+# editorial), plus the monochrome Noto Emoji. Variable fonts where
+# upstream ships one ([wght] carries every weight in one file); Poppins is
+# static-only upstream, so its common cuts land individually.
+#
+# Noto Emoji (mono): fonts-noto-color-emoji is a CBDT *bitmap* font with
+# no glyf/loca tables — reportlab's TTFont chokes on it ("missing location
+# table"), so pure-reportlab PDFs could not render emoji at all. The
+# outline variable font registers fine (family "Noto Emoji", distinct from
+# "Noto Color Emoji", so fontconfig/typst/weasyprint keep preferring the
+# color font for emoji fallback).
+# NB: RUN uses /bin/sh (dash) — POSIX only, no bashisms. The local target
+# name is passed explicitly (arg 3) instead of URL-decoding the source name.
+RUN set -eux; \
+    gf() { mkdir -p "/usr/share/fonts/truetype/$1"; \
+           curl -fsSL -o "/usr/share/fonts/truetype/$1/$3" \
+               "https://github.com/google/fonts/raw/main/ofl/$1/$2"; }; \
+    gf notoemoji "NotoEmoji%5Bwght%5D.ttf" "NotoEmoji.ttf"; \
+    gf oswald "Oswald%5Bwght%5D.ttf" "Oswald.ttf"; \
+    gf raleway "Raleway%5Bwght%5D.ttf" "Raleway.ttf"; \
+    gf worksans "WorkSans%5Bwght%5D.ttf" "WorkSans.ttf"; \
+    gf nunito "Nunito%5Bwght%5D.ttf" "Nunito.ttf"; \
+    gf playfairdisplay "PlayfairDisplay%5Bwght%5D.ttf" "PlayfairDisplay.ttf"; \
+    gf merriweather "Merriweather%5Bopsz,wdth,wght%5D.ttf" "Merriweather.ttf"; \
+    gf poppins "Poppins-Regular.ttf" "Poppins-Regular.ttf"; \
+    gf poppins "Poppins-Italic.ttf" "Poppins-Italic.ttf"; \
+    gf poppins "Poppins-SemiBold.ttf" "Poppins-SemiBold.ttf"; \
+    gf poppins "Poppins-Bold.ttf" "Poppins-Bold.ttf"; \
+    chmod -R a+rX /usr/share/fonts/truetype; \
+    fc-cache -f; \
+    # loud sanity check: every family resolvable by fontconfig
+    for fam in "Noto Emoji" Oswald Raleway "Work Sans" Nunito \
+               "Playfair Display" Merriweather Poppins; do \
+        fc-list | grep -qi "$fam" || { echo "font missing: $fam" >&2; exit 1; }; \
+    done
 
 # Pandoc, pinned to a recent upstream release. The Debian package lags badly;
 # newer pandoc has a much-improved Typst reader and docx/odt writers (and adds
