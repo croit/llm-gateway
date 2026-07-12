@@ -108,7 +108,18 @@ handle office files, and convert formats without runtime network:
 - **Docs/diagrams:** pandoc, typst (0.15, with the offline-cached
   `@preview/gribouille` ggplot-style charts package + its cetz backend),
   **excalirender** (`.excalidraw` → svg/png/pdf, bundles its own fonts),
-  weasyprint, markdown, **graphviz**; Latin + CJK + emoji fonts.
+  weasyprint, markdown, **graphviz**; Latin + CJK + emoji fonts. Noto Sans
+  CJK covers Latin+Japanese+Chinese in one family; emoji come from **Noto
+  Color Emoji** via fallback (typst/weasyprint/pango chain it automatically).
+  A monochrome outline **Noto Emoji** is also installed for reportlab, whose
+  `TTFont` cannot load the bitmap color font ("missing location table").
+- **Document fonts:** metric substitutes for the proprietary Office set —
+  Liberation (Arial/Times/Courier), **Carlito** (Calibri), **Caladea**
+  (Cambria), Comic Neue (Comic Sans) — plus the most-used free families:
+  Inter, Roboto (+Slab), Open Sans, Lato, Montserrat, Poppins, Oswald,
+  Raleway, Work Sans, Nunito, Quicksand, Cabin, PT Sans/Serif (paratype),
+  EB Garamond, Merriweather, Playfair Display, IBM Plex, and the code fonts
+  JetBrains Mono + Fira Code. `fc-list : family` in a run shows everything.
 - **Networking:** **tshark/tcpdump** + scapy/dpkt to read `.pcap`/`.pcapng`;
   curl/wget, dig, rsync, openssl, netcat, iproute2 (egress gated by the proxy
   allowlist).
