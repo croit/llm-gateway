@@ -72,7 +72,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         # so generated PDFs/decks can match common corporate styles offline
         fonts-inter fonts-inter-variable fonts-roboto fonts-roboto-slab \
         fonts-open-sans fonts-lato fonts-montserrat fonts-quicksand fonts-cabin \
-        fonts-ebgaramond fonts-ibm-plex fonts-paratype \
+        fonts-ebgaramond fonts-paratype \
         # code fonts for listings in documents
         fonts-jetbrains-mono fonts-firacode \
         # fc-cache/fc-list for the google-fonts layer below (not guaranteed
@@ -109,11 +109,25 @@ RUN set -eux; \
     gf poppins "Poppins-Italic.ttf" "Poppins-Italic.ttf"; \
     gf poppins "Poppins-SemiBold.ttf" "Poppins-SemiBold.ttf"; \
     gf poppins "Poppins-Bold.ttf" "Poppins-Bold.ttf"; \
+    # IBM Plex — a top corporate/document family. Debian only ships it in
+    # `contrib` (not enabled on debian:trixie-slim), so fetch it here like the
+    # other OFL families. Sans is a single [wdth,wght] variable file; Serif and
+    # Mono are static upstream, so their common cuts land individually.
+    gf ibmplexsans "IBMPlexSans%5Bwdth,wght%5D.ttf" "IBMPlexSans.ttf"; \
+    gf ibmplexserif "IBMPlexSerif-Regular.ttf" "IBMPlexSerif-Regular.ttf"; \
+    gf ibmplexserif "IBMPlexSerif-Italic.ttf" "IBMPlexSerif-Italic.ttf"; \
+    gf ibmplexserif "IBMPlexSerif-Bold.ttf" "IBMPlexSerif-Bold.ttf"; \
+    gf ibmplexserif "IBMPlexSerif-BoldItalic.ttf" "IBMPlexSerif-BoldItalic.ttf"; \
+    gf ibmplexmono "IBMPlexMono-Regular.ttf" "IBMPlexMono-Regular.ttf"; \
+    gf ibmplexmono "IBMPlexMono-Italic.ttf" "IBMPlexMono-Italic.ttf"; \
+    gf ibmplexmono "IBMPlexMono-Bold.ttf" "IBMPlexMono-Bold.ttf"; \
+    gf ibmplexmono "IBMPlexMono-BoldItalic.ttf" "IBMPlexMono-BoldItalic.ttf"; \
     chmod -R a+rX /usr/share/fonts/truetype; \
     fc-cache -f; \
     # loud sanity check: every family resolvable by fontconfig
     for fam in "Noto Emoji" Oswald Raleway "Work Sans" Nunito \
-               "Playfair Display" Merriweather Poppins; do \
+               "Playfair Display" Merriweather Poppins \
+               "IBM Plex Sans" "IBM Plex Serif" "IBM Plex Mono"; do \
         fc-list | grep -qi "$fam" || { echo "font missing: $fam" >&2; exit 1; }; \
     done
 
