@@ -46,8 +46,16 @@ ARG DEBIAN_CODENAME=trixie
 
 FROM debian:${DEBIAN_CODENAME}-slim AS runtime
 
+# Fonts are for the `typst_<template>` tools, which compile typst IN THIS
+# container (server/typst.rs) — unlike `render_typst`, which runs in the
+# sandbox image with its own fonts. typst's binary only embeds Libertinus /
+# New Computer Modern / DejaVu Sans Mono, so without system fonts any emoji
+# (and any glyph outside a template's bundled fonts) renders as a tofu box.
+# noto-core covers broad Latin/Cyrillic/Greek fallback, noto-color-emoji the
+# emoji. Add fonts-noto-cjk here if templates must render CJK (~+60 MB).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
+        fonts-dejavu fonts-liberation fonts-noto-core fonts-noto-color-emoji \
  && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 1000 gateway \
