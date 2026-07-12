@@ -270,9 +270,10 @@ fn target_for_key(key: &str) -> EnableTarget {
         ),
         "document" => (
             "Document canvas",
-            "THE default for drafting anything substantial (guide, letter, spec, article): \
-             a live side panel with passage-level edits across turns, full version history \
-             with rollback, several documents per conversation, and PDF/Word export",
+            "THE default for drafting anything substantial (guide, letter, spec, article, \
+             even Typst source to render): a live side panel with passage-level edits \
+             across turns, full version history with rollback, several documents per \
+             conversation, and PDF/Word export",
         ),
         "fetch_attachment" => (
             "Read an attachment",

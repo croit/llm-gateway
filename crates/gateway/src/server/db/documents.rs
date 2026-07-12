@@ -34,27 +34,37 @@ pub enum DocumentFormat {
     Html,
     Json,
     Toml,
+    /// Typst source — drafted in the canvas, rendered via `render_typst`
+    /// / `export_document`. Text-edited; sections anchor on `=` headings.
+    Typst,
+    /// YAML — deliberately TEXT-edited, not structured: a parse→patch→
+    /// reserialise round-trip would strip comments, anchors, and key
+    /// order, which is exactly what humans keep in YAML configs.
+    Yaml,
 }
 
 /// How edits address a document of a given format: anchored find/replace
 /// for free text, RFC 6902 JSON Patch for structured data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditKind {
-    /// `markdown` / `text` / `html` — edited with anchored find/replace.
+    /// `markdown` / `text` / `html` / `typst` / `yaml` — edited with
+    /// anchored find/replace (yaml deliberately so, to preserve comments).
     Text,
-    /// `json` / `yaml` / `toml` — edited with an RFC 6902 JSON Patch
-    /// (YAML/TOML are parsed to JSON, patched, then reserialised).
+    /// `json` / `toml` — edited with an RFC 6902 JSON Patch (TOML is
+    /// parsed to JSON, patched, then reserialised).
     Structured,
 }
 
 impl DocumentFormat {
     /// Iteration/listing order.
-    pub const ALL: [DocumentFormat; 5] = [
+    pub const ALL: [DocumentFormat; 7] = [
         DocumentFormat::Markdown,
         DocumentFormat::Text,
         DocumentFormat::Html,
         DocumentFormat::Json,
         DocumentFormat::Toml,
+        DocumentFormat::Typst,
+        DocumentFormat::Yaml,
     ];
 
     /// Stable string stored in the DB column + accepted from tool args.
@@ -65,6 +75,8 @@ impl DocumentFormat {
             DocumentFormat::Html => "html",
             DocumentFormat::Json => "json",
             DocumentFormat::Toml => "toml",
+            DocumentFormat::Typst => "typst",
+            DocumentFormat::Yaml => "yaml",
         }
     }
 
@@ -77,6 +89,8 @@ impl DocumentFormat {
             "html" => Some(DocumentFormat::Html),
             "json" => Some(DocumentFormat::Json),
             "toml" => Some(DocumentFormat::Toml),
+            "typst" | "typ" => Some(DocumentFormat::Typst),
+            "yaml" | "yml" => Some(DocumentFormat::Yaml),
             _ => None,
         }
     }
@@ -87,12 +101,28 @@ impl DocumentFormat {
         Self::parse(s).unwrap_or(DocumentFormat::Text)
     }
 
+    /// Conventional file extension for materialising a document of this
+    /// format on disk (sandbox staging, exports).
+    pub fn file_ext(self) -> &'static str {
+        match self {
+            DocumentFormat::Markdown => "md",
+            DocumentFormat::Text => "txt",
+            DocumentFormat::Html => "html",
+            DocumentFormat::Json => "json",
+            DocumentFormat::Toml => "toml",
+            DocumentFormat::Typst => "typ",
+            DocumentFormat::Yaml => "yaml",
+        }
+    }
+
     /// How this format is edited.
     pub fn edit_kind(self) -> EditKind {
         match self {
-            DocumentFormat::Markdown | DocumentFormat::Text | DocumentFormat::Html => {
-                EditKind::Text
-            }
+            DocumentFormat::Markdown
+            | DocumentFormat::Text
+            | DocumentFormat::Html
+            | DocumentFormat::Typst
+            | DocumentFormat::Yaml => EditKind::Text,
             DocumentFormat::Json | DocumentFormat::Toml => EditKind::Structured,
         }
     }

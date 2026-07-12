@@ -589,8 +589,88 @@ struct RunArgs {
     files: Vec<TextFile>,
     #[serde(default)]
     attachments: Vec<AttachmentArg>,
+    /// Canvas documents to materialize into `/work` server-side — the
+    /// big-content path (a large typst/markdown source stays in the
+    /// documents store instead of riding the tool-call payload).
+    #[serde(default)]
+    documents: Vec<DocumentArg>,
     #[serde(default)]
     network: bool,
+}
+
+/// One canvas document to stage into a run's working directory.
+#[derive(Deserialize)]
+struct DocumentArg {
+    /// Id from `create_document`.
+    document_id: String,
+    /// Specific version (default: latest).
+    #[serde(default)]
+    version: Option<i64>,
+    /// Filename in `/work` (default: `<title>.<format-ext>`, sanitized).
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Materialize the requested canvas documents as input files. Best-effort
+/// per document (a bad id becomes a note, not a failed run); returns the
+/// staged descriptors for the result body. Chat-path only — without a
+/// session there is no documents store to read.
+async fn stage_documents(
+    ctx: &ToolContext,
+    wanted: &[DocumentArg],
+    files: &mut Vec<InputFile>,
+    notes: &mut Vec<String>,
+) -> Vec<Value> {
+    use crate::server::db::documents;
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let Some(session_id) = ctx.session_id.as_deref() else {
+        notes.push(
+            "Canvas documents can't be staged on this path (no chat session). Ran without \
+             them."
+                .into(),
+        );
+        return Vec::new();
+    };
+    let mut staged = Vec::new();
+    for d in wanted {
+        match documents::get_version(&ctx.db, session_id, &d.document_id, d.version).await {
+            Ok(Some((doc, ver))) => {
+                let name = match d.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(n) => match sanitize_filename(n) {
+                        Some(n) => n,
+                        None => {
+                            notes.push(format!(
+                                "Ignored canvas document `{}`: `{n}` is not a valid filename.",
+                                d.document_id
+                            ));
+                            continue;
+                        }
+                    },
+                    None => format!("{}.{}", safe_stem(&doc.title), doc.format.file_ext()),
+                };
+                files.push(InputFile {
+                    name: name.clone(),
+                    content_b64: b64::encode(ver.content.as_bytes()),
+                });
+                staged.push(json!({
+                    "document_id": d.document_id,
+                    "version": ver.version,
+                    "name": name,
+                }));
+            }
+            Ok(None) => notes.push(format!(
+                "Ignored canvas document `{}`: not found in this conversation.",
+                d.document_id
+            )),
+            Err(e) => notes.push(format!(
+                "Could not read canvas document `{}`: {e}",
+                d.document_id
+            )),
+        }
+    }
+    staged
 }
 
 /// Splice staging metadata into a sandbox result so the model knows
@@ -661,7 +741,13 @@ impl Tool for RunInSandbox {
              `typ2pptx in.typ --root <dir> --detect-paragraphs -o out.pptx`; \
              if the deck's font comes out as Consolas, set the run typeface to \
              the real font name in ppt/slides/*.xml), \
-             pypdf/pdfplumber/pymupdf, reportlab, img2pdf, pillow, opencv, \
+             pypdf/pdfplumber/pymupdf, reportlab (outline fonts only — \
+             emoji need `pdfmetrics.registerFont(TTFont('NotoEmoji', \
+             '/usr/share/fonts/truetype/notoemoji/NotoEmoji.ttf'))`, \
+             monochrome; for COLOR emoji or mixed Latin+CJK+emoji PDFs \
+             prefer weasyprint or typst — their font fallback handles it, \
+             e.g. Noto Sans CJK JP covers Latin+Japanese+Chinese and Noto \
+             Color Emoji chains in automatically), img2pdf, pillow, opencv, \
              pytesseract (OCR), segno + qrcode (QR codes in generated \
              documents; for a standalone QR code prefer the faster \
              `generate_qr_code` tool), \
@@ -676,6 +762,13 @@ impl Tool for RunInSandbox {
              ghostscript/qpdf, poppler-utils (pdftotext/pdftoppm), \
              gzip/zstd/xz/bzip2/7z, git, curl/wget, dig/rsync, file/xxd, lnav, \
              and a C toolchain (gcc/make). Headless chromium is available too. \
+             Fonts: the common document families are installed — Calibri/\
+             Cambria/Arial/Times metric substitutes (Carlito, Caladea, \
+             Liberation), Inter, Roboto, Open Sans, Lato, Montserrat, \
+             Poppins, Oswald, Raleway, Work Sans, Nunito, EB Garamond, \
+             Merriweather, Playfair Display, IBM Plex, JetBrains Mono, \
+             Fira Code, Noto (incl. CJK + emoji) — `fc-list : family` \
+             shows all. \
              Each call starts clean — nothing persists between calls, so do \
              all the work for one job (combine/compare several files, \
              multi-step pipelines) in a SINGLE call rather than spreading it \
@@ -754,6 +847,26 @@ impl Tool for RunInSandbox {
                             }
                         }
                     },
+                    "documents": {
+                        "type": "array",
+                        "description": "Canvas documents (from `create_document`) to \
+                                        materialize into the working directory — resolved \
+                                        server-side, so use this instead of pasting large \
+                                        content into `files`.",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["document_id"],
+                            "properties": {
+                                "document_id": {"type": "string", "description": "Id from \
+                                                `create_document`."},
+                                "version": {"type": "integer", "description": "Specific \
+                                            version (default: latest)."},
+                                "name": {"type": "string", "description": "Filename in the \
+                                         working directory (default: `<title>.<ext>`)."}
+                            }
+                        }
+                    },
                     "network": {
                         "type": "boolean",
                         "description": "Request network egress for this run (web access, \
@@ -770,22 +883,24 @@ impl Tool for RunInSandbox {
         Box::pin(async move {
             let args: RunArgs = serde_json::from_value(args).map_err(|e| {
                 ToolError::InvalidArgs(format!(
-                    "expected {{language, code, files?, attachments?, network?}}: {e}"
+                    "expected {{language, code, files?, attachments?, documents?, network?}}: {e}"
                 ))
             })?;
             if args.code.trim().is_empty() {
                 return Err(ToolError::InvalidArgs("code must be non-empty".into()));
             }
             // Stage the round's uploads + any named attachments first, then
-            // append the model's inline text files (so an explicit text file
-            // wins over a same-named staged file).
+            // canvas documents, then the model's inline text files (so an
+            // explicit text file wins over a same-named staged file).
             let Staged {
                 files: staged_files,
                 staged,
                 available,
-                notes,
+                mut notes,
             } = stage_attachments(&ctx, &args.attachments).await?;
             let mut files = staged_files;
+            let staged_documents =
+                stage_documents(&ctx, &args.documents, &mut files, &mut notes).await;
             files.extend(args.files.into_iter().map(TextFile::into_input));
             let req = RunRequest {
                 language: args.language,
@@ -796,6 +911,11 @@ impl Tool for RunInSandbox {
             };
             let mut out = self.0.execute(&ctx, req).await?;
             augment_with_staging(&mut out, staged, available, notes);
+            if !staged_documents.is_empty()
+                && let Some(obj) = out.as_object_mut()
+            {
+                obj.insert("staged_documents".into(), json!(staged_documents));
+            }
             Ok(out)
         })
     }
@@ -939,8 +1059,11 @@ impl Tool for ExportDocument {
             "Export a document from the canvas (one you created with \
              `create_document`) to a finished PDF, Word (.docx), or PowerPoint \
              (.pptx) file and attach it for the user to download. Give the \
-             `document_id` and a `format`. Markdown and text documents only. \
-             For one-off Markdown you haven't put in the canvas, use \
+             `document_id` and a `format`. Works on markdown/text documents \
+             (via pandoc) and `typst` documents (pdf via `typst compile`, \
+             docx via pandoc's typst reader; pptx is not supported for typst \
+             — use run_in_sandbox with typ2pptx for an editable deck). For \
+             one-off Markdown you haven't put in the canvas, use \
              `generate_document` instead.",
             json!({
                 "type": "object",
@@ -979,29 +1102,54 @@ impl Tool for ExportDocument {
                         args.document_id
                     ))
                 })?;
-            // Pandoc reads the content as Markdown; only prose formats export
-            // sensibly. Structured/HTML docs would come out garbled.
-            if !matches!(doc.format, DocumentFormat::Markdown | DocumentFormat::Text) {
-                return Err(ToolError::InvalidArgs(format!(
-                    "only markdown or text documents can be exported; `{}` is {}",
-                    args.document_id,
-                    doc.format.as_str()
-                )));
-            }
             let ext = args.format.ext();
             let stem = filename_stem(args.filename.as_deref(), "document");
             let out = format!("{stem}.{ext}");
-            let pdf_engine = if matches!(args.format, DocFormat::Pdf) {
-                " --pdf-engine=weasyprint"
-            } else {
-                ""
+            // Per-format recipe. Markdown/text go through pandoc; typst
+            // compiles natively (pdf) or rides pandoc's typst reader (docx).
+            // Structured/HTML docs would come out garbled — reject those.
+            let (code, input_name) = match doc.format {
+                DocumentFormat::Markdown | DocumentFormat::Text => {
+                    let pdf_engine = if matches!(args.format, DocFormat::Pdf) {
+                        " --pdf-engine=weasyprint"
+                    } else {
+                        ""
+                    };
+                    (
+                        format!("set -e\npandoc input.md -o {out:?}{pdf_engine}\n"),
+                        "input.md",
+                    )
+                }
+                DocumentFormat::Typst => match args.format {
+                    DocFormat::Pdf => (
+                        format!("set -e\ntypst compile input.typ {out:?}\n"),
+                        "input.typ",
+                    ),
+                    DocFormat::Docx => (
+                        format!("set -e\npandoc -f typst input.typ -o {out:?}\n"),
+                        "input.typ",
+                    ),
+                    DocFormat::Pptx => {
+                        return Err(ToolError::InvalidArgs(
+                            "pptx export of a typst document isn't supported here — use \
+                             run_in_sandbox with typ2pptx for an editable deck"
+                                .into(),
+                        ));
+                    }
+                },
+                other => {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "only markdown, text, or typst documents can be exported; `{}` is {}",
+                        args.document_id,
+                        other.as_str()
+                    )));
+                }
             };
-            let code = format!("set -e\npandoc input.md -o {out:?}{pdf_engine}\n");
             let req = RunRequest {
                 language: Language::Bash,
                 code,
                 files: vec![InputFile {
-                    name: "input.md".into(),
+                    name: input_name.into(),
                     content_b64: b64::encode(ver.content.as_bytes()),
                 }],
                 timeout_secs: None,
@@ -1736,7 +1884,17 @@ impl Tool for RenderExcalidraw {
 struct TypstArgs {
     /// The Typst document source. May `#import "@preview/gribouille:0.3.0": *`
     /// for charts and `image("<staged-name>")` any staged attachment.
-    source: String,
+    /// Alternative to `document_id`; exactly one must be given.
+    #[serde(default)]
+    source: Option<String>,
+    /// Render from a `format: "typst"` canvas document instead of inline
+    /// source — the iterate-in-canvas, render-on-demand loop (also dodges
+    /// inline payload limits for large documents).
+    #[serde(default)]
+    document_id: Option<String>,
+    /// With `document_id`: render a specific version (default: latest).
+    #[serde(default)]
+    version: Option<i64>,
     /// Figures/data to drop into `/work` before compiling, so `source` can
     /// reference them by name. Use the `name` override to control the
     /// filename the source must match (e.g. `image("diagram.svg")`).
@@ -1784,20 +1942,35 @@ impl Tool for RenderTypst {
              multi-page documents/decks), `png`, or `svg` (single page; use \
              `pdf` if the document has multiple pages). The result is attached \
              to your reply. For the company-branded letter/deck templates, use \
-             the dedicated `typst_<template>` tools instead. For a document \
-             whose TEXT the user will read and iterate on (a letter, guide, \
-             article), draft the content in the document canvas FIRST \
-             (`create_document` — live panel, passage-level edits, version \
-             history) and use render_typst only for the final visual layout; \
-             a one-shot render is hard to revise. No network is used.",
+             the dedicated `typst_<template>` tools instead. For anything the \
+             user will iterate on, draft in the document canvas FIRST and \
+             render from there: prose in a `markdown` document, or the Typst \
+             source itself in a `format: \"typst\"` document — then pass its \
+             `document_id` here instead of `source` (edits + re-render keep \
+             working on the same document, and large sources dodge inline \
+             payload limits). Syntax notes: colors are `rgb(\"#1D4ED8\")` or \
+             named (`blue`) — a bare `#1D4ED8` is NOT valid Typst. Emoji \
+             render via the installed Noto Color Emoji fallback — just write \
+             them in the text. No network is used.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["source"],
+                "required": [],
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": "The Typst document source to compile."
+                        "description": "The Typst document source to compile. Pass either \
+                                        this or `document_id`, not both."
+                    },
+                    "document_id": {
+                        "type": "string",
+                        "description": "Render a `format: \"typst\"` canvas document \
+                                        (from `create_document`) instead of inline source."
+                    },
+                    "version": {
+                        "type": "integer",
+                        "description": "With `document_id`: render this specific version \
+                                        (default: latest)."
                     },
                     "attachments": {
                         "type": "array",
@@ -1836,12 +2009,60 @@ impl Tool for RenderTypst {
         Box::pin(async move {
             let args: TypstArgs = serde_json::from_value(args).map_err(|e| {
                 ToolError::InvalidArgs(format!(
-                    "expected {{source, attachments?, format?, filename?}}: {e}"
+                    "expected {{source? | document_id?, version?, attachments?, format?, \
+                     filename?}}: {e}"
                 ))
             })?;
-            if args.source.trim().is_empty() {
-                return Err(ToolError::InvalidArgs("source must be non-empty".into()));
-            }
+            // Exactly one source of truth: inline `source` XOR a typst
+            // canvas document.
+            let (source, canvas) = match (&args.source, &args.document_id) {
+                (Some(_), Some(_)) => {
+                    return Err(ToolError::InvalidArgs(
+                        "pass either `source` or `document_id`, not both".into(),
+                    ));
+                }
+                (None, None) => {
+                    return Err(ToolError::InvalidArgs(
+                        "pass `source` (inline Typst) or `document_id` (a `format: \"typst\"` \
+                         canvas document)"
+                            .into(),
+                    ));
+                }
+                (Some(s), None) => {
+                    if s.trim().is_empty() {
+                        return Err(ToolError::InvalidArgs("source must be non-empty".into()));
+                    }
+                    (s.clone(), None)
+                }
+                (None, Some(doc_id)) => {
+                    use crate::server::db::documents::{self, DocumentFormat};
+                    let session_id = ctx.session_id.as_deref().ok_or_else(|| {
+                        ToolError::Failed(
+                            "canvas documents are only available inside a chat session".into(),
+                        )
+                    })?;
+                    let (doc, ver) =
+                        documents::get_version(&ctx.db, session_id, doc_id, args.version)
+                            .await
+                            .map_err(|e| {
+                                ToolError::Failed(format!("reading canvas document: {e}"))
+                            })?
+                            .ok_or_else(|| {
+                                ToolError::InvalidArgs(format!(
+                                    "no canvas document `{doc_id}` (v{:?}) in this conversation",
+                                    args.version
+                                ))
+                            })?;
+                    if doc.format != DocumentFormat::Typst {
+                        return Err(ToolError::InvalidArgs(format!(
+                            "canvas document `{doc_id}` is `{}` — render_typst needs a \
+                             `format: \"typst\"` document",
+                            doc.format.as_str()
+                        )));
+                    }
+                    (ver.content.clone(), Some((doc_id.clone(), ver.version)))
+                }
+            };
 
             // Stage any referenced figures/data into /work first, then add the
             // source as in.typ (so an explicit attachment named `in.typ` can't
@@ -1855,7 +2076,7 @@ impl Tool for RenderTypst {
             let mut files = staged_files;
             files.push(InputFile {
                 name: "in.typ".into(),
-                content_b64: b64::encode(args.source.as_bytes()),
+                content_b64: b64::encode(source.as_bytes()),
             });
 
             let ext = args.format.ext();
@@ -1873,6 +2094,17 @@ impl Tool for RenderTypst {
             };
             let mut out_val = self.0.execute(&ctx, req).await?;
             augment_with_staging(&mut out_val, staged, available, notes);
+            if let (Some((doc_id, ver)), Some(obj)) = (canvas, out_val.as_object_mut()) {
+                obj.insert("canvas_document_id".into(), json!(doc_id));
+                obj.insert("canvas_version".into(), json!(ver));
+                obj.insert(
+                    "canvas_note".into(),
+                    json!(
+                        "Rendered from the canvas document — to change it, edit the \
+                         document and re-render with the SAME document_id."
+                    ),
+                );
+            }
             Ok(out_val)
         })
     }
@@ -2910,12 +3142,17 @@ mod tests {
     }
 
     #[test]
-    fn render_typst_schema_requires_source_and_lists_formats() {
+    fn render_typst_schema_offers_source_or_canvas_document() {
         let tool = RenderTypst(client("http://unused".into()));
         assert_eq!(tool.id(), "render_typst");
         let def = tool.schema();
         let params = serde_json::to_value(&def.function.parameters).unwrap();
-        assert_eq!(params["required"], json!(["source"]));
+        // `source` XOR `document_id` — neither is schema-required (the
+        // runtime enforces exactly one), both are advertised.
+        assert_eq!(params["required"], json!([]));
+        assert!(params["properties"].get("source").is_some());
+        assert!(params["properties"].get("document_id").is_some());
+        assert!(params["properties"].get("version").is_some());
         assert_eq!(
             params["properties"]["format"]["enum"],
             json!(["pdf", "png", "svg"])
@@ -2957,5 +3194,174 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn render_typst_requires_source_xor_document_id() {
+        let tool = RenderTypst(client("http://127.0.0.1:1".into()));
+        // Neither → clear error naming both options.
+        let err = tool.run(ctx().await, json!({})).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(ref m) if m.contains("document_id")),
+            "{err:?}"
+        );
+        // Both → rejected.
+        let err = tool
+            .run(
+                ctx().await,
+                json!({"source": "= Hi", "document_id": "doc_x"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(ref m) if m.contains("not both")),
+            "{err:?}"
+        );
+    }
+
+    /// Seed a session + one canvas document; returns (ctx, document_id).
+    async fn ctx_with_canvas_doc(format: &str, content: &str) -> (ToolContext, String) {
+        use crate::server::db::documents::{self, DocumentFormat};
+        let mut c = ctx().await;
+        seed_session_with_upload(&c.db, "t-seed", "hello").await;
+        c.session_id = Some("s1".into());
+        let id = documents::new_id();
+        documents::create(
+            &c.db,
+            &id,
+            "s1",
+            "u",
+            "My Deck",
+            DocumentFormat::parse(format).unwrap(),
+            content,
+            None,
+        )
+        .await
+        .unwrap();
+        (c, id)
+    }
+
+    #[tokio::test]
+    async fn render_typst_renders_from_canvas_typst_document() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .and(wiremock::matchers::body_string_contains(
+                "typst compile in.typ",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "exit_code": 0, "stdout": "", "stderr": "",
+                "artifacts": [], "duration_ms": 7, "timed_out": false
+            })))
+            .mount(&server)
+            .await;
+        let (c, id) = ctx_with_canvas_doc("typst", "= Hi from the canvas\n").await;
+        let tool = RenderTypst(client(server.uri()));
+        let out = tool
+            .run(c, json!({"document_id": id, "format": "pdf"}))
+            .await
+            .unwrap();
+        assert_eq!(out["exit_code"], 0);
+        // The result names its canvas source, so the model re-renders the
+        // same document after edits instead of pasting source inline.
+        assert_eq!(out["canvas_document_id"], json!(id));
+        assert_eq!(out["canvas_version"], 1);
+    }
+
+    #[tokio::test]
+    async fn render_typst_rejects_non_typst_canvas_document() {
+        let (c, id) = ctx_with_canvas_doc("markdown", "# Hi\n").await;
+        let tool = RenderTypst(client("http://127.0.0.1:1".into()));
+        let err = tool.run(c, json!({"document_id": id})).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(ref m) if m.contains("typst")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_document_compiles_typst_natively_for_pdf() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .and(wiremock::matchers::body_string_contains(
+                "typst compile input.typ",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "exit_code": 0, "stdout": "", "stderr": "",
+                "artifacts": [], "duration_ms": 7, "timed_out": false
+            })))
+            .mount(&server)
+            .await;
+        let (c, id) = ctx_with_canvas_doc("typst", "= Export me\n").await;
+        let tool = ExportDocument(client(server.uri()));
+        let out = tool
+            .run(c.clone(), json!({"document_id": id, "format": "pdf"}))
+            .await
+            .unwrap();
+        assert_eq!(out["exit_code"], 0);
+
+        // pptx export of typst is a clear error pointing at typ2pptx.
+        let err = tool
+            .run(c, json!({"document_id": id, "format": "pptx"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidArgs(ref m) if m.contains("typ2pptx")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_documents_materializes_canvas_content() {
+        let (c, id) = ctx_with_canvas_doc("typst", "= Staged\n").await;
+        let mut files = Vec::new();
+        let mut notes = Vec::new();
+        let staged = stage_documents(
+            &c,
+            &[
+                DocumentArg {
+                    document_id: id.clone(),
+                    version: None,
+                    name: None,
+                },
+                DocumentArg {
+                    document_id: "doc_missing".into(),
+                    version: None,
+                    name: None,
+                },
+            ],
+            &mut files,
+            &mut notes,
+        )
+        .await;
+        // Real document → an input file named from title + format ext.
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "My_Deck.typ");
+        assert_eq!(b64::decode(&files[0].content_b64).unwrap(), b"= Staged\n");
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0]["version"], 1);
+        // Unknown id → a note, not a failed run.
+        assert!(notes.iter().any(|n| n.contains("doc_missing")), "{notes:?}");
+    }
+
+    #[tokio::test]
+    async fn stage_documents_noop_without_session() {
+        let c = ctx().await;
+        let mut files = Vec::new();
+        let mut notes = Vec::new();
+        let staged = stage_documents(
+            &c,
+            &[DocumentArg {
+                document_id: "doc_x".into(),
+                version: None,
+                name: None,
+            }],
+            &mut files,
+            &mut notes,
+        )
+        .await;
+        assert!(staged.is_empty() && files.is_empty());
+        assert!(notes[0].contains("can't be staged"), "{notes:?}");
     }
 }

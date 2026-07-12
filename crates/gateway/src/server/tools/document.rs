@@ -230,10 +230,14 @@ impl Tool for CreateDocument {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["markdown", "text", "html", "json", "toml"],
+                        "enum": ["markdown", "text", "html", "json", "toml", "typst", "yaml"],
                         "description": "Content format. Use `markdown` for prose/guides \
-                                        (the default choice). `json`/`toml` enable \
-                                        structured editing via JSON Patch."
+                                        (the default choice); `typst` for layout-intensive \
+                                        documents you will render (draft the source here, \
+                                        compile via `render_typst`/`export_document`). \
+                                        `json`/`toml` enable structured editing via JSON \
+                                        Patch; `yaml` is edited as text so comments and \
+                                        key order survive."
                     },
                     "content": {
                         "type": "string",
@@ -264,7 +268,7 @@ impl Tool for CreateDocument {
                 .ok_or_else(|| ToolError::InvalidArgs("`format` is required".into()))?;
             let format = DocumentFormat::parse(format_s).ok_or_else(|| {
                 ToolError::InvalidArgs(format!(
-                    "unknown format `{format_s}`; use markdown, text, html, json, or toml"
+                    "unknown format `{format_s}`; use markdown, text, html, json, toml, typst, or yaml"
                 ))
             })?;
             let content = obj
@@ -490,7 +494,7 @@ impl Tool for ReadDocument {
                 "properties": {
                     "document_id": { "type": "string", "description": "The id from `create_document`." },
                     "version": { "type": "integer", "description": "Revision to read (default: latest)." },
-                    "section": { "type": "string", "description": "Markdown only: return the section whose heading contains this text, up to the next heading of the same or higher level." },
+                    "section": { "type": "string", "description": "Markdown/Typst only: return the section whose heading contains this text, up to the next heading of the same or higher level." },
                     "grep": { "type": "string", "description": "Return only lines containing this text (case-insensitive), with line numbers." },
                     "max_bytes": { "type": "integer", "description": "Cap the returned content size (default 16384). Ignored when `section`/`grep` are used." }
                 }
@@ -552,7 +556,13 @@ impl Tool for ReadDocument {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
             {
-                match extract_section(&ver.content, section) {
+                let Some(heading) = heading_level_fn(doc.format) else {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "`section` works on markdown and typst documents; `{document_id}` is {}                          — use `grep` or read from the top instead",
+                        doc.format.as_str()
+                    )));
+                };
+                match extract_section(&ver.content, section, heading) {
                     Some(s) => {
                         result["section"] = serde_json::json!(section);
                         result["content"] = serde_json::json!(s);
@@ -793,14 +803,15 @@ impl Tool for EditDocumentSection {
     fn schema(&self) -> ToolDef {
         ToolDef::function(
             self.id(),
-            "Replace a whole section of a MARKDOWN document by its heading, or \
-             add it if no such heading exists — a robust alternative to \
-             `edit_document` find/replace for larger structural changes. Give \
-             the `document_id`, the `heading` to target (matched by substring, \
-             case-insensitive), and the full replacement `content` INCLUDING \
-             its heading line (e.g. \"## Installation\\n\\n…\"). The section \
-             spans from its heading to the next heading of the same or higher \
-             level. Markdown documents only.",
+            "Replace a whole section of a MARKDOWN or TYPST document by its \
+             heading, or add it if no such heading exists — a robust \
+             alternative to `edit_document` find/replace for larger \
+             structural changes. Give the `document_id`, the `heading` to \
+             target (matched by substring, case-insensitive), and the full \
+             replacement `content` INCLUDING its heading line (markdown \
+             \"## Installation\\n\\n…\", typst \"== Installation\\n\\n…\"). \
+             The section spans from its heading to the next heading of the \
+             same or higher level.",
             serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -843,14 +854,14 @@ impl Tool for EditDocumentSection {
                         "no document `{document_id}` in this conversation"
                     ))
                 })?;
-            if doc.format != DocumentFormat::Markdown {
+            let Some(level) = heading_level_fn(doc.format) else {
                 return Err(ToolError::InvalidArgs(format!(
-                    "section edits are markdown-only; `{document_id}` is {}",
+                    "section edits work on markdown and typst documents; `{document_id}` is {}",
                     doc.format.as_str()
                 )));
-            }
-            let existed = extract_section(&ver.content, heading).is_some();
-            let new_content = replace_or_append_section(&ver.content, heading, content);
+            };
+            let existed = extract_section(&ver.content, heading, level).is_some();
+            let new_content = replace_or_append_section(&ver.content, heading, content, level);
             check_size(&new_content)?;
 
             let note = if existed {
@@ -909,19 +920,46 @@ fn markdown_heading_level(line: &str) -> Option<usize> {
     }
 }
 
+/// The heading level of a typst line (`== X` → 2): a run of `=` followed
+/// by a space. Mirrors [`markdown_heading_level`] for typst's syntax.
+fn typst_heading_level(line: &str) -> Option<usize> {
+    let eqs = line.chars().take_while(|c| *c == '=').count();
+    if eqs > 0 && line.chars().nth(eqs) == Some(' ') {
+        Some(eqs)
+    } else {
+        None
+    }
+}
+
+/// The heading detector for a format's section anchors, or `None` for
+/// formats without heading structure (text/html/json/toml/yaml). Single
+/// source of truth for `read_document`'s `section` slicing and
+/// `edit_document_section`, so both support exactly the same formats.
+fn heading_level_fn(format: DocumentFormat) -> Option<fn(&str) -> Option<usize>> {
+    match format {
+        DocumentFormat::Markdown => Some(markdown_heading_level),
+        DocumentFormat::Typst => Some(typst_heading_level),
+        _ => None,
+    }
+}
+
 /// Locate a markdown section by a heading substring (case-insensitive):
 /// returns `(start, end)` line indices spanning the heading through to the
 /// line before the next heading of the same or higher level. `None` if no
 /// heading matches.
-fn section_bounds(lines: &[&str], needle: &str) -> Option<(usize, usize)> {
+fn section_bounds(
+    lines: &[&str],
+    needle: &str,
+    heading: fn(&str) -> Option<usize>,
+) -> Option<(usize, usize)> {
     let needle = needle.to_lowercase();
     let start = lines
         .iter()
-        .position(|l| markdown_heading_level(l).is_some() && l.to_lowercase().contains(&needle))?;
-    let level = markdown_heading_level(lines[start]).unwrap();
+        .position(|l| heading(l).is_some() && l.to_lowercase().contains(&needle))?;
+    let level = heading(lines[start]).unwrap();
     let mut end = lines.len();
     for (i, l) in lines.iter().enumerate().skip(start + 1) {
-        if let Some(lvl) = markdown_heading_level(l)
+        if let Some(lvl) = heading(l)
             && lvl <= level
         {
             end = i;
@@ -933,19 +971,28 @@ fn section_bounds(lines: &[&str], needle: &str) -> Option<(usize, usize)> {
 
 /// Extract a markdown section's text (heading included). Returns `None` if
 /// no heading contains `needle`.
-fn extract_section(content: &str, needle: &str) -> Option<String> {
+fn extract_section(
+    content: &str,
+    needle: &str,
+    heading: fn(&str) -> Option<usize>,
+) -> Option<String> {
     let lines: Vec<&str> = content.lines().collect();
-    let (start, end) = section_bounds(&lines, needle)?;
+    let (start, end) = section_bounds(&lines, needle, heading)?;
     Some(lines[start..end].join("\n"))
 }
 
 /// Replace the section whose heading contains `heading` with
 /// `new_section` (which should include its own heading line), or append
 /// `new_section` as a new section when no heading matches.
-fn replace_or_append_section(content: &str, heading: &str, new_section: &str) -> String {
+fn replace_or_append_section(
+    content: &str,
+    heading: &str,
+    new_section: &str,
+    level: fn(&str) -> Option<usize>,
+) -> String {
     let new_section = new_section.trim_matches('\n');
     let lines: Vec<&str> = content.lines().collect();
-    match section_bounds(&lines, heading) {
+    match section_bounds(&lines, heading, level) {
         Some((start, end)) => {
             let mut parts: Vec<String> = Vec::new();
             if start > 0 {
@@ -1001,7 +1048,7 @@ mod tests {
     #[test]
     fn extract_section_returns_heading_to_next_same_level() {
         let md = "# Title\n\nintro\n\n## Install\n\nsteps\n\n## Usage\n\nmore\n";
-        let s = extract_section(md, "Install").unwrap();
+        let s = extract_section(md, "Install", markdown_heading_level).unwrap();
         assert!(s.starts_with("## Install"), "{s}");
         assert!(s.contains("steps"), "{s}");
         assert!(!s.contains("## Usage"), "{s}");
@@ -1010,20 +1057,25 @@ mod tests {
     #[test]
     fn extract_section_stops_at_higher_level_heading() {
         let md = "## A\n\naaa\n# B\n\nbbb\n";
-        let s = extract_section(md, "A").unwrap();
+        let s = extract_section(md, "A", markdown_heading_level).unwrap();
         assert!(s.contains("aaa"), "{s}");
         assert!(!s.contains("# B"), "{s}");
     }
 
     #[test]
     fn extract_section_missing_is_none() {
-        assert!(extract_section("# Only\n", "nope").is_none());
+        assert!(extract_section("# Only\n", "nope", markdown_heading_level).is_none());
     }
 
     #[test]
     fn replace_section_swaps_only_that_section() {
         let md = "# T\n\nintro\n\n## Install\n\nold steps\n\n## Usage\n\nuse it\n";
-        let out = replace_or_append_section(md, "Install", "## Install\n\nnew steps");
+        let out = replace_or_append_section(
+            md,
+            "Install",
+            "## Install\n\nnew steps",
+            markdown_heading_level,
+        );
         assert!(out.contains("new steps"), "{out}");
         assert!(!out.contains("old steps"), "{out}");
         assert!(out.contains("## Usage"), "{out}");
@@ -1033,7 +1085,8 @@ mod tests {
     #[test]
     fn replace_section_appends_when_heading_absent() {
         let md = "# T\n\nintro\n";
-        let out = replace_or_append_section(md, "Refs", "## Refs\n\nsee here");
+        let out =
+            replace_or_append_section(md, "Refs", "## Refs\n\nsee here", markdown_heading_level);
         assert!(out.starts_with("# T"), "{out}");
         assert!(out.trim_end().ends_with("see here"), "{out}");
         assert!(out.contains("intro"), "{out}");
@@ -1041,8 +1094,101 @@ mod tests {
 
     #[test]
     fn append_section_into_empty_doc() {
-        let out = replace_or_append_section("", "X", "## X\n\nbody");
+        let out = replace_or_append_section("", "X", "## X\n\nbody", markdown_heading_level);
         assert_eq!(out, "## X\n\nbody");
+    }
+
+    #[test]
+    fn typst_headings_anchor_sections() {
+        assert_eq!(typst_heading_level("= Title"), Some(1));
+        assert_eq!(typst_heading_level("== Sub"), Some(2));
+        assert_eq!(typst_heading_level("=no space"), None);
+        assert_eq!(typst_heading_level("text = x"), None);
+
+        let typ = "= Title\n\nintro\n\n== Install\n\nold steps\n\n== Usage\n\nuse it\n";
+        let s = extract_section(typ, "Install", typst_heading_level).unwrap();
+        assert!(s.starts_with("== Install"), "{s}");
+        assert!(!s.contains("== Usage"), "{s}");
+        let out = replace_or_append_section(
+            typ,
+            "Install",
+            "== Install\n\nnew steps",
+            typst_heading_level,
+        );
+        assert!(out.contains("new steps"), "{out}");
+        assert!(!out.contains("old steps"), "{out}");
+        assert!(out.contains("== Usage"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn tool_runtime_typst_document_with_section_edit() {
+        let pool = seeded_pool().await;
+        let c = ctx(pool, "s1");
+        let created = CreateDocument
+            .run(
+                c.clone(),
+                serde_json::json!({
+                    "title": "Deck", "format": "typst",
+                    "content": "= Deck\n\n== Intro\n\nhello\n"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["format"], "typst");
+        let id = created["document_id"].as_str().unwrap().to_string();
+
+        // Section edit anchors on the `==` typst heading.
+        let edited = EditDocumentSection
+            .run(
+                c.clone(),
+                serde_json::json!({
+                    "document_id": id, "heading": "Intro",
+                    "content": "== Intro\n\nrevised\n"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(edited["action"], "replaced");
+
+        // `section` reads work for typst too.
+        let read = ReadDocument
+            .run(
+                c.clone(),
+                serde_json::json!({"document_id": id, "section": "Intro"}),
+            )
+            .await
+            .unwrap();
+        assert!(read["content"].as_str().unwrap().contains("revised"));
+
+        // YAML is text-edited (find/replace), never JSON-patched.
+        let y = CreateDocument
+            .run(
+                c.clone(),
+                serde_json::json!({
+                    "title": "Cfg", "format": "yaml",
+                    "content": "# keep this comment\nport: 80\n"
+                }),
+            )
+            .await
+            .unwrap();
+        let yid = y["document_id"].as_str().unwrap().to_string();
+        EditDocument
+            .run(
+                c.clone(),
+                serde_json::json!({
+                    "document_id": yid,
+                    "edits": [{"find": "port: 80", "replace": "port: 8080"}]
+                }),
+            )
+            .await
+            .unwrap();
+        let read = ReadDocument
+            .run(c, serde_json::json!({"document_id": yid}))
+            .await
+            .unwrap();
+        let content = read["content"].as_str().unwrap();
+        assert!(content.contains("port: 8080"), "{content}");
+        assert!(content.contains("# keep this comment"), "{content}");
     }
 
     #[test]

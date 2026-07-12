@@ -35,7 +35,7 @@ which tool/engine does each job, and — importantly — what each path can and
 | `typst_letter` / `typst_onepager` / `typst_presentation` | structured input → file | typst | Renders a **branded** PDF + PNG preview from operator-defined templates. Also emits an editable export (below). |
 | — editable **PPTX** (presentation) | typst → pptx | **typ2pptx** | Direct typst→PowerPoint: real editable text/shapes/gradients. Post-processed with a font fixup + shrink-to-fit + **embedded fonts** (see limitations). |
 | — editable **DOCX** (letter/one-pager) | typst → HTML → docx | **pandoc** (+ python-docx) | The template is compiled to HTML and converted to editable Word by pandoc; the `[docx] font` is set as the document default and embedded as `.odttf` (from the template's own `fonts/`). Genuinely editable, on-brand text; fixed-layout chrome (a `place()`d footer) is dropped — see limitations. |
-| `create_document` / `edit_document` / `export_document` | canvas → file | in-proc + pandoc | Build a Markdown "canvas" doc across turns; export to pdf/docx/pptx. |
+| `create_document` / `edit_document` / `export_document` | canvas → file | in-proc + pandoc / typst | Build a "canvas" doc across turns (markdown, text, html, json, toml, **typst**, yaml); export markdown/text to pdf/docx/pptx via pandoc, and `typst` docs to pdf (`typst compile`) or docx (pandoc's typst reader). A typst canvas doc can also be rendered directly with `render_typst` via `document_id`. |
 | `run_in_sandbox` | anything | Python/bash in sandbox | Escape hatch: pandas, PyMuPDF, python-docx/pptx, LibreOffice, etc. for bespoke conversions. |
 
 All the file-producing paths run **inside the tool** — the model calls one tool
