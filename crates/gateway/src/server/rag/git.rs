@@ -15,6 +15,14 @@
 //! vars or credential helpers — that would either leak to child
 //! processes or require a writable HOME on the running gateway.
 //!
+//! A PAT is fundamentally an HTTPS credential, so when one is set we
+//! coerce the clone URL to `https://` first — including transcoding the
+//! SSH forms GitLab/GitHub hand out by default (scp-style
+//! `git@host:group/repo.git` and `ssh://git@host/group/repo.git`). That
+//! lets an operator paste *any* clone URL the forge offers and have it
+//! work with a token, without hand-rewriting it to HTTPS. Without a PAT,
+//! the URL is used verbatim so SSH URLs authenticate via the host keypair.
+//!
 //! Sandboxing flags we set on every git invocation:
 //!   * `GIT_TERMINAL_PROMPT=0` — never prompt for credentials; a bad PAT
 //!     becomes a clean error instead of a hung subprocess.
@@ -65,19 +73,31 @@ pub enum GitError {
     BadOutput { command: &'static str },
 }
 
-/// Inject `pat` into the `userinfo` portion of `url` so an HTTPS clone
-/// can authenticate without leaving the token in env vars or on disk.
-/// `None` PAT → URL returned unchanged. Non-HTTPS schemes (e.g. `git@…`
-/// SSH) are returned unchanged on the assumption that the operator
-/// configured a working keypair on the host.
+/// Produce the URL `git` should clone, authenticating with `pat` if set.
+///
+/// * **No PAT** (`None`/empty): the URL is returned verbatim. SSH URLs
+///   then authenticate via the host's keypair; public HTTPS needs nothing.
+/// * **PAT set**: the operator wants token auth, so we ensure an `https://`
+///   URL carrying the token in its userinfo — transcoding SSH forms
+///   (scp-style `git@host:path` and `ssh://…`) to their HTTPS equivalent
+///   first. The token goes in as `x-access-token:<pat>`, which GitLab and
+///   GitHub both accept (the username is ignored; the PAT is the password).
+///   A non-HTTPS, non-SSH URL a token can't safely ride on (`http://`,
+///   `git://`, `file://`) is passed through unchanged rather than leaking
+///   the token over a non-TLS transport.
 pub fn inject_pat(url: &str, pat: Option<&str>) -> Result<String, GitError> {
     let Some(pat) = pat.filter(|s| !s.is_empty()) else {
         return Ok(url.to_string());
     };
-    let mut parsed = Url::parse(url).map_err(|source| GitError::BadUrl {
-        url: url.to_string(),
-        source,
-    })?;
+    // Coerce SSH clone URLs to their https:// equivalent so the token can
+    // be injected; other schemes fall through to a plain parse.
+    let mut parsed = match ssh_to_https(url) {
+        Some(https) => https,
+        None => Url::parse(url).map_err(|source| GitError::BadUrl {
+            url: url.to_string(),
+            source,
+        })?,
+    };
     if parsed.scheme() != "https" {
         return Ok(url.to_string());
     }
@@ -86,6 +106,48 @@ pub fn inject_pat(url: &str, pat: Option<&str>) -> Result<String, GitError> {
     parsed.set_username("x-access-token").unwrap();
     parsed.set_password(Some(pat)).unwrap();
     Ok(parsed.to_string())
+}
+
+/// Transcode an SSH git URL to its `https://host/path` equivalent, or
+/// `None` if `url` isn't SSH (the caller then parses it as-is).
+///
+/// Handles both forms a forge emits:
+///   * scp-style `[user@]host:path` — recognised, per git's own rule, only
+///     when there's no `://` and no `/` before the first colon (so a local
+///     path like `./a:b` or `/tmp/x:y` is left alone).
+///   * `ssh://[user@]host[:port]/path` — the SSH port is dropped (it's
+///     meaningless over HTTPS).
+///
+/// Any embedded `user@` (typically `git@`) is discarded; HTTPS auth comes
+/// from the injected token, not the SSH login.
+fn ssh_to_https(url: &str) -> Option<Url> {
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        // rest = [user@]host[:port]/path
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        let host = host_port.split(':').next().unwrap_or(host_port);
+        return build_https(host, path);
+    }
+    if url.contains("://") {
+        return None;
+    }
+    let colon = url.find(':')?;
+    let (before, after) = (&url[..colon], &url[colon + 1..]);
+    if before.contains('/') {
+        return None; // local path with a colon, not an scp URL
+    }
+    let host = before.rsplit('@').next().unwrap_or(before);
+    build_https(host, after)
+}
+
+/// Assemble `https://<host>/<path>`, returning `None` on an empty host or
+/// a result the `url` crate rejects.
+fn build_https(host: &str, path: &str) -> Option<Url> {
+    if host.is_empty() {
+        return None;
+    }
+    let path = path.trim_start_matches('/');
+    Url::parse(&format!("https://{host}/{path}")).ok()
 }
 
 /// Idempotent fetch: clones if `target` doesn't exist, otherwise fetches
@@ -198,12 +260,38 @@ mod tests {
     }
 
     #[test]
-    fn inject_pat_leaves_ssh_urls_alone() {
-        let ssh = "git@example.com:org/repo.git";
-        // ssh URLs aren't url-parseable; helper returns BadUrl when a token
-        // is requested but they're meaningless for ssh anyway. Without a
-        // token, helper short-circuits before parsing.
+    fn inject_pat_passes_ssh_through_without_token() {
+        // No token → SSH URL is used verbatim so the host keypair authenticates.
+        let scp = "git@example.com:org/repo.git";
+        assert_eq!(inject_pat(scp, None).unwrap(), scp);
+        let ssh = "ssh://git@example.com/org/repo.git";
         assert_eq!(inject_pat(ssh, None).unwrap(), ssh);
+    }
+
+    #[test]
+    fn inject_pat_transcodes_scp_ssh_url_to_https_with_token() {
+        // A forge's default "Clone with SSH" URL, plus a PAT: it must be
+        // transcoded to https and carry the token — no operator rewrite needed.
+        let out = inject_pat("git@example.com:org/repo.git", Some("glpat-xyz")).unwrap();
+        assert_eq!(
+            out,
+            "https://x-access-token:glpat-xyz@example.com/org/repo.git"
+        );
+    }
+
+    #[test]
+    fn inject_pat_transcodes_ssh_scheme_url_dropping_port() {
+        // Explicit ssh:// form with a custom SSH port → https on 443, token injected.
+        let out = inject_pat("ssh://git@example.com:2222/org/repo.git", Some("tok")).unwrap();
+        assert_eq!(out, "https://x-access-token:tok@example.com/org/repo.git");
+    }
+
+    #[test]
+    fn ssh_to_https_ignores_local_path_with_colon() {
+        // A slash before the first colon means it's a path, not an scp URL
+        // (git's own disambiguation rule) — the transcoder must not misfire.
+        assert!(ssh_to_https("/srv/git/repo:mirror.git").is_none());
+        assert!(ssh_to_https("./relative:thing").is_none());
     }
 
     /// Build a tiny git repo to use as a clone source. Returns the path.
