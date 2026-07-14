@@ -398,19 +398,19 @@ fn render_filter_bar(
     html! {
         form(method: "get", action: "/usage", class: "flex flex-wrap items-end gap-3") {
             input(type: "hidden", name: "scope", value: (scope_value));
-            label(class: "form-control") {
+            label(class: "flex flex-col gap-1") {
                 span(class: "label-text text-xs text-base-content/60") { (period_label) }
                 select(name: "period", class: "select select-bordered select-sm", "data-on:change": (on_change)) {
                     for o in period_opts.iter() { (o.clone()) }
                 }
             }
-            label(class: "form-control") {
+            label(class: "flex flex-col gap-1") {
                 span(class: "label-text text-xs text-base-content/60") { (source_label) }
                 select(name: "source", class: "select select-bordered select-sm", "data-on:change": (on_change)) {
                     for o in source_opts.iter() { (o.clone()) }
                 }
             }
-            label(class: "form-control") {
+            label(class: "flex flex-col gap-1") {
                 span(class: "label-text text-xs text-base-content/60") { (backend_label) }
                 select(name: "backend", class: "select select-bordered select-sm", "data-on:change": (on_change)) {
                     for o in backend_opts.iter() { (o.clone()) }

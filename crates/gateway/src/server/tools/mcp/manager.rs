@@ -360,7 +360,19 @@ impl McpConnectionManager {
             .map(|exp| exp > Timestamp::now() + jiff::Span::new().seconds(REFRESH_SKEW_SECS))
             .unwrap_or(true); // no expiry recorded → assume usable
         if fresh_enough {
-            return Ok((self.decrypt_access(conn)?, false));
+            return match self.decrypt_access(conn) {
+                Ok(token) => Ok((token, false)),
+                // A decrypt failure won't self-heal — the encryption key changed
+                // or the value was sealed under a different key. Mark the
+                // connection errored (like the refresh path below) so it drops
+                // out of `connected_keys`, stops silently re-failing every turn,
+                // and the store UI prompts a reconnect instead of showing a stale
+                // "connected".
+                Err(err) => {
+                    let _ = user_mcp::mark_error(&self.db, user_id, &connector.key, &err).await;
+                    Err(err)
+                }
+            };
         }
         // Needs refresh.
         match self.refresh(user_id, connector, false).await {
@@ -1092,5 +1104,68 @@ mod tests {
         assert_eq!(layer.tool_ids(), vec!["company_echo".to_string()]);
         assert_eq!(layer.mode_of("company_echo"), Some(ToolMode::Always));
         assert_eq!(layer.connector_of("company_echo"), Some("gmail"));
+    }
+
+    #[tokio::test]
+    async fn access_token_decrypt_failure_marks_connection_errored() {
+        // Regression: a stored token sealed under a different key can't be
+        // decrypted and won't self-heal (e.g. the encryption key changed). The
+        // connection must flip from `connected` to `error` so it drops out of
+        // `connected_keys`, stops silently re-failing (and log-spamming) every
+        // turn, and the store UI prompts a reconnect instead of showing a stale
+        // green "connected".
+        let mgr = manager().await;
+        // FK: user_mcp_connections references users(id).
+        sqlx::query(
+            "INSERT INTO users (id, email, roles_json, created_at, updated_at) \
+             VALUES ('u1','u@e','[]','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        )
+        .execute(&mgr.db)
+        .await
+        .unwrap();
+        // Seal the token under a DIFFERENT key than the manager's ([7; 32]), so
+        // the manager can't open it — exactly the production key-drift scenario.
+        let sealed = Crypto::from_key([1u8; 32]).seal_str("stale-token").unwrap();
+        user_mcp::upsert_connection(
+            &mgr.db,
+            user_mcp::NewConnection {
+                user_id: "u1".into(),
+                connector_key: "discord".into(),
+                access_token_ct: sealed.ciphertext,
+                access_token_nonce: sealed.nonce,
+                refresh_token_ct: None,
+                refresh_token_nonce: None,
+                token_expires_at: None, // no expiry → fresh_enough → decrypt path
+                scopes: vec![],
+                dcr_client_id: None,
+                dcr_client_secret_ct: None,
+                dcr_client_secret_nonce: None,
+                token_url: None,
+            },
+        )
+        .await
+        .unwrap();
+        let connector = global_connector(AuthKind::OAuth2);
+        let conn = user_mcp::get_connection(&mgr.db, "u1", "discord")
+            .await
+            .unwrap()
+            .expect("connection was just inserted");
+        assert_eq!(conn.status, "connected", "starts life connected");
+
+        let res = mgr.access_token("u1", &connector, &conn).await;
+        assert!(res.is_err(), "decrypt under the wrong key must fail");
+
+        let after = user_mcp::get_connection(&mgr.db, "u1", "discord")
+            .await
+            .unwrap()
+            .expect("connection still present");
+        assert_eq!(
+            after.status, "error",
+            "a non-self-healing decrypt failure must mark the connection errored"
+        );
+        assert!(
+            after.last_error.unwrap_or_default().contains("decrypt"),
+            "last_error should record the decrypt failure"
+        );
     }
 }

@@ -175,12 +175,12 @@ pub(super) fn pk_name_input(value: &str, placeholder: &str, readonly: bool) -> p
     let placeholder = placeholder.to_string();
     if readonly {
         html! {
-            input(type: "text", name: "name", value: (value), required: "required", readonly: "readonly", class: "input input-bordered input-sm font-mono");
+            input(type: "text", name: "name", value: (value), required: "required", readonly: "readonly", class: "input input-bordered input-sm font-mono w-full");
         }
         .to_html()
     } else {
         html! {
-            input(type: "text", name: "name", value: (value), required: "required", placeholder: (placeholder), class: "input input-bordered input-sm font-mono");
+            input(type: "text", name: "name", value: (value), required: "required", placeholder: (placeholder), class: "input input-bordered input-sm font-mono w-full");
         }
         .to_html()
     }

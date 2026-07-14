@@ -773,7 +773,7 @@ fn render_ref_edit_form(lang: Lang, c: &rag_db::Collection, r: &rag_db::Collecti
                 "data-on:submit__prevent": (update_directive)
             ) {
                 div(class: "grid grid-cols-1 md:grid-cols-2 gap-3") {
-                    label(class: "form-control w-full") {
+                    label(class: "flex flex-col gap-1 w-full") {
                         div(class: "label") { span(class: "label-text text-xs") { (url_label) } }
                         input(
                             name: "git_url",
@@ -783,7 +783,7 @@ fn render_ref_edit_form(lang: Lang, c: &rag_db::Collection, r: &rag_db::Collecti
                             class: "input input-bordered input-sm w-full"
                         );
                     }
-                    label(class: "form-control w-full") {
+                    label(class: "flex flex-col gap-1 w-full") {
                         div(class: "label") { span(class: "label-text text-xs") { (t(lang, "rag-label-branch-tag")) } }
                         input(
                             name: "git_ref",
@@ -1580,7 +1580,7 @@ fn render_create_form(
                     (t(lang, "rag-create-description"))
                 }
                 div(class: "grid grid-cols-1 md:grid-cols-2 gap-4 mt-2") {
-                    label(class: "form-control w-full") {
+                    label(class: "flex flex-col gap-1 w-full") {
                         div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-name")) } }
                         input(
                             name: "name",
@@ -1591,7 +1591,7 @@ fn render_create_form(
                         );
                     }
                     (embedding_model_field(lang, embedding_models, default_embedding))
-                    label(class: "form-control w-full md:col-span-2") {
+                    label(class: "flex flex-col gap-1 w-full md:col-span-2") {
                         div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-description-optional")) } }
                         input(
                             name: "description",
@@ -1600,7 +1600,7 @@ fn render_create_form(
                             class: "input input-bordered w-full"
                         );
                     }
-                    label(class: "form-control w-full") {
+                    label(class: "flex flex-col gap-1 w-full") {
                         // Not `required`: aggregate collections leave this empty
                         // (each source brings its own URL). The server enforces
                         // a non-empty URL for versioned collections.
@@ -1612,7 +1612,7 @@ fn render_create_form(
                             class: "input input-bordered w-full"
                         );
                     }
-                    label(class: "form-control w-full") {
+                    label(class: "flex flex-col gap-1 w-full") {
                         div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-branch-tag")) } }
                         input(
                             name: "git_ref",
@@ -1621,7 +1621,7 @@ fn render_create_form(
                             class: "input input-bordered w-full"
                         );
                     }
-                    label(class: "form-control w-full md:col-span-2") {
+                    label(class: "flex flex-col gap-1 w-full md:col-span-2") {
                         div(class: "label") {
                             span(class: "label-text") { (t(lang, "rag-label-pat-optional")) }
                         }
@@ -1632,7 +1632,7 @@ fn render_create_form(
                             class: "input input-bordered w-full"
                         );
                     }
-                    label(class: "form-control w-full") {
+                    label(class: "flex flex-col gap-1 w-full") {
                         div(class: "label") {
                             span(class: "label-text") { (t(lang, "rag-label-include-globs-full")) }
                         }
@@ -1643,7 +1643,7 @@ fn render_create_form(
                             class: "input input-bordered w-full"
                         );
                     }
-                    label(class: "form-control w-full") {
+                    label(class: "flex flex-col gap-1 w-full") {
                         div(class: "label") {
                             span(class: "label-text") { (t(lang, "rag-label-exclude-globs")) }
                         }
@@ -1654,7 +1654,7 @@ fn render_create_form(
                             class: "input input-bordered w-full"
                         );
                     }
-                    label(class: "form-control w-full") {
+                    label(class: "flex flex-col gap-1 w-full") {
                         div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-chunk-size")) } }
                         input(
                             name: "chunk_size",
@@ -1665,7 +1665,7 @@ fn render_create_form(
                             class: "input input-bordered w-full"
                         );
                     }
-                    label(class: "form-control w-full") {
+                    label(class: "flex flex-col gap-1 w-full") {
                         div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-chunk-overlap")) } }
                         input(
                             name: "chunk_overlap",
@@ -1739,7 +1739,7 @@ fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[Stri
                         (status_badge(lang, c.status))
                     }
                     div(class: "grid grid-cols-1 md:grid-cols-2 gap-4 mt-2") {
-                        label(class: "form-control w-full md:col-span-2") {
+                        label(class: "flex flex-col gap-1 w-full md:col-span-2") {
                             div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-description")) } }
                             input(
                                 name: "description",
@@ -1748,7 +1748,7 @@ fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[Stri
                                 class: "input input-bordered w-full"
                             );
                         }
-                        label(class: "form-control w-full") {
+                        label(class: "flex flex-col gap-1 w-full") {
                             // Not `required`: aggregate collections leave this
                             // empty (sources bring their own URLs). The server
                             // only enforces it for versioned collections.
@@ -1760,7 +1760,7 @@ fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[Stri
                                 class: "input input-bordered w-full"
                             );
                         }
-                        label(class: "form-control w-full") {
+                        label(class: "flex flex-col gap-1 w-full") {
                             div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-branch-tag")) } }
                             input(
                                 name: "git_ref",
@@ -1770,7 +1770,7 @@ fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[Stri
                             );
                         }
                         (embedding_model_field(lang, embedding_models, Some(&c.embedding_model)))
-                        div(class: "form-control w-full") {
+                        div(class: "flex flex-col gap-1 w-full") {
                             div(class: "label") {
                                 span(class: "label-text") {
                                     (t(lang, "rag-label-pat"))
@@ -1803,7 +1803,7 @@ fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[Stri
                                 }
                             }
                         }
-                        label(class: "form-control w-full") {
+                        label(class: "flex flex-col gap-1 w-full") {
                             div(class: "label") {
                                 span(class: "label-text") { (t(lang, "rag-label-include-globs")) }
                             }
@@ -1815,7 +1815,7 @@ fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[Stri
                                 class: "input input-bordered w-full"
                             );
                         }
-                        label(class: "form-control w-full") {
+                        label(class: "flex flex-col gap-1 w-full") {
                             div(class: "label") {
                                 span(class: "label-text") { (t(lang, "rag-label-exclude-globs")) }
                             }
@@ -1827,7 +1827,7 @@ fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[Stri
                                 class: "input input-bordered w-full"
                             );
                         }
-                        label(class: "form-control w-full") {
+                        label(class: "flex flex-col gap-1 w-full") {
                             div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-chunk-size")) } }
                             input(
                                 name: "chunk_size",
@@ -1838,7 +1838,7 @@ fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[Stri
                                 class: "input input-bordered w-full"
                             );
                         }
-                        label(class: "form-control w-full") {
+                        label(class: "flex flex-col gap-1 w-full") {
                             div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-chunk-overlap")) } }
                             input(
                                 name: "chunk_overlap",
@@ -1877,7 +1877,7 @@ fn embedding_model_field(lang: Lang, models: &[String], selected: Option<&str>) 
     if models.is_empty() {
         let value = selected.unwrap_or("");
         return html! {
-            label(class: "form-control w-full") {
+            label(class: "flex flex-col gap-1 w-full") {
                 div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-embedding-model")) } }
                 input(
                     name: "embedding_model",
@@ -1905,7 +1905,7 @@ fn embedding_model_field(lang: Lang, models: &[String], selected: Option<&str>) 
         .filter(|s| !s.is_empty() && !models.iter().any(|m| m == s))
         .map(str::to_string);
     html! {
-        label(class: "form-control w-full") {
+        label(class: "flex flex-col gap-1 w-full") {
             div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-embedding-model")) } }
             select(
                 name: "embedding_model",

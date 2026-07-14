@@ -273,6 +273,14 @@ async fn main() -> anyhow::Result<()> {
         },
     );
     let registry = upstreams::UpstreamRegistry::new(&pools)?;
+    // The `/admin/upstreams` page reads topology from the DB (not the in-memory
+    // registry), so seed the same pools into the DB. Health rows key off the
+    // registry by backend name, which matches — so the seeded pools render as
+    // live "up" backends. Backends here carry no API key, so the crypto instance
+    // is never actually used to seal anything. Fresh in-memory DB every boot, so
+    // this always runs (no seed marker like main.rs).
+    let crypto = gateway::server::crypto::Crypto::from_env_or_session(&SESSION_SECRET);
+    db::upstreams_config::seed_from_config(&pool, &pools, &Default::default(), &crypto).await?;
     // Run the initial probe round so each backend's `/models` set is
     // populated before we start serving requests. Without this, the
     // first chat-page render lands on empty dropdowns until the

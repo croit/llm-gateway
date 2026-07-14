@@ -867,7 +867,7 @@ fn render_form(
         ) {
             div(class: "card-body gap-4") {
                 // --- Name ---
-                label(class: "form-control w-full") {
+                label(class: "flex flex-col gap-1 w-full") {
                     div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-name-label")) } }
                     input(
                         name: "name",
@@ -881,7 +881,7 @@ fn render_form(
                 }
 
                 // --- Model + compliance banner ---
-                label(class: "form-control w-full") {
+                label(class: "flex flex-col gap-1 w-full") {
                     div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-model-label")) } }
                     if models_empty {
                         input(
@@ -946,7 +946,7 @@ fn render_form(
                 }
 
                 // --- Prompt ---
-                label(class: "form-control w-full") {
+                label(class: "flex flex-col gap-1 w-full") {
                     div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-prompt-label")) } }
                     textarea(
                         name: "prompt",
@@ -1078,7 +1078,7 @@ fn render_schedule_builder(init: &BuilderInit, lang: Lang) -> Html {
 
             // Monthly: which day of the month. (Shown only in monthly mode.)
             div("data-show": "$mode === 'monthly'", class: "flex items-end gap-2") {
-                label(class: "form-control") {
+                label(class: "flex flex-col gap-1") {
                     div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-on-day-label")) } }
                     input(name: "dom", type: "number", min: "1", max: "31", value: (dom_str), "data-on:change": (PREVIEW_REFRESH), class: "input input-bordered w-24");
                 }
@@ -1092,7 +1092,7 @@ fn render_schedule_builder(init: &BuilderInit, lang: Lang) -> Html {
             // serde_urlencoded rejects). The hour + ":" hide in hourly mode
             // (which needs only a minute); "of every hour" shows there instead.
             div(class: "flex items-end flex-wrap gap-6") {
-                div("data-show": "$mode !== 'advanced'", class: "form-control") {
+                div("data-show": "$mode !== 'advanced'", class: "flex flex-col gap-1") {
                     div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-at-label")) } }
                     div(class: "flex items-end gap-1") {
                         span("data-show": "$mode !== 'hourly'", class: "flex items-end gap-1") {
@@ -1105,7 +1105,7 @@ fn render_schedule_builder(init: &BuilderInit, lang: Lang) -> Html {
                 }
 
                 // Timezone.
-                label(class: "form-control w-full max-w-xs") {
+                label(class: "flex flex-col gap-1 w-full max-w-xs") {
                     div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-timezone-label")) } }
                     input(name: "timezone", type: "text", value: (tz_str), placeholder: (t(lang, "scheduled-timezone-placeholder")), "data-on:change": (PREVIEW_REFRESH), class: "input input-bordered w-full");
                 }
@@ -1113,7 +1113,7 @@ fn render_schedule_builder(init: &BuilderInit, lang: Lang) -> Html {
 
             // Advanced panel.
             div("data-show": "$mode === 'advanced'", class: "flex flex-col gap-1") {
-                label(class: "form-control") {
+                label(class: "flex flex-col gap-1") {
                     div(class: "label") { span(class: "label-text") { (t(lang, "scheduled-cron-label")) } }
                     input(name: "advanced", type: "text", value: (advanced_str), placeholder: "0 9 * * *", "data-on:change": (PREVIEW_REFRESH), class: "input input-bordered w-full font-mono");
                 }

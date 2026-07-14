@@ -685,34 +685,34 @@ fn render_pool_form(
         ) {
             input(type: "hidden", name: "sort_order", value: (sort_order_str));
             div(class: "grid grid-cols-1 sm:grid-cols-3 gap-3") {
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "pools-field-name")) }
                     (name_field)
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "pools-field-kind")) }
                     (kind_select)
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "pools-field-strategy")) }
-                    select(name: "strategy", class: "select select-bordered select-sm") {
+                    select(name: "strategy", class: "select select-bordered select-sm w-full") {
                         for o in strategy_opts.iter() { (o.clone()) }
                     }
                 }
             }
-            label(class: "form-control gap-1") {
+            label(class: "flex flex-col gap-1") {
                 span(class: "text-xs opacity-70") { (t(lang, "pools-field-fallback-offline")) }
                 input(
                     type: "text", name: "fallback_offline", value: (fallback_offline),
-                    class: "input input-bordered input-sm font-mono",
+                    class: "input input-bordered input-sm font-mono w-full",
                     placeholder: (t(lang, "pools-field-fallback-offline-placeholder"))
                 );
             }
-            label(class: "form-control gap-1") {
+            label(class: "flex flex-col gap-1") {
                 span(class: "text-xs opacity-70") { (t(lang, "pools-field-models")) }
                 input(
                     type: "text", name: "models", value: (models),
-                    class: "input input-bordered input-sm font-mono",
+                    class: "input input-bordered input-sm font-mono w-full",
                     placeholder: "qwen-32b, glm-4.6"
                 );
                 span(class: "text-xs text-base-content/50") { (t(lang, "pools-field-models-hint")) }
@@ -753,7 +753,7 @@ fn pool_kind_select(kind_opts: &[Html], is_add: bool) -> Html {
     if is_add {
         html! {
             select(
-                name: "kind", class: "select select-bordered select-sm",
+                name: "kind", class: "select select-bordered select-sm w-full",
                 "data-bind": "addPoolKind"
             ) {
                 for o in kind_opts.iter() { (o.clone()) }
@@ -762,7 +762,7 @@ fn pool_kind_select(kind_opts: &[Html], is_add: bool) -> Html {
         .to_html()
     } else {
         html! {
-            select(name: "kind", class: "select select-bordered select-sm") {
+            select(name: "kind", class: "select select-bordered select-sm w-full") {
                 for o in kind_opts.iter() { (o.clone()) }
             }
         }
@@ -782,10 +782,10 @@ fn render_pool_voices_field(lang: Lang, voices: &str, is_add: bool, is_speech: b
     let label = t(lang, "pools-field-voices");
     if is_add {
         html! {
-            label(class: "form-control gap-1", "data-show": "$addPoolKind === 'speech'") {
+            label(class: "flex flex-col gap-1", "data-show": "$addPoolKind === 'speech'") {
                 span(class: "text-xs opacity-70") { (label) }
                 textarea(
-                    name: "voices", class: "textarea textarea-bordered textarea-sm font-mono",
+                    name: "voices", class: "textarea textarea-bordered textarea-sm font-mono w-full",
                     rows: "2", placeholder: "de=de-voice\nen=en-voice"
                 ) { (voices) }
             }
@@ -793,10 +793,10 @@ fn render_pool_voices_field(lang: Lang, voices: &str, is_add: bool, is_speech: b
         .to_html()
     } else {
         html! {
-            label(class: "form-control gap-1") {
+            label(class: "flex flex-col gap-1") {
                 span(class: "text-xs opacity-70") { (label) }
                 textarea(
-                    name: "voices", class: "textarea textarea-bordered textarea-sm font-mono",
+                    name: "voices", class: "textarea textarea-bordered textarea-sm font-mono w-full",
                     rows: "2", placeholder: "de=de-voice\nen=en-voice"
                 ) { (voices) }
             }
@@ -948,72 +948,72 @@ fn backend_form_fields(
     html! {
         div(class: "flex flex-col gap-3") {
             div(class: "grid grid-cols-1 sm:grid-cols-2 gap-3") {
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "backends-field-name")) }
                     (name_field)
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "backends-field-base-url")) }
                     input(
                         type: "text", name: "base_url", value: (base_url),
-                        class: "input input-bordered input-sm font-mono",
+                        class: "input input-bordered input-sm font-mono w-full",
                         required: "required", placeholder: "http://gpu-01:8000/v1"
                     );
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "backends-field-api-key")) }
                     input(
                         type: "password", name: "api_key", value: "", autocomplete: "off",
-                        class: "input input-bordered input-sm font-mono", placeholder: (key_placeholder)
+                        class: "input input-bordered input-sm font-mono w-full", placeholder: (key_placeholder)
                     );
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "backends-field-api-key-env")) }
                     input(
                         type: "text", name: "api_key_env", value: (api_key_env),
-                        class: "input input-bordered input-sm font-mono", placeholder: "GPU01_KEY"
+                        class: "input input-bordered input-sm font-mono w-full", placeholder: "GPU01_KEY"
                     );
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "backends-field-health-path")) }
                     input(
                         type: "text", name: "health_path", value: (health_path),
-                        class: "input input-bordered input-sm font-mono", placeholder: "/models"
+                        class: "input input-bordered input-sm font-mono w-full", placeholder: "/models"
                     );
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "backends-field-weight")) }
                     input(
                         type: "number", name: "weight", value: (weight), min: "1",
-                        class: "input input-bordered input-sm"
+                        class: "input input-bordered input-sm w-full"
                     );
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "backends-field-max-inflight")) }
                     input(
                         type: "number", name: "max_inflight", value: (max_inflight), min: "1",
-                        class: "input input-bordered input-sm"
+                        class: "input input-bordered input-sm w-full"
                     );
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "backends-field-pool")) }
-                    select(name: "pool", class: "select select-bordered select-sm") {
+                    select(name: "pool", class: "select select-bordered select-sm w-full") {
                         for o in pool_opts.iter() { (o.clone()) }
                     }
                     span(class: "text-xs text-base-content/50") { (t(lang, "backends-field-pool-hint")) }
                 }
             }
-            label(class: "form-control gap-1") {
+            label(class: "flex flex-col gap-1") {
                 span(class: "text-xs opacity-70") { (t(lang, "backends-field-models")) }
                 input(
                     type: "text", name: "models", value: (models),
-                    class: "input input-bordered input-sm font-mono", placeholder: "qwen-32b, qwen-7b"
+                    class: "input input-bordered input-sm font-mono w-full", placeholder: "qwen-32b, qwen-7b"
                 );
             }
-            label(class: "form-control gap-1") {
+            label(class: "flex flex-col gap-1") {
                 span(class: "text-xs opacity-70") { (t(lang, "backends-field-aliases")) }
                 textarea(
-                    name: "aliases", class: "textarea textarea-bordered textarea-sm font-mono",
+                    name: "aliases", class: "textarea textarea-bordered textarea-sm font-mono w-full",
                     rows: "2", placeholder: "fast=qwen-7b\nsmart=qwen-32b"
                 ) { (aliases) }
             }
@@ -1108,9 +1108,9 @@ fn fallback_select(lang: Lang, kind: &str, current: Option<&str>, all_models: &[
     html! {
         form(method: "post", action: (action), class: "m-0") {
             input(type: "hidden", name: "kind", value: (kind.to_string()));
-            label(class: "form-control gap-1") {
+            label(class: "flex flex-col gap-1") {
                 span(class: "text-xs opacity-70 font-mono") { (kind.to_string()) }
-                select(name: "model", class: "select select-bordered select-sm", "data-on:change": (post)) {
+                select(name: "model", class: "select select-bordered select-sm w-full", "data-on:change": (post)) {
                     for o in opts.iter() { (o.clone()) }
                 }
             }

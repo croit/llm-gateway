@@ -765,7 +765,7 @@ fn render_defaults_card(lang: Lang, rows: &[FeatureDefaultRow]) -> Html {
                 ));
             }
             html! {
-                form(method: "post", action: (action), class: "form-control m-0") {
+                form(method: "post", action: (action), class: "flex flex-col gap-1 m-0") {
                     input(type: "hidden", name: "feature", value: (row.feature.as_str()));
                     span(class: "label-text text-xs mb-1") { (t(lang, row.label_key)) }
                     select(
@@ -1145,29 +1145,29 @@ fn render_chat_editor(lang: Lang, currency: &str, row: &ModelRow, all_models: &[
         form(method: "post", action: (action), "data-on:submit__prevent": (post), class: "flex flex-col gap-3 m-0") {
             input(type: "hidden", name: "model_name", value: (row.name.clone()));
             div(class: "grid grid-cols-1 sm:grid-cols-2 gap-3") {
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "admin-price-in-label")) " (" (price_label.clone()) ")" }
                     input(type: "number", name: "input_price", value: (in_val), min: "0", step: "any",
                         placeholder: (t(lang, "admin-price-in-placeholder")), class: "input input-bordered input-sm");
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "admin-price-out-label")) " (" (price_label) ")" }
                     input(type: "number", name: "output_price", value: (out_val), min: "0", step: "any",
                         placeholder: (t(lang, "admin-price-out-placeholder")), class: "input input-bordered input-sm");
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "admin-context-window-full-label")) }
                     input(type: "number", name: "context_window", value: (ctx_val), min: "1",
                         placeholder: (t(lang, "admin-context-window-placeholder")), class: "input input-bordered input-sm");
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "admin-reasoning-style-label")) }
                     (reasoning_style_select(lang, &row.reasoning_style))
                 }
             }
             (render_reasoning_controls(lang, row))
             (render_capabilities(lang, row, all_models))
-            label(class: "form-control gap-1") {
+            label(class: "flex flex-col gap-1") {
                 span(class: "text-xs opacity-70") { (t(lang, "admin-toml-defaults-label")) }
                 textarea(
                     name: "defaults_toml",
@@ -1214,12 +1214,12 @@ fn render_price_only_editor(
         form(method: "post", action: (action), "data-on:submit__prevent": (post), class: "flex flex-col gap-3 m-0") {
             input(type: "hidden", name: "model_name", value: (name));
             div(class: "grid grid-cols-1 sm:grid-cols-2 gap-3") {
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "admin-price-in-label")) " (" (price_label.clone()) ")" }
                     input(type: "number", name: "input_price", value: (in_val), min: "0", step: "any",
                         placeholder: (t(lang, "admin-price-in-placeholder")), class: "input input-bordered input-sm");
                 }
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "admin-price-out-label")) " (" (price_label) ")" }
                     input(type: "number", name: "output_price", value: (out_val), min: "0", step: "any",
                         placeholder: (t(lang, "admin-price-out-placeholder")), class: "input input-bordered input-sm");
@@ -1274,7 +1274,7 @@ fn render_reasoning_controls(lang: Lang, row: &ModelRow) -> Html {
         let num = |name: &str, label_key: &str, val: &Option<i64>| {
             let v = val.map(|n| n.to_string()).unwrap_or_default();
             html! {
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, label_key)) }
                     input(type: "number", name: (name), value: (v), min: "1",
                         placeholder: (t(lang, "admin-budget-placeholder")),
@@ -1302,7 +1302,7 @@ fn render_reasoning_controls(lang: Lang, row: &ModelRow) -> Html {
                 opts.push(super::select_option(lvl, lvl, *lvl == current));
             }
             html! {
-                label(class: "form-control gap-1") {
+                label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, label_key)) }
                     select(name: (name), class: "select select-bordered select-sm") {
                         for o in opts.iter() { (o.clone()) }
@@ -1364,7 +1364,7 @@ fn cap_tri_select(lang: Lang, name: &str, label: &str, val: Option<bool>) -> Htm
         super::select_option("false", &t(lang, "admin-cap-disabled"), val == Some(false)),
     ];
     html! {
-        label(class: "form-control gap-1") {
+        label(class: "flex flex-col gap-1") {
             span(class: "text-xs opacity-70") { (label) }
             select(name: (name), class: "select select-bordered select-sm") {
                 for o in opts.iter() { (o.clone()) }
@@ -1394,7 +1394,7 @@ fn cap_fb_select(
         ));
     }
     html! {
-        label(class: "form-control gap-1") {
+        label(class: "flex flex-col gap-1") {
             span(class: "text-xs opacity-70") { (label) }
             select(name: (name), class: "select select-bordered select-sm") {
                 for o in opts.iter() { (o.clone()) }

@@ -15,82 +15,24 @@ request.model ──► [walk pools matching kind] ──► [pool whose backend
     - A picker strategy (`round_robin`, `least_inflight`). Default: `least_inflight`.
     - Implicit "what we serve" — the union of all backends' advertised-model sets.
 
-`crates/gateway/src/server/upstreams/` owns the runtime: `config.rs` parses the TOML, `registry.rs` walks pools per request, `health.rs` runs the probe loop.
+`crates/gateway/src/server/upstreams/` owns the runtime: the topology is loaded from the database (edited in the UI at `/admin/upstreams`), `registry.rs` walks pools per request, and `health.rs` runs the probe loop.
 
-## Config shape
+## Configuring pools & backends
 
-```toml
-# gateway.toml
-[upstream_pools.local_chat]
-kind = "chat"
-strategy = "least_inflight"
+Pools, backends, and per-model settings are configured **in the admin UI at `/admin/upstreams`** — the only supported path; there is no config-file topology. This section describes the fields you set there and how they behave; the [operator workflow](#operator-workflow) below has the click-path.
 
-[[upstream_pools.local_chat.backend]]
-name = "gpu-01"
-base_url = "http://gpu-01.internal:8000/v1"
-weight = 1
-max_inflight = 16
-# api_key_env = "BACKEND_GPU01_KEY"  # optional; for hosted providers
+A **pool** has a name, a `kind` (`chat` | `transcription` | `embedding` | `image` | `speech`), a picker `strategy` (`least_inflight` — recommended — or `round_robin`), optional GDPR/NDA compliance flags, a rate-limit-exemption toggle, and an optional offline-fallback model.
 
-[[upstream_pools.local_chat.backend]]
-name = "gpu-02"
-base_url = "http://gpu-02.internal:8000/v1"
-weight = 1
-max_inflight = 16
+A **backend** belongs to one pool and carries a name, base URL, an API key (entered once, stored encrypted; an env-var name can be given as a fallback), weight, max in-flight, health path, client-facing aliases, and two capability flags:
 
-[upstream_pools.local_whisper]
-kind = "transcription"
-strategy = "round_robin"
+- **Discover models from probe** (`probe_models`, default on). When off, the health probe is a pure liveness check and never overwrites the backend's configured model list. Turn it off for image/speech backends whose `/models` returns a *chat* catalog (z.AI's general endpoint, OpenAI) — otherwise the probe replaces the real model ids, makes them unroutable, and pollutes `/v1/models`. Such backends instead get an explicit model list (on the backend, or on the pool).
+- **Supports image editing** (`supports_edit`, default off). Marks an image backend as capable of editing. The `edit_image` tool is only registered when some image backend sets this, and editing is additionally refused against a backend whose pool is non-GDPR (it would ship existing user images off-site).
 
-[[upstream_pools.local_whisper.backend]]
-name = "whisper-01"
-base_url = "http://whisper-01.internal:9000/v1"
+A **speech** pool also takes an optional voice map — one voice id per spoken language (lowercase ISO-639-1), plus a default used when no language matches; voice mode resolves the voice from the language the STT detected. Unlike other kinds, a speech pool has **no unknown-model fallback** — a mistyped model or voice just surfaces the backend's own error. The chat UI's voice mode appears only when both a speech pool and a transcription model exist (see [`ui.md`](ui.md)).
 
-# Image generation / editing (OpenAI /images/* shape). Backs
-# POST /v1/images/generations + /v1/images/edits and the chat
-# generate_image / edit_image tools.
-[upstream_pools.images]
-kind = "image"
-models = ["gpt-image-1"]   # advertised statically; see probe_models below
+There is no static model table: each backend's `/models` response is the source of truth for what it serves. API keys are stored encrypted at rest; the optional env-var fallback is the only place key material comes from the environment.
 
-[[upstream_pools.images.backend]]
-name = "openai-image"
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-probe_models = false       # don't let the provider's /models catalog clobber the image ids
-supports_edit = true       # backend serves /images/edits (image-to-image)
-
-# Text-to-speech (OpenAI /v1/audio/speech shape). Backs POST /v1/audio/speech
-# and, together with a transcription pool, unlocks the chat UI's voice mode.
-[upstream_pools.tts]
-kind = "speech"
-models = ["gpt-4o-mini-tts"]   # required: most TTS servers have no usable /models probe
-
-  # Optional voice per spoken language (lowercase ISO-639-1). "" is the default
-  # when no language matches; omit the table to use the backend's own voice.
-  [upstream_pools.tts.voices]
-  "" = "alloy"
-  de = "nova"
-
-[[upstream_pools.tts.backend]]
-name = "openai-tts"
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-probe_models = false       # OpenAI's /models lists its whole catalog, not TTS ids
-```
-
-No `[[models]]` table. Each backend's `/models` response is the source of truth for what it serves.
-
-Two backend flags matter for image pools (and any backend whose `/models` catalog doesn't match what the pool serves):
-
-- **`probe_models`** (default `true`). When `false`, the health probe is a pure liveness check and never overwrites the configured `models`. Set it on image backends whose `/models` returns a *chat* catalog (z.AI's general endpoint, OpenAI) — otherwise the probe would replace the image model ids with chat models and make them unroutable, and pollute `/v1/models`.
-- **`supports_edit`** (default `false`). Marks a backend as capable of image *editing*. The `edit_image` tool is only registered when some image backend sets this, and editing is additionally refused against a backend whose pool is `gdpr = false` (it would ship existing user images off-site).
-
-For a `speech` pool, `models` is likewise required (set `probe_models = false` — most TTS servers have no usable `/models`, and cloud providers return their whole catalog). The optional `[upstream_pools.<name>.voices]` table maps a spoken language (lowercase ISO-639-1) to a backend voice id, with `""` as the default; voice mode resolves the voice from the language the STT detected. Unlike other kinds, a speech pool has **no unknown-model fallback** — a mistyped model or voice just surfaces the backend's own error. The chat UI's voice mode appears only when both a `speech` pool and a transcription model exist (see [`ui.md`](ui.md)).
-
-Secret material (`api_key_env`) is **only** sourced from env vars.
-
-For the `alias`, `[fallback]`, and `fallback_offline` keys, see [Model aliases](#model-aliases) and [Fallback models](#fallback-models).
+For aliases and the two fallback mechanisms, see [Model aliases](#model-aliases) and [Fallback models](#fallback-models) below.
 
 ## Model discovery
 
@@ -112,53 +54,30 @@ If two pools of the same kind advertise the same model, the first one we iterate
 
 An **alias** is a stable, client-facing name that routes to a real model, decoupling *what clients ask for* from *which model is actually loaded*. The problem it solves: without aliases a client hardcodes `Qwen/Qwen2.5-72B-Instruct`; the day you load `Qwen/Qwen3-235B` instead, the old id vanishes and every connected client `404`s until it's reconfigured. Point clients at the alias `qwen`, swap the loaded model, keep the alias — and nothing downstream changes.
 
-Aliases are declared **per backend**, inline. The same alias on several backends forms a **routing group**: a request for the alias load-balances across all of them via the normal pool picker, exactly as if they all advertised one shared model id. Both the alias *and* the real id are routable, and both appear in `/v1/models` — asking for the real id still pins that exact model.
+Aliases are set **per backend**, in the Add/Edit backend form's **Aliases** field (one `name=target` per line). The same alias on several backends forms a **routing group**: a request for the alias load-balances across all of them via the normal pool picker, exactly as if they all advertised one shared model id. Both the alias *and* the real id are routable, and both appear in `/v1/models` — asking for the real id still pins that exact model.
 
-Two forms — pick **one per backend**:
+There are two forms, and you pick **one per backend**:
 
-```toml
-# Single-model backend (the GPU norm): a bare list.
-# Each name binds to the one model this backend serves.
-[[upstream_pools.local_chat.backend]]
-name = "gpu-a"
-base_url = "http://gpu-a:8000/v1"
-alias = ["qwen", "fast"]
+- **Bare name** (the GPU norm) — a name with no target (leave the `=target` off, e.g. just `qwen`). It binds to the one model that backend serves, so it needs no target.
+- **`name=target`** — required on a **multi-model** backend (e.g. a cloud provider serving many models behind one base URL), where a bare name couldn't tell which model it means. For example `smart=glm-4.6` and `cheap=glm-4.5-air` on two lines.
 
-# Multi-model backend (e.g. a cloud provider serving many models
-# behind one base_url): a map, so each alias names its target real id.
-[[upstream_pools.cloud_chat.backend]]
-name = "zai"
-base_url = "https://api.z.ai/v1"
-api_key_env = "ZAI_KEY"
-alias = { smart = "glm-4.6", cheap = "glm-4.5-air" }
-```
-
-A bare-list alias needs no target because the backend serves exactly one model. The map form is **required** on multi-model backends, where a bare name couldn't tell which model it means. Both forms combine freely *across* backends into one group — list-form `qwen` on a GPU box and map-form `qwen = "glm-4.6"` on a cloud box share the same `qwen` group. A real model id always wins over an alias of the same spelling.
+Both forms combine freely *across* backends into one group — a bare `qwen` on a GPU box and `qwen=glm-4.6` on a cloud box share the same `qwen` group. A real model id always wins over an alias of the same spelling.
 
 When a request routes through an alias the gateway **rewrites the outgoing request body's `model` field to the resolved real id** — upstreams only know their own model ids, never the alias. The response therefore reports the real model that ran, and an `X-Gateway-Resolved-Model` response header records what the alias resolved to (only when it differs from what the client sent). Admin sampling/reasoning defaults key on the **real id**, so aliases inherit them automatically — configure defaults once, under the real model name.
 
 ### Alias validation
 
-- **At boot — refuse to start.** Statically-detectable conflicts: an alias name that collides with a real model id declared in config, or a map-form target that isn't in that backend's configured `models`. The gateway logs a clear line and exits non-zero.
+- **At registry build — refuse to start.** Statically-detectable conflicts: an alias name that collides with a real model id in the topology, or a `name=target` alias whose target isn't in that backend's configured `models`. The gateway logs a clear line and exits non-zero.
 - **At runtime — log + disable.** A backend's real model set is discovered from its `/models` probe, so some conflicts can't be known at boot. If a *bare* alias lands on a backend that the probe reveals serves more than one model, it's ambiguous: the gateway logs an `ERROR`, disables just that alias binding (it stops resolving and drops out of `/v1/models`), and keeps routing the backend's real ids by their own names. Detection runs when the probe updates the model set — on the transition only, not every probe.
 
 ## Fallback models
 
 Two independent safety nets for two different failures. Both are optional; leaving them unset reproduces the previous behavior exactly (`404` / `503`).
 
-- **`[fallback]` — unknown model (per kind).** When a request names a model that is neither a real id nor any alias, substitute a configured default *for that request kind*. Answers "the client asked for something we've never heard of" — a typo, or a model that got renamed. Unset ⇒ `404 model_not_found`.
-- **`fallback_offline` — known but offline (per pool).** When a model *is* known but no healthy backend can currently serve it, spill to a backup model — typically a different tier (local GPUs down → a cloud model). Answers "we know this model, our capacity for it is just down right now." Unset ⇒ `503`.
+- **Unknown-model fallback (per kind).** When a request names a model that is neither a real id nor any alias, substitute a configured default *for that request kind*. Answers "the client asked for something we've never heard of" — a typo, or a model that got renamed. Unset ⇒ `404 model_not_found`. Set these in the **Unknown-model fallbacks** editor on `/admin/upstreams` (one auto-saving picker per kind).
+- **Offline fallback (per pool).** When a model *is* known but no healthy backend can currently serve it, spill to a backup model — typically a different tier (local GPUs down → a cloud model). Answers "we know this model, our capacity for it is just down right now." Unset ⇒ `503`. Set it in the pool editor's **offline fallback** field.
 
-```toml
-[fallback]
-chat = "qwen"                        # unknown chat model → route to "qwen"
-embedding = "text-embedding-3-small"
-# transcription unset → stays 404
-
-[upstream_pools.local_chat]
-kind = "chat"
-fallback_offline = "glm-4.6"         # a known model in this pool going fully offline spills here
-```
+For example: an unknown chat model routes to `qwen` and an unknown embedding model to `text-embedding-3-small` (leave a kind's picker empty to keep returning `404`); a chat pool whose replicas all go down spills to `glm-4.6`.
 
 A fallback target is **re-resolved through the normal path**, so it may itself be an alias/group and lands on whatever healthy pool serves it. Fallback is a **single hop**: if the fallback target is *also* unavailable, the gateway returns the original `404`/`503` rather than chaining — no loops. Saturation (a healthy model whose backends are all at `max_inflight`) is **not** a fallback trigger — that stays a `503`, so a request never silently downgrades to a weaker model under mere load. Note the RAG embedding path deliberately does **not** apply `fallback_offline`: embeddings from a different model aren't comparable and would corrupt the index.
 
@@ -211,6 +130,7 @@ We do **not** transcode audio in the gateway — upstreams handle the formats th
 
 ## Operator workflow
 
+- Add, edit, or remove pools and backends at `/admin/upstreams`, then click **Apply changes** to reload the runtime registry (a sticky bar counts unapplied edits). Topology edits are saved to the database and take effect without a restart.
 - Add a model on a backend → it shows up in `/v1/models` and the chat picker within 5 s.
 - Drop a model → it disappears from routing within 5 s (next probe).
 - Want to verify? Check `tracing` output: every model-set change logs `advertised models updated added=[...] removed=[...] total=N`.

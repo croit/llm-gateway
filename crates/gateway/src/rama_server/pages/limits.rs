@@ -328,7 +328,7 @@ fn render_add_form(
                     "data-on:submit__prevent": (submit),
                     class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 m-0"
                 ) {
-                    label(class: "form-control") {
+                    label(class: "flex flex-col gap-1") {
                         span(class: "label-text text-xs opacity-70") { (t(lang, "limits-field-subject")) }
                         select(name: "subject_type", class: "select select-bordered select-sm") {
                             (opt("global", &t(lang, "limits-subject-global")))
@@ -336,7 +336,7 @@ fn render_add_form(
                             (opt("user", &t(lang, "limits-subject-user")))
                         }
                     }
-                    label(class: "form-control") {
+                    label(class: "flex flex-col gap-1") {
                         span(class: "label-text text-xs opacity-70") { (t(lang, "limits-field-subject-id")) }
                         input(
                             type: "text", name: "subject_id", list: "limits-subjects",
@@ -347,7 +347,7 @@ fn render_add_form(
                             for s in suggestions.iter() { (s.clone()) }
                         }
                     }
-                    label(class: "form-control") {
+                    label(class: "flex flex-col gap-1") {
                         span(class: "label-text text-xs opacity-70") { (t(lang, "limits-field-model")) }
                         select(name: "model", class: "select select-bordered select-sm") {
                             // Empty value = the all-models aggregate (the common case).
@@ -357,7 +357,7 @@ fn render_add_form(
                             }
                         }
                     }
-                    label(class: "form-control") {
+                    label(class: "flex flex-col gap-1") {
                         span(class: "label-text text-xs opacity-70") { (t(lang, "limits-field-dimension")) }
                         select(name: "dimension", class: "select select-bordered select-sm") {
                             (opt("requests", &t(lang, "limits-dim-requests")))
@@ -365,7 +365,7 @@ fn render_add_form(
                             (opt("cost", &cost_label))
                         }
                     }
-                    label(class: "form-control") {
+                    label(class: "flex flex-col gap-1") {
                         span(class: "label-text text-xs opacity-70") { (t(lang, "limits-field-window")) }
                         select(name: "window", class: "select select-bordered select-sm") {
                             (opt("hour", &t(lang, "limits-win-hour")))
@@ -374,7 +374,7 @@ fn render_add_form(
                             (opt("month", &t(lang, "limits-win-month")))
                         }
                     }
-                    label(class: "form-control") {
+                    label(class: "flex flex-col gap-1") {
                         span(class: "label-text text-xs opacity-70") { (t(lang, "limits-field-value")) }
                         input(
                             type: "number", name: "value", min: "0", step: "any", required: "required",

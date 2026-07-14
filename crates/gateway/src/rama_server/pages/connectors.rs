@@ -807,7 +807,7 @@ fn render_form_fields(
         let val = val.to_string();
         let ph = ph.to_string();
         html! {
-            label(class: "form-control w-full") {
+            label(class: "flex flex-col gap-1 w-full") {
                 span(class: "label-text text-xs") { (label) }
                 input(
                     type: "text", name: (fname), value: (val), placeholder: (ph),
@@ -841,7 +841,7 @@ fn render_form_fields(
         form(method: "post", action: "/admin/connectors", class: "flex flex-col gap-2") {
             div(class: "grid grid-cols-1 sm:grid-cols-2 gap-2") {
                 if is_edit {
-                    label(class: "form-control w-full") {
+                    label(class: "flex flex-col gap-1 w-full") {
                         span(class: "label-text text-xs") { (t(lang, "connectors-field-key-readonly-label")) }
                         input(type: "text", name: "key", value: (key.clone()), readonly: "readonly",
                               class: "input input-bordered input-sm w-full opacity-60");
@@ -855,7 +855,7 @@ fn render_form_fields(
             }
             (text_field(&description_label, "description", &description, &description_placeholder))
             (text_field(&url_label, "url", &url, "https://…/mcp"))
-            label(class: "form-control w-full") {
+            label(class: "flex flex-col gap-1 w-full") {
                 span(class: "label-text text-xs") { "Scope" }
                 select(name: "scope", class: "select select-bordered select-sm w-full") {
                     if is_global {
@@ -870,7 +870,7 @@ fn render_form_fields(
                     "Global connectors are shared by everyone (RBAC-gated) with no sign-in — a single bot/token for the whole gateway (e.g. Discord). They must use \"No auth\" or \"Bearer token\", not OAuth."
                 }
             }
-            label(class: "form-control w-full") {
+            label(class: "flex flex-col gap-1 w-full") {
                 span(class: "label-text text-xs") { (t(lang, "connectors-field-auth-label")) }
                 select(name: "auth", class: "select select-bordered select-sm w-full") {
                     if auth_static {
@@ -895,7 +895,7 @@ fn render_form_fields(
             // each user paste their own token on /integrations, so the field is
             // only shown for the global case.
             if is_global && auth_static {
-                label(class: "form-control w-full") {
+                label(class: "flex flex-col gap-1 w-full") {
                     span(class: "label-text text-xs") { "Bearer token (shared)" }
                     input(type: "password", name: "client_secret", placeholder: (secret_placeholder),
                           class: "input input-bordered input-sm w-full");
@@ -909,7 +909,7 @@ fn render_form_fields(
             // has no app-level client, so hide the whole block (incl. the
             // Google client-JSON paste).
             if !auth_static && !auth_none {
-                label(class: "form-control w-full") {
+                label(class: "flex flex-col gap-1 w-full") {
                     span(class: "label-text text-xs") {
                         (t(lang, "connectors-field-client-json-label"))
                     }
@@ -921,7 +921,7 @@ fn render_form_fields(
                     }
                 }
                 div(class: "grid grid-cols-1 sm:grid-cols-2 gap-2") {
-                    label(class: "form-control w-full") {
+                    label(class: "flex flex-col gap-1 w-full") {
                         span(class: "label-text text-xs") { (t(lang, "connectors-field-client-id-label")) }
                         input(type: "text", name: "client_id", value: (client_id),
                               placeholder: (client_id_placeholder),
@@ -932,7 +932,7 @@ fn render_form_fields(
                             (t(lang, "connectors-field-client-id-help-2"))
                         }
                     }
-                    label(class: "form-control w-full") {
+                    label(class: "flex flex-col gap-1 w-full") {
                         span(class: "label-text text-xs") { (t(lang, "connectors-field-client-secret-label")) }
                         input(type: "password", name: "client_secret", placeholder: (secret_placeholder),
                               class: "input input-bordered input-sm w-full");

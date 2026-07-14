@@ -916,7 +916,7 @@ fn render_token_form(lang: Lang, key: &str) -> Html {
     html! {
         form(method: "post", action: (action),
              class: "border-t border-base-300 pt-3 flex items-end gap-2 flex-wrap") {
-            label(class: "form-control flex-1 min-w-48") {
+            label(class: "flex flex-col gap-1 flex-1 min-w-48") {
                 span(class: "label-text text-xs") { (t(lang, "integrations-token-label")) }
                 input(type: "password", name: "token", required: "required",
                       placeholder: (t(lang, "integrations-token-placeholder")), autocomplete: "off",

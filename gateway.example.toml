@@ -22,7 +22,7 @@ allow_impersonation = false
 
 # ---- Usage metrics ---------------------------------------------------------
 # Per-user / per-backend request + token accounting, surfaced at /usage (and
-# the per-backend sparkline on /admin/backends). Recording is decoupled from
+# the per-backend sparkline on /admin/upstreams). Recording is decoupled from
 # the request path (a bounded channel drained by a batched background writer),
 # so it adds negligible load — but it's a production kill switch if you ever
 # need it: set `enabled = false` to stop all measurement (no writer task, no
@@ -50,194 +50,25 @@ currency = "USD"
 # read) regardless of configured rules — a production escape hatch.
 enabled = true
 
-# ---- Upstream pools --------------------------------------------------------
-# Each [upstream_pools.<name>] block defines a logical pool of backends that
-# serve the same kind of model (chat, transcription, embedding). The picker
-# strategy chooses one healthy backend per request:
-#   - round_robin     (default rotation)
-#   - least_inflight  (prefers the least-loaded backend; recommended)
-
-[upstream_pools.local_chat]
-kind = "chat"
-strategy = "least_inflight"
-# Backup model if a model THIS pool knows has no healthy backend right now
-# (every replica down). The request re-resolves to this instead of 503 —
-# typically a different tier. Single hop; may itself be an alias. See the
-# "Model aliases + fallback" note below and docs/upstreams.md.
-# fallback_offline = "glm-4.6"
-# Whether calls to this pool count toward users' rate limits / quotas
-# (see [limits] and /admin/limits). Default true. Set false for your own
-# self-hosted GPU pools — their usage still shows on /usage, but it's free,
-# so it should never consume a user's budget (only cloud pools do).
-# enforce_limits = false
-
-[[upstream_pools.local_chat.backend]]
-name = "gpu-01"
-base_url = "http://gpu-01.internal:8000/v1"
-# api_key_env = "GPU01_KEY"   # uncomment if the backend needs a bearer
-max_inflight = 16
-weight = 1
-# Client-facing aliases this backend also answers to (see the note below).
-# Bare list form: each binds to the one model this backend serves.
-# alias = ["qwen", "fast"]
-
-[[upstream_pools.local_chat.backend]]
-name = "gpu-02"
-base_url = "http://gpu-02.internal:8000/v1"
-max_inflight = 16
-weight = 1
-# Same alias on a second backend → "qwen" load-balances across both (a group).
-# alias = ["qwen"]
-
-# Optional data-handling flags for every model this pool serves. Both default
-# to true (compliant) — omit the block entirely and nothing changes. Set a flag
-# to false to surface an advisory warning in the chat UI (a dropdown-label
-# suffix + a red banner shown before any prompt). Purely informational: it does
-# NOT block or inspect requests. Use for non-EU / third-party providers, e.g.:
-#   [upstream_pools.zai.compliance]
-#   gdpr = false   # data leaves the EU / no GDPR safeguards → warn: no personal data
-#   nda  = false   # not covered by a confidentiality agreement → warn: no NDA material
-
-# Second pool for Whisper-style transcription. /v1/audio/transcriptions
-# routes here when the request's `model` field is advertised by any
-# backend in a transcription-kind pool.
-# [upstream_pools.local_whisper]
-# kind = "transcription"
-# strategy = "round_robin"
-# # Fallback model ids for backends that don't expose a usable `/models`
-# # endpoint (e.g. a Voxtral realtime server). Advertised in /v1/models and
-# # used for routing only while the probe reports nothing. Can also be set
-# # per-backend (below), which takes precedence over this pool-level list.
-# models = ["mistralai/Voxtral-Mini-4B-Realtime-2602"]
+# ---- Upstream pools, backends & models -------------------------------------
+# NOT configured in this file. Pools, backends, and per-model settings live in
+# the database and are managed entirely through the admin UI — this is the only
+# supported path. A fresh install boots with no upstreams; you sign in as an
+# admin (see [rbac] / [[roles]] below) and configure everything in the UI:
 #
-# [[upstream_pools.local_whisper.backend]]
-# name = "whisper-01"
-# base_url = "http://whisper-01.internal:9000/v1"
-# health_path = "/models"   # Whisper-only servers may need a different path
-# # models = ["whisper-1"]  # per-backend fallback; overrides the pool list
-
-# Image generation + editing. POST /v1/images/generations (and, for editing,
-# POST /v1/images/edits) route here when the request's `model` is advertised by
-# a backend in an image-kind pool; the chat `generate_image` / `edit_image`
-# tools use the same pool. Point it at any OpenAI `/images/*`-compatible
-# endpoint — a hosted provider (below) or a self-hosted image model (e.g.
-# Qwen-Image / Qwen-Image-Edit) behind an OpenAI-compatible server.
+#   * /admin/upstreams — create pools (kind = chat | transcription | embedding |
+#     image | speech) and their backends: base URL, API key (stored encrypted),
+#     weight, max in-flight, health path, and client-facing aliases; per-pool
+#     picker strategy (round_robin | least_inflight), GDPR/NDA compliance flags,
+#     rate-limit exemption, and the unknown-model / all-offline fallbacks. Edits
+#     take effect live via "Apply changes" — no restart, no file edit.
+#   * /admin/models — per-model prices (per 1M input/output tokens), reasoning
+#     budgets, context windows, capabilities, sampling defaults, and the
+#     per-feature default model (chat / voice / image generation).
 #
-# The example wires z.AI's GLM-Image. IMPORTANT knobs:
-#   * base_url is the GENERAL endpoint (…/api/paas/v4), NOT the /coding/ one a
-#     GLM *chat* pool uses.
-#   * probe_models = false: z.AI's /models lists its CHAT catalog, which would
-#     otherwise clobber the image model ids and make them unroutable. With it
-#     off, the probe is a pure liveness check and the `models` list below is
-#     authoritative.
-#   * [compliance] gdpr = false surfaces the usual non-EU-provider warning.
-#   * supports_edit = false: GLM-Image is text→image only, so the `edit_image`
-#     tool stays hidden. A self-hosted edit-capable model (Qwen-Image-Edit)
-#     sets this true — and editing is *additionally* refused against any
-#     gdpr=false backend (it would ship existing user images off-site), so an
-#     edit backend should be on-prem / GDPR-compliant.
-# [upstream_pools.zai_image]
-# kind = "image"
-# strategy = "round_robin"
-# models = ["glm-image"]   # the image model ids your z.AI plan actually serves
-#   [upstream_pools.zai_image.compliance]
-#   gdpr = false
-#
-# [[upstream_pools.zai_image.backend]]
-# name = "zai-image"
-# base_url = "https://api.z.ai/api/paas/v4"
-# api_key_env = "ZAI_API_KEY"
-# probe_models = false
-# supports_edit = false
-# ---- Text-to-speech (voice conversation) -----------------------------------
-# A `kind = "speech"` pool backs POST /v1/audio/speech (OpenAI-shaped) and,
-# together with a transcription pool, unlocks the chat UI's voice-conversation
-# mode. Point it at any OpenAI-compatible TTS server — self-hosted (Qwen3-TTS,
-# Kokoro, XTTS via openedai-speech, LocalAI) or a cloud provider. Omit the whole
-# block and voice mode simply doesn't appear.
-#
-# [upstream_pools.local_tts]
-# kind = "speech"
-# # Fallback model id if the backend has no usable /models probe (most TTS
-# # servers don't). Required so the UI has a default model to call.
-# models = ["tts-1"]
-# # Optional: pick a voice per spoken language (lowercase ISO-639-1). The voice
-# # mode resolves the voice from the language the user spoke (detected by STT).
-# # The "" key is the default when no language-specific voice matches; omit the
-# # whole table to always use the backend's own default voice.
-# [upstream_pools.local_tts.voices]
-# "" = "af_heart"     # default voice
-# en = "af_heart"
-# de = "bf_emma"
-#
-# [[upstream_pools.local_tts.backend]]
-# name = "tts-01"
-# base_url = "http://tts-01.internal:8880/v1"
-# health_path = "/models"
-#
-# --- Cloud TTS (OpenAI) ---
-# OpenAI's own /v1/audio/speech is the reference for this shape, so it drops
-# straight in — point a speech pool at api.openai.com with an API key. Voices
-# are alloy/echo/fable/onyx/nova/shimmer (multilingual, one voice covers many
-# languages, so a per-language map is optional). NOTE: this sends the spoken
-# text OUTSIDE the EU — flag `compliance` so the posture matches z.AI etc.
-#
-# [upstream_pools.openai_tts]
-# kind = "speech"
-# # REQUIRED for cloud providers: pins the TTS model. OpenAI's /models probe
-# # lists its whole catalogue, so voice mode uses this configured id rather than
-# # guessing from the probe. One of tts-1 / tts-1-hd / gpt-4o-mini-tts.
-# models = ["gpt-4o-mini-tts"]
-# [upstream_pools.openai_tts.compliance]
-# gdpr = false
-# nda = false
-# [upstream_pools.openai_tts.voices]
-# "" = "alloy"
-# [[upstream_pools.openai_tts.backend]]
-# name = "openai"
-# base_url = "https://api.openai.com/v1"
-# api_key_env = "OPENAI_API_KEY"
-
-# ---- Model → pool routing --------------------------------------------------
-# No static route table. The health probe hits each backend's `/models`
-# endpoint every 5 s, parses the OpenAI envelope (`{"data":[{"id":...}]}`),
-# and routes by what each backend reports. Load a model on a backend in
-# the right kind of pool and it becomes routable automatically — no
-# config edit required. (Run /v1/models or check the chat picker to see
-# what the gateway has discovered.)
-#
-# Model id resolution precedence per backend, highest first:
-#   1. what the backend's `/models` probe reports (authoritative);
-#   2. that backend's `models = [...]` (a fallback, more specific);
-#   3. the pool's `models = [...]` (a fallback, least specific).
-# The first non-empty source wins, so config is a fallback for backends that
-# can't self-report — not a supplement to a live probe.
-#
-# /v1/models lists EVERY model across ALL pools/kinds (chat + transcription +
-# embedding + image), de-duplicated by id — OpenAI parity; clients select by id.
-
-# ---- Model aliases + fallback ---------------------------------------------
-# Aliases (the per-backend `alias` key above) give clients a STABLE name that
-# routes to whatever real model is loaded — swap the model, keep the alias, and
-# connected clients never reconfigure. Two forms, pick one per backend:
-#   alias = ["qwen", "fast"]                 # bare list → the backend's sole model
-#   alias = { smart = "glm-4.6", cheap = "glm-4.5-air" }   # map → explicit targets
-# (use the map on a multi-model backend, e.g. a cloud provider). Both the alias
-# and the real id are routable and both appear in /v1/models. The forwarded
-# request's `model` is rewritten to the real id; the response carries
-# `X-Gateway-Resolved-Model`. Boot fails on an alias that shadows a real id or a
-# map target not in the backend's `models`; a bare alias on a backend serving
-# >1 model is disabled at runtime with a logged ERROR.
-#
-# Two optional fallbacks (unset ⇒ today's 404 / 503):
-#   - `[fallback]` (below): UNKNOWN model name → a per-kind default.
-#   - `fallback_offline` (per pool, above): a KNOWN model with all replicas down
-#     → a backup model. Not applied to RAG embeddings (a different embedding
-#     model would corrupt the index).
-# [fallback]
-# chat = "qwen"                       # unknown chat model → route to "qwen"
-# embedding = "text-embedding-3-small"
-# # transcription unset → stays 404
+# Routing needs no static table: the health probe reads each backend's /models
+# endpoint every few seconds and routes by what each one advertises. See
+# docs/upstreams.md for the routing model, aliases, and fallbacks.
 
 # ---- OIDC ------------------------------------------------------------------
 # Required for /auth/login and the /login page to work.
@@ -309,8 +140,9 @@ weight = 1
 # fully private (no public-read ACL, no presign capability needed).
 #
 # Capability gating is intentionally NOT done here — operators are
-# expected to point [upstream_pools] at multi-modal chat models only;
-# any model/attachment mismatch surfaces as the upstream's own error.
+# expected to point their chat pool (configured at /admin/upstreams) at
+# multi-modal models only; any model/attachment mismatch surfaces as the
+# upstream's own error.
 #
 # Past-turn attachments are stripped from the replayed history (kept as
 # brief `[attached: name.ext (omitted)]` stubs) so a long conversation
@@ -465,8 +297,8 @@ weight = 1
 # --- RAG (retrieval-augmented generation) ------------------------------
 # Operator-managed indexed codebases. Collections are added via the /rag
 # page (admin-only) or POST /api/v0/rag/collections; the gateway clones
-# them, chunks every file, embeds each chunk through one of the
-# `kind = "embedding"` pools above, and stores vectors in a per-collection
+# them, chunks every file, embeds each chunk through an embedding-kind pool
+# (configured at /admin/upstreams), and stores vectors in a per-collection
 # usearch file on disk. The `rag_search` + `rag_list_collections` tools
 # expose these collections to the chat model.
 #

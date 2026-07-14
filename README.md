@@ -30,10 +30,10 @@
 
 - **OpenAI-compatible API** — `POST /v1/chat/completions` (streaming + non-streaming), `POST /v1/embeddings`, `POST /v1/images/generations` + `POST /v1/images/edits`, `POST /v1/audio/transcriptions`, `POST /v1/audio/speech` (text-to-speech, when a speech pool is configured), and `GET /v1/models`. Point any OpenAI SDK at it.
 - **Multi-backend routing** — named upstream pools (`chat` / `transcription` / `embedding` / `image` / `speech` kinds). Each pool load-balances across its backends (round-robin or least-in-flight) with per-backend health probes. Models are discovered live from each backend's `/models` endpoint, so loading a model on a backend makes it routable with no config change.
-- **Model aliases + fallback** — give clients a stable name (`alias = ["qwen"]` on a backend) that routes to whatever real model is loaded, so swapping the model needs no client change; the same alias on several backends is a load-balanced group. Optional fallbacks cover an unknown model name (`[fallback].<kind>`) or a known model whose backends are all down (`fallback_offline`). See [`docs/upstreams.md`](docs/upstreams.md#model-aliases).
+- **Model aliases + fallback** — give clients a stable name (a per-backend alias like `qwen`) that routes to whatever real model is loaded, so swapping the model needs no client change; the same alias on several backends is a load-balanced group. Optional fallbacks cover an unknown model name or a known model whose backends are all down. All configured per backend/pool at `/admin/upstreams`. See [`docs/upstreams.md`](docs/upstreams.md#model-aliases).
 - **OIDC login** — browser sign-in against your identity provider; the gateway then issues its own `gwk_…` API tokens. Provider secrets come only from the environment.
 - **Per-user tokens + RBAC** — tokens are SHA-256-hashed at rest and revocable. Roles (mapped from OIDC claims) gate which models and server-side tools each user may use.
-- **Usage accounting, rate limits & quotas** — every call is metered per user/token/model (requests, tokens, and — with per-model prices — spend), shown on `/usage`. Set hard rate limits and quotas at `/admin/limits` (requests / tokens / cost, over a rolling hour / day / week / month), scoped globally, per-role, or per-user; over-budget callers get a `429`. Self-hosted pools can be marked `enforce_limits = false` so their usage is still recorded and shown on `/usage`, but never counts against a limit or quota.
+- **Usage accounting, rate limits & quotas** — every call is metered per user/token/model (requests, tokens, and — with per-model prices — spend), shown on `/usage`. Set hard rate limits and quotas at `/admin/limits` (requests / tokens / cost, over a rolling hour / day / week / month), scoped globally, per-role, or per-user; over-budget callers get a `429`. Self-hosted pools can be marked exempt (a per-pool toggle at `/admin/upstreams`) so their usage is still recorded and shown on `/usage`, but never counts against a limit or quota.
 - **Server-side tools** — the gateway runs tools *mid-completion* (web search, fetch-URL, document rendering, code execution, RAG, network lookups, and more); the client just sees a normal completion. Full list in [Tools the model can call](#tools-the-model-can-call).
 - **Chat UI** — a server-rendered, mobile-friendly chat at `/chat` with persisted multi-conversation history, token-by-token streaming, file attachments, voice dictation, shareable/exportable conversations, and resume-on-reconnect (every turn is written to SQLite as it happens).
 - **RAG** — operator-managed, indexed codebases that the chat model can search.
@@ -77,10 +77,12 @@ The UI is fully localized — English, German, French, Spanish, Russian, and Chi
 
 | | |
 |---|---|
-| ![The backends page: each upstream pool with its kind, load-balancing strategy, per-backend health, in-flight load against capacity, and the models each one currently advertises.](docs/img/backends.png) | ![The RAG page: a form to index a new collection from a git repo (embedding model, branch, include/exclude globs, chunk size) and a list of existing collections with their indexing status.](docs/img/rag.png) |
+| ![The /admin/upstreams page: one card per pool showing its kind and picker-strategy badges, GDPR/NDA/limits compliance flags, and a live health row per backend — status, base URL, in-flight load against capacity, advertised models, and a request sparkline — with inline Edit pool / Delete controls and Add pool / Add backend buttons.](docs/img/upstreams.png) | ![The RAG page: a form to index a new collection from a git repo (embedding model, branch, include/exclude globs, chunk size) and a list of existing collections with their indexing status.](docs/img/rag.png) |
 | **Upstreams** (`/admin/upstreams`) — one page for pools and backends: live health, in-flight load, and discovered models per pool, with inline add/edit/delete of pools and backends (API key stored encrypted, so a new backend goes live on "Apply changes" without a restart). A sticky bar counts unapplied topology edits until you reload the runtime registry. | **RAG** (`/rag`) — index a codebase from a git URL and watch it go from *pending* to *ready*. |
 
 There's also `/tokens` (mint, rotate, and revoke your `gwk_…` API tokens — and scope each token to a subset of your tools), `/usage` (your own request/token usage, plus spend when per-model prices are set), `/memory` (view and edit what the assistant has remembered about you), `/scheduled` (prompts that run on a cron schedule — see [Scheduled actions](#scheduled-actions)), `/admin/models` (server-wide sampling defaults, per-model reasoning budgets, per-model context windows that drive [conversation compaction](#conversation-compaction), per-model **prices** (input/output per 1M tokens) that turn token usage into spend on `/usage`, and the per-feature **default model** pre-selected for chat, voice, image generation, and the RAG embedding picker), `/admin/limits` (rate limits & quotas — see below), and `/admin/users` (registered users with their resolved roles). The users page can also let an admin **impersonate** another user for debugging — every impersonation is audited and shows a persistent banner. Impersonation is **opt-in**: it's off unless you set `[gateway].allow_impersonation = true` (default `false`), in which case the Impersonate buttons appear and `POST /admin/users/impersonate` is accepted; otherwise the buttons are hidden and that endpoint returns 403.
+
+![The /admin/models page: a "Default models" card with per-feature model pickers (chat, voice, image generation) above a filterable list of every advertised model — each row showing its kind, input/output price, context window, reasoning settings, and whether it has been configured, expandable for the full per-model editor.](docs/img/models.png)
 
 | | |
 |---|---|
@@ -89,7 +91,7 @@ There's also `/tokens` (mint, rotate, and revoke your `gwk_…` API tokens — a
 
 ![The /admin/users page: everyone who has signed in, each row showing their identity-provider groups, the gateway roles those resolve to, when they joined, and an Impersonate action — plus a recent-impersonation audit log below.](docs/img/users.png)
 
-**Rate limits & quotas.** At `/admin/limits`, cap how many **requests**, how many **tokens**, or how much **spend** a caller may use over a rolling **hour / day / week / month** — scoped **globally**, **per role**, or **per user**. Rules resolve most-specific-first (user → most-generous role → global default); with none configured everyone is unlimited. A user's whole budget is shared across their API tokens, chat, and scheduled runs, and an over-budget caller gets a `429` (or a graceful notice in chat). Self-hosted pools set `enforce_limits = false` so their usage is still recorded on `/usage` but never counts against a limit. Everyone sees their own live limit bars on `/usage`.
+**Rate limits & quotas.** At `/admin/limits`, cap how many **requests**, how many **tokens**, or how much **spend** a caller may use over a rolling **hour / day / week / month** — scoped **globally**, **per role**, or **per user**. Rules resolve most-specific-first (user → most-generous role → global default); with none configured everyone is unlimited. A user's whole budget is shared across their API tokens, chat, and scheduled runs, and an over-budget caller gets a `429` (or a graceful notice in chat). Self-hosted pools can be marked exempt at `/admin/upstreams` so their usage is still recorded on `/usage` but never counts against a limit. Everyone sees their own live limit bars on `/usage`.
 
 | | |
 |---|---|
@@ -140,7 +142,7 @@ Talk to the assistant and hear it answer. Voice mode is a **pipeline** — the g
 
 It appears in the chat composer **only when a `speech` upstream pool is configured** *and* a transcription model is available — otherwise the toggle is simply absent (like transcription, it degrades away). Same access layer as everything else: TTS is also exposed to API callers at `POST /v1/audio/speech`.
 
-**Configure it** by adding a pool with `kind = "speech"` — self-hosted (Qwen3-TTS, Kokoro, XTTS via openedai-speech, LocalAI) or cloud (**OpenAI** `api.openai.com/v1`, or any provider that speaks OpenAI's `/v1/audio/speech`). An optional `[upstream_pools.<name>.voices]` map picks a voice per spoken language (`de`, `en`, …; the `""` key is the default). Flag `compliance` on a non-EU pool (e.g. OpenAI) — voice mode sends the spoken text there. See `gateway.example.toml`.
+**Configure it** by adding a `speech`-kind pool at `/admin/upstreams` — self-hosted (Qwen3-TTS, Kokoro, XTTS via openedai-speech, LocalAI) or cloud (**OpenAI** `api.openai.com/v1`, or any provider that speaks OpenAI's `/v1/audio/speech`). An optional per-language voice map picks a voice per spoken language (`de`, `en`, …; the default applies when none matches). Flag the pool's compliance on a non-EU provider (e.g. OpenAI) — voice mode sends the spoken text there. See [`docs/upstreams.md`](docs/upstreams.md).
 
 **How it works:** push-to-talk (hold the mic) → release → the transcript is submitted with the voice directive → as the reply streams, complete sentences are spoken one at a time. Non-speakable bits (code, tables) become a short spoken marker like "the code is shown on screen." It's **half-duplex** — while the assistant speaks, the mic is inert (no echo loop). The reply's language follows what you *spoke*; only the opening greeting uses the UI language. Always-listening (voice-activity) mode and barge-in are a planned next phase.
 
@@ -177,7 +179,7 @@ You need [mise](https://mise.jdx.dev/), which manages the Rust + Node toolchains
 ```bash
 mise install                      # Rust 1.95 + Node 24
 cp gateway.example.toml gateway.toml
-$EDITOR gateway.toml              # set at least one [upstream_pools.*] backend (and [oidc] to sign in)
+$EDITOR gateway.toml              # set [oidc] to sign in + an admin role in [rbac]; add backends in the UI after
 mise run dev                      # runs the gateway (debug build) on http://localhost:8080
 ```
 
@@ -216,25 +218,48 @@ token_ttl_days      = 90
 session_key_env     = "GATEWAY_SESSION_KEY"          # names the env var holding a 64-hex (32-byte) key
 allow_impersonation = false                          # opt-in admin impersonation (default false); see below
 
-# At least one upstream pool. `kind` is chat | transcription | embedding | image.
-[upstream_pools.local_chat]
-kind     = "chat"
-strategy = "least_inflight"                        # or "round_robin"
-
-[[upstream_pools.local_chat.backend]]
-name     = "gpu-01"
-base_url = "http://gpu-01.internal:8000/v1"
-# api_key_env = "GPU01_KEY"                         # if the backend needs a bearer token (env-var fallback)
-# alias    = ["qwen", "fast"]                       # stable client-facing names → this backend's model
-
-# Needed for sign-in + token minting. Without it, /auth/login and the /login page don't work.
+# Needed for sign-in + token minting. Without it, /auth/login and the /login
+# page don't work — and since you configure everything else through the signed-in
+# admin UI, this is what bootstraps a new install.
 [oidc]
 issuer            = "https://id.example.com/realms/company"
 client_id         = "llm-gateway"
 client_secret_env = "GATEWAY_OIDC_CLIENT_SECRET"
 scopes            = ["email", "profile", "groups"]
 roles_claim       = "groups"
+
+# Make your own account an admin so you can reach /admin/*. An admin role is a
+# role flagged `admin = true`; you hold it by mapping one of your OIDC groups to
+# it. Without this, nobody can open the admin UI — where all upstream and model
+# config now lives — so a new install needs it to get off the ground.
+[rbac]
+default_role = "user"                    # every signed-in user gets this baseline role
+
+[[rbac.mapping]]
+oidc_claim = "groups"
+oidc_value = "platform-admins"           # an OIDC group you belong to
+role       = "admin"
+
+[[roles]]
+id = "user"                              # baseline: can chat, mint tokens, use tools
+models = ["*"]
+
+[[roles]]
+id = "admin"                             # `admin = true` is what unlocks /admin/*
+admin = true
+models = ["*"]
+tools = ["*"]
+skills = ["*"]
 ```
+
+**How you configure upstreams and models: through the admin UI, not this file.** Pools, backends, and per-model settings live in the database and are managed entirely at `/admin/*` — there is no TOML for them. A fresh install boots with no upstreams; the setup path for a new operator is:
+
+1. Write `gateway.toml` with the blocks above — `[oidc]` so you can sign in, and `[rbac]` + `[[roles]]` so your account resolves to an `admin = true` role.
+2. Start the gateway and sign in. Your account now reaches the admin UI.
+3. At [`/admin/upstreams`](#the-built-in-web-ui), add a pool (chat / transcription / embedding / image / speech) and its backends — base URL, API key (stored encrypted), weight, max in-flight, aliases, per-pool compliance and rate-limit flags, and unknown-model / all-offline fallbacks. Click **Apply changes** and it goes live — no restart.
+4. At `/admin/models`, set per-model prices, reasoning budgets, context windows, capabilities, sampling defaults, and the per-feature default model.
+
+Routing then needs no static table: the health probe reads each backend's `/models` endpoint and routes by what it advertises. See [`docs/upstreams.md`](docs/upstreams.md) for the routing model.
 
 The environment variables that config refers to:
 
@@ -254,7 +279,6 @@ Optional blocks, each documented inline in `gateway.example.toml`:
 - `[sandbox]` — enable the code-execution + document tools by pointing at a sandbox-runner service (see [`docs/sandbox.md`](docs/sandbox.md)).
 - `[geoip]` — IP→location for the `get_user_location` tool (IP2Location LITE database).
 - `[rag]` — index git repos and search them from chat (see [RAG](#rag-codebase-search)).
-- `[fallback]` — server-wide fallback models per kind, for unknown or all-offline model names (see [`docs/upstreams.md`](docs/upstreams.md#fallback-models)).
 - `[usage]` — request/token usage accounting behind the `/usage` page (retention-pruned; on by default).
 - `[feedback]` — the in-UI feedback widget that files GitHub issues.
 

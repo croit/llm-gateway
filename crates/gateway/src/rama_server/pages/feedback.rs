@@ -562,7 +562,7 @@ pub(super) fn render_dialog(lang: Lang) -> Html {
                 }
 
                 div(class: "px-5 py-4 flex flex-col gap-3 overflow-y-auto") {
-                    label(class: "form-control") {
+                    label(class: "flex flex-col gap-1") {
                         span(class: "label-text text-sm font-medium") { (t(lang, "feedback-title-label")) }
                         input(
                             id: "feedback-title",
@@ -574,7 +574,7 @@ pub(super) fn render_dialog(lang: Lang) -> Html {
                             class: "input input-bordered w-full"
                         );
                     }
-                    label(class: "form-control") {
+                    label(class: "flex flex-col gap-1") {
                         span(class: "label-text text-sm font-medium") { (t(lang, "feedback-description-label")) }
                         textarea(
                             id: "feedback-description",
@@ -585,7 +585,7 @@ pub(super) fn render_dialog(lang: Lang) -> Html {
                             class: "textarea textarea-bordered w-full"
                         ) {}
                     }
-                    label(class: "form-control") {
+                    label(class: "flex flex-col gap-1") {
                         span(class: "label-text text-sm font-medium") { (t(lang, "feedback-business-label")) }
                         textarea(
                             id: "feedback-business",
@@ -595,7 +595,7 @@ pub(super) fn render_dialog(lang: Lang) -> Html {
                             class: "textarea textarea-bordered w-full"
                         ) {}
                     }
-                    label(class: "form-control") {
+                    label(class: "flex flex-col gap-1") {
                         span(class: "label-text text-sm font-medium") { (t(lang, "feedback-acceptance-label")) }
                         textarea(
                             id: "feedback-acceptance",
@@ -605,7 +605,7 @@ pub(super) fn render_dialog(lang: Lang) -> Html {
                             class: "textarea textarea-bordered w-full"
                         ) {}
                     }
-                    label(class: "form-control") {
+                    label(class: "flex flex-col gap-1") {
                         span(class: "label-text text-sm font-medium") { (t(lang, "feedback-priority-label")) }
                         select(
                             id: "feedback-priority",

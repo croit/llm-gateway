@@ -651,7 +651,7 @@ fn render_tokens_body(
                 p(class: "text-base-content/70") {
                     (t(lang, "tokens-create-description"))
                 }
-                label(class: "form-control w-full") {
+                label(class: "flex flex-col gap-1 w-full") {
                     div(class: "label") {
                         span(class: "label-text") { (t(lang, "tokens-name-label")) }
                     }
@@ -664,7 +664,7 @@ fn render_tokens_body(
                         class: "input input-bordered w-full"
                     );
                 }
-                label(class: "form-control w-32") {
+                label(class: "flex flex-col gap-1 w-32") {
                     div(class: "label") {
                         span(class: "label-text") { (t(lang, "tokens-ttl-label")) }
                     }

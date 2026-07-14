@@ -1123,7 +1123,7 @@ fn render_rerun_body(
                         }
                         // Captured payload — read-only, so the owner sees exactly
                         // what will be replayed.
-                        label(class: "form-control w-full") {
+                        label(class: "flex flex-col gap-1 w-full") {
                             div(class: "label") { span(class: "label-text") { (t(lang, "webhooks-rerun-payload-label")) } }
                             textarea(
                                 readonly: "readonly",
@@ -1132,7 +1132,7 @@ fn render_rerun_body(
                             ) { (payload) }
                         }
                         // Prompt — prefilled, editable.
-                        label(class: "form-control w-full") {
+                        label(class: "flex flex-col gap-1 w-full") {
                             div(class: "label") { span(class: "label-text") { (t(lang, "webhooks-prompt-label")) } }
                             textarea(
                                 name: "prompt",
@@ -1310,7 +1310,7 @@ fn render_form(
         ) {
             div(class: "card-body gap-4") {
                 // --- Name ---
-                label(class: "form-control w-full") {
+                label(class: "flex flex-col gap-1 w-full") {
                     div(class: "label") { span(class: "label-text") { (t(lang, "webhooks-name-label")) } }
                     input(
                         name: "name",
@@ -1324,7 +1324,7 @@ fn render_form(
                 }
 
                 // --- Model + compliance banner ---
-                label(class: "form-control w-full") {
+                label(class: "flex flex-col gap-1 w-full") {
                     div(class: "label") { span(class: "label-text") { (t(lang, "webhooks-model-label")) } }
                     if models_empty {
                         input(
@@ -1381,7 +1381,7 @@ fn render_form(
                 }
 
                 // --- Prompt ---
-                label(class: "form-control w-full") {
+                label(class: "flex flex-col gap-1 w-full") {
                     div(class: "label") { span(class: "label-text") { (t(lang, "webhooks-prompt-label")) } }
                     textarea(
                         name: "prompt",

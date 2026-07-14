@@ -588,7 +588,13 @@ pub async fn seed_from_config(
     fallback: &FallbackConfig,
     crypto: &Crypto,
 ) -> Result<(), DbError> {
-    for (sort_order, (name, pool_cfg)) in pool_configs.iter().enumerate() {
+    // Iterate in a stable (name-sorted) order so the seeded `sort_order` — which
+    // drives the default display order on `/admin/upstreams` — is deterministic
+    // across boots, rather than following `HashMap`'s arbitrary iteration order.
+    let mut names: Vec<&String> = pool_configs.keys().collect();
+    names.sort();
+    for (sort_order, name) in names.into_iter().enumerate() {
+        let pool_cfg = &pool_configs[name];
         for backend in &pool_cfg.backend {
             let mut row = config_to_backend_row(backend);
             // Resolve the referenced env var ONCE, at migration time, and seal
