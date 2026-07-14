@@ -6,7 +6,7 @@ pools-heading = Upstream pools
 pools-description = Group backends into pools by kind and picker strategy. Changes are saved to the database but only take effect once you click "Apply changes".
 
 pools-fallbacks-heading = Unknown-model fallbacks
-pools-fallbacks-description = When a request names a model the gateway has never heard of, substitute this model for that kind. Blank = the miss returns 404.
+pools-fallbacks-description = The substitute when a request names a model no pool serves (unlike the per-feature default on the Models page, which applies when a request names nothing). Blank = the miss returns 404.
 
 pools-add-heading = Add pool
 pools-field-name = Name
@@ -14,7 +14,8 @@ pools-field-kind = Kind
 pools-field-strategy = Strategy
 pools-field-fallback-offline = Offline fallback model
 pools-field-fallback-offline-placeholder = served when every backend is down
-pools-field-models = Models (comma-separated)
+pools-field-models = Served models (allowlist, comma-separated)
+pools-field-models-hint = When set, only these ids are served from a probing backend — the rest are shown struck-through. Blank = serve everything the backend reports.
 pools-field-voices = Voices (lang=voice per line)
 pools-field-backends = Backends
 pools-no-backends = No backends defined yet. Add one on the Backends page first.

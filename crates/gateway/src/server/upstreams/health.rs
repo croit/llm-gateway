@@ -501,10 +501,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_models_true_would_clobber_with_chat_catalog() {
-        // The contrast case: with discovery on, the same server's chat catalog
-        // overwrites the model set — which is exactly why image backends set
-        // probe_models = false.
+    async fn probe_models_true_allowlist_withholds_chat_catalog() {
+        // The contrast case: with discovery on, the server's chat catalog
+        // (`glm-4.6`) is discovered — but the backend's configured `models`
+        // list (`glm-image`) is now an allowlist, so the unlisted chat model
+        // is *withheld* rather than clobbering the intended set. The
+        // intersection is empty here (the backend doesn't actually serve
+        // `glm-image`), so nothing is served and the discovered id shows up in
+        // the withheld set for the struck-through UI chip.
         let server = chat_catalog_server().await;
         let backend = backend_arc(&server.uri(), true);
 
@@ -513,9 +517,15 @@ mod tests {
             matches!(outcome, ProbeOutcome::AliveWithModels),
             "expected AliveWithModels, got {outcome:?}"
         );
+        assert!(
+            backend.models_snapshot().is_empty(),
+            "allowlist ∩ probe is empty → nothing served, got {:?}",
+            backend.models_snapshot()
+        );
         assert_eq!(
-            backend.models_snapshot(),
+            backend.withheld_models(),
             std::collections::HashSet::from(["glm-4.6".to_string()]),
+            "the discovered-but-unlisted chat model must be withheld"
         );
     }
 }

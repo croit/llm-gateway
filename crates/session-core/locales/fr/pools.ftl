@@ -13,7 +13,8 @@ pools-field-kind = Type
 pools-field-strategy = Stratégie
 pools-field-fallback-offline = Modèle de repli hors ligne
 pools-field-fallback-offline-placeholder = servi lorsque tous les backends sont hors service
-pools-field-models = Modèles (séparés par des virgules)
+pools-field-models = Modèles servis (liste d'autorisation, séparés par des virgules)
+pools-field-models-hint = Si défini, seuls ces ids d'un backend avec sonde /models sont servis — les autres sont affichés barrés. Vide = servir tout ce que le backend signale.
 pools-field-voices = Voix (lang=voice par ligne)
 pools-field-backends = Backends
 pools-no-backends = Aucun backend défini pour l'instant. Ajoutez-en un d'abord sur la page Backends.

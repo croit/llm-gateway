@@ -451,6 +451,36 @@ pub async fn delete_pool(db: &Pool, name: &str) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Set a backend's pool membership to *exactly* `pool` (or none): clears every
+/// existing `pool_backends` row for the backend, then — if a pool is given —
+/// appends it to that pool. Backs the single "Pool" select on the backend
+/// editor, which trades the DB's many-to-many capability for a simpler UI: a
+/// backend in several pools collapses to the one selected here. Pool-side
+/// editing (the pool's backend checkboxes) still supports multi-pool membership.
+pub async fn set_backend_pool(
+    db: &Pool,
+    backend_name: &str,
+    pool: Option<&str>,
+) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM pool_backends WHERE backend_name = ?")
+        .bind(backend_name)
+        .execute(db)
+        .await?;
+    if let Some(pool_name) = pool {
+        sqlx::query(
+            r#"INSERT INTO pool_backends (pool_name, backend_name, sort_order)
+               VALUES (?, ?, COALESCE(
+                   (SELECT MAX(sort_order) + 1 FROM pool_backends WHERE pool_name = ?), 0))"#,
+        )
+        .bind(pool_name)
+        .bind(backend_name)
+        .bind(pool_name)
+        .execute(db)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn replace_pool_backends(
     db: &Pool,
     pool_name: &str,

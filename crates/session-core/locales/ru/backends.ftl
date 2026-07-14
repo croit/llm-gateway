@@ -38,6 +38,9 @@ backends-field-api-key-env = Переменная окружения с API-кл
 backends-field-health-path = Путь проверки состояния
 backends-field-weight = Вес
 backends-field-max-inflight = Макс. одновременных
+backends-field-pool = Пул
+backends-field-pool-none = (нет)
+backends-field-pool-hint = Назначает этот бэкенд одному пулу. Бэкенд в нескольких пулах сводится к выбранному здесь.
 backends-field-models = Модели (через запятую)
 backends-field-aliases = Алиасы (name=target по одному в строке)
 backends-field-probe-models = Определять модели через проверочный запрос /models

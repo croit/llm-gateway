@@ -135,17 +135,44 @@ impl Backend {
         self.inflight.load(Ordering::Relaxed)
     }
 
-    /// Runs `f` against this backend's *effective* model set — the live probe
-    /// set while it reports anything, otherwise the configured fallback
-    /// (`config_models`). The single place the probe-then-config precedence
-    /// lives; the read lock is held only for the duration of `f`.
+    /// Runs `f` against this backend's *effective* model set — the set the
+    /// backend actually serves and advertises. The single place the
+    /// probe/config precedence lives; the read lock is held for the duration
+    /// of `f`. Precedence:
+    ///   - **live probe + a configured `models` list** → the *intersection*:
+    ///     the list is an allowlist, so a probed model it doesn't name is
+    ///     discovered-but-withheld (not served, not advertised);
+    ///   - **live probe + empty list** → the whole probe set (offer everything
+    ///     the backend reports);
+    ///   - **no live probe** → the configured `models` verbatim (the static
+    ///     fallback for backends that don't self-report via `/models`).
     fn with_effective_models<R>(&self, f: impl FnOnce(&HashSet<String>) -> R) -> R {
         if let Ok(probe) = self.models.read()
             && !probe.is_empty()
         {
-            return f(&probe);
+            if self.config_models.is_empty() {
+                return f(&probe);
+            }
+            let allowed: HashSet<String> =
+                probe.intersection(&self.config_models).cloned().collect();
+            return f(&allowed);
         }
         f(&self.config_models)
+    }
+
+    /// The models the backend reports via `/models` but its allowlist withholds
+    /// — i.e. `live probe \ effective`. Empty unless a configured `models` list
+    /// is actively filtering a live probe. Drives the struck-through
+    /// "discovered but not served" chips in the admin health view; never
+    /// consulted on the routing hot path.
+    pub fn withheld_models(&self) -> HashSet<String> {
+        let Ok(probe) = self.models.read() else {
+            return HashSet::new();
+        };
+        if probe.is_empty() || self.config_models.is_empty() {
+            return HashSet::new();
+        }
+        probe.difference(&self.config_models).cloned().collect()
     }
 
     /// Real-model membership only (no aliases): the backend's effective set
@@ -1609,27 +1636,61 @@ mod tests {
     }
 
     #[test]
-    fn live_probe_overrides_config_models() {
-        // While the probe reports anything, config fallback is not consulted
-        // — the endpoint is authoritative for its own loadout.
+    fn config_models_allowlist_restricts_live_probe() {
+        // A configured `models` list is an allowlist over the live probe: only
+        // the ids it names are served/advertised; a probed id it omits is
+        // discovered-but-withheld (404 on request, absent from `/v1/models`).
         let reg = build(vec![(
             "voice",
             pool_config_with_models(
                 PoolKind::Transcription,
-                &["config-only"],
+                &["keep-a", "keep-b"],
                 vec![backend("a", 16)],
             ),
         )]);
-        seed_models(&reg, "voice", 0, &["probe-reported"]);
+        seed_models(&reg, "voice", 0, &["keep-a", "keep-b", "drop-c"]);
         assert!(
-            reg.acquire_for("probe-reported", PoolKind::Transcription)
-                .is_ok()
+            reg.acquire_for("keep-a", PoolKind::Transcription).is_ok(),
+            "allowlisted id must route"
         );
+        assert!(reg.acquire_for("keep-b", PoolKind::Transcription).is_ok());
         let err = reg
-            .acquire_for("config-only", PoolKind::Transcription)
+            .acquire_for("drop-c", PoolKind::Transcription)
             .unwrap_err();
-        assert!(matches!(err, RouteError::UnknownModel(_)), "{err:?}");
-        assert_eq!(reg.all_models(), vec!["probe-reported"]);
+        assert!(
+            matches!(err, RouteError::UnknownModel(_)),
+            "withheld id must 404 even though the backend reports it: {err:?}"
+        );
+        // Advertised set is the allowlist ∩ probe, not the whole probe.
+        assert_eq!(reg.all_models(), vec!["keep-a", "keep-b"]);
+        // The withheld id surfaces for the struck-through UI chip.
+        let d = reg.data();
+        let b = &d.pools.get("voice").unwrap().backends[0];
+        assert_eq!(b.withheld_models(), HashSet::from(["drop-c".to_string()]));
+    }
+
+    #[test]
+    fn empty_model_list_serves_whole_probe_and_withholds_nothing() {
+        // With no configured list, the probe set is served verbatim — the
+        // allowlist is opt-in, so unconfigured pools are unaffected.
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![backend("a", 16)],
+            ),
+        )]);
+        seed_models(&reg, "chat", 0, &["m1", "m2"]);
+        assert!(reg.acquire_for("m1", PoolKind::Chat).is_ok());
+        assert!(reg.acquire_for("m2", PoolKind::Chat).is_ok());
+        assert_eq!(reg.all_models(), vec!["m1", "m2"]);
+        let d = reg.data();
+        let b = &d.pools.get("chat").unwrap().backends[0];
+        assert!(
+            b.withheld_models().is_empty(),
+            "no allowlist → nothing withheld"
+        );
     }
 
     #[test]

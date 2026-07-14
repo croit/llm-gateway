@@ -38,6 +38,9 @@ backends-field-api-key-env = API-Schlüssel-Umgebungsvariable
 backends-field-health-path = Health-Pfad
 backends-field-weight = Gewichtung
 backends-field-max-inflight = Max. gleichzeitig
+backends-field-pool = Pool
+backends-field-pool-none = (keiner)
+backends-field-pool-hint = Weist dieses Backend einem Pool zu. Ein Backend in mehreren Pools wird auf den hier gewählten reduziert.
 backends-field-models = Modelle (kommagetrennt)
 backends-field-aliases = Aliase (name=target pro Zeile)
 backends-field-probe-models = Modelle über /models-Probe erkennen

@@ -38,6 +38,9 @@ backends-field-api-key-env = Variable de entorno de clave de API
 backends-field-health-path = Ruta de estado
 backends-field-weight = Peso
 backends-field-max-inflight = Máximo en curso
+backends-field-pool = Grupo
+backends-field-pool-none = (ninguno)
+backends-field-pool-hint = Asigna este backend a un grupo. Un backend en varios grupos se reduce al elegido aquí.
 backends-field-models = Modelos (separados por comas)
 backends-field-aliases = Alias (name=target por línea)
 backends-field-probe-models = Descubrir modelos mediante la sonda /models

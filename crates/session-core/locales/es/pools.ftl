@@ -13,7 +13,8 @@ pools-field-kind = Tipo
 pools-field-strategy = Estrategia
 pools-field-fallback-offline = Modelo alternativo fuera de línea
 pools-field-fallback-offline-placeholder = servido cuando todos los backends están caídos
-pools-field-models = Modelos (separados por comas)
+pools-field-models = Modelos servidos (lista de permitidos, separados por comas)
+pools-field-models-hint = Si se define, solo se sirven estos ids de un backend con sondeo /models; el resto se muestra tachado. En blanco = servir todo lo que informa el backend.
 pools-field-voices = Voces (lang=voice por línea)
 pools-field-backends = Backends
 pools-no-backends = Aún no hay backends definidos. Añada uno primero en la página de Backends.

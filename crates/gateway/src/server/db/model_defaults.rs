@@ -407,6 +407,89 @@ pub async fn upsert(pool: &Pool, model_name: &str, defaults_toml: &str) -> Resul
     Ok(())
 }
 
+/// Every admin-editable field of a model_defaults row, for the consolidated
+/// `/admin/models/save` endpoint. Unlike the per-facet setters (which touch
+/// disjoint columns so they compose), [`set_all`] writes the whole row in one
+/// statement, so a value left `None`/empty here clears that column.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AllFields {
+    pub defaults_toml: String,
+    pub reasoning_style: Option<String>,
+    pub overrides: ReasoningOverrideCols,
+    pub context_window: Option<i64>,
+    pub input_price: Option<f64>,
+    pub output_price: Option<f64>,
+    pub capabilities: ModelCapabilities,
+}
+
+/// Insert or replace every admin-editable column of a model's row in one
+/// `INSERT … ON CONFLICT DO UPDATE`, so the consolidated save is atomic (no
+/// window where some facets are saved and others aren't). The caller is
+/// responsible for validating `defaults_toml`, budgets, efforts, prices, and
+/// context window before calling. A `None`/empty field clears that column.
+pub async fn set_all(pool: &Pool, model_name: &str, f: &AllFields) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    sqlx::query(
+        r#"INSERT INTO model_defaults
+              (model_name, defaults_toml, reasoning_style,
+               thinking_budget_standard, thinking_budget_deep, thinking_budget_max,
+               reasoning_effort_standard, reasoning_effort_deep, reasoning_effort_max,
+               context_window, input_price, output_price,
+               cap_vision, cap_audio_input, cap_pdf_input,
+               cap_tools, cap_parallel_tools, cap_structured_output,
+               fallback_vision, fallback_tools,
+               cap_updated_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(model_name) DO UPDATE SET
+               defaults_toml             = excluded.defaults_toml,
+               reasoning_style           = excluded.reasoning_style,
+               thinking_budget_standard  = excluded.thinking_budget_standard,
+               thinking_budget_deep      = excluded.thinking_budget_deep,
+               thinking_budget_max       = excluded.thinking_budget_max,
+               reasoning_effort_standard = excluded.reasoning_effort_standard,
+               reasoning_effort_deep     = excluded.reasoning_effort_deep,
+               reasoning_effort_max      = excluded.reasoning_effort_max,
+               context_window            = excluded.context_window,
+               input_price               = excluded.input_price,
+               output_price              = excluded.output_price,
+               cap_vision                = excluded.cap_vision,
+               cap_audio_input           = excluded.cap_audio_input,
+               cap_pdf_input             = excluded.cap_pdf_input,
+               cap_tools                 = excluded.cap_tools,
+               cap_parallel_tools        = excluded.cap_parallel_tools,
+               cap_structured_output     = excluded.cap_structured_output,
+               fallback_vision           = excluded.fallback_vision,
+               fallback_tools            = excluded.fallback_tools,
+               cap_updated_at            = excluded.cap_updated_at,
+               updated_at                = excluded.updated_at"#,
+    )
+    .bind(model_name)
+    .bind(&f.defaults_toml)
+    .bind(f.reasoning_style.as_deref())
+    .bind(f.overrides.budget_standard)
+    .bind(f.overrides.budget_deep)
+    .bind(f.overrides.budget_max)
+    .bind(f.overrides.effort_standard.as_deref())
+    .bind(f.overrides.effort_deep.as_deref())
+    .bind(f.overrides.effort_max.as_deref())
+    .bind(f.context_window)
+    .bind(f.input_price)
+    .bind(f.output_price)
+    .bind(f.capabilities.vision.map(|b| b as i64))
+    .bind(f.capabilities.audio_input.map(|b| b as i64))
+    .bind(f.capabilities.pdf_input.map(|b| b as i64))
+    .bind(f.capabilities.tools.map(|b| b as i64))
+    .bind(f.capabilities.parallel_tools.map(|b| b as i64))
+    .bind(f.capabilities.structured_output.map(|b| b as i64))
+    .bind(&f.capabilities.fallback_vision)
+    .bind(&f.capabilities.fallback_tools)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// A model's per-1M-token prices. Either side may be `None` (unpriced →
 /// that side contributes 0 cost).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -596,6 +679,67 @@ mod tests {
         assert_eq!(row.capabilities.structured_output, Some(false));
         assert_eq!(row.capabilities.audio_input, None);
         assert_eq!(row.capabilities.fallback_vision.as_deref(), Some("qwen-vl"));
+    }
+
+    #[tokio::test]
+    async fn set_all_round_trips_every_column() {
+        let pool = fresh().await;
+        let fields = AllFields {
+            defaults_toml: "temperature = 0.7".into(),
+            reasoning_style: Some("qwen".into()),
+            overrides: ReasoningOverrideCols {
+                budget_standard: Some(4_096),
+                budget_deep: Some(16_384),
+                budget_max: None,
+                ..Default::default()
+            },
+            context_window: Some(262_144),
+            input_price: Some(0.15),
+            output_price: Some(0.60),
+            capabilities: ModelCapabilities {
+                vision: Some(true),
+                tools: Some(true),
+                structured_output: Some(false),
+                fallback_vision: Some("glm-5.2".into()),
+                ..Default::default()
+            },
+        };
+        set_all(&pool, "m", &fields).await.unwrap();
+        let row = get(&pool, "m").await.unwrap().unwrap();
+        assert_eq!(row.defaults_toml, "temperature = 0.7");
+        assert_eq!(row.reasoning_style.as_deref(), Some("qwen"));
+        assert_eq!(row.thinking_budget_standard, Some(4_096));
+        assert_eq!(row.thinking_budget_deep, Some(16_384));
+        assert_eq!(row.thinking_budget_max, None);
+        assert_eq!(row.context_window, Some(262_144));
+        assert_eq!(row.input_price, Some(0.15));
+        assert_eq!(row.output_price, Some(0.60));
+        assert_eq!(row.capabilities.vision, Some(true));
+        assert_eq!(row.capabilities.structured_output, Some(false));
+        assert_eq!(row.capabilities.fallback_vision.as_deref(), Some("glm-5.2"));
+    }
+
+    /// A second `set_all` with cleared fields overwrites the whole row (unlike
+    /// the composing per-facet setters).
+    #[tokio::test]
+    async fn set_all_clears_omitted_columns() {
+        let pool = fresh().await;
+        set_all(
+            &pool,
+            "m",
+            &AllFields {
+                input_price: Some(3.0),
+                context_window: Some(1_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        set_all(&pool, "m", &AllFields::default()).await.unwrap();
+        let row = get(&pool, "m").await.unwrap().unwrap();
+        assert_eq!(row.input_price, None);
+        assert_eq!(row.context_window, None);
+        assert_eq!(row.defaults_toml, "");
     }
 
     #[tokio::test]

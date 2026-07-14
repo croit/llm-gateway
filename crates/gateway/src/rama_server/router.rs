@@ -140,34 +140,25 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
             "/chat/attachment/{turn_id}/{filename}",
             pages::chat_attachment,
         )
+        // `/admin/models/save` + `/admin/models/defaults` + `/admin/models/clear`
+        // MUST precede the `/admin/models` GET only in that they don't overlap;
+        // registration order is fine since these are distinct static paths.
         .with_get("/admin/models", pages::admin_models_index)
-        .with_post("/admin/models", pages::admin_models_save)
-        .with_post(
-            "/admin/models/reasoning",
-            pages::admin_models_reasoning_save,
-        )
-        .with_post(
-            "/admin/models/reasoning-budget",
-            pages::admin_models_reasoning_budget_save,
-        )
-        .with_post(
-            "/admin/models/context-window",
-            pages::admin_models_context_window_save,
-        )
-        .with_post("/admin/models/pricing", pages::admin_models_pricing_save)
+        .with_post("/admin/models/save", pages::admin_models_save)
+        .with_post("/admin/models/clear", pages::admin_models_clear)
         .with_post("/admin/models/defaults", pages::admin_models_defaults_save)
-        .with_post(
-            "/admin/models/capabilities",
-            pages::admin_models_capabilities_save,
-        )
         .with_post("/admin/upstreams/reload", pages::admin_upstreams_reload)
         .with_get("/admin/limits", pages::admin_limits_index)
         .with_post("/admin/limits", pages::admin_limits_save)
         .with_post("/admin/limits/delete", pages::admin_limits_delete)
-        .with_get("/admin/backends", pages::admin_backends_index)
+        // Merged pools + backends page. The old `/admin/backends` and
+        // `/admin/pools` GET routes 302-redirect here; the CRUD POST endpoints
+        // keep their paths (the ids ride in the body, not the URL).
+        .with_get("/admin/upstreams", pages::admin_upstreams_index)
+        .with_get("/admin/backends", pages::admin_backends_redirect)
         .with_post("/admin/backends/save", pages::admin_backends_save)
         .with_post("/admin/backends/delete", pages::admin_backends_delete)
-        .with_get("/admin/pools", pages::admin_pools_index)
+        .with_get("/admin/pools", pages::admin_pools_redirect)
         .with_post("/admin/pools/save", pages::admin_pools_save)
         .with_post("/admin/pools/delete", pages::admin_pools_delete)
         .with_post("/admin/pools/fallback", pages::admin_pools_fallback_save)

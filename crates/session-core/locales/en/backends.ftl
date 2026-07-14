@@ -42,6 +42,9 @@ backends-field-api-key-env = API key env var (fallback)
 backends-field-health-path = Health path
 backends-field-weight = Weight
 backends-field-max-inflight = Max in-flight
+backends-field-pool = Pool
+backends-field-pool-none = (none)
+backends-field-pool-hint = Assigns this backend to one pool. A backend in several pools collapses to the one chosen here.
 backends-field-models = Models (comma-separated)
 backends-field-aliases = Aliases (name=target per line)
 backends-field-probe-models = Discover models from /models probe

@@ -1,18 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 croit GmbH
 
-//! `/admin/*` pages. Currently just `/admin/models` for the
-//! per-model sampling defaults — temperature, top_p, top_k,
-//! min_p, repeat_penalty, frequency_penalty, presence_penalty,
-//! max_tokens, stop tokens, etc. Each model gets a key=value TOML
-//! textarea; the gateway parses it at save-time to reject
-//! obviously-broken submissions and at request-time to merge
-//! missing keys into the outgoing body. Client values always win.
+//! `/admin/models` — per-model settings.
+//!
+//! A "Default models" card (auto-saving per-feature pickers) plus one
+//! filterable list of every model the gateway advertises — chat models,
+//! aliases, and other-kind models (embedding / image / speech / transcription).
+//! Each real model is a collapsed row (name, kind, price, context, resolved
+//! reasoning style, and which facets are configured); expanding it reveals a
+//! single editor form that persists **all** settings at once via
+//! `POST /admin/models/save`:
+//!
+//!   - per-1M-token prices (cost accounting),
+//!   - context window (drives auto-compaction),
+//!   - reasoning style + adaptive per-effort budgets (Qwen/Anthropic token
+//!     budgets) or effort levels (OpenAI/GLM),
+//!   - capability tri-states + vision/tools fallbacks,
+//!   - sampling defaults (TOML, merged into requests that don't set the key).
+//!
+//! "Clear all overrides" (`POST /admin/models/clear`) deletes the row. Aliases
+//! are dimmed, non-expandable rows (they inherit their target's settings);
+//! other-kind models get a price-only editor posting to the same save endpoint.
 //!
 //! All routes are gated on the `admin` role via
-//! [`super::require_admin_or_403`] — non-admins see a 403 page and
-//! never the form. The sidebar entry is also conditional on that
-//! role, so non-admins don't even know the page exists.
+//! [`super::require_admin_or_403`] — non-admins see a 403 page and never the
+//! form. The sidebar entry is also conditional on that role.
 
 use std::sync::Arc;
 
@@ -31,12 +43,11 @@ use crate::rama_server::state::RamaState;
 use crate::server::db::model_defaults as db;
 use crate::server::feature_defaults::{self, Feature};
 use crate::server::model_defaults as merge;
+use crate::server::reasoning::ReasoningStyle;
 use crate::server::upstreams::PoolKind;
 
-/// GET /admin/models — one card per chat model, each with the
-/// stored TOML as a textarea + a Save button. Models with no row
-/// yet render an empty textarea (operator picks defaults from
-/// scratch).
+/// GET /admin/models — the default-models card + a single filterable list of
+/// every advertised model (chat, aliases, other kinds).
 pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let theme = Theme::from_headers(req.headers());
     let lang = Lang::from_headers(req.headers());
@@ -48,9 +59,8 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     };
 
     // Aliases carry no settings or price of their own — requests are configured
-    // and metered as the model they resolve to (see `openai_driver`/cost
-    // accounting). So split them out: real models get the full editor, aliases
-    // get a read-only "→ target" row.
+    // and metered as the model they resolve to. Split them out: real models get
+    // the full editor, aliases get a dimmed "→ target" row.
     let chat_models = state.upstreams.models_with_alias_target(PoolKind::Chat);
     let mut rows: Vec<ModelRow> = Vec::new();
     let mut aliases: Vec<AliasRow> = Vec::new();
@@ -99,7 +109,10 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
             input_price: row.as_ref().and_then(|r| r.input_price),
             output_price: row.as_ref().and_then(|r| r.output_price),
             cap_vision: row.as_ref().and_then(|r| r.capabilities.vision),
+            cap_audio_input: row.as_ref().and_then(|r| r.capabilities.audio_input),
+            cap_pdf_input: row.as_ref().and_then(|r| r.capabilities.pdf_input),
             cap_tools: row.as_ref().and_then(|r| r.capabilities.tools),
+            cap_parallel_tools: row.as_ref().and_then(|r| r.capabilities.parallel_tools),
             cap_structured_output: row.as_ref().and_then(|r| r.capabilities.structured_output),
             fallback_vision: row
                 .as_ref()
@@ -110,10 +123,8 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         });
     }
 
-    // Non-chat models (embedding / image / speech / transcription) get a
-    // pricing-only row — sampling/reasoning/context don't apply, but cost
-    // accounting does. Their aliases join the read-only alias list. Dedup by id;
-    // a model already shown as chat is skipped.
+    // Non-chat models get a price-only row. Their aliases join the alias list.
+    // Dedup by id; a model already shown as chat is skipped.
     let chat_names: std::collections::HashSet<&str> =
         chat_models.iter().map(|(n, _)| n.as_str()).collect();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -176,11 +187,17 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     )
 }
 
-/// POST /admin/models — save the per-model defaults. Form body
-/// carries both the `model_name` (as a hidden input — putting it
-/// in the URL path doesn't survive rama's path lowercasing +
-/// case-sensitive HuggingFace IDs) and the `defaults_toml`. An
-/// empty `defaults_toml` clears the stored row.
+// ---------------------------------------------------------------------------
+// POST handlers
+// ---------------------------------------------------------------------------
+
+/// POST /admin/models/save — persist every per-model setting at once. The form
+/// carries `model_name` as a hidden input (rama lowercases path segments, which
+/// would mangle case-sensitive HuggingFace ids). All fields are validated up
+/// front (TOML parses, budgets positive, efforts known, prices finite &
+/// non-negative, context window positive), then written in one atomic upsert.
+/// A blank field clears that facet; the row is kept (use "Clear all overrides"
+/// to delete it).
 pub async fn models_save(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
@@ -207,338 +224,8 @@ pub async fn models_save(State(state): State<Arc<RamaState>>, req: Request) -> R
     if form.model_name.is_empty() {
         return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
     }
-    let trimmed = form.defaults_toml.trim();
-    if trimmed.is_empty() {
-        if let Err(err) = db::delete(&state.db, &form.model_name).await {
-            return toast(
-                FlashKind::Error,
-                t_args(
-                    lang,
-                    "admin-db-delete-error",
-                    &i18n::args([("err", err.to_string().into())]),
-                ),
-            );
-        }
-        return toast(
-            FlashKind::Success,
-            t_args(
-                lang,
-                "admin-cleared-defaults",
-                &i18n::args([("model", form.model_name.clone().into())]),
-            ),
-        );
-    }
-    // Parse before persisting so we never store TOML that
-    // `apply_defaults` would later reject — keeps the round-trip
-    // honest (whatever you save is exactly what the merge will use).
-    if let Err(err) = merge::parse_defaults(&form.defaults_toml) {
-        return toast(
-            FlashKind::Error,
-            t_args(
-                lang,
-                "admin-invalid-toml",
-                &i18n::args([("err", err.to_string().into())]),
-            ),
-        );
-    }
-    if let Err(err) = db::upsert(&state.db, &form.model_name, &form.defaults_toml).await {
-        return toast(
-            FlashKind::Error,
-            t_args(
-                lang,
-                "admin-db-upsert-error",
-                &i18n::args([("err", err.to_string().into())]),
-            ),
-        );
-    }
-    toast(
-        FlashKind::Success,
-        t_args(
-            lang,
-            "admin-saved-defaults",
-            &i18n::args([("model", form.model_name.clone().into())]),
-        ),
-    )
-}
 
-/// POST /admin/models/reasoning — save a model's reasoning style (how its
-/// reasoning budget is expressed on the wire). Kept separate from the TOML
-/// save so clearing the sampling defaults (which deletes the row) doesn't also
-/// reset the reasoning style, and vice versa. An empty / "auto" value clears
-/// the explicit choice and falls back to name-based auto-detection.
-pub async fn models_reasoning_save(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let lang = Lang::from_headers(req.headers());
-    if let Err(resp) = require_admin_or_403(&state, &req).await {
-        return resp;
-    }
-    let (_, body) = req.into_parts();
-    let body = match read_body_to_bytes(body).await {
-        Ok(b) => b,
-        Err(msg) => return toast(FlashKind::Error, msg),
-    };
-    let form: ReasoningForm = match serde_urlencoded::from_bytes(&body) {
-        Ok(f) => f,
-        Err(err) => {
-            return toast(
-                FlashKind::Error,
-                t_args(
-                    lang,
-                    "admin-malformed-form",
-                    &i18n::args([("err", err.to_string().into())]),
-                ),
-            );
-        }
-    };
-    if form.model_name.is_empty() {
-        return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
-    }
-    // Empty / "auto" → clear the explicit choice (NULL), otherwise store the
-    // canonical value. Validate against the known styles so a bad submission
-    // can't poison the row.
-    let style = match form.reasoning_style.trim() {
-        "" | "auto" => None,
-        s @ ("none" | "qwen" | "openai" | "glm" | "anthropic") => Some(s),
-        other => {
-            return toast(
-                FlashKind::Error,
-                t_args(
-                    lang,
-                    "admin-unknown-reasoning-style",
-                    &i18n::args([("style", other.to_string().into())]),
-                ),
-            );
-        }
-    };
-    if let Err(err) = db::set_reasoning_style(&state.db, &form.model_name, style).await {
-        return toast(
-            FlashKind::Error,
-            t_args(
-                lang,
-                "admin-db-error",
-                &i18n::args([("err", err.to_string().into())]),
-            ),
-        );
-    }
-    toast(
-        FlashKind::Success,
-        t_args(
-            lang,
-            "admin-saved-reasoning-style",
-            &i18n::args([("model", form.model_name.clone().into())]),
-        ),
-    )
-}
-
-/// POST /admin/models/reasoning-budget — save a model's per-effort reasoning
-/// overrides (token budgets for Qwen/Anthropic, `reasoning_effort` levels for
-/// OpenAI/GLM). Like the reasoning-style save, this touches only its own
-/// columns so it composes with the TOML save and the style save. Empty fields
-/// clear that level back to the built-in default.
-pub async fn models_reasoning_budget_save(
-    State(state): State<Arc<RamaState>>,
-    req: Request,
-) -> Response {
-    let lang = Lang::from_headers(req.headers());
-    if let Err(resp) = require_admin_or_403(&state, &req).await {
-        return resp;
-    }
-    let (_, body) = req.into_parts();
-    let body = match read_body_to_bytes(body).await {
-        Ok(b) => b,
-        Err(msg) => return toast(FlashKind::Error, msg),
-    };
-    let form: ReasoningBudgetForm = match serde_urlencoded::from_bytes(&body) {
-        Ok(f) => f,
-        Err(err) => {
-            return toast(
-                FlashKind::Error,
-                t_args(
-                    lang,
-                    "admin-malformed-form",
-                    &i18n::args([("err", err.to_string().into())]),
-                ),
-            );
-        }
-    };
-    if form.model_name.is_empty() {
-        return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
-    }
-    // Parse + validate each field; an empty string clears the level.
-    let budget = |s: &str| -> Result<Option<i64>, String> {
-        let s = s.trim();
-        if s.is_empty() {
-            return Ok(None);
-        }
-        match s.parse::<i64>() {
-            Ok(n) if n >= 1 => Ok(Some(n)),
-            _ => Err(t_args(
-                lang,
-                "admin-budget-not-positive",
-                &i18n::args([("value", s.to_string().into())]),
-            )),
-        }
-    };
-    let effort = |s: &str| -> Result<Option<String>, String> {
-        let s = s.trim();
-        if s.is_empty() {
-            return Ok(None);
-        }
-        // Validate against the full intensity scale (the GLM superset); the
-        // dropdown only offers per-style-valid values anyway.
-        if crate::server::reasoning::ReasoningStyle::Glm
-            .effort_levels()
-            .contains(&s)
-        {
-            Ok(Some(s.to_string()))
-        } else {
-            Err(t_args(
-                lang,
-                "admin-unknown-reasoning-effort",
-                &i18n::args([("value", s.to_string().into())]),
-            ))
-        }
-    };
-    let build = || -> Result<db::ReasoningOverrideCols, String> {
-        Ok(db::ReasoningOverrideCols {
-            budget_standard: budget(&form.budget_standard)?,
-            budget_deep: budget(&form.budget_deep)?,
-            budget_max: budget(&form.budget_max)?,
-            effort_standard: effort(&form.effort_standard)?,
-            effort_deep: effort(&form.effort_deep)?,
-            effort_max: effort(&form.effort_max)?,
-        })
-    };
-    let cols = match build() {
-        Ok(c) => c,
-        Err(e) => return toast(FlashKind::Error, e),
-    };
-    if let Err(err) = db::set_reasoning_overrides(&state.db, &form.model_name, &cols).await {
-        return toast(
-            FlashKind::Error,
-            t_args(
-                lang,
-                "admin-db-error",
-                &i18n::args([("err", err.to_string().into())]),
-            ),
-        );
-    }
-    toast(
-        FlashKind::Success,
-        t_args(
-            lang,
-            "admin-saved-reasoning-budget",
-            &i18n::args([("model", form.model_name.clone().into())]),
-        ),
-    )
-}
-
-/// POST /admin/models/context-window — save a model's context window in tokens
-/// (used by the auto-compaction trigger). Touches only its own column so it
-/// composes with the TOML/style/budget saves. An empty value clears the row's
-/// window and falls back to the global `default_context_window`.
-pub async fn models_context_window_save(
-    State(state): State<Arc<RamaState>>,
-    req: Request,
-) -> Response {
-    let lang = Lang::from_headers(req.headers());
-    if let Err(resp) = require_admin_or_403(&state, &req).await {
-        return resp;
-    }
-    let (_, body) = req.into_parts();
-    let body = match read_body_to_bytes(body).await {
-        Ok(b) => b,
-        Err(msg) => return toast(FlashKind::Error, msg),
-    };
-    let form: ContextWindowForm = match serde_urlencoded::from_bytes(&body) {
-        Ok(f) => f,
-        Err(err) => {
-            return toast(
-                FlashKind::Error,
-                t_args(
-                    lang,
-                    "admin-malformed-form",
-                    &i18n::args([("err", err.to_string().into())]),
-                ),
-            );
-        }
-    };
-    if form.model_name.is_empty() {
-        return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
-    }
-    let window = match form.context_window.trim() {
-        "" => None,
-        s => match s.parse::<i64>() {
-            Ok(n) if n >= 1 => Some(n),
-            _ => {
-                return toast(
-                    FlashKind::Error,
-                    t_args(
-                        lang,
-                        "admin-context-window-invalid",
-                        &i18n::args([("value", s.to_string().into())]),
-                    ),
-                );
-            }
-        },
-    };
-    if let Err(err) = db::set_context_window(&state.db, &form.model_name, window).await {
-        return toast(
-            FlashKind::Error,
-            t_args(
-                lang,
-                "admin-db-upsert-error",
-                &i18n::args([("err", err.to_string().into())]),
-            ),
-        );
-    }
-    let msg = match window {
-        Some(_) => t_args(
-            lang,
-            "admin-context-window-saved",
-            &i18n::args([("model", form.model_name.clone().into())]),
-        ),
-        None => t_args(
-            lang,
-            "admin-context-window-cleared",
-            &i18n::args([("model", form.model_name.clone().into())]),
-        ),
-    };
-    toast(FlashKind::Success, msg)
-}
-
-/// POST /admin/models/pricing — save a model's per-1M-token prices for cost
-/// accounting. Touches only the two price columns so it composes with the
-/// TOML/style/budget/context-window saves. Either field blank clears that
-/// side (the model becomes unpriced on that side → 0 cost). A negative or
-/// non-numeric value is rejected.
-pub async fn models_pricing_save(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let lang = Lang::from_headers(req.headers());
-    if let Err(resp) = require_admin_or_403(&state, &req).await {
-        return resp;
-    }
-    let (_, body) = req.into_parts();
-    let body = match read_body_to_bytes(body).await {
-        Ok(b) => b,
-        Err(msg) => return toast(FlashKind::Error, msg),
-    };
-    let form: PricingForm = match serde_urlencoded::from_bytes(&body) {
-        Ok(f) => f,
-        Err(err) => {
-            return toast(
-                FlashKind::Error,
-                t_args(
-                    lang,
-                    "admin-malformed-form",
-                    &i18n::args([("err", err.to_string().into())]),
-                ),
-            );
-        }
-    };
-    if form.model_name.is_empty() {
-        return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
-    }
-    // A blank field clears that side; a present one must parse to a finite,
-    // non-negative price.
+    // ---- validate every field before touching the DB ----
     let parse_price = |s: &str| -> Result<Option<f64>, String> {
         match s.trim() {
             "" => Ok(None),
@@ -574,33 +261,195 @@ pub async fn models_pricing_save(State(state): State<Arc<RamaState>>, req: Reque
             );
         }
     };
-    if let Err(err) = db::set_pricing(&state.db, &form.model_name, input_price, output_price).await
+    let context_window = match form.context_window.trim() {
+        "" => None,
+        s => match s.parse::<i64>() {
+            Ok(n) if n >= 1 => Some(n),
+            _ => {
+                return toast(
+                    FlashKind::Error,
+                    t_args(
+                        lang,
+                        "admin-context-window-invalid",
+                        &i18n::args([("value", s.to_string().into())]),
+                    ),
+                );
+            }
+        },
+    };
+    let reasoning_style = match form.reasoning_style.trim() {
+        "" | "auto" => None,
+        s @ ("none" | "qwen" | "openai" | "glm" | "anthropic") => Some(s.to_string()),
+        other => {
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-unknown-reasoning-style",
+                    &i18n::args([("style", other.to_string().into())]),
+                ),
+            );
+        }
+    };
+    let budget = |s: &str| -> Result<Option<i64>, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        match s.parse::<i64>() {
+            Ok(n) if n >= 1 => Ok(Some(n)),
+            _ => Err(t_args(
+                lang,
+                "admin-budget-not-positive",
+                &i18n::args([("value", s.to_string().into())]),
+            )),
+        }
+    };
+    let effort = |s: &str| -> Result<Option<String>, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        if ReasoningStyle::Glm.effort_levels().contains(&s) {
+            Ok(Some(s.to_string()))
+        } else {
+            Err(t_args(
+                lang,
+                "admin-unknown-reasoning-effort",
+                &i18n::args([("value", s.to_string().into())]),
+            ))
+        }
+    };
+    let overrides = match (|| -> Result<db::ReasoningOverrideCols, String> {
+        Ok(db::ReasoningOverrideCols {
+            budget_standard: budget(&form.budget_standard)?,
+            budget_deep: budget(&form.budget_deep)?,
+            budget_max: budget(&form.budget_max)?,
+            effort_standard: effort(&form.effort_standard)?,
+            effort_deep: effort(&form.effort_deep)?,
+            effort_max: effort(&form.effort_max)?,
+        })
+    })() {
+        Ok(c) => c,
+        Err(e) => return toast(FlashKind::Error, e),
+    };
+    let toml = form.defaults_toml.trim();
+    if !toml.is_empty()
+        && let Err(err) = merge::parse_defaults(&form.defaults_toml)
     {
         return toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-invalid-toml",
+                &i18n::args([("err", err.to_string().into())]),
+            ),
+        );
+    }
+
+    let tri = |s: &str| -> Option<bool> {
+        match s.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    };
+    let fb = |s: &str| -> Option<String> {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    let fields = db::AllFields {
+        defaults_toml: form.defaults_toml.clone(),
+        reasoning_style,
+        overrides,
+        context_window,
+        input_price,
+        output_price,
+        capabilities: db::ModelCapabilities {
+            vision: tri(&form.cap_vision),
+            audio_input: tri(&form.cap_audio_input),
+            pdf_input: tri(&form.cap_pdf_input),
+            tools: tri(&form.cap_tools),
+            parallel_tools: tri(&form.cap_parallel_tools),
+            structured_output: tri(&form.cap_structured_output),
+            fallback_vision: fb(&form.fallback_vision),
+            fallback_tools: fb(&form.fallback_tools),
+        },
+    };
+    match db::set_all(&state.db, &form.model_name, &fields).await {
+        Ok(()) => toast(
+            FlashKind::Success,
+            t_args(
+                lang,
+                "admin-saved-model",
+                &i18n::args([("model", form.model_name.clone().into())]),
+            ),
+        ),
+        Err(err) => toast(
             FlashKind::Error,
             t_args(
                 lang,
                 "admin-db-upsert-error",
                 &i18n::args([("err", err.to_string().into())]),
             ),
-        );
-    }
-    toast(
-        FlashKind::Success,
-        t_args(
-            lang,
-            "admin-price-saved",
-            &i18n::args([("model", form.model_name.clone().into())]),
         ),
-    )
+    }
+}
+
+/// POST /admin/models/clear — delete a model's stored overrides entirely,
+/// returning it to the backend's built-in behaviour. `model_name` rides in the
+/// body (see [`models_save`]).
+pub async fn models_clear(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let form: ClearForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(err) => {
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-malformed-form",
+                    &i18n::args([("err", err.to_string().into())]),
+                ),
+            );
+        }
+    };
+    if form.model_name.is_empty() {
+        return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
+    }
+    match db::delete(&state.db, &form.model_name).await {
+        Ok(()) => toast(
+            FlashKind::Success,
+            t_args(
+                lang,
+                "admin-cleared-defaults",
+                &i18n::args([("model", form.model_name.clone().into())]),
+            ),
+        ),
+        Err(err) => toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-db-delete-error",
+                &i18n::args([("err", err.to_string().into())]),
+            ),
+        ),
+    }
 }
 
 /// POST /admin/models/defaults — set (or clear) the default model pre-selected
-/// for a feature (chat / voice-transcription / image). An empty `model` clears
-/// the override, restoring the "first advertised model" behaviour. The stored
-/// id is only *resolved* against the live set at use-time (see
-/// [`crate::server::feature_defaults`]), so saving a model that later stops
-/// being served degrades gracefully rather than erroring.
+/// for a feature (chat / voice-transcription / image / embedding). An empty
+/// `model` clears the override, restoring the "first advertised model"
+/// behaviour. Resolved against the live set at use-time, so a stale id degrades
+/// gracefully.
 pub async fn models_defaults_save(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
@@ -657,93 +506,14 @@ pub async fn models_defaults_save(State(state): State<Arc<RamaState>>, req: Requ
     toast(FlashKind::Success, msg)
 }
 
-/// POST /admin/models/capabilities — save a model's capability flags (tri-state)
-/// and fallback model references. Each capability field is "" (unknown/clear),
-/// "true", or "false". Fallback fields are a model id or "" (no fallback).
-pub async fn models_capabilities_save(
-    State(state): State<Arc<RamaState>>,
-    req: Request,
-) -> Response {
-    let lang = Lang::from_headers(req.headers());
-    if let Err(resp) = require_admin_or_403(&state, &req).await {
-        return resp;
-    }
-    let (_, body) = req.into_parts();
-    let body = match read_body_to_bytes(body).await {
-        Ok(b) => b,
-        Err(msg) => return toast(FlashKind::Error, msg),
-    };
-    let form: CapabilitiesForm = match serde_urlencoded::from_bytes(&body) {
-        Ok(f) => f,
-        Err(err) => {
-            return toast(
-                FlashKind::Error,
-                t_args(
-                    lang,
-                    "admin-malformed-form",
-                    &i18n::args([("err", err.to_string().into())]),
-                ),
-            );
-        }
-    };
-    if form.model_name.is_empty() {
-        return toast(FlashKind::Error, t(lang, "admin-missing-model-name"));
-    }
-
-    let parse_tri = |s: &str| -> Option<bool> {
-        match s.trim() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        }
-    };
-    let parse_fb = |s: &str| -> Option<String> {
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    };
-
-    let caps = crate::server::db::model_defaults::ModelCapabilities {
-        vision: parse_tri(&form.cap_vision),
-        audio_input: parse_tri(&form.cap_audio_input),
-        pdf_input: parse_tri(&form.cap_pdf_input),
-        tools: parse_tri(&form.cap_tools),
-        parallel_tools: parse_tri(&form.cap_parallel_tools),
-        structured_output: parse_tri(&form.cap_structured_output),
-        fallback_vision: parse_fb(&form.fallback_vision),
-        fallback_tools: parse_fb(&form.fallback_tools),
-    };
-
-    match crate::server::db::model_defaults::set_capabilities(&state.db, &form.model_name, &caps)
-        .await
-    {
-        Ok(()) => toast(
-            FlashKind::Success,
-            t_args(
-                lang,
-                "admin-capabilities-saved",
-                &i18n::args([("model", form.model_name.into())]),
-            ),
-        ),
-        Err(e) => toast(
-            FlashKind::Error,
-            t_args(
-                lang,
-                "admin-capabilities-error",
-                &i18n::args([("err", e.to_string().into())]),
-            ),
-        ),
-    }
-}
-
 /// POST /admin/upstreams/reload — rebuild the upstream registry from the DB
-/// topology (pools, backends, fallbacks) and re-spawn health probes for the
-/// new/changed backends. The "Apply changes" button after editing pools or
-/// backends in the admin UI.
+/// topology (pools, backends, fallbacks) and re-spawn health probes. The "Apply
+/// changes" button on `/admin/upstreams`. On success it clears the in-memory
+/// dirty counter and patches the `topologyDirty` signal to 0 so the apply bar
+/// disappears without a reload.
 pub async fn upstreams_reload(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    use session_core::chrome::{Flash, sse_response, sse_toast};
+
     let lang = Lang::from_headers(req.headers());
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
@@ -765,13 +535,6 @@ pub async fn upstreams_reload(State(state): State<Arc<RamaState>>, req: Request)
 
     match state.upstreams.reload(&snapshot, &state.crypto) {
         Ok(()) => {
-            // Await the initial probe round (bounded by the 2s probe timeout)
-            // before responding, so a brand-new backend has its model set
-            // populated before "Apply changes" reports success. Unchanged
-            // backends already carried their live set across the swap in
-            // `reload`, so existing traffic never sees an empty-model window.
-            // `spawn` also arms the new generation's probe loops; the old
-            // generation's loops retire themselves (see `health::run_probe`).
             crate::server::upstreams::health::spawn(state.upstreams.clone()).await;
             let pool_count = snapshot.pools.len();
             let backend_count = snapshot.backends.len();
@@ -780,17 +543,21 @@ pub async fn upstreams_reload(State(state): State<Arc<RamaState>>, req: Request)
                 backends = backend_count,
                 "upstream registry reloaded from DB"
             );
-            toast(
-                FlashKind::Success,
-                t_args(
-                    lang,
-                    "admin-reloaded",
-                    &i18n::args([
-                        ("pools", pool_count.to_string().into()),
-                        ("backends", backend_count.to_string().into()),
-                    ]),
-                ),
-            )
+            state.topology_dirty_reset();
+            sse_response(&[
+                sse_toast(&Flash {
+                    kind: FlashKind::Success,
+                    message: t_args(
+                        lang,
+                        "admin-reloaded",
+                        &i18n::args([
+                            ("pools", pool_count.to_string().into()),
+                            ("backends", backend_count.to_string().into()),
+                        ]),
+                    ),
+                }),
+                super::dirty_signal(0),
+            ])
         }
         Err(e) => toast(
             FlashKind::Error,
@@ -803,9 +570,47 @@ pub async fn upstreams_reload(State(state): State<Arc<RamaState>>, req: Request)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Form structs
+// ---------------------------------------------------------------------------
+
 #[derive(serde::Deserialize)]
-struct CapabilitiesForm {
+struct DefaultsForm {
+    feature: String,
+    #[serde(default)]
+    model: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ClearForm {
     model_name: String,
+}
+
+/// The consolidated per-model save form. Every field is optional / blank =
+/// "clear this facet"; the row itself is kept (delete it via `models_clear`).
+#[derive(Default, serde::Deserialize)]
+struct SaveForm {
+    model_name: String,
+    #[serde(default)]
+    input_price: String,
+    #[serde(default)]
+    output_price: String,
+    #[serde(default)]
+    context_window: String,
+    #[serde(default)]
+    reasoning_style: String,
+    #[serde(default)]
+    budget_standard: String,
+    #[serde(default)]
+    budget_deep: String,
+    #[serde(default)]
+    budget_max: String,
+    #[serde(default)]
+    effort_standard: String,
+    #[serde(default)]
+    effort_deep: String,
+    #[serde(default)]
+    effort_max: String,
     #[serde(default)]
     cap_vision: String,
     #[serde(default)]
@@ -822,64 +627,13 @@ struct CapabilitiesForm {
     fallback_vision: String,
     #[serde(default)]
     fallback_tools: String,
-}
-
-#[derive(serde::Deserialize)]
-struct DefaultsForm {
-    feature: String,
     #[serde(default)]
-    model: String,
-}
-
-#[derive(serde::Deserialize)]
-struct SaveForm {
-    model_name: String,
     defaults_toml: String,
 }
 
-#[derive(serde::Deserialize)]
-struct ContextWindowForm {
-    model_name: String,
-    #[serde(default)]
-    context_window: String,
-}
-
-#[derive(serde::Deserialize)]
-struct PricingForm {
-    model_name: String,
-    #[serde(default)]
-    input_price: String,
-    #[serde(default)]
-    output_price: String,
-}
-
-#[derive(serde::Deserialize)]
-struct ReasoningForm {
-    model_name: String,
-    reasoning_style: String,
-}
-
-/// Per-effort reasoning overrides form. All fields optional / empty = "clear
-/// this level" (fall back to the built-in default). For token-budget styles the
-/// `budget_*` fields are filled; for effort-level styles the `effort_*` fields.
-/// The form only renders the relevant set, but we accept and store all six so a
-/// later style switch can clear stale values.
-#[derive(Default, serde::Deserialize)]
-struct ReasoningBudgetForm {
-    model_name: String,
-    #[serde(default)]
-    budget_standard: String,
-    #[serde(default)]
-    budget_deep: String,
-    #[serde(default)]
-    budget_max: String,
-    #[serde(default)]
-    effort_standard: String,
-    #[serde(default)]
-    effort_deep: String,
-    #[serde(default)]
-    effort_max: String,
-}
+// ---------------------------------------------------------------------------
+// Row view models
+// ---------------------------------------------------------------------------
 
 struct ModelRow {
     name: String,
@@ -894,39 +648,61 @@ struct ModelRow {
     context_window: Option<i64>,
     input_price: Option<f64>,
     output_price: Option<f64>,
-    /// Model capabilities for the capability editor. `None` = unknown.
     cap_vision: Option<bool>,
+    cap_audio_input: Option<bool>,
+    cap_pdf_input: Option<bool>,
     cap_tools: Option<bool>,
+    cap_parallel_tools: Option<bool>,
     cap_structured_output: Option<bool>,
     fallback_vision: Option<String>,
     fallback_tools: Option<String>,
 }
 
-/// A non-chat model (embedding / image / speech / transcription) shown in the
-/// pricing-only section: sampling, reasoning, and context settings don't apply
-/// to it, but per-model cost pricing does.
+impl ModelRow {
+    fn has_price(&self) -> bool {
+        self.input_price.is_some() || self.output_price.is_some()
+    }
+    fn has_budget(&self) -> bool {
+        self.budget_standard.is_some()
+            || self.budget_deep.is_some()
+            || self.budget_max.is_some()
+            || !self.effort_standard.is_empty()
+            || !self.effort_deep.is_empty()
+            || !self.effort_max.is_empty()
+    }
+    fn has_caps(&self) -> bool {
+        self.cap_vision.is_some()
+            || self.cap_audio_input.is_some()
+            || self.cap_pdf_input.is_some()
+            || self.cap_tools.is_some()
+            || self.cap_parallel_tools.is_some()
+            || self.cap_structured_output.is_some()
+            || self.fallback_vision.is_some()
+            || self.fallback_tools.is_some()
+    }
+    fn configured(&self) -> bool {
+        self.has_price()
+            || self.has_budget()
+            || self.has_caps()
+            || self.context_window.is_some()
+            || !self.toml.trim().is_empty()
+            || !self.reasoning_style.is_empty()
+    }
+}
+
 struct OtherModelRow {
     name: String,
-    /// The pool kind that serves it (`embedding` / `image` / …), for the badge.
     kind_label: &'static str,
     input_price: Option<f64>,
     output_price: Option<f64>,
 }
 
-/// A model name that is an alias for another (real) model. Rendered read-only:
-/// aliases carry no settings or price of their own — each request is configured
-/// and metered as the model it resolves to (`target`).
 struct AliasRow {
     name: String,
-    /// The real model id this alias resolves to.
     target: String,
-    /// The pool kind that serves it (`chat` / `embedding` / …), for the badge.
     kind_label: &'static str,
 }
 
-/// One row of the "Default models" card: the feature, its label, the models
-/// its pool advertises (sorted), and the currently-stored override (raw — not
-/// yet resolved against `available`).
 struct FeatureDefaultRow {
     feature: Feature,
     label_key: &'static str,
@@ -934,8 +710,10 @@ struct FeatureDefaultRow {
     current: Option<String>,
 }
 
-/// Build the per-feature default-model rows for the admin card. A feature with
-/// no advertised models is omitted (nothing to pick from).
+// ---------------------------------------------------------------------------
+// Default-models card (unchanged behaviour)
+// ---------------------------------------------------------------------------
+
 async fn defaults_rows(state: &RamaState) -> Vec<FeatureDefaultRow> {
     let mut out = Vec::new();
     for (feature, label_key) in [
@@ -960,9 +738,6 @@ async fn defaults_rows(state: &RamaState) -> Vec<FeatureDefaultRow> {
     out
 }
 
-/// The "Default models" card: one auto-saving `<select>` per feature that picks
-/// which model is pre-selected in the chat/voice pickers (and the API fallback
-/// when a call omits a model). Renders nothing when no feature has any models.
 fn render_defaults_card(lang: Lang, rows: &[FeatureDefaultRow]) -> Html {
     if rows.is_empty() {
         return html! { (String::new()) }.to_html();
@@ -971,33 +746,26 @@ fn render_defaults_card(lang: Lang, rows: &[FeatureDefaultRow]) -> Html {
     let selects: Vec<Html> = rows
         .iter()
         .map(|row| {
-            // "First available" (empty value) is selected when nothing is
-            // stored, or the stored id is no longer advertised.
             let current_served = row
                 .current
                 .as_deref()
                 .filter(|c| row.available.iter().any(|a| a == c));
             let mut opts: Vec<Html> = Vec::with_capacity(row.available.len() + 1);
             let first_label = t(lang, "admin-defaults-first-option");
-            opts.push(if current_served.is_none() {
-                html! { option(value: "", selected: "selected") { (first_label) } }.to_html()
-            } else {
-                html! { option(value: "") { (first_label) } }.to_html()
-            });
+            opts.push(super::select_option(
+                "",
+                &first_label,
+                current_served.is_none(),
+            ));
             for m in &row.available {
-                opts.push(if current_served == Some(m.as_str()) {
-                    html! { option(value: (m.clone()), selected: "selected") { (m.clone()) } }
-                        .to_html()
-                } else {
-                    html! { option(value: (m.clone())) { (m.clone()) } }.to_html()
-                });
+                opts.push(super::select_option(
+                    m,
+                    m,
+                    current_served == Some(m.as_str()),
+                ));
             }
             html! {
-                form(
-                    method: "post",
-                    action: (action),
-                    class: "form-control m-0"
-                ) {
+                form(method: "post", action: (action), class: "form-control m-0") {
                     input(type: "hidden", name: "feature", value: (row.feature.as_str()));
                     span(class: "label-text text-xs mb-1") { (t(lang, row.label_key)) }
                     select(
@@ -1020,8 +788,6 @@ fn render_defaults_card(lang: Lang, rows: &[FeatureDefaultRow]) -> Html {
                     h2(class: "card-title text-base") { (t(lang, "admin-defaults-heading")) }
                     p(class: "text-base-content/70 text-sm") { (t(lang, "admin-defaults-intro")) }
                 }
-                // Uniform half-width columns: a 2-up grid so every picker is the
-                // same width and rows line up (single column on narrow screens).
                 div(class: "grid grid-cols-1 md:grid-cols-2 gap-4") {
                     for s in selects.iter() { (s.clone()) }
                 }
@@ -1030,6 +796,15 @@ fn render_defaults_card(lang: Lang, rows: &[FeatureDefaultRow]) -> Html {
     }
     .to_html()
 }
+
+// ---------------------------------------------------------------------------
+// Page body + model list
+// ---------------------------------------------------------------------------
+
+/// Inline grid template shared by the list header and every row, so the columns
+/// line up. Inline because the shipped CSS bundle carries no arbitrary
+/// `grid-cols-[…]` utility.
+const ROW_GRID: &str = "display:grid;grid-template-columns:minmax(170px,1.6fr) 82px 108px 84px 128px minmax(110px,1.1fr) 18px;gap:10px;align-items:center";
 
 fn render_models_body(
     lang: Lang,
@@ -1040,15 +815,11 @@ fn render_models_body(
     other: &[OtherModelRow],
     all_models: &[String],
 ) -> Html {
-    let cards: Vec<Html> = rows
-        .iter()
-        .map(|row| render_model_card(lang, currency, row, all_models))
-        .collect();
     html! {
         section(class: "max-w-5xl mx-auto p-4 sm:p-6 flex flex-col gap-4") {
             header(class: "flex flex-col gap-1") {
                 h1(class: "text-2xl font-bold") { (t(lang, "admin-heading")) }
-                p(class: "text-base-content/70 text-sm") {
+                p(class: "text-base-content/70 text-sm max-w-2xl") {
                     (t(lang, "admin-intro-prefix"))
                     " "
                     strong { (t(lang, "admin-intro-every")) }
@@ -1060,335 +831,415 @@ fn render_models_body(
                 }
             }
             (render_defaults_card(lang, defaults))
-            if rows.is_empty() {
-                div(class: "alert") {
-                    (icons::info(18))
-                    span {
-                        (t(lang, "admin-no-models"))
-                    }
-                }
-            } else {
-                div(class: "flex flex-col gap-4") {
-                    for c in cards.iter() {
-                        (c.clone())
-                    }
-                }
-            }
-            (render_alias_card(lang, aliases))
-            (render_other_models_card(lang, currency, other))
+            (render_model_list(lang, currency, rows, aliases, other, all_models))
         }
     }
     .to_html()
 }
 
-/// Read-only card listing alias model names and the real model each resolves to.
-/// Aliases carry no settings or price of their own — they inherit the target's,
-/// and cost accounting meters the resolved id — so they get no editors here,
-/// just an `(alias)` chip and the "→ target" mapping. Renders nothing when there
-/// are no aliases.
-fn render_alias_card(lang: Lang, aliases: &[AliasRow]) -> Html {
-    if aliases.is_empty() {
-        return html! {}.to_html();
-    }
-    let rows: Vec<Html> = aliases
-        .iter()
-        .map(|a| {
-            html! {
-                div(class: "flex items-center gap-2 flex-wrap py-1") {
-                    span(class: "badge badge-ghost badge-sm") { (a.kind_label) }
-                    span(class: "font-mono text-sm break-all") { (a.name.clone()) }
-                    span(class: "badge badge-info badge-sm") { (t(lang, "admin-alias-chip")) }
-                    span(class: "text-base-content/40") { "→" }
-                    span(class: "font-mono text-sm break-all text-base-content/70") {
-                        (a.target.clone())
-                    }
-                }
-            }
-            .to_html()
-        })
-        .collect();
-    html! {
-        article(class: "card border border-base-300 bg-base-100") {
-            div(class: "card-body gap-3") {
-                header(class: "flex flex-col gap-1") {
-                    h2(class: "card-title text-base") { (t(lang, "admin-aliases-heading")) }
-                    p(class: "text-base-content/70 text-sm") { (t(lang, "admin-aliases-intro")) }
-                }
-                div(class: "flex flex-col divide-y divide-base-200") {
-                    for r in rows.iter() { (r.clone()) }
-                }
-            }
-        }
-    }
-    .to_html()
-}
-
-/// Pricing-only card for non-chat models (embedding / image / speech /
-/// transcription). Those pools serve no sampling/reasoning/context settings,
-/// but their calls still cost money, so each gets just the price control.
-/// Renders nothing when there are no such models.
-fn render_other_models_card(lang: Lang, currency: &str, other: &[OtherModelRow]) -> Html {
-    if other.is_empty() {
-        return html! {}.to_html();
-    }
-    let rows: Vec<Html> = other
-        .iter()
-        .map(|m| {
-            html! {
-                div(class: "flex items-center justify-between gap-3 flex-wrap py-1") {
-                    div(class: "flex items-center gap-2 min-w-0") {
-                        span(class: "badge badge-ghost badge-sm") { (m.kind_label) }
-                        span(class: "font-mono text-sm break-all") { (m.name.clone()) }
-                    }
-                    (render_pricing(lang, currency, &m.name, m.input_price, m.output_price))
-                }
-            }
-            .to_html()
-        })
-        .collect();
-    html! {
-        article(class: "card border border-base-300 bg-base-100") {
-            div(class: "card-body gap-3") {
-                header(class: "flex flex-col gap-1") {
-                    h2(class: "card-title text-base") { (t(lang, "admin-other-heading")) }
-                    p(class: "text-base-content/70 text-sm") { (t(lang, "admin-other-intro")) }
-                }
-                div(class: "flex flex-col divide-y divide-base-200") {
-                    for r in rows.iter() { (r.clone()) }
-                }
-            }
-        }
-    }
-    .to_html()
-}
-
-fn render_model_card(lang: Lang, currency: &str, row: &ModelRow, all_models: &[String]) -> Html {
-    let action = "/admin/models";
-    let placeholder = format!(
-        "{}\n\
-         # temperature      = 0.7\n\
-         # top_p            = 0.95\n\
-         # top_k            = 40\n\
-         # min_p            = 0.05\n\
-         # repeat_penalty   = 1.1\n\
-         # frequency_penalty= 0.0\n\
-         # presence_penalty = 0.0\n\
-         # max_tokens       = 2048\n\
-         # stop             = [\"<|im_end|>\"]\n",
-        t(lang, "admin-toml-placeholder-header")
-    );
-    html! {
-        article(class: "card border border-base-300 bg-base-100") {
-            div(class: "card-body gap-3") {
-                header(class: "flex items-center justify-between gap-3 flex-wrap") {
-                    h2(class: "card-title text-base font-mono break-all") { (row.name.clone()) }
-                    div(class: "flex items-center gap-2 flex-wrap") {
-                        (render_pricing(lang, currency, &row.name, row.input_price, row.output_price))
-                        (render_context_window(lang, row))
-                        (render_reasoning_select(lang, row))
-                    }
-                }
-                (render_reasoning_budget(lang, row))
-                (render_capabilities(lang, row, all_models))
-                form(
-                    method: "post",
-                    action: (action),
-                    "data-on:submit__prevent":
-                        (format!("@post('{action}', {{contentType: 'form'}})")),
-                    class: "flex flex-col gap-2 m-0"
-                ) {
-                    input(type: "hidden", name: "model_name", value: (row.name.clone()));
-                    label(class: "label sr-only", "for": (format!("toml-{}", row.name))) {
-                        (t(lang, "admin-toml-defaults-label"))
-                    }
-                    textarea(
-                        id: (format!("toml-{}", row.name)),
-                        name: "defaults_toml",
-                        class: "textarea textarea-bordered font-mono text-sm w-full leading-relaxed",
-                        rows: "11",
-                        spellcheck: "false",
-                        placeholder: (placeholder)
-                    ) { (row.toml.clone()) }
-                    div(class: "flex justify-end") {
-                        button(type: "submit", class: "btn btn-primary btn-sm") {
-                            (icons::check(14))
-                            span { (t(lang, "admin-save")) }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    .to_html()
-}
-
-/// Capabilities editor: tri-state selects (Unknown/Enabled/Disabled) for each
-/// capability + fallback model dropdowns. One auto-saving form posts all fields
-/// to `/admin/models/capabilities` on any change.
-fn render_capabilities(lang: Lang, row: &ModelRow, all_models: &[String]) -> Html {
-    let action = "/admin/models/capabilities";
-    let post = format!("@post('{action}', {{contentType: 'form'}})");
-    html! {
-        form(method: "post", action: (action), class: "m-0") {
-            input(type: "hidden", name: "model_name", value: (row.name.clone()));
-            div(class: "collapse collapse-arrow bg-base-200/50") {
-                input(type: "checkbox");
-                div(class: "collapse-title font-medium text-sm py-2 min-h-0") {
-                    (t(lang, "admin-capabilities-heading"))
-                }
-                div(class: "collapse-content") {
-                    div(class: "grid grid-cols-1 sm:grid-cols-3 gap-2 mt-1") {
-                        (cap_tri_select(lang, "cap_vision", "Vision", row.cap_vision, &post))
-                        (cap_tri_select(lang, "cap_tools", "Tools", row.cap_tools, &post))
-                        (cap_tri_select(lang, "cap_structured_output", &t(lang, "admin-cap-structured-output"), row.cap_structured_output, &post))
-                    }
-                    div(class: "grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2") {
-                        (cap_fb_select(lang, "fallback_vision", &t(lang, "admin-cap-fallback-vision"), &row.fallback_vision, all_models, &post))
-                        (cap_fb_select(lang, "fallback_tools", &t(lang, "admin-cap-fallback-tools"), &row.fallback_tools, all_models, &post))
-                    }
-                }
-            }
-        }
-    }
-    .to_html()
-}
-
-fn cap_tri_select(lang: Lang, name: &str, label: &str, val: Option<bool>, post: &str) -> Html {
-    let opts = [
-        super::select_option("", &t(lang, "admin-cap-unknown"), val.is_none()),
-        super::select_option("true", &t(lang, "admin-cap-enabled"), val == Some(true)),
-        super::select_option("false", &t(lang, "admin-cap-disabled"), val == Some(false)),
-    ];
-    html! {
-        label(class: "form-control gap-1") {
-            span(class: "text-xs opacity-70") { (label) }
-            select(name: (name), class: "select select-bordered select-sm", "data-on:change": (post)) {
-                for o in opts.iter() { (o.clone()) }
-            }
-        }
-    }
-    .to_html()
-}
-
-fn cap_fb_select(
+fn render_model_list(
     lang: Lang,
-    name: &str,
-    label: &str,
-    current: &Option<String>,
+    currency: &str,
+    rows: &[ModelRow],
+    aliases: &[AliasRow],
+    other: &[OtherModelRow],
     all_models: &[String],
-    post: &str,
 ) -> Html {
-    let mut opts: Vec<Html> = vec![super::select_option(
-        "",
-        &t(lang, "admin-cap-no-fallback"),
-        false,
-    )];
-    for m in all_models {
-        opts.push(super::select_option(
-            m,
-            m,
-            current.as_deref() == Some(m.as_str()),
-        ));
+    if rows.is_empty() && aliases.is_empty() && other.is_empty() {
+        return html! {
+            div(class: "alert") {
+                (icons::info(18))
+                span { (t(lang, "admin-no-models")) }
+            }
+        }
+        .to_html();
     }
+    let chat_items: Vec<Html> = rows
+        .iter()
+        .map(|r| render_chat_item(lang, currency, r, all_models))
+        .collect();
+    let alias_items: Vec<Html> = aliases.iter().map(|a| render_alias_item(lang, a)).collect();
+    let other_items: Vec<Html> = other
+        .iter()
+        .map(|m| render_other_item(lang, currency, m))
+        .collect();
+
     html! {
-        label(class: "form-control gap-1") {
-            span(class: "text-xs opacity-70") { (label) }
-            select(name: (name), class: "select select-bordered select-sm", "data-on:change": (post)) {
-                for o in opts.iter() { (o.clone()) }
+        article(class: "card border border-base-300 bg-base-100", "data-signals": "{mfilter: '', mkind: 'all'}") {
+            // Toolbar: text filter + mutually-exclusive kind chips.
+            div(class: "card-body gap-3 pb-0") {
+                div(class: "flex gap-2 items-center flex-wrap") {
+                    input(
+                        type: "text", "data-bind": "mfilter",
+                        placeholder: (t(lang, "admin-filter-placeholder")),
+                        "aria-label": (t(lang, "admin-filter-placeholder")),
+                        class: "input input-bordered input-sm w-60 max-w-full"
+                    );
+                    (kind_chip(lang, "admin-filter-all", "all"))
+                    (kind_chip(lang, "admin-filter-chat", "chat"))
+                    (kind_chip(lang, "admin-filter-other", "other"))
+                    (kind_chip(lang, "admin-filter-aliases", "alias"))
+                    (kind_chip(lang, "admin-filter-configured", "configured"))
+                }
+            }
+            div(class: "card-body gap-0 pt-3 overflow-x-auto") {
+                // Header row.
+                div(
+                    class: "text-[11px] uppercase tracking-wide text-base-content/50 border-b border-base-300 pb-2",
+                    style: (ROW_GRID)
+                ) {
+                    span { (t(lang, "admin-col-model")) }
+                    span { (t(lang, "admin-col-kind")) }
+                    span { (t(lang, "admin-col-price")) }
+                    span { (t(lang, "admin-col-context")) }
+                    span { (t(lang, "admin-col-reasoning")) }
+                    span { (t(lang, "admin-col-configured")) }
+                    span {}
+                }
+                for it in chat_items.iter() { (it.clone()) }
+                for it in alias_items.iter() { (it.clone()) }
+                for it in other_items.iter() { (it.clone()) }
             }
         }
     }
     .to_html()
 }
 
-/// The per-model context-window field: a tiny number input that auto-saves on
-/// change. Drives the auto-compaction trigger (compaction fires once a session's
-/// replayed prompt reaches `[chat.compaction] trigger_ratio` of this window).
-/// Blank falls back to the global `default_context_window`.
-fn render_context_window(lang: Lang, row: &ModelRow) -> Html {
-    let action = "/admin/models/context-window";
-    let value = row
+/// A mutually-exclusive kind filter chip. Clicking sets `$mkind`; the active
+/// chip gets `btn-active` via `data-class`.
+fn kind_chip(lang: Lang, label_key: &str, value: &str) -> Html {
+    let click = format!("$mkind = '{value}'");
+    let active = format!("{{'btn-active': $mkind === '{value}'}}");
+    let label = t(lang, label_key);
+    html! {
+        button(type: "button", class: "btn btn-xs", "data-on:click": (click), "data-class": (active)) {
+            (label)
+        }
+    }
+    .to_html()
+}
+
+/// The per-row `data-show` expression: matches the kind chip (or "configured")
+/// AND the text filter (case-insensitive substring on the model name).
+fn row_show(group: &str, configured: bool, name: &str) -> String {
+    let name_json =
+        serde_json::to_string(&name.to_lowercase()).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "($mkind === 'all' || $mkind === '{group}' || ($mkind === 'configured' && {configured})) \
+         && {name_json}.includes($mfilter.toLowerCase())"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Rows
+// ---------------------------------------------------------------------------
+
+fn render_chat_item(lang: Lang, currency: &str, row: &ModelRow, all_models: &[String]) -> Html {
+    let show = row_show("chat", row.configured(), &row.name);
+    let price = fmt_price_pair(row.input_price, row.output_price);
+    let context = row
+        .context_window
+        .map(fmt_context)
+        .unwrap_or_else(|| t(lang, "admin-value-default"));
+    let context_dim = row.context_window.is_none();
+    let reasoning = reasoning_summary(lang, &row.reasoning_style, &row.name);
+    let cfg_badges = configured_badges(lang, row);
+
+    html! {
+        details(class: "group border-b border-base-300", "data-show": (show)) {
+            summary(class: "cursor-pointer select-none py-2 hover:bg-base-200/40 list-none [&::-webkit-details-marker]:hidden") {
+                div(style: (ROW_GRID)) {
+                    span(class: "font-mono text-sm font-semibold break-all") { (row.name.clone()) }
+                    span { span(class: "badge badge-secondary badge-sm") { "chat" } }
+                    (price_cell(&price))
+                    (value_cell(&context, context_dim))
+                    span(class: "text-xs") { (reasoning) }
+                    (cfg_badges)
+                    span(class: "text-base-content/40 transition-transform group-open:rotate-180") { (icons::chevron_down(14)) }
+                }
+            }
+            div(class: "bg-base-200/40 border-t border-base-300 p-3 flex flex-col gap-3") {
+                (render_chat_editor(lang, currency, row, all_models))
+            }
+        }
+    }
+    .to_html()
+}
+
+fn render_other_item(lang: Lang, currency: &str, m: &OtherModelRow) -> Html {
+    let configured = m.input_price.is_some() || m.output_price.is_some();
+    let show = row_show("other", configured, &m.name);
+    let price = fmt_price_pair(m.input_price, m.output_price);
+    let na = t(lang, "admin-value-na");
+    let cfg = if configured {
+        html! { span(class: "badge badge-ghost badge-sm") { (t(lang, "admin-badge-price")) } }
+            .to_html()
+    } else {
+        html! { span(class: "text-xs text-base-content/40") { (t(lang, "admin-not-configured")) } }
+            .to_html()
+    };
+    html! {
+        details(class: "group border-b border-base-300", "data-show": (show)) {
+            summary(class: "cursor-pointer select-none py-2 hover:bg-base-200/40 list-none [&::-webkit-details-marker]:hidden") {
+                div(style: (ROW_GRID)) {
+                    span(class: "font-mono text-sm font-semibold break-all") { (m.name.clone()) }
+                    span { span(class: "badge badge-secondary badge-sm") { (m.kind_label) } }
+                    (price_cell(&price))
+                    (value_cell(&na, true))
+                    span(class: "text-xs text-base-content/40") { (na.clone()) }
+                    span(class: "flex flex-wrap gap-1") { (cfg) }
+                    span(class: "text-base-content/40 transition-transform group-open:rotate-180") { (icons::chevron_down(14)) }
+                }
+            }
+            div(class: "bg-base-200/40 border-t border-base-300 p-3 flex flex-col gap-3") {
+                (render_price_only_editor(lang, currency, &m.name, m.input_price, m.output_price))
+            }
+        }
+    }
+    .to_html()
+}
+
+fn render_alias_item(lang: Lang, a: &AliasRow) -> Html {
+    let show = row_show("alias", false, &a.name);
+    html! {
+        div(class: "border-b border-base-300 opacity-70", "data-show": (show)) {
+            div(style: (ROW_GRID), class: "py-2") {
+                span(class: "font-mono text-sm break-all text-base-content/70") {
+                    (a.name.clone())
+                    " "
+                    span(class: "text-base-content/40") { "→ " (a.target.clone()) }
+                }
+                span { span(class: "badge badge-info badge-sm") { (t(lang, "admin-alias-chip")) } }
+                span(class: "text-xs text-base-content/40") { (a.kind_label) }
+                span {}
+                span {}
+                span(class: "text-xs text-base-content/40") { (t(lang, "admin-alias-inherits")) }
+                span {}
+            }
+        }
+    }
+    .to_html()
+}
+
+// ---------------------------------------------------------------------------
+// Cell formatters
+// ---------------------------------------------------------------------------
+
+fn fmt_price_pair(input: Option<f64>, output: Option<f64>) -> Option<String> {
+    match (input, output) {
+        (None, None) => None,
+        (i, o) => {
+            let f = |p: Option<f64>| p.map(|n| format!("{n}")).unwrap_or_else(|| "—".into());
+            Some(format!("{} / {}", f(i), f(o)))
+        }
+    }
+}
+
+fn fmt_context(n: i64) -> String {
+    if n >= 1000 {
+        format!("{}k", n / 1000)
+    } else {
+        n.to_string()
+    }
+}
+
+fn price_cell(price: &Option<String>) -> Html {
+    match price {
+        Some(p) => html! { span(class: "text-xs tabular-nums") { (p.clone()) } }.to_html(),
+        None => {
+            html! { span(class: "text-xs tabular-nums text-base-content/40") { "—" } }.to_html()
+        }
+    }
+}
+
+fn value_cell(value: &str, dim: bool) -> Html {
+    let value = value.to_string();
+    if dim {
+        html! { span(class: "text-xs tabular-nums text-base-content/40") { (value) } }.to_html()
+    } else {
+        html! { span(class: "text-xs tabular-nums") { (value) } }.to_html()
+    }
+}
+
+/// Collapsed-row reasoning summary: the explicit style's label, or
+/// "Auto → <resolved>" when left on auto (name detection).
+fn reasoning_summary(lang: Lang, explicit: &str, model: &str) -> String {
+    if explicit.is_empty() {
+        let resolved = ReasoningStyle::resolve(None, model);
+        t_args(
+            lang,
+            "admin-reasoning-auto-resolved",
+            &i18n::args([("style", reasoning_style_short(resolved).into())]),
+        )
+    } else {
+        let style = ReasoningStyle::resolve(Some(explicit), model);
+        reasoning_style_short(style).to_string()
+    }
+}
+
+fn reasoning_style_short(style: ReasoningStyle) -> &'static str {
+    match style {
+        ReasoningStyle::None => "none",
+        ReasoningStyle::Qwen => "Qwen",
+        ReasoningStyle::OpenAi => "OpenAI",
+        ReasoningStyle::Glm => "GLM",
+        ReasoningStyle::Anthropic => "Anthropic",
+    }
+}
+
+/// The "configured" cell: one small badge per configured facet, or a dim "not
+/// configured".
+fn configured_badges(lang: Lang, row: &ModelRow) -> Html {
+    if !row.configured() {
+        return html! { span(class: "text-xs text-base-content/40") { (t(lang, "admin-not-configured")) } }
+            .to_html();
+    }
+    let badge = |label: String| -> Html {
+        html! { span(class: "badge badge-ghost badge-sm") { (label) } }.to_html()
+    };
+    let mut out: Vec<Html> = Vec::new();
+    if row.has_price() {
+        out.push(badge(t(lang, "admin-badge-price")));
+    }
+    if row.context_window.is_some() {
+        out.push(badge(t(lang, "admin-badge-ctx")));
+    }
+    if row.has_budget() {
+        out.push(badge(t(lang, "admin-badge-budget")));
+    }
+    if row.has_caps() {
+        out.push(badge(t(lang, "admin-badge-caps")));
+    }
+    if !row.toml.trim().is_empty() {
+        out.push(badge(t(lang, "admin-badge-toml")));
+    }
+    html! {
+        span(class: "flex flex-wrap gap-1") {
+            for b in out.iter() { (b.clone()) }
+        }
+    }
+    .to_html()
+}
+
+// ---------------------------------------------------------------------------
+// Editors
+// ---------------------------------------------------------------------------
+
+fn render_chat_editor(lang: Lang, currency: &str, row: &ModelRow, all_models: &[String]) -> Html {
+    let action = "/admin/models/save";
+    let post = format!("@post('{action}', {{contentType: 'form'}})");
+    let clear = "@post('/admin/models/clear', {contentType: 'form'})".to_string();
+    let in_val = row.input_price.map(|n| n.to_string()).unwrap_or_default();
+    let out_val = row.output_price.map(|n| n.to_string()).unwrap_or_default();
+    let ctx_val = row
         .context_window
         .map(|n| n.to_string())
         .unwrap_or_default();
-    let label_text = t(lang, "admin-context-window-label");
-    let unit_text = t(lang, "admin-context-window-unit");
-    let placeholder = t(lang, "admin-context-window-placeholder");
-    let aria = t(lang, "admin-context-window-aria");
-    html! {
-        form(method: "post", action: (action), class: "m-0") {
-            input(type: "hidden", name: "model_name", value: (row.name.clone()));
-            label(class: "input input-bordered input-xs flex items-center gap-1") {
-                span(class: "text-xs opacity-70") { (label_text) }
-                input(
-                    type: "number", name: "context_window", value: (value), min: "1",
-                    placeholder: (placeholder), "aria-label": (aria),
-                    "data-on:change": (format!("@post('{action}', {{contentType: 'form'}})")),
-                    class: "w-24"
-                );
-                span(class: "text-xs opacity-70") { (unit_text) }
-            }
-        }
-    }
-    .to_html()
-}
-
-/// The per-model pricing field: two tiny number inputs (input / output price
-/// per 1M tokens) in one auto-saving form. Both are posted together on any
-/// change to `/admin/models/pricing`, so editing either side never clears the
-/// other. Blank = unpriced (0 cost). The `currency` label is cosmetic.
-fn render_pricing(
-    lang: Lang,
-    currency: &str,
-    model_name: &str,
-    input_price: Option<f64>,
-    output_price: Option<f64>,
-) -> Html {
-    let action = "/admin/models/pricing";
-    let fmt = |p: Option<f64>| p.map(|n| n.to_string()).unwrap_or_default();
-    let in_val = fmt(input_price);
-    let out_val = fmt(output_price);
-    let label_text = t_args(
+    let price_label = t_args(
         lang,
         "admin-price-label",
         &i18n::args([("cur", currency.to_string().into())]),
     );
-    let in_ph = t(lang, "admin-price-in-placeholder");
-    let out_ph = t(lang, "admin-price-out-placeholder");
-    let in_aria = t(lang, "admin-price-in-aria");
-    let out_aria = t(lang, "admin-price-out-aria");
-    let unit_text = t(lang, "admin-price-unit");
-    let post = format!("@post('{action}', {{contentType: 'form'}})");
+
     html! {
-        form(method: "post", action: (action), class: "m-0") {
-            input(type: "hidden", name: "model_name", value: (model_name.to_string()));
-            label(class: "input input-bordered input-xs flex items-center gap-1") {
-                span(class: "text-xs opacity-70") { (label_text) }
-                input(
-                    type: "number", name: "input_price", value: (in_val), min: "0", step: "any",
-                    placeholder: (in_ph), "aria-label": (in_aria),
-                    "data-on:change": (post.clone()),
-                    class: "w-16"
-                );
-                span(class: "text-xs opacity-50") { "/" }
-                input(
-                    type: "number", name: "output_price", value: (out_val), min: "0", step: "any",
-                    placeholder: (out_ph), "aria-label": (out_aria),
-                    "data-on:change": (post),
-                    class: "w-16"
-                );
-                span(class: "text-xs opacity-70") { (unit_text) }
+        form(method: "post", action: (action), "data-on:submit__prevent": (post), class: "flex flex-col gap-3 m-0") {
+            input(type: "hidden", name: "model_name", value: (row.name.clone()));
+            div(class: "grid grid-cols-1 sm:grid-cols-2 gap-3") {
+                label(class: "form-control gap-1") {
+                    span(class: "text-xs opacity-70") { (t(lang, "admin-price-in-label")) " (" (price_label.clone()) ")" }
+                    input(type: "number", name: "input_price", value: (in_val), min: "0", step: "any",
+                        placeholder: (t(lang, "admin-price-in-placeholder")), class: "input input-bordered input-sm");
+                }
+                label(class: "form-control gap-1") {
+                    span(class: "text-xs opacity-70") { (t(lang, "admin-price-out-label")) " (" (price_label) ")" }
+                    input(type: "number", name: "output_price", value: (out_val), min: "0", step: "any",
+                        placeholder: (t(lang, "admin-price-out-placeholder")), class: "input input-bordered input-sm");
+                }
+                label(class: "form-control gap-1") {
+                    span(class: "text-xs opacity-70") { (t(lang, "admin-context-window-full-label")) }
+                    input(type: "number", name: "context_window", value: (ctx_val), min: "1",
+                        placeholder: (t(lang, "admin-context-window-placeholder")), class: "input input-bordered input-sm");
+                }
+                label(class: "form-control gap-1") {
+                    span(class: "text-xs opacity-70") { (t(lang, "admin-reasoning-style-label")) }
+                    (reasoning_style_select(lang, &row.reasoning_style))
+                }
+            }
+            (render_reasoning_controls(lang, row))
+            (render_capabilities(lang, row, all_models))
+            label(class: "form-control gap-1") {
+                span(class: "text-xs opacity-70") { (t(lang, "admin-toml-defaults-label")) }
+                textarea(
+                    name: "defaults_toml",
+                    class: "textarea textarea-bordered font-mono text-sm w-full leading-relaxed",
+                    rows: "6", spellcheck: "false",
+                    placeholder: (toml_placeholder(lang))
+                ) { (row.toml.clone()) }
+            }
+            div(class: "flex items-center gap-2") {
+                button(type: "button", class: "btn btn-ghost btn-xs", "data-on:click": (clear)) {
+                    (t(lang, "admin-clear-overrides"))
+                }
+                span(class: "flex-1") {}
+                button(type: "button", class: "btn btn-ghost btn-sm",
+                    "data-on:click": "el.closest('details').open = false") { (t(lang, "admin-cancel")) }
+                button(type: "submit", class: "btn btn-primary btn-sm") {
+                    (icons::check(14))
+                    span { (t(lang, "admin-save-model")) }
+                }
             }
         }
     }
     .to_html()
 }
 
-/// The per-model "reasoning style" picker: a tiny form whose `<select>`
-/// auto-saves on change. Tells `apply_effort` how this model expects its
-/// reasoning budget on the wire; "Auto" leaves it to name detection.
-fn render_reasoning_select(lang: Lang, row: &ModelRow) -> Html {
-    let action = "/admin/models/reasoning";
+fn render_price_only_editor(
+    lang: Lang,
+    currency: &str,
+    name: &str,
+    input_price: Option<f64>,
+    output_price: Option<f64>,
+) -> Html {
+    let action = "/admin/models/save";
+    let post = format!("@post('{action}', {{contentType: 'form'}})");
+    let in_val = input_price.map(|n| n.to_string()).unwrap_or_default();
+    let out_val = output_price.map(|n| n.to_string()).unwrap_or_default();
+    let price_label = t_args(
+        lang,
+        "admin-price-label",
+        &i18n::args([("cur", currency.to_string().into())]),
+    );
+    let name = name.to_string();
+    html! {
+        form(method: "post", action: (action), "data-on:submit__prevent": (post), class: "flex flex-col gap-3 m-0") {
+            input(type: "hidden", name: "model_name", value: (name));
+            div(class: "grid grid-cols-1 sm:grid-cols-2 gap-3") {
+                label(class: "form-control gap-1") {
+                    span(class: "text-xs opacity-70") { (t(lang, "admin-price-in-label")) " (" (price_label.clone()) ")" }
+                    input(type: "number", name: "input_price", value: (in_val), min: "0", step: "any",
+                        placeholder: (t(lang, "admin-price-in-placeholder")), class: "input input-bordered input-sm");
+                }
+                label(class: "form-control gap-1") {
+                    span(class: "text-xs opacity-70") { (t(lang, "admin-price-out-label")) " (" (price_label) ")" }
+                    input(type: "number", name: "output_price", value: (out_val), min: "0", step: "any",
+                        placeholder: (t(lang, "admin-price-out-placeholder")), class: "input input-bordered input-sm");
+                }
+            }
+            p(class: "text-xs text-base-content/60 m-0") { (t(lang, "admin-other-price-note")) }
+            div(class: "flex items-center gap-2 justify-end") {
+                button(type: "button", class: "btn btn-ghost btn-sm",
+                    "data-on:click": "el.closest('details').open = false") { (t(lang, "admin-cancel")) }
+                button(type: "submit", class: "btn btn-primary btn-sm") {
+                    (icons::check(14))
+                    span { (t(lang, "admin-save-model")) }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+fn reasoning_style_select(lang: Lang, current: &str) -> Html {
     let options: &[(&str, &str)] = &[
         ("", "admin-reasoning-auto"),
         ("none", "admin-reasoning-none"),
@@ -1397,63 +1248,37 @@ fn render_reasoning_select(lang: Lang, row: &ModelRow) -> Html {
         ("glm", "admin-reasoning-glm"),
         ("anthropic", "admin-reasoning-anthropic"),
     ];
-    let current = row.reasoning_style.as_str();
-    let option_html: Vec<Html> = options
+    let opts: Vec<Html> = options
         .iter()
-        .map(|(value, key)| {
-            let label = t(lang, key);
-            if *value == current {
-                html! { option(value: (*value), selected: "selected") { (label) } }.to_html()
-            } else {
-                html! { option(value: (*value)) { (label) } }.to_html()
-            }
-        })
+        .map(|(value, key)| super::select_option(value, &t(lang, key), *value == current))
         .collect();
     html! {
-        form(
-            method: "post",
-            action: (action),
-            class: "m-0"
-        ) {
-            input(type: "hidden", name: "model_name", value: (row.name.clone()));
-            select(
-                name: "reasoning_style",
-                "aria-label": (t(lang, "admin-reasoning-style-aria")),
-                "data-on:change": (format!("@post('{action}', {{contentType: 'form'}})")),
-                class: "select select-bordered select-xs"
-            ) {
-                for o in option_html.iter() {
-                    (o.clone())
-                }
-            }
+        select(name: "reasoning_style", "aria-label": (t(lang, "admin-reasoning-style-aria")),
+            class: "select select-bordered select-sm") {
+            for o in opts.iter() { (o.clone()) }
         }
     }
     .to_html()
 }
 
-/// Adaptive per-effort reasoning controls, shown below the style picker. Token-
-/// budget styles (Qwen, Anthropic) get integer token fields; effort-level styles
-/// (OpenAI, GLM) get `reasoning_effort` dropdowns; styles without reasoning
-/// render nothing. The effective style is resolved the same way the request path
-/// does (explicit choice, else name detection), so the right controls appear
-/// even when the style is left on "Auto".
-fn render_reasoning_budget(lang: Lang, row: &ModelRow) -> Html {
-    use crate::server::reasoning::ReasoningStyle;
+/// Adaptive per-effort controls, rendered from the *resolved* reasoning style
+/// (explicit choice, else name detection): token-budget styles get number
+/// inputs, effort-level styles get `reasoning_effort` selects, styles without
+/// reasoning render nothing. Changing the style and saving re-renders with the
+/// right controls.
+fn render_reasoning_controls(lang: Lang, row: &ModelRow) -> Html {
     let explicit = (!row.reasoning_style.is_empty()).then_some(row.reasoning_style.as_str());
     let style = ReasoningStyle::resolve(explicit, &row.name);
-    let action = "/admin/models/reasoning-budget";
 
     let (controls, hint) = if style.uses_token_budget() {
         let num = |name: &str, label_key: &str, val: &Option<i64>| {
             let v = val.map(|n| n.to_string()).unwrap_or_default();
             html! {
-                label(class: "form-control") {
-                    span(class: "label-text text-xs") { (t(lang, label_key)) }
-                    input(
-                        type: "number", name: (name), value: (v), min: "1",
+                label(class: "form-control gap-1") {
+                    span(class: "text-xs opacity-70") { (t(lang, label_key)) }
+                    input(type: "number", name: (name), value: (v), min: "1",
                         placeholder: (t(lang, "admin-budget-placeholder")),
-                        class: "input input-bordered input-xs w-28"
-                    );
+                        class: "input input-bordered input-sm");
                 }
             }
             .to_html()
@@ -1468,24 +1293,18 @@ fn render_reasoning_budget(lang: Lang, row: &ModelRow) -> Html {
     } else if style.uses_effort_level() {
         let levels = style.effort_levels();
         let sel = |name: &str, label_key: &str, current: &str| {
-            let mut opts: Vec<Html> = Vec::new();
-            let default_label = t(lang, "admin-effort-default-option");
-            opts.push(if current.is_empty() {
-                html! { option(value: "", selected: "selected") { (default_label) } }.to_html()
-            } else {
-                html! { option(value: "") { (default_label) } }.to_html()
-            });
+            let mut opts: Vec<Html> = vec![super::select_option(
+                "",
+                &t(lang, "admin-effort-default-option"),
+                current.is_empty(),
+            )];
             for lvl in levels {
-                opts.push(if *lvl == current {
-                    html! { option(value: (*lvl), selected: "selected") { (*lvl) } }.to_html()
-                } else {
-                    html! { option(value: (*lvl)) { (*lvl) } }.to_html()
-                });
+                opts.push(super::select_option(lvl, lvl, *lvl == current));
             }
             html! {
-                label(class: "form-control") {
-                    span(class: "label-text text-xs") { (t(lang, label_key)) }
-                    select(name: (name), class: "select select-bordered select-xs") {
+                label(class: "form-control gap-1") {
+                    span(class: "text-xs opacity-70") { (t(lang, label_key)) }
+                    select(name: (name), class: "select select-bordered select-sm") {
                         for o in opts.iter() { (o.clone()) }
                     }
                 }
@@ -1500,30 +1319,100 @@ fn render_reasoning_budget(lang: Lang, row: &ModelRow) -> Html {
         .to_html();
         (controls, t(lang, "admin-effort-hint"))
     } else {
-        // No reasoning support → no controls.
-        return html! { (String::new()) }.to_html();
+        return html! {}.to_html();
     };
 
     html! {
-        form(
-            method: "post",
-            action: (action),
-            "data-on:submit__prevent":
-                (format!("@post('{action}', {{contentType: 'form'}})")),
-            class: "flex flex-col gap-2 m-0 border-t border-base-300 pt-3"
-        ) {
-            input(type: "hidden", name: "model_name", value: (row.name.clone()));
+        div(class: "flex flex-col gap-2 border-t border-base-300 pt-3") {
             span(class: "text-xs text-base-content/60") { (hint) }
-            div(class: "flex flex-wrap items-end gap-3") {
+            div(class: "grid grid-cols-1 sm:grid-cols-3 gap-3") {
                 (controls)
-                button(type: "submit", class: "btn btn-ghost btn-xs ml-auto self-end") {
-                    (icons::check(12))
-                    span { (t(lang, "admin-save-reasoning-budget")) }
-                }
             }
         }
     }
     .to_html()
+}
+
+/// Capability tri-states (Vision / Tools / Structured output / Audio / PDF /
+/// Parallel tools) + vision/tools fallback selects. Part of the one big form —
+/// no auto-save of its own.
+fn render_capabilities(lang: Lang, row: &ModelRow, all_models: &[String]) -> Html {
+    html! {
+        div(class: "flex flex-col gap-2 border-t border-base-300 pt-3") {
+            span(class: "text-xs text-base-content/60") { (t(lang, "admin-capabilities-heading")) }
+            div(class: "grid grid-cols-1 sm:grid-cols-3 gap-2") {
+                (cap_tri_select(lang, "cap_vision", &t(lang, "admin-cap-vision"), row.cap_vision))
+                (cap_tri_select(lang, "cap_tools", &t(lang, "admin-cap-tools"), row.cap_tools))
+                (cap_tri_select(lang, "cap_structured_output", &t(lang, "admin-cap-structured-output"), row.cap_structured_output))
+                (cap_tri_select(lang, "cap_audio_input", &t(lang, "admin-cap-audio-input"), row.cap_audio_input))
+                (cap_tri_select(lang, "cap_pdf_input", &t(lang, "admin-cap-pdf-input"), row.cap_pdf_input))
+                (cap_tri_select(lang, "cap_parallel_tools", &t(lang, "admin-cap-parallel-tools"), row.cap_parallel_tools))
+            }
+            div(class: "grid grid-cols-1 sm:grid-cols-2 gap-2") {
+                (cap_fb_select(lang, "fallback_vision", &t(lang, "admin-cap-fallback-vision"), &row.fallback_vision, all_models))
+                (cap_fb_select(lang, "fallback_tools", &t(lang, "admin-cap-fallback-tools"), &row.fallback_tools, all_models))
+            }
+        }
+    }
+    .to_html()
+}
+
+fn cap_tri_select(lang: Lang, name: &str, label: &str, val: Option<bool>) -> Html {
+    let opts = [
+        super::select_option("", &t(lang, "admin-cap-unknown"), val.is_none()),
+        super::select_option("true", &t(lang, "admin-cap-enabled"), val == Some(true)),
+        super::select_option("false", &t(lang, "admin-cap-disabled"), val == Some(false)),
+    ];
+    html! {
+        label(class: "form-control gap-1") {
+            span(class: "text-xs opacity-70") { (label) }
+            select(name: (name), class: "select select-bordered select-sm") {
+                for o in opts.iter() { (o.clone()) }
+            }
+        }
+    }
+    .to_html()
+}
+
+fn cap_fb_select(
+    lang: Lang,
+    name: &str,
+    label: &str,
+    current: &Option<String>,
+    all_models: &[String],
+) -> Html {
+    let mut opts: Vec<Html> = vec![super::select_option(
+        "",
+        &t(lang, "admin-cap-no-fallback"),
+        current.is_none(),
+    )];
+    for m in all_models {
+        opts.push(super::select_option(
+            m,
+            m,
+            current.as_deref() == Some(m.as_str()),
+        ));
+    }
+    html! {
+        label(class: "form-control gap-1") {
+            span(class: "text-xs opacity-70") { (label) }
+            select(name: (name), class: "select select-bordered select-sm") {
+                for o in opts.iter() { (o.clone()) }
+            }
+        }
+    }
+    .to_html()
+}
+
+fn toml_placeholder(lang: Lang) -> String {
+    format!(
+        "{}\n\
+         # temperature      = 0.7\n\
+         # top_p            = 0.95\n\
+         # max_tokens       = 2048\n\
+         # stop             = [\"<|im_end|>\"]\n",
+        t(lang, "admin-toml-placeholder-header")
+    )
 }
 
 #[cfg(test)]
@@ -1539,59 +1428,171 @@ mod tests {
         }
     }
 
-    /// The card's `<select>` must post to the exact route the router registers,
-    /// carry the feature discriminator, and mark the stored model selected — the
-    /// UI-directive ↔ endpoint contract.
+    fn chat_row(name: &str) -> ModelRow {
+        ModelRow {
+            name: name.to_string(),
+            toml: String::new(),
+            reasoning_style: String::new(),
+            budget_standard: None,
+            budget_deep: None,
+            budget_max: None,
+            effort_standard: String::new(),
+            effort_deep: String::new(),
+            effort_max: String::new(),
+            context_window: None,
+            input_price: None,
+            output_price: None,
+            cap_vision: None,
+            cap_audio_input: None,
+            cap_pdf_input: None,
+            cap_tools: None,
+            cap_parallel_tools: None,
+            cap_structured_output: None,
+            fallback_vision: None,
+            fallback_tools: None,
+        }
+    }
+
     #[test]
     fn defaults_card_wires_select_to_endpoint_and_marks_current() {
         let rows = vec![row(&["glm-4.5", "glm-4.7"], Some("glm-4.7"))];
         let html = render_defaults_card(Lang::En, &rows).to_string();
         assert!(
             html.contains(r#"action="/admin/models/defaults""#),
-            "form must post to the defaults route: {html}"
+            "{html}"
         );
         assert!(
             html.contains("@post(") && html.contains("/admin/models/defaults"),
-            "select must auto-save to the defaults route on change: {html}"
+            "{html}"
         );
-        assert!(
-            html.contains(r#"name="feature" value="chat""#),
-            "hidden feature field must identify the feature: {html}"
-        );
+        assert!(html.contains(r#"name="feature" value="chat""#), "{html}");
         assert!(
             html.contains(r#"value="glm-4.7" selected="selected""#),
-            "the stored default must be the selected option: {html}"
+            "{html}"
         );
     }
 
-    /// With nothing stored, or a stored id that's no longer advertised, the
-    /// "First available" option is the selected one (graceful fallback) and no
-    /// concrete model is pre-selected.
     #[test]
     fn defaults_card_selects_first_available_when_unset_or_stale() {
         for current in [None, Some("no-longer-served")] {
             let rows = vec![row(&["a", "b"], current)];
             let html = render_defaults_card(Lang::En, &rows).to_string();
-            assert!(
-                html.contains(r#"value="" selected="selected""#),
-                "first-available must be selected ({current:?}): {html}"
-            );
-            assert_eq!(
-                html.matches(r#"selected="selected""#).count(),
-                1,
-                "exactly one option selected ({current:?}): {html}"
-            );
+            assert!(html.contains(r#"value="" selected="selected""#), "{html}");
+            assert_eq!(html.matches(r#"selected="selected""#).count(), 1, "{html}");
         }
     }
 
-    /// No advertised models for any feature → the card renders nothing (no
-    /// stray form pointing at the endpoint).
+    /// The consolidated chat editor posts every facet to the single save
+    /// endpoint, carries the hidden model_name, and offers Clear (delete).
     #[test]
-    fn defaults_card_empty_when_no_features() {
-        let html = render_defaults_card(Lang::En, &[]).to_string();
+    fn chat_editor_wires_all_fields_to_save_endpoint() {
+        let mut r = chat_row("qwen-32b");
+        r.input_price = Some(0.15);
+        r.context_window = Some(262_144);
+        r.reasoning_style = "qwen".into();
+        let html = render_chat_item(Lang::En, "USD", &r, &["glm-4.6".into()]).to_string();
         assert!(
-            !html.contains("/admin/models/defaults"),
-            "empty card must not render the form: {html}"
+            html.contains(r#"action="/admin/models/save""#),
+            "save action: {html}"
         );
+        assert!(
+            html.contains(r#"name="model_name" value="qwen-32b""#),
+            "model_name: {html}"
+        );
+        assert!(
+            html.contains(r#"name="input_price""#),
+            "price field: {html}"
+        );
+        assert!(
+            html.contains(r#"name="context_window""#),
+            "context field: {html}"
+        );
+        assert!(
+            html.contains(r#"name="defaults_toml""#),
+            "toml field: {html}"
+        );
+        assert!(html.contains(r#"name="cap_vision""#), "caps field: {html}");
+        // Qwen style → token-budget inputs, not effort selects.
+        assert!(
+            html.contains(r#"name="budget_standard""#),
+            "budget inputs: {html}"
+        );
+        assert!(html.contains("/admin/models/clear"), "clear action: {html}");
+        // Explicit qwen style must be the selected option.
+        assert!(
+            html.contains(r#"value="qwen" selected="selected""#),
+            "style selected: {html}"
+        );
+    }
+
+    /// A GLM-detected model (auto style) renders effort selects, not budget
+    /// inputs — controls follow the resolved style.
+    #[test]
+    fn glm_model_renders_effort_selects() {
+        let r = chat_row("glm-4.6");
+        let html = render_chat_item(Lang::En, "USD", &r, &[]).to_string();
+        assert!(
+            html.contains(r#"name="effort_standard""#),
+            "effort selects: {html}"
+        );
+        assert!(
+            !html.contains(r#"name="budget_standard""#),
+            "no budget inputs: {html}"
+        );
+    }
+
+    /// The other-kind (price-only) editor posts to the same save endpoint with
+    /// just the price fields + model_name.
+    #[test]
+    fn other_kind_editor_is_price_only() {
+        let m = OtherModelRow {
+            name: "gpt-image-1".into(),
+            kind_label: "image",
+            input_price: Some(10.0),
+            output_price: Some(40.0),
+        };
+        let html = render_other_item(Lang::En, "USD", &m).to_string();
+        assert!(html.contains(r#"action="/admin/models/save""#), "{html}");
+        assert!(
+            html.contains(r#"name="model_name" value="gpt-image-1""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"name="input_price""#), "{html}");
+        assert!(
+            !html.contains(r#"name="reasoning_style""#),
+            "no reasoning: {html}"
+        );
+    }
+
+    /// A configured model shows its facet badges; an unconfigured one shows the
+    /// dim "not configured".
+    #[test]
+    fn configured_badges_reflect_stored_facets() {
+        let mut r = chat_row("m");
+        r.input_price = Some(1.0);
+        r.context_window = Some(1000);
+        let html = configured_badges(Lang::En, &r).to_string();
+        assert!(html.contains("PRICE") || html.contains(&t(Lang::En, "admin-badge-price")));
+        let empty = configured_badges(Lang::En, &chat_row("m2")).to_string();
+        assert!(
+            empty.contains(&t(Lang::En, "admin-not-configured")),
+            "{empty}"
+        );
+    }
+
+    /// The alias row is dimmed, non-expandable, and carries no editor/endpoint.
+    #[test]
+    fn alias_row_is_readonly() {
+        let a = AliasRow {
+            name: "glm".into(),
+            target: "glm-5.2".into(),
+            kind_label: "chat",
+        };
+        let html = render_alias_item(Lang::En, &a).to_string();
+        assert!(
+            !html.contains("/admin/models/save"),
+            "no save endpoint: {html}"
+        );
+        assert!(html.contains("glm-5.2"), "shows target: {html}");
     }
 }

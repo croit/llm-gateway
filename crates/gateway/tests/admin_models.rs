@@ -6,9 +6,10 @@
 //! What this pins:
 //!   - GET requires the `admin` role (anon → /login redirect,
 //!     logged-in-but-not-admin → 403).
-//!   - POST is gated the same way.
+//!   - The consolidated `POST /admin/models/save` is gated the same way.
 //!   - A valid TOML save round-trips into the DB so subsequent
 //!     /v1/chat/completions calls see the merged defaults.
+//!   - `POST /admin/models/clear` deletes the stored overrides row.
 
 mod common;
 
@@ -96,8 +97,8 @@ async fn admin_get_renders_page() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = String::from_utf8(common::read_body(resp).await.to_vec()).unwrap();
-    assert!(body.contains("Model defaults"), "page heading missing");
-    // The seeded pool advertises `model-a`, so we expect a card.
+    assert!(body.contains("Models"), "page heading missing");
+    // The seeded pool advertises `model-a`, so we expect a row.
     assert!(body.contains("model-a"), "model-a not listed: {body}");
 }
 
@@ -110,7 +111,7 @@ async fn non_admin_save_is_403() {
     let resp = app
         .serve(req_with_cookie(
             Method::POST,
-            "/admin/models",
+            "/admin/models/save",
             &cookie,
             Some("model_name=model-a&defaults_toml=temperature%20%3D%200.7"),
         ))
@@ -181,7 +182,7 @@ async fn save_then_get_renders_saved_toml_for_slashed_model() {
     let app = common::app(state);
 
     // POST the form using the URL-encoded model name in the path.
-    let post_uri = "/admin/models";
+    let post_uri = "/admin/models/save";
     let post_body =
         "model_name=Qwen%2FQwen3.6-27B-FP8&defaults_toml=temperature+%3D+0.7%0Atop_p+%3D+0.95";
     let resp = app
@@ -232,7 +233,7 @@ async fn admin_save_round_trips_to_db() {
     let resp = app
         .serve(req_with_cookie(
             Method::POST,
-            "/admin/models",
+            "/admin/models/save",
             &cookie,
             Some(body),
         ))
@@ -260,7 +261,7 @@ async fn admin_save_with_broken_toml_doesnt_persist() {
     let resp = app
         .serve(req_with_cookie(
             Method::POST,
-            "/admin/models",
+            "/admin/models/save",
             &cookie,
             Some(body),
         ))
@@ -272,7 +273,9 @@ async fn admin_save_with_broken_toml_doesnt_persist() {
 }
 
 #[tokio::test]
-async fn admin_save_empty_toml_clears_row() {
+async fn admin_clear_deletes_row() {
+    // "Clear all overrides" (`POST /admin/models/clear`) removes the stored
+    // row entirely — the model returns to the backend's built-in behaviour.
     let state = common::state_with_admin_rbac("http://unused.invalid").await;
     let cookie = seed_admin(&state, "root").await;
     db_defaults::upsert(&state.db, "model-a", "temperature = 0.7")
@@ -283,12 +286,39 @@ async fn admin_save_empty_toml_clears_row() {
     let resp = app
         .serve(req_with_cookie(
             Method::POST,
-            "/admin/models",
+            "/admin/models/clear",
             &cookie,
-            Some("model_name=model-a&defaults_toml="),
+            Some("model_name=model-a"),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(db_defaults::get(&db, "model-a").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn admin_save_empty_toml_keeps_row_with_prices() {
+    // Unlike "Clear", saving with an empty TOML but a price set persists a
+    // row (empty sampling defaults, priced) — the consolidated save writes all
+    // facets, it doesn't treat a blank textarea as "delete".
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "root").await;
+    let db = state.db.clone();
+    let app = common::app(state);
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/admin/models/save",
+            &cookie,
+            Some("model_name=model-a&defaults_toml=&input_price=1.5"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let row = db_defaults::get(&db, "model-a")
+        .await
+        .unwrap()
+        .expect("row persisted");
+    assert_eq!(row.input_price, Some(1.5));
+    assert_eq!(row.defaults_toml, "");
 }

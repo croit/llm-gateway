@@ -68,13 +68,11 @@ enum NavItem {
     /// The sidebar entry is only rendered for users whose `roles`
     /// includes `"admin"`; non-admins never see it.
     Admin,
-    /// Admin-only upstream backends status page (`/admin/backends`).
-    /// Same `admin`-role gate as [`NavItem::Admin`]; its own variant so
-    /// the sidebar highlight lands on it rather than on Models.
-    Backends,
-    /// Admin-only upstream pools CRUD page (`/admin/pools`). Same
-    /// `admin`-role gate; its own variant for the sidebar highlight.
-    Pools,
+    /// Admin-only merged upstream pools + backends page (`/admin/upstreams`).
+    /// Same `admin`-role gate as [`NavItem::Admin`]; its own variant so the
+    /// sidebar highlight lands on it rather than on Models. Replaced the old
+    /// separate Backends + Pools entries.
+    Upstreams,
     /// Admin-only RAG collection management page (`/rag`).
     Rag,
     /// Admin-only registered-users roster + impersonation (`/admin/users`).
@@ -166,30 +164,6 @@ pub(super) fn bool_checkbox(
         }
         .to_html()
     }
-}
-
-/// A datastar-submitting delete form for one CRUD row: a hidden `name` field
-/// plus a small ghost/error button, posting to `action`. Shared by the admin
-/// backends/pools editors, which otherwise duplicate this markup verbatim.
-pub(super) fn render_delete_form(action: &str, name: &str, label: &str) -> plait::Html {
-    use plait::{ToHtml, html};
-    let post = format!("@post('{action}', {{contentType: 'form'}})");
-    let action = action.to_string();
-    let name = name.to_string();
-    let label = label.to_string();
-    html! {
-        form(
-            method: "post", action: (action), "data-on:submit__prevent": (post),
-            class: "flex justify-end m-0"
-        ) {
-            input(type: "hidden", name: "name", value: (name));
-            button(type: "submit", class: "btn btn-ghost btn-xs text-error") {
-                (icons::trash(12))
-                span { (label) }
-            }
-        }
-    }
-    .to_html()
 }
 
 /// Render a `name` text input (the primary key of a CRUD row): read-only when
@@ -290,6 +264,15 @@ pub(super) fn toast(kind: FlashKind, message: impl Into<String>) -> Response {
         kind,
         message: message.into(),
     })])
+}
+
+/// A datastar `datastar-patch-signals` event that sets the `topologyDirty`
+/// signal to `count`. The `/admin/upstreams` apply bar binds its visibility +
+/// counter to this signal, so a pool/backend save or delete (and the reload
+/// that clears it) updates the bar in place — no full page re-render. Shared by
+/// the pools/backends save+delete handlers and the reload handler.
+pub(super) fn dirty_signal(count: u32) -> rama::bytes::Bytes {
+    session_core::chrome::sse_signals(&format!("{{topologyDirty: {count}}}"))
 }
 
 /// Read a request body and parse it as a urlencoded form. A
@@ -404,9 +387,8 @@ fn render_app_sidebar(
                 if is_admin {
                     (nav_group(lang, "admin", &t(lang, "nav-group-admin"), html! {
                         (sidebar_nav_link("/admin/users", NavItem::Users, active, icons::users(16), &t(lang, "nav-users")))
+                        (sidebar_nav_link("/admin/upstreams", NavItem::Upstreams, active, icons::cube(16), &t(lang, "nav-upstreams")))
                         (sidebar_nav_link("/admin/models", NavItem::Admin, active, icons::cpu(16), &t(lang, "nav-models")))
-                        (sidebar_nav_link("/admin/backends", NavItem::Backends, active, icons::cube(16), &t(lang, "nav-backends")))
-                        (sidebar_nav_link("/admin/pools", NavItem::Pools, active, icons::sliders(16), &t(lang, "nav-pools")))
                         (sidebar_nav_link("/rag", NavItem::Rag, active, icons::database(16), &t(lang, "nav-rag")))
                         (sidebar_nav_link("/admin/skills", NavItem::Skills, active, icons::sparkles(16), &t(lang, "nav-skills")))
                         (sidebar_nav_link("/admin/connectors", NavItem::Connectors, active, icons::plug(16), &t(lang, "nav-connectors")))
@@ -1300,28 +1282,33 @@ pub use connectors::{
 // sidebar entry either.
 mod admin;
 pub use admin::{
-    models_capabilities_save as admin_models_capabilities_save,
-    models_context_window_save as admin_models_context_window_save,
-    models_defaults_save as admin_models_defaults_save, models_index as admin_models_index,
-    models_pricing_save as admin_models_pricing_save,
-    models_reasoning_budget_save as admin_models_reasoning_budget_save,
-    models_reasoning_save as admin_models_reasoning_save, models_save as admin_models_save,
+    models_clear as admin_models_clear, models_defaults_save as admin_models_defaults_save,
+    models_index as admin_models_index, models_save as admin_models_save,
     upstreams_reload as admin_upstreams_reload,
 };
 
-// Admin upstream-backends status page (`/admin/backends`). Read-only;
-// same `admin`-role gate as the model-defaults page.
-mod backends;
-pub use backends::{
-    backends_delete as admin_backends_delete, backends_index as admin_backends_index,
-    backends_save as admin_backends_save,
+// Merged upstream pools + backends page (`/admin/upstreams`). The GET page
+// lives here; the old `/admin/pools` + `/admin/backends` GET routes 302 here.
+// Same `admin`-role gate as the model-defaults page.
+mod upstreams;
+pub use upstreams::{
+    backends_redirect as admin_backends_redirect, pools_redirect as admin_pools_redirect,
+    upstreams_index as admin_upstreams_index,
 };
 
-// Admin upstream-pools CRUD page (`/admin/pools`). Same `admin`-role gate.
+// Backend CRUD write handlers (paths `/admin/backends/*`, unchanged); the page
+// they back is now `/admin/upstreams`. Same `admin`-role gate.
+mod backends;
+pub use backends::{
+    backends_delete as admin_backends_delete, backends_save as admin_backends_save,
+};
+
+// Pool CRUD write handlers (paths `/admin/pools/*`, unchanged); the page they
+// back is now `/admin/upstreams`. Same `admin`-role gate.
 mod pools;
 pub use pools::{
     pools_delete as admin_pools_delete, pools_fallback_save as admin_pools_fallback_save,
-    pools_index as admin_pools_index, pools_save as admin_pools_save,
+    pools_save as admin_pools_save,
 };
 
 // Admin rate-limit / quota editor (`/admin/limits`). Same admin gate.

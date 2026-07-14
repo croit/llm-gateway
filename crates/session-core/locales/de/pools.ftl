@@ -5,7 +5,7 @@ pools-heading = Upstream-Pools
 pools-description = Backends nach Art und Auswahlstrategie in Pools gruppieren. Änderungen werden in der Datenbank gespeichert, werden aber erst wirksam, wenn Sie auf „Änderungen anwenden“ klicken.
 
 pools-fallbacks-heading = Fallbacks für unbekannte Modelle
-pools-fallbacks-description = Wenn eine Anfrage ein Modell benennt, das das Gateway nie kennengelernt hat, wird dieses Modell für diese Art ersetzt. Leer = der Fehltreffer gibt 404 zurück.
+pools-fallbacks-description = Ersatz, wenn eine Anfrage ein Modell benennt, das kein Pool bereitstellt (anders als der Feature-Standard auf der Modelle-Seite, der greift, wenn eine Anfrage gar kein Modell nennt). Leer = der Fehltreffer gibt 404 zurück.
 
 pools-add-heading = Pool hinzufügen
 pools-field-name = Name
@@ -13,7 +13,8 @@ pools-field-kind = Art
 pools-field-strategy = Strategie
 pools-field-fallback-offline = Offline-Fallback-Modell
 pools-field-fallback-offline-placeholder = wird ausgeliefert, wenn jedes Backend ausgefallen ist
-pools-field-models = Modelle (kommagetrennt)
+pools-field-models = Bereitgestellte Modelle (Positivliste, kommagetrennt)
+pools-field-models-hint = Wenn gesetzt, werden von einem Backend mit /models-Probe nur diese IDs bereitgestellt — der Rest wird durchgestrichen angezeigt. Leer = alles bereitstellen, was das Backend meldet.
 pools-field-voices = Stimmen (lang=voice pro Zeile)
 pools-field-backends = Backends
 pools-no-backends = Noch keine Backends definiert. Fügen Sie zuerst eines auf der Seite „Backends“ hinzu.

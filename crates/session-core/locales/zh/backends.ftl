@@ -38,6 +38,9 @@ backends-field-api-key-env = API 密钥环境变量
 backends-field-health-path = 健康检查路径
 backends-field-weight = 权重
 backends-field-max-inflight = 最大处理中数
+backends-field-pool = 池
+backends-field-pool-none = （无）
+backends-field-pool-hint = 将此后端分配到一个池。位于多个池中的后端会被收敛到此处所选的池。
 backends-field-models = 模型（逗号分隔）
 backends-field-aliases = 别名（每行 name=target）
 backends-field-probe-models = 通过 /models 探测发现模型

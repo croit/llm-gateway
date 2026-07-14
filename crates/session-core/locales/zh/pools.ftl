@@ -13,7 +13,8 @@ pools-field-kind = 类型
 pools-field-strategy = 策略
 pools-field-fallback-offline = 离线回退模型
 pools-field-fallback-offline-placeholder = 当所有后端都离线时提供服务
-pools-field-models = 模型（逗号分隔）
+pools-field-models = 提供的模型（白名单，逗号分隔）
+pools-field-models-hint = 设置后，对于启用 /models 探测的后端仅提供这些 id，其余以划线显示。留空 = 提供后端报告的所有模型。
 pools-field-voices = 语音（每行 lang=voice）
 pools-field-backends = 后端
 pools-no-backends = 尚未定义任何后端。请先在“后端”页面添加一个。
