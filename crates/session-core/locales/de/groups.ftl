@@ -1,0 +1,16 @@
+groups-heading = Gateway-Gruppen
+groups-intro = OIDC-Claim-Werte auf saubere, IdP-unabhängige Gruppennamen abbilden und festlegen, was jede Gruppe gewährt. Pools, RAG-Collections und MCP-Connectoren verweisen per Name auf diese Gruppen, um den Zugriff einzuschränken.
+groups-new-heading = Neue Gruppe
+groups-existing-heading = Gruppen
+groups-empty = Noch keine Gruppen. Oben eine anlegen.
+groups-field-name = Name
+groups-field-description = Beschreibung
+groups-field-admin = Admin (gewährt /admin-Zugriff)
+groups-field-default = Standard (gilt für jeden angemeldeten Nutzer)
+groups-field-oidc = OIDC-Gruppenwerte
+groups-field-oidc-help = Kommagetrennte rohe Claim-Werte aus deinem IdP (z. B. Entra-Objekt-GUIDs, LDAP-DNs oder einfache Gruppennamen). Jeder davon ordnet einen Nutzer dieser Gruppe zu.
+groups-field-tools = Tools
+groups-field-skills = Skills
+groups-save = Speichern
+groups-delete = Löschen
+groups-error-name-required = Ein Gruppenname ist erforderlich.

@@ -389,6 +389,7 @@ async fn transcription_models_lists_discovered_models() {
         "voice".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,
@@ -473,6 +474,7 @@ async fn session_transcribe_forwards_multipart_to_upstream() {
         "voice".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,
@@ -602,6 +604,7 @@ async fn session_transcribe_rejects_too_short_audio() {
         "voice".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,

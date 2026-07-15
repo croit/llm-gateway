@@ -217,12 +217,14 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
     // disclosure — the tools themselves stay out of the request until the
     // model, or the user via the composer, enables the connector).
     let mcp_role_ids = d.state.role_ids_for(&d.tool_ctx.roles);
+    let mcp_is_admin = d.state.rbac.is_admin(&mcp_role_ids);
     let user_mcp = d
         .state
         .mcp
         .layer_for_user(
             &d.tool_ctx.user_id,
             &mcp_role_ids,
+            mcp_is_admin,
             crate::server::tools::mcp::manager::AskContext::Chat,
         )
         .await;
@@ -238,10 +240,17 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
     // inherits the target's, exactly like cost accounting, which meters the
     // resolved id. Falls through to the requested name when it isn't an alias
     // (or isn't currently served — `route` below then maps the error).
+    // Gate model resolution + routing to pools the signed-in user's groups
+    // permit, so a chat conversation can't route to a restricted pool.
+    let access = d.state.pool_access_for(&d.tool_ctx.roles);
     let real_model = d
         .state
         .upstreams
-        .resolve_model(&ctx.model, crate::server::upstreams::PoolKind::Chat)
+        .resolve_model_for(
+            &ctx.model,
+            crate::server::upstreams::PoolKind::Chat,
+            &access,
+        )
         .unwrap_or_else(|| ctx.model.clone());
 
     // The conversation's effort level ("Denkaufwand") and the selected model's
@@ -450,7 +459,11 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         let acquired = d
             .state
             .upstreams
-            .route(&real_model, crate::server::upstreams::PoolKind::Chat)
+            .route_access(
+                &real_model,
+                crate::server::upstreams::PoolKind::Chat,
+                &access,
+            )
             .map_err(upstream_err)?;
         let backend = acquired.backend();
         let backend_name = backend.name.clone();

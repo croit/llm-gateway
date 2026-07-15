@@ -51,3 +51,5 @@ impersonation-return-button = Вернуться в свой аккаунт
 
 error-internal-heading = Внутренняя ошибка
 error-forbidden-heading = Доступ запрещён
+
+nav-groups = Группы

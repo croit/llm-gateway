@@ -53,6 +53,14 @@ pub struct Config {
     pub upstream_pools: HashMap<String, UpstreamPoolConfig>,
     pub oidc: Option<OidcConfig>,
     pub gateway: GatewayConfig,
+    /// Legacy RBAC config. As of the gateway-groups migration this is a
+    /// **seed-only** mechanism: on first boot (when the `gateway_groups` table
+    /// is empty) `[rbac]` + `[[roles]]` are imported once into the DB, after
+    /// which `/admin/groups` owns everything and this block is ignored. Kept so
+    /// existing config-driven deployments upgrade in place; new deployments can
+    /// leave it out and manage groups entirely in the UI. The only RBAC bits
+    /// that still live in the config are the OIDC provider setup and
+    /// `[gateway].bootstrap_admin_groups`.
     #[serde(default)]
     pub rbac: RbacConfig,
     #[serde(default, rename = "roles")]
@@ -554,6 +562,16 @@ pub struct GatewayConfig {
     /// nobody is trapped mid-session if the flag is flipped at runtime.
     #[serde(default)]
     pub allow_impersonation: bool,
+    /// Break-glass admin: raw OIDC claim values (group names) that ALWAYS
+    /// resolve to admin, regardless of the DB group tables. This is the one
+    /// RBAC decision that intentionally still matches raw OIDC claims rather
+    /// than a gateway group — the anti-lockout anchor. Gateway groups (incl.
+    /// which ones are admin) are managed in `/admin/groups`, but if that
+    /// mapping is misconfigured you could otherwise lock yourself out of the
+    /// very UI that fixes it. List at least one trusted group here so an
+    /// operator can always get in. Empty by default.
+    #[serde(default)]
+    pub bootstrap_admin_groups: Vec<String>,
 }
 
 impl Default for GatewayConfig {
@@ -563,6 +581,7 @@ impl Default for GatewayConfig {
             token_ttl_days: 90,
             session_key_env: "GATEWAY_SESSION_KEY".into(),
             allow_impersonation: false,
+            bootstrap_admin_groups: Vec::new(),
         }
     }
 }

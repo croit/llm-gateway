@@ -913,6 +913,10 @@ struct UpdateForm {
     exclude_globs: Option<String>,
     chunk_size: Option<i64>,
     chunk_overlap: Option<i64>,
+    /// Comma-separated gateway groups allowed to list + search this collection.
+    /// Empty = unrestricted. See `db::gateway_groups`.
+    #[serde(default)]
+    allowed_groups: Option<String>,
 }
 
 /// POST /rag/{id}/update — save the edited form. Patches the row back
@@ -1036,6 +1040,12 @@ pub async fn rag_update(
     .await;
     if let Err(err) = res {
         tracing::warn!(error = %err, %id, "update rag collection");
+        return toast(FlashKind::Error, t(lang, "rag-toast-save-failed"));
+    }
+    // Per-group access list (comma-separated gateway groups; empty = all).
+    let allowed_groups = super::parse_csv(form.allowed_groups.as_deref().unwrap_or(""));
+    if let Err(err) = rag_db::set_allowed_groups(&state.db, id, &allowed_groups).await {
+        tracing::warn!(error = %err, %id, "update rag allowed_groups");
         return toast(FlashKind::Error, t(lang, "rag-toast-save-failed"));
     }
     let updated = match rag_db::find_collection_by_id(&state.db, id).await {
@@ -1849,6 +1859,17 @@ fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[Stri
                             );
                         }
                     }
+                    label(class: "flex flex-col gap-1 w-full") {
+                        div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-allowed-groups")) } }
+                        input(
+                            name: "allowed_groups",
+                            type: "text",
+                            value: (c.allowed_groups.join(", ")),
+                            placeholder: "developers, network_admin",
+                            class: "input input-bordered w-full font-mono"
+                        );
+                        div(class: "label") { span(class: "label-text-alt text-base-content/60") { (t(lang, "rag-hint-allowed-groups")) } }
+                    }
                     div(class: "card-actions justify-end mt-2 gap-2") {
                         form(
                             action: (cancel_action.clone()),
@@ -2013,6 +2034,7 @@ mod tests {
             chunk_overlap: 100,
             search_mode: rag_db::SearchMode::Versioned,
             status: rag_db::CollectionStatus::Ready,
+            allowed_groups: Vec::new(),
             last_indexed_at: None,
             last_indexed_commit: None,
             last_error: None,

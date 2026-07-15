@@ -24,11 +24,24 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
+use std::sync::Arc;
+
 use super::{Tool, ToolContext, ToolError, ToolFuture};
 use crate::server::db::rag as rag_db;
 use crate::server::rag::worker;
+use crate::server::rbac::Resolver;
 
-pub struct RagListCollections;
+/// Holds the RBAC resolver so it can filter collections to the ones the
+/// caller's gateway groups permit (per-collection `allowed_groups`).
+pub struct RagListCollections {
+    rbac: Arc<Resolver>,
+}
+
+impl RagListCollections {
+    pub fn new(rbac: Arc<Resolver>) -> Self {
+        Self { rbac }
+    }
+}
 
 impl Tool for RagListCollections {
     fn id(&self) -> &str {
@@ -57,9 +70,15 @@ impl Tool for RagListCollections {
                 .indexer
                 .as_ref()
                 .ok_or_else(|| ToolError::Failed("RAG is not configured on this gateway".into()))?;
-            let cols = rag_db::list_collections(indexer.db())
+            let mut cols = rag_db::list_collections(indexer.db())
                 .await
                 .map_err(|e| ToolError::Failed(format!("listing collections: {e}")))?;
+            // Per-group access: hide collections this caller's gateway groups
+            // don't permit. Empty `allowed_groups` = visible to all; admins see
+            // everything. A hidden collection is also unsearchable by name (see
+            // `RagSearch::run`), so this is a real capability filter.
+            let role_ids = self.rbac.role_ids_for(&ctx.roles);
+            cols.retain(|c| self.rbac.resource_allowed(&role_ids, &c.allowed_groups));
             let mut items: Vec<Value> = Vec::new();
             for c in &cols {
                 let refs = rag_db::list_refs(indexer.db(), c.id)
@@ -123,7 +142,15 @@ impl Tool for RagListCollections {
     }
 }
 
-pub struct RagSearch;
+pub struct RagSearch {
+    rbac: Arc<Resolver>,
+}
+
+impl RagSearch {
+    pub fn new(rbac: Arc<Resolver>) -> Self {
+        Self { rbac }
+    }
+}
 
 #[derive(Deserialize)]
 struct SearchArgs {
@@ -219,6 +246,13 @@ impl Tool for RagSearch {
             let collection = rag_db::find_collection_by_name(indexer.db(), &args.collection)
                 .await
                 .map_err(|e| ToolError::Failed(format!("looking up collection: {e}")))?
+                // A collection the caller's groups don't permit is reported as
+                // "not found" — identical to a nonexistent one, so a restricted
+                // collection can't be probed for existence or searched by name.
+                .filter(|c| {
+                    let role_ids = self.rbac.role_ids_for(&ctx.roles);
+                    self.rbac.resource_allowed(&role_ids, &c.allowed_groups)
+                })
                 .ok_or_else(|| {
                     ToolError::Failed(format!(
                         "no RAG collection named `{}` — call rag_list_collections to discover \
@@ -392,6 +426,7 @@ mod tests {
             "embed".to_string(),
             UpstreamPoolConfig {
                 voices: Default::default(),
+                allowed_groups: Vec::new(),
                 compliance: Default::default(),
                 enforce_limits: true,
                 kind: PoolKind::Embedding,
@@ -485,10 +520,11 @@ mod tests {
         .await
         .unwrap();
         // A collection with no searchable ref is not advertised.
-        let out = RagListCollections
-            .run(ctx_with(indexer.clone()), json!({}))
-            .await
-            .unwrap();
+        let out =
+            RagListCollections::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
+                .run(ctx_with(indexer.clone()), json!({}))
+                .await
+                .unwrap();
         assert!(out["collections"].as_array().unwrap().is_empty());
 
         // Add a ref and bring it to ready → now listed with its refs.
@@ -502,10 +538,11 @@ mod tests {
             .await
             .unwrap();
 
-        let out = RagListCollections
-            .run(ctx_with(indexer), json!({}))
-            .await
-            .unwrap();
+        let out =
+            RagListCollections::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
+                .run(ctx_with(indexer), json!({}))
+                .await
+                .unwrap();
         let cs = out["collections"].as_array().unwrap();
         assert_eq!(cs.len(), 1);
         assert_eq!(cs[0]["name"], "demo");
@@ -566,10 +603,11 @@ mod tests {
             }
         }
 
-        let out = RagListCollections
-            .run(ctx_with(indexer), json!({}))
-            .await
-            .unwrap();
+        let out =
+            RagListCollections::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
+                .run(ctx_with(indexer), json!({}))
+                .await
+                .unwrap();
         let cs = out["collections"].as_array().unwrap();
         assert_eq!(cs.len(), 1);
         assert_eq!(cs[0]["mode"], "aggregate");
@@ -589,10 +627,11 @@ mod tests {
     #[tokio::test]
     async fn list_collections_without_indexer_is_clear_error() {
         let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
-        let err = RagListCollections
-            .run(ctx_without_indexer(pool), json!({}))
-            .await
-            .unwrap_err();
+        let err =
+            RagListCollections::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
+                .run(ctx_without_indexer(pool), json!({}))
+                .await
+                .unwrap_err();
         match err {
             ToolError::Failed(msg) => assert!(msg.contains("RAG is not configured")),
             other => panic!("expected Failed, got {other:?}"),
@@ -695,7 +734,7 @@ mod tests {
             .unwrap();
         assert!(!raw.is_empty(), "lower layer returned no hits");
 
-        let out = RagSearch
+        let out = RagSearch::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
             .run(
                 ctx_with(indexer),
                 json!({ "query": "alpha please", "collection": "code", "top_k": 3 }),
@@ -799,7 +838,7 @@ mod tests {
 
         // ONE query over the unified index — `alpha` ranks the pve-manager
         // chunk first, and the hit path is prefixed with its source repo.
-        let out = RagSearch
+        let out = RagSearch::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
             .run(
                 ctx_with(indexer),
                 json!({ "query": "alpha please", "collection": "proxmox", "top_k": 5 }),
@@ -848,7 +887,7 @@ mod tests {
         rag_db::add_ref(&pool, c.id, "main", None, true)
             .await
             .unwrap();
-        let err = RagSearch
+        let err = RagSearch::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
             .run(
                 ctx_with(indexer),
                 json!({"query": "x", "collection": "still-pending"}),
@@ -877,7 +916,7 @@ mod tests {
                 ..IndexerConfig::default()
             },
         );
-        let err = RagSearch
+        let err = RagSearch::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
             .run(
                 ctx_with(indexer),
                 json!({"query": "x", "collection": "no-such-thing"}),
@@ -893,9 +932,19 @@ mod tests {
     #[test]
     fn schema_ids_match() {
         assert_eq!(
-            RagListCollections.id(),
-            RagListCollections.schema().function.name
+            RagListCollections::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
+                .id(),
+            RagListCollections::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
+                .schema()
+                .function
+                .name
         );
-        assert_eq!(RagSearch.id(), RagSearch.schema().function.name);
+        assert_eq!(
+            RagSearch::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty())).id(),
+            RagSearch::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
+                .schema()
+                .function
+                .name
+        );
     }
 }

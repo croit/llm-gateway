@@ -115,6 +115,11 @@ pub struct Collection {
     /// How `rag_search` resolves a ref-less query. See [`SearchMode`].
     pub search_mode: SearchMode,
     pub status: CollectionStatus,
+    /// Gateway-group names allowed to list + search this collection. Empty =
+    /// unrestricted (every user with the RAG tools). Managed on the `/rag` edit
+    /// form. See `migrations/0046_rag_allowed_groups.sql` and
+    /// `Resolver::resource_allowed`.
+    pub allowed_groups: Vec<String>,
     pub last_indexed_at: Option<Timestamp>,
     pub last_indexed_commit: Option<String>,
     pub last_error: Option<String>,
@@ -180,6 +185,13 @@ fn map_collection_row(row: &SqliteRow) -> Result<Collection, DbError> {
         chunk_overlap: row.try_get("chunk_overlap")?,
         search_mode: SearchMode::from_db(&search_mode_s),
         status: CollectionStatus::from_db(&status_s),
+        allowed_groups: {
+            let json: String = row.try_get("allowed_groups")?;
+            serde_json::from_str(&json).map_err(|e| DbError::Decode {
+                column: "allowed_groups",
+                source: anyhow::Error::from(e),
+            })?
+        },
         last_indexed_at,
         last_indexed_commit: row.try_get("last_indexed_commit")?,
         last_error: row.try_get("last_error")?,
@@ -190,7 +202,8 @@ fn map_collection_row(row: &SqliteRow) -> Result<Collection, DbError> {
 
 const COLLECTION_COLUMNS: &str = "id, data_uuid, name, description, git_url, git_ref, pat, \
      embedding_model, include_globs_json, exclude_globs_json, chunk_size, chunk_overlap, \
-     search_mode, status, last_indexed_at, last_indexed_commit, last_error, created_at, updated_at";
+     search_mode, status, allowed_groups, last_indexed_at, last_indexed_commit, last_error, \
+     created_at, updated_at";
 
 pub async fn create_collection(pool: &Pool, new: &NewCollection) -> Result<Collection, DbError> {
     let now = Timestamp::now();
@@ -325,6 +338,25 @@ pub async fn request_reindex(pool: &Pool, id: i64) -> Result<(), DbError> {
     .bind(id)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Replace a collection's gateway-group access list (empty = unrestricted).
+/// Set from the `/rag` edit form. Group names are stored verbatim as a JSON
+/// array; the resolver treats a name no user holds as "no access", so a stale
+/// name for a deleted group just stops granting access.
+pub async fn set_allowed_groups(pool: &Pool, id: i64, groups: &[String]) -> Result<(), DbError> {
+    let json = serde_json::to_string(groups).map_err(|e| DbError::Decode {
+        column: "allowed_groups",
+        source: e.into(),
+    })?;
+    let now = Timestamp::now().to_string();
+    sqlx::query("UPDATE rag_collections SET allowed_groups = ?, updated_at = ? WHERE id = ?")
+        .bind(&json)
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

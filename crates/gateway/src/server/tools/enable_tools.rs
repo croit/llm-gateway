@@ -455,7 +455,13 @@ mod tests {
         // default one-liner, so the model couldn't tell it could search the
         // indexed codebase/docs.
         use crate::server::tools::rag::{RagListCollections, RagSearch};
-        let reg = ToolRegistry::new().with(RagListCollections).with(RagSearch);
+        let reg = ToolRegistry::new()
+            .with(RagListCollections::new(std::sync::Arc::new(
+                crate::server::rbac::Resolver::empty(),
+            )))
+            .with(RagSearch::new(std::sync::Arc::new(
+                crate::server::rbac::Resolver::empty(),
+            )));
         let et = EnableTools::from_registry(&reg);
         let rag = et
             .catalog

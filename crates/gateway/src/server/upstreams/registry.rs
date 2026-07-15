@@ -390,8 +390,46 @@ pub struct Pool {
     /// (every replica down). `UpstreamRegistry::route` re-resolves the request
     /// to this instead of returning `503`. See [`UpstreamPoolConfig::fallback_offline`].
     fallback_offline: Option<String>,
+    /// Gateway-group names allowed to see + route to this pool. Empty =
+    /// unrestricted (every user). See [`PoolAccess`] and
+    /// [`crate::server::rbac::Resolver::resource_allowed`].
+    pub allowed_groups: Vec<String>,
     /// Cursor for round-robin.
     rr_cursor: AtomicUsize,
+}
+
+/// A resolved caller's pool-access decision, built once per request from the
+/// RBAC resolver and threaded into the group-aware listing/routing methods.
+/// Encapsulates the opt-in + admin-bypass rule so the registry needs no
+/// dependency on `rbac`.
+#[derive(Debug, Clone, Default)]
+pub struct PoolAccess {
+    /// The caller's resolved gateway-group ids (`Resolver::role_ids_for`).
+    pub role_ids: Vec<String>,
+    /// True to bypass every restriction (`Resolver::is_admin`).
+    pub is_admin: bool,
+}
+
+impl PoolAccess {
+    /// Full access — used by internal callers that must see the whole topology
+    /// (health probes, admin topology views, non-user-facing resolution).
+    pub fn all() -> Self {
+        Self {
+            role_ids: Vec::new(),
+            is_admin: true,
+        }
+    }
+
+    /// Whether the caller may see/route to `pool`: unrestricted pools are open
+    /// to all; admins bypass; otherwise the caller must hold a listed group.
+    pub fn allows(&self, pool: &Pool) -> bool {
+        if self.is_admin || pool.allowed_groups.is_empty() {
+            return true;
+        }
+        pool.allowed_groups
+            .iter()
+            .any(|g| self.role_ids.iter().any(|r| r == g))
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -419,6 +457,7 @@ impl Pool {
             voices: cfg.voices.clone(),
             configured_models: cfg.models.clone(),
             fallback_offline: cfg.fallback_offline.clone(),
+            allowed_groups: cfg.allowed_groups.clone(),
             rr_cursor: AtomicUsize::new(0),
         }
     }
@@ -847,6 +886,28 @@ impl UpstreamRegistry {
         self.collect_models(|_| true)
     }
 
+    /// Like [`Self::all_models`], but only over pools `access` permits — the
+    /// per-user `GET /v1/models`. A model withheld here is also unroutable for
+    /// the same caller (see [`Self::route_for`]), so the list can't be bypassed.
+    pub fn all_models_for(&self, access: &PoolAccess) -> Vec<String> {
+        self.collect_models(|p| access.allows(p))
+    }
+
+    /// Like [`Self::models_for_kind`], but only over pools `access` permits —
+    /// the per-user chat / transcription / speech model dropdowns.
+    pub fn models_for_kind_for(&self, kind: PoolKind, access: &PoolAccess) -> Vec<String> {
+        self.collect_models(|p| p.kind == kind && access.allows(p))
+    }
+
+    /// True if a pool of *any* kind that `access` permits knows `model`. Backs
+    /// the per-user `GET /v1/models/{id}`.
+    pub fn knows_any_for(&self, model: &str, access: &PoolAccess) -> bool {
+        self.data()
+            .pools
+            .values()
+            .any(|p| access.allows(p) && p.knows_model(model))
+    }
+
     /// Sorted list of `(model_id, merged_compliance)` for every model served
     /// by a pool of `kind`. When the same id is served by multiple pools the
     /// flags are merged **most-restrictively** (a flag is clear only if it's
@@ -854,9 +915,23 @@ impl UpstreamRegistry {
     /// upstream but not another is treated as not-safe. Backs the chat-UI
     /// model dropdown labels and the per-conversation warning banner.
     pub fn models_with_compliance_for_kind(&self, kind: PoolKind) -> Vec<(String, Compliance)> {
+        self.models_with_compliance_for_kind_for(kind, &PoolAccess::all())
+    }
+
+    /// Like [`Self::models_with_compliance_for_kind`], but only over pools
+    /// `access` permits — the per-user chat model dropdown.
+    pub fn models_with_compliance_for_kind_for(
+        &self,
+        kind: PoolKind,
+        access: &PoolAccess,
+    ) -> Vec<(String, Compliance)> {
         let d = self.data();
         let mut merged: HashMap<String, Compliance> = HashMap::new();
-        for pool in d.pools.values().filter(|p| p.kind == kind) {
+        for pool in d
+            .pools
+            .values()
+            .filter(|p| p.kind == kind && access.allows(p))
+        {
             for backend in &pool.backends {
                 // Alias names inherit the pool's compliance flags, same as the
                 // real ids — clients pick either, so both must carry the warning.
@@ -924,22 +999,36 @@ impl UpstreamRegistry {
     ///   - the model *is* known but no healthy backend can serve it right
     ///     now → [`AcquireError::NoHealthyBackend`] / `Saturated` (`503`).
     pub fn acquire_for(&self, model: &str, kind: PoolKind) -> Result<Acquired, RouteError> {
+        self.acquire_for_access(model, kind, &PoolAccess::all())
+    }
+
+    /// Like [`Self::acquire_for`], but only considers pools `access` permits. A
+    /// model served solely by pools the caller can't access is reported as
+    /// [`RouteError::UnknownModel`] (→ `404`), identical to a model that
+    /// doesn't exist — so a restricted model can't be probed for existence, and
+    /// filtering the `/v1/models` list can't be bypassed by calling the id.
+    pub fn acquire_for_access(
+        &self,
+        model: &str,
+        kind: PoolKind,
+        access: &PoolAccess,
+    ) -> Result<Acquired, RouteError> {
         let d = self.data();
         // First, a pool with a healthy backend that serves the model.
         if let Some(pool) = d
             .pools
             .values()
-            .find(|p| p.kind == kind && p.serves_model(model))
+            .find(|p| p.kind == kind && access.allows(p) && p.serves_model(model))
         {
             return pool.acquire_for_model(model).map_err(RouteError::Acquire);
         }
         // No healthy serving backend. If the model is nonetheless known to a
-        // pool of this kind, it's a transient outage (all replicas down) —
-        // surface 503, not 404.
+        // pool of this kind the caller may access, it's a transient outage (all
+        // replicas down) — surface 503, not 404.
         if let Some(pool) = d
             .pools
             .values()
-            .find(|p| p.kind == kind && p.knows_model(model))
+            .find(|p| p.kind == kind && access.allows(p) && p.knows_model(model))
         {
             return Err(RouteError::Acquire(AcquireError::NoHealthyBackend {
                 pool: pool.name.clone(),
@@ -962,13 +1051,25 @@ impl UpstreamRegistry {
     /// method the dispatch paths call; the returned [`Acquired::resolved_model`]
     /// is the real id to forward (after alias/fallback resolution).
     pub fn route(&self, model: &str, kind: PoolKind) -> Result<Acquired, RouteError> {
-        match self.acquire_for(model, kind) {
+        self.route_access(model, kind, &PoolAccess::all())
+    }
+
+    /// Like [`Self::route`], but only over pools `access` permits — the fallback
+    /// targets are gated the same way, so a fallback can never route a caller to
+    /// a pool they're not allowed to use.
+    pub fn route_access(
+        &self,
+        model: &str,
+        kind: PoolKind,
+        access: &PoolAccess,
+    ) -> Result<Acquired, RouteError> {
+        match self.acquire_for_access(model, kind, access) {
             Ok(acquired) => Ok(acquired),
             Err(RouteError::UnknownModel(orig)) => {
                 let fb = self.data().fallback.for_kind(kind).map(str::to_owned);
                 match fb {
                     Some(fallback) => self
-                        .acquire_for(&fallback, kind)
+                        .acquire_for_access(&fallback, kind, access)
                         .map_err(|_| RouteError::UnknownModel(orig)),
                     None => Err(RouteError::UnknownModel(orig)),
                 }
@@ -976,7 +1077,7 @@ impl UpstreamRegistry {
             Err(RouteError::Acquire(AcquireError::NoHealthyBackend { pool })) => {
                 match self.pool_fallback_offline(&pool) {
                     Some(fallback) => self
-                        .acquire_for(&fallback, kind)
+                        .acquire_for_access(&fallback, kind, access)
                         .map_err(|_| RouteError::Acquire(AcquireError::NoHealthyBackend { pool })),
                     None => Err(RouteError::Acquire(AcquireError::NoHealthyBackend { pool })),
                 }
@@ -1007,10 +1108,22 @@ impl UpstreamRegistry {
     /// taken (the chat-UI driver serialises before acquiring). Does not apply
     /// fallback — that's `route`'s job at acquire time.
     pub fn resolve_model(&self, model: &str, kind: PoolKind) -> Option<String> {
+        self.resolve_model_for(model, kind, &PoolAccess::all())
+    }
+
+    /// Like [`Self::resolve_model`], but only over pools `access` permits. Used
+    /// by the chat-UI driver so it resolves a body's `model` only against pools
+    /// the signed-in user may use.
+    pub fn resolve_model_for(
+        &self,
+        model: &str,
+        kind: PoolKind,
+        access: &PoolAccess,
+    ) -> Option<String> {
         self.data()
             .pools
             .values()
-            .filter(|p| p.kind == kind)
+            .filter(|p| p.kind == kind && access.allows(p))
             .find_map(|p| p.resolve_healthy(model))
     }
 }
@@ -1117,6 +1230,7 @@ mod tests {
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             compliance: Default::default(),
             enforce_limits: true,
             kind,
@@ -1135,6 +1249,7 @@ mod tests {
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             compliance,
             kind,
             strategy: PickerStrategy::RoundRobin,
@@ -1153,6 +1268,7 @@ mod tests {
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             compliance: Default::default(),
             enforce_limits: true,
             kind,
@@ -1262,6 +1378,82 @@ mod tests {
             .acquire_for("whisper-1", PoolKind::Transcription)
             .unwrap();
         assert_eq!(g.backend().name, "b");
+    }
+
+    #[test]
+    fn pool_allowed_groups_gate_listing_and_routing() {
+        // Two chat pools: "open" (unrestricted) and "vip" (restricted to the
+        // `dev` gateway group). A user without the group sees only the open
+        // pool's model and can't route to the vip one; a member and an admin
+        // both see everything.
+        let mut vip = pool_config(
+            PoolKind::Chat,
+            PickerStrategy::RoundRobin,
+            vec![backend("vip-b", 16)],
+        );
+        vip.allowed_groups = vec!["dev".into()];
+        let reg = build(vec![
+            (
+                "open",
+                pool_config(
+                    PoolKind::Chat,
+                    PickerStrategy::RoundRobin,
+                    vec![backend("open-b", 16)],
+                ),
+            ),
+            ("vip", vip),
+        ]);
+        seed_models(&reg, "open", 0, &["open-model"]);
+        seed_models(&reg, "vip", 0, &["vip-model"]);
+
+        let outsider = PoolAccess {
+            role_ids: vec!["other".into()],
+            is_admin: false,
+        };
+        let member = PoolAccess {
+            role_ids: vec!["dev".into()],
+            is_admin: false,
+        };
+        let admin = PoolAccess::all();
+
+        // Listing: the restricted model is withheld from the outsider only.
+        let outsider_models = reg.all_models_for(&outsider);
+        assert!(outsider_models.contains(&"open-model".to_string()));
+        assert!(!outsider_models.contains(&"vip-model".to_string()));
+        assert!(
+            reg.all_models_for(&member)
+                .contains(&"vip-model".to_string())
+        );
+        assert!(
+            reg.all_models_for(&admin)
+                .contains(&"vip-model".to_string())
+        );
+
+        // knows_any_for mirrors the listing (backs GET /v1/models/{id}).
+        assert!(!reg.knows_any_for("vip-model", &outsider));
+        assert!(reg.knows_any_for("vip-model", &member));
+
+        // Routing: an outsider can't reach the restricted model — it's reported
+        // as UnknownModel (404), identical to a nonexistent one, so the listing
+        // filter can't be bypassed by calling the id directly. The open model
+        // still routes for them.
+        assert!(matches!(
+            reg.acquire_for_access("vip-model", PoolKind::Chat, &outsider),
+            Err(RouteError::UnknownModel(_))
+        ));
+        assert!(
+            reg.acquire_for_access("open-model", PoolKind::Chat, &outsider)
+                .is_ok()
+        );
+        // A member (and an admin) can route to the restricted model.
+        assert!(
+            reg.acquire_for_access("vip-model", PoolKind::Chat, &member)
+                .is_ok()
+        );
+        assert!(
+            reg.acquire_for_access("vip-model", PoolKind::Chat, &admin)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1795,6 +1987,7 @@ mod tests {
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             compliance: Default::default(),
             enforce_limits: true,
             kind,
@@ -2190,6 +2383,7 @@ mod tests {
                 compliance_nda: true,
                 enforce_limits: true,
                 sort_order: 0,
+                allowed_groups: Vec::new(),
                 backends: vec!["b".into()],
                 models: vec![],
                 voices: vec![],

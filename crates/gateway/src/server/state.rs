@@ -254,11 +254,38 @@ impl AppState {
         self
     }
 
-    /// Resolved internal role ids for a caller's raw OIDC group claims. Used
-    /// when building the per-request MCP layer so the connector `required_role`
-    /// gate is enforced at tool-exposure time.
+    /// Resolved gateway-group ids for a caller's raw OIDC group claims — the
+    /// "effective groups" seam. Used when building the per-request MCP layer and
+    /// when gating pools / RAG collections so resource `allowed_groups` are
+    /// enforced at exposure time.
     pub fn role_ids_for(&self, roles: &[String]) -> Vec<String> {
         self.rbac.role_ids_for(roles)
+    }
+
+    /// Build a caller's [`PoolAccess`] from their raw OIDC group claims — the
+    /// per-request gate threaded into the group-aware upstream listing/routing
+    /// methods so pool `allowed_groups` are enforced. Admins bypass.
+    pub fn pool_access_for(&self, roles: &[String]) -> crate::server::upstreams::PoolAccess {
+        let role_ids = self.rbac.role_ids_for(roles);
+        let is_admin = self.rbac.is_admin(&role_ids);
+        crate::server::upstreams::PoolAccess { role_ids, is_admin }
+    }
+
+    /// Reload the RBAC resolver from the DB after an admin edit to groups,
+    /// OIDC mappings, or tool grants (`/admin/groups`). Also refreshes the
+    /// skill-grant overlay. Best-effort: a DB hiccup leaves the previous
+    /// snapshot in place and logs, rather than clearing access.
+    pub async fn reload_rbac(&self) {
+        match crate::server::db::gateway_groups::load_snapshot(&self.db).await {
+            Ok(snap) => self.rbac.reload(snap),
+            Err(e) => {
+                tracing::warn!(error = %e, "reloading RBAC groups; keeping previous snapshot")
+            }
+        }
+        match crate::server::db::skill_grants::all(&self.db).await {
+            Ok(grants) => self.rbac.set_skill_grant_overlay(grants),
+            Err(e) => tracing::warn!(error = %e, "reloading skill-grant overlay"),
+        }
     }
 
     /// Union a once-per-request [`UserMcpLayer`]'s tool ids into an

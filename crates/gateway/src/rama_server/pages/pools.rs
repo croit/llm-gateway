@@ -142,6 +142,9 @@ pub async fn pools_save(State(state): State<Arc<RamaState>>, req: Request) -> Re
         compliance_nda: checkbox_on(field(&pairs, "compliance_nda")),
         enforce_limits: checkbox_on(field(&pairs, "enforce_limits")),
         sort_order,
+        // Gateway groups allowed to see + route to this pool (comma-separated
+        // group names; empty = unrestricted). See `db::gateway_groups`.
+        allowed_groups: parse_csv(field(&pairs, "allowed_groups")),
         backends: fields_all(&pairs, "backends"),
         models: parse_csv(field(&pairs, "models")),
         voices: parse_voices(field(&pairs, "voices")),

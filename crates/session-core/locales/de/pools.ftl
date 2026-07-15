@@ -15,6 +15,8 @@ pools-field-fallback-offline = Offline-Fallback-Modell
 pools-field-fallback-offline-placeholder = wird ausgeliefert, wenn jedes Backend ausgefallen ist
 pools-field-models = Bereitgestellte Modelle (Positivliste, kommagetrennt)
 pools-field-models-hint = Wenn gesetzt, werden von einem Backend mit /models-Probe nur diese IDs bereitgestellt — der Rest wird durchgestrichen angezeigt. Leer = alles bereitstellen, was das Backend meldet.
+pools-field-allowed-groups = Erlaubte Gruppen
+pools-field-allowed-groups-hint = Kommagetrennte Gateway-Gruppen, die die Modelle dieses Pools sehen + nutzen dürfen. Leer = alle. Admins haben immer Zugriff. Gruppen unter Admin → Gruppen verwalten.
 pools-field-voices = Stimmen (lang=voice pro Zeile)
 pools-field-backends = Backends
 pools-no-backends = Noch keine Backends definiert. Fügen Sie zuerst eines auf der Seite „Backends“ hinzu.

@@ -31,3 +31,6 @@ pools-saved = pool `{ $name }` enregistré — cliquez sur « Appliquer les modi
 pools-deleted = pool `{ $name }` supprimé — cliquez sur « Appliquer les modifications » pour recharger
 pools-fallback-saved = repli { $kind } défini sur `{ $model }`
 pools-fallback-cleared = repli { $kind } effacé
+
+pools-field-allowed-groups = Groupes autorisÃ©s
+pools-field-allowed-groups-hint = Groupes du gateway (sÃ©parÃ©s par des virgules) autorisÃ©s Ã  voir et utiliser les modÃ¨les de ce pool. Vide = tout le monde. Les admins ont toujours accÃ¨s. GÃ©rez les groupes dans Admin â Groupes.

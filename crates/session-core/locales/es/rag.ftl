@@ -136,3 +136,6 @@ rag-label-embedding-model = Modelo de embedding
 rag-placeholder-embedding-model-none = no hay pools de embedding configurados — escriba un id de modelo
 rag-option-choose-embedding-model = Elija un modelo de embedding…
 rag-suffix-not-advertised = (ya no disponible)
+
+rag-label-allowed-groups = Grupos permitidos
+rag-hint-allowed-groups = Grupos del gateway (separados por comas) autorizados a listar y buscar en esta colecciÃ³n. VacÃ­o = todos los que tengan las herramientas RAG. Los admins siempre tienen acceso.

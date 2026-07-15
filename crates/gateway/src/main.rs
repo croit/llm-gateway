@@ -99,17 +99,43 @@ async fn main() -> anyhow::Result<()> {
     // mistaken for a hung process — see `spawn_heartbeat`.
     srv::upstreams::health::spawn_heartbeat(upstreams.clone());
 
-    // Build the RBAC resolver up front: the `read_skill` tool holds a clone
-    // so it can authorize skill access at call time, the same way the rest of
-    // the gateway resolves roles → grants.
-    let rbac = srv::rbac::Resolver::build(config.rbac.clone(), config.roles.clone())
-        .map_err(|e| anyhow::anyhow!("building RBAC resolver: {e}"))?;
-    let rbac = Arc::new(rbac);
+    // Seed the RBAC group tables from the legacy `[rbac]` + `[[roles]]` config
+    // on first boot, then treat the DB as the source of truth — same
+    // marker-gated pattern as the upstream topology above, so an admin who
+    // later deletes every group in the UI doesn't get the config resurrected on
+    // the next restart. We validate the config through `Resolver::build` first
+    // so a malformed `[[roles]]` block still fails fast with a clear error.
+    const RBAC_SEED_MARKER: &str = "rbac.seeded";
+    let rbac_already_seeded = srv::db::app_settings::get(&db, RBAC_SEED_MARKER)
+        .await
+        .map_err(|e| anyhow::anyhow!("reading rbac seed marker: {e:#}"))?
+        .is_some();
+    if !rbac_already_seeded {
+        srv::rbac::Resolver::build(config.rbac.clone(), config.roles.clone())
+            .map_err(|e| anyhow::anyhow!("validating RBAC config for seeding: {e}"))?;
+        srv::db::gateway_groups::seed_from_config(&db, &config.rbac, &config.roles)
+            .await
+            .map_err(|e| anyhow::anyhow!("seeding RBAC groups from config: {e:#}"))?;
+        srv::db::app_settings::set(&db, RBAC_SEED_MARKER, "1")
+            .await
+            .map_err(|e| anyhow::anyhow!("recording rbac seed marker: {e:#}"))?;
+    }
 
-    // Seed the dynamic skill-grant overlay (the UI-managed grants on top of the
-    // static `[[roles]].skills` config) from the DB so admin grants survive a
-    // restart. A DB hiccup here just leaves the overlay empty — config grants
-    // still apply — rather than failing startup.
+    // Build the RBAC resolver from the DB snapshot: the `read_skill` tool holds
+    // a clone so it can authorize skill access at call time, the same way the
+    // rest of the gateway resolves groups → grants. `bootstrap_admin_groups`
+    // is layered on so a break-glass admin works even with an empty/broken DB.
+    let group_snapshot = srv::db::gateway_groups::load_snapshot(&db)
+        .await
+        .map_err(|e| anyhow::anyhow!("loading RBAC groups from DB: {e:#}"))?;
+    let rbac = Arc::new(srv::rbac::Resolver::from_snapshot(
+        group_snapshot,
+        config.gateway.bootstrap_admin_groups.clone(),
+    ));
+
+    // Seed the dynamic skill-grant overlay (the per-group skill grants in
+    // `skill_role_grants`) from the DB so grants survive a restart. A DB hiccup
+    // here just leaves the overlay empty rather than failing startup.
     match srv::db::skill_grants::all(&db).await {
         Ok(grants) => rbac.set_skill_grant_overlay(grants),
         Err(e) => {
@@ -156,8 +182,8 @@ async fn main() -> anyhow::Result<()> {
         // RAG. These tools are no-ops without the indexer wired into
         // AppState; registering them unconditionally keeps RBAC config
         // stable across deployments where `[rag]` is only sometimes set.
-        .with(srv::tools::rag::RagListCollections)
-        .with(srv::tools::rag::RagSearch)
+        .with(srv::tools::rag::RagListCollections::new(rbac.clone()))
+        .with(srv::tools::rag::RagSearch::new(rbac.clone()))
         // Document canvas — build up and incrementally edit long documents
         // across turns. Content lives in the `documents` store, not S3, so
         // these need no extra config; off the chat path they error cleanly.

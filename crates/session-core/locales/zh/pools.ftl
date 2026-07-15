@@ -31,3 +31,6 @@ pools-saved = 已保存池 `{ $name }` — 点击“应用更改”以重新加�
 pools-deleted = 已删除池 `{ $name }` — 点击“应用更改”以重新加载
 pools-fallback-saved = { $kind } 回退已设置为 `{ $model }`
 pools-fallback-cleared = { $kind } 回退已清除
+
+pools-field-allowed-groups = åè®¸çç»
+pools-field-allowed-groups-hint = åè®¸æ¥çåä½¿ç¨æ­¤æ± æ¨¡åçç½å³ç»ï¼ç¨éå·åéï¼ãçç©º = ææäººãç®¡çåå§ç»ææéãå¨ ç®¡ç â ç» ä¸­ç®¡çç»ã

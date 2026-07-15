@@ -1279,6 +1279,7 @@ mod tests {
             chunk_overlap: 100,
             search_mode: rag_db::SearchMode::Versioned,
             status: rag_db::CollectionStatus::Pending,
+            allowed_groups: Vec::new(),
             last_indexed_at: None,
             last_indexed_commit: None,
             last_error: None,

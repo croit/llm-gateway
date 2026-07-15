@@ -686,7 +686,9 @@ mod tests {
         use crate::server::tools::rag::RagSearch;
         let reg = ToolRegistry::new()
             .with(SearchWeb)
-            .with(RagSearch)
+            .with(RagSearch::new(std::sync::Arc::new(
+                crate::server::rbac::Resolver::empty(),
+            )))
             .with(Echo);
         // Echo (`company_echo`) is hidden → its area never shows. Order is by
         // Category::order: Web before Knowledge.
@@ -699,7 +701,9 @@ mod tests {
     #[test]
     fn rag_search_gets_a_curated_entry_in_the_knowledge_area() {
         use crate::server::tools::rag::RagSearch;
-        let reg = ToolRegistry::new().with(RagSearch);
+        let reg = ToolRegistry::new().with(RagSearch::new(std::sync::Arc::new(
+            crate::server::rbac::Resolver::empty(),
+        )));
         let entries = entries(&reg, &["rag_search".to_string()], &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].category, Category::Knowledge);

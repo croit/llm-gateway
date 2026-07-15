@@ -117,6 +117,8 @@ rag-label-exclude-globs = Exclude-Globs
 rag-placeholder-exclude-globs = target/, node_modules/
 rag-label-chunk-size = Chunk-Größe
 rag-label-chunk-overlap = Chunk-Überlappung
+rag-label-allowed-groups = Erlaubte Gruppen
+rag-hint-allowed-groups = Kommagetrennte Gateway-Gruppen, die diese Collection auflisten + durchsuchen dürfen. Leer = alle mit den RAG-Tools. Admins haben immer Zugriff.
 rag-create-aggregate-help = Aggregat (Multi-Quelle): durchsucht viele Repos als einen Korpus. Lassen Sie die Git-URL leer und fügen Sie nach dem Erstellen jedes Quell-Repo hinzu. Branch / Tag wird zum Standard-Ref für hinzugefügte Quellen.
 rag-button-queue-indexing = Indexierung einplanen
 

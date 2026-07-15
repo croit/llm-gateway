@@ -87,6 +87,9 @@ enum NavItem {
     /// Admin-only rate-limit / quota editor (`/admin/limits`). Same
     /// `admin`-role gate as the other operator pages.
     Limits,
+    /// Admin-only gateway-groups editor (`/admin/groups`) — OIDC→group mappings
+    /// plus per-group tool/skill grants. Same `admin`-role gate.
+    Groups,
 }
 
 /// Datastar directive that intercepts the click and triggers an
@@ -387,6 +390,7 @@ fn render_app_sidebar(
                 if is_admin {
                     (nav_group(lang, "admin", &t(lang, "nav-group-admin"), html! {
                         (sidebar_nav_link("/admin/users", NavItem::Users, active, icons::users(16), &t(lang, "nav-users")))
+                        (sidebar_nav_link("/admin/groups", NavItem::Groups, active, icons::users(16), &t(lang, "nav-groups")))
                         (sidebar_nav_link("/admin/upstreams", NavItem::Upstreams, active, icons::cube(16), &t(lang, "nav-upstreams")))
                         (sidebar_nav_link("/admin/models", NavItem::Admin, active, icons::cpu(16), &t(lang, "nav-models")))
                         (sidebar_nav_link("/rag", NavItem::Rag, active, icons::database(16), &t(lang, "nav-rag")))
@@ -1333,6 +1337,14 @@ pub use rag::{
     rag_add_ref, rag_add_sources_bulk, rag_cancel_edit, rag_create, rag_delete, rag_edit_form,
     rag_index, rag_ref_cancel_edit, rag_ref_delete, rag_ref_edit_form, rag_ref_log,
     rag_ref_reindex, rag_ref_set_primary, rag_ref_update, rag_reindex, rag_status, rag_update,
+};
+
+// Admin gateway-groups editor (`/admin/groups`) — OIDC→group mappings + per-group
+// tool/skill grants. Same admin gate.
+mod groups;
+pub use groups::{
+    groups_delete as admin_groups_delete, groups_index as admin_groups_index,
+    groups_save as admin_groups_save,
 };
 
 // Admin user roster + impersonation (`/admin/users`, `/admin/users/impersonate`)

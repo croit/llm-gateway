@@ -1,0 +1,16 @@
+groups-heading = 网关组
+groups-intro = 将 OIDC 声明值映射为清晰、与 IdP 无关的组名，并决定每个组授予的权限。池、RAG 集合和 MCP 连接器通过组名引用这些组，以限制谁可以使用它们。
+groups-new-heading = 新建组
+groups-existing-heading = 组
+groups-empty = 还没有任何组。请在上方创建一个。
+groups-field-name = 名称
+groups-field-description = 描述
+groups-field-admin = 管理员（授予 /admin 访问权限）
+groups-field-default = 默认（适用于每个已登录用户）
+groups-field-oidc = OIDC 组值
+groups-field-oidc-help = 来自你的 IdP 的原始声明值，用逗号分隔（例如 Entra 对象 GUID、LDAP DN 或普通组名）。其中任意一个都会将用户归入此组。
+groups-field-tools = 工具
+groups-field-skills = 技能
+groups-save = 保存
+groups-delete = 删除
+groups-error-name-required = 需要提供组名。

@@ -43,6 +43,7 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
         "pool".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,

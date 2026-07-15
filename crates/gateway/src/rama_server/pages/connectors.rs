@@ -19,7 +19,7 @@ use rama::http::{Request, Response, StatusCode, header};
 use serde::Deserialize;
 
 use super::{
-    NavItem, fetch_sidebar_chat, internal_error_html, nav_or_html_page, read_form,
+    NavItem, fetch_sidebar_chat, internal_error_html, nav_or_html_page, parse_csv, read_form,
     require_admin_or_403,
 };
 use crate::rama_server::state::RamaState;
@@ -86,7 +86,9 @@ struct SaveForm {
     token_url: Option<String>,
     registration_url: Option<String>,
     scopes: Option<String>,
-    required_role: Option<String>,
+    /// Comma-separated gateway groups allowed to see + connect this connector
+    /// (empty = everyone). Matched like a pool's `allowed_groups`.
+    allowed_groups: Option<String>,
     /// Optional: the OAuth client JSON downloaded from Google Cloud Console
     /// (`{"web":{…}}` / `{"installed":{…}}`). When present, its client_id /
     /// client_secret / auth_uri / token_uri pre-fill the fields below.
@@ -218,7 +220,7 @@ pub async fn connectors_save(State(state): State<Arc<RamaState>>, req: Request) 
         token_url,
         registration_url: clean(form.registration_url),
         scopes,
-        required_role: clean(form.required_role),
+        allowed_groups: parse_csv(&form.allowed_groups.unwrap_or_default()),
     };
 
     // Upsert: update if it exists, else create.
@@ -784,8 +786,8 @@ fn render_form_fields(
         .and_then(|c| c.registration_url.clone())
         .unwrap_or_default();
     let scopes = existing.map(|c| c.scopes.join(" ")).unwrap_or_default();
-    let required_role = existing
-        .and_then(|c| c.required_role.clone())
+    let allowed_groups = existing
+        .map(|c| c.allowed_groups.join(", "))
         .unwrap_or_default();
     let use_dcr = existing.map(|c| c.use_dcr).unwrap_or(true);
     let auth_kind = existing.map(|c| c.auth).unwrap_or(AuthKind::OAuth2);
@@ -833,8 +835,8 @@ fn render_form_fields(
     let authorize_url_label = t(lang, "connectors-field-authorize-url-label");
     let token_url_label = t(lang, "connectors-field-token-url-label");
     let registration_url_label = t(lang, "connectors-field-registration-url-label");
-    let required_role_label = t(lang, "connectors-field-required-role-label");
-    let required_role_placeholder = t(lang, "connectors-placeholder-optional");
+    let allowed_groups_label = t(lang, "connectors-field-allowed-groups-label");
+    let allowed_groups_placeholder = t(lang, "connectors-placeholder-optional");
     let client_id_placeholder = t(lang, "connectors-field-client-id-placeholder");
 
     html! {
@@ -960,7 +962,7 @@ fn render_form_fields(
                 }
             }
             // RBAC gate applies to any connector (who may *connect* it).
-            (text_field(&required_role_label, "required_role", &required_role, &required_role_placeholder))
+            (text_field(&allowed_groups_label, "allowed_groups", &allowed_groups, &allowed_groups_placeholder))
             // Audit toggle — applies to any connector. Records every tool call
             // (who/what/when/outcome) to the trail shown at the foot of this page.
             label(class: "label cursor-pointer justify-start gap-2 py-0") {

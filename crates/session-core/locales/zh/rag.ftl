@@ -136,3 +136,6 @@ rag-label-embedding-model = Embedding 模型
 rag-placeholder-embedding-model-none = 未配置 Embedding 池 — 请输入模型 ID
 rag-option-choose-embedding-model = 选择 Embedding 模型…
 rag-suffix-not-advertised = （不再提供）
+
+rag-label-allowed-groups = åè®¸çç»
+rag-hint-allowed-groups = åè®¸ååºåæç´¢æ­¤éåçç½å³ç»ï¼ç¨éå·åéï¼ãçç©º = æææ¥æ RAG å·¥å·çäººãç®¡çåå§ç»ææéã

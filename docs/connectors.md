@@ -62,7 +62,7 @@ Every connector has a **scope** (the `scope` column, set on the admin form):
   auth models above apply.
 - **Global** — one shared identity for the whole gateway. There is no per-user
   connection step: an admin enables the connector and its tools are immediately
-  available to everyone the connector's `required_role` allows (each user can
+  available to everyone the connector's `allowed_groups` permit (each user can
   still set them always/ask/off on their Tools page). The connection is
   established once and shared across users. Because the identity is shared,
   **only `none` or `static_bearer` auth is allowed** — OAuth is inherently

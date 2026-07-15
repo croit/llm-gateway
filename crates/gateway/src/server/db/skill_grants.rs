@@ -92,6 +92,82 @@ pub async fn delete_skill(pool: &Pool, skill_name: &str) -> Result<(), DbError> 
     Ok(())
 }
 
+/// Add `(skill, role_id)` grants for a single role (group), keeping any
+/// existing rows. Used by [`crate::server::db::gateway_groups::seed_from_config`]
+/// to import `[[roles]].skills` into the overlay, and by the `/admin/groups`
+/// editor when granting a group a set of skills. `*` is stored verbatim — the
+/// resolver expands it to every loaded skill at read time.
+pub async fn add_grants_for_role(
+    pool: &Pool,
+    role_id: &str,
+    skills: &[String],
+) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    for skill in skills {
+        let skill = skill.trim();
+        if skill.is_empty() {
+            continue;
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO skill_role_grants (skill_name, role_id, granted_at) VALUES (?, ?, ?)",
+        )
+        .bind(skill)
+        .bind(role_id)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// The skill names granted to `role_id` via the overlay (the inverse of
+/// [`roles_for_skill`]). Powers the `/admin/groups` per-group skill editor.
+/// May include the literal `*`.
+pub async fn skills_for_role(pool: &Pool, role_id: &str) -> Result<Vec<String>, DbError> {
+    let rows = sqlx::query(
+        "SELECT skill_name FROM skill_role_grants WHERE role_id = ? ORDER BY skill_name",
+    )
+    .bind(role_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| r.try_get::<String, _>("skill_name").map_err(DbError::from))
+        .collect()
+}
+
+/// Replace the full set of skills granted to `role_id` (deduplicated),
+/// transactionally. The per-group counterpart of [`set_for_skill`].
+pub async fn set_skills_for_role(
+    pool: &Pool,
+    role_id: &str,
+    skills: &[String],
+) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM skill_role_grants WHERE role_id = ?")
+        .bind(role_id)
+        .execute(&mut *tx)
+        .await?;
+    let mut seen: Vec<&str> = Vec::new();
+    for skill in skills {
+        let skill = skill.trim();
+        if skill.is_empty() || seen.contains(&skill) {
+            continue;
+        }
+        seen.push(skill);
+        sqlx::query(
+            "INSERT INTO skill_role_grants (skill_name, role_id, granted_at) VALUES (?, ?, ?)",
+        )
+        .bind(skill)
+        .bind(role_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

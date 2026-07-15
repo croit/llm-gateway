@@ -35,5 +35,5 @@ pub use config::{
     UpstreamPoolConfig,
 };
 pub use registry::{
-    AcquireError, Acquired, AliasStatus, Backend, Pool, RouteError, UpstreamRegistry,
+    AcquireError, Acquired, AliasStatus, Backend, Pool, PoolAccess, RouteError, UpstreamRegistry,
 };

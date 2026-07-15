@@ -234,11 +234,13 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     // already returned empty and we keep the byte-dumb path).
     let user_mcp = if user.tools_enabled {
         let role_ids = state.role_ids_for(&user.roles);
+        let is_admin = state.rbac.is_admin(&role_ids);
         state
             .mcp
             .layer_for_user(
                 &user.user_id,
                 &role_ids,
+                is_admin,
                 crate::server::tools::mcp::manager::AskContext::Api {
                     token_id: &user.token_id,
                 },
@@ -263,12 +265,18 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     // client brought its own `tools` — `inject_tools` unions ours in
     // and the loop runs gateway-owned calls while passing client-owned
     // ones through.
+    // Per-user pool access: a model served only by pools this caller can't
+    // reach routes as `UnknownModel` → 404, identical to a nonexistent model.
+    let access = state.pool_access_for(&user.roles);
     if allowed_tools.is_empty() {
         // `route` resolves aliases + the two fallbacks and returns a structured
         // `RouteError`, so `route_error_response` maps an unknown model straight
         // to 404 `model_not_found` (and known-but-down to 503). Acquires the
         // slot up front so the resolved real id is known before we touch the body.
-        let acquired = match state.upstreams.route(&model, PoolKind::Chat) {
+        let acquired = match state
+            .upstreams
+            .route_access(&model, PoolKind::Chat, &access)
+        {
             Ok(a) => a,
             Err(e) => return route_error_response(e),
         };
@@ -307,7 +315,10 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     // 503, so they can't distinguish an unknown model), and every round must
     // dispatch the *same* resolved real id. `route` here both maps the OpenAI
     // 404/503 before streaming starts and yields the real id to forward.
-    let real_model = match state.upstreams.route(&model, PoolKind::Chat) {
+    let real_model = match state
+        .upstreams
+        .route_access(&model, PoolKind::Chat, &access)
+    {
         Ok(a) => a.resolved_model().to_string(),
         Err(e) => return route_error_response(e),
     };
@@ -381,6 +392,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     };
     let state_clone = state.clone();
     let model_clone = real_model.clone();
+    let access_clone = access.clone();
     let headers_clone = parts.headers.clone();
     // One usage row per upstream round — built per request, finished off
     // with backend/status/latency/tokens inside the loop closure.
@@ -407,12 +419,13 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
         move |body_value| {
             let state = state_clone.clone();
             let model = model_clone.clone();
+            let access = access_clone.clone();
             let headers = headers_clone.clone();
             let rec = rec.clone();
             async move {
                 let acquired = state
                     .upstreams
-                    .acquire_for(&model, PoolKind::Chat)
+                    .acquire_for_access(&model, PoolKind::Chat, &access)
                     .map_err(|e| LoopError::Upstream(e.to_string()))?;
                 let backend_name = acquired.backend().name.clone();
                 let started = Instant::now();
@@ -541,7 +554,8 @@ pub async fn transcribe(State(state): State<Arc<RamaState>>, req: Request) -> Re
     // Model is parsed inside; `handle_transcription` fills the real model id
     // and the resolved `enforce_limits` flag into `rec` once routing has run.
     let rec = RecordParams::v1(&user, UsageKind::Transcription, String::new(), true);
-    handle_transcription(state, parts.headers, body, rec).await
+    let access = state.pool_access_for(&user.roles);
+    handle_transcription(state, parts.headers, body, rec, access).await
 }
 
 /// `POST /api/v0/transcriptions` — session-authed mirror of
@@ -573,16 +587,23 @@ pub async fn transcribe_session(State(state): State<Arc<RamaState>>, req: Reques
     // `chat`, no API token. Email is best-effort (one indexed read) so the
     // per-user breakdown reads nicely; user_id is always present. Skipped
     // when metrics are disabled (no extra DB read on the kill-switched path).
+    // Load the user once: for the usage-row email AND to resolve their gateway
+    // groups so the transcription model is gated to pools they may access, same
+    // as the API path.
+    let user_row = crate::server::db::users::find_by_id(&state.db, &session.user_id)
+        .await
+        .ok()
+        .flatten();
     let user_email = if state.usage.is_enabled() {
-        crate::server::db::users::find_by_id(&state.db, &session.user_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|u| u.email)
+        user_row
+            .as_ref()
+            .map(|u| u.email.clone())
             .unwrap_or_default()
     } else {
         String::new()
     };
+    let access =
+        state.pool_access_for(user_row.as_ref().map(|u| u.roles.as_slice()).unwrap_or(&[]));
     let rec = RecordParams {
         user_id: session.user_id.clone(),
         user_email,
@@ -598,7 +619,7 @@ pub async fn transcribe_session(State(state): State<Arc<RamaState>>, req: Reques
         Ok(b) => b,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, "invalid_request", &msg),
     };
-    handle_transcription(state, parts.headers, body, rec).await
+    handle_transcription(state, parts.headers, body, rec, access).await
 }
 
 /// Shared body of both transcription handlers: parse → VAD-trim → rebuild
@@ -609,6 +630,7 @@ async fn handle_transcription(
     mut headers: HeaderMap,
     body: Bytes,
     mut rec: RecordParams,
+    access: crate::server::upstreams::PoolAccess,
 ) -> Response {
     let fields = match parse_multipart_fields(&headers, body).await {
         Ok(f) => f,
@@ -633,7 +655,10 @@ async fn handle_transcription(
     // Resolve aliases + fallback before rebuilding the multipart body, so the
     // `model` part we forward carries the real id the upstream knows. The slot
     // is held across the (in-memory) VAD check + rebuild below.
-    let acquired = match state.upstreams.route(&model, PoolKind::Transcription) {
+    let acquired = match state
+        .upstreams
+        .route_access(&model, PoolKind::Transcription, &access)
+    {
         Ok(a) => a,
         Err(e) => return route_error_response(e),
     };
@@ -869,7 +894,11 @@ pub async fn embeddings(State(state): State<Arc<RamaState>>, req: Request) -> Re
     };
     // `route` resolves aliases + fallback and maps an unknown model → 404
     // `model_not_found` / all-down → 503 via `route_error_response`.
-    let acquired = match state.upstreams.route(&model, PoolKind::Embedding) {
+    let access = state.pool_access_for(&user.roles);
+    let acquired = match state
+        .upstreams
+        .route_access(&model, PoolKind::Embedding, &access)
+    {
         Ok(a) => a,
         Err(e) => return route_error_response(e),
     };
@@ -924,7 +953,11 @@ pub async fn images_generations(State(state): State<Arc<RamaState>>, req: Reques
             "request body is missing a string `model` field",
         );
     };
-    let acquired = match state.upstreams.route(&model, PoolKind::Image) {
+    let access = state.pool_access_for(&user.roles);
+    let acquired = match state
+        .upstreams
+        .route_access(&model, PoolKind::Image, &access)
+    {
         Ok(a) => a,
         Err(e) => return route_error_response(e),
     };
@@ -989,7 +1022,11 @@ pub async fn images_edits(State(state): State<Arc<RamaState>>, req: Request) -> 
             "multipart body missing required `model` field",
         );
     };
-    let acquired = match state.upstreams.route(&model, PoolKind::Image) {
+    let access = state.pool_access_for(&user.roles);
+    let acquired = match state
+        .upstreams
+        .route_access(&model, PoolKind::Image, &access)
+    {
         Ok(a) => a,
         Err(e) => return route_error_response(e),
     };
@@ -1098,7 +1135,11 @@ pub async fn speech(State(state): State<Arc<RamaState>>, req: Request) -> Respon
             "request body is missing a string `model` field",
         );
     };
-    let acquired = match state.upstreams.route(&model, PoolKind::Speech) {
+    let access = state.pool_access_for(&user.roles);
+    let acquired = match state
+        .upstreams
+        .route_access(&model, PoolKind::Speech, &access)
+    {
         Ok(a) => a,
         Err(e) => return route_error_response(e),
     };
@@ -1218,7 +1259,20 @@ pub async fn speech_session(State(state): State<Arc<RamaState>>, req: Request) -
         return audio_response(bytes);
     }
     let spoken_len = spoken.chars().count();
-    let acquired = match state.upstreams.route(&model, PoolKind::Speech) {
+    // Gate the TTS pool to the session user's groups, same as every other route.
+    let access = {
+        let roles = crate::server::db::users::find_by_id(&state.db, &session.user_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.roles)
+            .unwrap_or_default();
+        state.pool_access_for(&roles)
+    };
+    let acquired = match state
+        .upstreams
+        .route_access(&model, PoolKind::Speech, &access)
+    {
         Ok(a) => a,
         Err(e) => return route_error_response(e),
     };
@@ -1305,13 +1359,17 @@ pub async fn speech_session(State(state): State<Arc<RamaState>>, req: Request) -
 /// Bearer auth still required because the model list itself can be sensitive.
 pub async fn list_models(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let (parts, _body) = req.into_parts();
-    let _user = match require_bearer(&state, &parts.headers).await {
+    let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
         Err(resp) => return resp,
     };
+    // Per-user model visibility: only models served by a pool this caller may
+    // access. A withheld model is also unroutable for them (see `route_access`),
+    // so the list is a true capability view, not a cosmetic filter.
+    let access = state.pool_access_for(&user.roles);
     let data: Vec<Value> = state
         .upstreams
-        .all_models()
+        .all_models_for(&access)
         .into_iter()
         .map(model_object)
         .collect();
@@ -1336,7 +1394,7 @@ pub async fn list_models(State(state): State<Arc<RamaState>>, req: Request) -> R
 /// request URI and strip the static prefix.
 pub async fn retrieve_model(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let (parts, _body) = req.into_parts();
-    let _user = match require_bearer(&state, &parts.headers).await {
+    let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
         Err(resp) => return resp,
     };
@@ -1346,7 +1404,8 @@ pub async fn retrieve_model(State(state): State<Arc<RamaState>>, req: Request) -
         .strip_prefix("/v1/models/")
         .unwrap_or_default();
     let id = percent_decode(raw);
-    if id.is_empty() || !state.upstreams.knows_any(&id) {
+    let access = state.pool_access_for(&user.roles);
+    if id.is_empty() || !state.upstreams.knows_any_for(&id, &access) {
         return model_not_found_response(&id);
     }
     (
@@ -1889,6 +1948,7 @@ async fn forward_streaming_with_tools(
     // rama::futures::channel::mpsc::unbounded matches the pattern used by
     // the chat-page SSE producer (`pages/chat/mod.rs`).
     let (mut tx, rx) = mpsc::unbounded::<Result<Bytes, std::io::Error>>();
+    let access = state.pool_access_for(&user.roles);
 
     tokio::spawn(async move {
         if let Err(err) = drive_streaming_tool_loop(
@@ -1899,6 +1959,7 @@ async fn forward_streaming_with_tools(
             tool_ctx,
             rec,
             user_mcp,
+            access,
             &mut tx,
         )
         .await
@@ -2027,6 +2088,7 @@ async fn drive_streaming_tool_loop(
     tool_ctx: ToolContext,
     rec: RecordParams,
     user_mcp: super::super::server::tools::mcp::manager::UserMcpLayer,
+    access: crate::server::upstreams::PoolAccess,
     tx: &mut mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
     use rama::futures::StreamExt;
@@ -2056,7 +2118,7 @@ async fn drive_streaming_tool_loop(
     for _round in 0..STREAM_TOOL_LOOP_MAX_ROUNDS {
         let acquired = state
             .upstreams
-            .acquire_for(&model, PoolKind::Chat)
+            .acquire_for_access(&model, PoolKind::Chat, &access)
             .map_err(|e| e.to_string())?;
         let backend_name = acquired.backend().name.clone();
         let started = Instant::now();

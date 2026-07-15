@@ -56,6 +56,12 @@ pub struct UpstreamPoolConfig {
     /// ids. Empty ⇒ always send the backend/default voice.
     #[serde(default)]
     pub voices: HashMap<String, String>,
+    /// Gateway-group names allowed to see + route to this pool. Empty (default)
+    /// = unrestricted. Managed in `/admin/upstreams` (DB), not the config file;
+    /// this field exists so the DB→registry bridge can carry it. See
+    /// `db::gateway_groups` and `Resolver::resource_allowed`.
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
     pub backend: Vec<BackendConfig>,
 }
 

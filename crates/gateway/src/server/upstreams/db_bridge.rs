@@ -67,6 +67,7 @@ pub fn snapshot_to_configs(
                 },
                 enforce_limits: pool.enforce_limits,
                 voices,
+                allowed_groups: pool.allowed_groups.clone(),
                 backend: backend_configs,
             },
         );
@@ -212,6 +213,7 @@ mod tests {
             compliance_nda: true,
             enforce_limits: true,
             sort_order: 0,
+            allowed_groups: Vec::new(),
             backends: vec!["gpu-01".into()],
             models: vec!["pool-fb".into()],
             voices: vec![VoiceRow {
@@ -277,6 +279,7 @@ mod tests {
             compliance_nda: true,
             enforce_limits: true,
             sort_order: 0,
+            allowed_groups: Vec::new(),
             backends: vec!["b".into()],
             models: vec![],
             voices: vec![],
@@ -321,6 +324,7 @@ mod tests {
             compliance_nda: true,
             enforce_limits: true,
             sort_order: 0,
+            allowed_groups: Vec::new(),
             backends: vec!["b".into()],
             models: vec![],
             voices: vec![],

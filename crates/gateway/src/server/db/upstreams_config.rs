@@ -66,6 +66,10 @@ pub struct PoolRow {
     pub compliance_nda: bool,
     pub enforce_limits: bool,
     pub sort_order: i64,
+    /// Gateway-group names allowed to see + route to this pool (JSON array in
+    /// the `allowed_groups` column). Empty = unrestricted. See
+    /// `migrations/0045_pool_allowed_groups.sql`.
+    pub allowed_groups: Vec<String>,
     pub backends: Vec<String>,
     pub models: Vec<String>,
     pub voices: Vec<VoiceRow>,
@@ -205,7 +209,8 @@ async fn load_all_backends(db: &Pool) -> Result<HashMap<String, BackendRow>, DbE
 async fn load_all_pools(db: &Pool) -> Result<Vec<PoolRow>, DbError> {
     let rows = sqlx::query(
         r#"SELECT name, kind, strategy, fallback_offline, compliance_gdpr,
-                  compliance_nda, enforce_limits, sort_order, created_at, updated_at
+                  compliance_nda, enforce_limits, sort_order, allowed_groups,
+                  created_at, updated_at
              FROM pools ORDER BY sort_order, name"#,
     )
     .fetch_all(db)
@@ -215,6 +220,12 @@ async fn load_all_pools(db: &Pool) -> Result<Vec<PoolRow>, DbError> {
     for row in &rows {
         let created_at = parse_ts("created_at", row)?;
         let updated_at = parse_ts("updated_at", row)?;
+        let allowed_groups_json: String = row.try_get("allowed_groups")?;
+        let allowed_groups: Vec<String> =
+            serde_json::from_str(&allowed_groups_json).map_err(|e| DbError::Decode {
+                column: "allowed_groups",
+                source: e.into(),
+            })?;
         pools.push(PoolRow {
             name: row.try_get("name")?,
             kind: row.try_get("kind")?,
@@ -224,6 +235,7 @@ async fn load_all_pools(db: &Pool) -> Result<Vec<PoolRow>, DbError> {
             compliance_nda: row.try_get::<i64, _>("compliance_nda")? != 0,
             enforce_limits: row.try_get::<i64, _>("enforce_limits")? != 0,
             sort_order: row.try_get("sort_order")?,
+            allowed_groups,
             backends: Vec::new(),
             models: Vec::new(),
             voices: Vec::new(),
@@ -411,8 +423,9 @@ pub async fn upsert_pool(db: &Pool, row: &PoolRow) -> Result<(), DbError> {
     sqlx::query(
         r#"INSERT INTO pools
                (name, kind, strategy, fallback_offline, compliance_gdpr,
-                compliance_nda, enforce_limits, sort_order, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                compliance_nda, enforce_limits, sort_order, allowed_groups,
+                created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(name) DO UPDATE SET
                kind             = excluded.kind,
                strategy         = excluded.strategy,
@@ -421,6 +434,7 @@ pub async fn upsert_pool(db: &Pool, row: &PoolRow) -> Result<(), DbError> {
                compliance_nda   = excluded.compliance_nda,
                enforce_limits   = excluded.enforce_limits,
                sort_order       = excluded.sort_order,
+               allowed_groups   = excluded.allowed_groups,
                updated_at       = excluded.updated_at"#,
     )
     .bind(&row.name)
@@ -431,6 +445,7 @@ pub async fn upsert_pool(db: &Pool, row: &PoolRow) -> Result<(), DbError> {
     .bind(row.compliance_nda as i64)
     .bind(row.enforce_limits as i64)
     .bind(row.sort_order)
+    .bind(serde_json::to_string(&row.allowed_groups).unwrap_or_else(|_| "[]".to_string()))
     .bind(&now)
     .bind(&now)
     .execute(db)
@@ -678,6 +693,7 @@ fn config_to_pool_row(name: &str, cfg: &UpstreamPoolConfig, sort_order: i64) -> 
         compliance_gdpr: cfg.compliance.gdpr,
         compliance_nda: cfg.compliance.nda,
         enforce_limits: cfg.enforce_limits,
+        allowed_groups: cfg.allowed_groups.clone(),
         sort_order,
         backends: cfg.backend.iter().map(|b| b.name.clone()).collect(),
         models: cfg.models.clone(),
@@ -862,6 +878,7 @@ mod tests {
             compliance_nda: true,
             enforce_limits: true,
             sort_order: 0,
+            allowed_groups: Vec::new(),
             backends: vec!["b1".into()],
             models: vec!["pool-fallback-model".into()],
             voices: vec![],
@@ -917,6 +934,7 @@ mod tests {
             compliance_nda: true,
             enforce_limits: true,
             sort_order: 0,
+            allowed_groups: Vec::new(),
             backends: vec!["tts".into()],
             models: vec![],
             voices: vec![
@@ -1009,6 +1027,7 @@ mod tests {
                 compliance_nda: true,
                 enforce_limits: true,
                 sort_order: 0,
+                allowed_groups: Vec::new(),
                 backends: vec!["b".into()],
                 models: vec!["m".into()],
                 voices: vec![VoiceRow {

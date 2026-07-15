@@ -99,7 +99,10 @@ pub struct Connector {
     pub token_url: Option<String>,
     pub registration_url: Option<String>,
     pub scopes: Vec<String>,
-    pub required_role: Option<String>,
+    /// Gateway-group names allowed to see + connect this connector. Empty =
+    /// unrestricted (everyone). Matched exactly like a pool's `allowed_groups`
+    /// (admins bypass). Replaced the former single-valued `required_role`.
+    pub allowed_groups: Vec<String>,
     pub enabled: bool,
     pub seeded: bool,
     pub created_at: Timestamp,
@@ -120,6 +123,19 @@ impl Connector {
     /// A shared, connect-once connector (vs. one each user connects themselves).
     pub fn is_global(&self) -> bool {
         self.scope == Scope::Global
+    }
+
+    /// Whether a caller holding `role_ids` (with `is_admin`) may see + connect
+    /// this connector. Mirrors `PoolAccess::allows` / `Resolver::resource_allowed`
+    /// so all three resource types gate identically: empty `allowed_groups` =
+    /// everyone, admins bypass, otherwise the caller must hold a listed group.
+    pub fn allows(&self, role_ids: &[String], is_admin: bool) -> bool {
+        if is_admin || self.allowed_groups.is_empty() {
+            return true;
+        }
+        self.allowed_groups
+            .iter()
+            .any(|g| role_ids.iter().any(|r| r == g))
     }
 }
 
@@ -144,7 +160,7 @@ pub struct ConnectorInput {
     pub token_url: Option<String>,
     pub registration_url: Option<String>,
     pub scopes: Vec<String>,
-    pub required_role: Option<String>,
+    pub allowed_groups: Vec<String>,
 }
 
 fn parse_ts(s: String, column: &'static str) -> Result<Timestamp, DbError> {
@@ -175,7 +191,10 @@ fn map_row(row: &SqliteRow) -> Result<Connector, DbError> {
         token_url: row.try_get("token_url")?,
         registration_url: row.try_get("registration_url")?,
         scopes,
-        required_role: row.try_get("required_role")?,
+        allowed_groups: {
+            let json: String = row.try_get("allowed_groups")?;
+            serde_json::from_str(&json).unwrap_or_default()
+        },
         enabled: row.try_get::<i64, _>("enabled")? != 0,
         seeded: row.try_get::<i64, _>("seeded")? != 0,
         created_at: parse_ts(row.try_get("created_at")?, "created_at")?,
@@ -185,7 +204,7 @@ fn map_row(row: &SqliteRow) -> Result<Connector, DbError> {
 
 const COLS: &str = "key, name, description, icon, category, url, auth, scope, audit, use_dcr, \
      client_id, client_secret_ct, client_secret_nonce, authorize_url, token_url, \
-     registration_url, scopes_json, required_role, enabled, seeded, created_at, updated_at";
+     registration_url, scopes_json, allowed_groups, enabled, seeded, created_at, updated_at";
 
 /// Every connector, alphabetical by display name (admin view).
 pub async fn list_all(pool: &Pool) -> Result<Vec<Connector>, DbError> {
@@ -214,11 +233,13 @@ pub async fn get(pool: &Pool, key: &str) -> Result<Option<Connector>, DbError> {
 pub async fn create(pool: &Pool, input: ConnectorInput) -> Result<(), DbError> {
     let now = Timestamp::now().to_string();
     let scopes_json = serde_json::to_string(&input.scopes).unwrap_or_else(|_| "[]".into());
+    let allowed_groups_json =
+        serde_json::to_string(&input.allowed_groups).unwrap_or_else(|_| "[]".into());
     sqlx::query(
         r#"INSERT INTO mcp_catalog_connectors
               (key, name, description, icon, category, url, auth, scope, audit, use_dcr,
                client_id, client_secret_ct, client_secret_nonce, authorize_url,
-               token_url, registration_url, scopes_json, required_role,
+               token_url, registration_url, scopes_json, allowed_groups,
                enabled, seeded, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)"#,
     )
@@ -239,7 +260,7 @@ pub async fn create(pool: &Pool, input: ConnectorInput) -> Result<(), DbError> {
     .bind(&input.token_url)
     .bind(&input.registration_url)
     .bind(&scopes_json)
-    .bind(&input.required_role)
+    .bind(&allowed_groups_json)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -253,6 +274,8 @@ pub async fn create(pool: &Pool, input: ConnectorInput) -> Result<(), DbError> {
 pub async fn update(pool: &Pool, key: &str, input: ConnectorInput) -> Result<bool, DbError> {
     let now = Timestamp::now().to_string();
     let scopes_json = serde_json::to_string(&input.scopes).unwrap_or_else(|_| "[]".into());
+    let allowed_groups_json =
+        serde_json::to_string(&input.allowed_groups).unwrap_or_else(|_| "[]".into());
     // Only overwrite the secret columns when a new secret was supplied.
     let set_secret = input.client_secret_ct.is_some();
     let sql = if set_secret {
@@ -260,13 +283,13 @@ pub async fn update(pool: &Pool, key: &str, input: ConnectorInput) -> Result<boo
                name = ?, description = ?, icon = ?, category = ?, url = ?, auth = ?,
                scope = ?, audit = ?, use_dcr = ?, client_id = ?, client_secret_ct = ?, client_secret_nonce = ?,
                authorize_url = ?, token_url = ?, registration_url = ?, scopes_json = ?,
-               required_role = ?, updated_at = ?
+               allowed_groups = ?, updated_at = ?
            WHERE key = ?"#
     } else {
         r#"UPDATE mcp_catalog_connectors SET
                name = ?, description = ?, icon = ?, category = ?, url = ?, auth = ?,
                scope = ?, audit = ?, use_dcr = ?, client_id = ?, authorize_url = ?, token_url = ?,
-               registration_url = ?, scopes_json = ?, required_role = ?, updated_at = ?
+               registration_url = ?, scopes_json = ?, allowed_groups = ?, updated_at = ?
            WHERE key = ?"#
     };
     let mut q = sqlx::query(sql)
@@ -290,7 +313,7 @@ pub async fn update(pool: &Pool, key: &str, input: ConnectorInput) -> Result<boo
         .bind(&input.token_url)
         .bind(&input.registration_url)
         .bind(&scopes_json)
-        .bind(&input.required_role)
+        .bind(&allowed_groups_json)
         .bind(&now)
         .bind(key);
     Ok(q.execute(pool).await?.rows_affected() > 0)
@@ -736,7 +759,7 @@ mod tests {
                 token_url: None,
                 registration_url: None,
                 scopes: vec!["a".into(), "b".into()],
-                required_role: None,
+                allowed_groups: Vec::new(),
             },
         )
         .await
@@ -766,7 +789,7 @@ mod tests {
                 token_url: None,
                 registration_url: None,
                 scopes: vec![],
-                required_role: None,
+                allowed_groups: Vec::new(),
             },
         )
         .await
@@ -838,7 +861,7 @@ mod tests {
             token_url: None,
             registration_url: None,
             scopes: vec![],
-            required_role: None,
+            allowed_groups: Vec::new(),
         };
         create(&pool, input(Scope::Global)).await.unwrap();
         assert_eq!(get(&pool, "g").await.unwrap().unwrap().scope, Scope::Global);

@@ -460,6 +460,7 @@ mod tests {
             "images".to_string(),
             UpstreamPoolConfig {
                 voices: Default::default(),
+                allowed_groups: Vec::new(),
                 compliance: Default::default(),
                 enforce_limits: true,
                 kind: PoolKind::Image,

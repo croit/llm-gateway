@@ -19,6 +19,13 @@ session_key_env = "GATEWAY_SESSION_KEY"
 # POST /admin/users/impersonate endpoint returns 403. Stopping an already-active
 # impersonation still works regardless.
 allow_impersonation = false
+# Break-glass admin: raw OIDC claim values (group names) that ALWAYS resolve to
+# admin, regardless of the DB group tables. Gateway groups — including which are
+# admin — are managed at /admin/groups, but if that mapping is misconfigured you
+# could lock yourself out of the very UI that fixes it. List at least one trusted
+# group here so an operator can always get in. This is the ONE RBAC decision that
+# still matches raw OIDC claims directly (the anti-lockout anchor). Empty default.
+# bootstrap_admin_groups = ["platform-admins"]
 
 # ---- Usage metrics ---------------------------------------------------------
 # Per-user / per-backend request + token accounting, surfaced at /usage (and
@@ -81,8 +88,22 @@ enabled = true
 # roles_claim = "groups"
 
 # ---- RBAC ------------------------------------------------------------------
-# Map OIDC claim values to internal role IDs, and declare what each role can
-# access. The default_role applies to every authenticated user.
+# Access control is DB-backed and managed in the UI at /admin/groups: you map
+# OIDC claim values onto clean "gateway groups" and set what each group grants
+# (admin flag, default flag, built-in tools, skills). Pools (/admin/upstreams),
+# RAG collections (/rag), and MCP connectors (/admin/connectors) then restrict
+# access by referencing those group names in their "Allowed groups" field.
+# Empty allowed-groups = visible to everyone; admins bypass all restrictions.
+#
+# The [rbac] + [[roles]] blocks below are LEGACY, seed-only: on the very first
+# boot (empty group tables) they're imported once into the DB, after which
+# /admin/groups owns everything and these blocks are ignored. A fresh
+# deployment can leave them out entirely and manage groups in the UI from the
+# start. The only RBAC bits that stay in this file are the OIDC provider setup
+# above and [gateway].bootstrap_admin_groups (the break-glass admin).
+#
+# Note: a role's `models` list is NOT seeded — model access is governed
+# per-pool now (a pool's "Allowed groups"), not per-role.
 
 # [rbac]
 # default_role = "user"

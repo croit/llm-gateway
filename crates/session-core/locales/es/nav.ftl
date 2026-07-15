@@ -51,3 +51,5 @@ impersonation-return-button = Volver a tu cuenta
 
 error-internal-heading = Error interno
 error-forbidden-heading = Prohibido
+
+nav-groups = Grupos

@@ -54,13 +54,13 @@ pub async fn integrations_index(State(state): State<Arc<RamaState>>, req: Reques
         .await
         .unwrap_or_default();
     let role_ids = state.rbac.role_ids_for(&user.roles);
+    let admin = state.rbac.is_admin(&role_ids);
 
     let mut cards: Vec<Html> = Vec::new();
     for connector in &connectors {
-        // RBAC gate: hide connectors the caller's roles don't permit.
-        if let Some(required) = &connector.required_role
-            && !role_ids.iter().any(|r| r == required)
-        {
+        // RBAC gate: hide connectors this caller's gateway groups don't permit
+        // (empty allowed_groups = everyone; admins bypass).
+        if !connector.allows(&role_ids, admin) {
             continue;
         }
         let connected = user_mcp::get_connection(&state.db, &user.id, &connector.key)
@@ -133,13 +133,8 @@ pub async fn integrations_connect(
             );
         }
     };
-    if let Some(required) = &connector.required_role
-        && !state
-            .rbac
-            .role_ids_for(&user.roles)
-            .iter()
-            .any(|r| r == required)
-    {
+    let role_ids = state.rbac.role_ids_for(&user.roles);
+    if !connector.allows(&role_ids, state.rbac.is_admin(&role_ids)) {
         return forbidden_html(&user.email, &t(lang, "integrations-error-forbidden-role"));
     }
     if connector.is_global() {
@@ -534,13 +529,8 @@ pub async fn integrations_connect_token(
             );
         }
     };
-    if let Some(required) = &connector.required_role
-        && !state
-            .rbac
-            .role_ids_for(&user.roles)
-            .iter()
-            .any(|r| r == required)
-    {
+    let role_ids = state.rbac.role_ids_for(&user.roles);
+    if !connector.allows(&role_ids, state.rbac.is_admin(&role_ids)) {
         return forbidden_html(&user.email, &t(lang, "integrations-error-forbidden-role"));
     }
     if connector.is_global() {

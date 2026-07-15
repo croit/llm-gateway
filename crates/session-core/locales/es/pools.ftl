@@ -31,3 +31,6 @@ pools-saved = pool `{ $name }` guardado — haga clic en «Aplicar cambios» par
 pools-deleted = pool `{ $name }` eliminado — haga clic en «Aplicar cambios» para recargar
 pools-fallback-saved = alternativa de { $kind } establecida en `{ $model }`
 pools-fallback-cleared = alternativa de { $kind } eliminada
+
+pools-field-allowed-groups = Grupos permitidos
+pools-field-allowed-groups-hint = Grupos del gateway (separados por comas) autorizados a ver y usar los modelos de este pool. VacÃ­o = todos. Los admins siempre tienen acceso. Gestiona los grupos en Admin â Grupos.

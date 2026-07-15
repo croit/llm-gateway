@@ -158,6 +158,7 @@ impl McpConnectionManager {
         &self,
         user_id: &str,
         role_ids: &[String],
+        is_admin: bool,
         ask: AskContext<'_>,
     ) -> UserMcpLayer {
         let keys = user_mcp::connected_keys(&self.db, user_id)
@@ -172,7 +173,7 @@ impl McpConnectionManager {
                 // (no per-user connection applies) → hide its tools.
                 _ => return None,
             };
-            if !self.role_allows(&connector, role_ids) {
+            if !self.role_allows(&connector, role_ids, is_admin) {
                 return None;
             }
             let (allow_ask, modes) = self.ask_and_modes(user_id, &key, ask).await;
@@ -198,7 +199,7 @@ impl McpConnectionManager {
             .collect();
         let global_futs = globals.into_iter().map(|connector| async move {
             let key = connector.key.clone();
-            if !self.role_allows(&connector, role_ids) {
+            if !self.role_allows(&connector, role_ids, is_admin) {
                 return None;
             }
             let (allow_ask, modes) = self.ask_and_modes(user_id, &key, ask).await;
@@ -229,14 +230,13 @@ impl McpConnectionManager {
         layer
     }
 
-    /// RBAC gate at exposure time: a connector with a `required_role` is only
-    /// exposed to users holding that role (re-checked every turn, so revoking a
-    /// role or adding a `required_role` drops the tools immediately).
-    fn role_allows(&self, connector: &Connector, role_ids: &[String]) -> bool {
-        match &connector.required_role {
-            Some(required) => role_ids.iter().any(|r| r == required),
-            None => true,
-        }
+    /// RBAC gate at exposure time: a connector restricted to `allowed_groups`
+    /// is only exposed to users holding one of those gateway groups (admins
+    /// bypass). Re-checked every turn, so revoking a group or restricting a
+    /// connector drops the tools immediately. Delegates to
+    /// [`Connector::allows`] so pools, RAG, and MCP gate identically.
+    fn role_allows(&self, connector: &Connector, role_ids: &[String], is_admin: bool) -> bool {
+        connector.allows(role_ids, is_admin)
     }
 
     /// Resolve, for one connector, whether `ask`-mode tools are exposed in this
@@ -906,7 +906,7 @@ mod tests {
             token_url: None,
             registration_url: None,
             scopes: vec![],
-            required_role: None,
+            allowed_groups: Vec::new(),
             enabled: true,
             seeded: true,
             created_at: now,
@@ -941,13 +941,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn role_allows_gates_on_required_role() {
+    async fn role_allows_gates_on_allowed_groups() {
         let mgr = manager().await;
         let mut c = global_connector(AuthKind::None);
-        assert!(mgr.role_allows(&c, &[]), "no required_role → everyone");
-        c.required_role = Some("staff".into());
-        assert!(!mgr.role_allows(&c, &["user".into()]));
-        assert!(mgr.role_allows(&c, &["user".into(), "staff".into()]));
+        assert!(
+            mgr.role_allows(&c, &[], false),
+            "empty allowed_groups → everyone"
+        );
+        c.allowed_groups = vec!["staff".into()];
+        assert!(!mgr.role_allows(&c, &["user".into()], false));
+        assert!(mgr.role_allows(&c, &["user".into(), "staff".into()], false));
+        // Admins bypass the restriction, like pools + RAG.
+        assert!(mgr.role_allows(&c, &["user".into()], true));
     }
 
     #[tokio::test]

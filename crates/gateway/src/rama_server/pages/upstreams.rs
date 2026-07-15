@@ -630,6 +630,9 @@ fn render_pool_form(
     let nda = existing.map(|p| p.compliance_nda).unwrap_or(true);
     let enforce = existing.map(|p| p.enforce_limits).unwrap_or(true);
     let models = existing.map(|p| p.models.join(", ")).unwrap_or_default();
+    let allowed_groups = existing
+        .map(|p| p.allowed_groups.join(", "))
+        .unwrap_or_default();
     let voices = existing
         .map(|p| super::pools::voice_lines(&p.voices))
         .unwrap_or_default();
@@ -716,6 +719,15 @@ fn render_pool_form(
                     placeholder: "qwen-32b, glm-4.6"
                 );
                 span(class: "text-xs text-base-content/50") { (t(lang, "pools-field-models-hint")) }
+            }
+            label(class: "flex flex-col gap-1") {
+                span(class: "text-xs opacity-70") { (t(lang, "pools-field-allowed-groups")) }
+                input(
+                    type: "text", name: "allowed_groups", value: (allowed_groups),
+                    class: "input input-bordered input-sm font-mono w-full",
+                    placeholder: "developers, network_admin"
+                );
+                span(class: "text-xs text-base-content/50") { (t(lang, "pools-field-allowed-groups-hint")) }
             }
             (voices_field)
             fieldset(class: "flex flex-col gap-1") {
@@ -1208,6 +1220,7 @@ mod tests {
             compliance_nda: true,
             enforce_limits: true,
             sort_order: 3,
+            allowed_groups: vec!["developers".into()],
             backends: vec!["gpu-01".into()],
             models: vec!["qwen-32b".into()],
             voices: vec![],

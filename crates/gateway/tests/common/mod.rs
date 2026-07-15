@@ -86,6 +86,7 @@ pub async fn state_with_pool(upstream_url: &str, kind: PoolKind, model_name: &st
         "pool".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,
@@ -115,6 +116,7 @@ pub async fn state_with_chat_and_config_transcription(
         "chat".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,
@@ -131,6 +133,7 @@ pub async fn state_with_chat_and_config_transcription(
         "voice".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,
@@ -160,6 +163,7 @@ pub async fn state_with_chat_and_embed(chat_model: &str, embed_model: &str) -> R
         "chat".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,
@@ -173,6 +177,7 @@ pub async fn state_with_chat_and_embed(chat_model: &str, embed_model: &str) -> R
         "embed".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,
@@ -212,6 +217,7 @@ async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool
         "pool".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,

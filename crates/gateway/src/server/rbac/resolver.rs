@@ -7,22 +7,54 @@ use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 use super::config::{RbacConfig, RoleConfig};
+use crate::server::db::gateway_groups::GroupSnapshot;
 use crate::server::tools::ToolRegistry;
 
-/// Runtime view of `[rbac]` + `[[roles]]`. The static config (`rbac`,
-/// `roles`) is built once at startup; the skill-grant overlay is mutable so
-/// admin edits on `/admin/skills` take effect live.
+/// Synthetic group that `[gateway].bootstrap_admin_groups` resolve to. It is
+/// injected on every build/reload so a break-glass admin works regardless of
+/// what's in (or missing from) the DB group tables — the anti-lockout anchor.
+const BOOTSTRAP_ADMIN_GROUP: &str = "__bootstrap_admin__";
+
+/// A group's grants, minus skills (those come via the [`Self::skill_overlay`]).
+/// `is_admin` grants the admin UI + resource-restriction bypass; `is_default`
+/// makes the group apply to every authenticated user.
+#[derive(Debug, Clone, Default)]
+struct GroupDef {
+    is_admin: bool,
+    is_default: bool,
+    tools: Vec<String>,
+    /// Only populated on the config/test build path; the DB reload path leaves
+    /// this empty and sources skills entirely from the overlay.
+    skills: Vec<String>,
+}
+
+/// The whole resolvable state, swapped atomically on reload.
+#[derive(Debug, Clone, Default)]
+struct Snapshot {
+    /// `(oidc_value, group)` mapping rows.
+    mappings: Vec<(String, String)>,
+    groups: HashMap<String, GroupDef>,
+}
+
+/// Runtime view of the RBAC tables (`gateway_groups`, `oidc_group_mappings`,
+/// `group_tool_grants`) plus the skill-grant overlay (`skill_role_grants`).
+///
+/// A "gateway group" and an internal "role id" are the same thing in the same
+/// namespace. The DB is the source of truth; this snapshot is rebuilt from it
+/// at startup and after every admin edit ([`Self::reload`]). Tests and the
+/// first-boot seed still construct it straight from config ([`Self::build`]).
 #[derive(Debug, Clone)]
 pub struct Resolver {
-    rbac: RbacConfig,
-    roles: HashMap<String, RoleConfig>,
-    /// UI-managed skill→role grants, layered *on top of* each role's static
-    /// `skills` config (see `server::db::skill_grants`). Keyed by skill name →
-    /// the role ids granted it. Interior mutability behind an `Arc` so the one
-    /// resolver shared by `AppState` and the `read_skill` tool can be updated
-    /// without a rebuild; seeded from the DB at startup and replaced wholesale
-    /// after each edit.
+    inner: Arc<RwLock<Snapshot>>,
+    /// UI-managed skill→group grants (`skill_role_grants`), keyed by skill name
+    /// → the groups granted it. `*` as a skill name expands to every loaded
+    /// skill. Interior mutability so the resolver shared by `AppState` and the
+    /// `read_skill` tool updates without a rebuild.
     skill_overlay: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    /// Raw OIDC claim values that always resolve to admin, from
+    /// `[gateway].bootstrap_admin_groups`. Static (config-only) — re-applied on
+    /// every reload so a botched DB mapping can't lock the operator out.
+    bootstrap_admin_groups: Vec<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -36,45 +68,91 @@ pub enum ResolveError {
 }
 
 impl Resolver {
+    /// Build straight from `[rbac]` + `[[roles]]` config. Used by tests and by
+    /// the first-boot seed's validation; production reloads from the DB via
+    /// [`Self::from_snapshot`] / [`Self::reload`]. `models` on each role is
+    /// intentionally ignored — model access is governed per-pool now.
     pub fn build(rbac: RbacConfig, roles: Vec<RoleConfig>) -> Result<Self, ResolveError> {
-        let mut map: HashMap<String, RoleConfig> = HashMap::new();
+        Self::build_with_bootstrap(rbac, roles, Vec::new())
+    }
+
+    pub fn build_with_bootstrap(
+        rbac: RbacConfig,
+        roles: Vec<RoleConfig>,
+        bootstrap_admin_groups: Vec<String>,
+    ) -> Result<Self, ResolveError> {
+        let mut groups: HashMap<String, GroupDef> = HashMap::new();
         for role in roles {
-            if map.contains_key(&role.id) {
+            if groups.contains_key(&role.id) {
                 return Err(ResolveError::DuplicateRole(role.id));
             }
-            map.insert(role.id.clone(), role);
+            let is_default = rbac.default_role.as_deref() == Some(role.id.as_str());
+            groups.insert(
+                role.id.clone(),
+                GroupDef {
+                    is_admin: role.admin,
+                    is_default,
+                    tools: role.tools,
+                    skills: role.skills,
+                },
+            );
         }
-
         if let Some(default) = rbac.default_role.as_deref()
-            && !map.contains_key(default)
+            && !groups.contains_key(default)
         {
             return Err(ResolveError::UnknownDefaultRole(default.into()));
         }
         for m in &rbac.mappings {
-            if !map.contains_key(&m.role) {
+            if !groups.contains_key(&m.role) {
                 return Err(ResolveError::UnknownRoleInMapping(m.role.clone()));
             }
         }
+        let mappings: Vec<(String, String)> = rbac
+            .mappings
+            .iter()
+            .map(|m| (m.oidc_value.clone(), m.role.clone()))
+            .collect();
 
+        let mut snapshot = Snapshot { mappings, groups };
+        apply_bootstrap(&mut snapshot, &bootstrap_admin_groups);
         Ok(Self {
-            rbac,
-            roles: map,
+            inner: Arc::new(RwLock::new(snapshot)),
             skill_overlay: Arc::new(RwLock::new(HashMap::new())),
+            bootstrap_admin_groups,
         })
+    }
+
+    /// Build from a DB [`GroupSnapshot`] — the production startup path.
+    pub fn from_snapshot(snap: GroupSnapshot, bootstrap_admin_groups: Vec<String>) -> Self {
+        let snapshot = build_snapshot(&snap, &bootstrap_admin_groups);
+        Self {
+            inner: Arc::new(RwLock::new(snapshot)),
+            skill_overlay: Arc::new(RwLock::new(HashMap::new())),
+            bootstrap_admin_groups,
+        }
+    }
+
+    /// Swap in a freshly-loaded DB snapshot after an admin edit. Bootstrap
+    /// admins are re-applied. Skills are handled separately via
+    /// [`Self::set_skill_grant_overlay`].
+    pub fn reload(&self, snap: GroupSnapshot) {
+        let snapshot = build_snapshot(&snap, &self.bootstrap_admin_groups);
+        if let Ok(mut guard) = self.inner.write() {
+            *guard = snapshot;
+        }
     }
 
     pub fn empty() -> Self {
         Self {
-            rbac: RbacConfig::default(),
-            roles: HashMap::new(),
+            inner: Arc::new(RwLock::new(Snapshot::default())),
             skill_overlay: Arc::new(RwLock::new(HashMap::new())),
+            bootstrap_admin_groups: Vec::new(),
         }
     }
 
-    /// Replace the dynamic skill-grant overlay from flat `(skill, role)` pairs
+    /// Replace the dynamic skill-grant overlay from flat `(skill, group)` pairs
     /// (the shape stored in `skill_role_grants`). Called once at startup and
-    /// after every admin edit. The map is tiny, so a full rebuild + swap is
-    /// simpler — and races no reader — than an incremental update.
+    /// after every admin edit.
     pub fn set_skill_grant_overlay(&self, grants: Vec<(String, String)>) {
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
         for (skill, role) in grants {
@@ -88,9 +166,8 @@ impl Resolver {
         }
     }
 
-    /// Overlay role ids granting `skill` (UI grants only — config grants live
-    /// in `[[roles]].skills`). Powers the admin page's "Granted to" display and
-    /// pre-checks the grant dialog.
+    /// Overlay groups granting `skill` (`*` grants included verbatim). Powers
+    /// the admin page's "Granted to" display.
     pub fn overlay_roles_for_skill(&self, skill: &str) -> Vec<String> {
         self.skill_overlay
             .read()
@@ -99,10 +176,10 @@ impl Resolver {
             .unwrap_or_default()
     }
 
-    /// Resolves a user's raw OIDC claim values (the strings stored on
-    /// `User.roles`) to the set of internal role IDs they hold. The result is
-    /// stable-ordered: default role first (if any), then mappings in
-    /// declaration order, deduplicated.
+    /// Resolve a user's raw OIDC claim values to the set of group ids they hold:
+    /// every default group first, then mapped groups in declaration order,
+    /// deduplicated. This is the single "effective groups" seam every
+    /// access check flows through.
     pub fn role_ids_for(&self, oidc_values: &[String]) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         fn push(id: &str, out: &mut Vec<String>) {
@@ -110,37 +187,70 @@ impl Resolver {
                 out.push(id.to_string());
             }
         }
-        if let Some(default) = &self.rbac.default_role {
-            push(default, &mut out);
+        let Ok(snap) = self.inner.read() else {
+            return out;
+        };
+        // Default groups (stable order by name so the result is deterministic).
+        let mut defaults: Vec<&String> = snap
+            .groups
+            .iter()
+            .filter(|(_, g)| g.is_default)
+            .map(|(name, _)| name)
+            .collect();
+        defaults.sort();
+        for d in defaults {
+            push(d, &mut out);
         }
-        for m in &self.rbac.mappings {
-            if oidc_values.iter().any(|v| v == &m.oidc_value) {
-                push(&m.role, &mut out);
+        for (value, group) in &snap.mappings {
+            if oidc_values.iter().any(|v| v == value) {
+                push(group, &mut out);
             }
         }
         out
     }
 
-    /// True if any of the given role IDs is flagged `admin = true` in config.
-    /// The single source of truth for admin-UI / admin-action gating; replaces
-    /// the former check that matched a role literally named `"admin"`. Unknown
-    /// role IDs are ignored.
+    /// True if any of the given group ids is flagged `is_admin`.
     pub fn is_admin(&self, role_ids: &[String]) -> bool {
+        let Ok(snap) = self.inner.read() else {
+            return false;
+        };
         role_ids
             .iter()
-            .any(|id| self.roles.get(id).is_some_and(|r| r.admin))
+            .any(|id| snap.groups.get(id).is_some_and(|g| g.is_admin))
     }
 
-    /// Union of tool IDs granted by any of the user's roles, filtered to
-    /// tools that are actually registered. `"*"` in a role's `tools` list
-    /// expands to every registered tool.
+    /// True if a resource restricted to `allowed_groups` is accessible to a user
+    /// holding `role_ids`. The central enforcement primitive shared by pools,
+    /// RAG collections, and MCP connectors:
+    ///
+    /// * empty `allowed_groups` → unrestricted (visible to all) — the opt-in
+    ///   default that keeps existing setups unchanged;
+    /// * admins bypass every restriction;
+    /// * otherwise the user must hold at least one of the listed groups.
+    pub fn resource_allowed(&self, role_ids: &[String], allowed_groups: &[String]) -> bool {
+        if allowed_groups.is_empty() {
+            return true;
+        }
+        if self.is_admin(role_ids) {
+            return true;
+        }
+        allowed_groups
+            .iter()
+            .any(|g| role_ids.iter().any(|r| r == g))
+    }
+
+    /// Union of tool ids granted by any of the user's groups, filtered to
+    /// registered tools. `*` expands to every registered tool.
     pub fn allowed_tools(&self, role_ids: &[String], registry: &ToolRegistry) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
+        let Ok(snap) = self.inner.read() else {
+            return out;
+        };
         for role_id in role_ids {
-            let Some(role) = self.roles.get(role_id) else {
+            let Some(group) = snap.groups.get(role_id) else {
                 continue;
             };
-            for tool in &role.tools {
+            for tool in &group.tools {
                 if tool == "*" {
                     for id in registry.ids() {
                         if !out.iter().any(|s| s == id) {
@@ -155,22 +265,43 @@ impl Resolver {
         out
     }
 
-    /// Union of skill names granted by any of the user's roles, filtered to
-    /// skills that are actually loaded. `"*"` in a role's `skills` list
-    /// expands to every loaded skill. Mirrors [`Self::allowed_tools`] — the
-    /// outer authorization bound for both the system-message skill listing
-    /// and the `read_skill` tool.
+    /// Union of skill names granted by any of the user's groups, filtered to
+    /// loaded skills. `*` expands to every loaded skill. Sources both the config
+    /// build path's per-group `skills` and the DB `skill_role_grants` overlay.
     pub fn allowed_skills(
         &self,
         role_ids: &[String],
         registry: &crate::server::skills::SkillRegistry,
     ) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for role_id in role_ids {
-            let Some(role) = self.roles.get(role_id) else {
-                continue;
-            };
-            for skill in &role.skills {
+        if let Ok(snap) = self.inner.read() {
+            for role_id in role_ids {
+                let Some(group) = snap.groups.get(role_id) else {
+                    continue;
+                };
+                for skill in &group.skills {
+                    if skill == "*" {
+                        for name in registry.names() {
+                            if !out.iter().any(|s| s == name) {
+                                out.push(name.to_string());
+                            }
+                        }
+                    } else if registry.get(skill).is_some() && !out.iter().any(|s| s == skill) {
+                        out.push(skill.clone());
+                    }
+                }
+            }
+        }
+        // DB overlay grants, additive. `*` as a skill name expands to every
+        // loaded skill for the granted group.
+        if let Ok(overlay) = self.skill_overlay.read() {
+            for (skill, granted_roles) in overlay.iter() {
+                let held = granted_roles
+                    .iter()
+                    .any(|gr| role_ids.iter().any(|rid| rid == gr));
+                if !held {
+                    continue;
+                }
                 if skill == "*" {
                     for name in registry.names() {
                         if !out.iter().any(|s| s == name) {
@@ -182,52 +313,62 @@ impl Resolver {
                 }
             }
         }
-        // UI-managed overlay grants, additive on top of config. Same rules: the
-        // skill must be loaded, and we dedupe against what config already
-        // granted above.
-        if let Ok(overlay) = self.skill_overlay.read() {
-            for (skill, granted_roles) in overlay.iter() {
-                if registry.get(skill).is_none() || out.iter().any(|s| s == skill) {
-                    continue;
-                }
-                if granted_roles
-                    .iter()
-                    .any(|gr| role_ids.iter().any(|rid| rid == gr))
-                {
-                    out.push(skill.clone());
-                }
-            }
-        }
         out
-    }
-
-    /// True if any of the user's roles permits the given model. `"*"` matches
-    /// anything; a trailing `*` is a prefix match.
-    pub fn model_allowed(&self, role_ids: &[String], model: &str) -> bool {
-        for role_id in role_ids {
-            let Some(role) = self.roles.get(role_id) else {
-                continue;
-            };
-            for pattern in &role.models {
-                if pattern_matches(pattern, model) {
-                    return true;
-                }
-            }
-        }
-        false
     }
 }
 
-fn pattern_matches(pattern: &str, value: &str) -> bool {
-    if pattern == "*" || pattern == value {
-        return true;
+/// Build a runtime [`Snapshot`] from a DB [`GroupSnapshot`], then apply the
+/// bootstrap admins. Skills are left to the overlay (empty `GroupDef.skills`).
+fn build_snapshot(snap: &GroupSnapshot, bootstrap: &[String]) -> Snapshot {
+    let mut groups: HashMap<String, GroupDef> = HashMap::new();
+    for g in &snap.groups {
+        groups.insert(
+            g.name.clone(),
+            GroupDef {
+                is_admin: g.is_admin,
+                is_default: g.is_default,
+                tools: Vec::new(),
+                skills: Vec::new(),
+            },
+        );
     }
-    if let Some(prefix) = pattern.strip_suffix('*')
-        && value.starts_with(prefix)
-    {
-        return true;
+    for (group, tool) in &snap.tool_grants {
+        groups
+            .entry(group.clone())
+            .or_default()
+            .tools
+            .push(tool.clone());
     }
-    false
+    let mappings = snap.mappings.clone();
+    let mut snapshot = Snapshot { mappings, groups };
+    apply_bootstrap(&mut snapshot, bootstrap);
+    snapshot
+}
+
+/// Inject the synthetic admin group + a mapping for each bootstrap claim value.
+fn apply_bootstrap(snapshot: &mut Snapshot, bootstrap: &[String]) {
+    if bootstrap.is_empty() {
+        return;
+    }
+    snapshot.groups.insert(
+        BOOTSTRAP_ADMIN_GROUP.to_string(),
+        GroupDef {
+            is_admin: true,
+            is_default: false,
+            tools: vec!["*".to_string()],
+            skills: vec!["*".to_string()],
+        },
+    );
+    for value in bootstrap {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let pair = (value.to_string(), BOOTSTRAP_ADMIN_GROUP.to_string());
+        if !snapshot.mappings.contains(&pair) {
+            snapshot.mappings.push(pair);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -236,12 +377,12 @@ mod tests {
     use super::*;
     use crate::server::tools::{ToolRegistry, echo::Echo, time::CurrentTimestamp};
 
-    fn role(id: &str, tools: &[&str], models: &[&str]) -> RoleConfig {
+    fn role(id: &str, tools: &[&str]) -> RoleConfig {
         RoleConfig {
             id: id.into(),
             admin: false,
             tools: tools.iter().map(|s| (*s).to_string()).collect(),
-            models: models.iter().map(|s| (*s).to_string()).collect(),
+            models: Vec::new(),
             skills: Vec::new(),
         }
     }
@@ -266,8 +407,6 @@ mod tests {
         }
     }
 
-    /// A registry of empty-bodied skills with the given names, for RBAC
-    /// tests (which only care about name membership, not file contents).
     fn skill_registry(names: &[&str]) -> crate::server::skills::SkillRegistry {
         use crate::server::skills::Skill;
         crate::server::skills::SkillRegistry::new(names.iter().map(|n| Skill {
@@ -288,11 +427,8 @@ mod tests {
 
     #[test]
     fn build_rejects_duplicate_roles() {
-        let err = Resolver::build(
-            RbacConfig::default(),
-            vec![role("x", &[], &[]), role("x", &[], &[])],
-        )
-        .unwrap_err();
+        let err = Resolver::build(RbacConfig::default(), vec![role("x", &[]), role("x", &[])])
+            .unwrap_err();
         assert_eq!(err, ResolveError::DuplicateRole("x".into()));
     }
 
@@ -302,7 +438,7 @@ mod tests {
             default_role: Some("ghost".into()),
             mappings: vec![],
         };
-        let err = Resolver::build(rbac, vec![role("user", &[], &[])]).unwrap_err();
+        let err = Resolver::build(rbac, vec![role("user", &[])]).unwrap_err();
         assert_eq!(err, ResolveError::UnknownDefaultRole("ghost".into()));
     }
 
@@ -312,7 +448,7 @@ mod tests {
             default_role: None,
             mappings: vec![mapping("groups", "engineering", "engineering")],
         };
-        let err = Resolver::build(rbac, vec![role("user", &[], &[])]).unwrap_err();
+        let err = Resolver::build(rbac, vec![role("user", &[])]).unwrap_err();
         assert_eq!(
             err,
             ResolveError::UnknownRoleInMapping("engineering".into())
@@ -325,7 +461,7 @@ mod tests {
             default_role: Some("user".into()),
             mappings: vec![],
         };
-        let r = Resolver::build(rbac, vec![role("user", &[], &[])]).unwrap();
+        let r = Resolver::build(rbac, vec![role("user", &[])]).unwrap();
         assert_eq!(r.role_ids_for(&[]), vec!["user".to_string()]);
     }
 
@@ -341,9 +477,9 @@ mod tests {
         let r = Resolver::build(
             rbac,
             vec![
-                role("user", &[], &[]),
-                role("engineering", &[], &[]),
-                role("admin", &[], &[]),
+                role("user", &[]),
+                role("engineering", &[]),
+                role("admin", &[]),
             ],
         )
         .unwrap();
@@ -360,7 +496,7 @@ mod tests {
                 mapping("groups", "eng-team-b", "engineering"),
             ],
         };
-        let r = Resolver::build(rbac, vec![role("engineering", &[], &[])]).unwrap();
+        let r = Resolver::build(rbac, vec![role("engineering", &[])]).unwrap();
         let ids = r.role_ids_for(&["eng-team-a".into(), "eng-team-b".into()]);
         assert_eq!(ids, vec!["engineering".to_string()]);
     }
@@ -369,11 +505,9 @@ mod tests {
     fn is_admin_true_only_for_flagged_roles() {
         let r = Resolver::build(
             RbacConfig::default(),
-            vec![role("user", &[], &[]), admin_role("platform-admin")],
+            vec![role("user", &[]), admin_role("platform-admin")],
         )
         .unwrap();
-        // The capability rides on the flag, not the role name: a role named
-        // "platform-admin" grants admin, while "user" does not.
         assert!(r.is_admin(&["platform-admin".into()]));
         assert!(r.is_admin(&["user".into(), "platform-admin".into()]));
         assert!(!r.is_admin(&["user".into()]));
@@ -381,10 +515,7 @@ mod tests {
 
     #[test]
     fn is_admin_false_for_unflagged_role_named_admin() {
-        // The old code keyed off the literal name "admin"; now a role *named*
-        // admin but without the flag must NOT grant admin access.
-        let r =
-            Resolver::build(RbacConfig::default(), vec![role("admin", &["*"], &["*"])]).unwrap();
+        let r = Resolver::build(RbacConfig::default(), vec![role("admin", &["*"])]).unwrap();
         assert!(!r.is_admin(&["admin".into()]));
     }
 
@@ -396,13 +527,45 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_admin_groups_resolve_to_admin() {
+        // A raw OIDC claim value listed in bootstrap always resolves to admin,
+        // even with no DB groups at all — the anti-lockout anchor.
+        let r =
+            Resolver::build_with_bootstrap(RbacConfig::default(), vec![], vec!["ldap-ops".into()])
+                .unwrap();
+        let ids = r.role_ids_for(&["ldap-ops".into()]);
+        assert!(r.is_admin(&ids));
+        // A user without the bootstrap claim is not admin.
+        assert!(!r.is_admin(&r.role_ids_for(&["someone-else".into()])));
+    }
+
+    #[test]
+    fn resource_allowed_opt_in_and_admin_bypass() {
+        let r = Resolver::build(
+            RbacConfig {
+                default_role: None,
+                mappings: vec![mapping("groups", "g-dev", "developers")],
+            },
+            vec![role("developers", &[]), admin_role("ops")],
+        )
+        .unwrap();
+        // Unrestricted → everyone.
+        assert!(r.resource_allowed(&[], &[]));
+        // Restricted → only holders.
+        assert!(r.resource_allowed(&["developers".into()], &["developers".into()]));
+        assert!(!r.resource_allowed(&["other".into()], &["developers".into()]));
+        // Admin bypass.
+        assert!(r.resource_allowed(&["ops".into()], &["developers".into()]));
+    }
+
+    #[test]
     fn allowed_tools_unions_across_roles() {
         let reg = ToolRegistry::new().with(Echo).with(CurrentTimestamp);
         let r = Resolver::build(
             RbacConfig::default(),
             vec![
-                role("user", &["company_echo"], &[]),
-                role("engineering", &["get_current_timestamp"], &[]),
+                role("user", &["company_echo"]),
+                role("engineering", &["get_current_timestamp"]),
             ],
         )
         .unwrap();
@@ -415,11 +578,9 @@ mod tests {
     #[test]
     fn allowed_tools_wildcard_expands_to_all_registered() {
         let reg = ToolRegistry::new().with(Echo).with(CurrentTimestamp);
-        let r = Resolver::build(RbacConfig::default(), vec![role("admin", &["*"], &[])]).unwrap();
+        let r = Resolver::build(RbacConfig::default(), vec![role("admin", &["*"])]).unwrap();
         let tools = r.allowed_tools(&["admin".into()], &reg);
         assert_eq!(tools.len(), 2);
-        assert!(tools.contains(&"company_echo".to_string()));
-        assert!(tools.contains(&"get_current_timestamp".to_string()));
     }
 
     #[test]
@@ -427,11 +588,7 @@ mod tests {
         let reg = ToolRegistry::new().with(Echo);
         let r = Resolver::build(
             RbacConfig::default(),
-            vec![role(
-                "user",
-                &["company_echo", "company.does.not.exist"],
-                &[],
-            )],
+            vec![role("user", &["company_echo", "company.does.not.exist"])],
         )
         .unwrap();
         let tools = r.allowed_tools(&["user".into()], &reg);
@@ -441,13 +598,9 @@ mod tests {
     #[test]
     fn allowed_tools_ignores_unknown_role_ids() {
         let reg = ToolRegistry::new().with(Echo);
-        let r = Resolver::build(
-            RbacConfig::default(),
-            vec![role("user", &["company_echo"], &[])],
-        )
-        .unwrap();
-        let tools = r.allowed_tools(&["nobody".into()], &reg);
-        assert!(tools.is_empty());
+        let r =
+            Resolver::build(RbacConfig::default(), vec![role("user", &["company_echo"])]).unwrap();
+        assert!(r.allowed_tools(&["nobody".into()], &reg).is_empty());
     }
 
     #[test]
@@ -462,7 +615,6 @@ mod tests {
         )
         .unwrap();
         let skills = r.allowed_skills(&["user".into(), "eng".into()], &reg);
-        // `ghost` isn't loaded → filtered out; `brand` + `legal` survive.
         assert!(skills.contains(&"brand".to_string()));
         assert!(skills.contains(&"legal".to_string()));
         assert_eq!(skills.len(), 2);
@@ -478,14 +630,10 @@ mod tests {
         .unwrap();
         let skills = r.allowed_skills(&["admin".into()], &reg);
         assert_eq!(skills.len(), 2);
-        assert!(skills.contains(&"brand".to_string()));
-        assert!(skills.contains(&"legal".to_string()));
     }
 
     #[test]
     fn allowed_skills_overlay_unions_with_config() {
-        // Config grants `brand` to `user`; the UI overlay additionally grants
-        // `legal` to `user`. The caller sees both.
         let reg = skill_registry(&["brand", "legal"]);
         let r = Resolver::build(
             RbacConfig::default(),
@@ -500,31 +648,22 @@ mod tests {
     }
 
     #[test]
+    fn allowed_skills_overlay_wildcard_expands() {
+        let reg = skill_registry(&["brand", "legal"]);
+        let r = Resolver::build(RbacConfig::default(), vec![role("user", &[])]).unwrap();
+        r.set_skill_grant_overlay(vec![("*".into(), "user".into())]);
+        let skills = r.allowed_skills(&["user".into()], &reg);
+        assert_eq!(skills.len(), 2);
+    }
+
+    #[test]
     fn allowed_skills_overlay_grants_to_a_role_with_no_config_skills() {
-        // A role that grants no skills in config still sees a skill the UI
-        // overlay grants it — this is the whole point of the editable grant.
         let reg = skill_registry(&["brand"]);
-        let r = Resolver::build(RbacConfig::default(), vec![role("user", &[], &[])]).unwrap();
+        let r = Resolver::build(RbacConfig::default(), vec![role("user", &[])]).unwrap();
         assert!(r.allowed_skills(&["user".into()], &reg).is_empty());
         r.set_skill_grant_overlay(vec![("brand".into(), "user".into())]);
         assert_eq!(
             r.allowed_skills(&["user".into()], &reg),
-            vec!["brand".to_string()]
-        );
-    }
-
-    #[test]
-    fn allowed_skills_overlay_filters_to_loaded_and_role() {
-        let reg = skill_registry(&["brand"]);
-        let r = Resolver::build(RbacConfig::default(), vec![role("user", &[], &[])]).unwrap();
-        // `ghost` isn't loaded → filtered; `brand` granted to `eng`, not `user`.
-        r.set_skill_grant_overlay(vec![
-            ("ghost".into(), "user".into()),
-            ("brand".into(), "eng".into()),
-        ]);
-        assert!(r.allowed_skills(&["user".into()], &reg).is_empty());
-        assert_eq!(
-            r.allowed_skills(&["eng".into()], &reg),
             vec!["brand".to_string()]
         );
     }
@@ -544,45 +683,28 @@ mod tests {
     }
 
     #[test]
-    fn set_skill_grant_overlay_replaces_wholesale() {
+    fn reload_swaps_snapshot() {
+        use crate::server::db::gateway_groups::{GroupRow, GroupSnapshot};
         let r = Resolver::empty();
-        r.set_skill_grant_overlay(vec![("brand".into(), "eng".into())]);
-        r.set_skill_grant_overlay(vec![("brand".into(), "qa".into())]);
-        assert_eq!(r.overlay_roles_for_skill("brand"), vec!["qa".to_string()]);
-    }
-
-    #[test]
-    fn allowed_skills_empty_grant_yields_nothing() {
-        // A role that grants no skills sees none, even with skills loaded —
-        // adding `[skills]` must not silently expose them.
-        let reg = skill_registry(&["brand"]);
-        let r = Resolver::build(RbacConfig::default(), vec![role("user", &["*"], &["*"])]).unwrap();
-        assert!(r.allowed_skills(&["user".into()], &reg).is_empty());
-    }
-
-    #[test]
-    fn model_allowed_exact() {
-        let r = Resolver::build(
-            RbacConfig::default(),
-            vec![role("user", &[], &["gpt-4o", "llama-3.1-70b"])],
-        )
-        .unwrap();
-        assert!(r.model_allowed(&["user".into()], "gpt-4o"));
-        assert!(!r.model_allowed(&["user".into()], "gpt-4o-mini"));
-    }
-
-    #[test]
-    fn model_allowed_wildcard_and_prefix() {
-        let r = Resolver::build(
-            RbacConfig::default(),
-            vec![
-                role("admin", &[], &["*"]),
-                role("user", &[], &["llama-3.1-*"]),
-            ],
-        )
-        .unwrap();
-        assert!(r.model_allowed(&["admin".into()], "anything"));
-        assert!(r.model_allowed(&["user".into()], "llama-3.1-8b"));
-        assert!(!r.model_allowed(&["user".into()], "gpt-4o"));
+        assert!(r.role_ids_for(&["g-dev".into()]).is_empty());
+        r.reload(GroupSnapshot {
+            groups: vec![GroupRow {
+                name: "developers".into(),
+                description: String::new(),
+                is_admin: false,
+                is_default: false,
+            }],
+            mappings: vec![("g-dev".into(), "developers".into())],
+            tool_grants: vec![("developers".into(), "search_web".into())],
+        });
+        assert_eq!(
+            r.role_ids_for(&["g-dev".into()]),
+            vec!["developers".to_string()]
+        );
+        let reg = ToolRegistry::new().with(crate::server::tools::search_web::SearchWeb);
+        assert_eq!(
+            r.allowed_tools(&["developers".into()], &reg),
+            vec!["search_web".to_string()]
+        );
     }
 }

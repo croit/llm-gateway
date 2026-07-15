@@ -136,3 +136,6 @@ rag-label-embedding-model = Модель embedding
 rag-placeholder-embedding-model-none = пулы embedding не настроены — введите id модели
 rag-option-choose-embedding-model = Выберите модель embedding…
 rag-suffix-not-advertised = (больше не предлагается)
+
+rag-label-allowed-groups = Ð Ð°Ð·ÑÐµÑÑÐ½Ð½ÑÐµ Ð³ÑÑÐ¿Ð¿Ñ
+rag-hint-allowed-groups = ÐÑÑÐ¿Ð¿Ñ ÑÐ»ÑÐ·Ð° (ÑÐµÑÐµÐ· Ð·Ð°Ð¿ÑÑÑÑ), ÐºÐ¾ÑÐ¾ÑÑÐ¼ ÑÐ°Ð·ÑÐµÑÐµÐ½Ð¾ Ð¿ÑÐ¾ÑÐ¼Ð°ÑÑÐ¸Ð²Ð°ÑÑ Ð¸ Ð¸ÑÐºÐ°ÑÑ Ð² ÑÑÐ¾Ð¹ ÐºÐ¾Ð»Ð»ÐµÐºÑÐ¸Ð¸. ÐÑÑÑÐ¾ = Ð²ÑÐµ, Ñ ÐºÐ¾Ð³Ð¾ ÐµÑÑÑ RAG-Ð¸Ð½ÑÑÑÑÐ¼ÐµÐ½ÑÑ. ÐÐ´Ð¼Ð¸Ð½Ñ Ð²ÑÐµÐ³Ð´Ð° Ð¸Ð¼ÐµÑÑ Ð´Ð¾ÑÑÑÐ¿.

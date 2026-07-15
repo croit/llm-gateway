@@ -13,6 +13,7 @@ nav-tools = Tools
 nav-tokens = Tokens
 nav-usage = Usage
 nav-users = Users
+nav-groups = Groups
 nav-models = Models
 nav-upstreams = Upstreams
 nav-rag = RAG

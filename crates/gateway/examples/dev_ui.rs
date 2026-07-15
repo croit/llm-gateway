@@ -169,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
         "chat".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,
@@ -194,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
         "voice".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,
@@ -224,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         "speech".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,
@@ -251,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
         "image".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,
@@ -340,16 +344,49 @@ async fn main() -> anyhow::Result<()> {
     // `data/skills` is gitignored local data) — keeps README screenshots clean.
     // Absolute, CARGO_MANIFEST_DIR-anchored so it resolves regardless of cwd.
     let skills_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/demo-skills");
+    // OIDC→role mapping (seed-only, mirrors a real deployment). Every signed-in
+    // user gets `user` as a baseline; team/admin roles come from their OIDC
+    // groups. `dev` carries the `platform-admins` group → resolves to admin.
+    let dev_rbac = RbacConfig {
+        default_role: Some("user".into()),
+        mappings: vec![
+            RoleMapping {
+                oidc_claim: "groups".into(),
+                oidc_value: "platform-admins".into(),
+                role: "admin".into(),
+            },
+            RoleMapping {
+                oidc_claim: "groups".into(),
+                oidc_value: "engineering".into(),
+                role: "engineering".into(),
+            },
+            RoleMapping {
+                oidc_claim: "groups".into(),
+                oidc_value: "finance".into(),
+                role: "finance".into(),
+            },
+            RoleMapping {
+                oidc_claim: "groups".into(),
+                oidc_value: "support".into(),
+                role: "support".into(),
+            },
+        ],
+    };
     let config = Config {
         skills: Some(SkillsConfig {
             dir: skills_dir.clone(),
         }),
         // Turn on impersonation so the /admin/users page renders its
         // Impersonate action column (audited in production; harmless here).
+        // `bootstrap_admin_groups` mirrors production's break-glass admin so the
+        // `dev` user stays admin even after an `/admin/groups` edit reloads the
+        // resolver from the (DB-seeded) group tables.
         gateway: GatewayConfig {
             allow_impersonation: true,
+            bootstrap_admin_groups: vec!["platform-admins".into()],
             ..Default::default()
         },
+        rbac: dev_rbac.clone(),
         roles: roles.clone(),
         // Seed a feedback config so the floating feedback button + dialog
         // render in local UI debugging. The token is a dummy — recording,
@@ -373,40 +410,23 @@ async fn main() -> anyhow::Result<()> {
         }),
         ..Config::default()
     };
-    let rbac = Arc::new(
-        Resolver::build(
-            RbacConfig {
-                // Every signed-in user gets `user` as a baseline; team/admin
-                // roles come from their OIDC groups. `dev` carries the
-                // `platform-admins` group (below) → resolves to admin.
-                default_role: Some("user".into()),
-                mappings: vec![
-                    RoleMapping {
-                        oidc_claim: "groups".into(),
-                        oidc_value: "platform-admins".into(),
-                        role: "admin".into(),
-                    },
-                    RoleMapping {
-                        oidc_claim: "groups".into(),
-                        oidc_value: "engineering".into(),
-                        role: "engineering".into(),
-                    },
-                    RoleMapping {
-                        oidc_claim: "groups".into(),
-                        oidc_value: "finance".into(),
-                        role: "finance".into(),
-                    },
-                    RoleMapping {
-                        oidc_claim: "groups".into(),
-                        oidc_value: "support".into(),
-                        role: "support".into(),
-                    },
-                ],
-            },
-            roles,
-        )
-        .expect("dev_ui RBAC build"),
-    );
+    // Seed the DB group tables from the config (mirrors main.rs first-boot
+    // seeding), then build the resolver from the DB snapshot — so `/admin/groups`
+    // shows the seeded groups and an edit + `reload_rbac` round-trips through the
+    // same DB path production uses. `bootstrap_admin_groups` keeps `dev` admin.
+    gateway::server::db::gateway_groups::seed_from_config(&pool, &dev_rbac, &config.roles)
+        .await
+        .expect("dev_ui RBAC seed");
+    let group_snapshot = gateway::server::db::gateway_groups::load_snapshot(&pool)
+        .await
+        .expect("dev_ui load groups");
+    let rbac = Arc::new(Resolver::from_snapshot(
+        group_snapshot,
+        config.gateway.bootstrap_admin_groups.clone(),
+    ));
+    if let Ok(grants) = gateway::server::db::skill_grants::all(&pool).await {
+        rbac.set_skill_grant_overlay(grants);
+    }
     let skill_store = Arc::new(SkillStore::load(skills_dir));
     let tools = Arc::new(
         ToolRegistry::new()
@@ -444,6 +464,23 @@ async fn main() -> anyhow::Result<()> {
         },
     )
     .await?;
+    // A second, NON-admin user (OIDC group `engineering` → the `engineering`
+    // gateway group, no admin flag) so RBAC enforcement can be exercised in the
+    // browser: this user only sees pools / RAG / MCP their groups permit, with
+    // no admin bypass.
+    users::upsert(
+        &state.db,
+        &users::User {
+            id: "eng".into(),
+            email: "eng@example.com".into(),
+            name: Some("Eng User".into()),
+            roles: vec!["engineering".into()],
+            created_at: now,
+            updated_at: now,
+            timezone: None,
+        },
+    )
+    .await?;
 
     // --- Seed representative (non-croit) demo data so the README pages
     // render populated instead of empty "create your first…" states.
@@ -451,6 +488,8 @@ async fn main() -> anyhow::Result<()> {
 
     let session = state.sessions.create("dev").await?;
     let cookie = state.sessions.sign(&session.id);
+    let eng_session = state.sessions.create("eng").await?;
+    let eng_cookie = state.sessions.sign(&eng_session.id);
 
     eprintln!("---------------------------------------------------------------");
     eprintln!(
@@ -460,6 +499,8 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("authed pages: /, /tokens, /chat, /theme/toggle, /api/v0/*");
     eprintln!("seed cookie (paste into playwright / curl):");
     eprintln!("    id={cookie}");
+    eprintln!("non-admin (engineering) seed cookie:");
+    eprintln!("    eng_id={eng_cookie}");
     eprintln!("---------------------------------------------------------------");
 
     // rc1's `SocketAddress: FromStr` yields a boxed error that anyhow can't

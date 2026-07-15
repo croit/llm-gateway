@@ -1,0 +1,16 @@
+groups-heading = Группы шлюза
+groups-intro = Сопоставьте значения claim'ов OIDC с понятными, независимыми от IdP именами групп и задайте, что даёт каждая группа. Пулы, RAG-коллекции и MCP-коннекторы ссылаются на эти группы по имени, чтобы ограничить, кто может их использовать.
+groups-new-heading = Новая группа
+groups-existing-heading = Группы
+groups-empty = Пока нет ни одной группы. Создайте её выше.
+groups-field-name = Имя
+groups-field-description = Описание
+groups-field-admin = Админ (даёт доступ к /admin)
+groups-field-default = По умолчанию (применяется к каждому вошедшему пользователю)
+groups-field-oidc = Значения групп OIDC
+groups-field-oidc-help = Разделённые запятыми исходные значения claim'ов из вашего IdP (например, GUID объекта Entra, DN из LDAP или простые имена групп). Любое из них включает пользователя в эту группу.
+groups-field-tools = Инструменты
+groups-field-skills = Навыки
+groups-save = Сохранить
+groups-delete = Удалить
+groups-error-name-required = Требуется имя группы.

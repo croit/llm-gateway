@@ -51,3 +51,5 @@ impersonation-return-button = 返回您的账户
 
 error-internal-heading = 内部错误
 error-forbidden-heading = 禁止访问
+
+nav-groups = 组

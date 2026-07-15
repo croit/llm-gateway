@@ -266,6 +266,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
         "embed".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,
@@ -291,6 +292,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
         "chat".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
             enforce_limits: true,

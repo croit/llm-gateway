@@ -197,8 +197,9 @@ async fn render_chat_response(
             .flatten()
             .map(|t| t.id)
     };
-    let models = list_chat_models(&state).await;
-    let transcription_models = list_transcription_models(&state).await;
+    let access = state.pool_access_for(&user.roles);
+    let models = list_chat_models(&state, &access).await;
+    let transcription_models = list_transcription_models(&state, &access).await;
     // Effort + capability menu are owner-only (a read-only viewer has no
     // composer to attach them to): a default + empty set keeps the render
     // cheap for that path.
@@ -785,8 +786,9 @@ async fn build_capabilities(
     // connector, keyed `mcp__<connector>` — that single toggle governs every
     // tool the connector bridges (`entry_key_for` collapses `mcp__x__*` to
     // `mcp__x`), so enabling it exposes the whole integration to the model.
-    // Only catalog-enabled connectors passing the `required_role` gate appear.
+    // Only catalog-enabled connectors passing the `allowed_groups` gate appear.
     let role_ids = state.role_ids_for(&user.roles);
+    let admin = state.rbac.is_admin(&role_ids);
     if let Ok(connected) = crate::server::db::user_mcp::connected_keys(&state.db, &user.id).await {
         for ck in connected {
             let Ok(Some(c)) = crate::server::db::mcp_catalog::get(&state.db, &ck).await else {
@@ -795,9 +797,7 @@ async fn build_capabilities(
             if !c.enabled {
                 continue;
             }
-            if let Some(req) = &c.required_role
-                && !role_ids.iter().any(|r| r == req)
-            {
+            if !c.allows(&role_ids, admin) {
                 continue;
             }
             let key = format!("{}{ck}", crate::server::tools::mcp::MCP_ID_PREFIX);
@@ -1651,11 +1651,14 @@ fn first_message_title(msg: &str) -> String {
     }
 }
 
-async fn list_transcription_models(state: &RamaState) -> Vec<String> {
+async fn list_transcription_models(
+    state: &RamaState,
+    access: &crate::server::upstreams::PoolAccess,
+) -> Vec<String> {
     use crate::server::feature_defaults::{self, Feature};
     let mut models = state
         .upstreams
-        .models_for_kind(crate::server::upstreams::PoolKind::Transcription);
+        .models_for_kind_for(crate::server::upstreams::PoolKind::Transcription, access);
     // Move the operator-configured default (if still served) to the front so
     // the voice picker's first-option-wins default pre-selects it.
     let configured = feature_defaults::get(&state.db, Feature::Transcription).await;
@@ -1663,11 +1666,14 @@ async fn list_transcription_models(state: &RamaState) -> Vec<String> {
     models
 }
 
-async fn list_chat_models(state: &RamaState) -> Vec<render::ChatModelOption> {
+async fn list_chat_models(
+    state: &RamaState,
+    access: &crate::server::upstreams::PoolAccess,
+) -> Vec<render::ChatModelOption> {
     use crate::server::feature_defaults::{self, Feature};
     let mut models: Vec<render::ChatModelOption> = state
         .upstreams
-        .models_with_compliance_for_kind(crate::server::upstreams::PoolKind::Chat)
+        .models_with_compliance_for_kind_for(crate::server::upstreams::PoolKind::Chat, access)
         .into_iter()
         .map(|(id, c)| render::ChatModelOption {
             id,
