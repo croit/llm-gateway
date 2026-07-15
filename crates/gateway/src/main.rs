@@ -389,6 +389,26 @@ async fn main() -> anyhow::Result<()> {
         state = state.with_skills(store);
     }
 
+    // Web Push: load (or first-time generate + persist) the VAPID keypair and
+    // wire the sender in. Disabled via `[push] enabled = false`; a keypair
+    // failure logs and leaves push off rather than blocking boot.
+    if state.config.push.enabled {
+        match srv::push::PushSender::new(
+            &state.db,
+            &state.crypto,
+            state.config.push.contact.clone(),
+        )
+        .await
+        {
+            Ok(sender) => state = state.with_push(std::sync::Arc::new(sender)),
+            Err(err) => {
+                tracing::warn!(error = %err, "Web Push disabled: could not initialize VAPID key")
+            }
+        }
+    } else {
+        tracing::info!("Web Push disabled via [push].enabled = false");
+    }
+
     // GeoIP (client-IP → coarse location) for the `get_user_location`
     // tool. Optional: with no `[geoip]` block we skip it entirely. A
     // missing DB file is fine — the handle loads lazily, hot-reloads when

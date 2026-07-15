@@ -92,6 +92,14 @@ impl RamaState {
         self.usage = usage;
         self
     }
+
+    /// Install the Web Push sender on the wrapped [`AppState`]. Production
+    /// installs it on the `AppState` before `RamaState::new`; this mirror lets
+    /// callers (and tests) opt into push after the fact.
+    pub fn with_push(mut self, push: Arc<crate::server::push::PushSender>) -> Self {
+        self.inner = self.inner.with_push(push);
+        self
+    }
 }
 
 impl Deref for RamaState {

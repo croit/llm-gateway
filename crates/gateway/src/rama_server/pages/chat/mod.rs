@@ -1501,12 +1501,131 @@ async fn spawn_assistant_worker(
     let worker_for_task = worker.clone();
     let user_id_for_clear = user.id.clone();
     let pool_for_worker = state.db.clone();
+    let session_id_for_push = session_id.to_string();
+    let turn_id_for_push = assistant_turn_id.to_string();
     tokio::spawn(async move {
         session_core::worker::run_session_turn(pool_for_worker, driver, driver_ctx).await;
         worker_state
             .chats
             .clear(&user_id_for_clear, &worker_for_task);
+        // Turn's done — ping the user's subscribed browsers (no-op unless push
+        // is enabled and they opted in). Runs after the worker so the row is
+        // finalized and the status is readable.
+        notify_turn_complete(
+            &worker_state,
+            &user_id_for_clear,
+            &session_id_for_push,
+            &turn_id_for_push,
+        )
+        .await;
     });
+}
+
+/// Fire a Web Push "turn finished" notification to the user's subscribed
+/// browsers once a turn they started finalizes.
+///
+/// No-op unless push is enabled and the user has at least one subscription.
+/// Best-effort: every failure is logged, never surfaced — the turn itself
+/// already succeeded. Subscriptions the push service reports gone (404/410)
+/// are pruned. The server always sends; whether the user is *actually* looking
+/// at the app is decided client-side in the service worker, which suppresses
+/// the notification when a focused tab already has this conversation open.
+/// Truncate `s` to at most `max` chars on a char boundary, appending `…` when
+/// it was cut. Keeps the push notification title within the payload budget.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+async fn notify_turn_complete(
+    state: &RamaState,
+    user_id: &str,
+    session_id: &str,
+    assistant_turn_id: &str,
+) {
+    use crate::server::push::{PushMessage, SendOutcome};
+    use session_core::db::TurnStatus;
+
+    let Some(push) = state.push.clone() else {
+        return;
+    };
+
+    // Only notify on a real end state. `Cancelled` means the user pressed stop
+    // (they're present), and `InProgress` shouldn't reach here.
+    let turns = match session_core::db::list_turns(&state.db, session_id).await {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::warn!(error = %err, "push: reading finalized turn");
+            return;
+        }
+    };
+    let Some(view) = turns.iter().find(|t| t.turn.id == assistant_turn_id) else {
+        return;
+    };
+    let errored = match view.turn.status {
+        TurnStatus::Completed => false,
+        TurnStatus::Errored => true,
+        _ => return,
+    };
+
+    let subs = match crate::server::db::push_subscriptions::list_for_user(&state.db, user_id).await
+    {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => return,
+        Err(err) => {
+            tracing::warn!(error = %err, "push: listing subscriptions");
+            return;
+        }
+    };
+
+    // Conversation title for the heading; an untitled chat gets a localized
+    // fallback per subscription below.
+    let session_title = session_core::db::get_session(&state.db, user_id, session_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| s.title)
+        .filter(|t| !t.trim().is_empty());
+
+    let url = format!("/chat/{session_id}");
+    for sub in subs {
+        let lang = sub
+            .lang
+            .as_deref()
+            .and_then(Lang::from_code)
+            .unwrap_or(Lang::En);
+        // Cap the title: it's a user-influenced conversation title, and the
+        // whole payload rides in one aes128gcm record with a 4 KB budget (and
+        // FCM's own 4 KB body cap). 80 chars is plenty for a heading.
+        let title = session_title
+            .clone()
+            .map(|t| truncate_chars(&t, 80))
+            .unwrap_or_else(|| t(lang, "push-untitled-conversation"));
+        let body = t(
+            lang,
+            if errored {
+                "push-turn-error-body"
+            } else {
+                "push-turn-complete-body"
+            },
+        );
+        let message = PushMessage {
+            title,
+            body,
+            url: url.clone(),
+            tag: session_id.to_string(),
+        };
+        if push.send(&sub, &message).await == SendOutcome::Gone
+            && let Err(err) =
+                crate::server::db::push_subscriptions::delete(&state.db, &sub.id).await
+        {
+            tracing::warn!(error = %err, "push: pruning gone subscription");
+        }
+    }
 }
 
 /// Spawn a fresh assistant turn for the (already-truncated) session and

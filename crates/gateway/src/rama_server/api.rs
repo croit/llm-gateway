@@ -568,6 +568,133 @@ pub async fn delete_token(
 }
 
 // ---------------------------------------------------------------------------
+// Web Push (turn-complete notifications)
+
+/// GET /api/v0/push/config — what the client needs to decide whether to offer
+/// the "enable notifications" control and, if so, to subscribe:
+/// `{ "enabled": bool, "publicKey": <VAPID key base64url>|null }`.
+pub async fn push_config(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    if let Err(resp) = require_session(&state, &req).await {
+        return resp;
+    }
+    match state.push.as_ref() {
+        Some(push) => json_ok(&json!({ "enabled": true, "publicKey": push.public_key() })),
+        None => json_ok(&json!({ "enabled": false, "publicKey": null })),
+    }
+}
+
+/// POST /api/v0/push/subscribe — register this browser's push subscription for
+/// the signed-in user. Body is the browser's `PushSubscription.toJSON()`:
+/// `{ "endpoint": "...", "keys": { "p256dh": "...", "auth": "..." } }`.
+pub async fn push_subscribe(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let session = match require_session(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    if state.push.is_none() {
+        return error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "push_disabled",
+            "push notifications are disabled on this gateway",
+        );
+    }
+    let user_agent = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    // Capture the browser's UI language now (from the `lang` cookie) so the
+    // detached turn-complete send can localize the notification per device.
+    let lang = session_core::i18n::Lang::from_request(req.headers())
+        .code()
+        .to_string();
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return invalid_request(&msg),
+    };
+    #[derive(serde::Deserialize)]
+    struct Keys {
+        p256dh: String,
+        auth: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Body {
+        endpoint: String,
+        keys: Keys,
+    }
+    let parsed: Body = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(err) => {
+            return invalid_request(&format!(
+                "expected {{\"endpoint\":…,\"keys\":{{\"p256dh\":…,\"auth\":…}}}}: {err}"
+            ));
+        }
+    };
+    // Validate before storing: the gateway later POSTs to `endpoint` on turn
+    // completion, so reject non-https / private / loopback targets (blind-SSRF
+    // guard) and key material that could only ever fail to encrypt.
+    if let Err(msg) = crate::server::push::validate_subscription(
+        &parsed.endpoint,
+        &parsed.keys.p256dh,
+        &parsed.keys.auth,
+    ) {
+        return invalid_request(&msg);
+    }
+    if let Err(err) = crate::server::db::push_subscriptions::upsert(
+        &state.db,
+        &session.user_id,
+        &parsed.endpoint,
+        &parsed.keys.p256dh,
+        &parsed.keys.auth,
+        Some(lang.as_str()),
+        user_agent.as_deref(),
+    )
+    .await
+    {
+        tracing::warn!(error = %err, "storing push subscription");
+        return internal_error("could not store subscription");
+    }
+    json_ok(&json!({ "ok": true }))
+}
+
+/// POST /api/v0/push/unsubscribe — forget a browser subscription (the user
+/// turned notifications off, or the browser rotated it). Body:
+/// `{ "endpoint": "..." }`.
+pub async fn push_unsubscribe(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let session = match require_session(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return invalid_request(&msg),
+    };
+    #[derive(serde::Deserialize)]
+    struct Body {
+        endpoint: String,
+    }
+    let parsed: Body = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(err) => return invalid_request(&format!("expected {{\"endpoint\":…}}: {err}")),
+    };
+    // Scoped to the caller: a user can only forget their OWN subscription, so
+    // knowing another user's (opaque) endpoint can't be used to unsubscribe them.
+    if let Err(err) = crate::server::db::push_subscriptions::delete_by_endpoint(
+        &state.db,
+        &session.user_id,
+        &parsed.endpoint,
+    )
+    .await
+    {
+        tracing::warn!(error = %err, "deleting push subscription");
+        return internal_error("could not remove subscription");
+    }
+    json_ok(&json!({ "ok": true }))
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers (response builders + utilities)
 
 fn to_summary(t: tokens::Token, disabled_tools: Vec<String>) -> TokenSummary {

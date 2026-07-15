@@ -360,3 +360,22 @@ enabled = true
 # extraction_model  = ""                 # "text model": chat model for voice→fields; empty = first available chat model
 # voice_model       = ""                 # "voice model": transcription model for the recording; empty = first available transcription model
 # github_api_base   = "https://api.github.com"          # override for GitHub Enterprise
+
+# --- Web Push notifications --------------------------------------------
+# "Your turn finished" push notifications for the installed PWA: when an
+# assistant turn a user started completes while the app isn't focused, their
+# opted-in browsers get a notification. Requires HTTPS (localhost exempt for
+# dev) — a service worker + the Push API only run on secure origins.
+#
+# This works out of the box: a VAPID keypair is generated on first boot and
+# persisted in the DB (private half sealed under the at-rest key), and NO
+# third-party push provider/account is involved beyond the browser's own push
+# service. Nothing is ever sent until a user opts in from the /tokens page.
+#
+# The block is optional — these are the defaults. Set `enabled = false` to
+# turn the feature (and its /api/v0/push/* endpoints) off entirely, and set
+# `contact` to a real address for production (it's the VAPID `sub` claim the
+# push service may use to reach you; not verified, but must be a valid URI).
+# [push]
+# enabled = true
+# contact = "mailto:admin@example.com"

@@ -45,6 +45,14 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_get("/assets/datastar.js", assets::datastar_js)
         .with_get("/assets/app.js", assets::app_js)
         .with_get("/assets/pcm-recorder.js", assets::pcm_recorder_js)
+        // PWA installability: manifest, service worker, favicon, icons.
+        // All public (no session check) — the SW needs root-scope
+        // access and the manifest/icons are referenced from `<head>`
+        // before any auth redirect.
+        .with_get("/manifest.webmanifest", assets::manifest_webmanifest)
+        .with_get("/sw.js", assets::sw_js)
+        .with_get("/favicon.ico", assets::favicon)
+        .with_get("/icons/{*name}", assets::icon)
         // Page handlers — server-rendered HTML, plait + daisyUI.
         // `/` is the chat surface: a plain navigation 303s into the
         // latest (or a fresh) `/chat/{id}`; a Datastar nav renders chat
@@ -242,6 +250,9 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/api/v0/transcriptions", proxy::transcribe_session)
         .with_get("/api/v0/transcription_models", api::transcription_models)
         .with_post("/api/v0/speech", proxy::speech_session)
+        .with_get("/api/v0/push/config", api::push_config)
+        .with_post("/api/v0/push/subscribe", api::push_subscribe)
+        .with_post("/api/v0/push/unsubscribe", api::push_unsubscribe)
         .with_post("/api/v0/me/timezone", api::set_timezone)
         .with_post("/api/v0/me/location", api::set_location)
         .with_delete("/api/v0/me/location", api::clear_location)

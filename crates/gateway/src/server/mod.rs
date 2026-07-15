@@ -23,6 +23,7 @@ pub mod image_gen;
 pub mod limits;
 pub mod model_defaults;
 pub mod pdf;
+pub mod push;
 pub mod rag;
 pub mod rbac;
 pub mod reasoning;

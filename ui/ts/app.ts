@@ -28,6 +28,7 @@ import './chat/actions.js';
 import './clipboard.js';
 import './canvas.js';
 import './geo.js';
+import './push.js';
 import './feedback.js';
 import { initFeedbackCapture } from './feedback-capture.js';
 
@@ -143,3 +144,15 @@ document.addEventListener('submit', (ev) => {
 window.addEventListener('popstate', () => {
     location.reload();
 });
+
+// ---- Service worker registration --------------------------------------
+//
+// Registers /sw.js so the app is installable (PWA). The SW itself is
+// scope-rooted at / and handles caching strategy; this registration is
+// fire-and-forget. Guarded for browsers without SW support and wrapped
+// in try/catch so a registration failure never breaks the page.
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+    });
+}

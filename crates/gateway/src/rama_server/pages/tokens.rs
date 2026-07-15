@@ -89,7 +89,7 @@ pub async fn tokens_index(State(state): State<Arc<RamaState>>, req: Request) -> 
             disabled,
         ));
     }
-    let body = render_tokens_body(&rows, &entries, None, &account, lang);
+    let body = render_tokens_body(&rows, &entries, None, &account, state.push.is_some(), lang);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     nav_or_html_page(
         datastar,
@@ -618,6 +618,7 @@ fn render_tokens_body(
     entries: &[ToolEntry],
     minted: Option<&MintedBanner>,
     account: &AccountSummary,
+    push_enabled: bool,
     lang: Lang,
 ) -> Html {
     // The banner is either the rendered minted-card or an empty
@@ -627,6 +628,14 @@ fn render_tokens_body(
         Some(b) => render_minted_banner(b, lang),
         None => empty_banner_placeholder(),
     };
+    // Web Push opt-in card — only when the gateway has push enabled. The card
+    // is device-local (JS reveals + wires it via `ui/ts/push.ts`), so it ships
+    // hidden with every string as a `data-msg-*` attribute.
+    let push_card = if push_enabled {
+        render_push_card(lang)
+    } else {
+        html! {}.to_html()
+    };
     html! {
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
         h1(class: "text-2xl font-bold mb-2") { (t(lang, "tokens-page-heading")) }
@@ -635,6 +644,8 @@ fn render_tokens_body(
         }
 
         (banner)
+
+        (push_card)
 
         // datastar @post: form submission is intercepted, the form is
         // serialised + POSTed, and the response (SSE) patches the page
@@ -1085,6 +1096,51 @@ fn render_minted_banner(banner: &MintedBanner, lang: Lang) -> Html {
 fn empty_banner_placeholder() -> Html {
     html! {
         div(id: "token-minted-banner") {}
+    }
+    .to_html()
+}
+
+/// The "Notifications" card on `/tokens`. Ships hidden with every user-visible
+/// string as a `data-msg-*` attribute; `ui/ts/push.ts` reveals it, reflects
+/// this browser's subscription state into `[data-push-status]`, and shows the
+/// enable/disable button that applies. Device-local state, so all the logic is
+/// client-side — the server only renders the (localized) shell.
+fn render_push_card(lang: Lang) -> Html {
+    html! {
+        section(
+            class: "card border border-base-300 mb-6",
+            "data-push-card": "",
+            hidden: "hidden",
+            "data-msg-on": (t(lang, "tokens-push-on")),
+            "data-msg-off": (t(lang, "tokens-push-off")),
+            "data-msg-denied": (t(lang, "tokens-push-denied")),
+            "data-msg-unsupported": (t(lang, "tokens-push-unsupported")),
+            "data-msg-enabled": (t(lang, "tokens-push-enabled")),
+            "data-msg-disabled": (t(lang, "tokens-push-disabled")),
+            "data-msg-error": (t(lang, "tokens-push-error"))
+        ) {
+            div(class: "card-body") {
+                h2(class: "card-title") { (t(lang, "tokens-push-heading")) }
+                p(class: "text-base-content/70") { (t(lang, "tokens-push-description")) }
+                p(class: "text-sm text-base-content/60", "data-push-status") {}
+                div(class: "card-actions justify-end mt-2") {
+                    button(
+                        type: "button",
+                        class: "btn btn-primary",
+                        "data-push-enable": "",
+                        hidden: "hidden",
+                        "data-on:click": "window.gatewayPush.enable(el)"
+                    ) { (t(lang, "tokens-push-enable")) }
+                    button(
+                        type: "button",
+                        class: "btn btn-ghost",
+                        "data-push-disable": "",
+                        hidden: "hidden",
+                        "data-on:click": "window.gatewayPush.disable(el)"
+                    ) { (t(lang, "tokens-push-disable")) }
+                }
+            }
+        }
     }
     .to_html()
 }

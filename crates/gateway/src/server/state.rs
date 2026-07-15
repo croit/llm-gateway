@@ -57,6 +57,10 @@ pub struct AppState {
     /// per-template toggle row — the human title isn't in the tool schema.
     /// Empty when `[typst]` isn't configured.
     pub typst_templates: Arc<Vec<crate::server::tools::catalog::TemplateMeta>>,
+    /// Web Push sender (VAPID keypair + HTTP client). `None` when `[push]
+    /// enabled = false`; the push endpoints then report "disabled" and the
+    /// turn-complete hook is a no-op. Built at startup by [`Self::with_push`].
+    pub push: Option<Arc<crate::server::push::PushSender>>,
 }
 
 impl AppState {
@@ -86,6 +90,7 @@ impl AppState {
             crypto,
             mcp,
             typst_templates: Arc::new(Vec::new()),
+            push: None,
         }
     }
 
@@ -240,6 +245,13 @@ impl AppState {
 
     pub fn with_skills(mut self, skills: Arc<SkillStore>) -> Self {
         self.skills = Some(skills);
+        self
+    }
+
+    /// Install the Web Push sender (VAPID keypair + HTTP client). Called at
+    /// startup only when `[push] enabled = true`.
+    pub fn with_push(mut self, push: Arc<crate::server::push::PushSender>) -> Self {
+        self.push = Some(push);
         self
     }
 

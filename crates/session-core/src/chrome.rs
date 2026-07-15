@@ -668,6 +668,25 @@ pub fn html_response(body: String) -> Response {
         .into_response()
 }
 
+/// The PWA `<head>` markup — manifest link, both theme-color metas,
+/// apple-touch-icon, and favicon. Shared by every layout (this one and
+/// the gateway's authed shell) so the manifest path, theme colors, and
+/// icon links stay in lockstep; changing them in one place is enough.
+///
+/// Mirrored onto the login/error chrome too so that page is also
+/// installable (Chrome's install prompt needs the manifest link present
+/// on whatever page is open).
+pub fn pwa_head_links() -> Html {
+    html! {
+        link(rel: "manifest", href: "/manifest.webmanifest");
+        meta(name: "theme-color", content: "#1d1d1b", media: "(prefers-color-scheme: dark)");
+        meta(name: "theme-color", content: "#ffffff", media: "(prefers-color-scheme: light)");
+        link(rel: "apple-touch-icon", href: (assets::apple_touch_icon_url()));
+        link(rel: "icon", href: "/favicon.ico");
+    }
+    .to_html()
+}
+
 /// Minimal `<html>` chrome — daisyUI stylesheet + datastar runtime +
 /// a slot for `body`. No sidebar; used by the login/error pages and
 /// anything else that doesn't sit inside the authed app shell.
@@ -687,6 +706,8 @@ pub fn layout(theme: Theme, lang: Lang, next: &str, title: &str, body: Html) -> 
                 meta(name: "viewport", content: "width=device-width, initial-scale=1");
                 title { (title) }
                 link(rel: "stylesheet", href: (css_href));
+                // PWA: manifest, theme-color, apple-touch-icon, favicon.
+                (pwa_head_links())
                 script(type: "module", src: (datastar_src)) {}
             }
             body(class: "min-h-dvh bg-base-100 text-base-content") {

@@ -27,6 +27,10 @@ These are pre-approved; just add them to the relevant crate's `Cargo.toml` (refe
 | `sqlx` (sqlite, runtime-tokio-rustls, macros, migrate) | `gateway` | Persistence for users, gateway tokens, sessions, pending_logins, audit log. |
 | `hmac` + `sha2` | `gateway` | HMAC-SHA256 for the signed session cookie; SHA-256 for indexed bearer-token lookup. Tokens are 256-bit OS-random opaque strings, so argon2id would only add CPU cost without security gain. |
 | `rand` (with OsRng) | `gateway` | Session IDs and new gateway tokens from the OS RNG. |
+| `aes-gcm` | `gateway` | AES-256-GCM for at-rest secret sealing (`server::crypto`: MCP OAuth tokens, connector secrets, backend API keys) and AES-128-GCM for Web Push payload encryption (`server::push`, RFC 8291). |
+| `p256` (+ `ecdh`) | `gateway` | Web Push (`server::push`): P-256 ECDSA (ES256) for VAPID request signing (RFC 8292) + P-256 ECDH for payload encryption (RFC 8291). Already in the tree via `jsonwebtoken`; the `ecdh` feature is the only real addition. |
+| `hkdf` | `gateway` | HKDF-SHA256 key schedule for RFC 8291 Web Push payload encryption (`server::push`). Already transitive via `elliptic-curve`. |
+| `base64` | `gateway` | base64url (no-pad) for the Web Push wire format (`server::push`): VAPID JWT segments, the VAPID public key, and decoding subscription keys. Unconditionally in the tree already via `reqwest`/`hyper` (see the note below on why this is no longer avoided). |
 | `uuid` (v4, serde) | `gateway` | Stable IDs for tokens. |
 | `url` | `gateway` | OIDC redirect-URI construction and parsing. |
 | `clap` (derive) | `sandbox-runner` | Argument parsing. The standard. |
@@ -60,6 +64,8 @@ Detailed rationale that's too long for the table cells above.
 **`lumis` — grammar set, licensing, and themes.** We enable lumis' full `all-languages` set **minus `lang-caddy`**: `tree-sitter-caddy` is GPL-3.0, the only copyleft grammar in the set, and would force the binary to GPL — incompatible with our AGPL-3.0 license. The remaining ~116 grammars (all MIT/Apache-2.0) compile via build.rs, adding a few seconds to cold builds. The trade-off is accepted so anything an LLM emits (svelte, zig, terraform, kotlin, …) renders coloured rather than monochrome; only Caddyfile blocks fall back to plain text. Highlighting is rendered to inline-styled spans by the chat-render post-pass — no client-side highlighter on top of datastar. Light/dark switching uses `HtmlMultiThemesBuilder` with `tokyonight_day` + `tokyonight_night` and `default_theme = "light-dark()"`, so the browser flips colours from the document's `color-scheme` (which daisyUI sets per `data-theme`) without a re-render.
 
 **`fluent-templates`/`fluent-bundle` — transitive `once_cell`.** The Fluent stack's own transitive deps (`unic-langid-impl`, `intl-memoizer`) use `once_cell` internally. The "explicitly not allowed" rule below is about *direct* additions to code we write — it doesn't reach into an approved crate's own dependency choices, so this isn't an oversight of that rule.
+
+**`base64` — why it's no longer hand-rolled.** It used to sit in "not allowed": `rama_server::session` (and an OIDC test) carry a tiny inline `base64url_nopad` to save a transitive dep. That rationale is now moot — `reqwest`/`hyper-util` pull `base64` unconditionally, so it's compiled regardless. `server::push` needs both base64url encode **and** validating decode across several call sites (VAPID JWT, subscription keys), where the crate's `URL_SAFE_NO_PAD` engine is safer than growing the hand-rolled helper. The existing inline helpers are left as-is (not worth the churn); new code uses the crate.
 
 **`pdfium-render` — the runtime native-library exception.** This is the one runtime native-library exception to the static-binary rule. It loads Chromium's `pdfium` (BSD-3) *dynamically at runtime* via pre-generated bindings, so there's no bindgen/clang at build time and the build never needs the lib. It's optional: with no `pdfium` deployed, the `mode="images"` tier returns a clean "renderer unavailable" note (`server::pdf::bind_pdfium`) and the text tier is unaffected. Operators enable it by dropping `libpdfium` on the system search path or pointing `PDFIUM_LIB_PATH` at it.
 
@@ -98,7 +104,6 @@ Neither file pulls in a project-level `package.json` or `node_modules` — both 
 | `figment` | Hand-roll config layering until it stops being trivial. |
 | `axum`, `tower-sessions`, `tower-http` | The server stack is rama-only. Sessions are hand-rolled (`rama_server::session`); HTTP-layer concerns ride on rama services. Bringing axum back would mean running two routers in parallel. |
 | `dioxus`, `dioxus-primitives`, `dioxus-icons` | Dropped during the rama spike. Replaced by plait (server-rendered HTML) + daisyUI v5 (Tailwind v4 component classes) + datastar (SSE-driven DOM patches). |
-| `base64` | Hand-rolled `base64url_nopad` in two places (`rama_server::session`, `tests/oidc_integration.rs`) — saves a transitive dep. |
 
 ## Adding a dep — checklist
 

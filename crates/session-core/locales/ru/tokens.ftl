@@ -78,3 +78,17 @@ tokens-unknown-tool = Неизвестный инструмент.
 tokens-save-pref-failed = Не удалось сохранить настройку.
 tokens-capability-enabled-toast = { $name } включён для этого токена.
 tokens-capability-disabled-toast = { $name } отключён для этого токена.
+
+# Web Push "turn complete" opt-in card (rendered by `render_push_card`; wired
+# client-side by `ui/ts/push.ts`). Device-local notification settings.
+tokens-push-heading = Уведомления
+tokens-push-description = Получайте уведомление на этом устройстве, когда начатый вами ответ завершится, пока вы не в приложении.
+tokens-push-enable = Включить на этом устройстве
+tokens-push-disable = Выключить на этом устройстве
+tokens-push-on = Уведомления включены для этого устройства.
+tokens-push-off = Уведомления выключены для этого устройства.
+tokens-push-denied = Этот браузер заблокировал уведомления. Разрешите их в настройках браузера, чтобы включить.
+tokens-push-unsupported = Этот браузер не поддерживает уведомления.
+tokens-push-enabled = Уведомления включены на этом устройстве.
+tokens-push-disabled = Уведомления выключены на этом устройстве.
+tokens-push-error = Не удалось изменить настройки уведомлений.

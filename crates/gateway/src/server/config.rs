@@ -142,6 +142,38 @@ pub struct Config {
     /// `fallback_offline`, not here.
     #[serde(default)]
     pub fallback: FallbackConfig,
+    /// Web Push notifications ("your turn finished"). Optional — with no
+    /// `[push]` block it uses the defaults below (enabled, placeholder
+    /// contact), which is fine: a VAPID keypair is generated on first boot
+    /// and nothing is sent until a user opts in from the browser. Set
+    /// `[push] enabled = false` to turn the feature (and its endpoints) off.
+    #[serde(default)]
+    pub push: PushConfig,
+}
+
+/// Web Push settings. Everything needed to send is self-generated (the VAPID
+/// keypair persists in the DB); the only operator-facing knob besides the
+/// master switch is the VAPID `contact`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PushConfig {
+    /// Master switch. `true` (default) serves the push endpoints and fires
+    /// turn-complete notifications to opted-in browsers.
+    pub enabled: bool,
+    /// The VAPID `sub` claim: a `mailto:` or `https:` URI the push service can
+    /// use to contact the operator about this application server. Not verified
+    /// for reachability, but must be a well-formed URI. Override with a real
+    /// address for production.
+    pub contact: String,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            contact: "mailto:admin@example.com".to_string(),
+        }
+    }
 }
 
 /// Feedback-widget settings: where issues are filed and how the voice

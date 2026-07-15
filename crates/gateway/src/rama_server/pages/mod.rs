@@ -929,6 +929,8 @@ fn layout_authed(
                 meta(name: "viewport", content: "width=device-width, initial-scale=1");
                 title { (title) }
                 link(rel: "stylesheet", href: (css_href));
+                // PWA: manifest, theme-color, apple-touch-icon, favicon.
+                (chrome::pwa_head_links())
                 // app.js defines the `window.chat*` globals (chatScroll,
                 // chatComposer, …). It MUST execute before datastar: datastar
                 // processes `data-init` (e.g. `window.chatScroll.init(el)` on

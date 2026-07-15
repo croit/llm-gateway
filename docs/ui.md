@@ -430,9 +430,10 @@ ui/
 ├── src/
 │   └── main.css             # Tailwind/daisyUI entry, builds to assets/app.css
 └── ts/
-    ├── app.ts               # entry — toasts + timezone + popstate, imports below
+    ├── app.ts               # entry — toasts + timezone + popstate + SW register, imports below
     ├── global.d.ts          # window.* augmentations
     ├── clipboard.ts         # window.uiCopy
+    ├── push.ts              # window.gatewayPush (Web Push opt-in; /tokens Notifications card)
     ├── chat/
     │   ├── composer.ts      # window.chatComposer (Enter / submit / history)
     │   ├── mic.ts           # window.chatMic   (AudioWorklet → WAV → /transcriptions)
@@ -474,7 +475,13 @@ button(
 ) { (icons::copy(16)) }
 ```
 
-The `window.*` surface is declared in `ui/ts/global.d.ts` (`interface Window { uiCopy(btn: HTMLElement): Promise<void>; chatComposer: { … }; chatMic: { … }; chatVoice: { … }; chatScroll: { … }; }`) so call sites stay type-checked.
+The `window.*` surface is declared in `ui/ts/global.d.ts` (`interface Window { uiCopy(btn: HTMLElement): Promise<void>; chatComposer: { … }; chatMic: { … }; chatVoice: { … }; chatScroll: { … }; gatewayPush: { … }; }`) so call sites stay type-checked.
+
+### PWA + Web Push
+
+The app is an installable PWA. The service worker lives at `crates/session-core/assets/sw.js` and is served **verbatim** — it is NOT one of esbuild's bundle entries (only `app.ts` + `pcm-recorder.ts` are), so it gets no type-checking or transpile; keep it hand-valid browser JS. It cache-firsts the immutable `/assets/*` bundles, network-firsts the PWA metadata/icons, passes streaming/API traffic through untouched, and never caches authed HTML (per-user, often SSE).
+
+Turn-complete **Web Push** rides on top: `sw.js` carries `push` + `notificationclick` handlers, `ui/ts/push.ts` (`window.gatewayPush`) does the opt-in + subscription dance behind the `/tokens` Notifications card, and the server half is [`server::push`](../crates/gateway/src/server/push/) (VAPID + RFC 8291) fired from `spawn_assistant_worker`. The card ships every string as `data-msg-*` attributes so its copy stays server-localized despite the logic being client-side; whether to actually show a notification is decided in the SW via `clients.matchAll` (suppressed when a focused tab already has that conversation open). See the README's *Notifications* section for the operator-facing view.
 
 ### When to reach for what
 

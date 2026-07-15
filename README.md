@@ -353,6 +353,20 @@ dir = "/var/lib/gateway/skills"   # optional; default ./data/skills
 
 As an admin, open `/admin/skills` to **upload** a `.skill` archive (a zip of a `SKILL.md` bundle), **view** a skill's rendered `SKILL.md` + file tree, and **delete** one — all live, with no restart: the store re-scans the directory and hot-swaps the loaded set. RBAC gates which roles may use which skill; `read_skill` rides along automatically for any role that's been granted a skill. Grants come from two sources, unioned: each role's static `skills` list in the config (`["*"]` for all, exactly like `tools`), plus a **per-skill grant editor in the UI** — click **Granted to** on a skill to pick the roles allowed to load it. UI grants are stored in the DB and take effect immediately; config grants stay authoritative and show read-only in the dialog.
 
+### Notifications (Web Push)
+
+Because the UI is an installable PWA, it can push a notification when an assistant turn a user started finishes **while the app isn't focused** — useful on a phone where you fire off a long turn and lock the screen. Turns run server-side in a background worker regardless of whether a tab is attached, so the "done" ping fires even after you've closed the app.
+
+This is **on by default and needs no setup or third-party account** — the gateway generates its own [VAPID](https://datatracker.ietf.org/doc/html/rfc8292) keypair on first boot (persisted in the DB, private half sealed under the at-rest key) and encrypts each payload end-to-end for the subscription ([RFC 8291](https://datatracker.ietf.org/doc/html/rfc8291)). The only hard requirement is that the gateway is served over **HTTPS** (localhost is exempt for dev): service workers and the Push API only run on secure origins. A user opts in per device from the **Notifications** card on `/tokens`; whether a notification is actually shown is decided in the service worker (suppressed when a focused tab already has that conversation open).
+
+```toml
+[push]
+enabled = true                       # optional; default true. false turns the feature + its /api/v0/push/* endpoints off
+contact = "mailto:ops@example.com"   # VAPID `sub`: a contact the push service may use to reach you (set a real one for prod)
+```
+
+Platform support: **Android/Chrome** works directly; on **iOS** Web Push requires the PWA to be *installed* to the home screen (iOS 16.4+), not just open in Safari.
+
 ## Using the gateway
 
 **1 — Get an API token.** Sign in at `/login`, then create a `gwk_…` token on the `/tokens` page.
@@ -387,9 +401,14 @@ openai api chat_completions.create -m <model-id> -g user "Hello"
 | `/admin/users`, `/admin/groups`, `/rag`, `/admin/models`, `/admin/upstreams`, `/admin/skills`, `/admin/connectors`, `/admin/limits` | admin role | Admin UI (the users page lists registered users and starts impersonation; groups maps OIDC claims onto gateway groups and sets per-group tool/skill grants — pools, RAG collections, and MCP connectors then restrict access by group; upstreams edits the pool/backend topology in the DB and hot-reloads it via "Apply changes" — the old `/admin/backends` and `/admin/pools` now redirect here; connectors curates the MCP catalog — see [`docs/connectors.md`](docs/connectors.md) for provider setup; limits sets per-global/role/user rate limits & quotas). |
 | `POST /impersonate/stop` | session cookie | End an active impersonation and return to your own account. |
 | `/feedback`, `/feedback/extract`, `/feedback/config` | session cookie | Feedback widget: file a GitHub issue, turn a voice transcript into structured fields, and report whether the feature is configured. Enabled by the `[feedback]` config block. |
+| `/api/v0/push/config`, `/api/v0/push/subscribe`, `/api/v0/push/unsubscribe` | session cookie | Web Push (turn-complete notifications): fetch the VAPID public key + enabled flag, register a browser subscription, and forget one. Governed by the `[push]` config block. |
 | `/api/v0/*` | session cookie | JSON APIs backing the UI. |
 
 The `/v1/*` endpoints require `Authorization: Bearer gwk_…`. Client `Authorization` headers are dropped at the proxy and the configured upstream key (if any) is injected; hop-by-hop headers are filtered both ways; upstream 4xx/5xx are relayed verbatim. The UI pages use the signed session cookie minted at OIDC login.
+
+The UI is an installable **PWA** — `/manifest.webmanifest`, `/sw.js`, `/favicon.ico`, and `/icons/*` are public (no auth). The service worker cache-firsts the immutable content-hashed `/assets/*` bundles for fast loads, network-firsts the PWA metadata/icons so their short cache headers govern freshness, passes through all streaming/API traffic without buffering, and shows a localized offline fallback page for navigations — authed HTML is never cached (it's per-user and often a streaming SSE payload). Installability requires HTTPS (localhost exempt for dev).
+
+When `[push]` is enabled (default), the PWA can also deliver **Web Push** notifications: after a user opts in from the `/tokens` page, the service worker shows a notification when an assistant turn they started finishes while the app isn't focused. This uses a self-generated VAPID keypair (persisted, private half sealed under the at-rest key) and RFC 8291 payload encryption — no third-party push provider or account is involved beyond the browser's own push service.
 
 ## Production deployment (container + systemd)
 

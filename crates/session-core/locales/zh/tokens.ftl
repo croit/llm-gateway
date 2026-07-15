@@ -78,3 +78,17 @@ tokens-unknown-tool = 未知工具。
 tokens-save-pref-failed = 无法保存偏好设置。
 tokens-capability-enabled-toast = 已为此令牌启用 { $name }。
 tokens-capability-disabled-toast = 已为此令牌禁用 { $name }。
+
+# Web Push "turn complete" opt-in card (rendered by `render_push_card`; wired
+# client-side by `ui/ts/push.ts`). Device-local notification settings.
+tokens-push-heading = 通知
+tokens-push-description = 当您发起的回答在您离开应用时完成，在此设备上收到通知。
+tokens-push-enable = 在此设备上启用
+tokens-push-disable = 在此设备上停用
+tokens-push-on = 此设备已开启通知。
+tokens-push-off = 此设备已关闭通知。
+tokens-push-denied = 此浏览器已阻止通知。请在浏览器设置中允许以启用。
+tokens-push-unsupported = 此浏览器不支持通知。
+tokens-push-enabled = 已在此设备上启用通知。
+tokens-push-disabled = 已在此设备上停用通知。
+tokens-push-error = 无法更改通知设置。

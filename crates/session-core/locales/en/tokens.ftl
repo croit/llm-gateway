@@ -81,3 +81,17 @@ tokens-unknown-tool = Unknown tool.
 tokens-save-pref-failed = Could not save preference.
 tokens-capability-enabled-toast = { $name } enabled for this token.
 tokens-capability-disabled-toast = { $name } disabled for this token.
+
+# Web Push "turn complete" opt-in card (rendered by `render_push_card`; wired
+# client-side by `ui/ts/push.ts`). Device-local notification settings.
+tokens-push-heading = Notifications
+tokens-push-description = Get a notification on this device when an assistant turn you started finishes while you're away from the app.
+tokens-push-enable = Enable on this device
+tokens-push-disable = Disable on this device
+tokens-push-on = Notifications are on for this device.
+tokens-push-off = Notifications are off for this device.
+tokens-push-denied = This browser has blocked notifications. Allow them in your browser settings to enable.
+tokens-push-unsupported = This browser doesn't support notifications.
+tokens-push-enabled = Notifications enabled on this device.
+tokens-push-disabled = Notifications disabled on this device.
+tokens-push-error = Could not change notification settings.

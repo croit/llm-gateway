@@ -33,15 +33,19 @@ const METHODS: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPT
 /// HTTP endpoints table. Matched with the same coverage rule as the
 /// documented patterns (a `/*` suffix is a prefix glob).
 const UNDOCUMENTED: &[&str] = &[
-    "/assets/*",          // static bundles baked in via include_bytes
-    "/auth/*",            // OIDC browser flow (covered in prose)
-    "/theme/toggle",      // UI affordance, not an API surface
-    "/nav/toggle",        // UI affordance — collapse/expand a sidebar nav-group
-    "/lang",              // UI affordance — sets the language-preference cookie
-    "/admin/models/*",    // admin form-submit endpoints (covered by the page prose)
-    "/admin/upstreams/*", // admin topology reload endpoint
-    "/admin/backends/*",  // backend CRUD form-submit endpoints
-    "/admin/pools/*",     // pool CRUD page + form-submit endpoints
+    "/assets/*",             // static bundles baked in via include_bytes
+    "/manifest.webmanifest", // PWA manifest — static baked-in asset
+    "/sw.js",                // PWA service worker — static baked-in asset
+    "/favicon.ico",          // PWA favicon — static baked-in asset
+    "/icons/*",              // PWA icon PNGs — static baked-in assets
+    "/auth/*",               // OIDC browser flow (covered in prose)
+    "/theme/toggle",         // UI affordance, not an API surface
+    "/nav/toggle",           // UI affordance — collapse/expand a sidebar nav-group
+    "/lang",                 // UI affordance — sets the language-preference cookie
+    "/admin/models/*",       // admin form-submit endpoints (covered by the page prose)
+    "/admin/upstreams/*",    // admin topology reload endpoint
+    "/admin/backends/*",     // backend CRUD form-submit endpoints
+    "/admin/pools/*",        // pool CRUD page + form-submit endpoints
 ];
 
 /// `pat` covers concrete path `actual`. A trailing `/*` is a prefix glob;

@@ -425,9 +425,12 @@ pub async fn list_runs(
     webhook_id: &str,
     limit: i64,
 ) -> Result<Vec<WebhookRun>, DbError> {
+    // Newest-first. The tiebreaker is `rowid DESC` (SQLite's monotonic
+    // insertion order), NOT `id` — `id` is a random UUID, so two runs sharing a
+    // `fired_at` tick would otherwise come back in nondeterministic order.
     let sql = format!(
         "SELECT {RUN_COLS} FROM webhook_runs WHERE webhook_id = ? \
-         ORDER BY fired_at DESC, id ASC LIMIT ?"
+         ORDER BY fired_at DESC, rowid DESC LIMIT ?"
     );
     let rows = sqlx::query(&sql)
         .bind(webhook_id)

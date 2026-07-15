@@ -104,8 +104,15 @@ uuid = { workspace = true }
 url = { workspace = true }
 # AES-256-GCM at-rest encryption for per-user MCP OAuth tokens + admin-stored
 # connector client secrets (see `server::crypto`). Key from $GATEWAY_ENCRYPTION_KEY,
-# else derived from the session secret.
+# else derived from the session secret. AES-128-GCM (same crate) also encrypts
+# Web Push payloads (`server::push`, RFC 8291).
 aes-gcm = "0.10"
+# Web Push (`server::push`): VAPID signing (P-256 ECDSA / ES256) + RFC 8291
+# payload encryption (P-256 ECDH → HKDF-SHA256 → AES-128-GCM). p256 supplies
+# both ECDSA and ECDH; hkdf the key schedule; base64 the URL-safe wire coding.
+p256 = { version = "0.13", features = ["ecdh"] }
+hkdf = "0.12"
+base64 = "0.22"
 # typst compile scratch dirs (one per render); tiny, no native deps.
 tempfile = "3"
 

@@ -67,5 +67,15 @@ declare global {
             /** Chat prompt "Not now": tell the parked tool to stop waiting. */
             declineForTurn(turnId: string): Promise<void>;
         };
+        /**
+         * Web Push opt-in for turn-complete notifications. `enable(btn)`
+         * requests permission + subscribes this browser and registers it with
+         * the gateway; `disable(btn)` unsubscribes and forgets it. Called from
+         * the `/tokens` "Notifications" card. Owned by `ui/ts/push.ts`.
+         */
+        gatewayPush: {
+            enable(btn?: HTMLElement): Promise<void>;
+            disable(btn?: HTMLElement): Promise<void>;
+        };
     }
 }

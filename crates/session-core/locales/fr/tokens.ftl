@@ -78,3 +78,17 @@ tokens-unknown-tool = Outil inconnu.
 tokens-save-pref-failed = Impossible d'enregistrer la préférence.
 tokens-capability-enabled-toast = { $name } activé pour ce jeton.
 tokens-capability-disabled-toast = { $name } désactivé pour ce jeton.
+
+# Web Push "turn complete" opt-in card (rendered by `render_push_card`; wired
+# client-side by `ui/ts/push.ts`). Device-local notification settings.
+tokens-push-heading = Notifications
+tokens-push-description = Recevez une notification sur cet appareil lorsqu'une réponse que vous avez lancée se termine pendant que vous n'êtes pas dans l'application.
+tokens-push-enable = Activer sur cet appareil
+tokens-push-disable = Désactiver sur cet appareil
+tokens-push-on = Les notifications sont activées pour cet appareil.
+tokens-push-off = Les notifications sont désactivées pour cet appareil.
+tokens-push-denied = Ce navigateur a bloqué les notifications. Autorisez-les dans les paramètres du navigateur pour les activer.
+tokens-push-unsupported = Ce navigateur ne prend pas en charge les notifications.
+tokens-push-enabled = Notifications activées sur cet appareil.
+tokens-push-disabled = Notifications désactivées sur cet appareil.
+tokens-push-error = Impossible de modifier les paramètres de notification.

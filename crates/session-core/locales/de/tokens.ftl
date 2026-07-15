@@ -78,3 +78,17 @@ tokens-unknown-tool = Unbekanntes Werkzeug.
 tokens-save-pref-failed = Einstellung konnte nicht gespeichert werden.
 tokens-capability-enabled-toast = { $name } für dieses Token aktiviert.
 tokens-capability-disabled-toast = { $name } für dieses Token deaktiviert.
+
+# Web Push "turn complete" opt-in card (rendered by `render_push_card`; wired
+# client-side by `ui/ts/push.ts`). Device-local notification settings.
+tokens-push-heading = Benachrichtigungen
+tokens-push-description = Erhalten Sie auf diesem Gerät eine Benachrichtigung, wenn eine von Ihnen gestartete Antwort fertig ist, während Sie nicht in der App sind.
+tokens-push-enable = Auf diesem Gerät aktivieren
+tokens-push-disable = Auf diesem Gerät deaktivieren
+tokens-push-on = Benachrichtigungen sind für dieses Gerät aktiviert.
+tokens-push-off = Benachrichtigungen sind für dieses Gerät deaktiviert.
+tokens-push-denied = Dieser Browser hat Benachrichtigungen blockiert. Erlauben Sie sie in den Browsereinstellungen, um sie zu aktivieren.
+tokens-push-unsupported = Dieser Browser unterstützt keine Benachrichtigungen.
+tokens-push-enabled = Benachrichtigungen auf diesem Gerät aktiviert.
+tokens-push-disabled = Benachrichtigungen auf diesem Gerät deaktiviert.
+tokens-push-error = Benachrichtigungseinstellungen konnten nicht geändert werden.
