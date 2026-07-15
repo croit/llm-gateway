@@ -382,6 +382,12 @@ async fn main() -> anyhow::Result<()> {
     let mut state = AppState::new(config, db, upstreams, tools, rbac)
         .with_crypto(crypto)
         .with_typst_templates(typst_metas);
+    // Share the sandbox client with the per-turn code so it can build a
+    // `SandboxLease` (the container kept alive across a turn's tool rounds).
+    // `None` leaves leasing off — every sandbox call stays single-use.
+    if let Some(client) = sandbox_client.clone() {
+        state = state.with_sandbox_client(client);
+    }
     if let Some(client) = oidc {
         state = state.with_oidc(client);
     }

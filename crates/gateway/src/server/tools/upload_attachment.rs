@@ -246,6 +246,7 @@ mod tests {
             attachment_reservations: None,
             indexer: None,
             image_gen: None,
+            sandbox_lease: None,
         };
         let err = UploadAttachment
             .run(
@@ -282,6 +283,7 @@ mod tests {
             attachment_reservations: None,
             indexer: None,
             image_gen: None,
+            sandbox_lease: None,
         };
         let err = UploadAttachment
             .run(

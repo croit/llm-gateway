@@ -275,7 +275,9 @@ enabled = true
 # `convert_document`, and `edit_presentation` tools, which let the model run
 # Python/shell, build documents, capture web pages, and work on files the user
 # uploaded (convert a deck to PDF/images, edit a .pptx via python-pptx) inside a
-# single-use, strongly-isolated sandbox. Uploaded files reach the sandbox
+# strongly-isolated sandbox (single-use per call, except run_in_sandbox which
+# reuses one container across a turn so /work persists — see docs/sandbox.md).
+# Uploaded files reach the sandbox
 # server-side: the current turn's uploads are staged into the working directory
 # automatically, and the model can pull in files from earlier in the
 # conversation by attachment id (needs `[chat.s3]`). The heavy lifting

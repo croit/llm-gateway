@@ -375,7 +375,8 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Code sandbox",
             "Lets the assistant run Python or shell in a secure throwaway sandbox — for data \
              analysis, charts, calculations, running command-line tools, and generating \
-             files it returns to you. Each run is isolated and starts clean.",
+             files it returns to you. Isolated per conversation; within one, the assistant \
+             can run several steps that build on each other.",
         ),
         "generate_document" => (
             "Document generation",

@@ -1,9 +1,12 @@
 # Code-execution sandbox
 
 The gateway can let the chat model **run code** — Python, shell, document
-generation, headless-browser capture — inside a strongly isolated, single-use
-gVisor sandbox, and return the results (stdout/stderr + produced files) into the
-conversation. It's exposed as these tools:
+generation, headless-browser capture — inside a strongly isolated gVisor
+sandbox, and return the results (stdout/stderr + produced files) into the
+conversation. Containers are single-use by default; `run_in_sandbox` keeps one
+alive across a single conversation turn so the model can iterate (see
+[Per-turn container reuse](#per-turn-container-reuse)). It's exposed as these
+tools:
 
 | Tool | What it does |
 |---|---|
@@ -25,11 +28,13 @@ names), and the model can pull in a file from **earlier in the conversation**
 by passing its attachment id (`<turn>/<file>`, from an `[attached …]` stub) —
 `run_in_sandbox` takes an `attachments: [{id}]` array, the presets take an
 `attachment_id`. Resolution is scoped to the caller's own chat session, and a
-per-run input budget (50 MiB) bounds what gets staged. Because each run is
-single-use (no `/work` persistence between calls), multi-file work must happen
-in **one** call — the staging assembles every needed input up front. On the
-`/v1` API path there's no session and no S3-backed upload, so staging is a
-no-op there and the tools fall back to inline text inputs.
+per-run input budget (50 MiB) bounds what gets staged. Within a single
+conversation turn a `run_in_sandbox` container is kept alive across calls (see
+[Per-turn container reuse](#per-turn-container-reuse)), so `/work` persists and
+the model can iterate; the staging still assembles a call's declared inputs up
+front. On the `/v1` API path there's no session and no S3-backed upload, so
+staging is a no-op there and the tools fall back to inline text inputs (the
+per-turn reuse still applies — one `/v1` request is one turn).
 
 ## Why two services
 
@@ -77,6 +82,8 @@ runner itself: `systemctl status sandbox-runner.service` /
                          · mem/swap/cpu/pids capped · wall-clock timeout
 6. agent ──stdout/stderr + produced files (artifacts)──►  runner
 7. runner DESTROYS that sandbox (single-use) and refills the pool in the bg
+   — EXCEPT a `run_in_sandbox` call keeps its sandbox alive as a turn lease
+   (see [Per-turn container reuse](#per-turn-container-reuse))
 8. gateway returns stdout to the model; files → S3 chat attachment
                                               + bearer download URL (/v1 path)
 ```
@@ -84,7 +91,7 @@ runner itself: `systemctl status sandbox-runner.service` /
 The **gold image** baked for step 4 is a batteries-included "system-engineer
 shell": python + data/science stack, LibreOffice, pandoc, typst, ffmpeg, duckdb,
 ripgrep/jq, tshark, tesseract OCR, headless chromium. Default per call: **no
-network, single-use**.
+network** (and single-use, unless kept alive as a per-turn lease).
 
 ### What's in the gold image
 
@@ -141,9 +148,13 @@ Edit `sandbox-image/Containerfile` to add or trim tools, then rebuild/push.
   internet-facing. It runs as a host service (it needs **local** podman to
   select the gVisor runtime — remote podman over the socket can't pass
   `--runtime`).
-- **Single-use:** every job runs in a fresh container that's destroyed
-  afterwards — no state leaks between calls or users. A warm pool of
-  pre-booted sandboxes hides cold-start latency.
+- **Single-use by default, per-turn reuse for `run_in_sandbox`:** a job runs
+  in a fresh container that's destroyed afterwards — no state leaks between
+  *users*. The one exception is `run_in_sandbox`, whose container is kept alive
+  across the calls of a **single conversation turn** (same user, same
+  authorization) so `/work` persists while the model iterates; it's destroyed
+  at turn end. See [Per-turn container reuse](#per-turn-container-reuse). A warm
+  pool of pre-booted sandboxes hides cold-start latency.
 - **Default-deny network:** a sandbox has no network unless the call requests
   it *and* the operator wired an egress proxy, which only forwards to an
   allowlist.
@@ -155,8 +166,9 @@ reachable (it's arbitrary-code-execution as a service).
 
 ### Files across runs: attachments ARE the persistent store
 
-Runs are stateless by design, but files still persist *across* runs — through
-the conversation's attachment store, not a shared volume:
+Within a turn `/work` persists in the leased container (above); *across* turns
+(and for the one-shot tools) runs are stateless, but files still persist
+through the conversation's attachment store, not a shared volume:
 
 - every artifact a run produces is uploaded as a chat attachment (S3) and
   stays addressable for the rest of the conversation;
@@ -173,6 +185,50 @@ the staging path above already delivers the same UX (persist + reuse) through
 storage that's session-scoped and already access-controlled. If run-to-run
 state ever becomes a real need, stage-in/stage-out through S3 under a
 `shared/` prefix — not a mount — is the compatible shape.
+
+### Per-turn container reuse
+
+`run_in_sandbox` (only) keeps **one container alive for the duration of a
+single conversation turn** — user prompt → final answer, across however many
+tool rounds. Successive calls `exec` into the same container, so `/work` and
+scratch state survive between them and the model can iterate (run → read the
+error → patch → rerun) instead of cramming everything into one call. The other
+sandbox tools (`generate_document`, `capture_webpage`, `convert_document`,
+`edit_presentation`, `render_excalidraw`, `render_typst`) are genuinely
+one-shot and stay single-use.
+
+Why per-turn and not per-session or per-user: a turn is one user with one
+authorization, so state that persists *within* it never crosses a trust
+boundary. The invariant that matters — **no state leaks between users** — is
+unchanged. A leaked container (a turn that died without releasing) is only a
+*resource* leak, never a data leak: its id lives in the turn's in-memory
+context and dies with it, so no later turn or other user can ever address it.
+
+Mechanics:
+
+- The wire contract (`crates/shared/src/sandbox.rs`) carries
+  `container_id: Option<String>` + `keep_alive: bool` on the request and echoes
+  `container_id` back on the response. `keep_alive: false` (the default) is the
+  classic single-use behavior, so older callers and the one-shot tools are
+  unaffected.
+- The runner tracks kept-alive containers in a **lease table**. `network`
+  (egress) is fixed when a container is created and ignored on reuse — changing
+  it requires a fresh container, which is what the tool's `fresh: true`
+  parameter (and an automatic recreate on a network-posture change) does.
+- **Cleanup is layered.** The gateway releases the lease at turn end
+  (`DELETE /container/{id}`) — for the chat path in the driver's `run_turn`,
+  and for both `/v1` paths (buffered + streaming) at the tool loop's single
+  exit. A `SandboxLease` `Drop` guard is the backstop for any exit that skips
+  the explicit release. Backing all of that, the runner runs a
+  **TTL sweeper** that reaps any lease left idle longer than `lease_ttl_secs`
+  (skipping one with an in-flight exec), so a gateway that crashed mid-turn
+  can't leak a container indefinitely.
+- **Capacity is bounded** by `max_leases`, independent of `max_concurrent`
+  (which counts in-flight execs). A leased container pins RAM the whole time
+  it's idle — its `/work` + `/tmp` are RAM-backed tmpfs charged to `--memory` —
+  so when the cap is reached a keep-alive request still runs its job
+  single-use and simply returns no `container_id` (the turn gracefully loses
+  persistence rather than the runner over-committing host RAM).
 
 ## Pieces in this repo
 
@@ -485,14 +541,18 @@ role and toggleable per user/token on the `/tools` page — default-off.
 `SANDBOX_POOL_SIZE`, `SANDBOX_MAX_CONCURRENT`, `SANDBOX_TIMEOUT_SECS`,
 `SANDBOX_MAX_TIMEOUT_SECS`, `SANDBOX_MEMORY`, `SANDBOX_CPUS`, `SANDBOX_PIDS_LIMIT`,
 `SANDBOX_WORK_SIZE`, `SANDBOX_TMP_SIZE`, `SANDBOX_MAX_OUTPUT_BYTES`,
-`SANDBOX_EGRESS_NETWORK`, `SANDBOX_EGRESS_PROXY`.
+`SANDBOX_EGRESS_NETWORK`, `SANDBOX_EGRESS_PROXY`, `SANDBOX_LEASE_TTL_SECS`
+(default 600 — idle-lease reap TTL; keep it above `SANDBOX_MAX_TIMEOUT_SECS`),
+`SANDBOX_MAX_LEASES` (default 6 — cap on simultaneously kept-alive containers;
+see [Per-turn container reuse](#per-turn-container-reuse)).
 
 > **Sizing for large-file work (video, big datasets):** `/work` and `/tmp` are
 > RAM-backed tmpfs charged to the `--memory` cgroup, so
 > `SANDBOX_WORK_SIZE + SANDBOX_TMP_SIZE` + the job's own RAM must stay under
-> `SANDBOX_MEMORY`. Budget `SANDBOX_MEMORY × SANDBOX_MAX_CONCURRENT` against free
-> host RAM (with headroom). Produced files also pass back through the gateway's
-> `[sandbox] max_artifact_bytes` cap — raise it for large outputs.
+> `SANDBOX_MEMORY`. Warm/in-flight containers *and* idle per-turn leases both
+> count, so budget `SANDBOX_MEMORY × (SANDBOX_MAX_CONCURRENT + SANDBOX_MAX_LEASES)`
+> against free host RAM (with headroom). Produced files also pass back through
+> the gateway's `[sandbox] max_artifact_bytes` cap — raise it for large outputs.
 
 **Egress allowlist** — `deploy/quadlet/allowlist.txt` (one host per line),
 consumed by the squid proxy. Default-deny: only listed hosts are reachable.
@@ -554,6 +614,11 @@ in-sandbox) rather than dumping raw data.
   `Internal=true` network — a sandbox can reach *only* the proxy, which
   forwards *only* to `allowlist.txt`. Runtime `pip install` works against the
   PyPI entries; add scraping/API hosts deliberately.
+- **A per-turn `run_in_sandbox` lease with egress stays networked for the whole
+  turn** (previously every egress job was single-use). The allowlist still
+  bounds where it can reach, and the lease is destroyed at turn end / reaped by
+  the TTL sweeper; keep `SANDBOX_LEASE_TTL_SECS` tight if this widened window
+  matters for your threat model.
 - **Runtime `pip install` pulls arbitrary third-party code** into the sandbox.
   That's contained to the one-shot sandbox, but it's still code you didn't
   vet — keep the allowlist tight.

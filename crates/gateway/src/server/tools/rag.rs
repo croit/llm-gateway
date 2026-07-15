@@ -468,6 +468,7 @@ mod tests {
             attachment_reservations: None,
             indexer: Some(indexer),
             image_gen: None,
+            sandbox_lease: None,
         }
     }
 
@@ -485,6 +486,7 @@ mod tests {
             attachment_reservations: None,
             indexer: None,
             image_gen: None,
+            sandbox_lease: None,
         }
     }
 

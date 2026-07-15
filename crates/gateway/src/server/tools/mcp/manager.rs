@@ -971,6 +971,7 @@ mod tests {
             attachment_reservations: None,
             indexer: None,
             image_gen: None,
+            sandbox_lease: None,
         };
         let audited = AuditedTool {
             inner: Arc::new(Echo) as Arc<dyn Tool>,

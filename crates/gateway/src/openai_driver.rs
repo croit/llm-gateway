@@ -163,6 +163,13 @@ pub fn build_tool_context(
             state.usage.clone(),
             state.db.clone(),
         )),
+        // One lease per turn: successive `run_in_sandbox` calls reuse the same
+        // container (so `/work` persists across rounds). `None` when the
+        // sandbox isn't configured. Released in `run_turn` at turn end.
+        sandbox_lease: state
+            .sandbox_client
+            .clone()
+            .map(crate::server::tools::sandbox::SandboxLease::new),
     }
 }
 
@@ -170,6 +177,14 @@ pub fn build_tool_context(
 impl SessionDriver for OpenAiDriver {
     async fn run_turn(&self, ctx: SessionContext) -> Result<(), TurnError> {
         let result = run_one_turn(self, ctx.clone()).await;
+        // Free the turn's sandbox container (if any) here, the single choke
+        // point that covers every way `run_one_turn` exits — success, error,
+        // and the several early `Ok(())` cancel returns inside it. The
+        // `SandboxLease` `Drop` guard + the runner's TTL sweeper are the
+        // backstops; this is the prompt, normal path.
+        if let Some(lease) = &self.tool_ctx.sandbox_lease {
+            lease.release().await;
+        }
         // On a clean, non-cancelled completion, check whether this session's
         // context has grown past the compaction threshold and, if so, summarise
         // its oldest turns in the background so the *next* turn replays a smaller

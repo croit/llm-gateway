@@ -84,7 +84,33 @@ pub struct LoopOutput {
 /// LLM and returns the response body bytes + status. It accepts an opaque
 /// model string so the caller can rotate backends per round via the
 /// `UpstreamRegistry`.
+///
+/// A single `/v1` request is one whole agentic turn (the loop runs to the
+/// model's final answer server-side), so this is also where the turn's
+/// sandbox lease is freed: whatever way the inner loop exits — final answer,
+/// upstream error relayed, mixed client+gateway turn yielded, or round cap —
+/// we release the container before returning. (A mixed-turn yield ends this
+/// request; the client's re-submission is a fresh request with a fresh lease,
+/// so cross-yield persistence is intentionally not preserved.)
 pub async fn run_with_tools<F, Fut>(
+    tools: &dyn ToolSource,
+    allowed_tools: &[String],
+    ctx: &ToolContext,
+    request_body: Value,
+    upstream: F,
+) -> Result<LoopOutput, LoopError>
+where
+    F: Fn(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<(u16, Bytes), LoopError>>,
+{
+    let out = run_with_tools_inner(tools, allowed_tools, ctx, request_body, upstream).await;
+    if let Some(lease) = &ctx.sandbox_lease {
+        lease.release().await;
+    }
+    out
+}
+
+async fn run_with_tools_inner<F, Fut>(
     tools: &dyn ToolSource,
     allowed_tools: &[String],
     ctx: &ToolContext,
@@ -658,11 +684,124 @@ mod tests {
             attachment_reservations: None,
             indexer: None,
             image_gen: None,
+            sandbox_lease: None,
         }
     }
 
     fn registry() -> ToolRegistry {
         ToolRegistry::new().with(Echo).with(CurrentTimestamp)
+    }
+
+    /// A wiremock runner whose `/run` echoes a lease id and whose
+    /// `DELETE /container/{id}` returns 204 — plus a ready-to-use
+    /// [`ToolContext`] holding a lease with an already-established container.
+    /// Lets the release-wiring tests assert that `run_with_tools` frees the
+    /// turn's container at every exit.
+    async fn ctx_with_established_lease(
+        server: &wiremock::MockServer,
+    ) -> (
+        ToolContext,
+        std::sync::Arc<crate::server::tools::sandbox::SandboxLease>,
+    ) {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exit_code": 0, "stdout": "ok", "stderr": "", "artifacts": [],
+                "duration_ms": 1, "timed_out": false, "output_truncated": false,
+                "container_id": "c1",
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/container/.+"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(server)
+            .await;
+        let client = crate::server::tools::sandbox::SandboxClient::new(
+            Arc::new(crate::server::config::SandboxConfig {
+                enabled: true,
+                runner_url: server.uri(),
+                timeout_secs: 5,
+                max_artifact_bytes: 1024,
+            }),
+            "https://gw.example".into(),
+        );
+        let lease = crate::server::tools::sandbox::SandboxLease::new(client);
+        // Simulate the turn having called run_in_sandbox once (establishes c1).
+        lease
+            .run(
+                shared::sandbox::RunRequest {
+                    language: shared::sandbox::Language::Python,
+                    code: "print(1)".into(),
+                    files: vec![],
+                    timeout_secs: None,
+                    network: false,
+                    container_id: None,
+                    keep_alive: false,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let mut ctx = ctx().await;
+        ctx.sandbox_lease = Some(lease.clone());
+        (ctx, lease)
+    }
+
+    fn deleted_container(reqs: &[wiremock::Request]) -> bool {
+        reqs.iter().any(|r| {
+            r.method.as_str().eq_ignore_ascii_case("DELETE") && r.url.path() == "/container/c1"
+        })
+    }
+
+    #[tokio::test]
+    async fn run_with_tools_releases_the_lease_on_normal_completion() {
+        let server = wiremock::MockServer::start().await;
+        let (ctx, _lease) = ctx_with_established_lease(&server).await;
+        // Upstream returns a plain assistant message (no gateway tool calls),
+        // so the loop exits immediately — then the wrapper must release c1.
+        let final_msg = json!({"choices": [{"message": {"role": "assistant", "content": "done"}}]});
+        let bytes = Bytes::from(serde_json::to_vec(&final_msg).unwrap());
+        let out = run_with_tools(
+            &registry(),
+            &[],
+            &ctx,
+            json!({"model": "x", "messages": []}),
+            move |_| {
+                let b = bytes.clone();
+                async move { Ok::<_, LoopError>((200u16, b)) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.rounds, 0);
+        assert!(
+            deleted_container(&server.received_requests().await.unwrap()),
+            "run_with_tools must release the turn's sandbox container"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_tools_releases_the_lease_on_error() {
+        let server = wiremock::MockServer::start().await;
+        let (ctx, _lease) = ctx_with_established_lease(&server).await;
+        // Upstream returns 200 with a non-JSON body → the loop errors
+        // (MalformedUpstream). The wrapper must STILL release c1.
+        let out = run_with_tools(
+            &registry(),
+            &[],
+            &ctx,
+            json!({"model": "x", "messages": []}),
+            move |_| async move { Ok::<_, LoopError>((200u16, Bytes::from_static(b"not json"))) },
+        )
+        .await;
+        assert!(out.is_err(), "malformed upstream errors the loop");
+        assert!(
+            deleted_container(&server.received_requests().await.unwrap()),
+            "the lease must be released even when the loop errors"
+        );
     }
 
     #[test]

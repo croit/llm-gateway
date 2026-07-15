@@ -86,6 +86,11 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Reap leased (kept-alive) containers whose owning turn crashed without
+    // releasing them — the belt-and-braces backstop to the gateway's explicit
+    // turn-end release. Idle-only (skips in-flight execs).
+    pool.spawn_sweeper();
+
     // Verify the configured runtime actually isolates (catches a silently
     // non-isolating runtime — e.g. `--runtime` ignored over the socket).
     // Skip local-unsafe: it's intentionally not isolated and already warns.

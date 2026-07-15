@@ -2,9 +2,10 @@
 // Copyright (C) 2026 croit GmbH
 
 //! HTTP surface of the runner, built on the same rama stack as the
-//! gateway. Two routes:
-//!   - `GET  /healthz` — liveness/readiness for the Quadlet + gateway.
-//!   - `POST /run`     — execute one [`RunRequest`], return a [`RunResponse`].
+//! gateway. Three routes:
+//!   - `GET    /healthz`        — liveness/readiness for the Quadlet + gateway.
+//!   - `POST   /run`            — execute one [`RunRequest`], return a [`RunResponse`].
+//!   - `DELETE /container/{id}` — release a kept-alive (leased) container.
 //!
 //! There is no auth here by design: the runner must be reachable **only**
 //! from the gateway over an internal network (and, when remote, fronted by
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use rama::http::layer::error_handling::ErrorHandlerLayer;
 use rama::http::server::HttpServer;
 use rama::http::service::web::Router;
-use rama::http::service::web::extract::State;
+use rama::http::service::web::extract::{Path, State};
 use rama::http::service::web::response::{IntoResponse, Json};
 use rama::http::{Request, Response, StatusCode, header};
 use rama::layer::{ArcLayer, Layer};
@@ -36,6 +37,22 @@ pub fn router(state: Arc<RunnerState>) -> Router<Arc<RunnerState>> {
     Router::new_with_state(state)
         .with_get("/healthz", async || Json(json!({"status": "ok"})))
         .with_post("/run", run)
+        .with_delete("/container/{id}", release_container)
+}
+
+/// DELETE /container/{id} — release a kept-alive (leased) container. The
+/// gateway calls this at turn end (and on `reset`) so the container's RAM is
+/// freed promptly rather than waiting for the TTL sweeper. Idempotent: an
+/// unknown / already-reaped id is a clean `204`, so the gateway's turn-end
+/// release never has to care whether the sweeper got there first. Container
+/// ids are lowercase hex, so the path extractor's case handling is a non-issue
+/// here.
+async fn release_container(
+    State(state): State<Arc<RunnerState>>,
+    Path(id): Path<String>,
+) -> Response {
+    state.pool.release_container(&id).await;
+    (StatusCode::NO_CONTENT, ()).into_response()
 }
 
 /// POST /run — decode the request, execute it, return the result.

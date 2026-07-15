@@ -120,6 +120,13 @@ pub struct ToolContext {
     /// paths (tests) that never wired one up, where the tool degrades to a
     /// clear `Failed("image generation not configured")`.
     pub image_gen: Option<crate::server::image_gen::ImageGenerator>,
+    /// The turn's sandbox-container lease, so successive `run_in_sandbox`
+    /// calls reuse one container (persisting `/work` across a turn's rounds)
+    /// instead of each running single-use. `Some` on the chat + proxy paths
+    /// when `[sandbox]` is configured; `None` elsewhere (tests, sandbox-less
+    /// deployments), where sandbox calls stay single-use. The driver releases
+    /// it at turn end. See [`sandbox::SandboxLease`].
+    pub sandbox_lease: Option<std::sync::Arc<sandbox::SandboxLease>>,
 }
 
 /// Chat-only handles a tool needs to run an interactive prompt while a
@@ -167,6 +174,10 @@ impl std::fmt::Debug for ToolContext {
             .field(
                 "image_gen",
                 &self.image_gen.as_ref().map(|_| "<ImageGenerator>"),
+            )
+            .field(
+                "sandbox_lease",
+                &self.sandbox_lease.as_ref().map(|_| "<SandboxLease>"),
             )
             .finish()
     }

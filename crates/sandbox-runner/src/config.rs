@@ -117,6 +117,26 @@ pub struct Config {
     /// no proxy env set (and, with no egress network, no network at all).
     #[arg(long, env = "SANDBOX_EGRESS_PROXY", default_value = "")]
     pub egress_proxy: String,
+
+    /// How long (seconds) a leased (kept-alive) container may sit idle before
+    /// the background sweeper reaps it. Leases are freed explicitly by the
+    /// gateway at turn end; this is the crash/leak backstop for a gateway that
+    /// died mid-turn. MUST exceed `max_timeout_secs` so a single long-running
+    /// exec is never swept out from under itself (the sweeper skips containers
+    /// with an in-flight job regardless, but the margin is belt-and-braces).
+    #[arg(long, env = "SANDBOX_LEASE_TTL_SECS", default_value_t = 600)]
+    pub lease_ttl_secs: u64,
+
+    /// Hard ceiling on simultaneously-leased (kept-alive) containers. A leased
+    /// container pins host RAM the whole time it's idle (its `/work` + `/tmp`
+    /// are RAM-backed tmpfs charged to `--memory`), so this bounds that
+    /// commitment independently of `max_concurrent` (which only counts
+    /// in-flight execs). When the cap is hit, a keep-alive request still runs
+    /// its job — single-use — and returns no `container_id`, so the caller
+    /// gracefully loses persistence rather than the runner over-committing RAM.
+    /// Budget `(pool_size + max_leases) × SANDBOX_MEMORY` against host RAM.
+    #[arg(long, env = "SANDBOX_MAX_LEASES", default_value_t = 6)]
+    pub max_leases: usize,
 }
 
 impl Config {
@@ -158,6 +178,8 @@ mod tests {
             max_output_bytes: 1_048_576,
             egress_network: String::new(),
             egress_proxy: String::new(),
+            lease_ttl_secs: 600,
+            max_leases: 6,
         }
     }
 

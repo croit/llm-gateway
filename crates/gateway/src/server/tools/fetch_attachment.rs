@@ -214,6 +214,8 @@ async fn extract_office(
         }],
         timeout_secs: None,
         network: false,
+        container_id: None,
+        keep_alive: false,
     };
     let resp = sandbox.run_job(req).await?;
     if resp.exit_code != 0 || resp.timed_out {
@@ -747,6 +749,7 @@ mod tests {
             attachment_reservations: None,
             indexer: None,
             image_gen: None,
+            sandbox_lease: None,
         };
         let err = FetchAttachment::new(None)
             .run(ctx, json!({"id": "t-1/x.csv"}))
@@ -785,6 +788,7 @@ mod tests {
             attachment_reservations: None,
             indexer: None,
             image_gen: None,
+            sandbox_lease: None,
         };
         let err = FetchAttachment::new(None)
             .run(ctx, json!({"id": "nope"}))

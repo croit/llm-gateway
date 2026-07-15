@@ -387,6 +387,7 @@ async fn drive_agent(
             duration_ms: timeout.as_millis() as u64,
             timed_out: true,
             output_truncated: false,
+            container_id: None,
         }),
     }
 }
@@ -414,6 +415,8 @@ mod podman_args_tests {
             max_output_bytes: 131_072,
             egress_network: String::new(),
             egress_proxy: String::new(),
+            lease_ttl_secs: 600,
+            max_leases: 6,
         })
     }
 
@@ -600,6 +603,7 @@ pub(crate) mod fake {
                 duration_ms: 1,
                 timed_out: false,
                 output_truncated: false,
+                container_id: None,
             })
         }
 
@@ -615,6 +619,8 @@ pub(crate) mod fake {
             files: Vec::new(),
             timeout_secs: None,
             network: false,
+            container_id: None,
+            keep_alive: false,
         }
     }
 }
@@ -657,6 +663,8 @@ mod local_tests {
             }],
             timeout_secs: None,
             network: false,
+            container_id: None,
+            keep_alive: false,
         };
         let resp = be.exec(&id, &req, Duration::from_secs(30)).await.unwrap();
         be.destroy(&id).await;
@@ -688,6 +696,8 @@ mod local_tests {
             files: vec![],
             timeout_secs: None,
             network: false,
+            container_id: None,
+            keep_alive: false,
         };
         let resp = be.exec(&id, &req, Duration::from_secs(30)).await.unwrap();
         be.destroy(&id).await;
@@ -705,6 +715,59 @@ mod local_tests {
             resp.stderr,
         );
         assert!(art.unwrap().size >= 300_000, "preserved full stream");
+    }
+
+    #[tokio::test]
+    async fn reused_workdir_collects_only_this_calls_output() {
+        // A kept-alive container is exec'd into more than once in a turn. The
+        // agent must return only the files THIS call produced — not re-collect
+        // earlier calls' outputs (which would flood the user with duplicate
+        // attachments). Same container id = same /work across both execs.
+        if !python3_available() {
+            eprintln!("skipping local_backend test: python3 not on PATH");
+            return;
+        }
+        let be = LocalBackend::new().unwrap();
+        let id = be.create(Network::None).await.unwrap();
+        let mk = |code: &str| RunRequest {
+            language: Language::Python,
+            code: code.into(),
+            files: vec![],
+            timeout_secs: None,
+            network: false,
+            container_id: None,
+            keep_alive: false,
+        };
+
+        // Call 1 writes a.txt.
+        let r1 = be
+            .exec(
+                &id,
+                &mk("open('a.txt','w').write('one')"),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.exit_code, 0, "stderr={}", r1.stderr);
+        assert!(r1.artifacts.iter().any(|a| a.name == "a.txt"));
+
+        // Call 2 (same container) writes b.txt while a.txt still sits in /work.
+        let r2 = be
+            .exec(
+                &id,
+                &mk("open('b.txt','w').write('two')"),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        be.destroy(&id).await;
+        assert_eq!(r2.exit_code, 0, "stderr={}", r2.stderr);
+        let names: Vec<&str> = r2.artifacts.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"b.txt"), "new file collected: {names:?}");
+        assert!(
+            !names.contains(&"a.txt"),
+            "the untouched prior-call output must NOT be re-collected: {names:?}"
+        );
     }
 
     #[tokio::test]
@@ -726,6 +789,8 @@ mod local_tests {
             files: vec![],
             timeout_secs: None,
             network: false,
+            container_id: None,
+            keep_alive: false,
         };
         let resp = be.exec(&id, &req, Duration::from_secs(30)).await.unwrap();
         be.destroy(&id).await;

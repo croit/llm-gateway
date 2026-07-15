@@ -81,6 +81,29 @@ def safe_name(name):
     return name and name not in (".", "..") and "/" not in name and "\\" not in name
 
 
+def snapshot(workdir):
+    """Map each regular file in `workdir` to an (size, mtime_ns) identity.
+
+    Taken just before the job runs so artifact collection can return only the
+    files THIS call created or changed. A sandbox container may be kept alive
+    and reused across the calls of one conversation turn (see docs/sandbox.md),
+    so `/work` is no longer guaranteed empty at start — without this, every
+    earlier call's outputs (and a stale `stdout.txt`) would be re-collected and
+    re-delivered on every subsequent call. On a fresh container the snapshot is
+    just the staged inputs, so behaviour is identical to the old single-use
+    model."""
+    snap = {}
+    for entry in os.listdir(workdir):
+        path = os.path.join(workdir, entry)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if os.path.isfile(path):
+            snap[entry] = (st.st_size, st.st_mtime_ns)
+    return snap
+
+
 def emit(resp):
     """Return a RunResponse to the runner. Small payloads go inline on stdout;
     larger ones spill to a temp file (named in a tiny stdout header) because
@@ -151,6 +174,12 @@ def main():
             fh.write(data)
         inputs.add(name)
 
+    # Snapshot /work AFTER staging inputs but BEFORE running the job, so we can
+    # later collect only what this call produced. On a reused container this
+    # excludes leftovers from earlier calls in the turn; on a fresh one it's
+    # just the inputs (so nothing changes for the single-use path).
+    baseline = snapshot(WORK)
+
     # Build the command. The script body goes to a UNIQUE temp file (not a
     # fixed path) so concurrent jobs that share a /tmp — e.g. the dev
     # local-unsafe backend — never clobber each other's code; and it lives
@@ -209,14 +238,20 @@ def main():
 
     # Preserve the FULL stream as a downloadable artifact when it's large, so
     # the head+tail truncation applied on the way to the model never loses
-    # data. Only when sizable, and never clobber a file the user's code wrote.
+    # data. Overwrite any prior stdout.txt/stderr.txt (a reused container may
+    # carry one from an earlier call in the turn) so we never deliver a stale
+    # stream — the delta collection below then treats the rewrite as produced.
     for full_bytes, fname in ((out, "stdout.txt"), (errb, "stderr.txt")):
         fpath = os.path.join(WORK, fname)
-        if len(full_bytes) > PRESERVE_THRESHOLD and not os.path.exists(fpath):
+        if len(full_bytes) > PRESERVE_THRESHOLD:
             with open(fpath, "wb") as fh:
                 fh.write(full_bytes)
 
-    # Collect produced files: anything in /work not present as an input.
+    # Collect produced files: anything in /work that isn't an input and that
+    # THIS call created or modified (i.e. changed vs the pre-run snapshot).
+    # The snapshot diff is what keeps a reused container from re-delivering
+    # earlier calls' outputs; on a fresh container everything is new, so this
+    # is the same set as before.
     artifacts = []
     for entry in sorted(os.listdir(WORK)):
         if entry in inputs:
@@ -224,7 +259,10 @@ def main():
         path = os.path.join(WORK, entry)
         if not os.path.isfile(path):
             continue
-        size = os.path.getsize(path)
+        st = os.stat(path)
+        if baseline.get(entry) == (st.st_size, st.st_mtime_ns):
+            continue  # pre-existing and untouched by this call — not its output
+        size = st.st_size
         if size == 0 or size > MAX_ARTIFACT:
             continue
         with open(path, "rb") as fh:

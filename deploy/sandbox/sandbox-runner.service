@@ -38,6 +38,15 @@ Environment=SANDBOX_IMAGE=ghcr.io/croit/llm-gateway-sandbox:latest
 # service. Default 60; 0 disables.
 #Environment=SANDBOX_IMAGE_CHECK_SECS=60
 Environment=RUST_LOG=info,sandbox_runner=info
+# Per-turn container reuse (run_in_sandbox keeps one container alive across a
+# turn's calls so /work persists — see docs/sandbox.md). Defaults shown.
+# SANDBOX_LEASE_TTL_SECS: idle-lease reap TTL; keep it above
+# SANDBOX_MAX_TIMEOUT_SECS so a long exec is never swept mid-run.
+#Environment=SANDBOX_LEASE_TTL_SECS=600
+# SANDBOX_MAX_LEASES: cap on simultaneously kept-alive containers. Each pins RAM
+# while idle (tmpfs /work+/tmp), so budget
+# SANDBOX_MEMORY × (SANDBOX_MAX_CONCURRENT + SANDBOX_MAX_LEASES) against host RAM.
+#Environment=SANDBOX_MAX_LEASES=6
 # Egress (optional): uncomment / set by `setup-sandbox.sh --egress`.
 #Environment=SANDBOX_EGRESS_NETWORK=sandbox-egress
 #Environment=SANDBOX_EGRESS_PROXY=http://egress-proxy:3128

@@ -5,8 +5,10 @@
 //!
 //! The model writes Python or shell; the gateway forwards it to the
 //! standalone `sandbox-runner` service, which executes it inside an
-//! ephemeral, single-use sandbox and returns stdout/stderr plus any
-//! files the run produced. The runner enforces the real isolation
+//! ephemeral, isolated sandbox and returns stdout/stderr plus any files
+//! the run produced. Containers are single-use by default; `run_in_sandbox`
+//! keeps one alive across a conversation turn (a [`SandboxLease`]) so
+//! successive calls reuse `/work`. The runner enforces the real isolation
 //! (gVisor boundary, default-deny network behind an egress allowlist,
 //! resource caps); the gateway only does the tool plumbing.
 //!
@@ -111,10 +113,45 @@ impl SandboxClient {
         self.call_runner(&req).await
     }
 
+    /// Release a leased (kept-alive) container on the runner. Best-effort:
+    /// a failure is logged, never surfaced — the runner's TTL sweeper reaps
+    /// anything a failed DELETE left behind, and the id is turn-scoped so a
+    /// leak is never reachable by another turn. Idempotent on the runner
+    /// side (unknown id → `204`).
+    pub async fn release_container(&self, id: &str) {
+        let url = format!(
+            "{}/container/{}",
+            self.cfg.runner_url.trim_end_matches('/'),
+            urlencode_segment(id),
+        );
+        match self.http.delete(&url).send().await {
+            Ok(resp) if !resp.status().is_success() => {
+                tracing::warn!(container = %id, status = %resp.status(),
+                    "sandbox container release returned non-2xx (TTL sweeper will reap)")
+            }
+            Err(e) => tracing::warn!(container = %id, error = %e,
+                "sandbox container release failed (TTL sweeper will reap)"),
+            _ => {}
+        }
+    }
+
     /// Run a job and shape the model-facing result, delivering any
     /// produced files appropriately for the call's context.
     async fn execute(&self, ctx: &ToolContext, req: RunRequest) -> Result<Value, ToolError> {
         let resp = self.call_runner(&req).await?;
+        self.shape_response(ctx, resp).await
+    }
+
+    /// Turn a completed [`RunResponse`] into the model-facing tool result:
+    /// deliver artifacts (chat attachment / API URL), and shape stdout/stderr
+    /// into previews with `full_output_ref` handles. Split out of
+    /// [`Self::execute`] so the lease-managed `run_in_sandbox` path can run
+    /// the job through a [`SandboxLease`] and still share this shaping.
+    async fn shape_response(
+        &self,
+        ctx: &ToolContext,
+        resp: RunResponse,
+    ) -> Result<Value, ToolError> {
         let artifacts = self.deliver_artifacts(ctx, &resp.artifacts).await;
         // If any file was actually attached inline (chat path), tell the
         // model not to echo the marker text. Derived from the delivery
@@ -255,6 +292,137 @@ impl SandboxClient {
             "download_url": url,
             "note": "GET this URL with your API bearer token to download the file",
         }))
+    }
+}
+
+/// A per-turn hold on one sandbox container, so successive `run_in_sandbox`
+/// calls in a single conversation turn reuse the same environment (`/work`
+/// and scratch state persist between calls) instead of each getting a fresh,
+/// destroyed-after container.
+///
+/// Lifecycle:
+/// - **first call** — `container_id` is `None`; the runner creates a
+///   container, keeps it alive, and echoes its id, which we store.
+/// - **later calls** — we send the stored id; the runner `exec`s into the
+///   same container. A network-posture change (or an explicit `fresh`)
+///   releases the old container and starts a new one.
+/// - **turn end** — the driver calls [`Self::release`]; the `Drop` guard is
+///   the backstop for any path that skips it, and the runner's TTL sweeper
+///   backs *that* up.
+///
+/// The [`tokio::sync::Mutex`] is held across the whole runner round-trip, so
+/// concurrent `run_in_sandbox` calls in one tool round serialize: the first
+/// establishes the lease and the rest reuse it (first-writer-wins on the
+/// network posture) rather than racing to create parallel containers.
+///
+/// This serialization is **intentional and required**, not incidental: the
+/// calls share one container's `/work`, and the in-container agent attributes
+/// produced files by diffing `/work` against a snapshot taken just before the
+/// job runs (see `sandbox-image/sandbox-agent`). Two execs mutating that
+/// `/work` at once would race the snapshot and cross-attribute each other's
+/// outputs. The cost is that multiple `run_in_sandbox` calls emitted in a
+/// *single* round no longer run in parallel — but the iterate-on-`/work`
+/// pattern this feature exists for is inherently sequential (run, read result,
+/// adjust, rerun across rounds), so that case is rare. Callers that genuinely
+/// need parallel independent sandboxes should emit them across rounds.
+pub struct SandboxLease {
+    client: Arc<SandboxClient>,
+    state: tokio::sync::Mutex<LeaseState>,
+}
+
+#[derive(Default)]
+struct LeaseState {
+    /// The live container's id, once established.
+    container_id: Option<String>,
+    /// Whether the current container was created with egress. Used to
+    /// auto-recreate when a later call flips the network posture (the runner
+    /// fixes network at creation and ignores it on reuse).
+    network: bool,
+}
+
+impl SandboxLease {
+    pub fn new(client: Arc<SandboxClient>) -> Arc<Self> {
+        Arc::new(Self {
+            client,
+            state: tokio::sync::Mutex::new(LeaseState::default()),
+        })
+    }
+
+    /// Run one `run_in_sandbox` job against the turn's leased container,
+    /// creating/reusing/recreating it as needed. `explicit_fresh` (the tool's
+    /// `fresh: true`) forces a brand-new container even at the same network
+    /// posture — a deliberate "start clean". Returns the raw [`RunResponse`];
+    /// the caller shapes it via [`SandboxClient::shape_response`].
+    pub async fn run(
+        &self,
+        mut req: RunRequest,
+        explicit_fresh: bool,
+    ) -> Result<RunResponse, ToolError> {
+        let mut st = self.state.lock().await;
+        let want_net = req.network;
+        // A network-posture change can't be honored by reusing a container
+        // (the runner fixes egress at creation), so recreate — same as an
+        // explicit `fresh`.
+        let need_fresh = explicit_fresh || (st.container_id.is_some() && st.network != want_net);
+        // When recreating, DON'T release the old container up front: send the
+        // job with `container_id: None` so the runner makes a new one, and only
+        // release the old one AFTER that succeeds. Otherwise a recreate that
+        // fails (e.g. egress requested on a runner without it) would have
+        // already destroyed the turn's `/work` with nothing to fall back to.
+        let old_on_recreate = if need_fresh {
+            st.container_id.clone()
+        } else {
+            None
+        };
+        req.container_id = if need_fresh {
+            None
+        } else {
+            st.container_id.clone()
+        };
+        req.keep_alive = true;
+        let resp = self.client.call_runner(&req).await?;
+        // Success: retire the old container now that the new one is running.
+        // (Skip if the runner somehow handed us the same id back.)
+        if let Some(old) = old_on_recreate
+            && resp.container_id.as_deref() != Some(old.as_str())
+        {
+            self.client.release_container(&old).await;
+        }
+        // The runner echoes an id only while it holds the lease; if capacity
+        // was exhausted it ran single-use and returned `None`, so we drop our
+        // stored id and the next call starts fresh (still correct, just no
+        // persistence).
+        st.container_id = resp.container_id.clone();
+        st.network = want_net;
+        Ok(resp)
+    }
+
+    /// Release the leased container (turn end / reset). Idempotent.
+    pub async fn release(&self) {
+        let mut st = self.state.lock().await;
+        if let Some(id) = st.container_id.take() {
+            self.client.release_container(&id).await;
+        }
+    }
+}
+
+impl Drop for SandboxLease {
+    /// Backstop for any turn-exit path that didn't call [`Self::release`]
+    /// (a panic, an early return we missed): spawn a best-effort DELETE.
+    /// `Drop` can't await, so we grab the id via `try_lock` (uncontended at
+    /// drop time) and hand the release to a task. If we're outside a runtime
+    /// or the lock is held, the runner's TTL sweeper is the final backstop.
+    fn drop(&mut self) {
+        let Ok(mut st) = self.state.try_lock() else {
+            return;
+        };
+        let Some(id) = st.container_id.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let client = self.client.clone();
+            handle.spawn(async move { client.release_container(&id).await });
+        }
     }
 }
 
@@ -596,6 +764,11 @@ struct RunArgs {
     documents: Vec<DocumentArg>,
     #[serde(default)]
     network: bool,
+    /// Start from a clean container, discarding anything earlier calls in
+    /// this turn wrote to `/work`. Also the way to change `network` mid-turn
+    /// (the sandbox fixes egress at creation).
+    #[serde(default)]
+    fresh: bool,
 }
 
 /// One canvas document to stage into a run's working directory.
@@ -727,9 +900,9 @@ impl Tool for RunInSandbox {
     fn schema(&self) -> ToolDef {
         ToolDef::function(
             self.id(),
-            "Run Python or shell in a secure, isolated, single-use sandbox (a \
-             throwaway VM) and get back stdout, stderr, and any files it \
-             produced — like a capable system-engineer shell. Use it to \
+            "Run Python or shell in a secure, isolated sandbox (a throwaway VM \
+             scoped to this conversation turn) and get back stdout, stderr, and \
+             any files it produced — like a capable system-engineer shell. Use it to \
              inspect/debug large or compressed log files, analyze data, work \
              with office documents, convert between file formats, run CLI \
              tools, and generate files. \
@@ -769,10 +942,13 @@ impl Tool for RunInSandbox {
              Merriweather, Playfair Display, IBM Plex, JetBrains Mono, \
              Fira Code, Noto (incl. CJK + emoji) — `fc-list : family` \
              shows all. \
-             Each call starts clean — nothing persists between calls, so do \
-             all the work for one job (combine/compare several files, \
-             multi-step pipelines) in a SINGLE call rather than spreading it \
-             across calls. Files a user uploaded this turn are ALREADY waiting \
+             The sandbox PERSISTS for this turn: files you write to the \
+             working directory, and scratch state survive between calls, so \
+             you can iterate — run something, read the output, adjust, and \
+             run again — instead of cramming everything into one call. Set \
+             `fresh: true` to start over in a clean container (also required \
+             to change `network`, which is fixed when the container starts). \
+             Files a user uploaded this turn are ALREADY waiting \
              in the working directory under their original names — just open \
              them. To also work on a file from earlier in the conversation — \
              including files a previous sandbox/render call produced — pass \
@@ -784,8 +960,8 @@ impl Tool for RunInSandbox {
              `available_attachments` lists other files you can pull in by id. \
              The environment is a FIXED image: everything listed above is \
              preinstalled, and NOTHING can be installed — never try \
-             pip/apt/npm install (the sandbox is destroyed after the call, so \
-             even a successful install would be wasted). If a library is \
+             pip/apt/npm install (there is normally no network, and the \
+             sandbox is discarded at the end of the turn). If a library is \
              missing, solve the task with the preinstalled ones. Network \
              is OFF unless you set `network: true` (and the operator enabled \
              egress); without it web access fails. Write files \
@@ -872,7 +1048,15 @@ impl Tool for RunInSandbox {
                         "description": "Request network egress for this run (web access, \
                                         NOT for installing packages). Default false; only \
                                         honored if the operator configured an egress \
-                                        allowlist."
+                                        allowlist. Fixed when the sandbox starts — to \
+                                        change it mid-turn, also set `fresh: true`."
+                    },
+                    "fresh": {
+                        "type": "boolean",
+                        "description": "Discard the current sandbox and start from a clean \
+                                        one (drops anything earlier calls this turn wrote to \
+                                        the working directory). Default false. Use it to \
+                                        reset state, or to change `network`."
                     }
                 }
             }),
@@ -908,8 +1092,22 @@ impl Tool for RunInSandbox {
                 files,
                 timeout_secs: None,
                 network: args.network,
+                container_id: None,
+                keep_alive: false,
             };
-            let mut out = self.0.execute(&ctx, req).await?;
+            // When the turn carries a lease (chat + proxy paths with the
+            // sandbox configured), route through it so `/work` and scratch
+            // state persist across this turn's `run_in_sandbox` calls; the
+            // lease sets `container_id` / `keep_alive`. Without a lease (tests,
+            // sandbox-less paths) fall back to a single-use call. Either way
+            // the result is shaped the same.
+            let mut out = match &ctx.sandbox_lease {
+                Some(lease) => {
+                    let resp = lease.run(req, args.fresh).await?;
+                    self.0.shape_response(&ctx, resp).await?
+                }
+                None => self.0.execute(&ctx, req).await?,
+            };
             augment_with_staging(&mut out, staged, available, notes);
             if !staged_documents.is_empty()
                 && let Some(obj) = out.as_object_mut()
@@ -1020,6 +1218,8 @@ impl Tool for GenerateDocument {
                 }],
                 timeout_secs: None,
                 network: false,
+                container_id: None,
+                keep_alive: false,
             };
             self.0.execute(&ctx, req).await
         })
@@ -1154,6 +1354,8 @@ impl Tool for ExportDocument {
                 }],
                 timeout_secs: None,
                 network: false,
+                container_id: None,
+                keep_alive: false,
             };
             self.0.execute(&ctx, req).await
         })
@@ -1279,6 +1481,8 @@ impl Tool for CaptureWebpage {
                 }],
                 timeout_secs: None,
                 network: true,
+                container_id: None,
+                keep_alive: false,
             };
             self.0.execute(&ctx, req).await
         })
@@ -1541,6 +1745,8 @@ impl Tool for ConvertDocument {
                 }],
                 timeout_secs: None,
                 network: false,
+                container_id: None,
+                keep_alive: false,
             };
             let mut out = self.0.execute(&ctx, req).await?;
             if let Some(obj) = out.as_object_mut() {
@@ -1635,6 +1841,8 @@ impl Tool for EditPresentation {
                 }],
                 timeout_secs: None,
                 network: false,
+                container_id: None,
+                keep_alive: false,
             };
             let mut out = self.0.execute(&ctx, req).await?;
             if let Some(obj) = out.as_object_mut() {
@@ -1858,6 +2066,8 @@ impl Tool for RenderExcalidraw {
                 }],
                 timeout_secs: None,
                 network: false,
+                container_id: None,
+                keep_alive: false,
             };
             let mut out_val = self.0.execute(&ctx, req).await?;
             if let Some(obj) = out_val.as_object_mut() {
@@ -2091,6 +2301,8 @@ impl Tool for RenderTypst {
                 files,
                 timeout_secs: None,
                 network: false,
+                container_id: None,
+                keep_alive: false,
             };
             let mut out_val = self.0.execute(&ctx, req).await?;
             augment_with_staging(&mut out_val, staged, available, notes);
@@ -2410,6 +2622,7 @@ mod tests {
             attachment_reservations: None,
             indexer: None,
             image_gen: None,
+            sandbox_lease: None,
         }
     }
 
@@ -3363,5 +3576,248 @@ mod tests {
         .await;
         assert!(staged.is_empty() && files.is_empty());
         assert!(notes[0].contains("can't be staged"), "{notes:?}");
+    }
+
+    // ---- SandboxLease (per-turn container reuse) -----------------------
+
+    fn lease_req() -> RunRequest {
+        RunRequest {
+            language: Language::Python,
+            code: "print(1)".into(),
+            files: vec![],
+            timeout_secs: None,
+            network: false,
+            container_id: None,
+            keep_alive: false,
+        }
+    }
+
+    /// A `/run` mock that echoes back a fixed `container_id`, plus a `DELETE
+    /// /container/{id}` mock — the shape a keep-alive-capable runner presents.
+    async fn lease_server(container_id: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exit_code": 0, "stdout": "ok", "stderr": "", "artifacts": [],
+                "duration_ms": 1, "timed_out": false, "output_truncated": false,
+                "container_id": container_id,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/container/{container_id}")))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn body_of(reqs: &[wiremock::Request], p: &str) -> Vec<Value> {
+        reqs.iter()
+            .filter(|r| r.url.path() == p)
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn lease_reuses_one_container_then_releases_it() {
+        let server = lease_server("c1").await;
+        let lease = SandboxLease::new(client(server.uri()));
+
+        // First call: no container yet → sends container_id null, keep_alive
+        // true; stores the echoed id.
+        let r1 = lease.run(lease_req(), false).await.unwrap();
+        assert_eq!(r1.container_id.as_deref(), Some("c1"));
+        // Second call: reuses the stored id.
+        lease.run(lease_req(), false).await.unwrap();
+        // Turn end.
+        lease.release().await;
+
+        let reqs = server.received_requests().await.unwrap();
+        let runs = body_of(&reqs, "/run");
+        assert_eq!(runs.len(), 2, "two runner calls");
+        assert!(
+            runs[0].get("container_id").is_none_or(Value::is_null),
+            "first call creates (no container_id): {:?}",
+            runs[0]
+        );
+        assert_eq!(
+            runs[0]["keep_alive"],
+            json!(true),
+            "always keep-alive in a turn"
+        );
+        assert_eq!(
+            runs[1]["container_id"],
+            json!("c1"),
+            "second call reuses c1"
+        );
+        // Release issued exactly one DELETE for the leased container.
+        let deletes = reqs
+            .iter()
+            .filter(|r| r.url.path() == "/container/c1")
+            .count();
+        assert_eq!(deletes, 1, "released once at turn end");
+        // Releasing again is a no-op (no stored id).
+        lease.release().await;
+        let after = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/container/c1")
+            .count();
+        assert_eq!(after, 1, "second release is idempotent");
+    }
+
+    /// A `/run` responder that hands out a fresh incrementing container id
+    /// each call — so a recreate (which sends `container_id: null`) gets a
+    /// *different* id back, letting the test observe the old one being freed.
+    struct SeqContainerIds(std::sync::atomic::AtomicUsize);
+    impl wiremock::Respond for SeqContainerIds {
+        fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            ResponseTemplate::new(200).set_body_json(json!({
+                "exit_code": 0, "stdout": "ok", "stderr": "", "artifacts": [],
+                "duration_ms": 1, "timed_out": false, "output_truncated": false,
+                "container_id": format!("c{n}"),
+            }))
+        }
+    }
+
+    async fn seq_lease_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .respond_with(SeqContainerIds(std::sync::atomic::AtomicUsize::new(0)))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(wiremock::matchers::path_regex(r"^/container/.+"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn deleted_ids(reqs: &[wiremock::Request]) -> Vec<String> {
+        reqs.iter()
+            .filter(|r| r.method.as_str().eq_ignore_ascii_case("DELETE"))
+            .map(|r| r.url.path().trim_start_matches("/container/").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_serialize_onto_one_container() {
+        // Two run_in_sandbox jobs issued in the same round must share one
+        // container (the mutex serializes them: first creates, second reuses)
+        // rather than racing to create two — otherwise they'd write a shared
+        // /work concurrently and the agent's snapshot-diff would misattribute
+        // outputs. See the SandboxLease doc comment.
+        let server = lease_server("c1").await;
+        let lease = SandboxLease::new(client(server.uri()));
+        let (a, b) = tokio::join!(lease.run(lease_req(), false), lease.run(lease_req(), false));
+        a.unwrap();
+        b.unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let runs = body_of(&reqs, "/run");
+        assert_eq!(runs.len(), 2, "both jobs ran");
+        let created = runs
+            .iter()
+            .filter(|b| b.get("container_id").is_none_or(Value::is_null))
+            .count();
+        let reused = runs
+            .iter()
+            .filter(|b| b["container_id"] == json!("c1"))
+            .count();
+        assert_eq!(created, 1, "exactly one container created: {runs:?}");
+        assert_eq!(reused, 1, "the other reused it: {runs:?}");
+    }
+
+    #[tokio::test]
+    async fn lease_fresh_and_network_change_recreate_the_container() {
+        let server = seq_lease_server().await;
+        let lease = SandboxLease::new(client(server.uri()));
+
+        // Establish c1.
+        lease.run(lease_req(), false).await.unwrap();
+        // `fresh: true` recreates → c2, releasing c1.
+        lease.run(lease_req(), true).await.unwrap();
+        // A network-posture change also recreates → c3, releasing c2.
+        let mut net = lease_req();
+        net.network = true;
+        lease.run(net, false).await.unwrap();
+        // Turn end releases c3.
+        lease.release().await;
+
+        let reqs = server.received_requests().await.unwrap();
+        let runs = body_of(&reqs, "/run");
+        assert_eq!(runs.len(), 3);
+        // Calls 2 and 3 both re-create (send no container_id).
+        assert!(runs[1].get("container_id").is_none_or(Value::is_null));
+        assert!(runs[2].get("container_id").is_none_or(Value::is_null));
+        // Each recreate freed the prior container, and turn-end freed the last.
+        let mut deleted = deleted_ids(&reqs);
+        deleted.sort();
+        assert_eq!(
+            deleted,
+            vec!["c1", "c2", "c3"],
+            "every container freed once"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_recreate_preserves_the_current_container() {
+        // Finding #3: a recreate that fails must NOT have already destroyed the
+        // turn's container — /work has to survive so the model can retry.
+        let server = MockServer::start().await;
+        // First /run establishes c1; every later /run fails (e.g. egress
+        // requested on a runner without it).
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exit_code": 0, "stdout": "ok", "stderr": "", "artifacts": [],
+                "duration_ms": 1, "timed_out": false, "output_truncated": false,
+                "container_id": "c1",
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "network egress requested but not configured",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(wiremock::matchers::path_regex(r"^/container/.+"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let lease = SandboxLease::new(client(server.uri()));
+        lease.run(lease_req(), false).await.unwrap(); // establish c1
+        // A network flip forces a recreate, which the runner rejects.
+        let mut net = lease_req();
+        net.network = true;
+        assert!(lease.run(net, false).await.is_err(), "recreate fails");
+
+        // c1 must NOT have been released by the failed recreate.
+        let reqs = server.received_requests().await.unwrap();
+        assert!(
+            deleted_ids(&reqs).is_empty(),
+            "old container must survive a failed recreate: {:?}",
+            deleted_ids(&reqs)
+        );
+        // The lease still holds c1: releasing at turn end frees exactly it.
+        lease.release().await;
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(
+            deleted_ids(&reqs),
+            vec!["c1"],
+            "c1 still leased after failure"
+        );
     }
 }

@@ -673,6 +673,8 @@ async fn convert_to_docx(
         }],
         timeout_secs: None,
         network: false,
+        container_id: None,
+        keep_alive: false,
     };
     let resp = sandbox.run_job(req).await?;
     if resp.exit_code != 0 || resp.timed_out {
@@ -835,6 +837,8 @@ async fn convert_to_pptx(
         }],
         timeout_secs: None,
         network: false,
+        container_id: None,
+        keep_alive: false,
     };
     let resp = sandbox.run_job(req).await?;
     if resp.exit_code != 0 || resp.timed_out {

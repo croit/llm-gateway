@@ -389,6 +389,13 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
             state.usage.clone(),
             state.db.clone(),
         )),
+        // Per-request sandbox lease (the /v1 loop = one turn), so a client's
+        // multi-round `run_in_sandbox` reuses one container. `None` when the
+        // sandbox isn't configured. Released when the loop ends (see runner).
+        sandbox_lease: state
+            .sandbox_client
+            .clone()
+            .map(crate::server::tools::sandbox::SandboxLease::new),
     };
     let state_clone = state.clone();
     let model_clone = real_model.clone();
@@ -1932,6 +1939,14 @@ async fn forward_streaming_with_tools(
             state.usage.clone(),
             state.db.clone(),
         )),
+        // Per-request sandbox lease (the /v1 loop = one turn), so a client's
+        // multi-round `run_in_sandbox` reuses one container. `None` when the
+        // sandbox isn't configured. Freed explicitly at the end of
+        // `drive_streaming_tool_loop` (the `Drop` guard + TTL sweeper back it).
+        sandbox_lease: state
+            .sandbox_client
+            .clone()
+            .map(crate::server::tools::sandbox::SandboxLease::new),
     };
 
     // One usage row per upstream round; built here where the bearer's
@@ -2081,6 +2096,41 @@ fn synth_client_tool_call_chunks(
 
 #[allow(clippy::too_many_arguments)]
 async fn drive_streaming_tool_loop(
+    state: Arc<RamaState>,
+    model: String,
+    request_body: Value,
+    client_headers: HeaderMap,
+    tool_ctx: ToolContext,
+    rec: RecordParams,
+    user_mcp: super::super::server::tools::mcp::manager::UserMcpLayer,
+    access: crate::server::upstreams::PoolAccess,
+    tx: &mut mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+) -> Result<(), String> {
+    // Free the turn's sandbox lease on every exit of the loop below — the
+    // explicit, awaited counterpart to the chat path's `run_turn` and the
+    // buffered path's `run_with_tools` wrapper (the `Drop` guard is only the
+    // backstop). Clone the lease handle out before `tool_ctx` is moved in.
+    let lease = tool_ctx.sandbox_lease.clone();
+    let out = drive_streaming_tool_loop_inner(
+        state,
+        model,
+        request_body,
+        client_headers,
+        tool_ctx,
+        rec,
+        user_mcp,
+        access,
+        tx,
+    )
+    .await;
+    if let Some(lease) = &lease {
+        lease.release().await;
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_streaming_tool_loop_inner(
     state: Arc<RamaState>,
     model: String,
     mut request_body: Value,

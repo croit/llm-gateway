@@ -61,6 +61,11 @@ pub struct AppState {
     /// enabled = false`; the push endpoints then report "disabled" and the
     /// turn-complete hook is a no-op. Built at startup by [`Self::with_push`].
     pub push: Option<Arc<crate::server::push::PushSender>>,
+    /// The sandbox-runner HTTP client, shared so the per-turn tool context can
+    /// build a [`crate::server::tools::sandbox::SandboxLease`] (the container
+    /// kept alive across a turn's tool rounds). `None` when `[sandbox]` is
+    /// absent/disabled — leasing is off and every sandbox call is single-use.
+    pub sandbox_client: Option<Arc<crate::server::tools::sandbox::SandboxClient>>,
 }
 
 impl AppState {
@@ -91,7 +96,19 @@ impl AppState {
             mcp,
             typst_templates: Arc::new(Vec::new()),
             push: None,
+            sandbox_client: None,
         }
+    }
+
+    /// Install the sandbox-runner client (built once at startup when
+    /// `[sandbox]` is enabled) so per-turn tool contexts can lease a
+    /// container. Off → sandbox calls stay single-use.
+    pub fn with_sandbox_client(
+        mut self,
+        client: Arc<crate::server::tools::sandbox::SandboxClient>,
+    ) -> Self {
+        self.sandbox_client = Some(client);
+        self
     }
 
     /// Install the discovered typst templates' display metadata (for the

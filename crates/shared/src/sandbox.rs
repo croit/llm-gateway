@@ -64,9 +64,27 @@ pub struct RunRequest {
     pub timeout_secs: Option<u64>,
     /// Request network egress for this call. Default `false` (the
     /// sandbox runs with no network). Honored only against the runner's
-    /// curated egress allowlist.
+    /// curated egress allowlist. Honored **only at container creation**
+    /// (`container_id: None`); ignored when reusing a leased container.
     #[serde(default)]
     pub network: bool,
+    /// Reuse an existing leased container instead of obtaining a fresh
+    /// one. `Some(id)` asks the runner to `exec` into that live container
+    /// (so `/work` and scratch state from earlier calls in the same turn
+    /// survive). `None` (default) obtains a fresh container as before. A
+    /// stale/expired id the runner no longer tracks falls back to a fresh
+    /// container — the response's `container_id` then carries the new id.
+    #[serde(default)]
+    pub container_id: Option<String>,
+    /// Keep the container alive after this call so a later [`RunRequest`]
+    /// can reuse it (see [`Self::container_id`]). Default `false` = today's
+    /// single-use behavior (destroy after the call). When `true` and the
+    /// runner has lease capacity, the response carries the container's id
+    /// in [`RunResponse::container_id`]; when capacity is exhausted the
+    /// runner still runs the job single-use and returns `container_id: None`
+    /// (graceful fallback — the caller simply doesn't get persistence).
+    #[serde(default)]
+    pub keep_alive: bool,
 }
 
 /// A single file the run produced under `/work` (anything that wasn't an
@@ -97,6 +115,14 @@ pub struct RunResponse {
     /// True when stdout/stderr were clipped to the runner's output cap.
     #[serde(default)]
     pub output_truncated: bool,
+    /// Id of the container this job ran in, echoed back **only** when the
+    /// request set `keep_alive: true` and the runner kept the container
+    /// alive as a lease. `None` for single-use jobs (and when a keep-alive
+    /// request couldn't be leased because capacity was exhausted). The
+    /// caller stores this and sends it as [`RunRequest::container_id`] on
+    /// the next call to reuse the same environment.
+    #[serde(default)]
+    pub container_id: Option<String>,
 }
 
 /// Error envelope for a non-2xx runner response.
@@ -128,6 +154,37 @@ mod tests {
         assert!(req.files.is_empty());
         assert_eq!(req.timeout_secs, None);
         assert!(!req.network);
+        // New lease fields default to the single-use behavior, so a client
+        // (or an older gateway) that omits them is unchanged.
+        assert_eq!(req.container_id, None);
+        assert!(!req.keep_alive);
+    }
+
+    #[test]
+    fn run_request_round_trips_lease_fields() {
+        let req = RunRequest {
+            language: Language::Bash,
+            code: "echo hi".into(),
+            files: vec![],
+            timeout_secs: None,
+            network: false,
+            container_id: Some("abc123".into()),
+            keep_alive: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: RunRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn run_response_container_id_defaults_when_absent() {
+        // A runner predating the lease protocol omits `container_id`; it must
+        // deserialize as `None` (single-use), never fail.
+        let resp: RunResponse = serde_json::from_str(
+            r#"{"exit_code":0,"stdout":"","stderr":"","duration_ms":1,"timed_out":false}"#,
+        )
+        .unwrap();
+        assert_eq!(resp.container_id, None);
     }
 
     #[test]
@@ -146,6 +203,7 @@ mod tests {
             duration_ms: 42,
             timed_out: false,
             output_truncated: false,
+            container_id: Some("kept-alive-1".into()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: RunResponse = serde_json::from_str(&json).unwrap();
