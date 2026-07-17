@@ -338,9 +338,9 @@ fn render_pool_card(
         .to_html()
     });
 
-    // One health row per assigned backend, each a <summary> wrapping the
-    // backend's inline editor. A DB backend not (yet) in the runtime registry
-    // shows a "pending apply" status.
+    // One health row per assigned backend: a status block plus an "Edit
+    // backend" toggle holding the inline editor. A DB backend not (yet) in the
+    // runtime registry shows a "pending apply" status.
     let rows: Vec<Html> = pool
         .backends
         .iter()
@@ -411,10 +411,11 @@ fn compliance_indicators(lang: Lang, gdpr: bool, nda: bool, enforce: bool) -> Ht
     .to_html()
 }
 
-/// One backend health row as a `<details>`: the `<summary>` is the live status
-/// row (badge, base URL, models, in-flight bar, activity + sparkline); expanding
-/// it reveals the backend editor form. `health = None` renders a muted "pending
-/// apply" row (the backend is in the DB but not yet in the runtime registry).
+/// One backend health row: a static status block (badge, base URL, models,
+/// in-flight bar, activity + sparkline) followed by an explicit "Edit backend"
+/// `<details>` toggle that reveals the backend editor form. `health = None`
+/// renders a muted "pending apply" row (the backend is in the DB but not yet in
+/// the runtime registry).
 fn render_backend_details(
     lang: Lang,
     row: &BackendRow,
@@ -455,8 +456,10 @@ fn render_backend_details(
     let name = row.name.clone();
 
     html! {
-        details(class: "rounded-lg border border-base-300 bg-base-100") {
-            summary(class: "cursor-pointer select-none list-inside px-3 py-2 flex flex-col gap-2") {
+        div(class: "rounded-lg border border-base-300 bg-base-100") {
+            // Live status row — a static display (was formerly the sole expand
+            // affordance; the huge served-models list buried the disclosure).
+            div(class: "px-3 py-2 flex flex-col gap-2") {
                 div(class: "flex items-center justify-between gap-3 flex-wrap") {
                     div(class: "flex items-center gap-2 min-w-0") {
                         span(class: (status_class)) { (status_label) }
@@ -504,8 +507,15 @@ fn render_backend_details(
                     }
                 }
             }
-            div(class: "border-t border-base-300 p-3") {
-                (render_backend_form(lang, row, del_sig, current_pool, pool_names))
+            // Explicit "Edit backend" toggle (mirrors "Edit pool") so the
+            // editor is discoverable regardless of how tall the status row is.
+            details(class: "border-t border-base-300") {
+                summary(class: "cursor-pointer select-none px-3 py-2 text-sm font-medium") {
+                    (t(lang, "upstreams-edit-backend"))
+                }
+                div(class: "border-t border-base-300 p-3") {
+                    (render_backend_form(lang, row, del_sig, current_pool, pool_names))
+                }
             }
         }
     }
@@ -837,7 +847,7 @@ fn render_backend_form(
     current_pool: Option<&str>,
     pool_names: &[String],
 ) -> Html {
-    let fields = backend_form_fields(lang, Some(existing), current_pool, pool_names);
+    let fields = backend_form_fields(lang, Some(existing), current_pool, pool_names, None);
     let delete = two_step_delete(
         "/admin/backends/delete",
         &existing.name,
@@ -873,7 +883,13 @@ fn render_backend_form(
 /// Backend editor form for the Add-backend card (no delete; Cancel hides the
 /// card via `$addForm`).
 fn render_backend_form_add(lang: Lang, pool_names: &[String]) -> Html {
-    let fields = backend_form_fields(lang, None, None, pool_names);
+    let fields = backend_form_fields(
+        lang,
+        None,
+        None,
+        pool_names,
+        Some(ADD_BACKEND_POOL_SELECT_ID),
+    );
     html! {
         form(
             method: "post",
@@ -897,13 +913,77 @@ fn render_backend_form_add(lang: Lang, pool_names: &[String]) -> Html {
     .to_html()
 }
 
+/// Stable id of the Add-backend form's Pool `<select>`. The select is rendered
+/// once at page load; the pool save/delete handlers use this id to patch its
+/// options in place (via [`add_backend_pool_select_patch`]) so a just-created
+/// pool is immediately selectable without a full reload.
+pub(super) const ADD_BACKEND_POOL_SELECT_ID: &str = "add-backend-pool";
+
+/// The single "Pool" `<select>` for the backend editor: "(none)" plus one
+/// option per pool, preselecting `current_pool`. `id` is set only on the
+/// Add-backend instance (so it is patch-targetable — see
+/// [`ADD_BACKEND_POOL_SELECT_ID`]); the per-backend edit instances render
+/// without an id to keep ids unique on the page.
+fn render_pool_select(
+    lang: Lang,
+    id: Option<&str>,
+    current_pool: Option<&str>,
+    pool_names: &[String],
+) -> Html {
+    let mut opts = vec![super::select_option(
+        "",
+        &t(lang, "backends-field-pool-none"),
+        current_pool.is_none(),
+    )];
+    for p in pool_names {
+        opts.push(super::select_option(p, p, current_pool == Some(p.as_str())));
+    }
+    // Two standalone branches so the `html!` macro never has to express a
+    // conditional `id` attribute (see the note on `select_option`).
+    match id {
+        Some(id) => html! {
+            select(id: (id.to_string()), name: "pool", class: "select select-bordered select-sm w-full") {
+                for o in opts.iter() { (o.clone()) }
+            }
+        }
+        .to_html(),
+        None => html! {
+            select(name: "pool", class: "select select-bordered select-sm w-full") {
+                for o in opts.iter() { (o.clone()) }
+            }
+        }
+        .to_html(),
+    }
+}
+
+/// A `datastar-patch-elements` event re-rendering the Add-backend form's Pool
+/// `<select>` from the current pool list. Emitted by the pool save/delete
+/// handlers so a just-created (still-unapplied) pool becomes selectable
+/// immediately: the select is rendered once at page load and would otherwise
+/// keep its stale options until a reload. Morphs the element in place
+/// (`outer`), matched by [`ADD_BACKEND_POOL_SELECT_ID`].
+pub(super) fn add_backend_pool_select_patch(
+    lang: Lang,
+    pool_names: &[String],
+) -> rama::bytes::Bytes {
+    let select =
+        render_pool_select(lang, Some(ADD_BACKEND_POOL_SELECT_ID), None, pool_names).to_string();
+    session_core::chrome::sse_patch(
+        Some(&format!("#{ADD_BACKEND_POOL_SELECT_ID}")),
+        Some("outer"),
+        &select,
+    )
+}
+
 /// The shared field grid for the backend editor (add + edit). The primary-key
-/// `name` is read-only when editing.
+/// `name` is read-only when editing. `pool_select_id` tags the Pool `<select>`
+/// (Add-backend form only) so it can be patched in place on pool save/delete.
 fn backend_form_fields(
     lang: Lang,
     existing: Option<&BackendRow>,
     current_pool: Option<&str>,
     pool_names: &[String],
+    pool_select_id: Option<&str>,
 ) -> Html {
     let is_edit = existing.is_some();
     let name = existing.map(|b| b.name.clone()).unwrap_or_default();
@@ -946,17 +1026,7 @@ fn backend_form_fields(
     // Single "Pool" select: "(none)" plus one option per pool. Preselects the
     // backend's current pool so a plain round-trip save doesn't move it. See
     // `set_backend_pool` for the single-pool tradeoff this implies.
-    let pool_opts: Vec<Html> = {
-        let mut v = vec![super::select_option(
-            "",
-            &t(lang, "backends-field-pool-none"),
-            current_pool.is_none(),
-        )];
-        for p in pool_names {
-            v.push(super::select_option(p, p, current_pool == Some(p.as_str())));
-        }
-        v
-    };
+    let pool_select = render_pool_select(lang, pool_select_id, current_pool, pool_names);
     html! {
         div(class: "flex flex-col gap-3") {
             div(class: "grid grid-cols-1 sm:grid-cols-2 gap-3") {
@@ -1009,9 +1079,7 @@ fn backend_form_fields(
                 }
                 label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "backends-field-pool")) }
-                    select(name: "pool", class: "select select-bordered select-sm w-full") {
-                        for o in pool_opts.iter() { (o.clone()) }
-                    }
+                    (pool_select)
                     span(class: "text-xs text-base-content/50") { (t(lang, "backends-field-pool-hint")) }
                 }
             }
@@ -1421,6 +1489,74 @@ mod tests {
         assert!(
             html.contains("topologyDirty: 2"),
             "container must seed the dirty count: {html}"
+        );
+    }
+
+    /// The Add-backend form's Pool select carries the stable patch id and lists
+    /// the current pools, so pool save/delete can refresh it in place.
+    #[test]
+    fn add_backend_pool_select_carries_patch_id_and_lists_pools() {
+        let html =
+            render_add_backend_card(Lang::En, &["chat-eu".into(), "voxtral".into()]).to_string();
+        assert!(
+            html.contains(&format!(r#"id="{ADD_BACKEND_POOL_SELECT_ID}""#)),
+            "add-backend pool select must carry the patch id: {html}"
+        );
+        assert!(
+            html.contains(r#"value="voxtral""#),
+            "add-backend pool select must list the pools: {html}"
+        );
+    }
+
+    /// A pool save/delete emits a `datastar-patch-elements` event that morphs the
+    /// Add-backend Pool select (by id) to the fresh pool list — so a newly
+    /// created, still-unapplied pool is immediately selectable there without a
+    /// reload. Pins the wiring behind tasks: create pool → visible in backend form.
+    #[test]
+    fn pool_select_patch_targets_add_backend_select_by_id() {
+        let bytes = add_backend_pool_select_patch(Lang::En, &["chat-eu".into(), "newpool".into()]);
+        let s = String::from_utf8(bytes.to_vec()).expect("utf8");
+        assert!(
+            s.contains("event: datastar-patch-elements"),
+            "must be a patch-elements event: {s}"
+        );
+        assert!(
+            s.contains(&format!(r#"id="{ADD_BACKEND_POOL_SELECT_ID}""#)),
+            "patch must carry the select id so it morphs in place: {s}"
+        );
+        assert!(
+            s.contains("newpool"),
+            "patch must include the freshly-created pool: {s}"
+        );
+    }
+
+    /// A backend row (pooled or unassigned) exposes an explicit "Edit backend"
+    /// toggle that reveals the editor — the editor must not be buried inside the
+    /// live status/models summary (which is huge for many-model backends).
+    #[test]
+    fn backend_row_has_explicit_edit_toggle_revealing_editor() {
+        let b = sample_backend();
+        let html = render_backend_details(
+            Lang::En,
+            &b,
+            None,
+            "db0",
+            Some("chat-eu"),
+            &["chat-eu".into()],
+        )
+        .to_string();
+        assert!(
+            html.contains(&t(Lang::En, "upstreams-edit-backend")),
+            "must offer an explicit Edit backend toggle: {html}"
+        );
+        assert!(
+            html.contains("<details") && html.contains("<summary"),
+            "editor must sit behind a details/summary toggle: {html}"
+        );
+        assert!(
+            html.contains(r#"action="/admin/backends/save""#)
+                && html.contains(r#"name="name" value="gpu-01""#),
+            "the toggle must reveal the pre-filled backend editor: {html}"
         );
     }
 }

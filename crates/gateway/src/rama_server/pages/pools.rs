@@ -87,6 +87,21 @@ fn parse_voices(v: &str) -> Vec<VoiceRow> {
         .collect()
 }
 
+/// Re-read the pool list and build the `datastar-patch-elements` event that
+/// refreshes the Add-backend form's Pool `<select>` in place, so a just-saved
+/// or just-deleted pool shows up (or disappears) there without a page reload —
+/// the select is rendered once at page load and would otherwise keep its stale
+/// options. Pool order matches the page (`ORDER BY sort_order, name`, which the
+/// snapshot query already applies). Best-effort: a load error skips the patch
+/// (the toast + dirty signal still fire).
+async fn pool_select_patch(state: &RamaState, lang: Lang) -> Option<rama::bytes::Bytes> {
+    let snapshot = upstreams_config::load_snapshot(&state.db).await.ok()?;
+    let names: Vec<String> = snapshot.pools.iter().map(|p| p.name.clone()).collect();
+    Some(super::upstreams::add_backend_pool_select_patch(
+        lang, &names,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Handlers (POST) — write the DB topology; the registry picks changes up on
 // POST /admin/upstreams/reload ("Apply changes").
@@ -154,7 +169,7 @@ pub async fn pools_save(State(state): State<Arc<RamaState>>, req: Request) -> Re
     match upstreams_config::upsert_pool(&state.db, &row).await {
         Ok(()) => {
             let dirty = state.topology_dirty_bump();
-            sse_response(&[
+            let mut events = vec![
                 sse_toast(&session_core::chrome::Flash {
                     kind: FlashKind::Success,
                     message: t_args(
@@ -164,7 +179,11 @@ pub async fn pools_save(State(state): State<Arc<RamaState>>, req: Request) -> Re
                     ),
                 }),
                 dirty_signal(dirty),
-            ])
+            ];
+            // Refresh the Add-backend Pool select so this pool is immediately
+            // selectable there (no reload / no "Apply changes" needed).
+            events.extend(pool_select_patch(&state, lang).await);
+            sse_response(&events)
         }
         Err(e) => toast(
             FlashKind::Error,
@@ -193,7 +212,7 @@ pub async fn pools_delete(State(state): State<Arc<RamaState>>, req: Request) -> 
     match upstreams_config::delete_pool(&state.db, name).await {
         Ok(()) => {
             let dirty = state.topology_dirty_bump();
-            sse_response(&[
+            let mut events = vec![
                 sse_toast(&session_core::chrome::Flash {
                     kind: FlashKind::Success,
                     message: t_args(
@@ -203,7 +222,10 @@ pub async fn pools_delete(State(state): State<Arc<RamaState>>, req: Request) -> 
                     ),
                 }),
                 dirty_signal(dirty),
-            ])
+            ];
+            // Drop the deleted pool from the Add-backend Pool select in place.
+            events.extend(pool_select_patch(&state, lang).await);
+            sse_response(&events)
         }
         Err(e) => toast(
             FlashKind::Error,

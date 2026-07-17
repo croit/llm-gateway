@@ -515,9 +515,15 @@ impl FlashKind {
 
 /// The toast region every page mounts. Datastar SSE patches append
 /// `.toast-item` children to it.
+///
+/// Anchored top-center (`toast-top toast-center`) rather than the daisyUI
+/// default top-end: the top-right corner carries page chrome (the Upstreams
+/// sticky "Apply changes" bar) and the bottom-right corner carries the feedback
+/// FAB, both of which a corner-anchored toast (`z-index:70`) would sit on top of
+/// and hide. Top-center clears both.
 pub fn toast_container() -> Html {
     html! {
-        div(id: "toasts", class: "toast toast-top toast-end") {}
+        div(id: "toasts", class: "toast toast-top toast-center") {}
     }
     .to_html()
 }
