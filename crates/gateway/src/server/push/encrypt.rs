@@ -29,7 +29,7 @@ use hkdf::Hkdf;
 use p256::PublicKey;
 use p256::SecretKey;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
-use rand::TryRngCore;
+use rand::{Rng, TryRngCore};
 use sha2::Sha256;
 
 /// The `rs` (record size) we advertise. Our payloads are a few hundred bytes
@@ -71,10 +71,16 @@ pub fn encrypt(ua_public: &[u8], auth: &[u8], plaintext: &[u8]) -> Result<Vec<u8
     }
     let ephemeral = ephemeral.ok_or_else(|| EncryptError::Rng("no valid scalar".into()))?;
 
-    let mut salt = [0u8; 16];
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut salt)
-        .map_err(|e| EncryptError::Rng(e.to_string()))?;
+    // RFC 8188 content-encoding salt: 16 random bytes from OsRng, generated as
+    // a returned value rather than by filling a zero buffer. The buffer-fill
+    // form (`let mut salt = [0u8; 16]; OsRng.try_fill_bytes(&mut salt)`) leaves
+    // an all-zero literal in the salt's data-flow, which static analysis (CodeQL
+    // `rust/hard-coded-cryptographic-value`) reports as a hard-coded salt — it
+    // doesn't model the in-place `&mut` overwrite. Generating the value keeps
+    // the salt provably literal-free. `unwrap_err()` adapts the fallible
+    // `OsRng` into an infallible `RngCore` that panics only on a catastrophic
+    // OS-RNG failure (see `server::crypto`).
+    let salt: [u8; 16] = rand::rngs::OsRng.unwrap_err().random();
 
     encrypt_with(ua_public, auth, plaintext, &ephemeral, salt)
 }
