@@ -31,8 +31,17 @@
 //!      hallucination triggers — that's the change from a pure
 //!      "trim ends only" approach.
 
+use std::io::Cursor;
+
 use earshot::Detector;
 use rama::bytes::Bytes;
+use symphonia::core::{
+    formats::FormatOptions,
+    io::{MediaSourceStream, MediaSourceStreamOptions},
+    meta::MetadataOptions,
+    probe::Hint,
+};
+use symphonia::default::get_probe;
 
 /// Frame size earshot requires: 256 samples at 16 kHz = 16 ms.
 const FRAME_SAMPLES: usize = 256;
@@ -231,6 +240,82 @@ pub fn pcm16_mono_16k_duration_seconds(bytes: &[u8]) -> Option<f64> {
     Some(samples.len() as f64 / f64::from(SAMPLE_RATE))
 }
 
+/// Duration of an uncompressed PCM WAV, regardless of sample rate, channel
+/// count, or bit depth. This is the fallback for transcription uploads that
+/// are not eligible for the gateway's silence trimmer.
+pub fn wav_duration_seconds(bytes: &[u8]) -> Option<f64> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut cursor = 12;
+    let mut byte_rate = None;
+    let mut data_size = None;
+    while cursor + 8 <= bytes.len() {
+        let id = &bytes[cursor..cursor + 4];
+        let size = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().ok()?) as usize;
+        let start = cursor + 8;
+        let end = start.checked_add(size)?;
+        if end > bytes.len() {
+            return None;
+        }
+        match id {
+            b"fmt " if size >= 16 => {
+                let format = u16::from_le_bytes(bytes[start..start + 2].try_into().ok()?);
+                if format != 1 {
+                    return None;
+                }
+                byte_rate = Some(u32::from_le_bytes(
+                    bytes[start + 8..start + 12].try_into().ok()?,
+                ));
+            }
+            b"data" => {
+                data_size = Some(size);
+                break;
+            }
+            _ => {}
+        }
+        cursor = end + (size & 1);
+    }
+    let rate = byte_rate?.max(1) as f64;
+    Some(data_size? as f64 / rate)
+}
+
+pub fn encoded_audio_duration_seconds(bytes: Bytes) -> Option<f64> {
+    // `Bytes` is refcounted and `'static`, so `Cursor` can borrow it directly
+    // without the full heap copy a `&[u8]` source would force.
+    let source = MediaSourceStream::new(
+        Box::new(Cursor::new(bytes)),
+        MediaSourceStreamOptions::default(),
+    );
+    let mut probed = get_probe()
+        .format(
+            &Hint::new(),
+            source,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+    let (track_id, sample_rate, declared_frames) = {
+        let track = probed.format.default_track()?;
+        (
+            track.id,
+            track.codec_params.sample_rate?,
+            track.codec_params.n_frames,
+        )
+    };
+    if let Some(frames) = declared_frames {
+        return Some(frames as f64 / f64::from(sample_rate));
+    }
+
+    let mut packet_duration = 0u64;
+    while let Ok(packet) = probed.format.next_packet() {
+        if packet.track_id() == track_id {
+            packet_duration = packet_duration.checked_add(packet.dur())?;
+        }
+    }
+    (packet_duration > 0).then(|| packet_duration as f64 / f64::from(sample_rate))
+}
+
 /// Validate the incoming WAV and return its sample buffer. We only
 /// accept the exact format the browser worklet produces — anything
 /// else is left untrimmed (better than guessing wrong and silently
@@ -359,6 +444,22 @@ mod tests {
         // the rate alone, before checking byte rate. Either way the
         // function returns None.
         assert!(parse_pcm16_mono_16k(&wav).is_none());
+    }
+
+    #[test]
+    fn measures_pcm_wav_outside_the_vad_format() {
+        let mut wav = synth_wav(&[0, 0, 0, 0]);
+        wav[24..28].copy_from_slice(&48_000u32.to_le_bytes());
+        wav[28..32].copy_from_slice(&96_000u32.to_le_bytes());
+        assert!((wav_duration_seconds(&wav).unwrap() - 8.0 / 96_000.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn encoded_audio_duration_rejects_invalid_payload() {
+        assert_eq!(
+            encoded_audio_duration_seconds(Bytes::from_static(b"not audio")),
+            None
+        );
     }
 
     #[test]

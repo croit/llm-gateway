@@ -90,6 +90,56 @@ async fn happy_path_relays_text() {
 }
 
 #[tokio::test]
+async fn provider_duration_is_priced_for_transcription() {
+    use gateway::server::db::model_defaults::{self, PricingUnit};
+    use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
+    use jiff::Timestamp;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "text": "hello",
+            "duration": 12.5,
+        })))
+        .mount(&upstream)
+        .await;
+    let state =
+        common::state_with_pool(&upstream.uri(), PoolKind::Transcription, "whisper-1").await;
+    model_defaults::set_pricing_with_unit(
+        &state.db,
+        "whisper-1",
+        Some(0.02),
+        None,
+        PricingUnit::Seconds,
+    )
+    .await
+    .unwrap();
+    let metered = gateway::server::usage::spawn(state.db.clone(), 90);
+    let state = state.with_usage(metered);
+    let db = state.db.clone();
+    let bearer = common::seed_user_with_token(&state, "alice").await;
+    let app = common::app(state);
+    let resp = app
+        .serve(transcribe_request(
+            &bearer,
+            multipart(&[("model", "whisper-1")]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = common::read_body(resp).await;
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    let now = Timestamp::now();
+    let bounds = period_bounds(Period::Today, "UTC", now);
+    let agg = aggregate(&db, bounds, &Filter::default(), 90, now, true)
+        .await
+        .unwrap();
+    assert!((agg.summary.total_cost - 0.25).abs() < 1e-9);
+}
+
+#[tokio::test]
 async fn missing_model_field_is_400() {
     let state = common::state_with_pool(
         "http://unused.invalid",

@@ -287,6 +287,15 @@ async fn v1_images_generations_records_image_usage_row() {
         .await;
 
     let state = common::state_with_pool(&upstream.uri(), PoolKind::Image, "glm-image").await;
+    gateway::server::db::model_defaults::set_pricing_with_unit(
+        &state.db,
+        "glm-image",
+        None,
+        Some(0.75),
+        gateway::server::db::model_defaults::PricingUnit::Images,
+    )
+    .await
+    .unwrap();
     let metered = gateway::server::usage::spawn(state.db.clone(), 90);
     let state = state.with_usage(metered);
     let db = state.db.clone();
@@ -314,8 +323,120 @@ async fn v1_images_generations_records_image_usage_row() {
         .unwrap();
     assert_eq!(agg.summary.requests, 1, "one image call recorded");
     assert_eq!(agg.by_model[0].key, "glm-image");
+    assert!((agg.summary.total_cost - 0.75).abs() < 1e-9);
     // Images carry no token counts.
     assert_eq!(agg.summary.total_tokens, 0);
+}
+
+#[tokio::test]
+async fn v1_image_edits_count_all_input_images() {
+    use gateway::server::db::model_defaults::{self, PricingUnit};
+    use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
+    use jiff::Timestamp;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/images/edits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"url": "https://cdn.example/img.png"}],
+        })))
+        .mount(&upstream)
+        .await;
+    let state = common::state_with_pool(&upstream.uri(), PoolKind::Image, "image-edit").await;
+    model_defaults::set_pricing_with_unit(
+        &state.db,
+        "image-edit",
+        Some(2.0),
+        Some(3.0),
+        PricingUnit::Images,
+    )
+    .await
+    .unwrap();
+    let metered = gateway::server::usage::spawn(state.db.clone(), 90);
+    let state = state.with_usage(metered);
+    let db = state.db.clone();
+    let bearer = common::seed_user_with_token(&state, "alice").await;
+    let app = common::app(state);
+    let boundary = "edit-boundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nimage-edit\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\nA\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"b.png\"\r\nContent-Type: image/png\r\n\r\nB\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\ncombine\r\n--{boundary}--\r\n"
+    );
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/images/edits")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = common::read_body(resp).await;
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let now = Timestamp::now();
+    let agg = aggregate(
+        &db,
+        period_bounds(Period::Today, "UTC", now),
+        &Filter::default(),
+        90,
+        now,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!((agg.summary.total_cost - 7.0).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn v1_speech_records_character_usage_for_costs() {
+    use gateway::server::db::model_defaults::{self, PricingUnit};
+    use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
+    use jiff::Timestamp;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/audio/speech"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"audio".to_vec()))
+        .mount(&upstream)
+        .await;
+
+    let state = common::state_with_pool(&upstream.uri(), PoolKind::Speech, "tts-model").await;
+    model_defaults::set_pricing_with_unit(
+        &state.db,
+        "tts-model",
+        Some(0.01),
+        None,
+        PricingUnit::Characters,
+    )
+    .await
+    .unwrap();
+    let metered = gateway::server::usage::spawn(state.db.clone(), 90);
+    let state = state.with_usage(metered);
+    let db = state.db.clone();
+    let bearer = common::seed_user_with_token(&state, "alice").await;
+    let app = common::app(state);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/audio/speech")
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"model": "tts-model", "input": "hello"}).to_string(),
+        ))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = common::read_body(resp).await;
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    let now = Timestamp::now();
+    let bounds = period_bounds(Period::Today, "UTC", now);
+    let agg = aggregate(&db, bounds, &Filter::default(), 90, now, true)
+        .await
+        .unwrap();
+    assert!((agg.summary.total_cost - 0.05).abs() < 1e-9);
 }
 
 #[tokio::test]

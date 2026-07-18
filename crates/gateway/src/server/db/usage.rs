@@ -97,6 +97,10 @@ pub struct UsageRecord {
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
+    /// Normalized non-token usage. For token-priced models these remain zero;
+    /// for images, speech, and transcription they carry the billable units.
+    pub input_units: Option<f64>,
+    pub output_units: Option<f64>,
     /// Whether this call counts toward the caller's rate limits / quotas —
     /// the serving pool's `enforce_limits` flag, resolved at the call site (self-
     /// hosted pools are exempt). Recorded on every row so the dashboards still
@@ -104,18 +108,46 @@ pub struct UsageRecord {
     pub enforce_limits: bool,
 }
 
-/// Pull the OpenAI `usage` token counts out of a completion body or a
-/// trailing SSE `usage` frame. Missing fields come back `None` (e.g.
-/// transcription responses carry no `usage`; embeddings omit
-/// `completion_tokens`).
+/// Pull token counts out of an OpenAI-compatible completion body or trailing
+/// SSE usage frame. Both `prompt_tokens`/`completion_tokens` and
+/// `input_tokens`/`output_tokens` are accepted.
 pub fn usage_from_value(v: &Value) -> (Option<i64>, Option<i64>, Option<i64>) {
     let usage = v.get("usage");
-    let get = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_i64);
-    (
-        get("prompt_tokens"),
-        get("completion_tokens"),
-        get("total_tokens"),
-    )
+    let get = |key: &str, fallback: &str| {
+        usage
+            .and_then(|u| u.get(key).or_else(|| u.get(fallback)))
+            .and_then(Value::as_i64)
+    };
+    let prompt = get("prompt_tokens", "input_tokens");
+    let completion = get("completion_tokens", "output_tokens");
+    let total = usage
+        .and_then(|u| u.get("total_tokens"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            prompt
+                .zip(completion)
+                .and_then(|(input, output)| input.checked_add(output))
+        });
+    (prompt, completion, total)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct UnitUsage {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+}
+
+/// Read provider-neutral unit fields where providers expose them alongside
+/// token usage. The response adapters add modality-specific fallbacks.
+pub fn units_from_value(v: &Value) -> UnitUsage {
+    let usage = v.get("usage");
+    let number = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_f64);
+    UnitUsage {
+        input: number("input_units")
+            .or_else(|| number("input_seconds"))
+            .or_else(|| number("duration_seconds")),
+        output: number("output_units"),
+    }
 }
 
 /// Monetary cost of one call from its model's prices (per 1M tokens) and its
@@ -126,6 +158,8 @@ fn compute_cost(
     price: Option<&super::model_defaults::ModelPrice>,
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
+    input_units: Option<f64>,
+    output_units: Option<f64>,
 ) -> f64 {
     let Some(p) = price else {
         return 0.0;
@@ -133,7 +167,19 @@ fn compute_cost(
     let per_million = |rate: Option<f64>, tokens: Option<i64>| -> f64 {
         rate.unwrap_or(0.0) * (tokens.unwrap_or(0) as f64) / 1_000_000.0
     };
-    per_million(p.input_price, prompt_tokens) + per_million(p.output_price, completion_tokens)
+    if p.pricing_unit == super::model_defaults::PricingUnit::Tokens {
+        return per_million(p.input_price, prompt_tokens)
+            + per_million(p.output_price, completion_tokens);
+    }
+    let input_cost = match input_units {
+        Some(units) => p.input_price.unwrap_or(0.0) * units,
+        None => per_million(p.input_price, prompt_tokens),
+    };
+    let output_cost = match output_units {
+        Some(units) => p.output_price.unwrap_or(0.0) * units,
+        None => per_million(p.output_price, completion_tokens),
+    };
+    input_cost + output_cost
 }
 
 fn fmt_ts(ts: Timestamp) -> String {
@@ -161,13 +207,20 @@ pub async fn insert_batch(pool: &Pool, recs: &[UsageRecord]) -> Result<(), DbErr
     for r in recs {
         let created = fmt_ts(r.created_at);
         let day = fmt_day(r.created_at);
-        let cost = compute_cost(prices.get(&r.model), r.prompt_tokens, r.completion_tokens);
+        let cost = compute_cost(
+            prices.get(&r.model),
+            r.prompt_tokens,
+            r.completion_tokens,
+            r.input_units,
+            r.output_units,
+        );
         sqlx::query(
             "INSERT INTO usage_events
                (id, created_at, user_id, user_email, token_id, token_name,
                 source, kind, backend, model, status, duration_ms,
-                prompt_tokens, completion_tokens, total_tokens, cost, enforce_limits)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 prompt_tokens, completion_tokens, total_tokens, input_units, output_units,
+                 cost, enforce_limits)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(&created)
@@ -184,6 +237,8 @@ pub async fn insert_batch(pool: &Pool, recs: &[UsageRecord]) -> Result<(), DbErr
         .bind(r.prompt_tokens)
         .bind(r.completion_tokens)
         .bind(r.total_tokens)
+        .bind(r.input_units.unwrap_or(0.0))
+        .bind(r.output_units.unwrap_or(0.0))
         .bind(cost)
         .bind(i64::from(r.enforce_limits))
         .execute(&mut *tx)
@@ -193,15 +248,18 @@ pub async fn insert_batch(pool: &Pool, recs: &[UsageRecord]) -> Result<(), DbErr
         sqlx::query(
             "INSERT INTO usage_daily
                (day, user_id, user_email, source, kind, backend, model,
-                req_count, error_count, prompt_tokens, completion_tokens, total_tokens, cost)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                 req_count, error_count, prompt_tokens, completion_tokens, total_tokens,
+                 input_units, output_units, cost)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(day, user_id, source, kind, backend, model) DO UPDATE SET
                 req_count         = req_count         + 1,
                 error_count       = error_count       + excluded.error_count,
                 prompt_tokens     = prompt_tokens     + excluded.prompt_tokens,
-                completion_tokens = completion_tokens + excluded.completion_tokens,
-                total_tokens      = total_tokens      + excluded.total_tokens,
-                cost              = cost              + excluded.cost",
+                 completion_tokens = completion_tokens + excluded.completion_tokens,
+                 total_tokens      = total_tokens      + excluded.total_tokens,
+                 input_units       = input_units       + excluded.input_units,
+                 output_units      = output_units      + excluded.output_units,
+                 cost              = cost              + excluded.cost",
         )
         .bind(&day)
         .bind(&r.user_id)
@@ -214,6 +272,8 @@ pub async fn insert_batch(pool: &Pool, recs: &[UsageRecord]) -> Result<(), DbErr
         .bind(r.prompt_tokens.unwrap_or(0))
         .bind(r.completion_tokens.unwrap_or(0))
         .bind(r.total_tokens.unwrap_or(0))
+        .bind(r.input_units.unwrap_or(0.0))
+        .bind(r.output_units.unwrap_or(0.0))
         .bind(cost)
         .execute(&mut *tx)
         .await?;
@@ -412,6 +472,8 @@ pub struct GroupCount {
     pub label: String,
     pub requests: i64,
     pub total_tokens: i64,
+    pub input_units: f64,
+    pub output_units: f64,
     pub cost: f64,
     pub errors: i64,
 }
@@ -548,6 +610,8 @@ async fn query_group(
     let sql = format!(
         "SELECT {key} AS k, {label} AS label, {req} AS requests, \
                 COALESCE(SUM(total_tokens), 0) AS total_tokens, \
+                COALESCE(SUM(input_units), 0) AS input_units, \
+                COALESCE(SUM(output_units), 0) AS output_units, \
                 COALESCE(SUM(cost), 0) AS cost, {err} AS errors \
          FROM {table} WHERE {col} >= ? AND {col} < ?{fsql} \
          GROUP BY {key} ORDER BY requests DESC, k ASC",
@@ -572,6 +636,8 @@ async fn query_group(
                 key,
                 requests: row.try_get("requests")?,
                 total_tokens: row.try_get("total_tokens")?,
+                input_units: row.try_get("input_units")?,
+                output_units: row.try_get("output_units")?,
                 cost: row.try_get("cost")?,
                 errors: row.try_get("errors")?,
             })
@@ -720,6 +786,8 @@ mod tests {
             prompt_tokens: Some(total / 2),
             completion_tokens: Some(total / 2),
             total_tokens: Some(total),
+            input_units: None,
+            output_units: None,
             enforce_limits: true,
         }
     }
@@ -739,6 +807,37 @@ mod tests {
         // Embeddings: prompt+total but no completion.
         let e = serde_json::json!({"usage": {"prompt_tokens": 5, "total_tokens": 5}});
         assert_eq!(usage_from_value(&e), (Some(5), None, Some(5)));
+    }
+
+    #[test]
+    fn usage_from_value_accepts_input_output_token_names() {
+        let v = serde_json::json!({
+            "usage": {"input_tokens": 12, "output_tokens": 7}
+        });
+        assert_eq!(usage_from_value(&v), (Some(12), Some(7), Some(19)));
+    }
+
+    #[test]
+    fn non_token_pricing_falls_back_to_token_counts_when_units_are_missing() {
+        let price = crate::server::db::model_defaults::ModelPrice {
+            input_price: Some(3.0),
+            output_price: Some(15.0),
+            pricing_unit: crate::server::db::model_defaults::PricingUnit::Seconds,
+        };
+        let cost = compute_cost(Some(&price), Some(100), Some(100), None, None);
+        assert!((cost - 0.0018).abs() < 1e-9);
+    }
+
+    #[test]
+    fn units_from_value_reads_provider_duration_fields() {
+        let v = serde_json::json!({"usage": {"input_seconds": 12.5}});
+        assert_eq!(
+            units_from_value(&v),
+            UnitUsage {
+                input: Some(12.5),
+                output: None,
+            }
+        );
     }
 
     #[test]
@@ -849,6 +948,102 @@ mod tests {
         let agg = aggregate(&pool, bounds, &Filter::default(), 90, now, true)
             .await
             .unwrap();
+        assert_eq!(agg.summary.total_cost, 0.0);
+    }
+
+    #[tokio::test]
+    async fn non_token_units_are_priced_and_roll_up() {
+        use crate::server::db::model_defaults::{self, PricingUnit};
+        let pool = pool().await;
+        let now: Timestamp = "2026-06-20T12:00:00Z".parse().unwrap();
+        model_defaults::set_pricing_with_unit(
+            &pool,
+            "tts",
+            Some(0.01),
+            None,
+            PricingUnit::Characters,
+        )
+        .await
+        .unwrap();
+        insert_batch(
+            &pool,
+            &[UsageRecord {
+                created_at: now,
+                user_id: "alice".into(),
+                user_email: None,
+                token_id: None,
+                token_name: None,
+                source: UsageSource::Chat,
+                kind: UsageKind::Speech,
+                backend: "tts".into(),
+                model: "tts".into(),
+                status: 200,
+                duration_ms: 10,
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+                input_units: Some(25.0),
+                output_units: None,
+                enforce_limits: true,
+            }],
+        )
+        .await
+        .unwrap();
+        let bounds = period_bounds(Period::Today, "UTC", now);
+        let agg = aggregate(&pool, bounds, &Filter::default(), 90, now, true)
+            .await
+            .unwrap();
+        assert!((agg.summary.total_cost - 0.25).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn legacy_token_unit_does_not_overcharge_non_token_usage() {
+        use crate::server::db::model_defaults::{self, PricingUnit};
+        let pool = pool().await;
+        let now: Timestamp = "2026-06-20T12:00:00Z".parse().unwrap();
+        model_defaults::set_pricing_with_unit(
+            &pool,
+            "legacy-image",
+            None,
+            Some(2.0),
+            PricingUnit::Tokens,
+        )
+        .await
+        .unwrap();
+        insert_batch(
+            &pool,
+            &[UsageRecord {
+                created_at: now,
+                user_id: "alice".into(),
+                user_email: None,
+                token_id: None,
+                token_name: None,
+                source: UsageSource::V1Api,
+                kind: UsageKind::Image,
+                backend: "image".into(),
+                model: "legacy-image".into(),
+                status: 200,
+                duration_ms: 1,
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+                input_units: None,
+                output_units: Some(1.0),
+                enforce_limits: true,
+            }],
+        )
+        .await
+        .unwrap();
+        let agg = aggregate(
+            &pool,
+            period_bounds(Period::Today, "UTC", now),
+            &Filter::default(),
+            90,
+            now,
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(agg.summary.total_cost, 0.0);
     }
 

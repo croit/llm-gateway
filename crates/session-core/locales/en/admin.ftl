@@ -82,7 +82,11 @@ admin-unknown-reasoning-effort = unknown reasoning effort `{ $value }`
 admin-context-window-invalid = context window `{ $value }` must be a positive integer
 
 # Per-model pricing for cost accounting (price per 1M tokens, input / output).
-admin-price-label = { $cur }/1M
+admin-price-label = { $cur }/{ $unit }
+admin-price-unit-tokens = 1M tokens
+admin-price-unit-images = image
+admin-price-unit-characters = character
+admin-price-unit-seconds = second
 admin-price-in-label = Price in
 admin-price-out-label = Price out
 admin-price-in-placeholder = unpriced

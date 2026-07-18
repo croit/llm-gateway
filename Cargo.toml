@@ -53,6 +53,7 @@ rust-s3 = { version = "0.36", default-features = false, features = ["tokio-rustl
 ip2location = "0.6"
 notify = "8"
 zip = { version = "8", default-features = false, features = ["deflate"] }
+symphonia = { version = "0.5", default-features = false, features = ["flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
 
 # PDF reading for the `fetch_attachment` tool — two model-driven tiers:
 #   * pdf-extract (MIT, pure Rust via lopdf) pulls the text layer out of a

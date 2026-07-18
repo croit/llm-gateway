@@ -1444,6 +1444,8 @@ fn emit_usage(
         prompt_tokens,
         completion_tokens,
         total_tokens,
+        input_units: None,
+        output_units: None,
         enforce_limits: d
             .state
             .upstreams

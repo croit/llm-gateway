@@ -1037,6 +1037,8 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
             prompt_tokens: (prompt > 0).then_some(prompt),
             completion_tokens: (completion > 0).then_some(completion),
             total_tokens: (prompt + completion > 0).then_some(prompt + completion),
+            input_units: None,
+            output_units: None,
             enforce_limits: true,
         });
     }
@@ -1061,6 +1063,8 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
             prompt_tokens: Some(900),
             completion_tokens: Some(280),
             total_tokens: Some(1180),
+            input_units: None,
+            output_units: None,
             enforce_limits: true,
         });
     }

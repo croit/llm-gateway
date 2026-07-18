@@ -24,12 +24,12 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::server::chat_attachments;
 use crate::server::db::Pool;
-use crate::server::db::usage::{UsageKind, UsageRecord, UsageSource};
+use crate::server::db::usage::{UnitUsage, UsageKind, UsageRecord, UsageSource};
 use crate::server::feature_defaults::{self, Feature};
 use crate::server::upstreams::{PoolKind, UpstreamRegistry, registry::RouteError};
 use crate::server::usage::UsageHandle;
@@ -108,6 +108,19 @@ struct ImageDatum {
     b64_json: Option<String>,
     #[serde(default)]
     url: Option<String>,
+}
+
+/// Count image units consistently for the raw proxy and the built-in image
+/// tool. `None` means the provider response did not contain a generated image.
+pub fn image_units(count: usize) -> Option<f64> {
+    (count > 0).then_some(count as f64)
+}
+
+pub fn image_output_units_from_value(value: &Value) -> Option<f64> {
+    value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| image_units(data.len()))
 }
 
 /// Cheaply-cloneable image-generation handle. Built from state fields the
@@ -200,7 +213,7 @@ impl ImageGenerator {
             .send()
             .await
             .map_err(|e| ImageGenError::Upstream(format!("request failed: {e}")))?;
-        self.handle_response(resp, meta, &backend_name, &real_model, started)
+        self.handle_response(resp, meta, &backend_name, &real_model, started, None)
             .await
     }
 
@@ -277,8 +290,15 @@ impl ImageGenerator {
             .send()
             .await
             .map_err(|e| ImageGenError::Upstream(format!("request failed: {e}")))?;
-        self.handle_response(resp, meta, &backend_name, &real_model, started)
-            .await
+        self.handle_response(
+            resp,
+            meta,
+            &backend_name,
+            &real_model,
+            started,
+            image_units(1),
+        )
+        .await
     }
 
     /// Shared tail for `generate`/`edit`: meter the call, then turn the OpenAI
@@ -291,43 +311,69 @@ impl ImageGenerator {
         backend_name: &str,
         real_model: &str,
         started: Instant,
+        input_units: Option<f64>,
     ) -> Result<GeneratedImage, ImageGenError> {
         let status = resp.status();
-        // Meter the upstream call regardless of outcome — one row per call,
-        // mirroring the proxy. Images carry no token counts.
-        self.emit_usage(meta, backend_name, real_model, status.as_u16(), started);
-
-        if !status.is_success() {
+        let (result, units) = if !status.is_success() {
             let detail = resp.text().await.unwrap_or_default();
             let detail = detail.chars().take(500).collect::<String>();
-            return Err(ImageGenError::Upstream(format!("HTTP {status}: {detail}")));
-        }
-
-        let parsed: ImagesResponse = resp
-            .json()
-            .await
-            .map_err(|e| ImageGenError::BadResponse(format!("unparseable body: {e}")))?;
-        let datum = parsed
-            .data
-            .into_iter()
-            .next()
-            .ok_or_else(|| ImageGenError::BadResponse("empty `data` array".into()))?;
-
-        match (datum.b64_json, datum.url) {
-            (Some(b64), _) => {
-                let bytes =
-                    chat_attachments::decode_base64(&b64).map_err(ImageGenError::BadResponse)?;
-                if bytes.len() > MAX_IMAGE_BYTES {
-                    return Err(ImageGenError::TooLarge);
+            (
+                Err(ImageGenError::Upstream(format!("HTTP {status}: {detail}"))),
+                UnitUsage::default(),
+            )
+        } else {
+            match resp.json::<ImagesResponse>().await {
+                Err(e) => (
+                    Err(ImageGenError::BadResponse(format!("unparseable body: {e}"))),
+                    UnitUsage::default(),
+                ),
+                Ok(parsed) => {
+                    // One output unit per returned image, mirroring the raw proxy.
+                    let output_units = image_units(parsed.data.len());
+                    match parsed.data.into_iter().next() {
+                        None => (
+                            Err(ImageGenError::BadResponse("empty `data` array".into())),
+                            UnitUsage::default(),
+                        ),
+                        Some(datum) => {
+                            let result = match (datum.b64_json, datum.url) {
+                                (Some(b64), _) => chat_attachments::decode_base64(&b64)
+                                    .map_err(ImageGenError::BadResponse)
+                                    .and_then(|bytes| {
+                                        if bytes.len() > MAX_IMAGE_BYTES {
+                                            return Err(ImageGenError::TooLarge);
+                                        }
+                                        let mime = sniff_image_mime(&bytes)
+                                            .unwrap_or("image/png")
+                                            .to_string();
+                                        Ok(GeneratedImage { bytes, mime })
+                                    }),
+                                (None, Some(url)) => self.fetch_image_url(&url).await,
+                                (None, None) => Err(ImageGenError::BadResponse(
+                                    "datum has neither `b64_json` nor `url`".into(),
+                                )),
+                            };
+                            (
+                                result,
+                                UnitUsage {
+                                    input: input_units,
+                                    output: output_units,
+                                },
+                            )
+                        }
+                    }
                 }
-                let mime = sniff_image_mime(&bytes).unwrap_or("image/png").to_string();
-                Ok(GeneratedImage { bytes, mime })
             }
-            (None, Some(url)) => self.fetch_image_url(&url).await,
-            (None, None) => Err(ImageGenError::BadResponse(
-                "datum has neither `b64_json` nor `url`".into(),
-            )),
-        }
+        };
+        self.emit_usage(
+            meta,
+            backend_name,
+            real_model,
+            status.as_u16(),
+            started,
+            units,
+        );
+        result
     }
 
     /// Whether the image model's pool is GDPR-compliant (drives the edit gate).
@@ -422,6 +468,7 @@ impl ImageGenerator {
         model: &str,
         status: u16,
         started: Instant,
+        units: UnitUsage,
     ) {
         if !self.usage.is_enabled() {
             return;
@@ -441,6 +488,8 @@ impl ImageGenerator {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            input_units: units.input,
+            output_units: units.output,
             enforce_limits: self
                 .upstreams
                 .enforce_limits_for_model(model, crate::server::upstreams::PoolKind::Image),

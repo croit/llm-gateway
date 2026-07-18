@@ -77,7 +77,11 @@ admin-unknown-reasoning-effort = effort de raisonnement inconnu `{ $value }`
 admin-context-window-invalid = la fenêtre de contexte `{ $value }` doit être un entier positif
 
 # Tarifs par modèle pour la comptabilité des coûts (prix par 1 M de jetons, entrée / sortie).
-admin-price-label = { $cur }/1M
+admin-price-label = { $cur }/{ $unit }
+admin-price-unit-tokens = 1 M de tokens
+admin-price-unit-images = image
+admin-price-unit-characters = caractère
+admin-price-unit-seconds = seconde
 admin-price-in-label = Prix ent
 admin-price-out-label = Prix sor
 admin-price-in-placeholder = sans tarif
