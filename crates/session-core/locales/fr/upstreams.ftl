@@ -25,6 +25,9 @@ upstreams-backend-pending = en attente
 # Info-bulle sur une puce de modèle barrée : découvert via /models mais retenu
 # car la liste de modèles du pool (liste d'autorisation) ne le nomme pas.
 upstreams-model-withheld-title = Découvert via /models mais retenu par la liste de modèles de ce pool — ni servi ni annoncé.
+# Pastille repliée après les modèles servis : cliquer pour afficher les puces retenues (inactives).
+upstreams-models-inactive-pill = +{ $count } inactifs
+upstreams-models-inactive-hide = masquer
 
 upstreams-unassigned-heading = Non assignés
 upstreams-unassigned-description = Backends non assignés à un pool. Ajoutez-en un à un pool pour y acheminer le trafic.

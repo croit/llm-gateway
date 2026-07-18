@@ -24,6 +24,9 @@ upstreams-backend-pending = 待应用
 
 # 划掉的模型徽章上的提示：通过 /models 发现，但因该池的模型列表（白名单）未包含而被保留。
 upstreams-model-withheld-title = 通过 /models 发现，但被该池的模型列表保留 — 不提供也不公告。
+# 已服务模型之后的折叠标签：点击展开被保留（未启用）的模型。
+upstreams-models-inactive-pill = +{ $count } 个未启用
+upstreams-models-inactive-hide = 收起
 
 upstreams-unassigned-heading = 未分配
 upstreams-unassigned-description = 未分配给任何池的后端。将其加入某个池以向其路由流量。

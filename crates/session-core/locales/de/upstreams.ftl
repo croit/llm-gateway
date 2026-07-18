@@ -28,6 +28,9 @@ upstreams-backend-pending = ausstehend
 # Tooltip auf einem durchgestrichenen Modell-Chip: per /models-Probe erkannt,
 # aber durch die Modell-Liste (Positivliste) des Pools zurückgehalten.
 upstreams-model-withheld-title = Über /models erkannt, aber durch die Modell-Liste dieses Pools zurückgehalten — wird nicht bereitgestellt oder beworben.
+# Eingeklapptes Pill nach den bereitgestellten Modellen: Klick zeigt die zurückgehaltenen (inaktiven) Chips.
+upstreams-models-inactive-pill = +{ $count } inaktiv
+upstreams-models-inactive-hide = ausblenden
 
 upstreams-unassigned-heading = Nicht zugewiesen
 upstreams-unassigned-description = Backends, die keinem Pool zugewiesen sind. Weise eines einem Pool zu, um Anfragen dorthin zu leiten.

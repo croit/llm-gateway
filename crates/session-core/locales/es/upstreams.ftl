@@ -25,6 +25,9 @@ upstreams-backend-pending = pendiente
 # Tooltip en un chip de modelo tachado: descubierto vía /models pero retenido
 # porque la lista de modelos del pool (lista de permitidos) no lo incluye.
 upstreams-model-withheld-title = Descubierto vía /models pero retenido por la lista de modelos de este pool: no se sirve ni se anuncia.
+# Pastilla plegada tras los modelos servidos: haz clic para mostrar los chips retenidos (inactivos).
+upstreams-models-inactive-pill = +{ $count } inactivos
+upstreams-models-inactive-hide = ocultar
 
 upstreams-unassigned-heading = Sin asignar
 upstreams-unassigned-description = Backends no asignados a ningún pool. Añádelos a un pool para dirigirles tráfico.

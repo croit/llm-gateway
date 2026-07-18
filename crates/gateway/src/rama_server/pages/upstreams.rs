@@ -491,20 +491,7 @@ fn render_backend_details(
                     }
                 }
                 if !served.is_empty() || !withheld.is_empty() || !aliases.is_empty() {
-                    div(class: "flex flex-wrap gap-1 items-center") {
-                        for m in served.iter() {
-                            span(class: "badge badge-ghost badge-sm font-mono") { (m.clone()) }
-                        }
-                        // Discovered but withheld by the allowlist: struck-through
-                        // and muted, with a tooltip explaining why they're inert.
-                        for m in withheld.iter() {
-                            span(
-                                class: "badge badge-ghost badge-sm font-mono line-through opacity-50",
-                                title: (withheld_title.clone())
-                            ) { (m.clone()) }
-                        }
-                        for a in aliases.iter() { (a.clone()) }
-                    }
+                    (render_backend_model_chips(lang, del_sig, &served, &withheld, &aliases, &withheld_title))
                 }
             }
             // Explicit "Edit backend" toggle (mirrors "Edit pool") so the
@@ -518,6 +505,106 @@ fn render_backend_details(
                 }
             }
         }
+    }
+    .to_html()
+}
+
+/// The served/alias/withheld model chip row under a backend's status.
+///
+/// Active (served) models and alias chips are **always** shown in full. The
+/// withheld ("inactive") set — models the endpoint advertises but the pool's
+/// allowlist doesn't serve — can run to hundreds of entries (e.g. an OpenAI
+/// backend), so it collapses behind a clickable `+N inactive` pill; clicking it
+/// reveals the full struck-through list inline (and a "hide" pill to re-collapse
+/// it). Toggled by a per-row datastar signal (`inact_<del_sig>`, unique because
+/// `del_sig` is unique per rendered backend row) so several rows expand
+/// independently, with no page reload. Isolated in this helper so the `html!`
+/// `for`/attribute closures never capture the caller's locals (see the note on
+/// `select_option`).
+fn render_backend_model_chips(
+    lang: Lang,
+    del_sig: &str,
+    served: &[String],
+    withheld: &[String],
+    aliases: &[Html],
+    withheld_title: &str,
+) -> Html {
+    let sig = format!("inact_{del_sig}");
+    let signals = format!("{{{sig}: false}}");
+    let show = format!("${sig}");
+    let hide = format!("!${sig}");
+    let open = format!("${sig} = true");
+    let close = format!("${sig} = false");
+    let pill_label = t_args(
+        lang,
+        "upstreams-models-inactive-pill",
+        &i18n::args([("count", withheld.len().to_string().into())]),
+    );
+    let hide_label = t(lang, "upstreams-models-inactive-hide");
+
+    // Build every child up front via the standalone chip/pill helpers below
+    // (they take `&str`, so the `html!` closures only capture Copy references —
+    // moving the `String` locals into the macro's `FnMut` child closures here
+    // would fail to compile, E0507).
+    let mut children: Vec<Html> = served.iter().map(|m| served_chip(m)).collect();
+    children.extend(aliases.iter().cloned());
+    if !withheld.is_empty() {
+        children.push(inactive_toggle_pill(
+            &pill_label,
+            &hide,
+            &open,
+            withheld_title,
+        ));
+        // Each withheld chip is gated by the row signal (data-show), so the
+        // collapsed row is just the active chips + the pill.
+        children.extend(
+            withheld
+                .iter()
+                .map(|m| withheld_chip(m, &show, withheld_title)),
+        );
+        children.push(inactive_toggle_pill(&hide_label, &show, &close, ""));
+    }
+
+    html! {
+        div(class: "flex flex-wrap gap-1 items-center", "data-signals": (signals)) {
+            for c in children.iter() { (c.clone()) }
+        }
+    }
+    .to_html()
+}
+
+/// A served (active) model chip. Standalone so the `html!` never captures a
+/// caller local (see `select_option`).
+fn served_chip(model: &str) -> Html {
+    html! { span(class: "badge badge-ghost badge-sm font-mono") { (model.to_string()) } }.to_html()
+}
+
+/// A withheld (inactive) model chip — struck-through and muted, gated by the
+/// row's collapse signal via `show_expr` (a datastar `data-show` expression).
+fn withheld_chip(model: &str, show_expr: &str, title: &str) -> Html {
+    html! {
+        span(
+            class: "badge badge-ghost badge-sm font-mono line-through opacity-50",
+            "data-show": (show_expr.to_string()),
+            title: (title.to_string())
+        ) { (model.to_string()) }
+    }
+    .to_html()
+}
+
+/// A clickable pill toggling the withheld-models collapse: `show_expr` is the
+/// datastar `data-show` guard (visible only in one state) and `click_expr`
+/// flips the row signal. Used for both the `+N inactive` (collapsed) pill and
+/// the "hide" (expanded) pill. `title` is optional (`""` = none).
+fn inactive_toggle_pill(label: &str, show_expr: &str, click_expr: &str, title: &str) -> Html {
+    html! {
+        button(
+            type: "button",
+            class: "badge badge-ghost badge-sm cursor-pointer",
+            "data-show": (show_expr.to_string()),
+            "data-on:click": (click_expr.to_string()),
+            title: (title.to_string())
+        ) { (label.to_string()) }
     }
     .to_html()
 }
@@ -1557,6 +1644,53 @@ mod tests {
             html.contains(r#"action="/admin/backends/save""#)
                 && html.contains(r#"name="name" value="gpu-01""#),
             "the toggle must reveal the pre-filled backend editor: {html}"
+        );
+    }
+
+    /// Served (active) models are always shown; the withheld ("inactive") set
+    /// collapses behind a clickable `+N inactive` pill and each withheld chip is
+    /// gated by the row's toggle signal so the collapsed row stays compact.
+    #[test]
+    fn withheld_models_collapse_behind_inactive_pill() {
+        let b = sample_backend();
+        let health = BackendHealth {
+            healthy: true,
+            saturated: false,
+            inflight: 0,
+            max_inflight: 16,
+            served: vec!["gpt-4o-mini-tts".into()],
+            withheld: vec!["gpt-4".into(), "gpt-3.5-turbo".into(), "davinci-002".into()],
+            aliases: vec![],
+            recent: vec![],
+        };
+        let html = render_backend_details(
+            Lang::En,
+            &b,
+            Some(&health),
+            "dpb0_0",
+            Some("chat-eu"),
+            &["chat-eu".into()],
+        )
+        .to_string();
+        assert!(
+            html.contains("gpt-4o-mini-tts"),
+            "served (active) model must always be shown: {html}"
+        );
+        assert!(
+            html.contains("+3 inactive"),
+            "pill must show the withheld count: {html}"
+        );
+        assert!(
+            html.contains("{inact_dpb0_0: false}"),
+            "row must declare its own collapse signal: {html}"
+        );
+        assert!(
+            html.contains(r#"data-show="$inact_dpb0_0""#),
+            "withheld chips must be gated by the row signal (collapsed by default): {html}"
+        );
+        assert!(
+            html.contains("davinci-002"),
+            "withheld chips must still be rendered (revealed on expand): {html}"
         );
     }
 }

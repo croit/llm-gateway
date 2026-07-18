@@ -28,6 +28,9 @@ upstreams-backend-pending = pending apply
 # Tooltip on a struck-through model chip: discovered via the /models probe but
 # withheld because the pool's model list (allowlist) doesn't name it.
 upstreams-model-withheld-title = Discovered via /models but withheld by this pool's model list — not served or advertised.
+# Collapsed pill after the served models: click to reveal the withheld (inactive) chips.
+upstreams-models-inactive-pill = +{ $count } inactive
+upstreams-models-inactive-hide = hide inactive
 
 upstreams-unassigned-heading = Unassigned
 upstreams-unassigned-description = Backends not assigned to any pool. Add one to a pool to route traffic to it.
