@@ -30,7 +30,7 @@ use crate::rama_server::auth::require_bearer;
 use crate::rama_server::state::RamaState;
 use crate::rama_server::vad;
 use crate::server::auth::UserCtx;
-use crate::server::db::usage::{self, UsageKind, UsageRecord, UsageSource};
+use crate::server::db::usage::{self, UnitUsage, UsageKind, UsageRecord, UsageSource};
 use crate::server::speech::{self, SpokenMarkers};
 use crate::server::tools::ToolContext;
 use crate::server::tools::ToolSource;
@@ -57,6 +57,8 @@ struct RecordParams {
     /// from the registry once the real model id is known, and stamped onto
     /// every emitted row.
     enforce_limits: bool,
+    input_units: Option<f64>,
+    output_units: Option<f64>,
 }
 
 impl RecordParams {
@@ -73,6 +75,8 @@ impl RecordParams {
             kind,
             model,
             enforce_limits,
+            input_units: None,
+            output_units: None,
         }
     }
 
@@ -103,6 +107,8 @@ impl RecordParams {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            input_units: self.input_units,
+            output_units: self.output_units,
             enforce_limits: self.enforce_limits,
         });
     }
@@ -170,6 +176,54 @@ fn tokens_from_bytes(bytes: &Bytes) -> (Option<i64>, Option<i64>, Option<i64>) {
     serde_json::from_slice::<Value>(bytes)
         .map(|v| usage::usage_from_value(&v))
         .unwrap_or((None, None, None))
+}
+
+type TokenUsage = (Option<i64>, Option<i64>, Option<i64>);
+
+fn response_metrics(kind: UsageKind, bytes: &Bytes) -> (TokenUsage, UnitUsage) {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return ((None, None, None), UnitUsage::default());
+    };
+    let mut units = usage::units_from_value(&value);
+    if kind == UsageKind::Transcription && units.input.is_none() {
+        units.input = value.get("duration").and_then(Value::as_f64);
+    }
+    if kind == UsageKind::Image {
+        units.output =
+            crate::server::image_gen::image_output_units_from_value(&value).or(units.output);
+    }
+    (usage::usage_from_value(&value), units)
+}
+
+fn request_units(kind: UsageKind, body: &Bytes) -> UnitUsage {
+    match kind {
+        UsageKind::Speech => serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .map(|text| UnitUsage {
+                        input: Some(text.chars().count() as f64),
+                        output: None,
+                    })
+            })
+            .unwrap_or_default(),
+        _ => UnitUsage::default(),
+    }
+}
+
+fn image_edit_units(fields: &[MultipartField]) -> Option<f64> {
+    crate::server::image_gen::image_units(
+        fields
+            .iter()
+            .filter(|field| field.name == "image" || field.name == "image[]")
+            .count(),
+    )
+}
+
+fn prefer_positive(primary: Option<f64>, fallback: Option<f64>) -> Option<f64> {
+    primary.filter(|value| *value > 0.0).or(fallback)
 }
 
 /// `POST /v1/chat/completions`. Two paths under one handler:
@@ -621,6 +675,8 @@ pub async fn transcribe_session(State(state): State<Arc<RamaState>>, req: Reques
         model: String::new(),
         // Overwritten in `handle_transcription` once the real model resolves.
         enforce_limits: true,
+        input_units: None,
+        output_units: None,
     };
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
@@ -693,8 +749,15 @@ async fn handle_transcription(
     // bypass this check; their failure mode is bounded by the
     // upstream's own validation.
     const MIN_AUDIO_SECONDS: f64 = 0.4;
-    if let Some(file) = trimmed_fields.iter().find(|f| f.name == "file")
-        && let Some(secs) = vad::pcm16_mono_16k_duration_seconds(&file.bytes)
+    // Decode the PCM duration at most once: it gates the sub-threshold check
+    // below and doubles as the billable duration when the upload is 16 kHz
+    // mono PCM (the common browser-worklet case).
+    let file_bytes = trimmed_fields
+        .iter()
+        .find(|f| f.name == "file")
+        .map(|f| &f.bytes);
+    let pcm_seconds = file_bytes.and_then(|b| vad::pcm16_mono_16k_duration_seconds(b));
+    if let Some(secs) = pcm_seconds
         && secs < MIN_AUDIO_SECONDS
     {
         return error_response(
@@ -719,6 +782,11 @@ async fn handle_transcription(
     }
 
     rec.model = real_model.clone();
+    rec.input_units = file_bytes.and_then(|b| {
+        pcm_seconds
+            .or_else(|| vad::wav_duration_seconds(b))
+            .or_else(|| vad::encoded_audio_duration_seconds(b.clone()))
+    });
     rec.enforce_limits = state
         .upstreams
         .enforce_limits_for_model(&real_model, PoolKind::Transcription);
@@ -1051,7 +1119,7 @@ pub async fn images_edits(State(state): State<Arc<RamaState>>, req: Request) -> 
     if let Ok(val) = rama::http::HeaderValue::from_str(&content_type) {
         headers.insert(rama::http::header::CONTENT_TYPE, val);
     }
-    let rec = RecordParams::v1(
+    let mut rec = RecordParams::v1(
         &user,
         UsageKind::Image,
         real_model.clone(),
@@ -1059,6 +1127,7 @@ pub async fn images_edits(State(state): State<Arc<RamaState>>, req: Request) -> 
             .upstreams
             .enforce_limits_for_model(&real_model, PoolKind::Image),
     );
+    rec.input_units = image_edit_units(&fields);
     let resp = forward(
         &state,
         acquired,
@@ -1314,6 +1383,8 @@ pub async fn speech_session(State(state): State<Arc<RamaState>>, req: Request) -
         enforce_limits: state
             .upstreams
             .enforce_limits_for_model(&real_model, PoolKind::Speech),
+        input_units: None,
+        output_units: None,
     };
     let serialized = match serde_json::to_vec(&req_body) {
         Ok(v) => Bytes::from(v),
@@ -1518,7 +1589,7 @@ async fn forward(
     upstream_path: &str,
     client_headers: HeaderMap,
     body: Bytes,
-    rec: RecordParams,
+    mut rec: RecordParams,
 ) -> Response {
     // Outbound HTTP via reqwest, by design. Rama serves the inbound
     // side; reqwest handles outbound. Same split most rust web
@@ -1531,6 +1602,7 @@ async fn forward(
     let model_key = acquired.resolved_model().to_string();
     let url = format!("{}/{}", backend.base_url, upstream_path);
     let started = Instant::now();
+    let request_usage = request_units(rec.kind, &body);
 
     let mut req = state.http.request(method, &url);
     for (name, value) in &client_headers {
@@ -1546,6 +1618,8 @@ async fn forward(
         Ok(r) => r,
         Err(err) => {
             drop(acquired);
+            rec.input_units = None;
+            rec.output_units = None;
             rec.emit(
                 &state.usage,
                 &backend_name,
@@ -1571,6 +1645,8 @@ async fn forward(
         Ok(b) => b,
         Err(err) => {
             drop(acquired);
+            rec.input_units = None;
+            rec.output_units = None;
             rec.emit(
                 &state.usage,
                 &backend_name,
@@ -1587,14 +1663,29 @@ async fn forward(
     };
     drop(acquired);
 
-    // One row per upstream call. Embeddings carry a `usage` block;
-    // transcription responses don't, so tokens come back `None` there.
+    let (tokens, response_usage) = response_metrics(rec.kind, &bytes);
+    if status.is_success() {
+        rec.input_units = prefer_positive(
+            response_usage.input,
+            prefer_positive(request_usage.input, rec.input_units),
+        );
+        rec.output_units = response_usage
+            .output
+            .or(request_usage.output)
+            .or(rec.output_units);
+    } else {
+        rec.input_units = None;
+        rec.output_units = None;
+    }
+
+    // One row per upstream call. Token and modality-specific usage are
+    // normalized before the row is handed to the asynchronous writer.
     rec.emit(
         &state.usage,
         &backend_name,
         status.as_u16(),
         started,
-        tokens_from_bytes(&bytes),
+        tokens,
     );
 
     // Auto-learn a rejected capability before relaying the error verbatim.
@@ -2728,6 +2819,31 @@ mod tests {
         let body = Bytes::from(r#"{ not valid json stream_options here"#);
         let out = strip_stream_options_when_not_streaming(body.clone());
         assert_eq!(&out[..], &body[..]);
+    }
+
+    #[test]
+    fn image_edit_units_counts_both_multipart_image_names() {
+        let fields = vec![
+            MultipartField {
+                name: "image[]".into(),
+                filename: None,
+                content_type: None,
+                bytes: Bytes::new(),
+            },
+            MultipartField {
+                name: "image".into(),
+                filename: None,
+                content_type: None,
+                bytes: Bytes::new(),
+            },
+        ];
+        assert_eq!(image_edit_units(&fields), Some(2.0));
+    }
+
+    #[test]
+    fn zero_provider_duration_uses_measured_duration() {
+        assert_eq!(prefer_positive(Some(0.0), Some(4.5)), Some(4.5));
+        assert_eq!(prefer_positive(Some(2.0), Some(4.5)), Some(2.0));
     }
 
     #[test]

@@ -108,6 +108,10 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
             context_window: row.as_ref().and_then(|r| r.context_window),
             input_price: row.as_ref().and_then(|r| r.input_price),
             output_price: row.as_ref().and_then(|r| r.output_price),
+            pricing_unit: row
+                .as_ref()
+                .map(|r| r.pricing_unit)
+                .unwrap_or(db::PricingUnit::Tokens),
             cap_vision: row.as_ref().and_then(|r| r.capabilities.vision),
             cap_audio_input: row.as_ref().and_then(|r| r.capabilities.audio_input),
             cap_pdf_input: row.as_ref().and_then(|r| r.capabilities.pdf_input),
@@ -152,6 +156,10 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
                 kind_label,
                 input_price: row.as_ref().and_then(|r| r.input_price),
                 output_price: row.as_ref().and_then(|r| r.output_price),
+                pricing_unit: displayed_pricing_unit(
+                    kind_label,
+                    row.as_ref().map(|r| r.pricing_unit),
+                ),
                 name,
             });
         }
@@ -261,6 +269,36 @@ pub async fn models_save(State(state): State<Arc<RamaState>>, req: Request) -> R
             );
         }
     };
+    let pricing_unit = db::PricingUnit::parse(&form.pricing_unit);
+
+    if form.price_only == "1" {
+        return match db::set_pricing_with_unit(
+            &state.db,
+            &form.model_name,
+            input_price,
+            output_price,
+            pricing_unit,
+        )
+        .await
+        {
+            Ok(()) => toast(
+                FlashKind::Success,
+                t_args(
+                    lang,
+                    "admin-saved-model",
+                    &i18n::args([("model", form.model_name.clone().into())]),
+                ),
+            ),
+            Err(err) => toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-db-upsert-error",
+                    &i18n::args([("err", err.to_string().into())]),
+                ),
+            ),
+        };
+    }
     let context_window = match form.context_window.trim() {
         "" => None,
         s => match s.parse::<i64>() {
@@ -365,6 +403,7 @@ pub async fn models_save(State(state): State<Arc<RamaState>>, req: Request) -> R
         context_window,
         input_price,
         output_price,
+        pricing_unit,
         capabilities: db::ModelCapabilities {
             vision: tri(&form.cap_vision),
             audio_input: tri(&form.cap_audio_input),
@@ -596,6 +635,10 @@ struct SaveForm {
     #[serde(default)]
     output_price: String,
     #[serde(default)]
+    pricing_unit: String,
+    #[serde(default)]
+    price_only: String,
+    #[serde(default)]
     context_window: String,
     #[serde(default)]
     reasoning_style: String,
@@ -648,6 +691,7 @@ struct ModelRow {
     context_window: Option<i64>,
     input_price: Option<f64>,
     output_price: Option<f64>,
+    pricing_unit: db::PricingUnit,
     cap_vision: Option<bool>,
     cap_audio_input: Option<bool>,
     cap_pdf_input: Option<bool>,
@@ -695,6 +739,7 @@ struct OtherModelRow {
     kind_label: &'static str,
     input_price: Option<f64>,
     output_price: Option<f64>,
+    pricing_unit: db::PricingUnit,
 }
 
 struct AliasRow {
@@ -936,7 +981,7 @@ fn row_show(group: &str, configured: bool, name: &str) -> String {
 
 fn render_chat_item(lang: Lang, currency: &str, row: &ModelRow, all_models: &[String]) -> Html {
     let show = row_show("chat", row.configured(), &row.name);
-    let price = fmt_price_pair(row.input_price, row.output_price);
+    let price = fmt_price_pair(lang, row.input_price, row.output_price, row.pricing_unit);
     let context = row
         .context_window
         .map(fmt_context)
@@ -969,7 +1014,7 @@ fn render_chat_item(lang: Lang, currency: &str, row: &ModelRow, all_models: &[St
 fn render_other_item(lang: Lang, currency: &str, m: &OtherModelRow) -> Html {
     let configured = m.input_price.is_some() || m.output_price.is_some();
     let show = row_show("other", configured, &m.name);
-    let price = fmt_price_pair(m.input_price, m.output_price);
+    let price = fmt_price_pair(lang, m.input_price, m.output_price, m.pricing_unit);
     let na = t(lang, "admin-value-na");
     let cfg = if configured {
         html! { span(class: "badge badge-ghost badge-sm") { (t(lang, "admin-badge-price")) } }
@@ -992,7 +1037,14 @@ fn render_other_item(lang: Lang, currency: &str, m: &OtherModelRow) -> Html {
                 }
             }
             div(class: "bg-base-200/40 border-t border-base-300 p-3 flex flex-col gap-3") {
-                (render_price_only_editor(lang, currency, &m.name, m.input_price, m.output_price))
+                (render_price_only_editor(
+                    lang,
+                    currency,
+                    &m.name,
+                    m.input_price,
+                    m.output_price,
+                    m.pricing_unit,
+                ))
             }
         }
     }
@@ -1025,12 +1077,22 @@ fn render_alias_item(lang: Lang, a: &AliasRow) -> Html {
 // Cell formatters
 // ---------------------------------------------------------------------------
 
-fn fmt_price_pair(input: Option<f64>, output: Option<f64>) -> Option<String> {
+fn fmt_price_pair(
+    lang: Lang,
+    input: Option<f64>,
+    output: Option<f64>,
+    unit: db::PricingUnit,
+) -> Option<String> {
     match (input, output) {
         (None, None) => None,
         (i, o) => {
             let f = |p: Option<f64>| p.map(|n| format!("{n}")).unwrap_or_else(|| "—".into());
-            Some(format!("{} / {}", f(i), f(o)))
+            Some(format!(
+                "{} / {} {}",
+                f(i),
+                f(o),
+                pricing_unit_label(lang, unit)
+            ))
         }
     }
 }
@@ -1041,6 +1103,31 @@ fn fmt_context(n: i64) -> String {
     } else {
         n.to_string()
     }
+}
+
+fn pricing_unit_for_kind(kind: &str) -> db::PricingUnit {
+    match kind {
+        "image" => db::PricingUnit::Images,
+        "speech" => db::PricingUnit::Characters,
+        "transcription" => db::PricingUnit::Seconds,
+        _ => db::PricingUnit::Tokens,
+    }
+}
+
+fn displayed_pricing_unit(kind: &str, stored: Option<db::PricingUnit>) -> db::PricingUnit {
+    stored.unwrap_or_else(|| pricing_unit_for_kind(kind))
+}
+
+fn pricing_unit_label(lang: Lang, unit: db::PricingUnit) -> String {
+    t(
+        lang,
+        match unit {
+            db::PricingUnit::Tokens => "admin-price-unit-tokens",
+            db::PricingUnit::Images => "admin-price-unit-images",
+            db::PricingUnit::Characters => "admin-price-unit-characters",
+            db::PricingUnit::Seconds => "admin-price-unit-seconds",
+        },
+    )
 }
 
 fn price_cell(price: &Option<String>) -> Html {
@@ -1138,12 +1225,16 @@ fn render_chat_editor(lang: Lang, currency: &str, row: &ModelRow, all_models: &[
     let price_label = t_args(
         lang,
         "admin-price-label",
-        &i18n::args([("cur", currency.to_string().into())]),
+        &i18n::args([
+            ("cur", currency.to_string().into()),
+            ("unit", pricing_unit_label(lang, row.pricing_unit).into()),
+        ]),
     );
 
     html! {
         form(method: "post", action: (action), "data-on:submit__prevent": (post), class: "flex flex-col gap-3 m-0") {
             input(type: "hidden", name: "model_name", value: (row.name.clone()));
+            input(type: "hidden", name: "pricing_unit", value: (row.pricing_unit.as_str()));
             div(class: "grid grid-cols-1 sm:grid-cols-2 gap-3") {
                 label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "admin-price-in-label")) " (" (price_label.clone()) ")" }
@@ -1199,6 +1290,7 @@ fn render_price_only_editor(
     name: &str,
     input_price: Option<f64>,
     output_price: Option<f64>,
+    pricing_unit: db::PricingUnit,
 ) -> Html {
     let action = "/admin/models/save";
     let post = format!("@post('{action}', {{contentType: 'form'}})");
@@ -1207,12 +1299,17 @@ fn render_price_only_editor(
     let price_label = t_args(
         lang,
         "admin-price-label",
-        &i18n::args([("cur", currency.to_string().into())]),
+        &i18n::args([
+            ("cur", currency.to_string().into()),
+            ("unit", pricing_unit_label(lang, pricing_unit).into()),
+        ]),
     );
     let name = name.to_string();
     html! {
         form(method: "post", action: (action), "data-on:submit__prevent": (post), class: "flex flex-col gap-3 m-0") {
             input(type: "hidden", name: "model_name", value: (name));
+            input(type: "hidden", name: "pricing_unit", value: (pricing_unit.as_str()));
+            input(type: "hidden", name: "price_only", value: "1");
             div(class: "grid grid-cols-1 sm:grid-cols-2 gap-3") {
                 label(class: "flex flex-col gap-1") {
                     span(class: "text-xs opacity-70") { (t(lang, "admin-price-in-label")) " (" (price_label.clone()) ")" }
@@ -1442,6 +1539,7 @@ mod tests {
             context_window: None,
             input_price: None,
             output_price: None,
+            pricing_unit: db::PricingUnit::Tokens,
             cap_vision: None,
             cap_audio_input: None,
             cap_pdf_input: None,
@@ -1550,6 +1648,7 @@ mod tests {
             kind_label: "image",
             input_price: Some(10.0),
             output_price: Some(40.0),
+            pricing_unit: db::PricingUnit::Images,
         };
         let html = render_other_item(Lang::En, "USD", &m).to_string();
         assert!(html.contains(r#"action="/admin/models/save""#), "{html}");
@@ -1561,6 +1660,27 @@ mod tests {
         assert!(
             !html.contains(r#"name="reasoning_style""#),
             "no reasoning: {html}"
+        );
+        assert!(html.contains(r#"name="price_only" value="1""#), "{html}");
+    }
+
+    #[test]
+    fn stored_token_unit_is_not_coerced_for_image_models() {
+        assert_eq!(
+            displayed_pricing_unit("image", Some(db::PricingUnit::Tokens)),
+            db::PricingUnit::Tokens
+        );
+    }
+
+    #[test]
+    fn pricing_unit_labels_are_localized() {
+        assert_eq!(
+            pricing_unit_label(Lang::De, db::PricingUnit::Tokens),
+            "1 Mio. Tokens"
+        );
+        assert_eq!(
+            pricing_unit_label(Lang::En, db::PricingUnit::Seconds),
+            "second"
         );
     }
 

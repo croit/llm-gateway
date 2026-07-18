@@ -84,7 +84,11 @@ admin-unknown-reasoning-effort = unbekannter Reasoning-Aufwand `{ $value }`
 admin-context-window-invalid = Kontextfenster `{ $value }` muss eine positive Ganzzahl sein
 
 # Preise pro Modell für die Kostenabrechnung (Preis pro 1 Mio. Tokens, Eingabe / Ausgabe).
-admin-price-label = { $cur }/1M
+admin-price-label = { $cur }/{ $unit }
+admin-price-unit-tokens = 1 Mio. Tokens
+admin-price-unit-images = Bild
+admin-price-unit-characters = Zeichen
+admin-price-unit-seconds = Sekunde
 admin-price-in-label = Preis ein
 admin-price-out-label = Preis aus
 admin-price-in-placeholder = kein Preis

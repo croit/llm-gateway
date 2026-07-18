@@ -322,3 +322,42 @@ async fn admin_save_empty_toml_keeps_row_with_prices() {
     assert_eq!(row.input_price, Some(1.5));
     assert_eq!(row.defaults_toml, "");
 }
+
+#[tokio::test]
+async fn price_only_save_preserves_other_model_settings() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "root").await;
+    db_defaults::set_all(
+        &state.db,
+        "model-a",
+        &db_defaults::AllFields {
+            defaults_toml: "temperature = 0.7".into(),
+            context_window: Some(32_768),
+            capabilities: db_defaults::ModelCapabilities {
+                vision: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let db = state.db.clone();
+    let app = common::app(state);
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/admin/models/save",
+            &cookie,
+            Some("model_name=model-a&input_price=2&pricing_unit=images&price_only=1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let row = db_defaults::get(&db, "model-a").await.unwrap().unwrap();
+    assert_eq!(row.input_price, Some(2.0));
+    assert_eq!(row.pricing_unit, db_defaults::PricingUnit::Images);
+    assert_eq!(row.context_window, Some(32_768));
+    assert_eq!(row.capabilities.vision, Some(true));
+    assert!(row.defaults_toml.contains("temperature"));
+}

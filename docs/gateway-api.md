@@ -79,6 +79,27 @@ Hop-by-hop and identity headers are filtered in both directions. Requests drop `
 
 We mirror the OpenAI schema for compatibility. We do **not** invent new request/response body fields; gateway-specific signals go in headers (`X-Gateway-Resolved-Model`, `X-Gateway-Tool-Rounds`), never in the body. Handlers only read the fields they care about (`model`, `stream`, `messages`, `tools`) and pass the rest through to the upstream unmodified.
 
+## Usage and cost accounting
+
+The gateway records one usage event per upstream call. Token usage accepts both
+OpenAI-style `prompt_tokens`/`completion_tokens` and providers that return
+`input_tokens`/`output_tokens`. Non-token calls are normalized into billable
+units:
+
+- Image generation/editing: generated images and, for edits, one input image.
+- Text-to-speech: input characters.
+- Transcription: provider-reported duration, or the measured duration of a
+  decodable PCM/WAV, MP3, FLAC, Ogg/Vorbis, or ISO-MP4 payload.
+
+Configure prices per model in `/admin/models`. Chat and embedding models use
+prices per 1M tokens. Image, speech, and transcription models use prices per
+image, character, or second respectively. Costs are settled when the usage
+writer flushes the event and are immutable afterwards. A successful cache hit
+on the voice TTS path does not create an upstream event and is therefore free.
+
+Provider-specific cached-token discounts are not currently applied separately;
+the reported total input token count is priced at the configured input rate.
+
 ## Errors
 
 Errors are returned in the OpenAI envelope so SDKs surface them correctly. The general helper sets `type` and `code` to the **same** value:

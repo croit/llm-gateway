@@ -76,7 +76,11 @@ admin-unknown-reasoning-effort = 未知的推理强度 `{ $value }`
 admin-context-window-invalid = 上下文窗口 `{ $value }` 必须为正整数
 
 # 各模型的成本核算价格（每 100 万 token 的价格，输入 / 输出）。
-admin-price-label = { $cur }/1M
+admin-price-label = { $cur }/{ $unit }
+admin-price-unit-tokens = 100 万令牌
+admin-price-unit-images = 图像
+admin-price-unit-characters = 字符
+admin-price-unit-seconds = 秒
 admin-price-in-label = 输入价格
 admin-price-out-label = 输出价格
 admin-price-in-placeholder = 未定价

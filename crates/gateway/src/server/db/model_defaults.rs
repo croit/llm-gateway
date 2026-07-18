@@ -46,17 +46,47 @@ pub struct ModelDefaults {
     /// to the global `[chat.compaction] default_context_window`. See
     /// migration 0032.
     pub context_window: Option<i64>,
-    /// Price per 1,000,000 prompt tokens, in the deployment currency.
-    /// `None` = unpriced (contributes 0 cost — the default for self-hosted
-    /// models). Drives the `cost` column on usage rows. See migration 0037.
+    /// Input price in the deployment currency. The unit is `pricing_unit`:
+    /// tokens are priced per 1,000,000; images, characters, and seconds are
+    /// priced per one unit. `None` means unpriced.
     pub input_price: Option<f64>,
-    /// Price per 1,000,000 completion tokens. `None` = unpriced.
+    /// Output price using the same `pricing_unit` as `input_price`.
     pub output_price: Option<f64>,
+    pub pricing_unit: PricingUnit,
     /// What this model can/cannot do (vision, tools, …). Tri-state per field:
     /// `None` = unknown, `Some(true)` = supported, `Some(false)` = confirmed
     /// unsupported. See [`ModelCapabilities`].
     pub capabilities: ModelCapabilities,
     pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PricingUnit {
+    #[default]
+    Tokens,
+    Images,
+    Characters,
+    Seconds,
+}
+
+impl PricingUnit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tokens => "tokens",
+            Self::Images => "images",
+            Self::Characters => "characters",
+            Self::Seconds => "seconds",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "images" => Self::Images,
+            "characters" => Self::Characters,
+            "seconds" => Self::Seconds,
+            _ => Self::Tokens,
+        }
+    }
 }
 
 /// Per-model capability flags and fallback references.
@@ -93,6 +123,7 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
     let context_window: Option<i64> = row.try_get("context_window")?;
     let input_price: Option<f64> = row.try_get("input_price")?;
     let output_price: Option<f64> = row.try_get("output_price")?;
+    let pricing_unit: String = row.try_get("pricing_unit")?;
     let capabilities = map_capabilities(row)?;
     let updated_at_s: String = row.try_get("updated_at")?;
     let updated_at: Timestamp = updated_at_s
@@ -114,6 +145,7 @@ fn map_row(row: &SqliteRow) -> Result<ModelDefaults, DbError> {
         context_window,
         input_price,
         output_price,
+        pricing_unit: PricingUnit::parse(&pricing_unit),
         capabilities,
         updated_at,
     })
@@ -143,7 +175,7 @@ pub async fn get(pool: &Pool, model_name: &str) -> Result<Option<ModelDefaults>,
         r#"SELECT model_name, defaults_toml, reasoning_style,
                   thinking_budget_standard, thinking_budget_deep, thinking_budget_max,
                   reasoning_effort_standard, reasoning_effort_deep, reasoning_effort_max,
-                  context_window, input_price, output_price,
+                   context_window, input_price, output_price, pricing_unit,
                   cap_vision, cap_audio_input, cap_pdf_input,
                   cap_tools, cap_parallel_tools, cap_structured_output,
                   fallback_vision, fallback_tools,
@@ -208,8 +240,8 @@ pub async fn set_context_window(
     Ok(())
 }
 
-/// Set (or clear, with `None`) the per-1M-token prices for a model without
-/// touching its sampling defaults, reasoning config, or context window.
+/// Set (or clear, with `None`) the token prices for a model without touching
+/// its sampling defaults, reasoning config, or context window.
 /// Inserts a row with empty defaults if none exists yet; on conflict only the
 /// two price columns are updated, so it composes with the other setters in any
 /// order. `None` clears a price (the model becomes unpriced → 0 cost).
@@ -221,16 +253,47 @@ pub async fn set_pricing(
 ) -> Result<(), DbError> {
     let now = Timestamp::now().to_string();
     sqlx::query(
-        r#"INSERT INTO model_defaults (model_name, defaults_toml, input_price, output_price, updated_at)
+        r#"INSERT INTO model_defaults
+              (model_name, defaults_toml, input_price, output_price, updated_at)
            VALUES (?, '', ?, ?, ?)
            ON CONFLICT(model_name) DO UPDATE SET
-             input_price  = excluded.input_price,
-             output_price = excluded.output_price,
-             updated_at   = excluded.updated_at"#,
+              input_price  = excluded.input_price,
+              output_price = excluded.output_price,
+              updated_at   = excluded.updated_at"#,
     )
     .bind(model_name)
     .bind(input_price)
     .bind(output_price)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Set prices and the billable unit for a model. Token prices are per million
+/// tokens; non-token prices are per image, character, or second.
+pub async fn set_pricing_with_unit(
+    pool: &Pool,
+    model_name: &str,
+    input_price: Option<f64>,
+    output_price: Option<f64>,
+    pricing_unit: PricingUnit,
+) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    sqlx::query(
+        r#"INSERT INTO model_defaults
+              (model_name, defaults_toml, input_price, output_price, pricing_unit, updated_at)
+           VALUES (?, '', ?, ?, ?, ?)
+           ON CONFLICT(model_name) DO UPDATE SET
+              input_price  = excluded.input_price,
+              output_price = excluded.output_price,
+              pricing_unit = excluded.pricing_unit,
+              updated_at   = excluded.updated_at"#,
+    )
+    .bind(model_name)
+    .bind(input_price)
+    .bind(output_price)
+    .bind(pricing_unit.as_str())
     .bind(now)
     .execute(pool)
     .await?;
@@ -419,6 +482,7 @@ pub struct AllFields {
     pub context_window: Option<i64>,
     pub input_price: Option<f64>,
     pub output_price: Option<f64>,
+    pub pricing_unit: PricingUnit,
     pub capabilities: ModelCapabilities,
 }
 
@@ -434,12 +498,12 @@ pub async fn set_all(pool: &Pool, model_name: &str, f: &AllFields) -> Result<(),
               (model_name, defaults_toml, reasoning_style,
                thinking_budget_standard, thinking_budget_deep, thinking_budget_max,
                reasoning_effort_standard, reasoning_effort_deep, reasoning_effort_max,
-               context_window, input_price, output_price,
+                context_window, input_price, output_price, pricing_unit,
                cap_vision, cap_audio_input, cap_pdf_input,
                cap_tools, cap_parallel_tools, cap_structured_output,
                fallback_vision, fallback_tools,
                cap_updated_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(model_name) DO UPDATE SET
                defaults_toml             = excluded.defaults_toml,
                reasoning_style           = excluded.reasoning_style,
@@ -449,9 +513,10 @@ pub async fn set_all(pool: &Pool, model_name: &str, f: &AllFields) -> Result<(),
                reasoning_effort_standard = excluded.reasoning_effort_standard,
                reasoning_effort_deep     = excluded.reasoning_effort_deep,
                reasoning_effort_max      = excluded.reasoning_effort_max,
-               context_window            = excluded.context_window,
-               input_price               = excluded.input_price,
-               output_price              = excluded.output_price,
+                context_window            = excluded.context_window,
+                input_price               = excluded.input_price,
+                output_price              = excluded.output_price,
+                pricing_unit              = excluded.pricing_unit,
                cap_vision                = excluded.cap_vision,
                cap_audio_input           = excluded.cap_audio_input,
                cap_pdf_input             = excluded.cap_pdf_input,
@@ -475,6 +540,7 @@ pub async fn set_all(pool: &Pool, model_name: &str, f: &AllFields) -> Result<(),
     .bind(f.context_window)
     .bind(f.input_price)
     .bind(f.output_price)
+    .bind(f.pricing_unit.as_str())
     .bind(f.capabilities.vision.map(|b| b as i64))
     .bind(f.capabilities.audio_input.map(|b| b as i64))
     .bind(f.capabilities.pdf_input.map(|b| b as i64))
@@ -496,6 +562,7 @@ pub async fn set_all(pool: &Pool, model_name: &str, f: &AllFields) -> Result<(),
 pub struct ModelPrice {
     pub input_price: Option<f64>,
     pub output_price: Option<f64>,
+    pub pricing_unit: PricingUnit,
 }
 
 /// Load every priced model's prices into a map, keyed by model name. Rows
@@ -506,7 +573,7 @@ pub async fn all_prices(
     pool: &Pool,
 ) -> Result<std::collections::HashMap<String, ModelPrice>, DbError> {
     let rows = sqlx::query(
-        "SELECT model_name, input_price, output_price FROM model_defaults \
+        "SELECT model_name, input_price, output_price, pricing_unit FROM model_defaults \
          WHERE input_price IS NOT NULL OR output_price IS NOT NULL",
     )
     .fetch_all(pool)
@@ -519,6 +586,9 @@ pub async fn all_prices(
             ModelPrice {
                 input_price: row.try_get("input_price")?,
                 output_price: row.try_get("output_price")?,
+                pricing_unit: PricingUnit::parse(
+                    row.try_get::<String, _>("pricing_unit")?.as_str(),
+                ),
             },
         );
     }
@@ -696,6 +766,7 @@ mod tests {
             context_window: Some(262_144),
             input_price: Some(0.15),
             output_price: Some(0.60),
+            pricing_unit: PricingUnit::Tokens,
             capabilities: ModelCapabilities {
                 vision: Some(true),
                 tools: Some(true),
@@ -740,6 +811,33 @@ mod tests {
         assert_eq!(row.input_price, None);
         assert_eq!(row.context_window, None);
         assert_eq!(row.defaults_toml, "");
+    }
+
+    #[tokio::test]
+    async fn set_pricing_preserves_non_token_unit() {
+        let pool = fresh().await;
+        set_pricing_with_unit(&pool, "image", None, Some(1.0), PricingUnit::Images)
+            .await
+            .unwrap();
+        set_pricing(&pool, "image", None, Some(2.0)).await.unwrap();
+        let row = get(&pool, "image").await.unwrap().unwrap();
+        assert_eq!(row.pricing_unit, PricingUnit::Images);
+        assert_eq!(row.output_price, Some(2.0));
+    }
+
+    #[tokio::test]
+    async fn set_pricing_does_not_replace_unit_when_row_is_updated() {
+        let pool = fresh().await;
+        set_pricing_with_unit(&pool, "image", None, Some(1.0), PricingUnit::Images)
+            .await
+            .unwrap();
+        set_pricing(&pool, "image", Some(2.0), Some(3.0))
+            .await
+            .unwrap();
+        assert_eq!(
+            get(&pool, "image").await.unwrap().unwrap().pricing_unit,
+            PricingUnit::Images
+        );
     }
 
     #[tokio::test]

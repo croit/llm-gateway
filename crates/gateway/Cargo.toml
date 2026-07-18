@@ -54,6 +54,7 @@ regex = { workspace = true }
 # uploaded voice notes before they hit Whisper (silence is the single
 # biggest source of Whisper hallucinations).
 earshot = "1"
+symphonia = { workspace = true }
 
 # MCP (Model Context Protocol) client. Lets the gateway connect to external
 # MCP servers — over stdio (subprocess) or streamable HTTP — and surface

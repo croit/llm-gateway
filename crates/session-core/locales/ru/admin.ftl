@@ -77,7 +77,11 @@ admin-unknown-reasoning-effort = неизвестный уровень усил�
 admin-context-window-invalid = окно контекста `{ $value }` должно быть положительным целым
 
 # Цены по каждой модели для учёта расходов (цена за 1 млн токенов, ввод / вывод).
-admin-price-label = { $cur }/1M
+admin-price-label = { $cur }/{ $unit }
+admin-price-unit-tokens = 1 млн токенов
+admin-price-unit-images = изображение
+admin-price-unit-characters = символ
+admin-price-unit-seconds = секунда
 admin-price-in-label = Цена вх
 admin-price-out-label = Цена вых
 admin-price-in-placeholder = без цены

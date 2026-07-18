@@ -206,6 +206,8 @@ mod tests {
             prompt_tokens: Some(total),
             completion_tokens: Some(0),
             total_tokens: Some(total),
+            input_units: None,
+            output_units: None,
             enforce_limits,
         }
     }

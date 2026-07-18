@@ -108,7 +108,10 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
     let unpriced: Vec<String> = agg
         .by_model
         .iter()
-        .filter(|g| g.total_tokens > 0 && !priced.contains_key(&g.key))
+        .filter(|g| {
+            !priced.contains_key(&g.key)
+                && (g.total_tokens > 0 || g.input_units > 0.0 || g.output_units > 0.0)
+        })
         .map(|g| g.key.clone())
         .collect();
 

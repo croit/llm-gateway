@@ -77,7 +77,11 @@ admin-unknown-reasoning-effort = esfuerzo de razonamiento desconocido `{ $value 
 admin-context-window-invalid = la ventana de contexto `{ $value }` debe ser un entero positivo
 
 # Precios por modelo para la contabilidad de costes (precio por 1 M de tokens, entrada / salida).
-admin-price-label = { $cur }/1M
+admin-price-label = { $cur }/{ $unit }
+admin-price-unit-tokens = 1 M de tokens
+admin-price-unit-images = imagen
+admin-price-unit-characters = carácter
+admin-price-unit-seconds = segundo
 admin-price-in-label = Precio ent
 admin-price-out-label = Precio sal
 admin-price-in-placeholder = sin precio
