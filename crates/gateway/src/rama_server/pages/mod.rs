@@ -64,6 +64,10 @@ enum NavItem {
     /// Usage statistics (`/usage`). Shown to every signed-in user (scoped
     /// to their own requests); admins get an in-page "All users" toggle.
     Usage,
+    /// Per-user **private** skills page (`/skills`). Shown to every signed-in
+    /// user; each manages their own private Agent Skills, distinct from the
+    /// admin-only global [`NavItem::Skills`] page.
+    MySkills,
     /// Admin-only pages (model defaults, future operator tooling).
     /// The sidebar entry is only rendered for users whose `roles`
     /// includes `"admin"`; non-admins never see it.
@@ -336,6 +340,7 @@ fn render_app_sidebar(
     active: Option<NavItem>,
     user_email: &str,
     is_admin: bool,
+    skills_enabled: bool,
     theme: Theme,
     lang: Lang,
     chat: &SidebarChat,
@@ -381,6 +386,11 @@ fn render_app_sidebar(
                     (sidebar_nav_link("/scheduled", NavItem::Scheduled, active, icons::clock(16), &t(lang, "nav-scheduled")))
                     (sidebar_nav_link("/webhooks", NavItem::Webhooks, active, icons::send(16), &t(lang, "nav-webhooks")))
                     (sidebar_nav_link("/integrations", NavItem::Integrations, active, icons::plug(16), &t(lang, "nav-integrations")))
+                    // Hidden unless private skills are usable (configured + the
+                    // directory is accessible) — see `AppState::user_skills_enabled`.
+                    if skills_enabled {
+                        (sidebar_nav_link("/skills", NavItem::MySkills, active, icons::sparkles(16), &t(lang, "nav-my-skills")))
+                    }
                     (sidebar_nav_link("/tools", NavItem::Tools, active, icons::sliders(16), &t(lang, "nav-tools")))
                 }.to_html()))
                 (nav_group(lang, "account", &t(lang, "nav-group-account"), html! {
@@ -770,6 +780,7 @@ fn nav_or_html_page(
     title: &str,
     user_email: &str,
     is_admin: bool,
+    skills_enabled: bool,
     impersonating: bool,
     body: Html,
     url: &str,
@@ -784,6 +795,7 @@ fn nav_or_html_page(
             title,
             user_email,
             is_admin,
+            skills_enabled,
             impersonating,
             body,
             chat,
@@ -796,8 +808,16 @@ fn nav_or_html_page(
     .to_html()
     .to_string();
     let title_html = html! { title { (title) } }.to_html().to_string();
-    let sidebar_html =
-        render_app_sidebar(Some(active), user_email, is_admin, theme, lang, chat).to_string();
+    let sidebar_html = render_app_sidebar(
+        Some(active),
+        user_email,
+        is_admin,
+        skills_enabled,
+        theme,
+        lang,
+        chat,
+    )
+    .to_string();
     let push_url = serde_json::to_string(url).expect("url is JSON-encodable");
     // After the patch lands, push the URL and — if this page has a chat
     // composer (`#message`, only on /chat) — focus it so the user can
@@ -865,6 +885,7 @@ fn html_authed_page(
     title: &str,
     user_email: &str,
     is_admin: bool,
+    skills_enabled: bool,
     impersonating: bool,
     body: Html,
     chat: &SidebarChat,
@@ -877,6 +898,7 @@ fn html_authed_page(
         title,
         user_email,
         is_admin,
+        skills_enabled,
         impersonating,
         body,
         chat,
@@ -897,6 +919,7 @@ fn layout_authed(
     title: &str,
     user_email: &str,
     is_admin: bool,
+    skills_enabled: bool,
     impersonating: bool,
     body: Html,
     chat: &SidebarChat,
@@ -1009,7 +1032,7 @@ fn layout_authed(
                             "aria-label": (t(lang, "nav-close-menu-aria")),
                             class: "drawer-overlay"
                         ) {}
-                        (render_app_sidebar(active, user_email, is_admin, theme, lang, chat))
+                        (render_app_sidebar(active, user_email, is_admin, skills_enabled, theme, lang, chat))
                     }
                 }
                 (chrome::toast_container())
@@ -1078,7 +1101,7 @@ pub(super) async fn require_admin_or_403(
 /// Auth gate that redirects to /login on miss (vs the API gate which
 /// returns 401 JSON). Returns either the resolved session or the
 /// redirect Response that the caller should `return`.
-async fn require_session_or_redirect(
+pub(super) async fn require_session_or_redirect(
     state: &RamaState,
     req: &Request,
 ) -> Result<(Session, users::User), Response> {
@@ -1333,6 +1356,14 @@ pub use skills::{
     skills_upload as admin_skills_upload,
 };
 
+// Per-user private skills page (`/skills`, upload, save, delete, download).
+// Signed-in-user gate (not admin) — each user manages their own bundles.
+mod skills_user;
+pub use skills_user::{
+    user_skills_delete, user_skills_download, user_skills_index, user_skills_save,
+    user_skills_upload,
+};
+
 // Admin RAG-collections CRUD (`/rag`). Same admin gate.
 mod rag;
 pub use rag::{
@@ -1396,6 +1427,7 @@ fn internal_error_html(user_email: &str, message: &str) -> Response {
                 user_email,
                 false,
                 false,
+                false,
                 body,
                 &SidebarChat::default(),
             )
@@ -1429,6 +1461,7 @@ pub(super) fn forbidden_html(user_email: &str, message: &str) -> Response {
                 None,
                 "Forbidden — LLM Gateway",
                 user_email,
+                false,
                 false,
                 false,
                 body,

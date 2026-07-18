@@ -69,6 +69,35 @@ fn state_from_registry(db_pool: db::Pool, registry: Arc<upstreams::UpstreamRegis
     )
 }
 
+/// Build a minimal `RamaState` (empty upstream registry) with the Agent
+/// Skills feature enabled: a global store at `root` plus a per-user store at
+/// `root/.users`. For the `/skills` (per-user private skills) page tests.
+pub async fn state_with_user_skills(root: std::path::PathBuf) -> RamaState {
+    use gateway::server::skills::{SkillStore, UserSkillStore};
+    let db_pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+    let registry = upstreams::UpstreamRegistry::new(&HashMap::new()).unwrap();
+    let tools = Arc::new(ToolRegistry::new());
+    let rbac = Arc::new(Resolver::empty());
+    let app = AppState::new(Config::default(), db_pool.clone(), registry, tools, rbac)
+        .with_skills(Arc::new(SkillStore::load(root.clone())))
+        .with_user_skills(Arc::new(UserSkillStore::new(root.join(".users"))));
+    let sessions = SessionStore::new(db_pool, TEST_SECRET);
+    RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    )
+}
+
+/// Build a minimal `RamaState` (empty upstream registry) with the Agent
+/// Skills feature **not** configured — for asserting the `/skills` nav entry
+/// is hidden when skills are off.
+pub async fn state_no_skills() -> RamaState {
+    let db_pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+    let registry = upstreams::UpstreamRegistry::new(&HashMap::new()).unwrap();
+    state_from_registry(db_pool, registry)
+}
+
 /// Build a `RamaState` wired to a single backend pool (chat kind).
 /// `upstream_url` is typically a wiremock `mock_server.uri()`.
 pub async fn state_with_chat_pool(upstream_url: &str) -> RamaState {

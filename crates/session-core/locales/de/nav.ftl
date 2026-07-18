@@ -52,3 +52,5 @@ impersonation-return-button = Zurück zu Ihrem Konto
 
 error-internal-heading = Interner Fehler
 error-forbidden-heading = Zugriff verweigert
+
+nav-my-skills = Meine Skills

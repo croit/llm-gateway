@@ -43,3 +43,5 @@ skills-cancel-button = Annuler
 skills-save-access-button = Enregistrer l'accès
 
 skills-from-config-badge = depuis la configuration
+
+skills-error-no-dir-access = Pas d’accès au répertoire des compétences — vérifiez qu’il existe et que la passerelle peut y lire et écrire :

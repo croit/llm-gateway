@@ -51,3 +51,5 @@ skills-cancel-button = Cancel
 skills-save-access-button = Save access
 
 skills-from-config-badge = from config
+
+skills-error-no-dir-access = No access to the skills directory — check that it exists and the gateway can read and write it:

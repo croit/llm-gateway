@@ -43,3 +43,5 @@ skills-cancel-button = Отмена
 skills-save-access-button = Сохранить доступ
 
 skills-from-config-badge = из конфигурации
+
+skills-error-no-dir-access = Нет доступа к каталогу навыков — проверьте, что он существует и шлюз может читать и записывать в него:

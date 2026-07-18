@@ -31,7 +31,7 @@ use gateway::rama_server::{RamaState, SessionStore, router};
 use gateway::server::config::{FeedbackConfig, GatewayConfig, SkillsConfig};
 use gateway::server::rbac::RoleConfig;
 use gateway::server::rbac::{Resolver, config::RbacConfig, config::RoleMapping};
-use gateway::server::skills::SkillStore;
+use gateway::server::skills::{SkillStore, UserSkillStore};
 use gateway::server::tools::{ToolRegistry, echo, fetch_url, read_skill, search_web, time};
 use gateway::server::upstreams::{
     self,
@@ -427,6 +427,7 @@ async fn main() -> anyhow::Result<()> {
     if let Ok(grants) = gateway::server::db::skill_grants::all(&pool).await {
         rbac.set_skill_grant_overlay(grants);
     }
+    let user_skill_store = Arc::new(UserSkillStore::new(skills_dir.join(".users")));
     let skill_store = Arc::new(SkillStore::load(skills_dir));
     let tools = Arc::new(
         ToolRegistry::new()
@@ -436,10 +437,13 @@ async fn main() -> anyhow::Result<()> {
             .with(search_web::SearchWeb)
             .with(read_skill::ReadSkill::new(
                 skill_store.clone(),
+                user_skill_store.clone(),
                 rbac.clone(),
             )),
     );
-    let app = AppState::new(config, pool.clone(), registry, tools, rbac).with_skills(skill_store);
+    let app = AppState::new(config, pool.clone(), registry, tools, rbac)
+        .with_skills(skill_store)
+        .with_user_skills(user_skill_store);
     // Enabled usage handle (90-day retention) so the /usage page renders real
     // aggregates instead of the "metrics disabled" banner. Spawn before the
     // pool is moved into the session store.

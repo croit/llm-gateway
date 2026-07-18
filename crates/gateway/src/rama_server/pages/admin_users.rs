@@ -92,6 +92,7 @@ pub async fn users_index(State(state): State<Arc<RamaState>>, req: Request) -> R
         &title,
         &admin.email,
         is_admin(&state, &admin),
+        state.user_skills_enabled(),
         session.impersonator_id.is_some(),
         body,
         "/admin/users",

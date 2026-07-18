@@ -57,6 +57,7 @@ pub async fn limits_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         &title,
         &user.email,
         is_admin(&state, &user),
+        state.user_skills_enabled(),
         session.impersonator_id.is_some(),
         body,
         "/admin/limits",

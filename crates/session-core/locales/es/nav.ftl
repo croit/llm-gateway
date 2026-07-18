@@ -53,3 +53,5 @@ error-internal-heading = Error interno
 error-forbidden-heading = Prohibido
 
 nav-groups = Grupos
+
+nav-my-skills = Mis habilidades

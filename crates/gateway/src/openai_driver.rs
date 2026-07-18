@@ -1187,8 +1187,13 @@ async fn build_mcp_offer_section(
 /// registry; descriptions are the bundle authors' own, written to trigger
 /// the model — so no language-specific keyword matching lives here.
 async fn build_skills_section(d: &OpenAiDriver) -> Option<String> {
-    let registry = d.state.skills.as_ref()?.current();
-    let allowed = d.state.allowed_skills_for(&d.tool_ctx.roles);
+    // Combined registry (private overlaid on global, private shadows global) so
+    // a name resolves to the same bundle the caller was advertised — global
+    // operator skills plus this user's own private skills.
+    let registry = d.state.combined_skills_for(&d.tool_ctx.user_id)?;
+    let allowed = d
+        .state
+        .allowed_skills_for(&d.tool_ctx.roles, &d.tool_ctx.user_id);
     if allowed.is_empty() {
         return None;
     }
