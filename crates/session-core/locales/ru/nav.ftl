@@ -53,3 +53,5 @@ error-internal-heading = Внутренняя ошибка
 error-forbidden-heading = Доступ запрещён
 
 nav-groups = Группы
+
+nav-my-skills = Мои навыки

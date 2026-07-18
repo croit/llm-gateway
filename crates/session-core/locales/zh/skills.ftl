@@ -43,3 +43,5 @@ skills-cancel-button = 取消
 skills-save-access-button = 保存访问权限
 
 skills-from-config-badge = 来自配置
+
+skills-error-no-dir-access = 无法访问技能目录——请检查它是否存在，以及网关能否读写：

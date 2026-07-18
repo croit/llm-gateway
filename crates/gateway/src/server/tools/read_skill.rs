@@ -32,27 +32,51 @@ use shared::api::ToolDef;
 
 use super::{Tool, ToolContext, ToolError, ToolFuture};
 use crate::server::rbac::Resolver;
-use crate::server::skills::SkillStore;
+use crate::server::skills::{SkillRegistry, SkillStore, UserSkillStore, combined_registry};
 
 /// Tool id — also the OpenAI function name and the `/tools` toggle key.
 pub const READ_SKILL_ID: &str = "read_skill";
 
 pub struct ReadSkill {
     store: Arc<SkillStore>,
+    user_store: Arc<UserSkillStore>,
     rbac: Arc<Resolver>,
 }
 
 impl ReadSkill {
-    pub fn new(store: Arc<SkillStore>, rbac: Arc<Resolver>) -> Self {
-        Self { store, rbac }
+    pub fn new(
+        store: Arc<SkillStore>,
+        user_store: Arc<UserSkillStore>,
+        rbac: Arc<Resolver>,
+    ) -> Self {
+        Self {
+            store,
+            user_store,
+            rbac,
+        }
     }
 
-    /// Skill names the caller's roles permit, intersected with what's
-    /// currently loaded. The single authorization gate for this tool; reads
-    /// the live registry so an uploaded skill is usable without a restart.
+    /// The registry to resolve a requested skill name against: the caller's
+    /// private skills overlaid on the global operator ones (private shadows
+    /// global). Read live so an upload/edit is usable without a restart.
+    fn registry_for(&self, ctx: &ToolContext) -> SkillRegistry {
+        let private = self.user_store.registry_for(&ctx.user_id);
+        combined_registry(&self.store.current(), &private)
+    }
+
+    /// Skill names the caller may load: their roles' global grants, plus every
+    /// private skill they own (ownership is the grant). The single
+    /// authorization gate for this tool — a name absent here is refused with
+    /// the same "unknown" answer as a non-existent one.
     fn allowed_for(&self, ctx: &ToolContext) -> Vec<String> {
         let role_ids = self.rbac.role_ids_for(&ctx.roles);
-        self.rbac.allowed_skills(&role_ids, &self.store.current())
+        let mut allowed = self.rbac.allowed_skills(&role_ids, &self.store.current());
+        for name in self.user_store.registry_for(&ctx.user_id).names() {
+            if !allowed.iter().any(|n| n == name) {
+                allowed.push(name.to_string());
+            }
+        }
+        allowed
     }
 }
 
@@ -112,9 +136,10 @@ impl Tool for ReadSkill {
 
             // Authorize before we reveal anything: a not-permitted skill and a
             // non-existent one get the identical answer. Snapshot the live
-            // registry once so it stays alive for the borrows below.
+            // combined registry (global + this user's private) once so it stays
+            // alive for the borrows below.
             let allowed = self.allowed_for(&ctx);
-            let registry = self.store.current();
+            let registry = self.registry_for(&ctx);
             let skill = match registry.get(&args.name) {
                 Some(s) if allowed.iter().any(|n| n == &args.name) => s,
                 _ => {
@@ -176,7 +201,7 @@ impl Tool for ReadSkill {
 mod tests {
     use super::*;
     use crate::server::rbac::config::{RbacConfig, RoleConfig};
-    use crate::server::skills::SkillStore;
+    use crate::server::skills::{SkillStore, UserSkillStore};
     use std::path::{Path, PathBuf};
 
     fn write_skill(parent: &Path, name: &str) -> PathBuf {
@@ -196,6 +221,14 @@ mod tests {
             write_skill(parent, n);
         }
         Arc::new(SkillStore::load(parent.to_path_buf()))
+    }
+
+    /// An empty per-user store rooted under the same tempdir the global store
+    /// uses (`.users/` subdir — a level deeper than the global scanner reaches,
+    /// so the two never cross). Most tests exercise global skills; a couple
+    /// seed private ones via the returned store.
+    fn user_store_in(parent: &Path) -> Arc<UserSkillStore> {
+        Arc::new(UserSkillStore::new(parent.join(".users")))
     }
 
     fn rbac_granting(skills: &[&str]) -> Arc<Resolver> {
@@ -260,7 +293,11 @@ mod tests {
     #[tokio::test]
     async fn body_call_returns_instructions_and_file_list() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ReadSkill::new(store(dir.path(), &["brand"]), rbac_granting(&["brand"]));
+        let tool = ReadSkill::new(
+            store(dir.path(), &["brand"]),
+            user_store_in(dir.path()),
+            rbac_granting(&["brand"]),
+        );
         let out = tool
             .run(ctx().await, json!({"name": "brand"}))
             .await
@@ -279,7 +316,11 @@ mod tests {
             .await
             .unwrap();
         seed_session(&pool, "s1").await;
-        let tool = ReadSkill::new(store(dir.path(), &["brand"]), rbac_granting(&["brand"]));
+        let tool = ReadSkill::new(
+            store(dir.path(), &["brand"]),
+            user_store_in(dir.path()),
+            rbac_granting(&["brand"]),
+        );
         tool.run(
             ctx_with(pool.clone(), Some("s1".into())),
             json!({"name": "brand"}),
@@ -301,7 +342,11 @@ mod tests {
             .await
             .unwrap();
         seed_session(&pool, "s1").await;
-        let tool = ReadSkill::new(store(dir.path(), &["brand"]), rbac_granting(&["brand"]));
+        let tool = ReadSkill::new(
+            store(dir.path(), &["brand"]),
+            user_store_in(dir.path()),
+            rbac_granting(&["brand"]),
+        );
         tool.run(
             ctx_with(pool.clone(), Some("s1".into())),
             json!({"name": "brand", "path": "assets/logo.svg"}),
@@ -319,7 +364,11 @@ mod tests {
     #[tokio::test]
     async fn path_call_returns_one_file() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ReadSkill::new(store(dir.path(), &["brand"]), rbac_granting(&["brand"]));
+        let tool = ReadSkill::new(
+            store(dir.path(), &["brand"]),
+            user_store_in(dir.path()),
+            rbac_granting(&["brand"]),
+        );
         let out = tool
             .run(
                 ctx().await,
@@ -337,6 +386,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = ReadSkill::new(
             store(dir.path(), &["brand", "legal"]),
+            user_store_in(dir.path()),
             rbac_granting(&["brand"]),
         );
         let err = tool
@@ -349,7 +399,11 @@ mod tests {
     #[tokio::test]
     async fn rejects_unknown_skill() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ReadSkill::new(store(dir.path(), &["brand"]), rbac_granting(&["*"]));
+        let tool = ReadSkill::new(
+            store(dir.path(), &["brand"]),
+            user_store_in(dir.path()),
+            rbac_granting(&["*"]),
+        );
         let err = tool
             .run(ctx().await, json!({"name": "ghost"}))
             .await
@@ -361,7 +415,11 @@ mod tests {
     async fn path_traversal_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("secret.txt"), "TOPSECRET").unwrap();
-        let tool = ReadSkill::new(store(dir.path(), &["brand"]), rbac_granting(&["brand"]));
+        let tool = ReadSkill::new(
+            store(dir.path(), &["brand"]),
+            user_store_in(dir.path()),
+            rbac_granting(&["brand"]),
+        );
         let err = tool
             .run(
                 ctx().await,
@@ -375,8 +433,70 @@ mod tests {
     #[test]
     fn id_matches_schema_name() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ReadSkill::new(store(dir.path(), &[]), rbac_granting(&[]));
+        let tool = ReadSkill::new(
+            store(dir.path(), &[]),
+            user_store_in(dir.path()),
+            rbac_granting(&[]),
+        );
         assert_eq!(tool.id(), tool.schema().function.name);
         assert_eq!(tool.id(), READ_SKILL_ID);
+    }
+
+    #[tokio::test]
+    async fn private_skill_loads_without_any_role_grant() {
+        // Ownership is the grant: a user's own private skill is loadable even
+        // though no role grants it. Global skills the role doesn't grant stay
+        // invisible.
+        let dir = tempfile::tempdir().unwrap();
+        let user_store = user_store_in(dir.path());
+        user_store
+            .save_manifest(
+                "u1",
+                "myown",
+                "---\nname: myown\ndescription: mine.\n---\n\nDo my private thing.\n",
+            )
+            .unwrap();
+        // Global `secret` exists but the role grants nothing.
+        let tool = ReadSkill::new(
+            store(dir.path(), &["secret"]),
+            user_store,
+            rbac_granting(&[]),
+        );
+
+        // The private skill loads.
+        let out = tool
+            .run(ctx().await, json!({"name": "myown"}))
+            .await
+            .unwrap();
+        assert_eq!(out["body"].as_str().unwrap().trim(), "Do my private thing.");
+
+        // The ungranted global skill is still refused.
+        assert!(
+            tool.run(ctx().await, json!({"name": "secret"}))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn another_users_private_skill_is_invisible() {
+        // u1 owns `mine`; the tool runs as u1 (ctx()), so a *different* owner's
+        // skill must not be reachable. Seed under "u2" and confirm u1 can't see it.
+        let dir = tempfile::tempdir().unwrap();
+        let user_store = user_store_in(dir.path());
+        user_store
+            .save_manifest(
+                "u2",
+                "mine",
+                "---\nname: mine\ndescription: u2's.\n---\nbody",
+            )
+            .unwrap();
+        let tool = ReadSkill::new(store(dir.path(), &[]), user_store, rbac_granting(&["*"]));
+        // ctx() is user u1 — u2's private skill is not available.
+        assert!(
+            tool.run(ctx().await, json!({"name": "mine"}))
+                .await
+                .is_err()
+        );
     }
 }

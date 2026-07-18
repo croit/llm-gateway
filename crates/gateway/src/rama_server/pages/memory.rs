@@ -70,6 +70,7 @@ pub async fn memory_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         &t(lang, "memory-page-title"),
         &user.email,
         is_admin(&state, &user),
+        state.user_skills_enabled(),
         session.impersonator_id.is_some(),
         body,
         "/memory",

@@ -201,6 +201,13 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/admin/skills/upload", pages::admin_skills_upload)
         .with_post("/admin/skills/delete", pages::admin_skills_delete)
         .with_post("/admin/skills/grants", pages::admin_skills_grants_save)
+        // Per-user private skills (signed-in-user gate, not admin). Distinct
+        // from the /admin/skills operator surface above.
+        .with_get("/skills", pages::user_skills_index)
+        .with_get("/skills/download", pages::user_skills_download)
+        .with_post("/skills/upload", pages::user_skills_upload)
+        .with_post("/skills/save", pages::user_skills_save)
+        .with_post("/skills/delete", pages::user_skills_delete)
         .with_get("/rag", pages::rag_index)
         .with_get("/rag/status", pages::rag_status)
         .with_post("/rag", pages::rag_create)

@@ -352,9 +352,29 @@ async fn main() -> anyhow::Result<()> {
         );
         Arc::new(store)
     });
-    if let Some(store) = skill_store.as_ref() {
+    // Per-user **private** skills live under `<skills.dir>/.users/` — a level
+    // deeper than the global scanner reaches, so the two never cross. Wired
+    // only when `[skills]` is configured, in lockstep with `skill_store`.
+    let user_skill_store = config.skills.as_ref().map(|skills_cfg| {
+        let users_dir = skills_cfg.dir.join(".users");
+        // Best-effort: create the skills dir + its `.users` subdir now, so the
+        // accessibility check (which drives the `/skills` nav visibility and
+        // the admin "no directory access" message) reflects a real, usable
+        // directory. A permission failure here is logged, not fatal — the
+        // check then reports "not accessible" and the feature hides itself.
+        if let Err(err) = std::fs::create_dir_all(&users_dir) {
+            tracing::warn!(
+                error = %err,
+                dir = %users_dir.display(),
+                "could not create private-skills directory — /skills will be hidden until it's accessible"
+            );
+        }
+        Arc::new(srv::skills::UserSkillStore::new(users_dir))
+    });
+    if let (Some(store), Some(user_store)) = (skill_store.as_ref(), user_skill_store.as_ref()) {
         tool_registry = tool_registry.with(srv::tools::read_skill::ReadSkill::new(
             store.clone(),
+            user_store.clone(),
             rbac.clone(),
         ));
         tracing::info!(tool = "read_skill", "registered skills tool");
@@ -393,6 +413,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(store) = skill_store {
         state = state.with_skills(store);
+    }
+    if let Some(user_store) = user_skill_store {
+        state = state.with_user_skills(user_store);
     }
 
     // Web Push: load (or first-time generate + persist) the VAPID keypair and

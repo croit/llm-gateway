@@ -281,6 +281,7 @@ async fn render_chat_response(
             &format!("{title} — LLM Gateway"),
             &user.email,
             is_admin(&state, user),
+            state.user_skills_enabled(),
             impersonating,
             body,
             &url,
@@ -295,6 +296,7 @@ async fn render_chat_response(
             &format!("{title} — LLM Gateway"),
             &user.email,
             is_admin(&state, user),
+            state.user_skills_enabled(),
             impersonating,
             body,
             &chat_sidebar,
@@ -548,6 +550,7 @@ pub async fn chat_search(State(state): State<Arc<RamaState>>, req: Request) -> R
             &t(lang, "nav-search-title"),
             &user.email,
             is_admin(&state, &user),
+            state.user_skills_enabled(),
             session.impersonator_id.is_some(),
             body,
             "/chat/search",
@@ -828,8 +831,8 @@ async fn build_capabilities(
     let loaded = crate::server::db::chat_session_skills::loaded_for_session(&state.db, session_id)
         .await
         .unwrap_or_default();
-    let skill_reg = state.skills.as_ref().map(|s| s.current());
-    for name in state.allowed_skills_for(&user.roles) {
+    let skill_reg = state.combined_skills_for(&user.id);
+    for name in state.allowed_skills_for(&user.roles, &user.id) {
         let on = loaded.iter().any(|s| s == &name);
         let (label, description) = skill_reg
             .as_ref()

@@ -43,3 +43,5 @@ skills-cancel-button = Abbrechen
 skills-save-access-button = Zugriff speichern
 
 skills-from-config-badge = aus Konfiguration
+
+skills-error-no-dir-access = Kein Zugriff auf das Verzeichnis — prüfen Sie, ob es existiert und das Gateway darauf lesen und schreiben kann:

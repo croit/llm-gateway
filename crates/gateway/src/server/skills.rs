@@ -30,7 +30,7 @@
 //! which roles see which skill, by `name`, via the role's `skills` list (see
 //! `rbac::Resolver`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -78,6 +78,12 @@ impl Skill {
     pub fn body(&self) -> Result<String, std::io::Error> {
         let raw = std::fs::read_to_string(self.root.join(MANIFEST_FILE))?;
         Ok(strip_frontmatter(&raw).to_string())
+    }
+
+    /// The full raw `SKILL.md` (frontmatter included) — what the inline editor
+    /// loads so a user can edit both the metadata and the body in one place.
+    pub fn manifest_text(&self) -> Result<String, std::io::Error> {
+        std::fs::read_to_string(self.root.join(MANIFEST_FILE))
     }
 
     /// Relative paths of every readable file in the bundle except
@@ -217,7 +223,8 @@ impl SkillRegistry {
     }
 }
 
-/// Failure installing or removing a skill at runtime via [`SkillStore`].
+/// Failure installing or removing a skill at runtime via [`SkillStore`] or
+/// [`UserSkillStore`].
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("not a readable .skill archive (expected a zip): {0}")]
@@ -228,6 +235,18 @@ pub enum StoreError {
     MissingField(&'static str),
     #[error("skill name `{0}` is not valid (use letters, digits, `.`, `_`, `-`; max 64)")]
     BadName(String),
+    /// The user already owns [`MAX_USER_SKILLS`] private skills. Only raised by
+    /// [`UserSkillStore`]; global (operator) skills have no cap.
+    #[error("you already have {0} skills, which is the maximum")]
+    QuotaExceeded(usize),
+    /// A user upload / manifest exceeded its size limit (bytes). Only raised by
+    /// [`UserSkillStore`].
+    #[error("that is too large (the maximum is {0} bytes)")]
+    TooLarge(usize),
+    /// The inline editor's `SKILL.md` frontmatter `name` didn't match the skill
+    /// it's being saved as. Only raised by [`UserSkillStore::save_manifest`].
+    #[error("the SKILL.md `name: {manifest}` must match the skill `{target}`")]
+    NameMismatch { manifest: String, target: String },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -351,6 +370,238 @@ impl SkillStore {
         self.reload();
         Ok(true)
     }
+}
+
+/// Max private skills a single user may own. A soft guard so a user can't fill
+/// disk — or bloat their own chat system message — with unbounded bundles.
+/// Global operator skills have no such cap (an admin owns the box).
+pub const MAX_USER_SKILLS: usize = 20;
+/// Max size of a user-uploaded `.skill` archive.
+pub const MAX_USER_ARCHIVE_BYTES: usize = 1024 * 1024;
+/// Max size of a `SKILL.md` saved through the inline editor.
+pub const MAX_USER_MANIFEST_BYTES: usize = 64 * 1024;
+
+/// Per-user store for **private** Agent Skills — the user-owned counterpart to
+/// the operator-global [`SkillStore`]. Each user's bundles live under
+/// `<root>/<hash(user_id)>/<name>/`, so one user's skills are invisible to
+/// every other user and to the global scanner (they sit a level deeper than
+/// [`discover`] reaches). Ownership *is* the grant: a user may load any skill
+/// they own, no RBAC role needed — see [`combined_registry`] for how these
+/// overlay the global set (private shadows global on a name collision).
+///
+/// Reads ([`registry_for`](Self::registry_for)) are cached per user and
+/// invalidated on that user's own mutations; since only this process writes
+/// these bundles (via the `/skills` page), self-invalidation is sufficient.
+pub struct UserSkillStore {
+    root: PathBuf,
+    cache: RwLock<HashMap<String, Arc<SkillRegistry>>>,
+}
+
+impl UserSkillStore {
+    /// Build a store rooted at `root` (created lazily on first write). Empty
+    /// cache; each user's registry is scanned on first access.
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The on-disk directory holding `user_id`'s bundles. The id is hex-encoded
+    /// (see [`encode_user_id`]) so an OIDC subject that isn't a safe path
+    /// component — or a hostile `../` — can never escape `root`.
+    fn user_dir(&self, user_id: &str) -> PathBuf {
+        self.root.join(encode_user_id(user_id))
+    }
+
+    /// This user's private skills, cached. Cheap on a hit (an `Arc` clone under
+    /// a read lock); a miss scans their directory once and memoises it.
+    pub fn registry_for(&self, user_id: &str) -> Arc<SkillRegistry> {
+        if let Ok(cache) = self.cache.read()
+            && let Some(reg) = cache.get(user_id)
+        {
+            return reg.clone();
+        }
+        let reg = Arc::new(SkillRegistry::new(scan(&self.user_dir(user_id))));
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(user_id.to_string(), reg.clone());
+        }
+        reg
+    }
+
+    /// Drop this user's cached registry so the next read re-scans. Called after
+    /// every mutation of their bundles.
+    fn invalidate(&self, user_id: &str) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.remove(user_id);
+        }
+    }
+
+    /// Install a private skill from a `.skill` archive's bytes — the per-user
+    /// analogue of [`SkillStore::install_archive`], plus a size guard and the
+    /// [`MAX_USER_SKILLS`] quota. Re-uploading an existing name replaces it (and
+    /// doesn't count against the quota); a new name past the cap is rejected.
+    pub fn install_archive(&self, user_id: &str, bytes: &[u8]) -> Result<String, StoreError> {
+        if bytes.len() > MAX_USER_ARCHIVE_BYTES {
+            return Err(StoreError::TooLarge(MAX_USER_ARCHIVE_BYTES));
+        }
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes))
+            .map_err(|e| StoreError::BadArchive(e.to_string()))?;
+        let tmp = tempfile::tempdir()?;
+        zip.extract(tmp.path())
+            .map_err(|e| StoreError::BadArchive(e.to_string()))?;
+        let bundle = find_bundle_root(tmp.path()).ok_or(StoreError::NoManifest)?;
+        let raw = std::fs::read_to_string(bundle.join(MANIFEST_FILE))?;
+        let front = parse_frontmatter(&raw);
+        let name = front
+            .get("name")
+            .ok_or(StoreError::MissingField("name"))?
+            .clone();
+        if !front.contains_key("description") {
+            return Err(StoreError::MissingField("description"));
+        }
+        if !is_valid_name(&name) {
+            return Err(StoreError::BadName(name));
+        }
+        self.check_quota(user_id, &name)?;
+
+        let dir = self.user_dir(user_id);
+        std::fs::create_dir_all(&dir)?;
+        let target = dir.join(&name);
+        if target.exists() {
+            std::fs::remove_dir_all(&target)?;
+        }
+        copy_dir_all(&bundle, &target)?;
+        self.invalidate(user_id);
+        Ok(name)
+    }
+
+    /// Create or edit a private skill from raw `SKILL.md` text (the inline
+    /// editor path). Validates the frontmatter (`name` + `description`), pins
+    /// the frontmatter `name` to the target `name` so the on-disk slug and the
+    /// model-facing id can't diverge, enforces the size + quota limits, then
+    /// writes only `SKILL.md` (existing `references/`/`assets/` are left intact,
+    /// so editing the body of an uploaded bundle keeps its files).
+    pub fn save_manifest(
+        &self,
+        user_id: &str,
+        name: &str,
+        skill_md: &str,
+    ) -> Result<String, StoreError> {
+        if skill_md.len() > MAX_USER_MANIFEST_BYTES {
+            return Err(StoreError::TooLarge(MAX_USER_MANIFEST_BYTES));
+        }
+        if !is_valid_name(name) {
+            return Err(StoreError::BadName(name.to_string()));
+        }
+        let front = parse_frontmatter(skill_md);
+        let manifest_name = front
+            .get("name")
+            .ok_or(StoreError::MissingField("name"))?
+            .clone();
+        if !front.contains_key("description") {
+            return Err(StoreError::MissingField("description"));
+        }
+        if manifest_name != name {
+            return Err(StoreError::NameMismatch {
+                manifest: manifest_name,
+                target: name.to_string(),
+            });
+        }
+        self.check_quota(user_id, name)?;
+
+        let dir = self.user_dir(user_id).join(name);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(MANIFEST_FILE), skill_md)?;
+        self.invalidate(user_id);
+        Ok(name.to_string())
+    }
+
+    /// Remove one of this user's private skills by `name`. Returns whether a
+    /// bundle was deleted. A bad/empty name or an absent skill is a clean
+    /// `false`, never an error.
+    pub fn remove(&self, user_id: &str, name: &str) -> Result<bool, StoreError> {
+        if !is_valid_name(name) {
+            return Ok(false);
+        }
+        let dir = self.user_dir(user_id).join(name);
+        if !dir.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_dir_all(&dir)?;
+        self.invalidate(user_id);
+        Ok(true)
+    }
+
+    /// Reject a mutation that would push a user past [`MAX_USER_SKILLS`]. Only a
+    /// *new* name counts — replacing/editing an existing skill is always
+    /// allowed, so a user at the cap can still fix their bundles.
+    fn check_quota(&self, user_id: &str, name: &str) -> Result<(), StoreError> {
+        let existing = self.registry_for(user_id);
+        if existing.get(name).is_none() && existing.len() >= MAX_USER_SKILLS {
+            return Err(StoreError::QuotaExceeded(existing.len()));
+        }
+        Ok(())
+    }
+}
+
+/// Overlay a user's private skills on the global (operator) ones: private
+/// shadows global on a name collision, so a user can override a global skill
+/// for their own sessions. Silent — unlike [`SkillRegistry::new`], which warns
+/// on a duplicate name — because a private-over-global override is deliberate,
+/// not a misconfiguration. Cheap: clones the `Skill` structs (a couple of
+/// `String`s + a `PathBuf` each).
+pub fn combined_registry(global: &SkillRegistry, private: &SkillRegistry) -> SkillRegistry {
+    let mut map: BTreeMap<String, Skill> = BTreeMap::new();
+    for skill in global.iter() {
+        map.insert(skill.name.clone(), skill.clone());
+    }
+    for skill in private.iter() {
+        map.insert(skill.name.clone(), skill.clone());
+    }
+    SkillRegistry { skills: map }
+}
+
+/// Whether `dir` can serve as a skills-store root right now: it's a directory
+/// we can list, or it doesn't exist yet but its parent does (so the store can
+/// create it on first write). A permission error — or a non-directory at the
+/// path — is *not* accessible. Cheap (one or two `read_dir`/`stat` syscalls),
+/// side-effect-free (never creates anything). Drives hiding the `/skills` nav
+/// entry and the admin "no directory access" message.
+pub fn dir_accessible(dir: &Path) -> bool {
+    if std::fs::read_dir(dir).is_ok() {
+        return true;
+    }
+    if dir.exists() {
+        return false; // exists but unreadable, or not a directory
+    }
+    dir.parent().is_some_and(|p| std::fs::read_dir(p).is_ok())
+}
+
+/// The `name` declared in a raw `SKILL.md`'s frontmatter, if any. Used by the
+/// inline-editor save path to derive a new skill's slug from its content, so a
+/// user types the name once (in the frontmatter) rather than in a separate
+/// field that could drift from it.
+pub fn manifest_name(skill_md: &str) -> Option<String> {
+    parse_frontmatter(skill_md).remove("name")
+}
+
+/// A filesystem-safe, collision-free directory name for a user id: lowercase
+/// hex of its bytes. OIDC subjects aren't constrained to safe path characters,
+/// so a raw id is never placed on disk — a `/` or `..` in an id must not let
+/// one user's bundles land in another's (or escape the store root). Hex is
+/// deterministic and injective; we only ever map forward (id → dir).
+fn encode_user_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len() * 2);
+    for b in id.as_bytes() {
+        out.push(char::from_digit((b >> 4) as u32, 16).expect("nibble is 0..16"));
+        out.push(char::from_digit((b & 0xf) as u32, 16).expect("nibble is 0..16"));
+    }
+    out
 }
 
 /// `discover`, but tolerant: a read error logs and yields no skills (so the
@@ -998,5 +1249,180 @@ mod tests {
             Err(StoreError::NoManifest)
         ));
         assert_eq!(store.current().len(), 0);
+    }
+
+    // ---- UserSkillStore (private, per-user) ----
+
+    #[test]
+    fn encode_user_id_is_hex_and_deterministic() {
+        assert_eq!(encode_user_id("A"), "41");
+        assert_eq!(encode_user_id("ab"), "6162");
+        assert_eq!(encode_user_id("u1"), encode_user_id("u1"));
+        assert_ne!(encode_user_id("u1"), encode_user_id("u2"));
+        // A hostile id can't produce path separators or `..`.
+        let enc = encode_user_id("../../etc/passwd");
+        assert!(enc.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn dir_accessible_covers_readable_missing_and_denied() {
+        let base = tempfile::tempdir().unwrap();
+        // A readable existing dir → accessible.
+        assert!(dir_accessible(base.path()));
+        // A missing dir whose parent exists → accessible (creatable on write).
+        assert!(dir_accessible(&base.path().join("does-not-exist-yet")));
+        // A dir whose parent also doesn't exist → not accessible.
+        assert!(!dir_accessible(&base.path().join("missing").join("child")));
+        // A path that exists but is a *file*, not a directory → not accessible.
+        let file = base.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(!dir_accessible(&file));
+    }
+
+    #[test]
+    fn user_store_install_edit_remove_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = UserSkillStore::new(dir.path().to_path_buf());
+        assert_eq!(store.registry_for("u1").len(), 0);
+
+        // Upload a bundle.
+        let zip = skill_zip(
+            "mine",
+            &[
+                (
+                    "SKILL.md",
+                    "---\nname: mine\ndescription: My own skill.\n---\n\nDo my thing.\n",
+                ),
+                ("assets/logo.svg", "<svg/>"),
+            ],
+        );
+        assert_eq!(store.install_archive("u1", &zip).unwrap(), "mine");
+        let reg = store.registry_for("u1");
+        assert_eq!(reg.len(), 1);
+        assert_eq!(
+            reg.get("mine").unwrap().body().unwrap().trim(),
+            "Do my thing."
+        );
+
+        // Inline-edit the body; the asset survives (only SKILL.md is rewritten).
+        store
+            .save_manifest(
+                "u1",
+                "mine",
+                "---\nname: mine\ndescription: My own skill.\n---\n\nDo it BETTER.\n",
+            )
+            .unwrap();
+        let reg = store.registry_for("u1");
+        assert_eq!(
+            reg.get("mine").unwrap().body().unwrap().trim(),
+            "Do it BETTER."
+        );
+        assert_eq!(
+            reg.get("mine").unwrap().files(),
+            vec!["assets/logo.svg".to_string()]
+        );
+
+        // Remove it.
+        assert!(store.remove("u1", "mine").unwrap());
+        assert_eq!(store.registry_for("u1").len(), 0);
+        assert!(!store.remove("u1", "mine").unwrap(), "gone → clean false");
+    }
+
+    #[test]
+    fn user_store_isolates_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = UserSkillStore::new(dir.path().to_path_buf());
+        store
+            .save_manifest(
+                "alice",
+                "secret",
+                "---\nname: secret\ndescription: Alice's.\n---\nbody",
+            )
+            .unwrap();
+        // Bob sees nothing of Alice's.
+        assert_eq!(store.registry_for("bob").len(), 0);
+        assert!(store.registry_for("bob").get("secret").is_none());
+        // Alice still has hers.
+        assert_eq!(store.registry_for("alice").len(), 1);
+    }
+
+    #[test]
+    fn user_store_save_rejects_name_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = UserSkillStore::new(dir.path().to_path_buf());
+        let err = store
+            .save_manifest("u1", "foo", "---\nname: bar\ndescription: d.\n---\nbody")
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NameMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn user_store_enforces_quota_on_new_names_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = UserSkillStore::new(dir.path().to_path_buf());
+        for i in 0..MAX_USER_SKILLS {
+            let name = format!("s{i}");
+            store
+                .save_manifest(
+                    "u1",
+                    &name,
+                    &format!("---\nname: {name}\ndescription: d.\n---\nbody"),
+                )
+                .unwrap();
+        }
+        // One more *new* skill is rejected…
+        let err = store
+            .save_manifest(
+                "u1",
+                "overflow",
+                "---\nname: overflow\ndescription: d.\n---\nx",
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::QuotaExceeded(_)), "{err:?}");
+        // …but editing an existing one is still allowed at the cap.
+        assert!(
+            store
+                .save_manifest("u1", "s0", "---\nname: s0\ndescription: d.\n---\nedited")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn user_store_rejects_oversize_upload_and_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = UserSkillStore::new(dir.path().to_path_buf());
+        let big = vec![0u8; MAX_USER_ARCHIVE_BYTES + 1];
+        assert!(matches!(
+            store.install_archive("u1", &big),
+            Err(StoreError::TooLarge(_))
+        ));
+        let big_md = format!(
+            "---\nname: x\ndescription: d.\n---\n{}",
+            "a".repeat(MAX_USER_MANIFEST_BYTES)
+        );
+        assert!(matches!(
+            store.save_manifest("u1", "x", &big_md),
+            Err(StoreError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn combined_registry_private_shadows_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |name: &str, desc: &str, sub: &str| Skill {
+            name: name.into(),
+            title: name.into(),
+            description: desc.into(),
+            root: dir.path().join(sub),
+        };
+        let global = SkillRegistry::new([mk("shared", "global one", "g"), mk("g-only", "g", "g2")]);
+        let private =
+            SkillRegistry::new([mk("shared", "private one", "p"), mk("p-only", "p", "p2")]);
+        let merged = combined_registry(&global, &private);
+        assert_eq!(merged.len(), 3);
+        // Private wins the collision.
+        assert_eq!(merged.get("shared").unwrap().description, "private one");
+        assert!(merged.get("g-only").is_some());
+        assert!(merged.get("p-only").is_some());
     }
 }

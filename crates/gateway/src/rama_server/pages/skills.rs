@@ -400,8 +400,10 @@ async fn reload_skill_overlay(state: &RamaState) {
 }
 
 /// Pull the first `skill` multipart field's bytes out of the request body.
-/// Returns `Ok(None)` when no (non-empty) file part was sent.
-async fn read_upload_field(
+/// Returns `Ok(None)` when no (non-empty) file part was sent. Shared with the
+/// per-user skills page ([`super::skills_user`]), which accepts the same
+/// `.skill` upload shape.
+pub(super) async fn read_upload_field(
     content_type: &str,
     body: rama::bytes::Bytes,
 ) -> Result<Option<Vec<u8>>, String> {
@@ -423,7 +425,8 @@ async fn read_upload_field(
 }
 
 /// Pull `?skill=<name>` out of the request URI, percent-decoding `%XX`/`+`.
-fn selected_skill_param(req: &Request) -> Option<String> {
+/// Shared with the per-user skills page.
+pub(super) fn selected_skill_param(req: &Request) -> Option<String> {
     let query = req.uri().query()?;
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
@@ -431,7 +434,7 @@ fn selected_skill_param(req: &Request) -> Option<String> {
     })
 }
 
-fn percent_decode(s: &str) -> String {
+pub(super) fn percent_decode(s: &str) -> String {
     let replaced = s.replace('+', " ");
     let bytes = replaced.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -484,7 +487,16 @@ async fn render_page(
         None => "/admin/skills".to_string(),
     };
     let roles = all_role_ids(state);
-    let body = render_body(lang, &views, selected, dir.as_deref(), &roles, error);
+    let dir_inaccessible = state.skills_dir_inaccessible();
+    let body = render_body(
+        lang,
+        &views,
+        selected,
+        dir.as_deref(),
+        dir_inaccessible,
+        &roles,
+        error,
+    );
     let chat = fetch_sidebar_chat(state, &user.id, None).await;
     let title = t(lang, "skills-page-title");
     nav_or_html_page(
@@ -496,6 +508,7 @@ async fn render_page(
         &title,
         &user.email,
         is_admin(state, user),
+        state.user_skills_enabled(),
         impersonating,
         body,
         &push_url,
@@ -562,6 +575,9 @@ fn render_body(
     skills: &[SkillView],
     selected: usize,
     dir: Option<&str>,
+    // The skills dir is configured but not accessible (missing/permission
+    // denied) — surface a prominent "no directory access" warning.
+    dir_inaccessible: bool,
     all_roles: &[String],
     error: Option<&str>,
 ) -> Html {
@@ -579,6 +595,18 @@ fn render_body(
                 " " (t(lang, "skills-intro-part3"))
             }
 
+            if dir_inaccessible {
+                div(class: "alert alert-warning text-sm mb-4") {
+                    (icons::alert(16))
+                    span {
+                        (t(lang, "skills-error-no-dir-access"))
+                        if let Some(dir) = dir {
+                            " " span(class: "font-mono break-all") { (dir) }
+                        }
+                    }
+                }
+            }
+
             if let Some(error) = error {
                 div(class: "alert alert-error text-sm mb-4") { (error) }
             }
@@ -587,7 +615,9 @@ fn render_body(
                 (render_rail(lang, skills, selected, dir))
                 if skills.is_empty() {
                     section(class: "flex-1 min-w-0 text-base-content/60 text-sm pt-2") {
-                        if dir.is_some() {
+                        if dir_inaccessible {
+                            (t(lang, "skills-error-no-dir-access"))
+                        } else if dir.is_some() {
                             (t(lang, "skills-empty-loaded"))
                         } else {
                             (t(lang, "skills-empty-not-configured"))
@@ -937,6 +967,22 @@ fn role_checkbox(role: &str, checked: bool) -> Html {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A configured-but-inaccessible skills dir must surface the "no directory
+    /// access" warning (the admin-facing half of hiding the feature). It shows
+    /// even though the dir path is `Some(...)` — that's the "configured but
+    /// broken" state, distinct from "not configured".
+    #[test]
+    fn inaccessible_dir_shows_the_no_access_warning() {
+        let html = render_body(Lang::En, &[], 0, Some("data/skills"), true, &[], None).to_string();
+        assert!(
+            html.contains("No access to the skills directory"),
+            "should surface the no-directory-access message"
+        );
+        // A healthy configured dir shows the ordinary empty state instead.
+        let ok = render_body(Lang::En, &[], 0, Some("data/skills"), false, &[], None).to_string();
+        assert!(!ok.contains("No access to the skills directory"));
+    }
 
     fn view(config_roles: &[&str], granted_roles: &[&str]) -> SkillView {
         SkillView {

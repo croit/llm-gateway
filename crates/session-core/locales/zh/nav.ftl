@@ -53,3 +53,5 @@ error-internal-heading = 内部错误
 error-forbidden-heading = 禁止访问
 
 nav-groups = 组
+
+nav-my-skills = 我的技能

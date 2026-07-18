@@ -41,6 +41,14 @@ pub struct AppState {
     /// restart). RBAC narrows which skills each caller sees (see
     /// [`Self::allowed_skills_for`]).
     pub skills: Option<Arc<SkillStore>>,
+    /// Per-user **private** Agent Skills (the user-owned counterpart to
+    /// [`Self::skills`]). `None` unless `[skills]` is configured — private
+    /// skills piggyback on the same feature toggle and live under
+    /// `<skills.dir>/.users/`. Ownership is the grant: a user may load any
+    /// skill they own without an RBAC role, and their private skills overlay
+    /// the global set (private shadows global; see
+    /// [`crate::server::skills::combined_registry`]).
+    pub user_skills: Option<Arc<crate::server::skills::UserSkillStore>>,
     /// At-rest encryption for the gateway's database-stored secrets: per-user
     /// MCP OAuth tokens, admin-stored connector client secrets, and upstream
     /// backend API keys. `new()` installs an ephemeral key; production overrides
@@ -92,6 +100,7 @@ impl AppState {
             geoip: None,
             indexer: None,
             skills: None,
+            user_skills: None,
             crypto,
             mcp,
             typst_templates: Arc::new(Vec::new()),
@@ -121,17 +130,73 @@ impl AppState {
         self
     }
 
-    /// Skill names this caller's roles permit, intersected with what's
-    /// loaded. Empty when `[skills]` isn't configured. The single home for
-    /// skill authorization, shared by the chat system-message listing, the
-    /// `read_skill`-always-on rule below, and the admin page — so they can't
-    /// drift, the same way [`Self::allowed_tools_for_user`] anchors tools.
-    pub fn allowed_skills_for(&self, roles: &[String]) -> Vec<String> {
+    /// Skill names this caller may load: the global (operator) skills their
+    /// roles permit, unioned with **all** of their private skills — ownership
+    /// alone grants a private skill, no RBAC role needed. Global names come
+    /// first (RBAC order), then any private names not already present; a
+    /// private skill that shadows a global one appears once, under that name.
+    /// Empty when `[skills]` isn't configured. The single home for skill
+    /// authorization, shared by the chat system-message listing, the
+    /// `read_skill`-always-on rule below, and the chat capability rows — so
+    /// they can't drift, the same way [`Self::allowed_tools_for_user`] anchors
+    /// tools.
+    pub fn allowed_skills_for(&self, roles: &[String], user_id: &str) -> Vec<String> {
         let Some(store) = self.skills.as_ref() else {
             return Vec::new();
         };
         let role_ids = self.rbac.role_ids_for(roles);
-        self.rbac.allowed_skills(&role_ids, &store.current())
+        let mut allowed = self.rbac.allowed_skills(&role_ids, &store.current());
+        if let Some(user_store) = self.user_skills.as_ref() {
+            for name in user_store.registry_for(user_id).names() {
+                if !allowed.iter().any(|a| a == name) {
+                    allowed.push(name.to_string());
+                }
+            }
+        }
+        allowed
+    }
+
+    /// True when per-user private skills are usable right now: the feature is
+    /// configured **and** the store's directory is accessible. Drives whether
+    /// the `/skills` nav entry is shown — it's hidden when skills aren't
+    /// configured, or the directory can't be read/created.
+    pub fn user_skills_enabled(&self) -> bool {
+        self.user_skills
+            .as_ref()
+            .is_some_and(|s| crate::server::skills::dir_accessible(s.root()))
+    }
+
+    /// True when the (global) skills feature is configured but its directory
+    /// isn't accessible — the admin `/admin/skills` page shows a "no directory
+    /// access" message in this state. `false` when unconfigured (which gets a
+    /// different message) or when the directory is fine.
+    pub fn skills_dir_inaccessible(&self) -> bool {
+        self.skills
+            .as_ref()
+            .is_some_and(|s| !crate::server::skills::dir_accessible(s.dir()))
+    }
+
+    /// The skill registry to resolve names against for `user_id`: their private
+    /// skills overlaid on the global operator skills (private shadows global).
+    /// `None` when `[skills]` isn't configured. Used by the chat driver's
+    /// skill advertisement / re-injection and the chat capability rows, so the
+    /// name a caller sees always resolves to the right bundle body.
+    pub fn combined_skills_for(
+        &self,
+        user_id: &str,
+    ) -> Option<Arc<crate::server::skills::SkillRegistry>> {
+        let global = self.skills.as_ref()?.current();
+        match self.user_skills.as_ref() {
+            Some(user_store) => {
+                let private = user_store.registry_for(user_id);
+                Some(Arc::new(crate::server::skills::combined_registry(
+                    &global, &private,
+                )))
+            }
+            // Skills configured but no per-user store (shouldn't happen — both
+            // are wired together): fall back to the global registry alone.
+            None => Some(global),
+        }
     }
 
     /// The tool ids a user may actually use this request: the union of
@@ -221,7 +286,7 @@ impl AppState {
         // friction. With no permitted skills it stays lazy (and is usually not
         // even registered), so skill-less deployments are unaffected.
         let skill_loader_on = allowed.iter().any(|id| id == READ_SKILL_ID)
-            && !self.allowed_skills_for(roles).is_empty();
+            && !self.allowed_skills_for(roles, user_id).is_empty();
         allowed.retain(|id| {
             id == BOOTSTRAP_TOOL_ID
                 || (skill_loader_on && id == READ_SKILL_ID)
@@ -262,6 +327,17 @@ impl AppState {
 
     pub fn with_skills(mut self, skills: Arc<SkillStore>) -> Self {
         self.skills = Some(skills);
+        self
+    }
+
+    /// Install the per-user private-skills store. Wired at startup alongside
+    /// [`Self::with_skills`] (both gate on `[skills]`), so `user_skills` is
+    /// `Some` exactly when `skills` is.
+    pub fn with_user_skills(
+        mut self,
+        user_skills: Arc<crate::server::skills::UserSkillStore>,
+    ) -> Self {
+        self.user_skills = Some(user_skills);
         self
     }
 
@@ -362,7 +438,7 @@ mod skill_overlay_tests {
     use crate::server::config::Config;
     use crate::server::db;
     use crate::server::rbac::config::{RbacConfig, RoleConfig};
-    use crate::server::skills::{Skill, SkillRegistry, SkillStore};
+    use crate::server::skills::{Skill, SkillRegistry, SkillStore, UserSkillStore};
     use crate::server::tools::enable_tools::EnableTools;
     use crate::server::tools::read_skill::{READ_SKILL_ID, ReadSkill};
 
@@ -396,11 +472,22 @@ mod skill_overlay_tests {
             ..Config::default()
         };
         let rbac = Arc::new(Resolver::build(config.rbac.clone(), config.roles.clone()).unwrap());
-        let mut reg = ToolRegistry::new().with(ReadSkill::new(skills.clone(), rbac.clone()));
+        // Empty per-user store (its dir doesn't exist → scans to nothing), so
+        // these tests exercise the global-skill path exactly as before.
+        let user_skills = Arc::new(UserSkillStore::new(std::path::PathBuf::from(
+            "/nonexistent/.users",
+        )));
+        let mut reg = ToolRegistry::new().with(ReadSkill::new(
+            skills.clone(),
+            user_skills.clone(),
+            rbac.clone(),
+        ));
         let et = EnableTools::from_registry(&reg);
         reg = reg.with(et);
         let upstreams = UpstreamRegistry::new(&config.upstream_pools).unwrap();
-        AppState::new(config, pool, upstreams, Arc::new(reg), rbac).with_skills(skills)
+        AppState::new(config, pool, upstreams, Arc::new(reg), rbac)
+            .with_skills(skills)
+            .with_user_skills(user_skills)
     }
 
     #[tokio::test]

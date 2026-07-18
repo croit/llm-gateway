@@ -56,3 +56,5 @@ impersonation-return-button = Return to your account
 
 error-internal-heading = Internal error
 error-forbidden-heading = Forbidden
+
+nav-my-skills = My Skills

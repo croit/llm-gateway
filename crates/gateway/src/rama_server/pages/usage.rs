@@ -141,6 +141,7 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
         &title,
         &user.email,
         admin,
+        state.user_skills_enabled(),
         session.impersonator_id.is_some(),
         body,
         "/usage",

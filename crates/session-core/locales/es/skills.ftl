@@ -43,3 +43,5 @@ skills-cancel-button = Cancelar
 skills-save-access-button = Guardar acceso
 
 skills-from-config-badge = desde la configuración
+
+skills-error-no-dir-access = Sin acceso al directorio de habilidades — comprueba que existe y que la puerta de enlace puede leerlo y escribirlo:
