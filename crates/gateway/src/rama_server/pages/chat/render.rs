@@ -179,6 +179,27 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
         .iter()
         .map(|m| (m.id.clone(), model_label(lang, m)))
         .collect();
+    // Preselect the model this conversation last used — the most recent turn
+    // that recorded one (assistant turns carry `model`) — so reopening a chat
+    // keeps its model instead of snapping back to the global default. A stored
+    // model no longer on offer (removed/unassigned since) is ignored, letting
+    // the default win. Empty (new chat / no turns yet) → no preselection.
+    let last_used_model: Option<String> = page
+        .turns
+        .iter()
+        .rev()
+        .find_map(|t| t.turn.model.clone())
+        .filter(|m| model_options.iter().any(|(v, _)| v == m));
+    // Pre-built so the `<option selected>` (emitted only when selected — see
+    // `select_option`) isn't assembled inside the `html!` `for`, which would
+    // move these locals into the macro's per-attribute closures.
+    let model_option_html: Vec<Html> = model_options
+        .iter()
+        .map(|(value, label)| {
+            let selected = last_used_model.as_deref() == Some(value.as_str());
+            crate::rama_server::pages::select_option(value, label, selected)
+        })
+        .collect();
     // Compliance UI is owner-only (a read-only shared viewer sends nothing)
     // and only meaningful when there's a real model picker. The signal store
     // is emitted whenever the picker is shown (so the picker's `data-on:change`
@@ -293,9 +314,7 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                             "data-on:change": "$selectedModel = evt.target.value",
                             class: "select select-bordered select-sm chat-model-select"
                         ) {
-                            for (value, label) in model_options.iter() {
-                                option(value: (value.clone())) { (label.clone()) }
-                            }
+                            for o in model_option_html.iter() { (o.clone()) }
                         }
                     }
                 }
@@ -1411,11 +1430,43 @@ mod tests {
         .to_string()
     }
 
+    /// An assistant turn that recorded `model` (what the load path reads back to
+    /// preselect the picker).
+    fn assistant_turn(model: &str) -> TurnWithTools {
+        let now = Timestamp::now();
+        TurnWithTools {
+            turn: session_core::db::Turn {
+                id: "t1".into(),
+                session_id: "s1".into(),
+                seq: 1,
+                role: session_core::db::TurnRole::Assistant,
+                user_content: None,
+                model: Some(model.into()),
+                content: Some("hi".into()),
+                reasoning: None,
+                reasoning_elapsed_ms: None,
+                status: session_core::db::TurnStatus::Completed,
+                error_message: None,
+                created_at: now,
+                completed_at: Some(now),
+            },
+            tool_calls: vec![],
+        }
+    }
+
     fn page_body_with_models(models: &[ChatModelOption], read_only: bool) -> String {
+        page_body_with_models_and_turns(models, read_only, &[])
+    }
+
+    fn page_body_with_models_and_turns(
+        models: &[ChatModelOption],
+        read_only: bool,
+        turns: &[TurnWithTools],
+    ) -> String {
         let s = session();
         render_chat_page(ChatPage {
             active: &s,
-            turns: &[],
+            turns,
             in_flight_turn_id: None,
             models,
             transcription_models: &[],
@@ -1438,6 +1489,52 @@ mod tests {
             gdpr,
             nda,
         }
+    }
+
+    #[test]
+    fn reopened_chat_preselects_the_last_used_model() {
+        // Conversation last ran on qwen-7b (not the first/default option) → its
+        // option must carry `selected` so reopening keeps the model.
+        let turns = [assistant_turn("qwen-7b")];
+        let body = page_body_with_models_and_turns(
+            &[opt("qwen-32b", true, true), opt("qwen-7b", true, true)],
+            false,
+            &turns,
+        );
+        assert!(
+            body.contains(r#"<option value="qwen-7b" selected="selected">"#),
+            "last-used model must be preselected: {body}"
+        );
+        assert!(
+            !body.contains(r#"<option value="qwen-32b" selected="selected">"#),
+            "the default model must not be preselected when another was used: {body}"
+        );
+    }
+
+    #[test]
+    fn no_turns_preselects_nothing_leaving_the_default() {
+        // A fresh chat (no turns) marks no option selected → the browser keeps
+        // the first (global-default) option, unchanged from before.
+        let body = page_body_with_models(
+            &[opt("qwen-32b", true, true), opt("qwen-7b", true, true)],
+            false,
+        );
+        assert!(
+            !body.contains(r#"selected="selected""#),
+            "no turn → no forced preselection: {body}"
+        );
+    }
+
+    #[test]
+    fn stale_last_model_no_longer_offered_is_ignored() {
+        // The conversation's recorded model was removed from the topology since
+        // → don't emit a dangling selected option; fall back to the default.
+        let turns = [assistant_turn("retired-model")];
+        let body = page_body_with_models_and_turns(&[opt("qwen-32b", true, true)], false, &turns);
+        assert!(
+            !body.contains(r#"selected="selected""#),
+            "a stored model no longer offered must not be preselected: {body}"
+        );
     }
 
     #[test]
