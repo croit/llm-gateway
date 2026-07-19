@@ -86,6 +86,33 @@ struct ToolCallAcc {
     arguments: String,
 }
 
+/// Ensure every tool call in one round has a non-empty id that is unique
+/// across the whole turn. Some OpenAI-compatible backends (qwen / vLLM are
+/// the usual offenders) emit `tool_call_id`s that are empty or recycled
+/// per response (`call_0`, `call_0`, … reset every round). Because
+/// `chat_tool_calls.id` is the PRIMARY KEY, a duplicate insert aborts the
+/// whole turn with `UNIQUE constraint failed: chat_tool_calls.id`. Rewrite
+/// any empty or colliding id to a synthesised, turn-unique one *before* it
+/// is used for the DB row, the assistant message replayed upstream, and the
+/// tool result — so all three keep referring to the same id. `seen`
+/// accumulates across rounds of a single turn. Pure so it's unit-tested.
+fn ensure_unique_tool_call_ids(
+    round_calls: &mut [ToolCallAcc],
+    round: usize,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    for (i, acc) in round_calls.iter_mut().enumerate() {
+        // `insert` returns false when the id is already taken this turn.
+        if acc.id.is_empty() || !seen.insert(acc.id.clone()) {
+            let mut synth = format!("call_{round}_{i}");
+            while !seen.insert(synth.clone()) {
+                synth.push('_');
+            }
+            acc.id = synth;
+        }
+    }
+}
+
 /// Per-turn driver. Built once by the chat-message handler with the
 /// caller's tool context, then boxed into a `dyn SessionDriver` and handed
 /// to `session_core::worker::run_session_turn`. Holding `Arc<RamaState>`
@@ -373,6 +400,11 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
     // history plus every prior round's tool traffic), so a running max is
     // the right summary.
     let mut max_prompt_tokens: i64 = 0;
+
+    // Every `tool_call_id` persisted this turn, so `ensure_unique_tool_call_ids`
+    // can spot cross-round collisions (a backend that recycles ids per round).
+    let mut seen_tool_call_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for round in 0..max_rounds {
         if ctx.cancel.load(Ordering::SeqCst) {
@@ -799,7 +831,10 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         // Tool calls fired. Insert each as 'running' and broadcast,
         // then execute concurrently. Each result flips its row to
         // 'completed' / 'errored'.
-        let collected: Vec<ToolCallAcc> = tool_acc.into_values().collect();
+        let mut collected: Vec<ToolCallAcc> = tool_acc.into_values().collect();
+        // Guarantee unique, non-empty ids before they hit the DB (PK),
+        // the replayed assistant message, and the tool results.
+        ensure_unique_tool_call_ids(&mut collected, round as usize, &mut seen_tool_call_ids);
         // Tool groups the user explicitly switched **off** for this
         // conversation. The model never sees their schemas (they're not in
         // `allowed_tools`), but it can still hallucinate a direct call from
@@ -1483,7 +1518,13 @@ fn error_chain(err: &dyn std::error::Error) -> String {
     let mut chain = err.to_string();
     let mut src = err.source();
     while let Some(e) = src {
-        let _ = write!(chain, ": {e}");
+        let s = e.to_string();
+        // thiserror's `#[error("… {0}")]` already embeds the source in the
+        // parent's `Display`, so a naive walk prints the same sqlx text
+        // several times. Skip any frame whose text we've already emitted.
+        if !chain.contains(&s) {
+            let _ = write!(chain, ": {s}");
+        }
         src = e.source();
     }
     chain
@@ -1533,7 +1574,10 @@ fn reasoning_overrides_from_row(
 
 #[cfg(test)]
 mod tests {
-    use super::{THINK_TAGS, render_active_skills, render_skill_listing, take_safe_content};
+    use super::{
+        THINK_TAGS, ToolCallAcc, ensure_unique_tool_call_ids, render_active_skills,
+        render_skill_listing, take_safe_content,
+    };
     use crate::server::skills::{Skill, SkillRegistry};
     use std::path::PathBuf;
 
@@ -1575,6 +1619,60 @@ mod tests {
         // A `<` that never becomes a tag is delayed, never dropped.
         assert_eq!(stream(&["a < b"]), "a < b");
         assert_eq!(stream(&["value <", " 5 end"]), "value < 5 end");
+    }
+
+    fn acc(id: &str, name: &str) -> ToolCallAcc {
+        ToolCallAcc {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: String::new(),
+        }
+    }
+
+    #[test]
+    fn tool_call_ids_deduped_within_a_round() {
+        // Backend emitted two calls with the SAME id in one response.
+        let mut seen = std::collections::HashSet::new();
+        let mut calls = vec![acc("call_0", "a"), acc("call_0", "b")];
+        ensure_unique_tool_call_ids(&mut calls, 0, &mut seen);
+        assert_eq!(calls[0].id, "call_0"); // first keeps it
+        assert_ne!(calls[1].id, "call_0"); // second rewritten
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn empty_tool_call_ids_get_synthesised() {
+        // Backend omitted the id entirely — must never persist "" (would
+        // collide with the next empty-id call on the PK).
+        let mut seen = std::collections::HashSet::new();
+        let mut calls = vec![acc("", "a"), acc("", "b")];
+        ensure_unique_tool_call_ids(&mut calls, 1, &mut seen);
+        assert!(!calls[0].id.is_empty());
+        assert!(!calls[1].id.is_empty());
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn tool_call_ids_deduped_across_rounds() {
+        // The real bug: a backend recycles `call_0` every round. Round 0's
+        // id is fine; round 1's identical id must be rewritten so the second
+        // insert doesn't hit `UNIQUE constraint failed: chat_tool_calls.id`.
+        let mut seen = std::collections::HashSet::new();
+        let mut round0 = vec![acc("call_0", "a")];
+        ensure_unique_tool_call_ids(&mut round0, 0, &mut seen);
+        let mut round1 = vec![acc("call_0", "b")];
+        ensure_unique_tool_call_ids(&mut round1, 1, &mut seen);
+        assert_eq!(round0[0].id, "call_0");
+        assert_ne!(round1[0].id, "call_0");
+    }
+
+    #[test]
+    fn distinct_tool_call_ids_are_left_untouched() {
+        let mut seen = std::collections::HashSet::new();
+        let mut calls = vec![acc("abc", "a"), acc("xyz", "b")];
+        ensure_unique_tool_call_ids(&mut calls, 0, &mut seen);
+        assert_eq!(calls[0].id, "abc");
+        assert_eq!(calls[1].id, "xyz");
     }
 
     fn registry(entries: &[(&str, &str)]) -> SkillRegistry {

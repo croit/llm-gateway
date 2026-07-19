@@ -64,7 +64,13 @@ pub async fn run_session_turn(pool: Pool, driver: Box<dyn SessionDriver>, ctx: S
             let mut chain = err.to_string();
             let mut src = std::error::Error::source(&err);
             while let Some(e) = src {
-                chain.push_str(&format!(": {e}"));
+                // Skip frames already embedded via thiserror's `{0}` so the
+                // same cause isn't printed several times over.
+                let s = e.to_string();
+                if !chain.contains(&s) {
+                    chain.push_str(": ");
+                    chain.push_str(&s);
+                }
                 src = e.source();
             }
             tracing::error!(
