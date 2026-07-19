@@ -930,18 +930,16 @@ pub async fn fork_session(
         .await?;
 
         for tc in &tw.tool_calls {
-            // Mint a fresh id: `chat_tool_calls.id` is a global PRIMARY KEY
-            // (it's the model's tool_call_id), so reusing the source row's id
-            // would collide with the original — and with any prior fork of the
-            // same shared chat. The id is only a row/DOM handle once persisted,
-            // so a new UUID is safe.
+            // Tool-call identity is (turn_id, id); the copy lands under a fresh
+            // turn id, so the source id is preserved without any risk of
+            // colliding with the original or a prior fork.
             sqlx::query(
                 r#"INSERT INTO chat_tool_calls
                       (id, turn_id, seq, name, arguments_json, output_json,
                        status, created_at, completed_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
-            .bind(Uuid::new_v4().to_string())
+            .bind(&tc.id)
             .bind(new_turn_id)
             .bind(tc.seq)
             .bind(&tc.name)
@@ -1635,6 +1633,7 @@ fn cap_tool_output(raw: &str) -> std::borrow::Cow<'_, str> {
 /// (id, output) pair: worker calls it exactly once per tool result.
 pub async fn complete_tool_call(
     pool: &Pool,
+    turn_id: &str,
     id: &str,
     output_json: &str,
     status: ToolCallStatus,
@@ -1646,14 +1645,17 @@ pub async fn complete_tool_call(
         });
     }
     let capped = cap_tool_output(output_json);
+    // Key on the full (turn_id, id) identity — `id` alone is only unique
+    // within its turn.
     sqlx::query(
         r#"UPDATE chat_tool_calls
            SET output_json = ?, status = ?, completed_at = ?
-           WHERE id = ?"#,
+           WHERE turn_id = ? AND id = ?"#,
     )
     .bind(capped.as_ref())
     .bind(status.as_str())
     .bind(Timestamp::now().to_string())
+    .bind(turn_id)
     .bind(id)
     .execute(pool)
     .await?;
@@ -1754,7 +1756,7 @@ mod tests {
                 UNIQUE (session_id, seq)
             )"#,
             r#"CREATE TABLE chat_tool_calls (
-                id              TEXT PRIMARY KEY NOT NULL,
+                id              TEXT NOT NULL,
                 turn_id         TEXT NOT NULL,
                 seq             INTEGER NOT NULL,
                 name            TEXT NOT NULL,
@@ -1763,6 +1765,7 @@ mod tests {
                 status          TEXT NOT NULL,
                 created_at      TEXT NOT NULL,
                 completed_at    TEXT,
+                PRIMARY KEY (turn_id, id),
                 FOREIGN KEY (turn_id) REFERENCES chat_turns(id) ON DELETE CASCADE,
                 UNIQUE (turn_id, seq)
             )"#,
@@ -2215,9 +2218,15 @@ mod tests {
         insert_running_tool_call(&pool, &t.id, "call_2", "now", r#"{}"#)
             .await
             .unwrap();
-        complete_tool_call(&pool, "call_1", r#"{"ok":true}"#, ToolCallStatus::Completed)
-            .await
-            .unwrap();
+        complete_tool_call(
+            &pool,
+            &t.id,
+            "call_1",
+            r#"{"ok":true}"#,
+            ToolCallStatus::Completed,
+        )
+        .await
+        .unwrap();
 
         let turns = list_turns(&pool, &s.id).await.unwrap();
         assert_eq!(turns.len(), 1);
@@ -2228,6 +2237,47 @@ mod tests {
         assert_eq!(calls[0].output_json.as_deref(), Some(r#"{"ok":true}"#));
         assert_eq!(calls[1].id, "call_2");
         assert_eq!(calls[1].status, ToolCallStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn tool_call_ids_may_repeat_across_turns() {
+        // Regression: tool-call identity is (turn_id, id), so a backend that
+        // recycles `call_0` every request (qwen / vLLM) can use it again in a
+        // later turn — or another session — without the insert aborting on a
+        // `UNIQUE constraint failed`. Two turns, same id, both persist; and
+        // completing one keys on its own turn, never touching the other.
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        let t1 = create_assistant_turn_in_progress(&pool, &s.id, "asst-1", "m")
+            .await
+            .unwrap();
+        insert_running_tool_call(&pool, &t1.id, "call_0", "echo", "{}")
+            .await
+            .unwrap();
+        let t2 = create_assistant_turn_in_progress(&pool, &s.id, "asst-2", "m")
+            .await
+            .unwrap();
+        // Same id, different turn — must not collide.
+        insert_running_tool_call(&pool, &t2.id, "call_0", "echo", "{}")
+            .await
+            .unwrap();
+
+        complete_tool_call(
+            &pool,
+            &t2.id,
+            "call_0",
+            r#"{"ok":true}"#,
+            ToolCallStatus::Completed,
+        )
+        .await
+        .unwrap();
+
+        let turns = list_turns(&pool, &s.id).await.unwrap();
+        let by_id =
+            |tid: &str| turns.iter().find(|t| t.turn.id == tid).unwrap().tool_calls[0].clone();
+        // Only turn 2's call flipped to completed; turn 1's stays running.
+        assert_eq!(by_id(&t1.id).status, ToolCallStatus::Running);
+        assert_eq!(by_id(&t2.id).status, ToolCallStatus::Completed);
     }
 
     #[tokio::test]
@@ -2386,6 +2436,7 @@ mod tests {
             .unwrap();
         complete_tool_call(
             &pool,
+            &t.id,
             "done_call",
             r#"{"ok":true}"#,
             ToolCallStatus::Completed,
@@ -2561,12 +2612,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_session_remints_tool_call_ids() {
-        // `chat_tool_calls.id` is a global PRIMARY KEY (the model's
-        // tool_call_id). Forking a conversation that made tool calls must
-        // mint fresh ids — reusing the source ids collides with the originals
-        // (and with any prior fork of the same shared chat), which used to
-        // surface as a 500 on POST /chat/{id}/fork.
+    async fn fork_session_preserves_tool_call_ids_scoped_to_turn() {
+        // Tool-call identity is (turn_id, id). A fork lands under fresh turn
+        // ids, so the source tool-call id is copied verbatim without colliding
+        // with the original — or with any prior fork of the same shared chat.
+        // (This used to require re-minting a UUID, back when `id` alone was a
+        // global primary key and reusing it surfaced as a 500 on fork.)
         let pool = pool().await;
         seed_user(&pool, "u2").await;
         let src = create_session(&pool, "u1").await.unwrap();
@@ -2582,20 +2633,23 @@ mod tests {
 
         let src = get_session(&pool, "u1", &src.id).await.unwrap().unwrap();
 
-        // First fork succeeds and the copied tool call has a fresh id.
+        // The copied tool call keeps its id, scoped under the fork's new turn.
         let (fork1, _) = fork_session(&pool, &src, "u2").await.unwrap();
         let copy1 = list_turns(&pool, &fork1.id).await.unwrap();
         assert_eq!(copy1[0].tool_calls.len(), 1);
-        assert_ne!(
-            copy1[0].tool_calls[0].id, "call_1",
-            "tool-call id must be re-minted, not reused"
-        );
+        assert_eq!(copy1[0].tool_calls[0].id, "call_1");
         assert_eq!(copy1[0].tool_calls[0].name, "web_search");
 
-        // Forking the same shared chat again must not collide on the PK.
+        // Forking the same shared chat again lands under yet another turn id,
+        // so the identical tool-call id does not collide on the PK.
         let (fork2, _) = fork_session(&pool, &src, "u2").await.unwrap();
         let copy2 = list_turns(&pool, &fork2.id).await.unwrap();
-        assert_ne!(copy1[0].tool_calls[0].id, copy2[0].tool_calls[0].id);
+        assert_eq!(copy2[0].tool_calls[0].id, "call_1");
+        assert_ne!(
+            copy1[0].turn.id, copy2[0].turn.id,
+            "each fork gets a distinct turn id, which is what makes the shared \
+             tool-call id safe"
+        );
     }
 
     // -----------------------------------------------------------------------

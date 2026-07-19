@@ -608,6 +608,7 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
     .await?;
     chatdb::complete_tool_call(
         &state.db,
+        &a,
         "call_search",
         r#"{"results":[{"title":"Module ngx_http_gzip_module","url":"https://nginx.org/en/docs/http/ngx_http_gzip_module.html","snippet":"A filter that compresses responses with the gzip method. Directives: gzip, gzip_types, gzip_min_length, gzip_comp_level."}]}"#,
         ToolCallStatus::Completed,
@@ -624,6 +625,7 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
     .await?;
     chatdb::complete_tool_call(
         &state.db,
+        &a,
         "call_fetch",
         r#"{"url":"https://nginx.org/en/docs/http/ngx_http_gzip_module.html","text":"Syntax: gzip on | off; Default: gzip off; Context: http, server, location. Enables or disables gzipping of responses. gzip_types, gzip_min_length and gzip_comp_level tune which responses are compressed and how hard."}"#,
         ToolCallStatus::Completed,

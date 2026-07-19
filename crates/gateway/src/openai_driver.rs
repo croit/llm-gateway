@@ -87,15 +87,17 @@ struct ToolCallAcc {
 }
 
 /// Ensure every tool call in one round has a non-empty id that is unique
-/// across the whole turn. Some OpenAI-compatible backends (qwen / vLLM are
-/// the usual offenders) emit `tool_call_id`s that are empty or recycled
-/// per response (`call_0`, `call_0`, … reset every round). Because
-/// `chat_tool_calls.id` is the PRIMARY KEY, a duplicate insert aborts the
-/// whole turn with `UNIQUE constraint failed: chat_tool_calls.id`. Rewrite
-/// any empty or colliding id to a synthesised, turn-unique one *before* it
-/// is used for the DB row, the assistant message replayed upstream, and the
-/// tool result — so all three keep referring to the same id. `seen`
-/// accumulates across rounds of a single turn. Pure so it's unit-tested.
+/// *within the turn*. Some OpenAI-compatible backends (qwen / vLLM are the
+/// usual offenders) emit `tool_call_id`s that are empty or recycled per
+/// response (`call_0`, `call_0`, … reset every round). Two identical ids in
+/// one turn are illegal both for the OpenAI tool-call protocol (the assistant
+/// message can't carry duplicate ids) and for the persistence layer, whose
+/// primary key is `(turn_id, id)`. Rewrite any empty or colliding id to a
+/// synthesised one *before* it is used for the DB row, the assistant message
+/// replayed upstream, and the tool result — so all three keep referring to the
+/// same id. `seen` accumulates across rounds of a single turn; identity is
+/// scoped to the turn (the aggregate), so ids recycled in a *later* turn are
+/// none of this function's business. Pure so it's unit-tested.
 fn ensure_unique_tool_call_ids(
     round_calls: &mut [ToolCallAcc],
     round: usize,
@@ -884,6 +886,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                          used here.";
                     if let Err(err) = chat::complete_tool_call(
                         &d.state.db,
+                        &ctx.assistant_turn_id,
                         &acc.id,
                         reason,
                         ToolCallStatus::Errored,
@@ -951,9 +954,14 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                      id as an argument — do not call the capability id as if it were its own tool.",
                     acc.name
                 );
-                if let Err(err) =
-                    chat::complete_tool_call(&d.state.db, &acc.id, &reason, ToolCallStatus::Errored)
-                        .await
+                if let Err(err) = chat::complete_tool_call(
+                    &d.state.db,
+                    &ctx.assistant_turn_id,
+                    &acc.id,
+                    &reason,
+                    ToolCallStatus::Errored,
+                )
+                .await
                 {
                     tracing::warn!(error = %err, tool = %acc.name, "recording unknown tool call");
                 }
@@ -995,6 +1003,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                 serde_json::to_string_pretty(&result.body).unwrap_or_else(|_| "{}".to_string());
             chat::complete_tool_call(
                 &d.state.db,
+                &ctx.assistant_turn_id,
                 &call.id,
                 &output_str,
                 ToolCallStatus::Completed,
@@ -1648,9 +1657,9 @@ mod tests {
 
     #[test]
     fn tool_call_ids_deduped_across_rounds() {
-        // The real bug: a backend recycles `call_0` every round. Round 0's
+        // A backend recycles `call_0` every round of the same turn. Round 0's
         // id is fine; round 1's identical id must be rewritten so the second
-        // insert doesn't hit `UNIQUE constraint failed: chat_tool_calls.id`.
+        // insert doesn't collide on the turn's `(turn_id, id)` primary key.
         let mut seen = std::collections::HashSet::new();
         let mut round0 = vec![acc("call_0", "a")];
         ensure_unique_tool_call_ids(&mut round0, 0, &mut seen);

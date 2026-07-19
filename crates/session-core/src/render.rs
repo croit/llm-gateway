@@ -544,6 +544,12 @@ pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: La
     let reasoning = turn.reasoning.clone().unwrap_or_default();
     let content = turn.content.clone().unwrap_or_default();
     let elapsed_ms = turn.reasoning_elapsed_ms;
+    // The reasoning phase is over — and its timer must stop — the moment the
+    // driver freezes `reasoning_elapsed_ms` (on the first content delta, or at
+    // finalize for a reasoning-only turn), NOT when the whole turn ends. Tying
+    // this to turn status would let the live timer keep climbing through the
+    // entire answer/tool-call stream and only snap back at completion.
+    let reasoning_done = elapsed_ms.is_some();
     let in_progress = turn.status == TurnStatus::InProgress;
     let errored = turn.status == TurnStatus::Errored;
     let error_msg = turn.error_message.clone().unwrap_or_default();
@@ -568,7 +574,7 @@ pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: La
             // empty placeholder (so subsequent inner-patches of the
             // bubble can morph it in without touching siblings).
             if has_reasoning {
-                (render_thinking_block(&turn.id, &reasoning, elapsed_ms, turn.reasoning_started_at, !in_progress, lang))
+                (render_thinking_block(&turn.id, &reasoning, elapsed_ms, turn.reasoning_started_at, reasoning_done, lang))
             } else {
                 div(id: (thinking_id.clone()), class: "thinking-block-slot") {}
             }
@@ -1024,7 +1030,10 @@ pub fn render_tool_call_list(tools: &[ToolCall], turn_id: &str, lang: Lang) -> H
 /// input and output. `data-preserve-attr="open"` keeps their
 /// toggle state across re-renders.
 pub fn render_tool_call(call: &ToolCall, lang: Lang) -> Html {
-    let dom_id = format!("tc-{}", call.id);
+    // Scope the DOM id by turn: `call.id` is only unique within its turn, but
+    // the full conversation renders every turn into one document, so two turns
+    // that each used `call_0` would otherwise clash on a duplicate element id.
+    let dom_id = format!("tc-{}-{}", call.turn_id, call.id);
     let args_pretty = match serde_json::from_str::<serde_json::Value>(&call.arguments_json) {
         Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| call.arguments_json.clone()),
         Err(_) => call.arguments_json.clone(),
@@ -1599,6 +1608,79 @@ mod tests {
         }
     }
 
+    /// An assistant turn carrying reasoning, for the thinking-timer tests.
+    fn reasoning_turn(
+        content: Option<&str>,
+        reasoning_elapsed_ms: Option<i64>,
+        status: TurnStatus,
+    ) -> TurnWithTools {
+        let now = jiff::Timestamp::now();
+        TurnWithTools {
+            turn: Turn {
+                id: "t1".into(),
+                session_id: "s1".into(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                user_content: None,
+                model: None,
+                content: content.map(str::to_string),
+                reasoning: Some("let me think".into()),
+                reasoning_elapsed_ms,
+                reasoning_started_at: Some(now),
+                status,
+                error_message: None,
+                created_at: now,
+                completed_at: None,
+            },
+            tool_calls: vec![],
+        }
+    }
+
+    #[test]
+    fn thinking_timer_ticks_client_side_while_reasoning_streams() {
+        // Reasoning in progress (no content, elapsed not yet frozen): the
+        // block must emit the client-driven <thinking-timer>, not a settled
+        // label.
+        let tw = reasoning_turn(None, None, TurnStatus::InProgress);
+        let html = render_assistant_turn(&tw, None, Lang::En).to_string();
+        assert!(
+            html.contains("<thinking-timer"),
+            "live client timer expected while reasoning streams: {html}"
+        );
+        assert!(
+            html.contains("data-label-template="),
+            "timer needs its template: {html}"
+        );
+        assert!(
+            !html.contains("Thought for"),
+            "must not read as finalized while still reasoning: {html}"
+        );
+    }
+
+    #[test]
+    fn thinking_timer_finalizes_when_reasoning_freezes_even_mid_stream() {
+        // Regression (code-review): the timer must stop when reasoning ends —
+        // i.e. when `reasoning_elapsed_ms` is frozen on the first content
+        // delta — NOT when the whole turn finalizes. A still-InProgress turn
+        // that has produced content and a frozen elapsed must show the settled
+        // "Thought for X.Ys" label and drop the live <thinking-timer>, so the
+        // count can't keep climbing through the answer stream.
+        let tw = reasoning_turn(
+            Some("answer, still streaming…"),
+            Some(3000),
+            TurnStatus::InProgress,
+        );
+        let html = render_assistant_turn(&tw, None, Lang::En).to_string();
+        assert!(
+            html.contains("Thought for"),
+            "reasoning must read as finalized once its elapsed is frozen: {html}"
+        );
+        assert!(
+            !html.contains("<thinking-timer"),
+            "no live client timer once reasoning is frozen, even mid content-stream: {html}"
+        );
+    }
+
     #[test]
     fn compaction_divider_marks_boundary_when_compacted() {
         let turns = vec![
@@ -1723,8 +1805,9 @@ mod tests {
             html.contains("rag_search ×13"),
             "summary should tally by name: {html}"
         );
-        // The individual rows still live inside (unfold on click).
-        assert!(html.contains("tc-c0") && html.contains("tc-c12"));
+        // The individual rows still live inside (unfold on click). DOM ids are
+        // scoped by turn (`tc-<turn_id>-<id>`).
+        assert!(html.contains("tc-t1-c0") && html.contains("tc-t1-c12"));
         // Stable group id so morph preserves the open/close toggle.
         assert!(html.contains("turn-t1-tools-group"));
     }
