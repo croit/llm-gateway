@@ -51,7 +51,7 @@ pub enum DbError {
         #[source]
         source: sqlx::migrate::MigrateError,
     },
-    #[error("query")]
+    #[error("query: {0}")]
     Query(#[from] sqlx::Error),
     #[error("decoding row column `{column}`")]
     Decode {

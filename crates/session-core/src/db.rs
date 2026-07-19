@@ -44,7 +44,7 @@ pub type Pool = sqlx::SqlitePool;
 /// session_core::db::DbError)`).
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
-    #[error("query")]
+    #[error("query: {0}")]
     Query(#[from] sqlx::Error),
     #[error("decoding row column `{column}`")]
     Decode {

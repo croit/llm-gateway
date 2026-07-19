@@ -295,7 +295,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
 
     let turns = chat::list_turns(&d.state.db, &ctx.session_id)
         .await
-        .map_err(upstream_err)?;
+        .map_err(persist_err("list_turns", &ctx.assistant_turn_id))?;
     // Compaction overlay: when a session has been compacted, its oldest turns
     // (seq <= up_to_seq) are represented by one summary message instead of
     // being replayed verbatim. `None` (never compacted) replays everything as
@@ -629,7 +629,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                         }
                         chat::append_reasoning(&d.state.db, &ctx.assistant_turn_id, reasoning)
                             .await
-                            .map_err(upstream_err)?;
+                            .map_err(persist_err("append_reasoning", &ctx.assistant_turn_id))?;
                         // Advance the live thinking timer as reasoning
                         // streams, so the label ticks up instead of
                         // freezing until the first content delta. Frozen
@@ -647,7 +647,10 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                                     elapsed_ms,
                                 )
                                 .await
-                                .map_err(upstream_err)?;
+                                .map_err(persist_err(
+                                    "set_reasoning_elapsed",
+                                    &ctx.assistant_turn_id,
+                                ))?;
                             }
                         }
                         let _ = ctx.broadcast.send(TurnUpdate::Tick);
@@ -685,7 +688,10 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                                 elapsed_ms,
                             )
                             .await
-                            .map_err(upstream_err)?;
+                            .map_err(persist_err(
+                                "set_reasoning_elapsed",
+                                &ctx.assistant_turn_id,
+                            ))?;
                             frozen_reasoning_elapsed = true;
                         }
                         // Strip stray reasoning tags leaked into content.
@@ -695,7 +701,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                             round_content.push_str(&emit);
                             chat::append_content(&d.state.db, &ctx.assistant_turn_id, &emit)
                                 .await
-                                .map_err(upstream_err)?;
+                                .map_err(persist_err("append_content", &ctx.assistant_turn_id))?;
                             let _ = ctx.broadcast.send(TurnUpdate::Tick);
                             if content_guard.push(&emit) {
                                 emit_usage(
@@ -776,7 +782,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                 round_content.push_str(&content_tag_buf);
                 chat::append_content(&d.state.db, &ctx.assistant_turn_id, &content_tag_buf)
                     .await
-                    .map_err(upstream_err)?;
+                    .map_err(persist_err("append_content_flush", &ctx.assistant_turn_id))?;
                 let _ = ctx.broadcast.send(TurnUpdate::Tick);
             }
         }
@@ -822,7 +828,10 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                 &acc.arguments,
             )
             .await
-            .map_err(upstream_err)?;
+            .map_err(persist_err(
+                "insert_running_tool_call",
+                &ctx.assistant_turn_id,
+            ))?;
             let _ = ctx.broadcast.send(TurnUpdate::Tick);
 
             assistant_tool_calls.push(serde_json::json!({
@@ -962,7 +971,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                 ToolCallStatus::Completed,
             )
             .await
-            .map_err(upstream_err)?;
+            .map_err(persist_err("complete_tool_call", &ctx.assistant_turn_id))?;
             let _ = ctx.broadcast.send(TurnUpdate::Tick);
             // If the tool returned a `tool_content_parts(...)` envelope
             // we splice it into the message as array content (so a
@@ -1462,6 +1471,45 @@ fn upstream_err<E: std::fmt::Display>(e: E) -> TurnError {
 fn transport_err<E: std::fmt::Display>(e: E) -> TurnError {
     TurnError::Transport {
         message: e.to_string(),
+    }
+}
+
+/// Flatten an error's full `source()` chain into one line. The top-level
+/// `Display` of our `DbError` is terse (`DbError::Query` renders the
+/// wrapped `sqlx::Error` only via `#[source]`), so `to_string()` alone
+/// drops the real cause. This keeps every link.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    use std::fmt::Write as _;
+    let mut chain = err.to_string();
+    let mut src = err.source();
+    while let Some(e) = src {
+        let _ = write!(chain, ": {e}");
+        src = e.source();
+    }
+    chain
+}
+
+/// `map_err` adaptor for the turn's local persistence steps. Logs the
+/// failing operation + turn id + the full DB error chain at `error`
+/// level (so it's always traceable server-side even if the UI truncates)
+/// and returns a `Persistence` error whose message names the operation
+/// and carries the real cause — so `upstream: query` becomes
+/// `storage: append_content: error returned from database: database is locked`.
+fn persist_err<'a, E>(op: &'static str, turn_id: &'a str) -> impl FnOnce(E) -> TurnError + 'a
+where
+    E: std::error::Error + 'a,
+{
+    move |e| {
+        let chain = error_chain(&e);
+        tracing::error!(
+            operation = op,
+            assistant_turn_id = %turn_id,
+            error = %chain,
+            "turn persistence step failed"
+        );
+        TurnError::Persistence {
+            message: format!("{op}: {chain}"),
+        }
     }
 }
 

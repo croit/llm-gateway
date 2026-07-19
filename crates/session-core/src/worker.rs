@@ -56,7 +56,25 @@ pub async fn run_session_turn(pool: Pool, driver: Box<dyn SessionDriver>, ctx: S
     let (status, error_message) = match result {
         Ok(()) if cancel.load(Ordering::SeqCst) => (TurnStatus::Cancelled, None),
         Ok(()) => (TurnStatus::Completed, None),
-        Err(err) => (TurnStatus::Errored, Some(err.to_string())),
+        Err(err) => {
+            // The top-level `Display` often hides the real cause (e.g.
+            // `DbError::Query`'s source sqlx error). Walk the full
+            // `source()` chain into the log so a terse UI message like
+            // "upstream: query" is always traceable server-side.
+            let mut chain = err.to_string();
+            let mut src = std::error::Error::source(&err);
+            while let Some(e) = src {
+                chain.push_str(&format!(": {e}"));
+                src = e.source();
+            }
+            tracing::error!(
+                %session_id,
+                %assistant_turn_id,
+                error = %chain,
+                "turn failed"
+            );
+            (TurnStatus::Errored, Some(err.to_string()))
+        }
     };
 
     // Reasoning timer cleanup. If the model emitted `reasoning_*`

@@ -52,6 +52,12 @@ pub enum TurnError {
     /// pick on transports but not 4xx responses.
     #[error("transport: {message}")]
     Transport { message: String },
+    /// A local persistence step failed (SQLite write/read on the turn
+    /// row) — NOT an upstream/model problem. Split out from `Upstream`
+    /// so the UI/log label is honest ("storage" vs "upstream") and the
+    /// message carries the operation name + the real DB error chain.
+    #[error("storage: {message}")]
+    Persistence { message: String },
     /// Caller passed a malformed `SessionContext` — almost always a
     /// bug in the harness. Not a user-facing condition.
     #[error("invalid request: {message}")]
