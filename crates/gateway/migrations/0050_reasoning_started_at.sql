@@ -1,0 +1,20 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (C) 2026 croit GmbH
+--
+-- Anchor for the client-side "Thinking… (X.Ys)" timer.
+--
+-- The live thinking timer used to be server-driven: `reasoning_elapsed_ms`
+-- was rewritten on every reasoning chunk (throttled to 100 ms) and the whole
+-- assistant bubble re-rendered per tick just to advance a number. That froze
+-- at 0.0s whenever a backend delivered its reasoning in a single burst — the
+-- zero point was the first reasoning delta, so `elapsed` was ≈0 at every
+-- write and content immediately froze it.
+--
+-- The timer now ticks client-side (a `<thinking-timer>` custom element that
+-- counts up locally). The server only records *when* reasoning began, so a
+-- mid-stream reload or a late SSE subscriber can resume the count from the
+-- right offset instead of restarting at 0.
+--
+-- Nullable RFC3339 TEXT to match `created_at` / `completed_at`. NULL on every
+-- existing row and on any turn that never reasoned.
+ALTER TABLE chat_turns ADD COLUMN reasoning_started_at TEXT;

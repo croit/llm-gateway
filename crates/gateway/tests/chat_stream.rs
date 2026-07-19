@@ -313,37 +313,25 @@ async fn message_send_renders_markdown_even_when_upstream_omits_done() {
     assert_eq!(asst.turn.content.as_deref(), Some("# Hi\n\nbody"));
 }
 
-/// The largest in-progress "Thinking… (X.Ys)" value the stream ever
-/// rendered. Returns -1.0 if no in-progress thinking label appeared.
-/// Deliberately ignores the finalized "Thought for …" label — the bug
-/// was that the *live* timer never moved off 0.0s while reasoning
-/// streamed, even though the final stamped value was correct.
-fn max_in_progress_thinking_secs(body: &str) -> f64 {
-    let marker = "Thinking… (";
-    let mut max = -1.0_f64;
-    let mut rest = body;
-    while let Some(i) = rest.find(marker) {
-        rest = &rest[i + marker.len()..];
-        if let Some(end) = rest.find("s)")
-            && let Ok(v) = rest[..end].parse::<f64>()
-        {
-            max = max.max(v);
-        }
-    }
-    max
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reasoning_timer_advances_while_reasoning_streams() {
-    // Regression: while the model streams reasoning (and before any
-    // content arrives), the "Thinking… (Xs)" timer must tick up. It
-    // used to freeze at 0.0s because `reasoning_elapsed_ms` was only
-    // stamped on the first *content* delta / at finalization, so every
-    // in-progress re-render rendered the NULL → 0.0s default.
+async fn reasoning_timer_is_client_driven_and_finalizes_nonzero() {
+    // Regression (structural). The live "Thinking… (Xs)" timer used to be
+    // server-driven: `reasoning_elapsed_ms` was rewritten per reasoning
+    // chunk and the bubble re-rendered each tick. On a backend that flushes
+    // its reasoning in a single burst the elapsed was ≈0 at every write and
+    // then frozen on finalize → a permanent 0.0s.
     //
-    // wiremock delivers the whole body in one shot (elapsed ≈ 0 for
-    // every chunk), so we hand-roll a raw upstream that puts real
-    // wall-clock gaps between reasoning chunks.
+    // The timer now ticks client-side. The server's job is only to (a) emit
+    // a `<thinking-timer>` element carrying the `data-elapsed-ms` anchor and
+    // a `{secs}`-placeholder `data-label-template` while reasoning is in
+    // progress, and (b) stamp one authoritative `reasoning_elapsed_ms` at
+    // finalize — measured start→finalize, so it is non-zero even when the
+    // whole reasoning arrives in ONE chunk.
+    //
+    // This upstream reproduces exactly that pathological shape: a single
+    // reasoning burst, a real wall-clock gap, then [DONE] with no content.
+    // wiremock can't (it delivers the whole body at once), so we hand-roll
+    // a raw upstream.
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -410,17 +398,19 @@ async fn reasoning_timer_advances_while_reasoning_streams() {
                 {
                     return;
                 }
-                // Reasoning-only stream: no content delta ever lands, so
-                // the bubble stays "Thinking…" the whole way and the
-                // timer is driven purely by the reasoning path under test.
+                // Single-burst reasoning-only stream: ALL reasoning in one
+                // delta (the shape that used to freeze the old server-driven
+                // timer at 0.0s), then a real wall-clock gap, then [DONE]
+                // with no content ever landing — so the turn finalizes while
+                // still "thinking" and the freeze happens at finalize.
                 let chunks = [
-                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me\"}}]}\n\n",
-                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" think\"}}]}\n\n",
-                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" hard\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think hard\"}}]}\n\n",
                     "data: [DONE]\n\n",
                 ];
                 for (i, c) in chunks.iter().enumerate() {
                     if i > 0 {
+                        // Gap between the reasoning burst and [DONE] so the
+                        // start→finalize duration is unambiguously non-zero.
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
                     let frame = format!("{:x}\r\n{c}\r\n", c.len());
@@ -457,17 +447,33 @@ async fn reasoning_timer_advances_while_reasoning_streams() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
 
-    // The live timer must have advanced past zero *while reasoning was
-    // still streaming* (two 200ms gaps before [DONE] → ≥ 0.2s). Before
-    // the fix this was always 0.0s.
-    let max_live = max_in_progress_thinking_secs(body);
+    // (a) While reasoning was in progress the server emitted the
+    // client-driven timer element — a `<thinking-timer>` carrying the
+    // elapsed-so-far anchor and a localized template with the `{secs}`
+    // placeholder the browser fills each frame. This is the wiring that
+    // makes the live count independent of upstream chunk cadence; before
+    // the fix the server rendered a frozen number instead.
     assert!(
-        max_live >= 0.1,
-        "expected an in-progress 'Thinking… (Xs)' label > 0.0s while reasoning streamed, \
-         got max {max_live}; body was:\n{body}"
+        body.contains("<thinking-timer"),
+        "expected a <thinking-timer> element while reasoning streamed; body was:\n{body}"
+    );
+    assert!(
+        body.contains("data-elapsed-ms="),
+        "thinking-timer must carry the data-elapsed-ms anchor; body was:\n{body}"
+    );
+    assert!(
+        body.contains("data-label-template=") && body.contains("{secs}"),
+        "thinking-timer must carry a {{secs}}-placeholder label template; body was:\n{body}"
     );
 
-    // And the persisted value is the reasoning duration, not NULL.
+    // (b) The finalized bubble shows the settled "Thought for Xs" label,
+    // and the persisted duration is non-zero — measured start→finalize, so
+    // a single-burst reasoning stream (the old freeze case) still records
+    // real think-time rather than 0.0s.
+    assert!(
+        body.contains("Thought for"),
+        "expected the finalized 'Thought for Xs' label; body was:\n{body}"
+    );
     let turns = chat::list_turns(&state.db, &session_id).await.unwrap();
     let asst = turns
         .iter()
@@ -475,8 +481,12 @@ async fn reasoning_timer_advances_while_reasoning_streams() {
         .unwrap();
     assert_eq!(asst.turn.status, chat::TurnStatus::Completed);
     assert!(
+        asst.turn.reasoning_started_at.is_some(),
+        "reasoning_started_at should be stamped on the first reasoning chunk"
+    );
+    assert!(
         asst.turn.reasoning_elapsed_ms.unwrap_or(0) > 0,
-        "reasoning_elapsed_ms should be stamped from the reasoning stream"
+        "reasoning_elapsed_ms should be stamped non-zero at finalize even for a single burst"
     );
 }
 

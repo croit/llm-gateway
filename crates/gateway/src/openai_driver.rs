@@ -361,15 +361,14 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         messages.insert(0, system);
     }
 
+    // Monotonic zero point of the reasoning phase, set on the first
+    // reasoning chunk. Used to compute the single authoritative
+    // `reasoning_elapsed_ms` frozen when content starts. The *live*
+    // "Thinking… (Xs)" timer is not driven from here — it ticks
+    // client-side, anchored to the `reasoning_started_at` wall-clock
+    // stamp written once below.
     let mut started_reasoning: Option<std::time::Instant> = None;
     let mut frozen_reasoning_elapsed = false;
-    // Last `reasoning_elapsed_ms` we persisted, in 100ms buckets. The
-    // live "Thinking… (Xs)" timer is server-driven: it only moves when
-    // the DB value changes and the bubble re-renders. We bump it on
-    // every reasoning chunk, but throttle the write to the 0.1s the
-    // label actually displays so a fast token stream doesn't issue a
-    // redundant UPDATE per delta. `-1` so the first chunk always writes.
-    let mut last_timer_decis: i64 = -1;
 
     // Email for the usage row, looked up once (best-effort; the user_id is
     // always present even if this read fails). The chat/scheduler paths
@@ -656,35 +655,30 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                             );
                             traced_first_reasoning = true;
                         }
+                        // First reasoning chunk: anchor the timer. The
+                        // monotonic `Instant` gives an accurate final
+                        // duration; the wall-clock stamp lets the
+                        // client-side `<thinking-timer>` count up (and a
+                        // reload / late subscriber resume from the right
+                        // offset). Both set once — no per-chunk writes,
+                        // so a single-burst reasoning stream no longer
+                        // freezes the label at 0.0s.
                         if started_reasoning.is_none() {
                             started_reasoning = Some(std::time::Instant::now());
+                            chat::set_reasoning_started(
+                                &d.state.db,
+                                &ctx.assistant_turn_id,
+                                jiff::Timestamp::now(),
+                            )
+                            .await
+                            .map_err(persist_err(
+                                "set_reasoning_started",
+                                &ctx.assistant_turn_id,
+                            ))?;
                         }
                         chat::append_reasoning(&d.state.db, &ctx.assistant_turn_id, reasoning)
                             .await
                             .map_err(persist_err("append_reasoning", &ctx.assistant_turn_id))?;
-                        // Advance the live thinking timer as reasoning
-                        // streams, so the label ticks up instead of
-                        // freezing until the first content delta. Frozen
-                        // once content arrives (or never, for a
-                        // reasoning-only turn — the last bump stands).
-                        if let Some(start) = started_reasoning
-                            && !frozen_reasoning_elapsed
-                        {
-                            let elapsed_ms = start.elapsed().as_millis() as i64;
-                            if elapsed_ms / 100 != last_timer_decis {
-                                last_timer_decis = elapsed_ms / 100;
-                                chat::set_reasoning_elapsed(
-                                    &d.state.db,
-                                    &ctx.assistant_turn_id,
-                                    elapsed_ms,
-                                )
-                                .await
-                                .map_err(persist_err(
-                                    "set_reasoning_elapsed",
-                                    &ctx.assistant_turn_id,
-                                ))?;
-                            }
-                        }
                         let _ = ctx.broadcast.send(TurnUpdate::Tick);
                         if reasoning_guard.push(reasoning) {
                             // Drop the upstream stream (closes the
@@ -1750,6 +1744,7 @@ mod tests {
                     content,
                     reasoning: None,
                     reasoning_elapsed_ms: None,
+                    reasoning_started_at: None,
                     status: TurnStatus::Completed,
                     error_message: None,
                     created_at: now,

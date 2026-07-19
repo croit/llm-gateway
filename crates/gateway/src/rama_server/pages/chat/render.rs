@@ -1445,6 +1445,7 @@ mod tests {
                 content: Some("hi".into()),
                 reasoning: None,
                 reasoning_elapsed_ms: None,
+                reasoning_started_at: None,
                 status: session_core::db::TurnStatus::Completed,
                 error_message: None,
                 created_at: now,

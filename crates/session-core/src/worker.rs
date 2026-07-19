@@ -86,20 +86,24 @@ pub async fn run_session_turn(pool: Pool, driver: Box<dyn SessionDriver>, ctx: S
     // Reasoning timer cleanup. If the model emitted `reasoning_*`
     // chunks but never landed visible content (or the cancel
     // pre-empted the first content delta), the row's
-    // `reasoning_elapsed_ms` is still NULL — the renderer shows a
-    // forever-spinning "Thinking…" pseudo-state. Stamp it as
-    // "now minus created_at" so the bubble reads as "Thought for
-    // Xs" once the row finalises.
+    // `reasoning_elapsed_ms` is still NULL — the renderer would show a
+    // forever-spinning "Thinking…" pseudo-state. Freeze it now so the
+    // bubble reads "Thought for Xs" once the row finalises. Measured
+    // from `reasoning_started_at` (the actual first reasoning chunk)
+    // when present, falling back to `created_at` for legacy rows.
     if let Ok(Some(turn)) = db::list_turns(&pool, &session_id)
         .await
         .map(|turns| turns.into_iter().find(|t| t.turn.id == assistant_turn_id))
         && turn.turn.reasoning.is_some()
         && turn.turn.reasoning_elapsed_ms.is_none()
     {
-        let created = turn.turn.created_at;
-        let elapsed_ms = (jiff::Timestamp::now() - created).total(jiff::Unit::Millisecond);
+        let anchor = turn
+            .turn
+            .reasoning_started_at
+            .unwrap_or(turn.turn.created_at);
+        let elapsed_ms = (jiff::Timestamp::now() - anchor).total(jiff::Unit::Millisecond);
         if let Ok(ms) = elapsed_ms {
-            let _ = db::set_reasoning_elapsed(&pool, &assistant_turn_id, ms as i64).await;
+            let _ = db::set_reasoning_elapsed(&pool, &assistant_turn_id, ms.max(0.0) as i64).await;
         }
     }
 

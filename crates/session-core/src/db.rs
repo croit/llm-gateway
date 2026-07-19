@@ -181,6 +181,11 @@ pub struct Turn {
     pub content: Option<String>,
     pub reasoning: Option<String>,
     pub reasoning_elapsed_ms: Option<i64>,
+    /// When the model emitted its first reasoning chunk. The anchor the
+    /// client-side thinking timer counts up from (and a mid-stream reload
+    /// resumes from). `None` until the turn reasons, or never for a turn
+    /// that produces no reasoning.
+    pub reasoning_started_at: Option<Timestamp>,
     pub status: TurnStatus,
     pub error_message: Option<String>,
     pub created_at: Timestamp,
@@ -250,6 +255,10 @@ fn map_turn(row: &SqliteRow) -> Result<Turn, DbError> {
         content: row.try_get("content")?,
         reasoning: row.try_get("reasoning")?,
         reasoning_elapsed_ms: row.try_get("reasoning_elapsed_ms")?,
+        reasoning_started_at: parse_optional_ts(
+            row.try_get("reasoning_started_at")?,
+            "reasoning_started_at",
+        )?,
         status: TurnStatus::parse(&status)?,
         error_message: row.try_get("error_message")?,
         created_at: parse_ts(row.try_get("created_at")?, "created_at")?,
@@ -898,9 +907,10 @@ pub async fn fork_session(
         sqlx::query(
             r#"INSERT INTO chat_turns
                   (id, session_id, seq, role, user_content, model, content,
-                   reasoning, reasoning_elapsed_ms, status, error_message,
+                   reasoning, reasoning_elapsed_ms, reasoning_started_at,
+                   status, error_message,
                    created_at, completed_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(new_turn_id)
         .bind(&new_session.id)
@@ -911,6 +921,7 @@ pub async fn fork_session(
         .bind(content)
         .bind(turn.reasoning.as_deref())
         .bind(turn.reasoning_elapsed_ms)
+        .bind(turn.reasoning_started_at.map(|t| t.to_string()))
         .bind(status.as_str())
         .bind(turn.error_message.as_deref())
         .bind(turn.created_at.to_string())
@@ -1011,6 +1022,7 @@ pub async fn create_user_turn(
         content: None,
         reasoning: None,
         reasoning_elapsed_ms: None,
+        reasoning_started_at: None,
         status: TurnStatus::Completed,
         error_message: None,
         created_at: now,
@@ -1060,6 +1072,7 @@ pub async fn create_assistant_turn_in_progress(
         content: None,
         reasoning: None,
         reasoning_elapsed_ms: None,
+        reasoning_started_at: None,
         status: TurnStatus::InProgress,
         error_message: None,
         created_at: now,
@@ -1151,8 +1164,32 @@ pub async fn append_reasoning(pool: &Pool, turn_id: &str, chunk: &str) -> Result
     Ok(())
 }
 
-/// Freeze the reasoning timer. Called the moment the model emits its
-/// first visible content delta (= it has stopped reasoning).
+/// Anchor the reasoning timer. Called once, when the model emits its
+/// first reasoning chunk. The client-side `<thinking-timer>` counts up
+/// from this instant; a mid-stream reload / late SSE subscriber reads it
+/// to resume the count instead of restarting at 0. The `IS NULL` guard
+/// keeps it set-once even if the driver calls it more than once.
+pub async fn set_reasoning_started(
+    pool: &Pool,
+    turn_id: &str,
+    started_at: Timestamp,
+) -> Result<(), DbError> {
+    sqlx::query(
+        r#"UPDATE chat_turns SET reasoning_started_at = ?
+           WHERE id = ? AND reasoning_started_at IS NULL"#,
+    )
+    .bind(started_at.to_string())
+    .bind(turn_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Freeze the reasoning timer at its final duration. Called once, the
+/// moment the model emits its first visible content delta (= it has
+/// stopped reasoning), and at finalization for a reasoning-only turn.
+/// This is the authoritative value the settled "Thought for X.Ys" label
+/// renders from.
 pub async fn set_reasoning_elapsed(
     pool: &Pool,
     turn_id: &str,
@@ -1239,7 +1276,8 @@ pub async fn finalize_turn(
 pub async fn list_turns(pool: &Pool, session_id: &str) -> Result<Vec<TurnWithTools>, DbError> {
     let turn_rows = sqlx::query(
         r#"SELECT id, session_id, seq, role, user_content, model, content,
-                  reasoning, reasoning_elapsed_ms, status, error_message,
+                  reasoning, reasoning_elapsed_ms, reasoning_started_at,
+                  status, error_message,
                   created_at, completed_at
            FROM chat_turns
            WHERE session_id = ?
@@ -1288,7 +1326,8 @@ pub async fn list_turns(pool: &Pool, session_id: &str) -> Result<Vec<TurnWithToo
 pub async fn in_flight_turn(pool: &Pool, session_id: &str) -> Result<Option<Turn>, DbError> {
     let row = sqlx::query(
         r#"SELECT id, session_id, seq, role, user_content, model, content,
-                  reasoning, reasoning_elapsed_ms, status, error_message,
+                  reasoning, reasoning_elapsed_ms, reasoning_started_at,
+                  status, error_message,
                   created_at, completed_at
            FROM chat_turns
            WHERE session_id = ? AND status = 'in_progress'
@@ -1311,7 +1350,8 @@ pub async fn get_turn(
 ) -> Result<Option<Turn>, DbError> {
     let row = sqlx::query(
         r#"SELECT id, session_id, seq, role, user_content, model, content,
-                  reasoning, reasoning_elapsed_ms, status, error_message,
+                  reasoning, reasoning_elapsed_ms, reasoning_started_at,
+                  status, error_message,
                   created_at, completed_at
            FROM chat_turns
            WHERE session_id = ? AND id = ?"#,
@@ -1705,6 +1745,7 @@ mod tests {
                 content               TEXT,
                 reasoning             TEXT,
                 reasoning_elapsed_ms  INTEGER,
+                reasoning_started_at  TEXT,
                 status                TEXT NOT NULL,
                 error_message         TEXT,
                 created_at            TEXT NOT NULL,

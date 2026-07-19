@@ -568,7 +568,7 @@ pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: La
             // empty placeholder (so subsequent inner-patches of the
             // bubble can morph it in without touching siblings).
             if has_reasoning {
-                (render_thinking_block(&turn.id, &reasoning, elapsed_ms, !in_progress, lang))
+                (render_thinking_block(&turn.id, &reasoning, elapsed_ms, turn.reasoning_started_at, !in_progress, lang))
             } else {
                 div(id: (thinking_id.clone()), class: "thinking-block-slot") {}
             }
@@ -651,31 +651,14 @@ pub fn render_thinking_block(
     turn_id: &str,
     reasoning: &str,
     elapsed_ms: Option<i64>,
+    reasoning_started_at: Option<jiff::Timestamp>,
     finalized: bool,
     lang: Lang,
 ) -> Html {
     let body_id = format!("turn-{turn_id}-thinking-body");
     let shell_id = format!("turn-{turn_id}-thinking");
     let summary_id = format!("turn-{turn_id}-thinking-summary");
-    let elapsed_secs = elapsed_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
-    // Pre-format the number ourselves (rather than handing Fluent a raw
-    // f64) so every locale gets the same fixed one-decimal "12.3" shape —
-    // Fluent's NUMBER() would otherwise apply locale-specific grouping/
-    // decimal-separator rules we don't want for a short elapsed-time label.
-    let secs_str = format!("{elapsed_secs:.1}");
-    let summary_label = if finalized {
-        t_args(
-            lang,
-            "render-thinking-finalized",
-            &i18n::args([("secs", secs_str.into())]),
-        )
-    } else {
-        t_args(
-            lang,
-            "render-thinking-in-progress",
-            &i18n::args([("secs", secs_str.into())]),
-        )
-    };
+    let timer_id = format!("turn-{turn_id}-thinking-timer");
     let rendered = render_markdown(reasoning);
     html! {
         // Collapsed by default — reasoning is mostly debugging
@@ -690,10 +673,32 @@ pub fn render_thinking_block(
             "data-preserve-attr": "open"
         ) {
             summary(id: (summary_id), class: "thinking-block__summary") {
-                if !finalized {
+                if finalized {
+                    // Settled: a static, server-authoritative label.
+                    span(class: "thinking-block__label") {
+                        (finalized_thinking_label(elapsed_ms, lang))
+                    }
+                } else {
+                    // In progress: the live timer ticks client-side. The
+                    // server hands it the elapsed-so-far anchor
+                    // (`data-elapsed-ms`, computed from the wall-clock
+                    // reasoning start so a reload / late subscriber resumes
+                    // correctly) and a localized `data-label-template` with a
+                    // `{secs}` placeholder it fills each frame. The element's
+                    // light-DOM text is a static fallback for the pre-upgrade
+                    // / no-JS case; once upgraded it renders into a shadow
+                    // root that datastar's morph never touches, so the count
+                    // survives every per-tick bubble re-render.
                     span(class: "thinking-block__indicator") { (icons::spinner(12)) }
+                    thinking_timer(
+                        id: (timer_id),
+                        class: "thinking-block__label",
+                        data_elapsed_ms: (live_elapsed_ms(reasoning_started_at, elapsed_ms).to_string()),
+                        data_label_template: (in_progress_label_template(lang))
+                    ) {
+                        (in_progress_thinking_label(reasoning_started_at, elapsed_ms, lang))
+                    }
                 }
-                span(class: "thinking-block__label") { (summary_label) }
             }
             div(id: (body_id), class: "thinking-prose") {
                 #(rendered)
@@ -701,6 +706,66 @@ pub fn render_thinking_block(
         }
     }
     .to_html()
+}
+
+/// One-decimal, locale-stable seconds string (e.g. "12.3"). We format the
+/// number ourselves rather than handing Fluent a raw f64 so every locale
+/// gets the same fixed shape — Fluent's `NUMBER()` would otherwise apply
+/// locale-specific grouping / decimal-separator rules we don't want for a
+/// short elapsed-time label.
+fn fmt_secs(elapsed_ms: i64) -> String {
+    format!("{:.1}", elapsed_ms as f64 / 1000.0)
+}
+
+/// Elapsed reasoning time at render instant, in ms. Prefers the wall-clock
+/// `reasoning_started_at` anchor (so a mid-stream reload resumes at the
+/// right offset); falls back to a frozen `reasoning_elapsed_ms`, then 0.
+fn live_elapsed_ms(reasoning_started_at: Option<jiff::Timestamp>, elapsed_ms: Option<i64>) -> i64 {
+    reasoning_started_at
+        .and_then(|s| {
+            (jiff::Timestamp::now() - s)
+                .total(jiff::Unit::Millisecond)
+                .ok()
+        })
+        .map(|ms| ms.max(0.0) as i64)
+        .or(elapsed_ms)
+        .unwrap_or(0)
+}
+
+/// Settled "Thought for X.Ys" label.
+fn finalized_thinking_label(elapsed_ms: Option<i64>, lang: Lang) -> String {
+    t_args(
+        lang,
+        "render-thinking-finalized",
+        &i18n::args([("secs", fmt_secs(elapsed_ms.unwrap_or(0)).into())]),
+    )
+}
+
+/// Static "Thinking… (X.Ys)" fallback for the in-progress element's light
+/// DOM (pre-upgrade / no-JS). The live value is driven by the client.
+fn in_progress_thinking_label(
+    reasoning_started_at: Option<jiff::Timestamp>,
+    elapsed_ms: Option<i64>,
+    lang: Lang,
+) -> String {
+    let secs = fmt_secs(live_elapsed_ms(reasoning_started_at, elapsed_ms));
+    t_args(
+        lang,
+        "render-thinking-in-progress",
+        &i18n::args([("secs", secs.into())]),
+    )
+}
+
+/// The in-progress label with a literal `{secs}` placeholder instead of a
+/// number — the client-side `<thinking-timer>` substitutes the live value
+/// each frame. Keeps all translations server-owned (Fluent runs with
+/// `use_isolating(false)`, so no bidi marks split the placeholder).
+fn in_progress_label_template(lang: Lang) -> String {
+    t_args(
+        lang,
+        "render-thinking-in-progress",
+        &i18n::args([("secs", "{secs}".into())]),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1524,6 +1589,7 @@ mod tests {
                 content,
                 reasoning: None,
                 reasoning_elapsed_ms: None,
+                reasoning_started_at: None,
                 status: TurnStatus::Completed,
                 error_message: None,
                 created_at: now,

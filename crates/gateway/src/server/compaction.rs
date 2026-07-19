@@ -415,6 +415,7 @@ mod tests {
                 content,
                 reasoning: None,
                 reasoning_elapsed_ms: None,
+                reasoning_started_at: None,
                 status,
                 error_message: None,
                 created_at: now,
