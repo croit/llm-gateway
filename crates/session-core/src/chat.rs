@@ -203,10 +203,25 @@ pub fn spawn_session_stream_response(
                         return;
                     }
                 }
-                Ok(TurnUpdate::SidebarChanged) => match (on_sidebar_changed)(tx).await {
-                    Ok(t) => tx = t,
-                    Err(_) => return,
-                },
+                Ok(TurnUpdate::SidebarChanged) => {
+                    if emit_current_state(
+                        &pool,
+                        &session_id,
+                        &assistant_turn_id,
+                        &mut tx,
+                        actions,
+                        lang,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    match (on_sidebar_changed)(tx).await {
+                        Ok(t) => tx = t,
+                        Err(_) => return,
+                    }
+                }
                 // Forward pre-framed bytes straight through — transient UI
                 // (e.g. a tool's location prompt) that the DB-driven
                 // re-render must not own.

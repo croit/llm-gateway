@@ -85,8 +85,28 @@ pub(crate) async fn me_response(state: &RamaState, user_id: &str) -> Response {
         }
     };
     let role_ids = state.rbac.role_ids_for(&user.roles);
-    let allowed_tool_ids = state.rbac.allowed_tools(&role_ids, &state.tools);
-    let allowed_tools = state.tools.summaries_for(&allowed_tool_ids);
+    let mut allowed_tool_ids = state.rbac.allowed_tools(&role_ids, &state.tools);
+    state.expand_comfyui_tools(&mut allowed_tool_ids, &role_ids);
+    let mut allowed_tools = state.tools.summaries_for(&allowed_tool_ids);
+    // summaries_for only covers the static ToolRegistry; comfyui_* tools
+    // live in the hot-reloadable ComfyuiToolSource. Build summaries from
+    // the live catalog snapshot for any ids that summaries_for missed.
+    if let Some(handle) = state.comfyui.as_ref() {
+        let snapshot = handle.store.current();
+        for id in &allowed_tool_ids {
+            if id.starts_with("comfyui_")
+                && !allowed_tools.iter().any(|t| &t.id == id)
+                && let Some(manifest_id) = id.strip_prefix("comfyui_")
+                && let Some(m) = snapshot.lookup(manifest_id)
+            {
+                allowed_tools.push(shared::api::ToolSummary {
+                    id: id.clone(),
+                    name: id.clone(),
+                    description: m.description.clone(),
+                });
+            }
+        }
+    }
     json_ok(&Me {
         id: user.id,
         email: user.email,

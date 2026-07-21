@@ -1,0 +1,131 @@
+id = "image_to_video"
+title = "Image to Video"
+description = "Animate a still image into a short video clip using Wan 2.2 14B. Pass the image_id of a picture already in the conversation plus a motion prompt. The clip is stored in the gateway and rendered inline; do NOT describe it in prose."
+output_kind = "video"
+output_node_id = "108"
+output_filename_prefix = "llmgw-image2video"
+
+[[params]]
+key = "image"
+node_id = "97"
+input_key = "image"
+required = true
+description = "Source image to animate. Pass the attachment id EXACTLY as it appears in the conversation — the long `<turn_id>/<filename>` string from the `[attached: id=...]` marker. Copy it verbatim; do NOT shorten or invent."
+
+  [params.schema]
+  type = "image_attachment"
+
+[[params]]
+key = "prompt"
+node_id = "129:93"
+input_key = "text"
+required = true
+description = "Motion description — what should move and how. Concrete actions work best ('camera slowly zooms in', 'hair blows in the wind', 'subject turns head to the right'). Single, simple motion reads better than multi-clause prompts."
+
+  [params.schema]
+  type = "string"
+  max_length = 1000
+
+[[params]]
+key = "negative_prompt"
+node_id = "129:89"
+input_key = "text"
+description = "Motion artifacts to avoid ('static, distorted, morphing, flickering'). The template ships with a Chinese-language negative prompt that already covers common Wan 2.2 failure modes — override only when you have a specific reason."
+default = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+
+  [params.schema]
+  type = "string"
+  max_length = 1000
+
+[[params]]
+key = "turbo"
+node_id = "129:131"
+input_key = "value"
+description = "Enable 4-step turbo LoRA for ~5× faster generation (recommended). When ON: 4 diffusion steps instead of 20, finishes in 2-4 minutes. When OFF: full 20 steps for maximum quality, takes 15-30 minutes. Leave ON for previews and iteration; turn OFF only for final high-quality output."
+default = true
+
+  [params.schema]
+  type = "boolean"
+
+[[params]]
+key = "width"
+node_id = "129:98"
+input_key = "width"
+description = "Video width in pixels. Keep SMALL (512 or below) for fast previews on 24 GB VRAM — each doubling of resolution costs ~4× more compute time. Go to 768 only for final quality; 1024+ takes 20+ minutes even with turbo."
+default = 512
+
+  [params.schema]
+  type = "integer"
+  min = 320
+  max = 1280
+
+[[params]]
+key = "height"
+node_id = "129:98"
+input_key = "height"
+description = "Video height in pixels. Match `width` for square, or use 512×320 for landscape, 320×512 for portrait. Same compute cost rule as `width`."
+default = 512
+
+  [params.schema]
+  type = "integer"
+  min = 320
+  max = 1280
+
+[[params]]
+key = "duration_seconds"
+node_id = "129:161"
+input_key = "value"
+description = "Clip length in seconds. Keep SHORT (2-3s) for previews — frame count = duration × fps + 1, and each additional frame costs linear compute time. 2s = quick test; 5s = good clip; 10s = long, only with turbo."
+default = 3
+
+  [params.schema]
+  type = "number"
+  min = 1.0
+  max = 15.0
+
+[[params]]
+key = "fps"
+node_id = "129:162"
+input_key = "value"
+description = "Output frame rate. 16 fps is the fast default; 24 for cinematic; 30 for smooth. Lower fps = fewer frames = faster generation."
+default = 16
+
+  [params.schema]
+  type = "number"
+  min = 8
+  max = 60
+
+[[params]]
+key = "steps"
+node_id = "129:128"
+input_key = "value"
+description = "Diffusion steps (only used when turbo is OFF — turbo always uses 4 steps). 20 is the Wan 2.2 full-quality default; 15 acceptable for faster non-turbo output. Ignored entirely when turbo is ON."
+default = 20
+
+  [params.schema]
+  type = "integer"
+  min = 1
+  max = 60
+
+[[params]]
+key = "cfg"
+node_id = "129:126"
+input_key = "value"
+description = "Classifier-free guidance (only used when turbo is OFF — turbo uses CFG 1). 3.5 is the Wan 2.2 default for image-to-video; higher = stronger motion but can look artificial. Ignored entirely when turbo is ON."
+default = 3.5
+
+  [params.schema]
+  type = "number"
+  min = 0.0
+  max = 15.0
+
+[[params]]
+key = "seed"
+node_id = "129:86"
+input_key = "noise_seed"
+description = "Random seed. Same image + prompt + seed = same clip. -1 = fresh random."
+default = -1
+
+  [params.schema]
+  type = "integer"
+  min = -1

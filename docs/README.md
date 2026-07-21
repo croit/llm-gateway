@@ -18,6 +18,7 @@ This directory holds the design docs for the LLM gateway. The agent-facing entry
 | [`ui.md`](ui.md) | Server-rendered HTML with plait + daisyUI + datastar (SSE-patch CRUD pattern) |
 | [`testing.md`](testing.md) | Test layers, mocking strategy, coverage targets |
 | [`errors.md`](errors.md) | Error type tiers, message anatomy, OpenAI mapping |
+| [`comfyui.md`](comfyui.md) | Headless ComfyUI worker — workflows, manifests, operator config |
 
 ## Editing rules
 

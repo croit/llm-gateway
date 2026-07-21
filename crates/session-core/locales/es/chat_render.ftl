@@ -8,7 +8,17 @@
 # `chat.ftl`.
 
 chat-render-canvas-toggle-title = Mostrar / ocultar el lienzo de documento
-chat-render-canvas-toggle-label = Documento
+chat-render-canvas-toggle-label = Lienzo
+chat-render-canvas-document-tab = Documento
+chat-render-canvas-assets-tab = Archivos
+chat-render-canvas-assets-heading = Archivos de la conversación
+chat-render-canvas-assets-count = { $count ->
+    [one] { $count } archivo
+   *[other] { $count } archivos
+}
+chat-render-canvas-assets-empty = Todavía no se han añadido archivos a esta conversación.
+chat-render-canvas-asset-download = Descargar archivo
+chat-render-canvas-close-title = Cerrar lienzo
 
 chat-render-model-placeholder = modelo (p. ej., gpt-4o-mini)
 chat-render-model-aria = Modelo de chat

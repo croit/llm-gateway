@@ -140,7 +140,9 @@ async fn live_update(ctx: &ToolContext, session_id: &str, active_id: &str) {
     let mut frame =
         session_core::chrome::sse_patch(Some("#document-canvas-slot"), Some("inner"), &html)
             .to_vec();
-    frame.extend_from_slice(&session_core::chrome::sse_signals(r#"{"hasCanvas": true}"#));
+    frame.extend_from_slice(&session_core::chrome::sse_signals(
+        r#"{"hasCanvas": true, "hasDocument": true}"#,
+    ));
     frame.extend_from_slice(&session_core::chrome::sse_script(
         "if(window.innerWidth>=768){window.dispatchEvent(new CustomEvent('gwcanvasopen'))}",
     ));

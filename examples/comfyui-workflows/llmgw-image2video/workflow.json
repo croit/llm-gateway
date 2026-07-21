@@ -1,0 +1,296 @@
+{
+  "_comment": "Image-to-video workflow — exported verbatim from ComfyUI's built-in template 'Wan 2.2 14B Image to Video' via app.graphToPrompt(). The gateway substitutes the (node_id, input_key) targets named in manifest.toml. Model paths, LoRA setup, two-stage noise split, and 4-step turbo switch all stay operator-curated. The SaveVideo filename_prefix is overwritten post-substitution by the runner.",
+
+  "97": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "{{image}}"
+    },
+    "_meta": { "title": "Load Image" }
+  },
+
+  "108": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "filename_prefix": "llmgw-image2video",
+      "format": "auto",
+      "codec": "auto",
+      "video": ["129:94", 0]
+    },
+    "_meta": { "title": "Save Video" }
+  },
+
+  "129:94": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "fps": ["129:162", 0],
+      "bit_depth": 8,
+      "images": ["129:87", 0]
+    },
+    "_meta": { "title": "Create Video" }
+  },
+
+  "129:104": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": {
+      "shift": 5.0,
+      "model": ["129:116", 0]
+    },
+    "_meta": { "title": "ModelSamplingSD3" }
+  },
+
+  "129:89": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "{{negative_prompt}}",
+      "clip": ["129:84", 0]
+    },
+    "_meta": { "title": "CLIP Text Encode (Negative Prompt)" }
+  },
+
+  "129:128": {
+    "class_type": "PrimitiveInt",
+    "inputs": {
+      "value": "{{steps}}"
+    },
+    "_meta": { "title": "Int (Steps)" }
+  },
+
+  "129:87": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["129:85", 0],
+      "vae": ["129:90", 0]
+    },
+    "_meta": { "title": "VAE Decode" }
+  },
+
+  "129:93": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "{{prompt}}",
+      "clip": ["129:84", 0]
+    },
+    "_meta": { "title": "CLIP Text Encode (Positive Prompt)" }
+  },
+
+  "129:131": {
+    "class_type": "PrimitiveBoolean",
+    "inputs": {
+      "value": "{{turbo}}"
+    },
+    "_meta": { "title": "Enable 4steps LoRA?" }
+  },
+
+  "129:90": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "wan_2.1_vae.safetensors"
+    },
+    "_meta": { "title": "Load VAE" }
+  },
+
+  "129:84": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    },
+    "_meta": { "title": "Load CLIP" }
+  },
+
+  "129:96": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    },
+    "_meta": { "title": "Load Diffusion Model (low noise)" }
+  },
+
+  "129:95": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    },
+    "_meta": { "title": "Load Diffusion Model (high noise)" }
+  },
+
+  "129:127": {
+    "class_type": "PrimitiveInt",
+    "inputs": {
+      "value": 10
+    },
+    "_meta": { "title": "Int (split_step)" }
+  },
+
+  "129:126": {
+    "class_type": "PrimitiveFloat",
+    "inputs": {
+      "value": "{{cfg}}"
+    },
+    "_meta": { "title": "Float (CFG)" }
+  },
+
+  "129:102": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+      "strength_model": 1.0,
+      "model": ["129:96", 0]
+    },
+    "_meta": { "title": "Load LoRA (low noise turbo)" }
+  },
+
+  "129:101": {
+    "class_type": "LoraLoaderModelOnly",
+    "inputs": {
+      "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+      "strength_model": 1.0,
+      "model": ["129:95", 0]
+    },
+    "_meta": { "title": "Load LoRA (high noise turbo)" }
+  },
+
+  "129:86": {
+    "class_type": "KSamplerAdvanced",
+    "inputs": {
+      "add_noise": "enable",
+      "noise_seed": "{{seed}}",
+      "steps": ["129:119", 0],
+      "cfg": ["129:120", 0],
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": 0,
+      "end_at_step": ["129:125", 0],
+      "return_with_leftover_noise": "enable",
+      "model": ["129:104", 0],
+      "positive": ["129:98", 0],
+      "negative": ["129:98", 1],
+      "latent_image": ["129:98", 2]
+    },
+    "_meta": { "title": "KSampler (high-noise stage)" }
+  },
+
+  "129:85": {
+    "class_type": "KSamplerAdvanced",
+    "inputs": {
+      "add_noise": "disable",
+      "noise_seed": 0,
+      "steps": ["129:119", 0],
+      "cfg": ["129:120", 0],
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": ["129:125", 0],
+      "end_at_step": ["129:119", 0],
+      "return_with_leftover_noise": "disable",
+      "model": ["129:103", 0],
+      "positive": ["129:98", 0],
+      "negative": ["129:98", 1],
+      "latent_image": ["129:86", 0]
+    },
+    "_meta": { "title": "KSampler (low-noise stage)" }
+  },
+
+  "129:122": {
+    "class_type": "PrimitiveFloat",
+    "inputs": { "value": 1 },
+    "_meta": { "title": "Float (CFG turbo)" }
+  },
+  "129:124": {
+    "class_type": "PrimitiveInt",
+    "inputs": { "value": 2 },
+    "_meta": { "title": "Int (split_step turbo)" }
+  },
+  "129:118": {
+    "class_type": "PrimitiveInt",
+    "inputs": { "value": 4 },
+    "_meta": { "title": "Int (Steps turbo)" }
+  },
+
+  "129:116": {
+    "class_type": "ComfySwitchNode",
+    "inputs": {
+      "switch": ["129:131", 0],
+      "on_false": ["129:95", 0],
+      "on_true": ["129:101", 0]
+    }
+  },
+  "129:125": {
+    "class_type": "ComfySwitchNode",
+    "inputs": {
+      "switch": ["129:131", 0],
+      "on_false": ["129:127", 0],
+      "on_true": ["129:124", 0]
+    }
+  },
+  "129:119": {
+    "class_type": "ComfySwitchNode",
+    "inputs": {
+      "switch": ["129:131", 0],
+      "on_false": ["129:128", 0],
+      "on_true": ["129:118", 0]
+    }
+  },
+  "129:120": {
+    "class_type": "ComfySwitchNode",
+    "inputs": {
+      "switch": ["129:131", 0],
+      "on_false": ["129:126", 0],
+      "on_true": ["129:122", 0]
+    }
+  },
+
+  "129:103": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": {
+      "shift": 5.0,
+      "model": ["129:117", 0]
+    }
+  },
+
+  "129:117": {
+    "class_type": "ComfySwitchNode",
+    "inputs": {
+      "switch": ["129:131", 0],
+      "on_false": ["129:96", 0],
+      "on_true": ["129:102", 0]
+    }
+  },
+
+  "129:161": {
+    "class_type": "PrimitiveFloat",
+    "inputs": { "value": "{{duration_seconds}}" },
+    "_meta": { "title": "Float (Duration)" }
+  },
+  "129:162": {
+    "class_type": "PrimitiveFloat",
+    "inputs": { "value": "{{fps}}" },
+    "_meta": { "title": "Float (FPS)" }
+  },
+  "129:163": {
+    "class_type": "ComfyMathExpression",
+    "inputs": {
+      "expression": "floor (a * b + 1)",
+      "values.a": ["129:161", 0],
+      "values.b": ["129:162", 0]
+    }
+  },
+
+  "129:98": {
+    "class_type": "WanImageToVideo",
+    "inputs": {
+      "width": "{{width}}",
+      "height": "{{height}}",
+      "length": ["129:163", 1],
+      "batch_size": 1,
+      "positive": ["129:93", 0],
+      "negative": ["129:89", 0],
+      "vae": ["129:90", 0],
+      "start_image": ["97", 0]
+    },
+    "_meta": { "title": "WanImageToVideo" }
+  }
+}

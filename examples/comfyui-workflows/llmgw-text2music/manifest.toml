@@ -1,0 +1,113 @@
+id = "text_to_music"
+title = "Text to Music"
+description = "Generate a music clip from a description (tags) and optional lyrics. Pass genre/mood/instrumentation as tags; pass full song text (with [Verse]/[Chorus] markers) as lyrics for a vocal track, or leave lyrics empty for instrumental. Useful as background music for videos, podcast intros, jingles."
+output_kind = "audio"
+output_node_id = "107"
+output_filename_prefix = "llmgw-text2music"
+
+[[params]]
+key = "tags"
+node_id = "94"
+input_key = "tags"
+required = true
+description = "Genre, mood, instrumentation, tempo description. Be specific: 'Upbeat synthwave with driving bass, 80s retro, energetic' beats 'happy music'. This drives the overall musical style."
+
+  [params.schema]
+  type = "string"
+  max_length = 1000
+
+[[params]]
+key = "lyrics"
+node_id = "94"
+input_key = "lyrics"
+description = "Full song lyrics with section markers — [Verse 1], [Chorus], [Bridge], etc. — for a vocal track. Leave empty for instrumental. The model composes the vocal melody from this text."
+default = ""
+
+  [params.schema]
+  type = "string"
+  max_length = 4000
+
+[[params]]
+key = "duration_seconds"
+node_id = "duration_src"
+input_key = "value"
+description = "Length of the produced clip in seconds. 18–30 s typical for jingles/intros; up to 120 s for full tracks. Longer takes more VRAM and time."
+default = 30
+
+  [params.schema]
+  type = "number"
+  min = 4.0
+  max = 200.0
+
+[[params]]
+key = "bpm"
+node_id = "94"
+input_key = "bpm"
+description = "Tempo in beats per minute. 60 = slow ballad, 90 = pop, 120 = dance, 160+ = drum & bass. Pick to match the genre."
+default = 120
+
+  [params.schema]
+  type = "integer"
+  min = 10
+  max = 300
+
+[[params]]
+key = "time_signature"
+node_id = "94"
+input_key = "timesignature"
+description = "Time signature as a string. '4' = 4/4 (default, most pop/rock), '3' = 3/4 (waltz), '6' = 6/8."
+default = "4"
+
+  [params.schema]
+  type = "string"
+  enum_values = ["3", "4", "5", "6", "7"]
+
+[[params]]
+key = "language"
+node_id = "94"
+input_key = "language"
+description = "Language code for lyric pronunciation. 'en' (English), 'de' (German), 'es', 'fr', 'ja', 'zh', 'ko', etc. Use 'en' if unsure."
+default = "en"
+
+  [params.schema]
+  type = "string"
+  enum_values = ["en", "de", "es", "fr", "it", "ja", "zh", "ko", "ru", "pt"]
+
+[[params]]
+key = "key_scale"
+node_id = "94"
+input_key = "keyscale"
+description = "Musical key + scale. Drives the harmonic character. Common: 'C major' (bright), 'A minor' (melancholic), 'E minor' (rock), 'G major' (pop)."
+default = "C major"
+
+  [params.schema]
+  type = "string"
+  enum_values = [
+    "C major", "G major", "D major", "A major", "E major", "B major", "F# major", "C# major",
+    "F major", "Bb major", "Eb major", "Ab major", "Db major", "Gb major", "Cb major",
+    "A minor", "E minor", "B minor", "F# minor", "C# minor", "G# minor", "D# minor", "A# minor",
+    "D minor", "G minor", "C minor", "F minor", "Bb minor", "Eb minor", "Ab minor"
+  ]
+
+[[params]]
+key = "steps"
+node_id = "3"
+input_key = "steps"
+description = "Diffusion steps. ACE-Step Turbo converges at 8; the standard model uses 50. Raising above 8 rarely helps Turbo and just costs time."
+default = 8
+
+  [params.schema]
+  type = "integer"
+  min = 1
+  max = 100
+
+[[params]]
+key = "seed"
+node_id = "seed_src"
+input_key = "value"
+description = "Random seed. Same tags + lyrics + seed = same clip. -1 = fresh random."
+default = -1
+
+  [params.schema]
+  type = "integer"
+  min = -1

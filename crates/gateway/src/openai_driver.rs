@@ -272,10 +272,16 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             crate::server::tools::mcp::manager::AskContext::Chat,
         )
         .await;
+    let comfyui = d
+        .state
+        .comfyui
+        .as_ref()
+        .map(|h| crate::server::comfyui::ComfyuiToolSource::new((**h).clone()));
     let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
         d.state.tools.as_ref(),
         &user_mcp,
-    );
+    )
+    .with_comfyui(comfyui.as_ref());
 
     // The conversation's model may be an alias (the picker lists them). Resolve
     // it to the real upstream id ONCE per turn and key every per-model lookup

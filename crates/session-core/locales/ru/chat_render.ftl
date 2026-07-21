@@ -8,7 +8,19 @@
 # `chat.ftl`.
 
 chat-render-canvas-toggle-title = Показать / скрыть холст документа
-chat-render-canvas-toggle-label = Документ
+chat-render-canvas-toggle-label = Холст
+chat-render-canvas-document-tab = Документ
+chat-render-canvas-assets-tab = Файлы
+chat-render-canvas-assets-heading = Файлы беседы
+chat-render-canvas-assets-count = { $count ->
+    [one] { $count } файл
+    [few] { $count } файла
+    [many] { $count } файлов
+   *[other] { $count } файла
+}
+chat-render-canvas-assets-empty = В эту беседу пока не добавлены файлы.
+chat-render-canvas-asset-download = Скачать файл
+chat-render-canvas-close-title = Закрыть холст
 
 chat-render-model-placeholder = модель (напр., gpt-4o-mini)
 chat-render-model-aria = Модель чата

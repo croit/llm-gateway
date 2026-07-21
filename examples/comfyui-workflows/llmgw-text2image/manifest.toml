@@ -1,0 +1,87 @@
+id = "text_to_image"
+title = "Text to Image"
+description = "Generate an image from a text prompt using Flux.2 Klein 9B (base, fp8). Best for photorealistic subjects, marketing visuals, concept art. The image is stored in the gateway and rendered inline in your reply — do NOT describe the result back to the user."
+output_kind = "image"
+output_node_id = "9"
+output_filename_prefix = "llmgw-text2image"
+
+[[params]]
+key = "prompt"
+node_id = "75:74"
+input_key = "text"
+required = true
+description = "What to draw. Be specific about subject, style, composition, colours, lighting. Vivid prompts give better results than terse ones."
+
+  [params.schema]
+  type = "string"
+  max_length = 2000
+
+[[params]]
+key = "negative_prompt"
+node_id = "75:67"
+input_key = "text"
+description = "What to avoid in the image ('blurry, low quality, watermark'). Empty = no negative conditioning."
+default = ""
+
+  [params.schema]
+  type = "string"
+  max_length = 1000
+
+[[params]]
+key = "width"
+node_id = "75:68"
+input_key = "value"
+description = "Image width in pixels. Square (1024×1024) is the default and matches what Flux.2 was trained on; go larger only when you need an unusual aspect ratio."
+default = 1024
+
+  [params.schema]
+  type = "integer"
+  min = 256
+  max = 2048
+
+[[params]]
+key = "height"
+node_id = "75:69"
+input_key = "value"
+description = "Image height in pixels. See `width` — same VRAM/quality tradeoff. Common aspect ratios: 1024×1024 (square), 1024×768 (landscape), 768×1024 (portrait)."
+default = 1024
+
+  [params.schema]
+  type = "integer"
+  min = 256
+  max = 2048
+
+[[params]]
+key = "steps"
+node_id = "75:62"
+input_key = "steps"
+description = "Diffusion steps via the Flux2 scheduler. 20 default for Flux.2 Klein fp8; 30 marginally better; above 30 rarely helps."
+default = 20
+
+  [params.schema]
+  type = "integer"
+  min = 1
+  max = 60
+
+[[params]]
+key = "cfg"
+node_id = "75:63"
+input_key = "cfg"
+description = "Classifier-free guidance. How strictly the image follows the prompt. 5 is the Flux.2 default; lower = more creative, higher = more literal."
+default = 5
+
+  [params.schema]
+  type = "number"
+  min = 0.0
+  max = 15.0
+
+[[params]]
+key = "seed"
+node_id = "75:73"
+input_key = "noise_seed"
+description = "Random seed. Same prompt + seed = same image. Pass -1 to let the gateway pick a fresh random seed each call."
+default = -1
+
+  [params.schema]
+  type = "integer"
+  min = -1

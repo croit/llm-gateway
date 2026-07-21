@@ -177,12 +177,15 @@ async fn message_send_emits_initial_bubbles_and_finalizes_signal() {
         "expected at least one outer-mode patch on #turn-{assistant_id}, body was:\n{body}"
     );
 
-    // Final signal-patch flips chatStreaming=false on every attached
-    // client.
-    let signal_event_count = body.matches("event: datastar-patch-signals").count();
+    // The final signal-patch flips chatStreaming=false on every attached
+    // client. Other signal patches, such as asset-panel state, may be
+    // emitted during the stream.
+    let finalized_signal_count = body
+        .matches(r#"data: signals {"chatStreaming":false}"#)
+        .count();
     assert_eq!(
-        signal_event_count, 1,
-        "expected one datastar-patch-signals event (end-of-stream flag flip):\n{body}"
+        finalized_signal_count, 1,
+        "expected one chatStreaming=false signal patch:\n{body}"
     );
     assert!(
         body.contains(r#"data: signals {"chatStreaming":false}"#),

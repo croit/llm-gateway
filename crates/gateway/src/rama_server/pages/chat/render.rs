@@ -16,6 +16,8 @@ use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 use session_core::render;
 
+use crate::server::chat_attachments::AttachmentRef;
+
 /// One selectable chat model + its data-handling flags. `gdpr`/`nda` are
 /// `true` (clear) for the common case; a `false` drives the dropdown-label
 /// suffix and the per-conversation warning banner. Built from
@@ -152,6 +154,9 @@ pub(super) struct ChatPage<'a> {
     /// always-present `#document-canvas-slot` wraps it so a later
     /// `create_document` has a live morph target even on a doc-less load.
     pub document_canvas_html: Option<&'a str>,
+    /// Every attachment referenced by this conversation, shown in the
+    /// chat-scoped assets tab beside the document canvas.
+    pub assets: &'a [AttachmentRef],
     /// Highest turn `seq` folded into the conversation's compaction summary, or
     /// `None` if the session has never been compacted. Drives the transcript's
     /// "earlier messages condensed" divider.
@@ -224,8 +229,14 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
     // shows/hides the column. `canvasOpen` seeds false and a `data-init` opens
     // it on mount only on a wide viewport — so a doc-bearing chat opens docked
     // on desktop but never auto-covers the chat on mobile (button-only there).
-    let has_canvas = document_canvas_html.is_some();
-    let canvas_signals = format!("{{\"hasCanvas\": {has_canvas}, \"canvasOpen\": false}}");
+    let has_canvas = document_canvas_html.is_some() || !page.assets.is_empty();
+    let has_document = document_canvas_html.is_some();
+    let has_assets = !page.assets.is_empty();
+    let initial_tab = if has_document { "document" } else { "assets" };
+    let canvas_signals = format!(
+        "{{\"hasCanvas\": {has_canvas}, \"hasDocument\": {has_document}, \"hasAssets\": {has_assets}, \"assetCount\": {}, \"canvasOpen\": false, \"canvasTab\": \"{initial_tab}\"}}",
+        page.assets.len()
+    );
 
     let post_url = format!("/chat/{session_id}/messages");
     let cancel_url = format!("/chat/{session_id}/cancel");
@@ -242,8 +253,8 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
           "data-signals": (canvas_signals),
           // Open docked on mount, desktop only. Live edits re-open via the
           // `gwcanvasopen` window event (also desktop-gated, in the tool).
-          "data-init": "$canvasOpen = $hasCanvas && window.innerWidth >= 768",
-          "data-on:gwcanvasopen__window": "$canvasOpen = true",
+            "data-init": "$canvasOpen = $hasCanvas && window.innerWidth >= 768",
+           "data-on:gwcanvasopen__window": "$canvasOpen = true; $canvasTab = 'document'",
           // Full width ONLY while the canvas is docked; otherwise the chat
           // falls back to the centered reading column (see main.css).
           "data-class": "{'canvas-open': $canvasOpen}"
@@ -271,8 +282,8 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
             // Export is available to anyone who can read the chat (owner or a
             // shared viewer), so it lives outside the owner-only block below.
             (render_export_control(&session_id, lang))
-            // Document-canvas toggle. Hidden until a document exists (the live
-            // create flips `$hasCanvas`); click shows/hides the docked panel.
+            // Canvas toggle. Hidden until a document or asset exists; click
+            // shows/hides the docked panel.
             button(
                 type: "button",
                 class: "btn btn-ghost btn-sm gap-1",
@@ -436,20 +447,131 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
             "aria-hidden": "true"
         ) {}
         // Right-docked canvas column. Always in the DOM (even empty) so it is a
-        // stable morph target for the first `create_document`; shown when the
-        // panel is open.
+        // stable panel shell for the first `create_document`; shown when the
+        // panel is open. The document tab below is the live morph target.
         aside(
-            id: "document-canvas-slot",
+            id: "canvas-panel-slot",
             class: "canvas-col",
             "data-show": "$canvasOpen"
         ) {
+            div(class: "canvas-tabs border-b border-base-300") {
+                button(
+                    type: "button",
+                    class: "canvas-tab",
+                    "data-show": "$hasDocument",
+                    "data-class": "{'canvas-tab--active': $canvasTab === 'document'}",
+                    "data-on:click": "$canvasTab = 'document'"
+                ) { (t(lang, "chat-render-canvas-document-tab")) }
+                button(
+                    type: "button",
+                    class: "canvas-tab",
+                    "data-show": "$hasAssets",
+                    "data-class": "{'canvas-tab--active': $canvasTab === 'assets'}",
+                    "data-on:click": "$canvasTab = 'assets'"
+                ) {
+                    (t(lang, "chat-render-canvas-assets-tab"))
+                    span(class: "badge badge-sm ml-1", "data-text": "$assetCount") {
+                        (page.assets.len().to_string())
+                    }
+                }
+                button(
+                    type: "button",
+                    class: "btn btn-ghost btn-sm btn-circle ml-auto",
+                    title: (t(lang, "chat-render-canvas-close-title")),
+                    "aria-label": (t(lang, "chat-render-canvas-close-title")),
+                    "data-on:click": "$canvasOpen = false"
+                ) { (icons::x_mark(16)) }
+            }
             if let Some(html) = document_canvas_html.as_ref() {
-                #(html.clone())
+                div(
+                    id: "document-canvas-slot",
+                    "data-show": "$canvasTab === 'document'"
+                ) { #(html.clone()) }
+            } else {
+                div(id: "document-canvas-slot", "data-show": "$canvasTab === 'document'") {}
+            }
+            div(
+                id: "assets-canvas-slot",
+                class: "assets-canvas",
+                "data-show": "$canvasTab === 'assets'"
+            ) {
+                (render_assets_panel(page.assets, lang))
             }
         }
       } // .chat-shell
     }
     .to_html()
+}
+
+pub(super) fn render_assets_panel(assets: &[AttachmentRef], lang: Lang) -> Html {
+    html! {
+        div(class: "assets-canvas__header") {
+            div {
+                h2(class: "text-base font-semibold") { (t(lang, "chat-render-canvas-assets-heading")) }
+                p(class: "text-sm text-base-content/60") {
+                    (t_args(lang, "chat-render-canvas-assets-count", &i18n::args([(
+                        "count", assets.len().to_string().into()
+                    )])))
+                }
+            }
+        }
+        div(class: "assets-canvas__body") {
+            if assets.is_empty() {
+                div(class: "alert") { span { (t(lang, "chat-render-canvas-assets-empty")) } }
+            }
+            for asset in assets.iter() {
+                (render_asset_card(asset, lang))
+            }
+        }
+    }
+    .to_html()
+}
+
+fn render_asset_card(asset: &AttachmentRef, lang: Lang) -> Html {
+    let url = format!("/chat/attachment/{}/{}", asset.turn_id, asset.filename);
+    let size = format_asset_bytes(asset.size);
+    let is_image = asset.mime.starts_with("image/");
+    let is_video = asset.mime.starts_with("video/");
+    let is_audio = asset.mime.starts_with("audio/");
+    html! {
+        article(class: "asset-card") {
+            if is_image {
+                img(src: (url.clone()), alt: (asset.filename.clone()), loading: "lazy", class: "asset-card__preview");
+            } else if is_video {
+                video(src: (url.clone()), controls: "controls", preload: "metadata", class: "asset-card__preview", title: (asset.filename.clone())) {}
+            } else if is_audio {
+                div(class: "asset-card__audio") {
+                    span(class: "text-lg") { "♪" }
+                    audio(src: (url.clone()), controls: "controls", preload: "metadata") {}
+                }
+            } else {
+                div(class: "asset-card__file") { (icons::paperclip(18)) }
+            }
+            div(class: "asset-card__footer") {
+                div(class: "min-w-0") {
+                    a(href: (url.clone()), target: "_blank", rel: "noopener", class: "asset-card__name", title: (asset.filename.clone())) {
+                        (asset.filename.clone())
+                    }
+                    div(class: "asset-card__meta") { (asset.mime.clone()) " · " (size) }
+                }
+                a(href: (url), download: "download", class: "btn btn-ghost btn-sm btn-square", title: (t(lang, "chat-render-canvas-asset-download")), "aria-label": (t(lang, "chat-render-canvas-asset-download"))) {
+                    (icons::download(16))
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+fn format_asset_bytes(n: u64) -> String {
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let kb = n as f64 / 1024.0;
+    if kb < 1024.0 {
+        return format!("{kb:.1} KB");
+    }
+    format!("{:.1} MB", kb / 1024.0)
 }
 
 /// Dropdown label for one model: the raw id, plus a parenthetical suffix
@@ -1423,6 +1545,7 @@ mod tests {
             effort: crate::server::reasoning::Effort::Standard,
             capabilities: &[],
             document_canvas_html: None,
+            assets: &[],
             compacted_up_to_seq: None,
             voice_available: false,
             lang: Lang::En,
@@ -1477,6 +1600,7 @@ mod tests {
             effort: crate::server::reasoning::Effort::Standard,
             capabilities: &[],
             document_canvas_html: None,
+            assets: &[],
             compacted_up_to_seq: None,
             voice_available: false,
             lang: Lang::En,
@@ -1510,6 +1634,45 @@ mod tests {
             !body.contains(r#"<option value="qwen-32b" selected="selected">"#),
             "the default model must not be preselected when another was used: {body}"
         );
+    }
+
+    #[test]
+    fn assets_panel_renders_session_scoped_media_cards() {
+        let assets = [
+            AttachmentRef {
+                id: "turn-1/clip.mp4".into(),
+                turn_id: "turn-1".into(),
+                filename: "clip.mp4".into(),
+                mime: "video/mp4".into(),
+                size: 209_000,
+            },
+            AttachmentRef {
+                id: "turn-2/song.mp3".into(),
+                turn_id: "turn-2".into(),
+                filename: "song.mp3".into(),
+                mime: "audio/mpeg".into(),
+                size: 2_400_000,
+            },
+        ];
+        let html = render_assets_panel(&assets, Lang::En).to_string();
+
+        assert!(html.contains("Conversation assets"));
+        assert!(html.contains("clip.mp4"));
+        assert!(html.contains("<video"));
+        assert!(html.contains("/chat/attachment/turn-1/clip.mp4"));
+        assert!(html.contains("song.mp3"));
+        assert!(html.contains("<audio"));
+        assert!(html.contains("/chat/attachment/turn-2/song.mp3"));
+    }
+
+    #[test]
+    fn assets_tab_is_reactive_even_when_the_conversation_starts_empty() {
+        let body = page_body(None);
+
+        assert!(body.contains("hasAssets"));
+        assert!(body.contains("assetCount"));
+        assert!(body.contains("data-show=\"$hasAssets\""));
+        assert!(body.contains("data-text=\"$assetCount\""));
     }
 
     #[test]

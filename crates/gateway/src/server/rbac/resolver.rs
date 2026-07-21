@@ -265,6 +265,48 @@ impl Resolver {
         out
     }
 
+    /// Whether any of `role_ids`'s groups declares a tool grant that should
+    /// also unlock the dynamically-loaded ComfyUI workflows (`comfyui_<id>`
+    /// tools that aren't in the static registry). True when the group lists
+    /// `*`, lists any `comfyui_*` id, or is admin-tier (admins bypass the
+    /// tool gate entirely). The caller then expands the result of
+    /// [`Self::allowed_tools`] with the live catalog's workflow ids.
+    pub fn grants_comfyui_overlay(&self, role_ids: &[String]) -> ComfyuiGrant {
+        let Ok(snap) = self.inner.read() else {
+            return ComfyuiGrant::None;
+        };
+        let mut wildcard = false;
+        let mut specific: Vec<String> = Vec::new();
+        for role_id in role_ids {
+            let Some(group) = snap.groups.get(role_id) else {
+                continue;
+            };
+            for tool in &group.tools {
+                if tool == "*" {
+                    wildcard = true;
+                } else if tool.starts_with("comfyui_") && !specific.contains(tool) {
+                    specific.push(tool.clone());
+                }
+            }
+        }
+        // Check admin using the snapshot we already hold — avoids
+        // re-entrant read-lock on self.inner (which deadlocks against a
+        // queued writer). Mirrors is_admin's logic but on `snap`.
+        let is_admin = role_ids
+            .iter()
+            .any(|id| snap.groups.get(id).is_some_and(|g| g.is_admin));
+        if is_admin {
+            return ComfyuiGrant::Wildcard;
+        }
+        if wildcard {
+            ComfyuiGrant::Wildcard
+        } else if !specific.is_empty() {
+            ComfyuiGrant::Specific(specific)
+        } else {
+            ComfyuiGrant::None
+        }
+    }
+
     /// Union of skill names granted by any of the user's groups, filtered to
     /// loaded skills. `*` expands to every loaded skill. Sources both the config
     /// build path's per-group `skills` and the DB `skill_role_grants` overlay.
@@ -343,6 +385,18 @@ fn build_snapshot(snap: &GroupSnapshot, bootstrap: &[String]) -> Snapshot {
     let mut snapshot = Snapshot { mappings, groups };
     apply_bootstrap(&mut snapshot, bootstrap);
     snapshot
+}
+
+/// Result of [`Resolver::grants_comfyui_overlay`] — describes which
+/// `comfyui_*` tool ids the caller may use, given their RBAC grants.
+#[derive(Debug, Clone)]
+pub enum ComfyuiGrant {
+    /// No ComfyUI grant at all — caller may not use any `comfyui_*` tool.
+    None,
+    /// Wildcard grant — caller may use every currently-loaded workflow.
+    Wildcard,
+    /// Explicit list — caller may use only these `comfyui_<id>` ids.
+    Specific(Vec<String>),
 }
 
 /// Inject the synthetic admin group + a mapping for each bootstrap claim value.

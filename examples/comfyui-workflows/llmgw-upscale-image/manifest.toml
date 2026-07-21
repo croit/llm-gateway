@@ -1,0 +1,38 @@
+id = "upscale_image"
+title = "Upscale Image"
+description = "Increase the resolution of an existing image using SeedVR2 7B Int8 (single-step diffusion restoration). Useful for restoring low-resolution photos, sharpening lightly degraded digital images, preparing assets for print. Best results with portraits and natural scenes."
+output_kind = "image"
+output_node_id = "9"
+output_filename_prefix = "llmgw-upscale-image"
+
+[[params]]
+key = "image"
+node_id = "1"
+input_key = "image"
+required = true
+description = "The image to upscale. Pass the attachment id EXACTLY as it appears in the conversation — the long `<turn_id>/<filename>` string from the `[attached: id=...]` marker. Copy it verbatim; do NOT shorten or invent."
+
+  [params.schema]
+  type = "image_attachment"
+
+[[params]]
+key = "multiplier"
+node_id = "66:57"
+input_key = "resize_type.multiplier"
+description = "Upscale multiplier. 2 doubles width and height (≈4× pixels); 4 quadruples them (≈16× pixels). 4 is the model default and what SeedVR2 was trained for; 2 still works but yields softer output."
+default = 4
+
+  [params.schema]
+  type = "integer"
+  enum_values = ["2", "4"]
+
+[[params]]
+key = "seed"
+node_id = "66:54"
+input_key = "seed"
+description = "Random seed for the restoration pass. The diffusion run is single-step so seed matters less than in iterative samplers, but it still varies the restoration. -1 = fresh random."
+default = -1
+
+  [params.schema]
+  type = "integer"
+  min = -1

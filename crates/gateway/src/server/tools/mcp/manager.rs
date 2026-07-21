@@ -815,30 +815,68 @@ impl UserMcpLayer {
     }
 }
 
-/// The static registry unioned with a per-request user MCP overlay. The
-/// registry wins on id collisions (built-ins are authoritative).
+/// The static registry unioned with the gateway-side ComfyUI overlay and a
+/// per-request user MCP overlay. Lookups run in declaration order —
+/// registry wins on id collisions (built-ins are authoritative), ComfyUI
+/// fills in any `comfyui_*` ids the registry doesn't have, MCP fills in
+/// everything else. The ComfyUI overlay is a per-request construction
+/// (cheaply: one `ComfyuiHandle` clone) so the live catalog snapshot is
+/// always fresh — a `/api/v0/comfyui/reload` is visible on the very next
+/// chat call without rebuilding the registry.
 pub struct CompositeToolSource<'a> {
     registry: &'a ToolRegistry,
+    comfyui: Option<&'a crate::server::comfyui::ComfyuiToolSource>,
     user: &'a UserMcpLayer,
 }
 
 impl<'a> CompositeToolSource<'a> {
     pub fn new(registry: &'a ToolRegistry, user: &'a UserMcpLayer) -> Self {
-        Self { registry, user }
+        Self {
+            registry,
+            comfyui: None,
+            user,
+        }
+    }
+
+    /// ComfyUI overlay extension. Builder-style; chain after `new()` when
+    /// the caller has a live [`ComfyuiToolSource`] to layer in.
+    pub fn with_comfyui(
+        mut self,
+        comfyui: Option<&'a crate::server::comfyui::ComfyuiToolSource>,
+    ) -> Self {
+        self.comfyui = comfyui;
+        self
     }
 }
 
 impl ToolSource for CompositeToolSource<'_> {
     fn get(&self, id: &str) -> Option<Arc<dyn Tool>> {
-        ToolSource::get(self.registry, id).or_else(|| self.user.get(id))
+        ToolSource::get(self.registry, id)
+            .or_else(|| self.comfyui.and_then(|c| c.get(id)))
+            .or_else(|| self.user.get(id))
     }
 
     fn defs_for(&self, allowed: &[String]) -> Vec<ToolDef> {
         let mut defs = ToolSource::defs_for(self.registry, allowed);
-        // Only add user-overlay defs for ids the registry didn't already
-        // provide, preserving `allowed` order for the overlay tail.
+        // Only add overlay defs for ids the registry didn't already
+        // provide, preserving `allowed` order for the overlay tail. ComfyUI
+        // first (it's gateway-global, so its ids are stable), then the
+        // per-user MCP layer.
+        if let Some(comfyui) = self.comfyui {
+            for id in allowed {
+                if !self.registry.contains(id)
+                    && let Some(def) = comfyui
+                        .defs_for(std::slice::from_ref(id))
+                        .into_iter()
+                        .next()
+                {
+                    defs.push(def);
+                }
+            }
+        }
         for id in allowed {
             if !self.registry.contains(id)
+                && !self.comfyui.is_some_and(|c| c.contains(id))
                 && let Some(def) = self.user.find_def(id)
             {
                 defs.push(def);
@@ -849,12 +887,17 @@ impl ToolSource for CompositeToolSource<'_> {
 
     fn ids(&self) -> Vec<String> {
         let mut ids = ToolSource::ids(self.registry);
+        if let Some(comfyui) = self.comfyui {
+            ids.extend(comfyui.ids());
+        }
         ids.extend(self.user.ids());
         ids
     }
 
     fn contains(&self, id: &str) -> bool {
-        self.registry.contains(id) || self.user.contains(id)
+        self.registry.contains(id)
+            || self.comfyui.is_some_and(|c| c.contains(id))
+            || self.user.contains(id)
     }
 }
 

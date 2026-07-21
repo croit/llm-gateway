@@ -45,3 +45,4 @@ IP2LOCATION-LITE-DB11.BIN
 __pycache__/
 *.pyc
 
+gateway.toml

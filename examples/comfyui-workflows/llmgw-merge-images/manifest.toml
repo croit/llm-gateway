@@ -1,0 +1,72 @@
+id = "merge_images"
+title = "Merge Images"
+description = "Combine two images following a text instruction using Qwen Image Edit 2511 (Material Replacement). Useful for: replace material/texture of an object (sofa leather → fur), put subject from image A onto background from image B, blend style of image B onto subject of image A. Pass both image_ids plus a prompt that explicitly references 'image 1' and 'image 2'."
+output_kind = "image"
+output_node_id = "9"
+output_filename_prefix = "llmgw-merge-images"
+
+[[params]]
+key = "image_a"
+node_id = "41"
+input_key = "image"
+required = true
+description = "Primary source image. Pass the attachment id EXACTLY as it appears in the conversation — the long `<turn_id>/<filename>` string from the `[attached: id=...]` marker. Copy it verbatim. The model treats this as 'image 1' in the prompt."
+
+  [params.schema]
+  type = "image_attachment"
+
+[[params]]
+key = "image_b"
+node_id = "83"
+input_key = "image"
+required = true
+description = "Secondary source image. Pass the attachment id EXACTLY as it appears in the conversation — the long `<turn_id>/<filename>` string from the `[attached: id=...]` marker. Copy it verbatim. The model treats this as 'image 2' in the prompt."
+
+  [params.schema]
+  type = "image_attachment"
+
+[[params]]
+key = "prompt"
+node_id = "170:151"
+input_key = "prompt"
+required = true
+description = "How to combine. Reference 'image 1' and 'image 2' explicitly — e.g. 'Change the furniture material in image 1 to the fur material in image 2', 'Put the person from image 1 in front of the landscape from image 2', 'Apply the painting style of image 2 onto the subject of image 1'."
+
+  [params.schema]
+  type = "string"
+  max_length = 1500
+
+[[params]]
+key = "steps"
+node_id = "170:166"
+input_key = "value"
+description = "Diffusion steps. 40 is the Qwen Image Edit 2511 default; 20 is acceptable for quick previews. The 4-step turbo LoRA is off by default (operator can enable in workflow.json for ~10× speedup at small quality cost)."
+default = 40
+
+  [params.schema]
+  type = "integer"
+  min = 4
+  max = 60
+
+[[params]]
+key = "cfg"
+node_id = "170:154"
+input_key = "value"
+description = "Classifier-free guidance. 4 is the Qwen default. Lower = more creative interpretation; higher = more literal adherence to the prompt."
+default = 4
+
+  [params.schema]
+  type = "number"
+  min = 0.0
+  max = 15.0
+
+[[params]]
+key = "seed"
+node_id = "170:169"
+input_key = "seed"
+description = "Random seed. Same images + prompt + seed = same result. -1 = fresh random."
+default = -1
+
+  [params.schema]
+  type = "integer"
+  min = -1

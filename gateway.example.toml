@@ -298,6 +298,25 @@ enabled = true
 # timeout_secs      = 120        # HTTP timeout for one /run call
 # max_artifact_bytes = 26214400  # 25 MiB — larger produced files are dropped
 
+# --- ComfyUI worker ----------------------------------------------------
+# Headless ComfyUI as the gateway's image / video / audio inference engine.
+# The gateway owns the workflow catalog (in `content_dir`) and exposes each
+# workflow as a `comfyui_<id>` tool the model can call. Users never see
+# ComfyUI itself. See docs/comfyui.md for the workflow + manifest format.
+#
+# `base_url` MUST be reachable only from the gateway — ComfyUI has no auth
+# and executes arbitrary workflows. `content_dir` is NOT part of the public
+# repository; operators back it up out of band. With no `[comfyui]` block
+# no comfyui tools register and the gateway boots fine.
+
+# [comfyui]
+# enabled                = true                          # master switch
+# base_url               = "http://comfyui-worker:8188"  # internal-only
+# content_dir            = "/opt/llm-content"            # workflows + manifests
+# timeout_secs           = 600                            # per-workflow execution ceiling
+# queue_poll_interval_ms = 500                            # /history poll cadence
+# max_concurrent_jobs    = 1                              # 24 GB VRAM ≈ 1 diffusion job
+
 # ---------------------------------------------------------------------------
 # External MCP (Model Context Protocol) servers.
 #

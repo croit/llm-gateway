@@ -31,7 +31,7 @@ use serde_json::json;
 
 use crate::rama_server::RamaState;
 use crate::rama_server::cors::V1CorsLayer;
-use crate::rama_server::{api, oidc_handlers, pages, proxy, rag_api, sandbox_api};
+use crate::rama_server::{api, comfyui_api, oidc_handlers, pages, proxy, rag_api, sandbox_api};
 use session_core::assets;
 
 /// Builds the rama router. State is shared via `Arc` since handlers
@@ -201,6 +201,8 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/admin/skills/upload", pages::admin_skills_upload)
         .with_post("/admin/skills/delete", pages::admin_skills_delete)
         .with_post("/admin/skills/grants", pages::admin_skills_grants_save)
+        .with_get("/admin/comfyui", pages::admin_comfyui_index)
+        .with_post("/admin/comfyui/reload", pages::admin_comfyui_reload)
         // Per-user private skills (signed-in-user gate, not admin). Distinct
         // from the /admin/skills operator surface above.
         .with_get("/skills", pages::user_skills_index)
@@ -276,6 +278,8 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
             "/api/v0/rag/collections/{id}/reindex",
             rag_api::reindex_collection,
         )
+        .with_post("/api/v0/comfyui/reload", comfyui_api::reload)
+        .with_get("/api/v0/comfyui/catalog", comfyui_api::catalog)
 }
 
 /// The complete HTTP service: the router plus the layers that make it

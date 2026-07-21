@@ -1,0 +1,161 @@
+{
+  "9": {
+    "inputs": {
+      "filename_prefix": "llmgw-text2image",
+      "images": [
+        "75:65",
+        0
+      ]
+    },
+    "class_type": "SaveImage"
+  },
+  "75:61": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect"
+  },
+  "75:62": {
+    "inputs": {
+      "steps": "{{steps}}",
+      "width": [
+        "75:68",
+        0
+      ],
+      "height": [
+        "75:69",
+        0
+      ]
+    },
+    "class_type": "Flux2Scheduler"
+  },
+  "75:63": {
+    "inputs": {
+      "cfg": "{{cfg}}",
+      "model": [
+        "75:70",
+        0
+      ],
+      "positive": [
+        "75:74",
+        0
+      ],
+      "negative": [
+        "75:67",
+        0
+      ]
+    },
+    "class_type": "CFGGuider"
+  },
+  "75:64": {
+    "inputs": {
+      "noise": [
+        "75:73",
+        0
+      ],
+      "guider": [
+        "75:63",
+        0
+      ],
+      "sampler": [
+        "75:61",
+        0
+      ],
+      "sigmas": [
+        "75:62",
+        0
+      ],
+      "latent_image": [
+        "75:66",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced"
+  },
+  "75:65": {
+    "inputs": {
+      "samples": [
+        "75:64",
+        0
+      ],
+      "vae": [
+        "75:72",
+        0
+      ]
+    },
+    "class_type": "VAEDecode"
+  },
+  "75:66": {
+    "inputs": {
+      "width": [
+        "75:68",
+        0
+      ],
+      "height": [
+        "75:69",
+        0
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyFlux2LatentImage"
+  },
+  "75:67": {
+    "inputs": {
+      "text": "{{negative_prompt}}",
+      "clip": [
+        "75:71",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "75:68": {
+    "inputs": {
+      "value": "{{width}}"
+    },
+    "class_type": "PrimitiveInt"
+  },
+  "75:69": {
+    "inputs": {
+      "value": "{{height}}"
+    },
+    "class_type": "PrimitiveInt"
+  },
+  "75:73": {
+    "inputs": {
+      "noise_seed": "{{seed}}"
+    },
+    "class_type": "RandomNoise"
+  },
+  "75:70": {
+    "inputs": {
+      "unet_name": "flux2_klein_9b_fp8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader"
+  },
+  "75:71": {
+    "inputs": {
+      "clip_name": "qwen_3_4b_flux2_9b_fp8.safetensors",
+      "type": "flux2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader"
+  },
+  "75:72": {
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    },
+    "class_type": "VAELoader"
+  },
+  "75:74": {
+    "inputs": {
+      "text": "{{prompt}}",
+      "clip": [
+        "75:71",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode"
+  }
+}

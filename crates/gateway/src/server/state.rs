@@ -74,6 +74,11 @@ pub struct AppState {
     /// kept alive across a turn's tool rounds). `None` when `[sandbox]` is
     /// absent/disabled — leasing is off and every sandbox call is single-use.
     pub sandbox_client: Option<Arc<crate::server::tools::sandbox::SandboxClient>>,
+    /// Hot-reloadable ComfyUI workflow catalog + HTTP client. `None` when
+    /// `[comfyui]` is absent/disabled — no `comfyui_*` tools register. The
+    /// tool source reads the live snapshot per request, so an admin
+    /// `POST /api/v0/comfyui/reload` takes effect immediately.
+    pub comfyui: Option<Arc<crate::server::comfyui::ComfyuiHandle>>,
 }
 
 impl AppState {
@@ -106,6 +111,7 @@ impl AppState {
             typst_templates: Arc::new(Vec::new()),
             push: None,
             sandbox_client: None,
+            comfyui: None,
         }
     }
 
@@ -117,6 +123,13 @@ impl AppState {
         client: Arc<crate::server::tools::sandbox::SandboxClient>,
     ) -> Self {
         self.sandbox_client = Some(client);
+        self
+    }
+
+    /// Install the ComfyUI catalog + HTTP client. Built once at startup
+    /// when `[comfyui]` is enabled; off → no `comfyui_*` tools register.
+    pub fn with_comfyui(mut self, comfyui: Arc<crate::server::comfyui::ComfyuiHandle>) -> Self {
+        self.comfyui = Some(comfyui);
         self
     }
 
@@ -208,11 +221,45 @@ impl AppState {
     pub async fn allowed_tools_for_user(&self, roles: &[String], user_id: &str) -> Vec<String> {
         let role_ids = self.rbac.role_ids_for(roles);
         let mut allowed = self.rbac.allowed_tools(&role_ids, &self.tools);
+        self.expand_comfyui_tools(&mut allowed, &role_ids);
         let disabled = crate::server::db::user_tool_prefs::disabled_for_user(&self.db, user_id)
             .await
             .unwrap_or_default();
         crate::server::tools::catalog::retain_enabled(&mut allowed, &disabled);
         allowed
+    }
+
+    /// Append the currently-loaded `comfyui_*` tool ids to `allowed` based
+    /// on the RBAC grant (admin / wildcard / explicit list). Centralised so
+    /// every call site that asks "what tools does this caller see"
+    /// (`/api/v0/me`, `/tools` page, `allowed_tools_for_user`) agrees on
+    /// ComfyUI visibility. No-op when `[comfyui]` isn't configured.
+    pub fn expand_comfyui_tools(&self, allowed: &mut Vec<String>, role_ids: &[String]) {
+        let Some(handle) = self.comfyui.as_ref() else {
+            return;
+        };
+        match self.rbac.grants_comfyui_overlay(role_ids) {
+            crate::server::rbac::resolver::ComfyuiGrant::Wildcard => {
+                for m in handle.store.current().workflows() {
+                    let id = format!("comfyui_{}", m.id);
+                    if !allowed.contains(&id) {
+                        allowed.push(id);
+                    }
+                }
+            }
+            crate::server::rbac::resolver::ComfyuiGrant::Specific(ids) => {
+                let snapshot = handle.store.current();
+                for id in ids {
+                    let Some(workflow_id) = id.strip_prefix("comfyui_") else {
+                        continue;
+                    };
+                    if snapshot.lookup(workflow_id).is_some() && !allowed.contains(&id) {
+                        allowed.push(id);
+                    }
+                }
+            }
+            crate::server::rbac::resolver::ComfyuiGrant::None => {}
+        }
     }
 
     /// The tool ids an **API token** may use this request — the per-token

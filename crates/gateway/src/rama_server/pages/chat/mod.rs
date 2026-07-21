@@ -226,6 +226,13 @@ async fn render_chat_response(
             .await
             .ok()
             .flatten();
+    let assets = match chat_attachments::list_session_attachments(&state.db, &active.id).await {
+        Ok(assets) => assets,
+        Err(err) => {
+            tracing::warn!(error = %err, session_id = %active.id, "list chat assets");
+            Vec::new()
+        }
+    };
     // Compaction cutoff, if this conversation has been compacted — drives the
     // transcript's "earlier messages condensed" divider. A read error degrades
     // to "no divider".
@@ -246,6 +253,7 @@ async fn render_chat_response(
         effort,
         capabilities: &capabilities,
         document_canvas_html: document_canvas_html.as_deref(),
+        assets: &assets,
         compacted_up_to_seq,
         // The full voice loop needs both a TTS (speech) pool and a
         // transcription model. Owner only — a read-only shared viewer has no
@@ -1748,6 +1756,38 @@ fn gateway_sidebar_emitter(
             if tx.send(Ok(patch)).await.is_err() {
                 Err(())
             } else {
+                let assets = match chat_attachments::list_session_attachments(
+                    &state.db,
+                    &session_id,
+                )
+                .await
+                {
+                    Ok(assets) => assets,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "chat stream: list assets for canvas patch failed");
+                        return Ok(tx);
+                    }
+                };
+                let assets_html = render::render_assets_panel(&assets, lang);
+                let assets_patch = sse_patch(
+                    Some("#assets-canvas-slot"),
+                    Some("inner"),
+                    &assets_html.to_string(),
+                );
+                if tx.send(Ok(assets_patch)).await.is_err() {
+                    return Err(());
+                }
+                let signals = if assets.is_empty() {
+                    sse_signals(r#"{"hasAssets": false, "assetCount": 0}"#)
+                } else {
+                    sse_signals(&format!(
+                        "{{\"hasCanvas\": true, \"hasAssets\": true, \"assetCount\": {}}}",
+                        assets.len()
+                    ))
+                };
+                if tx.send(Ok(signals)).await.is_err() {
+                    return Err(());
+                }
                 Ok(tx)
             }
         })

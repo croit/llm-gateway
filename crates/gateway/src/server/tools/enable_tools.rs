@@ -34,7 +34,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use super::catalog::{BOOTSTRAP_TOOL_ID, TYPST_PREFIX, entry_key_for, is_hidden, prettify};
+use super::catalog::{
+    BOOTSTRAP_TOOL_ID, COMFYUI_KEY, TYPST_PREFIX, entry_key_for, is_hidden, prettify,
+};
 use super::mcp::MCP_ID_PREFIX;
 use super::{Tool, ToolContext, ToolError, ToolFuture, ToolRegistry};
 
@@ -48,8 +50,16 @@ pub struct EnableTarget {
     pub one_liner: String,
 }
 
+#[derive(Clone)]
 pub struct EnableTools {
     catalog: Arc<Vec<EnableTarget>>,
+    /// Hot-reloadable ComfyUI catalog. When `Some`, the `schema()`
+    /// description gains a `comfyui` entry advertising the master
+    /// ComfyUI-workflows toggle — listing whatever workflows are
+    /// currently loaded. ComfyUI tools aren't in the static `ToolRegistry`
+    /// (they're discovered from `[comfyui] content_dir`), so without this
+    /// hook the model would never see the toggle and couldn't enable it.
+    comfyui_store: Option<Arc<crate::server::comfyui::ComfyuiStore>>,
 }
 
 impl EnableTools {
@@ -57,6 +67,24 @@ impl EnableTools {
     /// can list every group the model could turn on. Should be built *after*
     /// every other tool (static + MCP + typst) is registered.
     pub fn from_registry(registry: &ToolRegistry) -> Self {
+        let catalog = Self::snapshot_catalog(registry);
+        Self {
+            catalog: Arc::new(catalog),
+            comfyui_store: None,
+        }
+    }
+
+    /// Install the hot-reloadable ComfyUI catalog. Builder-style; chain after
+    /// `from_registry` when `[comfyui]` is configured. The `comfyui` toggle
+    /// key then appears in the schema description listing whichever workflows
+    /// are currently loaded — and the model can pass it to `enable_tools`
+    /// to turn the whole ComfyUI family on.
+    pub fn with_comfyui_store(mut self, store: Arc<crate::server::comfyui::ComfyuiStore>) -> Self {
+        self.comfyui_store = Some(store);
+        self
+    }
+
+    fn snapshot_catalog(registry: &ToolRegistry) -> Vec<EnableTarget> {
         let mut seen = std::collections::HashSet::new();
         let mut catalog: Vec<EnableTarget> = registry
             .ids()
@@ -83,9 +111,32 @@ impl EnableTools {
         // Byte-stable order across boots so the schema description (which
         // ends up in the prefix cache) doesn't churn.
         catalog.sort_by(|a, b| a.key.cmp(&b.key));
-        Self {
-            catalog: Arc::new(catalog),
+        catalog
+    }
+
+    /// The full list of enableable groups to advertise in the schema
+    /// description. The static registry snapshot, plus — when a ComfyUI
+    /// store is wired in and has at least one workflow loaded — a `comfyui`
+    /// entry for the master ComfyUI toggle. Reads the live snapshot, so a
+    /// `/api/v0/comfyui/reload` that adds workflows propagates immediately.
+    fn full_catalog(&self) -> Vec<EnableTarget> {
+        let mut out: Vec<EnableTarget> = (*self.catalog).clone();
+        if let Some(store) = self.comfyui_store.as_ref() {
+            let workflows = store.current().workflows();
+            if !workflows.is_empty() {
+                let names: Vec<String> = workflows.iter().map(|m| m.title.clone()).collect();
+                out.push(EnableTarget {
+                    key: COMFYUI_KEY.into(),
+                    title: "ComfyUI workflows".into(),
+                    one_liner: format!(
+                        "image / video / audio generation through the headless ComfyUI worker. \
+                         Currently loaded: {}",
+                        names.join(", ")
+                    ),
+                });
+            }
         }
+        out
     }
 }
 
@@ -100,6 +151,7 @@ impl Tool for EnableTools {
     }
 
     fn schema(&self) -> ToolDef {
+        let catalog = self.full_catalog();
         let mut description = String::from(
             "Turn on one or more additional tools for the rest of this conversation. \
              Use this whenever the user's request needs a capability that isn't already \
@@ -108,10 +160,10 @@ impl Tool for EnableTools {
              The real tool schemas appear in your tools list on the next turn after the \
              call succeeds.\n\nAvailable keys:\n",
         );
-        for t in self.catalog.iter() {
+        for t in catalog.iter() {
             description.push_str(&format!("- {} — {} ({})\n", t.key, t.title, t.one_liner));
         }
-        if self.catalog.is_empty() {
+        if catalog.is_empty() {
             description
                 .push_str("(none built in — every available capability is already active)\n");
         }
@@ -162,8 +214,9 @@ impl Tool for EnableTools {
             };
             // Snapshot the keys we advertise so we can reject typos before
             // writing rows.
+            let catalog = self.full_catalog();
             let known: std::collections::HashSet<&str> =
-                self.catalog.iter().map(|t| t.key.as_str()).collect();
+                catalog.iter().map(|t| t.key.as_str()).collect();
             // Keys the user explicitly switched **off** in the composer menu.
             // The user's choice is authoritative: refuse to re-enable these,
             // so an Off toggle genuinely hides the tool from the model rather

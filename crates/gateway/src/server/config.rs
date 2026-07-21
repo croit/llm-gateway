@@ -125,6 +125,14 @@ pub struct Config {
     /// talks HTTP to it. See `server::tools::sandbox`.
     #[serde(default)]
     pub sandbox: Option<SandboxConfig>,
+    /// Headless ComfyUI worker for image / video / audio workflows.
+    /// Optional — with no `[comfyui]` block no `comfyui_*` tools register
+    /// and the gateway boots fine. When set, `base_url` points at an
+    /// internal ComfyUI instance and `content_dir` holds the curated
+    /// workflow catalog (workflow.json + manifest.toml per subdirectory).
+    /// See `docs/comfyui.md` and `server::comfyui`.
+    #[serde(default)]
+    pub comfyui: Option<ComfyuiConfig>,
     /// Feedback widget. Optional — with no `[feedback]` block the floating
     /// feedback button stays hidden (the `/feedback/config` endpoint reports
     /// it unconfigured, so the client never reveals the FAB). When set,
@@ -293,6 +301,57 @@ fn default_sandbox_timeout() -> u64 {
 
 fn default_sandbox_max_artifact() -> u64 {
     25 * 1024 * 1024
+}
+
+/// Headless ComfyUI worker settings. The worker owns GPU + model files;
+/// the gateway owns the curated workflow catalog and the typed tool
+/// surface the model sees. See `docs/comfyui.md`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComfyuiConfig {
+    /// Master switch. `true` (default) registers the `comfyui_*` tools;
+    /// `false` keeps the config block but disables registration (handy
+    /// for turning the feature off without deleting the block).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Base URL of the ComfyUI instance, e.g. `http://comfyui-worker:8188`.
+    /// MUST be reachable only from the gateway — ComfyUI has no auth and
+    /// executes arbitrary workflows. Operators front it with an internal
+    /// network / mTLS / an IP allowlist.
+    pub base_url: String,
+    /// Root directory holding one subdirectory per workflow. Each subdirectory
+    /// must contain `manifest.toml` (tool surface) + `workflow.json` (ComfyUI
+    /// prompt-API document). The directory is **not** part of the public
+    /// repository — operators back it up out of band. See `docs/comfyui.md`.
+    pub content_dir: PathBuf,
+    /// Per-workflow execution timeout. Diffusion runs are slow; this is the
+    /// upper bound on how long the gateway will poll ComfyUI's `/history`
+    /// endpoint before giving up and returning a timeout error to the tool.
+    #[serde(default = "default_comfyui_timeout")]
+    pub timeout_secs: u64,
+    /// How often to poll ComfyUI's `/history/{prompt_id}` while waiting for
+    /// a workflow to finish. Lower = snappier feedback, higher = less load
+    /// on ComfyUI's history API. Default 500 ms.
+    #[serde(default = "default_comfyui_poll_interval")]
+    pub queue_poll_interval_ms: u64,
+    /// Max workflows the gateway will let the model dispatch concurrently.
+    /// Default 1 — a single 24 GB GPU realistically runs one diffusion job
+    /// at a time. ComfyUI itself queues internally, so raising this mainly
+    /// affects how many gateway-side slots are reserved.
+    #[serde(default = "default_comfyui_concurrency")]
+    pub max_concurrent_jobs: usize,
+}
+
+fn default_comfyui_timeout() -> u64 {
+    600
+}
+
+fn default_comfyui_poll_interval() -> u64 {
+    500
+}
+
+fn default_comfyui_concurrency() -> usize {
+    1
 }
 
 /// Usage-metrics knobs. Recording is decoupled from the request path (a

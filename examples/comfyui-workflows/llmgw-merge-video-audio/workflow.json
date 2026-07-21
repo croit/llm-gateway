@@ -1,0 +1,39 @@
+{
+  "_comment": "Merge an existing video and audio attachment into one MP4. Requires ComfyUI-VideoHelperSuite, which provides VHS_LoadVideo and VHS_VideoCombine. The gateway resolves the attachment placeholders, uploads both inputs to ComfyUI, and re-hosts the combined output in the chat.",
+  "1": {
+    "class_type": "VHS_LoadVideo",
+    "inputs": {
+      "video": "{{video}}",
+      "force_rate": 0,
+      "force_size": "Disabled",
+      "custom_width": 0,
+      "custom_height": 0,
+      "frame_load_cap": 0,
+      "skip_first_frames": 0,
+      "select_every_nth": 1
+    },
+    "_meta": { "title": "Load Video" }
+  },
+  "2": {
+    "class_type": "LoadAudio",
+    "inputs": {
+      "audio": "{{audio}}",
+      "audioUI": ""
+    },
+    "_meta": { "title": "Load Audio" }
+  },
+  "3": {
+    "class_type": "VHS_VideoCombine",
+    "inputs": {
+      "images": ["1", 0],
+      "audio": ["2", 0],
+      "frame_rate": "{{frame_rate}}",
+      "loop_count": 0,
+      "filename_prefix": "llmgw-merge-video-audio",
+      "format": "video/h264-mp4",
+      "pingpong": false,
+      "save_output": true
+    },
+    "_meta": { "title": "Merge Video and Audio" }
+  }
+}

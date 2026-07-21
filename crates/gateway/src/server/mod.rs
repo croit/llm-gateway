@@ -10,6 +10,7 @@
 pub mod auth;
 pub mod capabilities;
 pub mod chat_attachments;
+pub mod comfyui;
 pub mod compaction;
 pub mod config;
 pub mod crypto;

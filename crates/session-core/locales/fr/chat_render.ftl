@@ -8,7 +8,17 @@
 # `chat.ftl`.
 
 chat-render-canvas-toggle-title = Afficher / masquer le canevas de document
-chat-render-canvas-toggle-label = Document
+chat-render-canvas-toggle-label = Canevas
+chat-render-canvas-document-tab = Document
+chat-render-canvas-assets-tab = Fichiers
+chat-render-canvas-assets-heading = Fichiers de la conversation
+chat-render-canvas-assets-count = { $count ->
+    [one] { $count } fichier
+   *[other] { $count } fichiers
+}
+chat-render-canvas-assets-empty = Aucun fichier n’a encore été ajouté à cette conversation.
+chat-render-canvas-asset-download = Télécharger le fichier
+chat-render-canvas-close-title = Fermer le canevas
 
 chat-render-model-placeholder = modèle (ex. gpt-4o-mini)
 chat-render-model-aria = Modèle de chat

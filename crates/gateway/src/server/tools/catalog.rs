@@ -26,6 +26,19 @@ use super::ToolRegistry;
 /// while different templates stay independently selectable.
 pub const TYPST_PREFIX: &str = "typst_";
 
+/// Tool-id prefix for ComfyUI workflows (`comfyui_<id>`). Each loaded
+/// workflow is its own id, but they all collapse to one [`COMFYUI_KEY`]
+/// toggle — one switch governs the whole ComfyUI family.
+pub const COMFYUI_PREFIX: &str = "comfyui_";
+
+/// The single toggle key that governs every `comfyui_*` tool. Same
+/// pattern as MCP (`mcp__<server>`) and Memory (`remember`+`recall`):
+/// the user reasons about ComfyUI as one capability, so one switch turns
+/// the whole family on/off. A newly-reloaded workflow is automatically
+/// enabled when this toggle is on — the catalog never has to chase a
+/// per-workflow preference.
+pub const COMFYUI_KEY: &str = "comfyui";
+
 /// Tool-id suffixes of the per-template variant tools. `entry_key_for` strips
 /// these to recover the template's render id (its toggle key); discovery
 /// rejects template ids ending in any of them so the strip is unambiguous.
@@ -70,6 +83,11 @@ pub enum Category {
     /// Per-template typst document tools (`typst_<id>`) — one row per
     /// operator-installed template, individually selectable.
     Templates,
+    /// ComfyUI workflows (`comfyui_<id>`) — image / video / audio
+    /// generation through the headless ComfyUI worker. Distinct from
+    /// [`Category::Media`] (the OpenAI-compatible image tools) so users
+    /// see which backend a toggle actually governs.
+    ComfyMedia,
     /// Semantic search over operator-indexed knowledge bases (`rag_*`) —
     /// the user's own repositories and documents.
     Knowledge,
@@ -89,6 +107,7 @@ impl Category {
             Category::Documents => "Attachments & Documents",
             Category::Media => "Images & Media",
             Category::Templates => "Document templates",
+            Category::ComfyMedia => "ComfyUI workflows",
             Category::Knowledge => "Knowledge base",
             Category::Code => "Code & Sandbox",
             Category::Memory => "Memory",
@@ -103,12 +122,13 @@ impl Category {
             Category::Web => 0,
             Category::Documents => 1,
             Category::Media => 2,
-            Category::Templates => 3,
-            Category::Knowledge => 4,
-            Category::Code => 5,
-            Category::Memory => 6,
-            Category::Integrations => 7,
-            Category::Utility => 8,
+            Category::ComfyMedia => 3,
+            Category::Templates => 4,
+            Category::Knowledge => 5,
+            Category::Code => 6,
+            Category::Memory => 7,
+            Category::Integrations => 8,
+            Category::Utility => 9,
         }
     }
 }
@@ -133,6 +153,16 @@ pub struct ToolEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TemplateMeta {
     pub key: String,
+    pub title: String,
+    pub description: String,
+}
+
+/// Same shape as [`TemplateMeta`], but for ComfyUI workflows (`comfyui_<id>`).
+/// `tool_id` is the full tool id including the `comfyui_` prefix; `key` would
+/// be redundant so the field is named differently to make call sites read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComfyuiMeta {
+    pub tool_id: String,
     pub title: String,
     pub description: String,
 }
@@ -173,6 +203,10 @@ pub fn entry_key_for(tool_id: &str) -> &str {
         MEMORY_KEY
     } else if DOCUMENT_IDS.contains(&tool_id) {
         DOCUMENT_KEY
+    } else if tool_id.starts_with(COMFYUI_PREFIX) {
+        // All comfyui_* tools collapse to the single "comfyui" toggle,
+        // so the user enables/disables the whole family at once.
+        COMFYUI_KEY
     } else if tool_id.starts_with(crate::server::tools::mcp::MCP_ID_PREFIX) {
         // All of one MCP server's tools collapse to a single toggle, so a
         // user enables/disables the whole integration at once.
@@ -202,6 +236,7 @@ pub fn is_hidden(tool_id: &str) -> bool {
 /// of truth so the advertise filter can't drift from the runtime gate.
 pub fn requires_chat_session(tool_id: &str) -> bool {
     tool_id.starts_with(TYPST_PREFIX)
+        || tool_id.starts_with(COMFYUI_PREFIX)
         || DOCUMENT_IDS.contains(&tool_id)
         || tool_id == "upload_attachment"
         || tool_id == "list_attachments"
@@ -240,6 +275,7 @@ fn category_for(tool_id: &str) -> Category {
         | "render_excalidraw"
         | "render_typst" => Category::Code,
         _ if tool_id.starts_with(TYPST_PREFIX) => Category::Templates,
+        _ if tool_id.starts_with(COMFYUI_PREFIX) => Category::ComfyMedia,
         _ if DOCUMENT_IDS.contains(&tool_id) => Category::Documents,
         "remember" | "recall" => Category::Memory,
         _ if tool_id.starts_with(crate::server::tools::mcp::MCP_ID_PREFIX) => {
@@ -444,14 +480,18 @@ pub fn capability_domains(registry: &ToolRegistry) -> Vec<&'static str> {
 /// user's roles grant. Hidden tools are dropped; each typst *template* gets
 /// its own row (its render + variant tools fold into one), labelled from
 /// `templates` (the startup snapshot of manifest titles/descriptions).
-/// Sorted by category then key so the page is stable across requests.
+/// ComfyUI workflows likewise get one row each, labelled from
+/// `comfyui_metas` (live snapshot — hot-reloadable). Sorted by category
+/// then key so the page is stable across requests.
 pub fn entries(
     registry: &ToolRegistry,
     allowed: &[String],
     templates: &[TemplateMeta],
+    comfyui_metas: &[ComfyuiMeta],
 ) -> Vec<ToolEntry> {
     let mut out: Vec<ToolEntry> = Vec::new();
     let mut typst_seen: HashSet<String> = HashSet::new();
+    let mut comfyui_seen = false;
     let mut memory_seen = false;
     let mut document_seen = false;
     let mut mcp_servers_seen: HashSet<String> = HashSet::new();
@@ -517,6 +557,45 @@ pub fn entries(
                     category: Category::Templates,
                 });
             }
+            continue;
+        }
+        if id.starts_with(COMFYUI_PREFIX) {
+            // All comfyui_* ids collapse to a single "ComfyUI workflows"
+            // toggle. The row's description lists the currently-loaded
+            // workflows so the user sees what they get; a hot-reload that
+            // adds a new workflow lands here automatically when the master
+            // toggle is on (no per-workflow preference to chase).
+            if comfyui_seen {
+                continue;
+            }
+            comfyui_seen = true;
+            let count = comfyui_metas
+                .iter()
+                .filter(|m| m.tool_id.starts_with(COMFYUI_PREFIX))
+                .count();
+            let names: Vec<String> = comfyui_metas
+                .iter()
+                .filter(|m| m.tool_id.starts_with(COMFYUI_PREFIX))
+                .map(|m| m.title.clone())
+                .collect();
+            let description = if count == 0 {
+                "Headless ComfyUI workflows (none loaded — visit /admin/comfyui to install). \
+                 One switch enables or disables the whole family."
+                    .to_string()
+            } else {
+                format!(
+                    "Image / video / audio generation through the headless ComfyUI worker. \
+                     Currently loaded: {}. One switch enables or disables the whole family.",
+                    names.join(", ")
+                )
+            };
+            out.push(ToolEntry {
+                key: COMFYUI_KEY.to_string(),
+                title: "ComfyUI workflows".to_string(),
+                tech: format!("{COMFYUI_PREFIX}*"),
+                description,
+                category: Category::ComfyMedia,
+            });
             continue;
         }
         // All of one MCP server's tools collapse to a single toggle, keyed
@@ -613,7 +692,7 @@ mod tests {
             title: "Formal letter".to_string(),
             description: "A business letter. Renders to PDF.".to_string(),
         }];
-        let rows = entries(&reg, &allowed, &metas);
+        let rows = entries(&reg, &allowed, &metas, &[]);
         // One row per template (variants folded), both under Templates.
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows.iter().all(|e| e.category == Category::Templates));
@@ -705,7 +784,7 @@ mod tests {
         let reg = ToolRegistry::new().with(RagSearch::new(std::sync::Arc::new(
             crate::server::rbac::Resolver::empty(),
         )));
-        let entries = entries(&reg, &["rag_search".to_string()], &[]);
+        let entries = entries(&reg, &["rag_search".to_string()], &[], &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].category, Category::Knowledge);
         // Curated title from `display_meta`, not the raw schema function name.
@@ -716,7 +795,7 @@ mod tests {
     fn entries_hide_smoke_test_tools() {
         let reg = ToolRegistry::new().with(Echo).with(SearchWeb);
         let allowed = vec!["company_echo".to_string(), "search_web".to_string()];
-        let entries = entries(&reg, &allowed, &[]);
+        let entries = entries(&reg, &allowed, &[], &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "search_web");
         assert_eq!(entries[0].category, Category::Web);
@@ -729,7 +808,7 @@ mod tests {
             "get_current_timestamp".to_string(),
             "search_web".to_string(),
         ];
-        let entries = entries(&reg, &allowed, &[]);
+        let entries = entries(&reg, &allowed, &[], &[]);
         // Web (search_web) sorts before Utility (get_current_timestamp).
         assert_eq!(entries[0].key, "search_web");
         assert_eq!(entries[1].key, "get_current_timestamp");
@@ -753,7 +832,7 @@ mod tests {
         use crate::server::tools::memory::{Recall, Remember};
         let reg = ToolRegistry::new().with(Remember).with(Recall);
         let allowed = vec!["remember".to_string(), "recall".to_string()];
-        let entries = entries(&reg, &allowed, &[]);
+        let entries = entries(&reg, &allowed, &[], &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "memory");
         assert_eq!(entries[0].category, Category::Memory);
@@ -793,7 +872,7 @@ mod tests {
             "read_document".to_string(),
             "list_documents".to_string(),
         ];
-        let entries = entries(&reg, &allowed, &[]);
+        let entries = entries(&reg, &allowed, &[], &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "document");
         assert_eq!(entries[0].category, Category::Documents);
@@ -858,7 +937,7 @@ mod tests {
             "mcp__demo__get-sum".to_string(),
             "mcp__other__ping".to_string(),
         ];
-        let mcp: Vec<_> = entries(&reg, &allowed, &[])
+        let mcp: Vec<_> = entries(&reg, &allowed, &[], &[])
             .into_iter()
             .filter(|e| e.category == Category::Integrations)
             .collect();

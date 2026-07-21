@@ -329,10 +329,34 @@ async fn main() -> anyhow::Result<()> {
         None => tracing::info!("no [sandbox] config — sandbox tools not registered"),
     }
     // `enable_tools` is registered last so its catalog snapshot covers every
-    // other tool (static + typst + MCP). It's part of the always-on core so
-    // the model can always reach it; calling it writes per-conversation rows
-    // that the next round's `allowed_tools_for_session` picks up.
-    let enable_tools = srv::tools::enable_tools::EnableTools::from_registry(&tool_registry);
+    // other tool (static + typst + MCP + ComfyUI). It's part of the
+    // always-on core so the model can always reach it; calling it writes
+    // per-conversation rows that the next round's `allowed_tools_for_session`
+    // picks up.
+    //
+    // We need the ComfyUI store handle here (so enable_tools can advertise
+    // the `comfyui` master toggle in its description), but the store is built
+    // from config — same source the rest of the registry sees. Build it now
+    // from `[comfyui]`, before wiring the ComfyuiHandle onto AppState further
+    // down.
+    let comfyui_store: Option<std::sync::Arc<srv::comfyui::ComfyuiStore>> =
+        if let Some(comfyui_cfg) = config.comfyui.clone().filter(|c| c.enabled) {
+            let store = std::sync::Arc::new(srv::comfyui::ComfyuiStore::load(
+                comfyui_cfg.content_dir.clone(),
+            ));
+            tracing::info!(
+                content_dir = %comfyui_cfg.content_dir.display(),
+                loaded = store.current().len(),
+                "loaded ComfyUI workflow catalog",
+            );
+            Some(store)
+        } else {
+            None
+        };
+    let mut enable_tools = srv::tools::enable_tools::EnableTools::from_registry(&tool_registry);
+    if let Some(store) = comfyui_store.clone() {
+        enable_tools = enable_tools.with_comfyui_store(store);
+    }
     tool_registry = tool_registry.with(enable_tools);
 
     // Agent Skills: a hot-reloadable store over `[skills] dir` (admin upload /
@@ -407,6 +431,72 @@ async fn main() -> anyhow::Result<()> {
     // `None` leaves leasing off — every sandbox call stays single-use.
     if let Some(client) = sandbox_client.clone() {
         state = state.with_sandbox_client(client);
+    }
+    // ComfyUI worker — optional, internal-only. The store was built above
+    // (before enable_tools, so the catalog could advertise the `comfyui`
+    // master toggle). Here we just pair it with the HTTP client + S3
+    // handle and install it on AppState. The store hot-reloads on
+    // `POST /api/v0/comfyui/reload`; the tool source is wired into the
+    // chat tool-overlay path (mirrors MCP per-request layering), not
+    // into the static `ToolRegistry`, so new workflows discovered via
+    // reload don't need the registry to rebuild.
+    if let Some(comfyui_cfg) = state.config.comfyui.clone().filter(|c| c.enabled) {
+        match srv::comfyui::Client::new(comfyui_cfg.base_url.clone()) {
+            Ok(client) => {
+                // The store was already built above — reuse the same
+                // Arc so live reloads stay visible to enable_tools.
+                let store = comfyui_store
+                    .clone()
+                    .expect("comfyui_store built alongside enable_tools");
+                // Pass the chat-attachment S3 config through so the
+                // runner can resolve Image/Video/AudioAttachment params
+                // via the same path `edit_image` uses. The config is
+                // already validated when the state was built — `None`
+                // only when `[chat.s3]` is unconfigured, in which case
+                // workflows with attachment-kind params fail cleanly.
+                let s3 = state.config.chat.s3.clone().map(std::sync::Arc::new);
+                let chat_updates = srv::comfyui::ChatUpdateRegistry::default();
+                let handle = std::sync::Arc::new(srv::comfyui::ComfyuiHandle {
+                    store: store.clone(),
+                    client: client.clone(),
+                    runner_poll_interval: std::time::Duration::from_millis(
+                        comfyui_cfg.queue_poll_interval_ms,
+                    ),
+                    runner_timeout: std::time::Duration::from_secs(comfyui_cfg.timeout_secs),
+                    s3,
+                    max_concurrent_jobs: comfyui_cfg.max_concurrent_jobs,
+                    chat_updates: chat_updates.clone(),
+                });
+                tracing::info!(
+                    base_url = %comfyui_cfg.base_url,
+                    content_dir = %comfyui_cfg.content_dir.display(),
+                    loaded = store.current().len(),
+                    "registered ComfyUI catalog",
+                );
+                // Spawn the async job scheduler. It polls pending jobs
+                // every `queue_poll_interval_ms`, fetches completed
+                // assets from ComfyUI, re-hosts them in S3, and appends
+                // the attachment marker to the owning turn. Boot-tolerant:
+                // pending jobs survive in the DB across restarts.
+                let scheduler = srv::comfyui::ComfyuiScheduler::new(
+                    state.db.clone(),
+                    client.clone(),
+                    state.config.chat.s3.clone().map(std::sync::Arc::new),
+                    std::time::Duration::from_millis(comfyui_cfg.queue_poll_interval_ms),
+                    std::time::Duration::from_secs(comfyui_cfg.timeout_secs),
+                    chat_updates,
+                );
+                scheduler.spawn();
+                state = state.with_comfyui(handle);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    base_url = %comfyui_cfg.base_url,
+                    "[comfyui] client build failed — no comfyui tools will be registered",
+                );
+            }
+        }
     }
     if let Some(client) = oidc {
         state = state.with_oidc(client);

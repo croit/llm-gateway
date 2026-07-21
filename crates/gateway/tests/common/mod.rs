@@ -231,6 +231,85 @@ pub async fn state_with_admin_rbac(upstream_url: &str) -> RamaState {
     state_with_admin_rbac_cfg(upstream_url, true).await
 }
 
+/// Same as [`state_with_admin_rbac`] but with a ComfyUI store wired in
+/// (empty content dir from a tempdir). For the `/admin/comfyui` route
+/// tests.
+pub async fn state_with_admin_rbac_and_comfyui(upstream_url: &str) -> RamaState {
+    use gateway::server::comfyui::{Client, ComfyuiHandle, ComfyuiStore};
+    let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool".to_string(),
+        UpstreamPoolConfig {
+            voices: Default::default(),
+            allowed_groups: Vec::new(),
+            fallback_offline: None,
+            compliance: Default::default(),
+            enforce_limits: true,
+            kind: PoolKind::Chat,
+            strategy: PickerStrategy::RoundRobin,
+            models: Vec::new(),
+            backend: vec![BackendConfig {
+                alias: None,
+                probe_models: true,
+                supports_edit: false,
+                name: "mock".into(),
+                base_url: upstream_url.into(),
+                api_key_env: None,
+                api_key: None,
+                weight: 1,
+                max_inflight: 16,
+                health_path: "/models".into(),
+                models: Vec::new(),
+            }],
+        },
+    );
+    let registry = upstreams::UpstreamRegistry::new(&pools).unwrap();
+    seed_pool_models(&registry, "pool", 0, &["model-a"]);
+
+    let tools = Arc::new(ToolRegistry::new());
+    use gateway::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
+    let rbac_config = RbacConfig {
+        default_role: None,
+        mappings: vec![RoleMapping {
+            oidc_claim: "groups".into(),
+            oidc_value: "admin".into(),
+            role: "admin".into(),
+        }],
+    };
+    let admin_role = RoleConfig {
+        id: "admin".into(),
+        admin: true,
+        models: vec!["*".into()],
+        tools: vec!["*".into()],
+        skills: vec![],
+    };
+    let rbac = Arc::new(Resolver::build(rbac_config, vec![admin_role]).unwrap());
+
+    let mut config = Config::default();
+    config.gateway.allow_impersonation = true;
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(ComfyuiStore::load(tmp.keep()));
+    let client = Client::new("http://unused.invalid".to_string()).unwrap();
+    let comfyui = Arc::new(ComfyuiHandle {
+        store,
+        client,
+        runner_poll_interval: std::time::Duration::from_millis(10),
+        runner_timeout: std::time::Duration::from_secs(5),
+        s3: None,
+        max_concurrent_jobs: 1,
+        chat_updates: gateway::server::comfyui::ChatUpdateRegistry::default(),
+    });
+    let app = AppState::new(config, pool.clone(), registry, tools, rbac).with_comfyui(comfyui);
+    let sessions = SessionStore::new(pool, TEST_SECRET);
+    RamaState::new(
+        app,
+        sessions,
+        gateway::server::usage::UsageHandle::disabled(),
+    )
+}
+
 /// Same as [`state_with_admin_rbac`] but with `[gateway].allow_impersonation`
 /// turned off, for tests that exercise the impersonation kill switch.
 pub async fn state_with_admin_rbac_no_impersonation(upstream_url: &str) -> RamaState {

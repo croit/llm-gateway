@@ -91,6 +91,11 @@ enum NavItem {
     /// Admin-only rate-limit / quota editor (`/admin/limits`). Same
     /// `admin`-role gate as the other operator pages.
     Limits,
+    /// Admin-only ComfyUI workflow catalog (`/admin/comfyui`) — live
+    /// snapshot of the loaded workflows, operator-triggered reload, and
+    /// the per-workflow parameter surface. Same admin-role gate as the
+    /// other operator pages.
+    Comfyui,
     /// Admin-only gateway-groups editor (`/admin/groups`) — OIDC→group mappings
     /// plus per-group tool/skill grants. Same `admin`-role gate.
     Groups,
@@ -406,6 +411,7 @@ fn render_app_sidebar(
                         (sidebar_nav_link("/rag", NavItem::Rag, active, icons::database(16), &t(lang, "nav-rag")))
                         (sidebar_nav_link("/admin/skills", NavItem::Skills, active, icons::sparkles(16), &t(lang, "nav-skills")))
                         (sidebar_nav_link("/admin/connectors", NavItem::Connectors, active, icons::plug(16), &t(lang, "nav-connectors")))
+                        (sidebar_nav_link("/admin/comfyui", NavItem::Comfyui, active, icons::sparkles(16), "ComfyUI"))
                         (sidebar_nav_link("/admin/limits", NavItem::Limits, active, icons::sliders(16), &t(lang, "nav-limits")))
                     }.to_html()))
                 }
@@ -1363,6 +1369,12 @@ pub use skills_user::{
     user_skills_delete, user_skills_download, user_skills_index, user_skills_save,
     user_skills_upload,
 };
+
+// `/admin/comfyui` — operator viewer for the headless ComfyUI workflow
+// catalog (live snapshot + reload trigger). Same admin gate as the other
+// operator pages.
+mod comfyui;
+pub use comfyui::{comfyui_index as admin_comfyui_index, comfyui_reload as admin_comfyui_reload};
 
 // Admin RAG-collections CRUD (`/rag`). Same admin gate.
 mod rag;

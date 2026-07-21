@@ -467,10 +467,15 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     );
 
     // Reuse the layer built once above (same ids we advertised) for dispatch.
+    let comfyui = state
+        .comfyui
+        .as_ref()
+        .map(|h| crate::server::comfyui::ComfyuiToolSource::new((**h).clone()));
     let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
         state.tools.as_ref(),
         &user_mcp,
-    );
+    )
+    .with_comfyui(comfyui.as_ref());
 
     let outcome = runner::run_with_tools(
         &tool_source,
@@ -1991,10 +1996,15 @@ async fn forward_streaming_with_tools(
 ) -> Response {
     // Use the layer built once by the caller (same ids it advertised) for
     // injection here and for dispatch inside the loop.
+    let comfyui = state
+        .comfyui
+        .as_ref()
+        .map(|h| crate::server::comfyui::ComfyuiToolSource::new((**h).clone()));
     let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
         state.tools.as_ref(),
         &user_mcp,
-    );
+    )
+    .with_comfyui(comfyui.as_ref());
     // Inject gateway tools, force stream:true. `stream_options` can
     // stay (vLLM accepts it with stream:true).
     if let Err(err) = runner::inject_tools(&mut request_body, &tool_source, &allowed_tools) {
@@ -2236,10 +2246,15 @@ async fn drive_streaming_tool_loop_inner(
 
     // The caller's connected-connector MCP tools, unioned onto the registry so
     // the ownership split + dispatch below recognise + run them too.
+    let comfyui = state
+        .comfyui
+        .as_ref()
+        .map(|h| crate::server::comfyui::ComfyuiToolSource::new((**h).clone()));
     let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
         state.tools.as_ref(),
         &user_mcp,
-    );
+    )
+    .with_comfyui(comfyui.as_ref());
 
     // Force a trailing usage frame each round so token/cost accounting works
     // even when the client didn't opt in; hide it from the client stream

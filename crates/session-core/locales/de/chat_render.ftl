@@ -8,7 +8,17 @@
 # `chat.ftl`.
 
 chat-render-canvas-toggle-title = Dokumentenansicht ein-/ausblenden
-chat-render-canvas-toggle-label = Dokument
+chat-render-canvas-toggle-label = Canvas
+chat-render-canvas-document-tab = Dokument
+chat-render-canvas-assets-tab = Dateien
+chat-render-canvas-assets-heading = Dateien dieser Unterhaltung
+chat-render-canvas-assets-count = { $count ->
+    [one] { $count } Datei
+   *[other] { $count } Dateien
+}
+chat-render-canvas-assets-empty = Dieser Unterhaltung wurden noch keine Dateien hinzugefügt.
+chat-render-canvas-asset-download = Datei herunterladen
+chat-render-canvas-close-title = Canvas schließen
 
 chat-render-model-placeholder = Modell (z. B. gpt-4o-mini)
 chat-render-model-aria = Chat-Modell

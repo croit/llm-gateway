@@ -8,7 +8,14 @@
 # `chat.ftl`.
 
 chat-render-canvas-toggle-title = 显示/隐藏文档画布
-chat-render-canvas-toggle-label = 文档
+chat-render-canvas-toggle-label = 画布
+chat-render-canvas-document-tab = 文档
+chat-render-canvas-assets-tab = 文件
+chat-render-canvas-assets-heading = 对话文件
+chat-render-canvas-assets-count = { $count } 个文件
+chat-render-canvas-assets-empty = 此对话中还没有文件。
+chat-render-canvas-asset-download = 下载文件
+chat-render-canvas-close-title = 关闭画布
 
 chat-render-model-placeholder = 模型（例如 gpt-4o-mini）
 chat-render-model-aria = 聊天模型

@@ -1,0 +1,96 @@
+id = "talking_video"
+title = "Talking Video (Image + Audio)"
+description = "Turn a still portrait into a talking-head video synced to an audio track using LTX-2.3 (22B, fp8). Pass the portrait image_id and a voice/audio attachment id. Useful for narration, dialogue, voice-over. The model also runs an LLM-side prompt enhancement step on your motion description."
+output_kind = "video"
+output_node_id = "341"
+output_filename_prefix = "llmgw-talking-video"
+
+[[params]]
+key = "image"
+node_id = "269"
+input_key = "image"
+required = true
+description = "Portrait image to animate. Pass the attachment id EXACTLY as it appears in the conversation — the long `<turn_id>/<filename>` string from the `[attached: id=...]` marker. Copy it verbatim; do NOT shorten or invent."
+
+  [params.schema]
+  type = "image_attachment"
+
+[[params]]
+key = "audio"
+node_id = "276"
+input_key = "audio"
+required = true
+description = "Voice / speech track to sync the lip movement to. Pass the attachment id EXACTLY as it appears in the conversation — the long `<turn_id>/<filename>` string from the `[attached: id=...]` marker. Copy it verbatim. WAV or MP3, clean isolated speech works best."
+
+  [params.schema]
+  type = "audio_attachment"
+
+[[params]]
+key = "prompt"
+node_id = "340:319"
+input_key = "value"
+description = "Optional motion / scene description beyond the portrait. The audio already drives the mouth; this controls other motion ('subtle head movement', 'natural eye blinks'). The template also runs an LLM prompt-enhancement step on this text before generation."
+default = "Talking head, subtle natural motion, eye blinks, head sway"
+
+  [params.schema]
+  type = "string"
+  max_length = 1500
+
+[[params]]
+key = "width"
+node_id = "340:330"
+input_key = "value"
+description = "Video width in pixels. 1280 default matches LTX training. Lower (768) for faster iteration; keep 1280 for final output."
+default = 1280
+
+  [params.schema]
+  type = "integer"
+  min = 512
+  max = 1920
+
+[[params]]
+key = "height"
+node_id = "340:324"
+input_key = "value"
+description = "Video height. 720 default (16:9 landscape at 1280×720). Use 1280×1280 for square, 720×1280 for portrait."
+default = 720
+
+  [params.schema]
+  type = "integer"
+  min = 320
+  max = 1920
+
+[[params]]
+key = "duration_seconds"
+node_id = "340:331"
+input_key = "value"
+description = "Clip length in seconds. Audio longer than this is trimmed. 9 s default; longer takes proportionally more VRAM and time. Stay below 30 s on 24 GB."
+default = 9
+
+  [params.schema]
+  type = "number"
+  min = 1.0
+  max = 30.0
+
+[[params]]
+key = "fps"
+node_id = "340:323"
+input_key = "value"
+description = "Output frame rate. 24 fps default (cinematic); 30 for smooth motion. The video gets resampled to this regardless of model output rate."
+default = 24
+
+  [params.schema]
+  type = "integer"
+  min = 8
+  max = 60
+
+[[params]]
+key = "seed"
+node_id = "seed_src"
+input_key = "value"
+description = "Random seed. Same image + audio + prompt + seed = same clip. -1 = fresh random. Both sampling passes share this seed."
+default = -1
+
+  [params.schema]
+  type = "integer"
+  min = -1

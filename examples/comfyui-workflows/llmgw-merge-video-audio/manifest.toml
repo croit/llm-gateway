@@ -1,0 +1,38 @@
+id = "merge_video_audio"
+title = "Merge Video and Audio"
+description = "Combine an existing video and audio file from this conversation into one MP4 with sound. Pass the video and audio attachment ids exactly as they appear in the conversation. The output duration follows the shorter input so the result never contains silent or frozen trailing content."
+output_kind = "video"
+output_node_id = "3"
+output_filename_prefix = "llmgw-merge-video-audio"
+
+[[params]]
+key = "video"
+node_id = "1"
+input_key = "video"
+required = true
+description = "Video attachment to use as the visual track. Pass the attachment id EXACTLY as it appears in the conversation — the long <turn_id>/<filename> string from the attachment marker."
+
+  [params.schema]
+  type = "video_attachment"
+
+[[params]]
+key = "audio"
+node_id = "2"
+input_key = "audio"
+required = true
+description = "Audio attachment to mux into the video. Pass the attachment id EXACTLY as it appears in the conversation — the long <turn_id>/<filename> string from the attachment marker."
+
+  [params.schema]
+  type = "audio_attachment"
+
+[[params]]
+key = "frame_rate"
+node_id = "3"
+input_key = "frame_rate"
+default = 16.0
+description = "Output frame rate. Use the source video's frame rate when known; 16 fps matches the gateway's generated video default."
+
+  [params.schema]
+  type = "number"
+  min = 1.0
+  max = 60.0

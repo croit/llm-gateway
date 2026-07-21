@@ -393,8 +393,9 @@ fn render_user_edit(turn: &Turn, base: &str, content: &str, lang: Lang) -> Html 
 /// the model's attachments look identical to the user's.
 ///
 /// Images are `<img>`-displayed at a thumbnail cap (max ~16 rem each
-/// side) linked through to the full-res URL; everything else gets a
-/// neutral chip with a mime-aware icon + filename + byte size.
+/// side) linked through to the full-res URL. Audio and video get native
+/// browser controls; everything else gets a neutral chip with a
+/// mime-aware icon + filename + byte size.
 /// Extract the turn id baked into a gateway attachment URL
 /// (`/chat/attachment/<turn_id>/<filename>`). Returns `None` for any URL
 /// not in that canonical shape, so a non-gateway URL is never misjudged.
@@ -466,6 +467,58 @@ fn render_attachment(
         return html! {
             a(href: (href), target: "_blank", rel: "noopener", class: "chat-msg__attachment-image") {
                 img(src: (url), alt: (alt), title: (title), loading: "lazy");
+            }
+        }
+        .to_html();
+    }
+    if mime.starts_with("video/") {
+        let title = t_args(
+            lang,
+            "render-attachment-title",
+            &i18n::args([
+                ("filename", filename.clone().into()),
+                ("mime", mime.clone().into()),
+                ("size", size.clone().into()),
+            ]),
+        );
+        return html! {
+            div(class: "chat-msg__attachment-player") {
+                video(
+                    src: (url.clone()),
+                    controls: "controls",
+                    preload: "metadata",
+                    title: (title)
+                ) {}
+                a(href: (url), target: "_blank", rel: "noopener", class: "chat-msg__attachment-player-meta") {
+                    span(class: "chat-msg__attachment-name") { (filename) }
+                    span(class: "chat-msg__attachment-meta") { (size) }
+                }
+            }
+        }
+        .to_html();
+    }
+    if mime.starts_with("audio/") {
+        let title = t_args(
+            lang,
+            "render-attachment-title",
+            &i18n::args([
+                ("filename", filename.clone().into()),
+                ("mime", mime.clone().into()),
+                ("size", size.clone().into()),
+            ]),
+        );
+        return html! {
+            div(class: "chat-msg__attachment-player chat-msg__attachment-player--audio") {
+                audio(
+                    src: (url.clone()),
+                    controls: "controls",
+                    preload: "metadata",
+                    title: (title)
+                ) {}
+                a(href: (url), target: "_blank", rel: "noopener", class: "chat-msg__attachment-player-meta") {
+                    span(class: "chat-msg__attachment-name") { (filename) }
+                    span(class: "chat-msg__attachment-meta") { (size) }
+                }
             }
         }
         .to_html();
@@ -2054,6 +2107,52 @@ mod tests {
         assert!(
             !orphan_img.contains("<img"),
             "an orphaned image must not emit a broken <img>: {orphan_img}"
+        );
+    }
+
+    #[test]
+    fn render_attachment_uses_native_players_for_audio_and_video() {
+        let video = crate::attachments::ParsedAttachment {
+            filename: "clip.mp4".into(),
+            mime: "video/mp4".into(),
+            url: "/chat/attachment/turn-A/clip.mp4".into(),
+            size: 209_000,
+            link: None,
+        };
+        let audio = crate::attachments::ParsedAttachment {
+            filename: "song.mp3".into(),
+            mime: "audio/mpeg".into(),
+            url: "/chat/attachment/turn-A/song.mp3".into(),
+            size: 2_400_000,
+            link: None,
+        };
+
+        let video_html = render_attachment(&video, "turn-A", Lang::En).to_string();
+        let audio_html = render_attachment(&audio, "turn-A", Lang::En).to_string();
+
+        assert!(
+            video_html.contains("<video"),
+            "video player missing: {video_html}"
+        );
+        assert!(
+            video_html.contains("controls"),
+            "video controls missing: {video_html}"
+        );
+        assert!(
+            video_html.contains("clip.mp4"),
+            "video filename missing: {video_html}"
+        );
+        assert!(
+            audio_html.contains("<audio"),
+            "audio player missing: {audio_html}"
+        );
+        assert!(
+            audio_html.contains("controls"),
+            "audio controls missing: {audio_html}"
+        );
+        assert!(
+            audio_html.contains("song.mp3"),
+            "audio filename missing: {audio_html}"
         );
     }
 

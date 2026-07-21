@@ -45,8 +45,30 @@ impl ToggleCtx {
 /// panel resolve the row list through, so they never drift.
 pub fn entries_for_roles(state: &RamaState, roles: &[String]) -> Vec<ToolEntry> {
     let role_ids = state.rbac.role_ids_for(roles);
-    let allowed = state.rbac.allowed_tools(&role_ids, &state.tools);
-    catalog::entries(&state.tools, &allowed, &state.typst_templates)
+    let mut allowed = state.rbac.allowed_tools(&role_ids, &state.tools);
+    state.expand_comfyui_tools(&mut allowed, &role_ids);
+    let comfyui_metas = state
+        .comfyui
+        .as_ref()
+        .map(|h| {
+            h.store
+                .current()
+                .workflows()
+                .into_iter()
+                .map(|m| catalog::ComfyuiMeta {
+                    tool_id: format!("comfyui_{}", m.id),
+                    title: m.title.clone(),
+                    description: m.description.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    catalog::entries(
+        &state.tools,
+        &allowed,
+        &state.typst_templates,
+        &comfyui_metas,
+    )
 }
 
 /// The set of valid toggle keys for these entries — used to reject bogus
