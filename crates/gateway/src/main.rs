@@ -465,6 +465,9 @@ async fn main() -> anyhow::Result<()> {
                     runner_timeout: std::time::Duration::from_secs(comfyui_cfg.timeout_secs),
                     s3,
                     max_concurrent_jobs: comfyui_cfg.max_concurrent_jobs,
+                    job_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                        comfyui_cfg.max_concurrent_jobs.max(1),
+                    )),
                     chat_updates: chat_updates.clone(),
                 });
                 tracing::info!(

@@ -29,9 +29,8 @@ pub struct EditImage;
 
 #[derive(Deserialize)]
 struct EditArgs {
-    /// Attachment id of the image to edit: `<turn_id>/<filename>` (the `id`
-    /// field `generate_image` / `upload_attachment` / `fetch_attachment`
-    /// return).
+    /// Attachment id or visible filename of the image to edit. Bare filenames
+    /// are resolved against the current chat session.
     image_id: String,
     prompt: String,
     #[serde(default)]
@@ -49,12 +48,11 @@ impl Tool for EditImage {
         ToolDef::function(
             self.id(),
             "Edit an existing image with a text instruction (image-to-image): \
-             change the background, add or remove an element, restyle it. Pass \
-             the `image_id` of an image already in the conversation (the `id` \
-             returned by generate_image, upload_attachment, or a user upload's \
-             attachment id) plus a `prompt` describing the change. The edited \
-             image is rendered inline in your reply; do NOT repeat any marker \
-             or describe it in prose.",
+              change the background, add or remove an element, restyle it. Pass \
+              the `image_id` of an image already in the conversation. Use the \
+              attachment id when available, or the visible filename. The edited \
+              image is rendered inline in your reply; do NOT repeat any marker \
+              or describe it in prose.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -62,8 +60,8 @@ impl Tool for EditImage {
                 "properties": {
                     "image_id": {
                         "type": "string",
-                        "description": "Attachment id of the source image, \
-                                        formatted `<turn_id>/<filename>`."
+                        "description": "Attachment id or visible filename of the \
+                                        source image already in this conversation."
                     },
                     "prompt": {
                         "type": "string",
@@ -90,12 +88,26 @@ impl Tool for EditImage {
             if args.prompt.trim().is_empty() {
                 return Err(ToolError::InvalidArgs("`prompt` must not be empty".into()));
             }
-            let (src_turn, src_file) = args.image_id.split_once('/').ok_or_else(|| {
-                ToolError::InvalidArgs(format!(
-                    "`image_id` must be `<turn_id>/<filename>`, got `{}`",
-                    args.image_id
-                ))
+            let session_id = ctx.session_id.as_ref().ok_or_else(|| {
+                ToolError::Failed("edit_image is only available inside a chat session".into())
             })?;
+            let resolved = if let Some((src_turn, src_file)) = args.image_id.split_once('/') {
+                (src_turn.to_string(), src_file.to_string())
+            } else {
+                let attachments = chat_attachments::list_session_attachments(&ctx.db, session_id)
+                    .await
+                    .map_err(|e| ToolError::Failed(format!("listing chat attachments: {e}")))?;
+                let Some(attachment) =
+                    chat_attachments::resolve_attachment(&attachments, &args.image_id)
+                else {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "`image_id` does not identify an image in this conversation (got `{}`)",
+                        args.image_id
+                    )));
+                };
+                (attachment.turn_id.clone(), attachment.filename.clone())
+            };
+            let (src_turn, src_file) = (&resolved.0, &resolved.1);
 
             let image_gen = ctx.image_gen.as_ref().ok_or_else(|| {
                 ToolError::Failed("image generation is not configured on this gateway".into())

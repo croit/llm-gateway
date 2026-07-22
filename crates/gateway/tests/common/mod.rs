@@ -299,6 +299,7 @@ pub async fn state_with_admin_rbac_and_comfyui(upstream_url: &str) -> RamaState 
         runner_timeout: std::time::Duration::from_secs(5),
         s3: None,
         max_concurrent_jobs: 1,
+        job_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         chat_updates: gateway::server::comfyui::ChatUpdateRegistry::default(),
     });
     let app = AppState::new(config, pool.clone(), registry, tools, rbac).with_comfyui(comfyui);

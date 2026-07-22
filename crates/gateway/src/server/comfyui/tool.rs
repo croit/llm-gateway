@@ -46,6 +46,9 @@ pub struct ComfyuiHandle {
     /// limit, so a single 24 GB GPU isn't flooded with overlapping
     /// diffusion runs. Mirrors `[comfyui] max_concurrent_jobs`.
     pub max_concurrent_jobs: usize,
+    /// Process-local slots prevent one model response from flooding the
+    /// worker with several long-running workflows at once.
+    pub job_slots: Arc<tokio::sync::Semaphore>,
     pub chat_updates: ChatUpdateRegistry,
 }
 
@@ -184,6 +187,14 @@ impl Tool for ComfyuiWorkflowTool {
                 )
             })?;
 
+            let _job_slot = self
+                .handle
+                .job_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| ToolError::Failed("ComfyUI job scheduler is shutting down".into()))?;
+
             // Enforce the operator's concurrency limit before doing any
             // work. A single 24 GB GPU can only run one diffusion job at
             // a time; queuing more just floods ComfyUI's internal queue
@@ -198,9 +209,10 @@ impl Tool for ComfyuiWorkflowTool {
                 )));
             }
 
-            // Phase 1: resolve args, upload attachments, submit to ComfyUI.
-            // Returns immediately with a prompt_id — does NOT wait for the
-            // workflow to finish. The scheduler handles completion later.
+            // Submit the workflow and persist it before waiting. The scheduler
+            // owns polling, fetching, and re-hosting; this tool future stays
+            // pending so the normal LLM tool loop cannot run ahead of the
+            // generated asset.
             let runner = self.runner();
             let prompt_id = runner.prepare_and_submit(&manifest, &args).await.map_err(|e| match e {
                 RunError::InvalidArgs(arg) => ToolError::InvalidArgs(format!("{arg}")),
@@ -211,8 +223,6 @@ impl Tool for ComfyuiWorkflowTool {
                 other => ToolError::Failed(format!("{other}")),
             })?;
 
-            // Store the job in the DB so the scheduler can poll for
-            // completion and re-host the result as a chat attachment.
             let job_id = super::jobs::create(
                 &ctx.db,
                 &prompt_id,
@@ -237,30 +247,55 @@ impl Tool for ComfyuiWorkflowTool {
                 job_id,
                 prompt_id = %prompt_id,
                 workflow = %manifest.id,
-                "ComfyUI job submitted — scheduler will handle completion",
+                "ComfyUI job submitted — waiting for scheduler completion",
             );
 
-            // Return immediately. The LLM tells the user "generation started";
-            // the result appears as an attachment when the scheduler completes.
-            Ok(json!({
-                "status": "started",
-                "job_id": job_id,
-                "prompt_id": prompt_id,
-                "workflow": manifest.id,
-                "note": "The generation is running in the background. The result \
-                         will appear as an attachment in your message bubble \
-                         when it finishes — usually within 30 seconds to a few \
-                         minutes depending on the model. Do NOT tell the user \
-                         the image is ready yet; wait for it to appear."
-            }))
+            let deadline = tokio::time::Instant::now() + self.handle.runner_timeout;
+            loop {
+                let job = super::jobs::get(&ctx.db, job_id)
+                    .await
+                    .map_err(|e| ToolError::Failed(format!("read ComfyUI job status: {e}")))?
+                    .ok_or_else(|| {
+                        ToolError::Failed(format!(
+                            "ComfyUI job {job_id} disappeared before completion"
+                        ))
+                    })?;
+                match job.status.as_str() {
+                    "completed" => {
+                        return Ok(json!({
+                            "status": "completed",
+                            "job_id": job_id,
+                            "prompt_id": prompt_id,
+                            "workflow": manifest.id,
+                            "filename": job.output_filename,
+                            "mime": job.output_mime,
+                            "note": "The generated asset is attached. Continue with the next requested action."
+                        }));
+                    }
+                    "failed" => {
+                        return Err(ToolError::Failed(format!(
+                            "ComfyUI workflow failed: {}",
+                            job.error_message.unwrap_or_else(|| {
+                                "the scheduler reported an unknown failure".into()
+                            })
+                        )));
+                    }
+                    _ if tokio::time::Instant::now() >= deadline => {
+                        return Err(ToolError::Failed(format!(
+                            "ComfyUI workflow did not finish within {} seconds",
+                            self.handle.runner_timeout.as_secs()
+                        )));
+                    }
+                    _ => tokio::time::sleep(self.handle.runner_poll_interval).await,
+                }
+            }
         })
     }
 
     fn max_duration(&self) -> Option<std::time::Duration> {
-        // The tool only does Phase 1 (submit), which is a single HTTP POST
-        // to ComfyUI + attachment uploads. It should be fast (< 30s even
-        // with large image uploads). The scheduler handles the long wait.
-        Some(std::time::Duration::from_secs(60))
+        // The scheduler performs the long poll, but the tool future stays
+        // pending so the model receives a terminal result before continuing.
+        Some(self.handle.runner_timeout + std::time::Duration::from_secs(30))
     }
 }
 
@@ -419,6 +454,7 @@ type = "string"
             runner_timeout: std::time::Duration::from_secs(1),
             s3: None,
             max_concurrent_jobs: 1,
+            job_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             chat_updates: super::ChatUpdateRegistry::default(),
         };
         let tool = ComfyuiWorkflowTool::new("text_to_image".into(), handle);
@@ -435,6 +471,7 @@ type = "string"
             runner_timeout: std::time::Duration::from_secs(1),
             s3: None,
             max_concurrent_jobs: 1,
+            job_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             chat_updates: super::ChatUpdateRegistry::default(),
         };
         let tool = ComfyuiWorkflowTool::new("text_to_image".into(), handle);
@@ -457,6 +494,7 @@ type = "string"
             runner_timeout: std::time::Duration::from_secs(1),
             s3: None,
             max_concurrent_jobs: 1,
+            job_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             chat_updates: super::ChatUpdateRegistry::default(),
         };
         let source = ComfyuiToolSource::new(handle);
@@ -475,6 +513,7 @@ type = "string"
             runner_timeout: std::time::Duration::from_secs(1),
             s3: None,
             max_concurrent_jobs: 1,
+            job_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             chat_updates: super::ChatUpdateRegistry::default(),
         };
         let source = ComfyuiToolSource::new(handle);
@@ -494,6 +533,7 @@ type = "string"
             runner_timeout: std::time::Duration::from_secs(1),
             s3: None,
             max_concurrent_jobs: 1,
+            job_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             chat_updates: super::ChatUpdateRegistry::default(),
         };
         let source = ComfyuiToolSource::new(handle);

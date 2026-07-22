@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jiff::Timestamp;
+use serde_json::json;
+use sqlx::Row;
 
 use super::client::{Client, ProducedAsset, StatusCheck};
 use super::jobs::{self, ComfyuiJob};
@@ -188,11 +190,11 @@ impl ComfyuiScheduler {
         };
         let ext = ext_for_mime(&downloaded.mime);
         // Include the job id + a short slice of prompt_id for uniqueness
-        // — two comfyui_text_to_image calls in one turn would otherwise
-        // collide on <turn_id>/comfyui-text_to_image.png and the second
+        // — two text_to_image calls in one turn would otherwise collide on
+        // <turn_id>/text_to_image.png and the second
         // upload would silently overwrite the first.
         let prompt_short: String = job.prompt_id.chars().take(8).collect();
-        let filename = format!("comfyui-{}-{}{}", job.workflow_id, prompt_short, ext);
+        let filename = format!("{}-{}{}", job.workflow_id, prompt_short, ext);
         let upload = match chat_attachments::upload(
             s3,
             &job.turn_id,
@@ -229,6 +231,7 @@ impl ComfyuiScheduler {
         if let Err(e) = session_core::db::append_content(&self.db, &job.turn_id, &chunk).await {
             tracing::warn!(job_id = job.id, error = %e, "ComfyUI scheduler: append to turn failed (job is already marked completed)");
         }
+        self.mark_tool_call_completed(job, &upload).await;
         self.chat_updates.notify(&job.session_id);
         tracing::info!(
             job_id = job.id,
@@ -236,6 +239,60 @@ impl ComfyuiScheduler {
             filename = %upload.filename,
             "ComfyUI job completed — asset re-hosted and appended to turn",
         );
+    }
+
+    async fn mark_tool_call_completed(
+        &self,
+        job: &ComfyuiJob,
+        upload: &chat_attachments::UploadOutcome,
+    ) {
+        let rows = match sqlx::query(
+            "SELECT id, output_json FROM chat_tool_calls WHERE turn_id = ? AND name = ?",
+        )
+        .bind(&job.turn_id)
+        .bind(format!("comfyui_{}", job.workflow_id))
+        .fetch_all(&self.db)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(job_id = job.id, error = %err, "ComfyUI scheduler: could not load tool call status");
+                return;
+            }
+        };
+
+        for row in rows {
+            let Ok(id) = row.try_get::<String, _>("id") else {
+                continue;
+            };
+            let Some(raw) = row
+                .try_get::<Option<String>, _>("output_json")
+                .ok()
+                .flatten()
+            else {
+                continue;
+            };
+            let Ok(mut output) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if output.get("status").and_then(|value| value.as_str()) != Some("started") {
+                continue;
+            }
+            output["status"] = json!("completed");
+            output["filename"] = json!(upload.filename);
+            output["mime"] = json!(upload.mime);
+            if let Err(err) = session_core::db::complete_tool_call(
+                &self.db,
+                &job.turn_id,
+                &id,
+                &output.to_string(),
+                session_core::db::ToolCallStatus::Completed,
+            )
+            .await
+            {
+                tracing::warn!(job_id = job.id, error = %err, "ComfyUI scheduler: could not complete tool call status");
+            }
+        }
     }
 
     async fn handle_failure(&self, job: &ComfyuiJob, reason: &str) {

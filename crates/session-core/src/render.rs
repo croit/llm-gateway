@@ -47,10 +47,13 @@ use crate::icons;
 /// `<img src>`. (Raw `<img>` HTML the model types is already escaped to
 /// text by `Options::gfm()`'s `allow_dangerous_html = false`.)
 pub fn render_markdown(text: &str) -> String {
+    // Images in assistant prose are never real gateway attachments. Actual
+    // images use gw-attachment markers and are rendered separately.
+    let text = SYNTHETIC_IMAGE_RE.replace_all(text, "$1");
     let mut options = markdown::Options::gfm();
     options.parse.constructs.label_start_image = false;
-    let html =
-        markdown::to_html_with_options(text, &options).unwrap_or_else(|_| markdown::to_html(text));
+    let html = markdown::to_html_with_options(&text, &options)
+        .unwrap_or_else(|_| markdown::to_html(&text));
     highlight_fenced_code_blocks(&html)
 }
 
@@ -76,6 +79,10 @@ static DARK_THEME: std::sync::LazyLock<lumis::themes::Theme> = std::sync::LazyLo
 /// code blocks don't merge into one giant match.
 static FENCED_CODE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r#"(?s)<pre><code class="language-([\w+\-.]+)">(.*?)</code></pre>"#).unwrap()
+});
+
+static SYNTHETIC_IMAGE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"!\[([^\]]*)\]\((?:[^)]*/)?generated-image[^)]*\)").unwrap()
 });
 
 fn highlight_fenced_code_blocks(html: &str) -> String {
@@ -297,7 +304,7 @@ pub fn render_user_turn(turn: &Turn, actions: Option<&str>, lang: Lang) -> Html 
                             }
                         }
                         crate::attachments::Segment::Attachment(att) => {
-                            (render_attachment(att, &turn.id, lang))
+                             (render_attachment(att, lang))
                         }
                     }
                 }
@@ -396,48 +403,11 @@ fn render_user_edit(turn: &Turn, base: &str, content: &str, lang: Lang) -> Html 
 /// side) linked through to the full-res URL. Audio and video get native
 /// browser controls; everything else gets a neutral chip with a
 /// mime-aware icon + filename + byte size.
-/// Extract the turn id baked into a gateway attachment URL
-/// (`/chat/attachment/<turn_id>/<filename>`). Returns `None` for any URL
-/// not in that canonical shape, so a non-gateway URL is never misjudged.
-fn attachment_turn_id(url: &str) -> Option<&str> {
-    url.strip_prefix("/chat/attachment/")
-        .and_then(|rest| rest.split('/').next())
-        .filter(|id| !id.is_empty())
-}
-
-fn render_attachment(
-    att: &crate::attachments::ParsedAttachment,
-    owner_turn_id: &str,
-    lang: Lang,
-) -> Html {
+fn render_attachment(att: &crate::attachments::ParsedAttachment, lang: Lang) -> Html {
     let url = att.url.clone();
     let filename = att.filename.clone();
     let mime = att.mime.clone();
     let size = format_bytes(att.size);
-    // Orphaned marker: an attachment URL carries the id of the turn that
-    // owns it (the upload writes the marker into that same turn), so a
-    // turn_id that doesn't match the turn we're rendering means the bytes
-    // are unreachable — the fetch route would 404 "no such turn". This can
-    // happen with rows left behind by an older build or an interrupted
-    // generation. Render a muted, link-less placeholder rather than a
-    // broken <img> or a download link that dead-ends.
-    if let Some(att_turn) = attachment_turn_id(&url)
-        && att_turn != owner_turn_id
-    {
-        let unavailable_title = t(lang, "render-attachment-unavailable-title");
-        let unavailable_meta = t(lang, "render-attachment-unavailable-meta");
-        return html! {
-            span(
-                class: "chat-msg__attachment-chip chat-msg__attachment-chip--missing",
-                title: (unavailable_title)
-            ) {
-                span(class: "chat-msg__attachment-icon") { (icons::paperclip(14)) }
-                span(class: "chat-msg__attachment-name") { (filename) }
-                span(class: "chat-msg__attachment-meta") { (unavailable_meta) }
-            }
-        }
-        .to_html();
-    }
     if att.is_image() {
         let alt = filename.clone();
         // A preview image (e.g. a typst render's PNG) clicks through to
@@ -647,7 +617,7 @@ pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: La
                             #(html.clone())
                         }
                         AssistantSegment::Attachment(att) => {
-                            (render_attachment(att, &turn.id, lang))
+                            (render_attachment(att, lang))
                         }
                     }
                 }
@@ -1096,9 +1066,22 @@ pub fn render_tool_call(call: &ToolCall, lang: Lang) -> Html {
         .output_json
         .clone()
         .map(|s| truncate_for_display(s, lang));
-    let is_running = call.status == ToolCallStatus::Running;
+    let async_started = call
+        .output_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .map(|output| output.get("status").and_then(|status| status.as_str()) == Some("started"))
+        .unwrap_or(false);
+    let is_running = call.status == ToolCallStatus::Running || async_started;
     let status_label = match call.status {
-        ToolCallStatus::Running => t(lang, "render-tool-status-calling"),
+        ToolCallStatus::Running => {
+            if async_started || call.name.starts_with("comfyui_") {
+                t(lang, "render-tools-running")
+            } else {
+                t(lang, "render-tool-status-calling")
+            }
+        }
+        ToolCallStatus::Completed if async_started => t(lang, "render-tools-running"),
         ToolCallStatus::Completed => t(lang, "render-tool-status-used"),
         ToolCallStatus::Errored => t(lang, "render-tool-status-error"),
     };
@@ -2053,17 +2036,7 @@ mod tests {
     }
 
     #[test]
-    fn attachment_turn_id_parses_gateway_urls_only() {
-        assert_eq!(
-            attachment_turn_id("/chat/attachment/abc-123/letter.pdf"),
-            Some("abc-123")
-        );
-        assert_eq!(attachment_turn_id("https://example.invalid/x.png"), None);
-        assert_eq!(attachment_turn_id("/chat/attachment//letter.pdf"), None);
-    }
-
-    #[test]
-    fn render_attachment_degrades_when_marker_turn_orphaned() {
+    fn render_attachment_keeps_proxy_url_when_marker_turn_differs() {
         let pdf = crate::attachments::ParsedAttachment {
             filename: "letter.pdf".into(),
             mime: "application/pdf".into(),
@@ -2071,31 +2044,19 @@ mod tests {
             size: 19600,
             link: None,
         };
-        // Owner matches → normal chip with a working download link.
-        let ok = render_attachment(&pdf, "turn-A", Lang::En).to_string();
+        let rendered = render_attachment(&pdf, Lang::En).to_string();
         assert!(
-            ok.contains("/chat/attachment/turn-A/letter.pdf"),
-            "expected the real download link: {ok}"
+            rendered.contains("/chat/attachment/turn-A/letter.pdf"),
+            "expected the real download link: {rendered}"
         );
         assert!(
-            !ok.contains("unavailable"),
-            "should not be a placeholder: {ok}"
-        );
-        // Owner differs (orphaned marker) → muted placeholder, no dead link.
-        let orphan = render_attachment(&pdf, "turn-B", Lang::En).to_string();
-        assert!(
-            orphan.contains("unavailable"),
-            "expected the unavailable placeholder: {orphan}"
+            !rendered.contains("unavailable"),
+            "a valid session attachment should not be a placeholder: {rendered}"
         );
         assert!(
-            !orphan.contains("href"),
-            "an orphaned attachment must not render a dead link: {orphan}"
+            rendered.contains("letter.pdf"),
+            "filename should still be shown: {rendered}"
         );
-        assert!(
-            orphan.contains("letter.pdf"),
-            "filename should still be shown: {orphan}"
-        );
-        // An orphaned image must not emit a broken <img>.
         let png = crate::attachments::ParsedAttachment {
             filename: "preview.png".into(),
             mime: "image/png".into(),
@@ -2103,10 +2064,10 @@ mod tests {
             size: 1000,
             link: None,
         };
-        let orphan_img = render_attachment(&png, "turn-B", Lang::En).to_string();
+        let rendered_img = render_attachment(&png, Lang::En).to_string();
         assert!(
-            !orphan_img.contains("<img"),
-            "an orphaned image must not emit a broken <img>: {orphan_img}"
+            rendered_img.contains("<img"),
+            "a valid session image should be rendered inline: {rendered_img}"
         );
     }
 
@@ -2127,8 +2088,8 @@ mod tests {
             link: None,
         };
 
-        let video_html = render_attachment(&video, "turn-A", Lang::En).to_string();
-        let audio_html = render_attachment(&audio, "turn-A", Lang::En).to_string();
+        let video_html = render_attachment(&video, Lang::En).to_string();
+        let audio_html = render_attachment(&audio, Lang::En).to_string();
 
         assert!(
             video_html.contains("<video"),

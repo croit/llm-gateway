@@ -83,6 +83,17 @@ pub async fn pending_count(db: &Pool) -> Result<i64, sqlx::Error> {
     row.try_get::<i64, _>("count")
 }
 
+/// Load one job so the tool invocation can remain pending until the scheduler
+/// records a terminal result. This is what lets the normal LLM tool loop send
+/// the completed result back to the model and continue with its next action.
+pub async fn get(db: &Pool, id: i64) -> Result<Option<ComfyuiJob>, sqlx::Error> {
+    let row = sqlx::query("SELECT * FROM comfyui_jobs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.as_ref().map(row_to_job))
+}
+
 /// Mark a job as completed and record the output metadata.
 pub async fn complete(
     db: &Pool,
@@ -210,6 +221,28 @@ mod tests {
             recent[0].output_filename.as_deref(),
             Some("llmgw-t2i_001.png")
         );
+    }
+
+    #[tokio::test]
+    async fn get_returns_the_current_job_state() {
+        let db = db().await;
+        let id = create(
+            &db,
+            "p-get",
+            "s-get",
+            "t-get",
+            "u-get",
+            "text_to_image",
+            "image",
+            "9",
+            "llmgw-t2i",
+        )
+        .await
+        .unwrap();
+        let job = get(&db, id).await.unwrap().unwrap();
+        assert_eq!(job.id, id);
+        assert_eq!(job.status, "pending");
+        assert!(get(&db, id + 1).await.unwrap().is_none());
     }
 
     #[tokio::test]

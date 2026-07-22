@@ -172,7 +172,10 @@ gateway uploads bytes to chat attachments S3 bucket
    ↓
 gateway splices [gw-attachment …] marker into assistant turn
    ↓
-tool returns concise metadata to model (no bytes)
+tool returns concise terminal metadata to model (no bytes)
+   ↓
+the normal tool loop wakes the LLM only after success or failure, so it can
+continue with the next requested action
 ```
 
 ## RBAC
