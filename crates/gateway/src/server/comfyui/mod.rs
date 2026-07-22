@@ -66,14 +66,15 @@ impl ChatUpdateRegistry {
     }
 
     pub fn notify(&self, session_id: &str) {
-        let sender = self
-            .0
-            .lock()
-            .expect("chat update registry lock poisoned")
-            .get(session_id)
-            .cloned();
-        if let Some(sender) = sender {
+        let mut map = self.0.lock().expect("chat update registry lock poisoned");
+        if let Some(sender) = map.get(session_id) {
             let _ = sender.send(session_core::workers::TurnUpdate::SidebarChanged);
         }
+        // Prune senders whose live chat stream has gone away (no receivers
+        // left). Without this the map grows by one entry per session that
+        // ever ran a job, for the whole process lifetime. Live sessions —
+        // including a second concurrent job on this same session — keep a
+        // receiver, so they survive the sweep.
+        map.retain(|_, sender| sender.receiver_count() > 0);
     }
 }

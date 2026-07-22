@@ -647,6 +647,25 @@ pub fn marker_line_linked(turn_id: &str, att: &UploadOutcome, link: &str) -> Str
     )
 }
 
+/// Canonical file extension (including the leading dot) for a produced
+/// asset's mime type, or `None` for a type we don't recognise. Single
+/// source of truth for the image/video/audio tools (image_gen,
+/// generate_image, edit_image, comfyui) — each applies its own fallback
+/// (`.png` for the image-only paths, `.bin` for the mixed comfyui path).
+pub fn ext_for_mime(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some(".png"),
+        "image/jpeg" => Some(".jpg"),
+        "image/webp" => Some(".webp"),
+        "image/gif" => Some(".gif"),
+        "video/mp4" => Some(".mp4"),
+        "video/webm" => Some(".webm"),
+        "audio/mpeg" => Some(".mp3"),
+        "audio/wav" => Some(".wav"),
+        _ => None,
+    }
+}
+
 /// The gateway-relative URL the chat bubble's `<img>` / chip hrefs
 /// point at for one uploaded attachment. The handler at this path
 /// gates on the session cookie + verifies the turn belongs to the

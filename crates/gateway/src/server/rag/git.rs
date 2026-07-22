@@ -231,12 +231,6 @@ async fn run(command: &'static str, cwd: &Path, args: &[&str]) -> Result<String,
     String::from_utf8(output.stdout).map_err(|_| GitError::BadOutput { command })
 }
 
-/// Internal convenience for callers (and tests) that want a target dir
-/// under the gateway's `data/rag-cache/<id>/` layout.
-pub fn cache_path_for(base: &Path, collection_id: i64) -> PathBuf {
-    base.join(format!("{collection_id}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

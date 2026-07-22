@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use shared::api::ToolDef;
 use thiserror::Error;
 
 /// One loaded workflow. Cheaply cloneable; held in `Arc` by the registry.
@@ -28,9 +29,6 @@ pub struct WorkflowManifest {
     pub output_node_id: String,
     pub output_filename_prefix: String,
     pub params: Vec<Param>,
-    /// Path to `workflow.json` in the same directory. The loader resolves
-    /// it once so the runtime doesn't have to repeat the path dance.
-    pub workflow_path: PathBuf,
     /// Parsed `workflow.json` content, cached at load time so the runner
     /// doesn't re-read + re-parse the file on every tool call. Cloned
     /// cheaply (it's behind `Arc`).
@@ -106,6 +104,13 @@ pub struct ParamSchema {
     pub enum_values: Option<Vec<String>>,
     #[serde(default, rename = "max_length")]
     pub max_length: Option<u64>,
+    /// When `true`, a resolved value of `-1` is replaced with a fresh random
+    /// value before the workflow is submitted (the conventional ComfyUI
+    /// "seed = -1 → randomize" contract). Declared per-param in the manifest
+    /// so the behavior is explicit and data-driven, not inferred from the
+    /// parameter's name. Only meaningful for integer params.
+    #[serde(default)]
+    pub randomize_on_sentinel: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -229,6 +234,21 @@ impl WorkflowManifest {
             .filter(|p| p.required)
             .map(|p| p.key.clone())
             .collect()
+    }
+
+    /// The full [`ToolDef`] the model sees for this workflow, keyed by the
+    /// caller-supplied tool id (`comfyui_<manifest id>`).
+    pub fn tool_def(&self, tool_id: impl Into<String>) -> ToolDef {
+        ToolDef::function(
+            tool_id.into(),
+            self.description.clone(),
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": self.required_keys(),
+                "properties": self.tool_properties(),
+            }),
+        )
     }
 
     /// Validate + resolve incoming args against the manifest. Applies
@@ -477,7 +497,6 @@ pub fn load(dir: &std::path::Path) -> Result<WorkflowManifest, ManifestError> {
         output_node_id: raw.output_node_id,
         output_filename_prefix: raw.output_filename_prefix,
         params: raw.params,
-        workflow_path,
         workflow_json: Arc::new(workflow_json),
     })
 }
@@ -530,7 +549,6 @@ mod tests {
             output_node_id: "9".into(),
             output_filename_prefix: "comfyui".into(),
             params,
-            workflow_path: PathBuf::from("/dev/null/workflow.json"),
             workflow_json: Arc::new(json!({})),
         }
     }
@@ -549,6 +567,7 @@ mod tests {
                 max: None,
                 enum_values: None,
                 max_length: Some(100),
+                randomize_on_sentinel: false,
             },
         }
     }
@@ -567,6 +586,7 @@ mod tests {
                 max,
                 enum_values: None,
                 max_length: None,
+                randomize_on_sentinel: false,
             },
         }
     }
@@ -585,6 +605,7 @@ mod tests {
                 max: None,
                 enum_values: Some(values.iter().map(|s| s.to_string()).collect()),
                 max_length: None,
+                randomize_on_sentinel: false,
             },
         }
     }

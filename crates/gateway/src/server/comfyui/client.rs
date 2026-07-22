@@ -157,11 +157,10 @@ impl Client {
         prompt_id: &str,
         output_node_id: &str,
     ) -> Result<StatusCheck, ComfyuiClientError> {
-        match self.history(prompt_id).await? {
+        match self.history(prompt_id, output_node_id).await? {
             HistoryState::Pending => Ok(StatusCheck::Pending),
             HistoryState::Failed(status) => Ok(StatusCheck::Failed(status)),
-            HistoryState::Completed(outputs) => {
-                let assets = outputs.get(output_node_id).cloned().unwrap_or_default();
+            HistoryState::Completed(assets) => {
                 if assets.is_empty() {
                     Ok(StatusCheck::Failed("no output asset for the node".into()))
                 } else {
@@ -189,7 +188,7 @@ impl Client {
                     timeout_secs: timeout.as_secs(),
                 });
             }
-            match self.history(prompt_id).await? {
+            match self.history(prompt_id, output_node_id).await? {
                 HistoryState::Pending => {
                     tokio::time::sleep(poll_interval).await;
                 }
@@ -199,20 +198,24 @@ impl Client {
                         status,
                     });
                 }
-                HistoryState::Completed(outputs) => {
-                    let node = outputs.get(output_node_id).ok_or_else(|| {
-                        ComfyuiClientError::NoOutput {
+                HistoryState::Completed(assets) => {
+                    if assets.is_empty() {
+                        return Err(ComfyuiClientError::NoOutput {
                             prompt_id: prompt_id.into(),
                             node_id: output_node_id.into(),
-                        }
-                    })?;
-                    return Ok(node.clone());
+                        });
+                    }
+                    return Ok(assets);
                 }
             }
         }
     }
 
-    async fn history(&self, prompt_id: &str) -> Result<HistoryState, ComfyuiClientError> {
+    async fn history(
+        &self,
+        prompt_id: &str,
+        output_node_id: &str,
+    ) -> Result<HistoryState, ComfyuiClientError> {
         let path = format!("/history/{prompt_id}");
         let resp = self
             .http
@@ -241,7 +244,7 @@ impl Client {
                     path,
                     source: e,
                 })?;
-        Ok(parsed.into_state(prompt_id))
+        Ok(parsed.into_state(prompt_id, output_node_id))
     }
 
     /// Upload a file (image/video/audio) into ComfyUI's input store via
@@ -352,11 +355,12 @@ impl Client {
                 method: "GET",
                 path,
                 source: e,
-            })?
-            .to_vec();
+            })?;
+        // Reject oversized payloads before copying the buffer into a `Vec`.
         if bytes.len() > MAX_OUTPUT_BYTES {
             return Err(ComfyuiClientError::OutputTooLarge);
         }
+        let bytes = bytes.to_vec();
         Ok(DownloadedAsset {
             bytes,
             mime: content_type,
@@ -377,12 +381,6 @@ pub struct ProducedAsset {
 
 fn default_output_type() -> String {
     "output".into()
-}
-
-impl ProducedAsset {
-    pub fn output_kind(&self) -> &str {
-        &self.r#type
-    }
 }
 
 /// Result of a single-shot [`Client::check_status`] call — non-blocking
@@ -497,11 +495,11 @@ struct HistoryStatus {
 enum HistoryState {
     Pending,
     Failed(String),
-    Completed(std::collections::HashMap<String, Vec<ProducedAsset>>),
+    Completed(Vec<ProducedAsset>),
 }
 
 impl HistoryResponse {
-    fn into_state(self, prompt_id: &str) -> HistoryState {
+    fn into_state(self, prompt_id: &str, output_node_id: &str) -> HistoryState {
         let Some(entry) = self.0.get(prompt_id) else {
             return HistoryState::Pending;
         };
@@ -516,26 +514,10 @@ impl HistoryResponse {
                     }
                     return HistoryState::Pending;
                 }
-                HistoryState::Completed(flatten_outputs(entry))
+                HistoryState::Completed(entry.assets_for(output_node_id))
             }
         }
     }
-}
-
-/// Flatten ComfyUI's nested `{node_id: {kind: [values]}}` outputs into
-/// `{node_id: [asset, ...]}`. Non-asset values (PreviewAny text, bools)
-/// are silently skipped — the runner only cares about file-producing
-/// nodes (SaveImage / SaveVideo / SaveAudio). Uses
-/// [`HistoryEntry::assets_for`] internally.
-fn flatten_outputs(entry: &HistoryEntry) -> std::collections::HashMap<String, Vec<ProducedAsset>> {
-    let mut out = std::collections::HashMap::new();
-    for node_id in entry.outputs.keys() {
-        let assets = entry.assets_for(node_id);
-        if !assets.is_empty() {
-            out.insert(node_id.clone(), assets);
-        }
-    }
-    out
 }
 
 fn truncate(s: String, max: usize) -> String {

@@ -19,9 +19,9 @@ async fn text_to_image_against_real_comfyui() {
         .with_env_filter("gateway=debug")
         .try_init();
 
-    // Point at the real ComfyUI worker. Adjust if your worker is elsewhere.
+    // Point at the real ComfyUI worker. Set COMFYUI_URL to your worker.
     let base_url = std::env::var("COMFYUI_URL")
-        .unwrap_or_else(|_| "http://llm01.int.croit.io:8008".to_string());
+        .unwrap_or_else(|_| "http://comfyui.example.com:8008".to_string());
 
     let client = Client::new(base_url).expect("client build");
     let runner = Runner::new(client, Duration::from_millis(500), Duration::from_secs(120));

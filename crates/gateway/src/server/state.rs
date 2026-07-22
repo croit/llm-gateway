@@ -250,7 +250,9 @@ impl AppState {
             crate::server::rbac::resolver::ComfyuiGrant::Specific(ids) => {
                 let snapshot = handle.store.current();
                 for id in ids {
-                    let Some(workflow_id) = id.strip_prefix("comfyui_") else {
+                    let Some(workflow_id) =
+                        id.strip_prefix(crate::server::tools::catalog::COMFYUI_PREFIX)
+                    else {
                         continue;
                     };
                     if snapshot.lookup(workflow_id).is_some() && !allowed.contains(&id) {

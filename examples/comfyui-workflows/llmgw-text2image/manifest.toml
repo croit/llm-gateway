@@ -85,3 +85,4 @@ default = -1
   [params.schema]
   type = "integer"
   min = -1
+  randomize_on_sentinel = true

@@ -22,7 +22,7 @@ use session_core::icons;
 
 use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_admin_or_403};
 use crate::rama_server::state::RamaState;
-use crate::server::comfyui::{ComfyuiStore, OutputKind, ReloadReport, WorkflowManifest};
+use crate::server::comfyui::{ComfyuiStore, ReloadReport, WorkflowManifest};
 use crate::server::db::users::User;
 
 /// GET /admin/comfyui — render the current catalog snapshot.
@@ -64,7 +64,16 @@ pub async fn comfyui_reload(State(state): State<Arc<RamaState>>, req: Request) -
     let Some(handle) = state.comfyui.as_ref() else {
         return see_other("/admin/comfyui");
     };
-    let report: ReloadReport = handle.store.reload();
+    // The rescan is synchronous disk I/O + parsing — run it off the async
+    // worker thread.
+    let store = handle.store.clone();
+    let report: ReloadReport = match tokio::task::spawn_blocking(move || store.reload()).await {
+        Ok(report) => report,
+        Err(err) => {
+            tracing::warn!(error = %err, "comfyui reload task panicked");
+            return see_other("/admin/comfyui");
+        }
+    };
     tracing::info!(
         loaded = report.total,
         skipped = report.skipped.len(),
@@ -124,7 +133,6 @@ async fn render_page(
     impersonating: bool,
     flash: Option<&str>,
 ) -> Response {
-    let _handle = state.comfyui.as_ref().map(|h| (**h).clone());
     let jobs = crate::server::comfyui::jobs::recent(&state.db, 20)
         .await
         .unwrap_or_default();
@@ -304,12 +312,7 @@ fn reload_button(enabled: bool) -> Html {
 
 fn render_workflow_row(m: &WorkflowManifest) -> Html {
     let tool_id = format!("comfyui_{}", m.id);
-    let kind_label = match m.output_kind {
-        OutputKind::Image => "image",
-        OutputKind::Video => "video",
-        OutputKind::Audio => "audio",
-        OutputKind::Json => "json",
-    };
+    let kind_label = m.output_kind.to_string();
     let params: Vec<Html> = m
         .params
         .iter()

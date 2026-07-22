@@ -154,7 +154,10 @@ impl Tool for EditImage {
                 .await
                 .map_err(|e| ToolError::Failed(e.to_string()))?;
 
-            let base = format!("edited-image{}", ext_for_mime(&edited.mime));
+            let base = format!(
+                "edited-image{}",
+                chat_attachments::ext_for_mime(&edited.mime).unwrap_or(".png")
+            );
             let filename =
                 chat_attachments::reserve_filename(&ctx.db, turn_id, reservations, &base)
                     .await
@@ -183,16 +186,6 @@ impl Tool for EditImage {
 
     fn max_duration(&self) -> Option<std::time::Duration> {
         Some(std::time::Duration::from_secs(130))
-    }
-}
-
-/// File extension (with leading dot) for a mime; defaults to `.png`.
-fn ext_for_mime(mime: &str) -> &'static str {
-    match mime {
-        "image/jpeg" => ".jpg",
-        "image/webp" => ".webp",
-        "image/gif" => ".gif",
-        _ => ".png",
     }
 }
 

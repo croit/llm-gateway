@@ -284,7 +284,9 @@ impl Resolver {
             for tool in &group.tools {
                 if tool == "*" {
                     wildcard = true;
-                } else if tool.starts_with("comfyui_") && !specific.contains(tool) {
+                } else if tool.starts_with(crate::server::tools::catalog::COMFYUI_PREFIX)
+                    && !specific.contains(tool)
+                {
                     specific.push(tool.clone());
                 }
             }

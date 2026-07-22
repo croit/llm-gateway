@@ -215,31 +215,6 @@ pub async fn set_reasoning_style(
     Ok(())
 }
 
-/// Set (or clear, with `None`) the model's context window in tokens without
-/// touching its sampling defaults or reasoning config. Inserts a row with empty
-/// defaults if none exists yet; on conflict only `context_window` is updated,
-/// so it composes with the other setters in any order.
-pub async fn set_context_window(
-    pool: &Pool,
-    model_name: &str,
-    context_window: Option<i64>,
-) -> Result<(), DbError> {
-    let now = Timestamp::now().to_string();
-    sqlx::query(
-        r#"INSERT INTO model_defaults (model_name, defaults_toml, context_window, updated_at)
-           VALUES (?, '', ?, ?)
-           ON CONFLICT(model_name) DO UPDATE SET
-             context_window = excluded.context_window,
-             updated_at     = excluded.updated_at"#,
-    )
-    .bind(model_name)
-    .bind(context_window)
-    .bind(now)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// Set (or clear, with `None`) the token prices for a model without touching
 /// its sampling defaults, reasoning config, or context window.
 /// Inserts a row with empty defaults if none exists yet; on conflict only the

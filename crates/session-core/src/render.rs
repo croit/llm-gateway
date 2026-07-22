@@ -514,7 +514,7 @@ fn render_attachment(att: &crate::attachments::ParsedAttachment, lang: Lang) -> 
     .to_html()
 }
 
-fn format_bytes(n: u64) -> String {
+pub fn format_bytes(n: u64) -> String {
     if n < 1024 {
         return format!("{n} B");
     }
@@ -524,6 +524,17 @@ fn format_bytes(n: u64) -> String {
     }
     let mb = kb / 1024.0;
     format!("{mb:.1} MB")
+}
+
+/// Char-bounded truncation with a trailing `…` when the string was cut.
+/// Char-based (not byte-based) so it never splits a UTF-8 sequence.
+pub fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 /// One slice of an assistant bubble — either pre-rendered markdown
@@ -1066,22 +1077,17 @@ pub fn render_tool_call(call: &ToolCall, lang: Lang) -> Html {
         .output_json
         .clone()
         .map(|s| truncate_for_display(s, lang));
-    let async_started = call
-        .output_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-        .map(|output| output.get("status").and_then(|status| status.as_str()) == Some("started"))
-        .unwrap_or(false);
-    let is_running = call.status == ToolCallStatus::Running || async_started;
+    // Long-running tools (currently the ComfyUI workflow family) keep their
+    // tool future pending while the background job runs, so the row sits in
+    // `Running` for the whole generation — label that "running" rather than
+    // the momentary "calling" shown for fast synchronous tools. This prefix
+    // is the single, deliberate signal: the persisted tool-call row carries
+    // no generic async flag to key on.
+    let is_long_running = call.name.starts_with("comfyui_");
+    let is_running = call.status == ToolCallStatus::Running;
     let status_label = match call.status {
-        ToolCallStatus::Running => {
-            if async_started || call.name.starts_with("comfyui_") {
-                t(lang, "render-tools-running")
-            } else {
-                t(lang, "render-tool-status-calling")
-            }
-        }
-        ToolCallStatus::Completed if async_started => t(lang, "render-tools-running"),
+        ToolCallStatus::Running if is_long_running => t(lang, "render-tools-running"),
+        ToolCallStatus::Running => t(lang, "render-tool-status-calling"),
         ToolCallStatus::Completed => t(lang, "render-tool-status-used"),
         ToolCallStatus::Errored => t(lang, "render-tool-status-error"),
     };

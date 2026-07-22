@@ -183,12 +183,6 @@ impl ReasoningStyle {
         }
     }
 
-    /// Whether this style supports a reasoning budget at all (drives whether the
-    /// UI greys out the effort control for the selected model).
-    pub fn supports_reasoning(self) -> bool {
-        !matches!(self, Self::None)
-    }
-
     /// Whether this style is tuned by a numeric *token budget* per effort
     /// (`thinking_token_budget` / `thinking.budget_tokens`). The admin UI shows
     /// integer token fields for these.

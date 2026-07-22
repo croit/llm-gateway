@@ -101,16 +101,6 @@ impl ComfyuiStore {
         }
     }
 
-    /// Build a store around an empty snapshot without touching disk. Test
-    /// scaffolding only — [`Self::reload`] would try to re-scan the path,
-    /// so only call this with a path that actually exists.
-    pub fn empty_for(dir: PathBuf) -> Self {
-        Self {
-            dir,
-            current: RwLock::new(Arc::new(Snapshot::empty())),
-        }
-    }
-
     pub fn dir(&self) -> &Path {
         &self.dir
     }

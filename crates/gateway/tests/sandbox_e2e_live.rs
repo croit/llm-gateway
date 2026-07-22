@@ -31,7 +31,7 @@ fn enabled() -> bool {
 fn s3_cfg() -> Arc<S3Config> {
     Arc::new(S3Config {
         endpoint: std::env::var("E2E_S3_ENDPOINT")
-            .unwrap_or_else(|_| "https://fra1.s3.croit.io".into()),
+            .unwrap_or_else(|_| "https://s3.example.com".into()),
         region: std::env::var("E2E_S3_REGION").unwrap_or_else(|_| "fra1".into()),
         bucket: std::env::var("E2E_S3_BUCKET").unwrap_or_else(|_| "llm-gateway".into()),
         access_key_env: "GATEWAY_S3_ACCESS_KEY".into(),

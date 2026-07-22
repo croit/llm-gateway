@@ -1036,14 +1036,6 @@ pub async fn upsert_file(
     Ok(id)
 }
 
-pub async fn delete_file(pool: &Pool, file_id: i64) -> Result<(), DbError> {
-    sqlx::query("DELETE FROM rag_files WHERE id = ?")
-        .bind(file_id)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
 // ---- chunk-side metadata --------------------------------------------------
 
 /// One chunk: provenance for a single vector. `vector_id` is the integer
@@ -1117,17 +1109,6 @@ pub async fn insert_chunks(
     }
     tx.commit().await?;
     Ok(())
-}
-
-/// Returns `(chunk_id, vector_id)` pairs for every chunk belonging to
-/// `file_id`. The indexer uses this when a file changes: pull the prior
-/// vector ids, remove them from usearch, then delete the chunks.
-pub async fn chunk_vector_ids_for_file(pool: &Pool, file_id: i64) -> Result<Vec<i64>, DbError> {
-    let rows: Vec<i64> = sqlx::query_scalar("SELECT vector_id FROM rag_chunks WHERE file_id = ?")
-        .bind(file_id)
-        .fetch_all(pool)
-        .await?;
-    Ok(rows)
 }
 
 pub async fn delete_chunks_for_file(pool: &Pool, file_id: i64) -> Result<(), DbError> {

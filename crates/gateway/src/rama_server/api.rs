@@ -94,9 +94,10 @@ pub(crate) async fn me_response(state: &RamaState, user_id: &str) -> Response {
     if let Some(handle) = state.comfyui.as_ref() {
         let snapshot = handle.store.current();
         for id in &allowed_tool_ids {
-            if id.starts_with("comfyui_")
+            if id.starts_with(crate::server::tools::catalog::COMFYUI_PREFIX)
                 && !allowed_tools.iter().any(|t| &t.id == id)
-                && let Some(manifest_id) = id.strip_prefix("comfyui_")
+                && let Some(manifest_id) =
+                    id.strip_prefix(crate::server::tools::catalog::COMFYUI_PREFIX)
                 && let Some(m) = snapshot.lookup(manifest_id)
             {
                 allowed_tools.push(shared::api::ToolSummary {

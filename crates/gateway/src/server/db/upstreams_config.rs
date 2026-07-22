@@ -307,11 +307,6 @@ async fn load_all_fallbacks(db: &Pool) -> Result<HashMap<String, String>, DbErro
 // Backend CRUD
 // ---------------------------------------------------------------------------
 
-/// List all backends for the admin UI.
-pub async fn list_backends(db: &Pool) -> Result<Vec<BackendRow>, DbError> {
-    Ok(load_all_backends(db).await?.into_values().collect())
-}
-
 /// Fetch a single backend by name.
 pub async fn get_backend(db: &Pool, name: &str) -> Result<Option<BackendRow>, DbError> {
     let mut backends = load_all_backends(db).await?;

@@ -130,6 +130,23 @@ pub async fn fail(db: &Pool, id: i64, error: &str) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+/// Mark a job as timed out. Distinct from [`fail`] so the admin UI (and a
+/// waiting tool call) can tell a deadline overrun apart from a hard ComfyUI
+/// failure — the `status` column enumerates `timeout` for exactly this.
+pub async fn timeout(db: &Pool, id: i64, error: &str) -> Result<(), sqlx::Error> {
+    let now = Timestamp::now().to_string();
+    sqlx::query(
+        "UPDATE comfyui_jobs SET status = 'timeout', error_message = ?, completed_at = ? \
+         WHERE id = ?",
+    )
+    .bind(error)
+    .bind(&now)
+    .bind(id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// Recent jobs (any status) for the admin UI. Limited to the last N.
 pub async fn recent(db: &Pool, limit: i64) -> Result<Vec<ComfyuiJob>, sqlx::Error> {
     let rows = sqlx::query("SELECT * FROM comfyui_jobs ORDER BY created_at DESC LIMIT ?")

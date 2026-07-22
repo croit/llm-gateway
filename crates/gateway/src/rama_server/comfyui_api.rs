@@ -36,7 +36,17 @@ pub async fn reload(State(state): State<Arc<RamaState>>, req: Request) -> Respon
             "[comfyui] is not configured on this gateway",
         );
     };
-    let report: ReloadReport = handle.store.reload();
+    // The rescan walks the content dir and parses every manifest.toml +
+    // workflow.json synchronously — keep that blocking I/O off the async
+    // worker thread.
+    let store = handle.store.clone();
+    let report: ReloadReport = match tokio::task::spawn_blocking(move || store.reload()).await {
+        Ok(report) => report,
+        Err(err) => {
+            tracing::warn!(error = %err, "comfyui reload task panicked");
+            return internal_error("comfyui catalog reload failed");
+        }
+    };
     tracing::info!(
         loaded = report.total,
         skipped = report.skipped.len(),

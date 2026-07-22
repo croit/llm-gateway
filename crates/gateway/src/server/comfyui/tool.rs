@@ -139,17 +139,7 @@ impl Tool for ComfyuiWorkflowTool {
                 );
             }
         };
-        let required = manifest.required_keys();
-        ToolDef::function(
-            self.id(),
-            manifest.description.clone(),
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "required": required,
-                "properties": manifest.tool_properties(),
-            }),
-        )
+        manifest.tool_def(self.id())
     }
 
     fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
@@ -272,7 +262,7 @@ impl Tool for ComfyuiWorkflowTool {
                             "note": "The generated asset is attached. Continue with the next requested action."
                         }));
                     }
-                    "failed" => {
+                    "failed" | "timeout" => {
                         return Err(ToolError::Failed(format!(
                             "ComfyUI workflow failed: {}",
                             job.error_message.unwrap_or_else(|| {
@@ -341,17 +331,7 @@ impl ToolSource for ComfyuiToolSource {
                 continue;
             };
             if let Some(manifest) = snapshot.lookup(manifest_id) {
-                let required = manifest.required_keys();
-                out.push(ToolDef::function(
-                    id,
-                    manifest.description.clone(),
-                    json!({
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": required,
-                        "properties": manifest.tool_properties(),
-                    }),
-                ));
+                out.push(manifest.tool_def(id));
             }
         }
         out
@@ -374,7 +354,6 @@ mod tests {
     use crate::server::comfyui::manifest::{
         OutputKind, Param, ParamSchema, ParamType, WorkflowManifest,
     };
-    use std::path::PathBuf;
 
     fn make_manifest(id: &str) -> WorkflowManifest {
         WorkflowManifest {
@@ -397,9 +376,9 @@ mod tests {
                     max: None,
                     enum_values: None,
                     max_length: None,
+                    randomize_on_sentinel: false,
                 },
             }],
-            workflow_path: PathBuf::from("/dev/null"),
             workflow_json: std::sync::Arc::new(json!({})),
         }
     }

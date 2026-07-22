@@ -1541,17 +1541,6 @@ async fn spawn_assistant_worker(
 /// are pruned. The server always sends; whether the user is *actually* looking
 /// at the app is decided client-side in the service worker, which suppresses
 /// the notification when a focused tab already has this conversation open.
-/// Truncate `s` to at most `max` chars on a char boundary, appending `…` when
-/// it was cut. Keeps the push notification title within the payload budget.
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
-}
-
 async fn notify_turn_complete(
     state: &RamaState,
     user_id: &str,
@@ -1614,7 +1603,7 @@ async fn notify_turn_complete(
         // FCM's own 4 KB body cap). 80 chars is plenty for a heading.
         let title = session_title
             .clone()
-            .map(|t| truncate_chars(&t, 80))
+            .map(|t| session_core::render::truncate_chars(&t, 80))
             .unwrap_or_else(|| t(lang, "push-untitled-conversation"));
         let body = t(
             lang,

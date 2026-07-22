@@ -108,7 +108,22 @@ default = "euler"
 
 [params.schema]
 type = "string"
-enum = ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde"]
+enum_values = ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde"]
+
+[[params]]
+key = "seed"
+node_id = "75:73"
+input_key = "noise_seed"
+description = "Random seed. Same prompt + seed = same image. Pass -1 for a fresh random seed each call."
+default = -1
+
+[params.schema]
+type = "integer"
+min = -1
+# Replace a resolved value of -1 with a fresh random seed before dispatch
+# (the conventional ComfyUI "seed = -1 → randomize" contract). Opt-in per
+# param — the gateway never infers this from the parameter's name.
+randomize_on_sentinel = true
 ```
 
 ### Parameter description rules

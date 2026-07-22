@@ -261,7 +261,10 @@ impl ImageGenerator {
         let backend_name = backend.name.clone();
         let url = format!("{}/images/edits", backend.base_url);
 
-        let file_name = format!("image{}", ext_for_mime(image_mime));
+        let file_name = format!(
+            "image{}",
+            crate::server::chat_attachments::ext_for_mime(image_mime).unwrap_or(".png")
+        );
         let part = reqwest::multipart::Part::bytes(image)
             .file_name(file_name)
             .mime_str(image_mime)
@@ -494,18 +497,6 @@ impl ImageGenerator {
                 .upstreams
                 .enforce_limits_for_model(model, crate::server::upstreams::PoolKind::Image),
         });
-    }
-}
-
-/// File extension (with leading dot) for an image mime — for the multipart
-/// filename an `/images/edits` server may key its decoder off. Defaults to
-/// `.png`.
-fn ext_for_mime(mime: &str) -> &'static str {
-    match mime {
-        "image/jpeg" => ".jpg",
-        "image/webp" => ".webp",
-        "image/gif" => ".gif",
-        _ => ".png",
     }
 }
 

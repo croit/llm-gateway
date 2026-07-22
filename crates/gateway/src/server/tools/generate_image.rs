@@ -137,7 +137,10 @@ impl Tool for GenerateImage {
                 .await
                 .map_err(|e| ToolError::Failed(e.to_string()))?;
 
-            let base = format!("generated-image{}", ext_for_mime(&image.mime));
+            let base = format!(
+                "generated-image{}",
+                crate::server::chat_attachments::ext_for_mime(&image.mime).unwrap_or(".png")
+            );
             let filename =
                 chat_attachments::reserve_filename(&ctx.db, turn_id, reservations, &base)
                     .await
@@ -173,17 +176,6 @@ impl Tool for GenerateImage {
     }
 }
 
-/// File extension (with leading dot) for a generated-image mime. Defaults to
-/// `.png` for anything unrecognised — the marker only needs a plausible name.
-fn ext_for_mime(mime: &str) -> &'static str {
-    match mime {
-        "image/jpeg" => ".jpg",
-        "image/webp" => ".webp",
-        "image/gif" => ".gif",
-        _ => ".png",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,10 +187,16 @@ mod tests {
 
     #[test]
     fn ext_for_mime_maps_common_types() {
-        assert_eq!(ext_for_mime("image/png"), ".png");
-        assert_eq!(ext_for_mime("image/jpeg"), ".jpg");
-        assert_eq!(ext_for_mime("image/webp"), ".webp");
-        assert_eq!(ext_for_mime("application/octet-stream"), ".png");
+        use crate::server::chat_attachments::ext_for_mime;
+        assert_eq!(ext_for_mime("image/png"), Some(".png"));
+        assert_eq!(ext_for_mime("image/jpeg"), Some(".jpg"));
+        assert_eq!(ext_for_mime("image/webp"), Some(".webp"));
+        // Unknown types fall back to `.png` at the call site.
+        assert_eq!(ext_for_mime("application/octet-stream"), None);
+        assert_eq!(
+            ext_for_mime("application/octet-stream").unwrap_or(".png"),
+            ".png"
+        );
     }
 
     async fn ctx_without_image_gen() -> ToolContext {

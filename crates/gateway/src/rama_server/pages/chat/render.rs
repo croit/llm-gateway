@@ -528,8 +528,8 @@ pub(super) fn render_assets_panel(assets: &[AttachmentRef], lang: Lang) -> Html 
 }
 
 fn render_asset_card(asset: &AttachmentRef, lang: Lang) -> Html {
-    let url = format!("/chat/attachment/{}/{}", asset.turn_id, asset.filename);
-    let size = format_asset_bytes(asset.size);
+    let url = crate::server::chat_attachments::proxy_url(&asset.turn_id, &asset.filename);
+    let size = render::format_bytes(asset.size);
     let is_image = asset.mime.starts_with("image/");
     let is_video = asset.mime.starts_with("video/");
     let is_audio = asset.mime.starts_with("audio/");
@@ -561,17 +561,6 @@ fn render_asset_card(asset: &AttachmentRef, lang: Lang) -> Html {
         }
     }
     .to_html()
-}
-
-fn format_asset_bytes(n: u64) -> String {
-    if n < 1024 {
-        return format!("{n} B");
-    }
-    let kb = n as f64 / 1024.0;
-    if kb < 1024.0 {
-        return format!("{kb:.1} KB");
-    }
-    format!("{:.1} MB", kb / 1024.0)
 }
 
 /// Dropdown label for one model: the raw id, plus a parenthetical suffix

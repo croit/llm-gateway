@@ -92,7 +92,7 @@ impl Runner {
         args: &Value,
     ) -> Result<String, RunError> {
         let mut resolved = manifest.resolve_args(args)?;
-        self.resolve_seed_sentinel(&mut resolved);
+        self.resolve_seed_sentinel(manifest, &mut resolved);
         self.resolve_uploads(manifest, &mut resolved).await?;
         // Clone the pre-parsed workflow.json from the manifest's cache.
         // The manifest loaded + parsed it once at scan time; we just
@@ -149,15 +149,24 @@ impl Runner {
         })
     }
 
-    /// Resolve the conventional "-1 = fresh random" sentinel for seed-
-    /// shaped params into concrete u64 values before submitting.
-    fn resolve_seed_sentinel(&self, resolved: &mut Value) {
-        if let Some(obj) = resolved.as_object_mut() {
-            for (k, v) in obj.iter_mut() {
-                if v.as_i64() == Some(-1) && k.contains("seed") {
-                    let n: u64 = rand::random();
-                    *v = Value::Number(serde_json::Number::from(n));
-                }
+    /// Resolve the conventional "-1 = fresh random" sentinel into a concrete
+    /// value for every param the manifest marks `randomize_on_sentinel`.
+    /// Driven by the manifest declaration, not the parameter's name, so a
+    /// seed-role param can be called anything and a param that merely
+    /// contains "seed" in its key isn't silently rewritten.
+    fn resolve_seed_sentinel(&self, manifest: &WorkflowManifest, resolved: &mut Value) {
+        let Some(obj) = resolved.as_object_mut() else {
+            return;
+        };
+        for param in &manifest.params {
+            if !param.schema.randomize_on_sentinel {
+                continue;
+            }
+            if let Some(v) = obj.get_mut(&param.key)
+                && v.as_i64() == Some(-1)
+            {
+                let n: u64 = rand::random();
+                *v = Value::Number(serde_json::Number::from(n));
             }
         }
     }
@@ -175,26 +184,6 @@ pub struct RunOutcome {
 pub enum RunError {
     #[error("workflow arguments did not match the manifest")]
     InvalidArgs(#[from] ArgError),
-    #[error("reading workflow.json at `{path}`")]
-    ReadWorkflow {
-        path: std::path::PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("parsing workflow.json at `{path}`")]
-    ParseWorkflow {
-        path: std::path::PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error(
-        "workflow.json node `{node_id}` is missing or not an object (manifest targets it via `[[params]] node_id`)"
-    )]
-    MissingTargetNode { node_id: String },
-    #[error(
-        "workflow.json node `{node_id}` has no `inputs.{input_key}` field (manifest targets it via `[[params]] node_id/input_key`)"
-    )]
-    MissingTargetInput { node_id: String, input_key: String },
     #[error("ComfyUI communication failed")]
     Client(#[source] ComfyuiClientError),
     #[error("ComfyUI recorded no output for node `{node_id}` (workflow `{prompt_id}`)")]
@@ -386,7 +375,6 @@ mod tests {
     use super::*;
     use crate::server::comfyui::manifest::ParamSchema;
     use serde_json::json;
-    use std::path::PathBuf;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -429,6 +417,7 @@ mod tests {
                         max: None,
                         enum_values: None,
                         max_length: None,
+                        randomize_on_sentinel: false,
                     },
                 },
                 super::super::manifest::Param {
@@ -444,10 +433,10 @@ mod tests {
                         max: Some(2048.0),
                         enum_values: None,
                         max_length: None,
+                        randomize_on_sentinel: false,
                     },
                 },
             ],
-            workflow_path: PathBuf::from("/dev/null"),
             workflow_json: std::sync::Arc::new(json!({})),
         }
     }
@@ -537,14 +526,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("workflow.json"),
-            serde_json::to_string(&text_workflow()).unwrap(),
-        )
-        .unwrap();
-        let mut m = manifest_with("ignored", 0);
-        m.workflow_path = tmp.path().join("workflow.json");
+        let m = manifest_with("ignored", 0);
 
         let client = Client::with_http(server.uri(), reqwest::Client::new());
         let runner = Runner::with_client(client);
@@ -593,14 +575,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join("workflow.json"),
-            serde_json::to_string(&text_workflow()).unwrap(),
-        )
-        .unwrap();
-        let mut m = manifest_with("ignored", 0);
-        m.workflow_path = tmp.path().join("workflow.json");
+        let m = manifest_with("ignored", 0);
 
         let client = Client::with_http(server.uri(), reqwest::Client::new());
         let runner = Runner::with_client(client);

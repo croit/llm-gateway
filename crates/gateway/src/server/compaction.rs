@@ -271,31 +271,23 @@ fn append_turn(out: &mut String, t: &TurnWithTools) {
                 out.push_str("  [tool ");
                 out.push_str(&tc.name);
                 out.push('(');
-                out.push_str(&truncate_chars(
+                out.push_str(&session_core::render::truncate_chars(
                     tc.arguments_json.trim(),
                     MAX_TOOL_ARGS_CHARS,
                 ));
                 out.push(')');
                 if let Some(output) = tc.output_json.as_deref() {
                     out.push_str(" -> ");
-                    out.push_str(&truncate_chars(output.trim(), MAX_TOOL_OUTPUT_CHARS));
+                    out.push_str(&session_core::render::truncate_chars(
+                        output.trim(),
+                        MAX_TOOL_OUTPUT_CHARS,
+                    ));
                 }
                 out.push_str("]\n");
             }
             out.push('\n');
         }
     }
-}
-
-/// Char-bounded truncation with an ellipsis marker. Char-based (not byte-based)
-/// so it never splits a UTF-8 sequence.
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
 }
 
 /// One non-streaming chat completion that produces the summary. Modelled on the
@@ -496,10 +488,13 @@ mod tests {
 
     #[test]
     fn truncate_is_char_safe() {
-        assert_eq!(truncate_chars("hello", 10), "hello");
-        assert_eq!(truncate_chars("hello", 3), "hel…");
+        assert_eq!(session_core::render::truncate_chars("hello", 10), "hello");
+        assert_eq!(session_core::render::truncate_chars("hello", 3), "hel…");
         // Multi-byte chars aren't split.
-        assert_eq!(truncate_chars("héllo wörld", 4), "héll…");
+        assert_eq!(
+            session_core::render::truncate_chars("héllo wörld", 4),
+            "héll…"
+        );
     }
 
     #[test]
