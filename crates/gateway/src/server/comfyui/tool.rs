@@ -259,7 +259,7 @@ impl Tool for ComfyuiWorkflowTool {
                             "workflow": manifest.id,
                             "filename": job.output_filename,
                             "mime": job.output_mime,
-                            "note": "The generated asset is attached. Continue with the next requested action."
+                            "note": "The generated asset is attached and already shown to the user. Generate only ONE asset per request — do NOT call this tool again or produce extra variants unless the user explicitly asked for multiple images/videos or variations. Do not describe the asset in prose; continue with the next requested action."
                         }));
                     }
                     "failed" | "timeout" => {

@@ -1,6 +1,6 @@
 id = "text_to_image"
 title = "Text to Image"
-description = "Generate an image from a text prompt using Flux.2 Klein 9B (base, fp8). Best for photorealistic subjects, marketing visuals, concept art. The image is stored in the gateway and rendered inline in your reply — do NOT describe the result back to the user."
+description = "Generate an image from a text prompt using Flux.2 Klein 9B (base, fp8). Best for photorealistic subjects, marketing visuals, concept art. The image is stored in the gateway and rendered inline in your reply — do NOT describe the result back to the user. Produce exactly ONE image per request: only call this tool more than once, or generate variants, when the user explicitly asked for several images or variations (e.g. 'give me 3 options'). A single well-crafted image is the default."
 output_kind = "image"
 output_node_id = "9"
 output_filename_prefix = "llmgw-text2image"

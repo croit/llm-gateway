@@ -13,8 +13,8 @@
     "class_type": "SaveVideo",
     "inputs": {
       "filename_prefix": "llmgw-image2video",
-      "format": "auto",
-      "codec": "auto",
+      "format": "mp4",
+      "codec": "h264",
       "video": ["129:94", 0]
     },
     "_meta": { "title": "Save Video" }
@@ -33,10 +33,16 @@
   "129:104": {
     "class_type": "ModelSamplingSD3",
     "inputs": {
-      "shift": 5.0,
+      "shift": ["129:200", 0],
       "model": ["129:116", 0]
     },
     "_meta": { "title": "ModelSamplingSD3" }
+  },
+
+  "129:200": {
+    "class_type": "PrimitiveFloat",
+    "inputs": { "value": "{{shift}}" },
+    "_meta": { "title": "Float (shift)" }
   },
 
   "129:89": {
@@ -148,7 +154,7 @@
     "class_type": "LoraLoaderModelOnly",
     "inputs": {
       "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
-      "strength_model": 1.0,
+      "strength_model": "{{lora_strength_high}}",
       "model": ["129:95", 0]
     },
     "_meta": { "title": "Load LoRA (high noise turbo)" }
@@ -201,12 +207,12 @@
   },
   "129:124": {
     "class_type": "PrimitiveInt",
-    "inputs": { "value": 2 },
+    "inputs": { "value": 3 },
     "_meta": { "title": "Int (split_step turbo)" }
   },
   "129:118": {
     "class_type": "PrimitiveInt",
-    "inputs": { "value": 4 },
+    "inputs": { "value": 6 },
     "_meta": { "title": "Int (Steps turbo)" }
   },
 
@@ -246,7 +252,7 @@
   "129:103": {
     "class_type": "ModelSamplingSD3",
     "inputs": {
-      "shift": 5.0,
+      "shift": ["129:200", 0],
       "model": ["129:117", 0]
     }
   },

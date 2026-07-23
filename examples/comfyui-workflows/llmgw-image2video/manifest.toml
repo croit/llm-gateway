@@ -1,6 +1,6 @@
 id = "image_to_video"
 title = "Image to Video"
-description = "Animate a still image into a short video clip using Wan 2.2 14B. Pass the image_id of a picture already in the conversation plus a motion prompt. The clip is stored in the gateway and rendered inline; do NOT describe it in prose."
+description = "Animate a still image into a short video clip using Wan 2.2 14B. Pass the image_id of a picture already in the conversation plus a motion prompt. The clip is stored in the gateway and rendered inline; do NOT describe it in prose. Produce exactly ONE clip per request — only animate several images or make variants when the user explicitly asked. For lively, action-heavy or person-focused results the motion prompt matters most (see the `prompt` field)."
 output_kind = "video"
 output_node_id = "108"
 output_filename_prefix = "llmgw-image2video"
@@ -20,7 +20,7 @@ key = "prompt"
 node_id = "129:93"
 input_key = "text"
 required = true
-description = "Motion description — what should move and how. Concrete actions work best ('camera slowly zooms in', 'hair blows in the wind', 'subject turns head to the right'). Single, simple motion reads better than multi-clause prompts."
+description = "Motion description — describe the ACTION and the CAMERA, not just the scene. Lead with what the subject actively DOES using strong physical verbs ('sprints toward camera', 'raises both arms as flames erupt behind him', 'cape billowing, debris flying'), then add a camera move ('camera tracks alongside', 'slow dolly-in', 'low-angle push', 'handheld shake'), then secondary motion ('embers drift', 'smoke swirls', 'sparks scatter'). Concrete, forceful action produces far more movement than a static description — a prompt like 'a hero standing in a server room' yields a near-frozen clip. For B-roll and cinematic energy, always combine subject action + camera motion."
 
   [params.schema]
   type = "string"
@@ -41,11 +41,35 @@ default = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格
 key = "turbo"
 node_id = "129:131"
 input_key = "value"
-description = "Enable 4-step turbo LoRA for ~5× faster generation (recommended). When ON: 4 diffusion steps instead of 20, finishes in 2-4 minutes. When OFF: full 20 steps for maximum quality, takes 15-30 minutes. Leave ON for previews and iteration; turn OFF only for final high-quality output."
+description = "Enable the fast lightx2v turbo path (recommended default). When ON: 6 diffusion steps with a reduced high-noise LoRA strength tuned for more motion, ~3-5 minutes. When OFF: the full 20-step Wan 2.2 path with NO distill LoRA — maximum quality and the strongest, most natural motion, but 15-30 minutes; prefer OFF for final hero / action / person-focused shots where movement matters most. Leave ON for previews and iteration."
 default = true
 
   [params.schema]
   type = "boolean"
+
+[[params]]
+key = "lora_strength_high"
+node_id = "129:101"
+input_key = "strength_model"
+description = "Motion control (turbo path only). Strength of the 4-step lightx2v LoRA on the HIGH-noise stage — the single biggest motion knob. 1.0 = fastest but almost frozen ('live wallpaper'); LOWER = more motion. Default 0.75. Turn it DOWN (0.5-0.65) when the user wants strong action, b-roll energy, or a person clearly moving; turn it UP (0.85-1.0) for calm, subtle, or slow motion. Ignored when turbo is OFF (that path uses no LoRA)."
+default = 0.75
+
+  [params.schema]
+  type = "number"
+  min = 0.0
+  max = 1.0
+
+[[params]]
+key = "shift"
+node_id = "129:200"
+input_key = "value"
+description = "Motion control (both diffusion stages). ModelSamplingSD3 shift. LOWER = more, faster, more intense motion; HIGHER = calmer, steadier. Default 4.0. Drop toward 3.0 for high-energy action; raise to 5.0-6.0 for slow, locked-off, or subtle shots. Pairs with lora_strength_high."
+default = 4.0
+
+  [params.schema]
+  type = "number"
+  min = 1.0
+  max = 8.0
 
 [[params]]
 key = "width"

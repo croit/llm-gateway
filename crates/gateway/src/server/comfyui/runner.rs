@@ -496,6 +496,47 @@ mod tests {
         assert!(out["9"]["inputs"].get("filename_prefix").is_none());
     }
 
+    #[test]
+    fn image2video_example_wires_motion_params() {
+        // Regression: the exposed motion knobs (`lora_strength_high`, `shift`)
+        // must resolve their defaults, overwrite the `{{…}}` placeholders with
+        // real numbers, and land on the right nodes — and the two sampling
+        // stages must both keep reading `shift` from the shared source node.
+        // Guards against a placeholder leaking through to ComfyUI (which would
+        // fail the whole workflow) and against the param↔node mapping drifting.
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/comfyui-workflows/llmgw-image2video");
+        let m = super::super::manifest::load(&dir).expect("example manifest loads");
+
+        // Defaults only (model supplied just the required fields).
+        let resolved = m
+            .resolve_args(&json!({ "image": "t/pic.png", "prompt": "runs forward" }))
+            .expect("resolve defaults");
+        assert_eq!(resolved["lora_strength_high"], json!(0.75));
+        assert_eq!(resolved["shift"], json!(4.0));
+
+        let wf = inject_params((*m.workflow_json).clone(), &m, &resolved);
+        // Placeholders replaced by real numbers on the target nodes.
+        assert_eq!(wf["129:101"]["inputs"]["strength_model"], json!(0.75));
+        assert_eq!(wf["129:200"]["inputs"]["value"], json!(4.0));
+        // Both sampling stages still pull shift from the shared source node.
+        assert_eq!(wf["129:103"]["inputs"]["shift"], json!(["129:200", 0]));
+        assert_eq!(wf["129:104"]["inputs"]["shift"], json!(["129:200", 0]));
+
+        // A high-motion request threads the lowered values through.
+        let hot = m
+            .resolve_args(&json!({
+                "image": "t/pic.png",
+                "prompt": "sprints toward camera",
+                "lora_strength_high": 0.5,
+                "shift": 3.0,
+            }))
+            .expect("resolve high-motion");
+        let wf2 = inject_params((*m.workflow_json).clone(), &m, &hot);
+        assert_eq!(wf2["129:101"]["inputs"]["strength_model"], json!(0.5));
+        assert_eq!(wf2["129:200"]["inputs"]["value"], json!(3.0));
+    }
+
     #[tokio::test]
     async fn run_end_to_end_returns_downloaded_bytes() {
         let server = MockServer::start().await;

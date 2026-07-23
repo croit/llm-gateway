@@ -18,6 +18,15 @@ render-attachment-open-title = Abrir { $filename } · { $mime } · { $size }
 render-attachment-title = { $filename } · { $mime } · { $size }
 render-attachment-chip-title = { $mime } · { $size }
 
+# Título de cada medio generado en una respuesta con varios medios, para
+# poder referirse a ellos («convierte la 2.ª imagen en un vídeo»).
+render-media-label = { $kind ->
+    [image] Imagen { $n }
+    [video] Vídeo { $n }
+    [audio] Audio { $n }
+   *[other] Medio { $n }
+}
+
 render-thinking-spinner = Pensando…
 render-thinking-finalized = Pensó durante { $secs } s
 render-thinking-in-progress = Pensando… ({ $secs } s)

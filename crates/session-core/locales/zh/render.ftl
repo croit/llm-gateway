@@ -18,6 +18,14 @@ render-attachment-open-title = 打开 { $filename } · { $mime } · { $size }
 render-attachment-title = { $filename } · { $mime } · { $size }
 render-attachment-chip-title = { $mime } · { $size }
 
+# 多媒体回复中每个生成媒体的标签，便于引用（“把第 2 张图片做成视频”）。
+render-media-label = { $kind ->
+    [image] 图片 { $n }
+    [video] 视频 { $n }
+    [audio] 音频 { $n }
+   *[other] 媒体 { $n }
+}
+
 render-thinking-spinner = 思考中…
 render-thinking-finalized = 思考了 { $secs } 秒
 render-thinking-in-progress = 思考中…（{ $secs } 秒）

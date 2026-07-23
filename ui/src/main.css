@@ -1453,6 +1453,43 @@
         color: color-mix(in oklch, var(--color-base-content) 55%, transparent);
         flex-shrink: 0;
     }
+    /* Media gallery: when a single reply produces 2+ images/videos, they
+     * lay out side by side (wrapping on narrow screens) instead of
+     * stacking, each with a "Image 2 / Video 1 …" caption so the reader
+     * can reference them in the next message. A lone media item never gets
+     * this treatment — it renders inline at full size. */
+    .chat-media-gallery {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-start;
+        gap: 0.5rem;
+        margin: 0.25rem 0;
+    }
+    .chat-media {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+        margin: 0;
+        min-width: 0;
+        max-width: 100%;
+    }
+    .chat-media__label {
+        font-size: 0.6875rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: color-mix(in oklch, var(--color-base-content) 60%, transparent);
+    }
+    /* Inside a gallery the tiles are capped smaller so siblings fit next to
+     * each other; the single-media path keeps the larger inline sizes. */
+    .chat-media-gallery .chat-msg__attachment-image > img {
+        max-height: 14rem;
+    }
+    .chat-media-gallery .chat-msg__attachment-player {
+        width: min(100%, 22rem);
+    }
+    .chat-media-gallery .chat-msg__attachment-player video {
+        max-height: 14rem;
+    }
     /* Per-message hover actions: Edit (user) / Retry (assistant).
      * Absolutely positioned just under the bubble so they overlay the
      * gap instead of adding height — the conversation layout doesn't

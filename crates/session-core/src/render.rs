@@ -294,20 +294,25 @@ pub fn render_user_turn(turn: &Turn, actions: Option<&str>, lang: Lang) -> Html 
         let body_text = content.clone();
         html! { div(class: "chat-msg__body") { (body_text) } }.to_html()
     } else {
+        // Normalise the segments into body pieces, then let `render_body`
+        // group any run of 2+ media into a numbered side-by-side gallery.
+        let pieces: Vec<BodyPiece> = segments
+            .iter()
+            .filter_map(|seg| match seg {
+                crate::attachments::Segment::Text(t) if !t.is_empty() => Some(BodyPiece::Block(
+                    html! { div(class: "chat-msg__prose") { (t.to_string()) } }.to_html(),
+                )),
+                crate::attachments::Segment::Text(_) => None,
+                crate::attachments::Segment::Attachment(att) => Some(match media_kind(att) {
+                    Some(_) => BodyPiece::Media(att.clone()),
+                    None => BodyPiece::File(att.clone()),
+                }),
+            })
+            .collect();
+        let items = render_body(&pieces, lang);
         html! {
             div(class: "chat-msg__body") {
-                for seg in segments.iter() {
-                    match seg {
-                        crate::attachments::Segment::Text(t) => {
-                            if !t.is_empty() {
-                                div(class: "chat-msg__prose") { (t.to_string()) }
-                            }
-                        }
-                        crate::attachments::Segment::Attachment(att) => {
-                             (render_attachment(att, lang))
-                        }
-                    }
-                }
+                for item in items.iter() { (item.clone()) }
             }
         }
         .to_html()
@@ -514,6 +519,128 @@ fn render_attachment(att: &crate::attachments::ParsedAttachment, lang: Lang) -> 
     .to_html()
 }
 
+/// The gallery "kind" of an attachment — `Some("image"|"video"|"audio")`
+/// for media that participates in the numbered gallery, `None` for plain
+/// file chips (pdf, csv, …) which stay inline and unnumbered.
+fn media_kind(att: &crate::attachments::ParsedAttachment) -> Option<&'static str> {
+    if att.is_image() {
+        Some("image")
+    } else if att.mime.starts_with("video/") {
+        Some("video")
+    } else if att.mime.starts_with("audio/") {
+        Some("audio")
+    } else {
+        None
+    }
+}
+
+/// One piece of a rendered message body: a pre-built block (prose/text),
+/// a numbered media attachment, or a plain file attachment.
+enum BodyPiece {
+    /// Pre-rendered block HTML (markdown prose or an escaped user-text
+    /// slot) — emitted verbatim.
+    Block(Html),
+    /// An image/video/audio attachment — grouped into the numbered gallery
+    /// when a reply carries two or more.
+    Media(crate::attachments::ParsedAttachment),
+    /// A non-media attachment (pdf, csv, …) — rendered as an inline chip,
+    /// never numbered.
+    File(crate::attachments::ParsedAttachment),
+}
+
+/// One media tile inside a gallery: the attachment plus, when the reply
+/// carries 2+ media, a "Image 2 / Video 1 …" caption so the reader can
+/// reference it in the next message ("turn the 2nd image into a video").
+fn render_media_tile(
+    att: &crate::attachments::ParsedAttachment,
+    kind: &str,
+    n: usize,
+    numbered: bool,
+    lang: Lang,
+) -> Html {
+    let inner = render_attachment(att, lang);
+    if !numbered {
+        return html! { div(class: "chat-media") { (inner) } }.to_html();
+    }
+    let label = t_args(
+        lang,
+        "render-media-label",
+        &i18n::args([
+            ("kind", kind.to_string().into()),
+            ("n", n.to_string().into()),
+        ]),
+    );
+    html! {
+        div(class: "chat-media") {
+            div(class: "chat-media__label") { (label) }
+            (inner)
+        }
+    }
+    .to_html()
+}
+
+/// Render a message body from its pieces, coalescing consecutive media
+/// attachments into a side-by-side `chat-media-gallery`. Media are
+/// numbered per kind within the reply (Image 1, Image 2, Video 1, …).
+///
+/// Grouping + numbering only engage when the body holds 2+ media — a lone
+/// image/video renders inline exactly as before, so the single-media and
+/// text-only cases (and their streaming-morph output) are unchanged.
+fn render_body(pieces: &[BodyPiece], lang: Lang) -> Vec<Html> {
+    let total_media = pieces
+        .iter()
+        .filter(|p| matches!(p, BodyPiece::Media(_)))
+        .count();
+    if total_media < 2 {
+        return pieces
+            .iter()
+            .map(|p| match p {
+                BodyPiece::Block(h) => h.clone(),
+                BodyPiece::File(att) | BodyPiece::Media(att) => render_attachment(att, lang),
+            })
+            .collect();
+    }
+    let mut counters: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
+    let mut out: Vec<Html> = Vec::with_capacity(pieces.len());
+    let mut i = 0;
+    while i < pieces.len() {
+        match &pieces[i] {
+            BodyPiece::Block(h) => {
+                out.push(h.clone());
+                i += 1;
+            }
+            BodyPiece::File(att) => {
+                out.push(render_attachment(att, lang));
+                i += 1;
+            }
+            BodyPiece::Media(_) => {
+                // Consume the run of consecutive media into one gallery.
+                let mut tiles: Vec<Html> = Vec::new();
+                while let Some(BodyPiece::Media(att)) = pieces.get(i) {
+                    let kind = media_kind(att).unwrap_or("other");
+                    let n = {
+                        let c = counters.entry(kind).or_insert(0);
+                        *c += 1;
+                        *c
+                    };
+                    tiles.push(render_media_tile(att, kind, n, true, lang));
+                    i += 1;
+                }
+                out.push(
+                    html! {
+                        div(class: "chat-media-gallery") {
+                            for t in tiles.iter() { (t.clone()) }
+                        }
+                    }
+                    .to_html(),
+                );
+            }
+        }
+    }
+    out
+}
+
 pub fn format_bytes(n: u64) -> String {
     if n < 1024 {
         return format!("{n} B");
@@ -599,6 +726,19 @@ pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: La
     // markdown segment and the body stays one block, preserving the
     // pre-existing fast path.
     let segments = assistant_segments(&content);
+    // Normalise into body pieces so a run of 2+ generated media collapses
+    // into a numbered side-by-side gallery. Prose stays raw-injected HTML.
+    let body_pieces: Vec<BodyPiece> = segments
+        .into_iter()
+        .map(|seg| match seg {
+            AssistantSegment::Prose(html) => BodyPiece::Block(html! { #(html) }.to_html()),
+            AssistantSegment::Attachment(att) => match media_kind(&att) {
+                Some(_) => BodyPiece::Media(att),
+                None => BodyPiece::File(att),
+            },
+        })
+        .collect();
+    let body_items = render_body(&body_pieces, lang);
     let has_reasoning = !reasoning.is_empty();
 
     html! {
@@ -622,15 +762,8 @@ pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: La
             // markdown-rendered block, with attachment chips/images
             // spliced inline at the model's write-position.
             div(id: (text_id), class: "chat-prose") {
-                for seg in segments.iter() {
-                    match seg {
-                        AssistantSegment::Prose(html) => {
-                            #(html.clone())
-                        }
-                        AssistantSegment::Attachment(att) => {
-                            (render_attachment(att, lang))
-                        }
-                    }
+                for item in body_items.iter() {
+                    (item.clone())
                 }
             }
             // "Thinking…" spinner. Visible only when the turn is
@@ -2039,6 +2172,77 @@ mod tests {
             _ => panic!("expected attachment in middle slot"),
         }
         assert!(matches!(&segs[2], AssistantSegment::Prose(s) if s.contains("adjustments")));
+    }
+
+    fn media_marker(filename: &str, mime: &str) -> String {
+        crate::attachments::marker_line(
+            filename,
+            mime,
+            &format!("/chat/attachment/t0/{filename}"),
+            10,
+        )
+    }
+
+    #[test]
+    fn multiple_media_render_as_numbered_gallery() {
+        // Three generated images in one reply must lay out side by side
+        // (one `chat-media-gallery`) with per-kind "Image N" captions so the
+        // user can reference them ("turn the 2nd image into a video").
+        let content = format!(
+            "Here you go:\n\n{}\n\n{}\n\n{}\n\n",
+            media_marker("a.png", "image/png"),
+            media_marker("b.png", "image/png"),
+            media_marker("c.png", "image/png"),
+        );
+        let tw = conv_turn(0, TurnRole::Assistant, &content);
+        let html = render_assistant_turn(&tw, None, Lang::En).to_string();
+        assert!(
+            html.matches("chat-media-gallery").count() == 1,
+            "consecutive media collapse into exactly one gallery: {html}"
+        );
+        for label in ["Image 1", "Image 2", "Image 3"] {
+            assert!(html.contains(label), "missing caption {label}: {html}");
+        }
+    }
+
+    #[test]
+    fn single_media_stays_inline_without_label() {
+        // A lone image must render exactly as before — no gallery wrapper,
+        // no "Image 1" caption — so single-generation replies stay clean.
+        let content = format!(
+            "One image:\n\n{}\n\n",
+            media_marker("only.png", "image/png")
+        );
+        let tw = conv_turn(0, TurnRole::Assistant, &content);
+        let html = render_assistant_turn(&tw, None, Lang::En).to_string();
+        assert!(
+            !html.contains("chat-media-gallery"),
+            "a lone image must not be grouped into a gallery: {html}"
+        );
+        assert!(
+            !html.contains("chat-media__label"),
+            "a lone image must not be captioned: {html}"
+        );
+        assert!(
+            html.contains("chat-msg__attachment-image"),
+            "the image itself still renders: {html}"
+        );
+    }
+
+    #[test]
+    fn mixed_media_are_numbered_per_kind() {
+        // An image + a video (2 media) group into a gallery, each numbered
+        // within its own kind so "the 2nd image" / "the video" map cleanly.
+        let content = format!(
+            "{}\n\n{}\n\n",
+            media_marker("pic.png", "image/png"),
+            media_marker("clip.mp4", "video/mp4"),
+        );
+        let tw = conv_turn(0, TurnRole::Assistant, &content);
+        let html = render_assistant_turn(&tw, None, Lang::En).to_string();
+        assert!(html.contains("chat-media-gallery"), "2 media group: {html}");
+        assert!(html.contains("Image 1"), "image labelled per kind: {html}");
+        assert!(html.contains("Video 1"), "video labelled per kind: {html}");
     }
 
     #[test]

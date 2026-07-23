@@ -187,12 +187,12 @@ impl ComfyuiScheduler {
             return;
         };
         let ext = chat_attachments::ext_for_mime(&downloaded.mime).unwrap_or(".bin");
-        // Include the job id + a short slice of prompt_id for uniqueness
-        // — two text_to_image calls in one turn would otherwise collide on
-        // <turn_id>/text_to_image.png and the second
-        // upload would silently overwrite the first.
-        let prompt_short: String = job.prompt_id.chars().take(8).collect();
-        let filename = format!("{}-{}{}", job.workflow_id, prompt_short, ext);
+        // The DB job id is globally unique, so keying the filename on it
+        // guarantees two jobs in one turn can never collide on
+        // <turn_id>/<workflow>-<id>.<ext> — a prompt_id[:8] slice alone
+        // could, and the second upload would then silently overwrite the
+        // first in S3 (the "second video is broken / duplicated" report).
+        let filename = format!("{}-{}{}", job.workflow_id, job.id, ext);
         let upload = match chat_attachments::upload(
             s3,
             &job.turn_id,
@@ -223,11 +223,30 @@ impl ComfyuiScheduler {
             tracing::warn!(job_id = job.id, error = %e, "ComfyUI scheduler: complete DB write failed, will retry");
             return;
         }
-        // Append the attachment marker to the owning turn.
-        let marker = chat_attachments::marker_line(&job.turn_id, &upload);
-        let chunk = format!("\n\n{marker}\n\n");
-        if let Err(e) = session_core::db::append_content(&self.db, &job.turn_id, &chunk).await {
-            tracing::warn!(job_id = job.id, error = %e, "ComfyUI scheduler: append to turn failed (job is already marked completed)");
+        // Idempotent append: if a marker for this file is already on the
+        // turn (a crash/resume between an earlier append and `complete`, or
+        // any double-processing), don't write a second copy — that's what
+        // renders as two players for one clip. The unique `job.id` filename
+        // means this only ever matches THIS job's own prior marker.
+        let already_present = session_core::db::get_content(&self.db, &job.turn_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| session_core::attachments::existing_filenames(&c).contains(&upload.filename))
+            .unwrap_or(false);
+        if already_present {
+            tracing::info!(
+                job_id = job.id,
+                filename = %upload.filename,
+                "ComfyUI scheduler: marker already present, skipping duplicate append",
+            );
+        } else {
+            // Append the attachment marker to the owning turn.
+            let marker = chat_attachments::marker_line(&job.turn_id, &upload);
+            let chunk = format!("\n\n{marker}\n\n");
+            if let Err(e) = session_core::db::append_content(&self.db, &job.turn_id, &chunk).await {
+                tracing::warn!(job_id = job.id, error = %e, "ComfyUI scheduler: append to turn failed (job is already marked completed)");
+            }
         }
         self.chat_updates.notify(&job.session_id);
         tracing::info!(

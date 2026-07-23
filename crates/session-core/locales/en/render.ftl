@@ -17,6 +17,16 @@ render-attachment-open-title = Open { $filename } · { $mime } · { $size }
 render-attachment-title = { $filename } · { $mime } · { $size }
 render-attachment-chip-title = { $mime } · { $size }
 
+# Caption on each generated media tile in a multi-media reply, so the
+# reader can reference it ("turn the 2nd image into a video"). Numbered
+# per media kind within the turn.
+render-media-label = { $kind ->
+    [image] Image { $n }
+    [video] Video { $n }
+    [audio] Audio { $n }
+   *[other] Media { $n }
+}
+
 render-thinking-spinner = Thinking…
 render-thinking-finalized = Thought for { $secs }s
 render-thinking-in-progress = Thinking… ({ $secs }s)
