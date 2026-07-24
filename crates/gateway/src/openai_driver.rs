@@ -81,6 +81,12 @@ fn take_safe_content(buf: &mut String) -> String {
 
 use crate::server::tools::runner::ToolCallAcc;
 
+fn configure_final_tool_round(body: &mut serde_json::Value) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("tool_choice".into(), serde_json::json!("none"));
+    }
+}
+
 /// Ensure every tool call in one round has a non-empty id that is unique
 /// *within the turn*. Some OpenAI-compatible backends (qwen / vLLM are the
 /// usual offenders) emit `tool_call_id`s that are empty or recycled per
@@ -623,9 +629,16 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         d.state
             .union_enabled_mcp_tool_ids(&mut allowed_tools, &user_mcp, &enabled_keys);
         if final_round {
+            // Keep the tool definitions in the request so providers whose
+            // templates need them can render an explicit no-tools turn. vLLM
+            // Gemma deployments use --exclude-tools-when-tool-choice-none to
+            // remove them from the actual prompt while retaining the signal.
+            runner::inject_tools(&mut request_body, &tool_source, &allowed_tools)
+                .map_err(upstream_err)?;
+            configure_final_tool_round(&mut request_body);
             tracing::info!(
                 max_rounds,
-                "tool-round budget reached; requesting final answer with tools withheld"
+                "tool-round budget reached; requesting final answer with tool choice none"
             );
         } else {
             runner::inject_tools(&mut request_body, &tool_source, &allowed_tools)
@@ -1589,8 +1602,8 @@ fn reasoning_overrides_from_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        THINK_TAGS, ToolCallAcc, ensure_unique_tool_call_ids, render_active_skills,
-        render_skill_listing, take_safe_content,
+        THINK_TAGS, ToolCallAcc, configure_final_tool_round, ensure_unique_tool_call_ids,
+        render_active_skills, render_skill_listing, take_safe_content,
     };
     use crate::server::skills::{Skill, SkillRegistry};
     use std::path::PathBuf;
@@ -1614,6 +1627,13 @@ mod tests {
     #[test]
     fn plain_content_passes_through() {
         assert_eq!(stream(&["Hello, ", "world!"]), "Hello, world!");
+    }
+
+    #[test]
+    fn final_tool_round_explicitly_disables_tool_choice() {
+        let mut body = serde_json::json!({"messages": []});
+        configure_final_tool_round(&mut body);
+        assert_eq!(body["tool_choice"], serde_json::json!("none"));
     }
 
     #[test]
