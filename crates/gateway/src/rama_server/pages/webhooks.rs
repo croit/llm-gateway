@@ -443,21 +443,26 @@ pub async fn webhooks_index(State(state): State<Arc<RamaState>>, req: Request) -
     let models = list_models(&state).await;
     let body = render_index_body(&hooks, &models, lang);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Webhooks,
-        &t(lang, "webhooks-page-title"),
-        &user.email,
-        is_admin(&state, &user),
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        "/webhooks",
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: is_admin(&state, &user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(
+            &pctx,
+            NavItem::Webhooks,
+            &t(lang, "webhooks-page-title"),
+            body,
+            "/webhooks",
+            &chat,
+        )
+    }
 }
 
 /// POST /webhooks — create from the form. Mints the secret, reveals the full
@@ -533,21 +538,26 @@ pub async fn webhooks_edit_form(
     let models = list_models(&state).await;
     let body = render_edit_body(&hook, &models, lang);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Webhooks,
-        &t(lang, "webhooks-edit-page-title"),
-        &user.email,
-        is_admin(&state, &user),
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        &format!("/webhooks/{id}/edit"),
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: is_admin(&state, &user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(
+            &pctx,
+            NavItem::Webhooks,
+            &t(lang, "webhooks-edit-page-title"),
+            body,
+            &format!("/webhooks/{id}/edit"),
+            &chat,
+        )
+    }
 }
 
 /// POST /webhooks/{id} — apply an edit; navigate back to the list on success.
@@ -734,21 +744,26 @@ pub async fn webhooks_rerun_form(
         lang,
     );
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Webhooks,
-        &t(lang, "webhooks-rerun-page-title"),
-        &user.email,
-        is_admin(&state, &user),
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        &format!("/webhooks/{id}/rerun"),
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: is_admin(&state, &user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(
+            &pctx,
+            NavItem::Webhooks,
+            &t(lang, "webhooks-rerun-page-title"),
+            body,
+            &format!("/webhooks/{id}/rerun"),
+            &chat,
+        )
+    }
 }
 
 /// POST /webhooks/{id}/rerun — replay the stored payload with the submitted
@@ -901,21 +916,26 @@ pub async fn webhooks_runs(
     };
     let body = render_runs_body(&hook, &runs, lang);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Webhooks,
-        &t(lang, "webhooks-runs-page-title"),
-        &user.email,
-        is_admin(&state, &user),
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        &format!("/webhooks/{id}/runs"),
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: is_admin(&state, &user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(
+            &pctx,
+            NavItem::Webhooks,
+            &t(lang, "webhooks-runs-page-title"),
+            body,
+            &format!("/webhooks/{id}/runs"),
+            &chat,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -49,21 +49,26 @@ pub async fn connectors_index(State(state): State<Arc<RamaState>>, req: Request)
     let body = render_body(lang, &connectors, &redirect_uri);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "connectors-page-title");
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Connectors,
-        &title,
-        &user.email,
-        true,
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        "/admin/connectors",
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: true,
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(
+            &pctx,
+            NavItem::Connectors,
+            &title,
+            body,
+            "/admin/connectors",
+            &chat,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -368,21 +373,26 @@ pub async fn connectors_audit(
     let body = render_audit_page(&name, &key, &events);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = format!("{name} — audit log");
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Connectors,
-        &title,
-        &user.email,
-        true,
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        "/admin/connectors",
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: true,
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(
+            &pctx,
+            NavItem::Connectors,
+            &title,
+            body,
+            "/admin/connectors",
+            &chat,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

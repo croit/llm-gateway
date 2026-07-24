@@ -513,21 +513,19 @@ async fn render_page(
     );
     let chat = fetch_sidebar_chat(state, &user.id, None).await;
     let title = t(lang, "my-skills-page-title");
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::MySkills,
-        &title,
-        &user.email,
-        is_admin(state, user),
-        state.user_skills_enabled(),
-        impersonating,
-        body,
-        &push_url,
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: is_admin(state, user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating,
+        };
+        nav_or_html_page(&pctx, NavItem::MySkills, &title, body, &push_url, &chat)
+    }
 }
 
 fn render_body(

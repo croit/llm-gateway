@@ -274,21 +274,26 @@ async fn render_chat_response(
         .unwrap_or_else(|| t(lang, "chat-default-title"));
     let url = format!("/chat/{}", active.id);
     if datastar {
-        nav_or_html_page(
-            true,
-            theme,
-            lang,
-            nav,
-            NavItem::Chat,
-            &format!("{title} — LLM Gateway"),
-            &user.email,
-            is_admin(&state, user),
-            state.user_skills_enabled(),
-            impersonating,
-            body,
-            &url,
-            &chat_sidebar,
-        )
+        {
+            let pctx = super::PageCtx {
+                theme,
+                lang,
+                nav,
+                datastar: true,
+                user_email: user.email.clone(),
+                is_admin: is_admin(&state, user),
+                skills_enabled: state.user_skills_enabled(),
+                impersonating,
+            };
+            nav_or_html_page(
+                &pctx,
+                NavItem::Chat,
+                &format!("{title} — LLM Gateway"),
+                body,
+                &url,
+                &chat_sidebar,
+            )
+        }
     } else {
         html_authed_page(
             theme,
@@ -528,17 +533,20 @@ pub async fn chat_search(State(state): State<Arc<RamaState>>, req: Request) -> R
         let nav = NavSections::from_headers(req.headers());
         let chat = super::fetch_sidebar_chat(&state, &user.id, None).await;
         let body = super::render_search_page_body(&form.q, &hits, lang);
-        return nav_or_html_page(
-            false,
+        let pctx = super::PageCtx {
             theme,
             lang,
             nav,
+            datastar: false,
+            user_email: user.email.clone(),
+            is_admin: is_admin(&state, &user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        return nav_or_html_page(
+            &pctx,
             NavItem::Chat,
             &t(lang, "nav-search-title"),
-            &user.email,
-            is_admin(&state, &user),
-            state.user_skills_enabled(),
-            session.impersonator_id.is_some(),
             body,
             "/chat/search",
             &chat,

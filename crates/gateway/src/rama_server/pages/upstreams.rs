@@ -88,21 +88,26 @@ pub async fn upstreams_index(State(state): State<Arc<RamaState>>, req: Request) 
         dirty,
     );
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Upstreams,
-        &t(lang, "upstreams-page-title"),
-        &user.email,
-        is_admin(&state, &user),
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        "/admin/upstreams",
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: is_admin(&state, &user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(
+            &pctx,
+            NavItem::Upstreams,
+            &t(lang, "upstreams-page-title"),
+            body,
+            "/admin/upstreams",
+            &chat,
+        )
+    }
 }
 
 /// GET /admin/pools and GET /admin/backends — the two pages merged into

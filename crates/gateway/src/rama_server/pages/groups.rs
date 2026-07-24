@@ -68,21 +68,19 @@ pub async fn groups_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     let body = render_body(lang, &views, &observed, &tool_ids, &skill_names);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "groups-heading");
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Groups,
-        &title,
-        &user.email,
-        is_admin(&state, &user),
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        "/admin/groups",
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: is_admin(&state, &user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(&pctx, NavItem::Groups, &title, body, "/admin/groups", &chat)
+    }
 }
 
 async fn load_group_views(state: &RamaState) -> Vec<GroupView> {

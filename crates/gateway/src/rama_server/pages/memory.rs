@@ -58,21 +58,26 @@ pub async fn memory_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         .unwrap_or_default();
     let body = render_memory_body(lang, &memories);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Memory,
-        &t(lang, "memory-page-title"),
-        &user.email,
-        is_admin(&state, &user),
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        "/memory",
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: is_admin(&state, &user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(
+            &pctx,
+            NavItem::Memory,
+            &t(lang, "memory-page-title"),
+            body,
+            "/memory",
+            &chat,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -230,21 +230,26 @@ pub async fn scheduled_index(State(state): State<Arc<RamaState>>, req: Request) 
     let default_tz = user.timezone.clone().unwrap_or_else(|| "UTC".to_string());
     let body = render_index_body(&actions, &models, &default_tz, lang);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Scheduled,
-        &t(lang, "scheduled-page-title"),
-        &user.email,
-        is_admin(&state, &user),
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        "/scheduled",
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: is_admin(&state, &user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(
+            &pctx,
+            NavItem::Scheduled,
+            &t(lang, "scheduled-page-title"),
+            body,
+            "/scheduled",
+            &chat,
+        )
+    }
 }
 
 /// POST /scheduled — create from the builder form.
@@ -336,21 +341,26 @@ pub async fn scheduled_edit_form(
     let models = list_models(&state).await;
     let body = render_edit_body(&action, &models, lang);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Scheduled,
-        &t(lang, "scheduled-edit-page-title"),
-        &user.email,
-        is_admin(&state, &user),
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        &format!("/scheduled/{id}/edit"),
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: is_admin(&state, &user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(
+            &pctx,
+            NavItem::Scheduled,
+            &t(lang, "scheduled-edit-page-title"),
+            body,
+            &format!("/scheduled/{id}/edit"),
+            &chat,
+        )
+    }
 }
 
 /// POST /scheduled/{id} — apply an edit. On success navigates back to the

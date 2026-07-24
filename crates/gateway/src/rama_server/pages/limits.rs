@@ -48,21 +48,19 @@ pub async fn limits_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     let body = render_body(lang, currency, &rules, &role_ids, &roster, &models);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "limits-heading");
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Limits,
-        &title,
-        &user.email,
-        is_admin(&state, &user),
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        "/admin/limits",
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: is_admin(&state, &user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(&pctx, NavItem::Limits, &title, body, "/admin/limits", &chat)
+    }
 }
 
 #[derive(serde::Deserialize)]

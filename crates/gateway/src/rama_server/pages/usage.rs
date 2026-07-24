@@ -132,21 +132,19 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
         &unpriced,
     );
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Usage,
-        &title,
-        &user.email,
-        admin,
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        "/usage",
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: admin,
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(&pctx, NavItem::Usage, &title, body, "/usage", &chat)
+    }
 }
 
 /// Source filter options: `(value, i18n key)`. Empty value = "all".

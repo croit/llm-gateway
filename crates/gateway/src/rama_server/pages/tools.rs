@@ -89,21 +89,19 @@ pub async fn tools_index(State(state): State<Arc<RamaState>>, req: Request) -> R
     let body = render_tools_body(lang, &entries, &disabled, geo_label.as_deref());
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "tools-page-title");
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Tools,
-        &title,
-        &user.email,
-        is_admin(&state, &user),
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        "/tools",
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: user.email.clone(),
+            is_admin: is_admin(&state, &user),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(&pctx, NavItem::Tools, &title, body, "/tools", &chat)
+    }
 }
 
 /// The tools the user's roles grant, grouped + de-noised for display.

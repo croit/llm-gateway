@@ -83,21 +83,19 @@ pub async fn users_index(State(state): State<Arc<RamaState>>, req: Request) -> R
     let body = render_body(lang, &rows, &events, allow_impersonation);
     let chat = fetch_sidebar_chat(&state, &admin.id, None).await;
     let title = t(lang, "admin-users-page-title");
-    nav_or_html_page(
-        datastar,
-        theme,
-        lang,
-        nav,
-        NavItem::Users,
-        &title,
-        &admin.email,
-        is_admin(&state, &admin),
-        state.user_skills_enabled(),
-        session.impersonator_id.is_some(),
-        body,
-        "/admin/users",
-        &chat,
-    )
+    {
+        let pctx = super::PageCtx {
+            theme,
+            lang,
+            nav,
+            datastar,
+            user_email: admin.email.clone(),
+            is_admin: is_admin(&state, &admin),
+            skills_enabled: state.user_skills_enabled(),
+            impersonating: session.impersonator_id.is_some(),
+        };
+        nav_or_html_page(&pctx, NavItem::Users, &title, body, "/admin/users", &chat)
+    }
 }
 
 #[derive(Deserialize)]

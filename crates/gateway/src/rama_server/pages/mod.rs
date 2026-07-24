@@ -798,32 +798,44 @@ fn render_sidebar_session(
 /// nav item + active conversation row), updates `<title>`, and
 /// pushes the URL.
 #[allow(clippy::too_many_arguments)]
+/// Request-scoped page chrome shared by every authed index handler: the
+/// header-derived display prefs (`theme`/`lang`/`nav`/`datastar`) plus the
+/// session/user-derived nav state (`user_email`/`is_admin`/`skills_enabled`/
+/// `impersonating`). Bundled so [`nav_or_html_page`] takes one `&PageCtx`
+/// instead of the old 13 positional args (four of them `bool`/enum that were
+/// trivial to transpose). Build it with [`PageCtx::new`] for the common case;
+/// override a field with struct-update syntax where a handler differs (e.g.
+/// admin-only pages that force `is_admin: true`).
+pub(super) struct PageCtx {
+    pub theme: Theme,
+    pub lang: Lang,
+    pub nav: NavSections,
+    pub datastar: bool,
+    pub user_email: String,
+    pub is_admin: bool,
+    pub skills_enabled: bool,
+    pub impersonating: bool,
+}
+
 fn nav_or_html_page(
-    datastar: bool,
-    theme: Theme,
-    lang: Lang,
-    nav: NavSections,
+    p: &PageCtx,
     active: NavItem,
     title: &str,
-    user_email: &str,
-    is_admin: bool,
-    skills_enabled: bool,
-    impersonating: bool,
     body: Html,
     url: &str,
     chat: &SidebarChat,
 ) -> Response {
-    if !datastar {
+    if !p.datastar {
         return html_authed_page(
-            theme,
-            lang,
-            nav,
+            p.theme,
+            p.lang,
+            p.nav,
             Some(active),
             title,
-            user_email,
-            is_admin,
-            skills_enabled,
-            impersonating,
+            &p.user_email,
+            p.is_admin,
+            p.skills_enabled,
+            p.impersonating,
             body,
             chat,
         );
@@ -837,11 +849,11 @@ fn nav_or_html_page(
     let title_html = html! { title { (title) } }.to_html().to_string();
     let sidebar_html = render_app_sidebar(
         Some(active),
-        user_email,
-        is_admin,
-        skills_enabled,
-        theme,
-        lang,
+        &p.user_email,
+        p.is_admin,
+        p.skills_enabled,
+        p.theme,
+        p.lang,
         chat,
     )
     .to_string();
