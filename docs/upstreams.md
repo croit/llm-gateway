@@ -10,7 +10,7 @@ request.model ──► [walk pools matching kind] ──► [pool whose backend
 ```
 
 - A **`Backend`** is a single addressable upstream: base URL, optional API key, weight, `max_inflight`, plus a runtime-populated set of advertised model IDs.
-- A **`Pool`** is an ordered set of backends sharing a `kind` (`chat` | `transcription` | `embedding` | `image`) and a picker strategy. Pools own:
+- A **`Pool`** is an ordered set of backends sharing a `kind` (`chat` | `transcription` | `embedding` | `image` | `speech` | `ocr`) and a picker strategy. Pools own:
     - A health-check loop per backend.
     - A picker strategy (`round_robin`, `least_inflight`). Default: `least_inflight`.
     - Implicit "what we serve" — the union of all backends' advertised-model sets.
@@ -21,7 +21,7 @@ request.model ──► [walk pools matching kind] ──► [pool whose backend
 
 Pools, backends, and per-model settings are configured **in the admin UI at `/admin/upstreams`** — the only supported path; there is no config-file topology. This section describes the fields you set there and how they behave; the [operator workflow](#operator-workflow) below has the click-path.
 
-A **pool** has a name, a `kind` (`chat` | `transcription` | `embedding` | `image` | `speech`), a picker `strategy` (`least_inflight` — recommended — or `round_robin`), optional GDPR/NDA compliance flags, a rate-limit-exemption toggle, and an optional offline-fallback model.
+A **pool** has a name, a `kind` (`chat` | `transcription` | `embedding` | `image` | `speech` | `ocr`), a picker `strategy` (`least_inflight` — recommended — or `round_robin`), optional GDPR/NDA compliance flags, a rate-limit-exemption toggle, and an optional offline-fallback model. An `ocr` pool is reserved for internal document parsing and is not a general-purpose chat endpoint.
 
 A **backend** belongs to one pool and carries a name, base URL, an API key (entered once, stored encrypted; an env-var name can be given as a fallback), weight, max in-flight, health path, client-facing aliases, and two capability flags:
 

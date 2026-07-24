@@ -53,7 +53,7 @@ CREATE TABLE backend_aliases (
 -- ---------------------------------------------------------------------------
 CREATE TABLE pools (
     name             TEXT PRIMARY KEY NOT NULL,
-    kind             TEXT NOT NULL,              -- chat|transcription|embedding|image|speech
+    kind             TEXT NOT NULL,              -- chat|transcription|embedding|image|speech|ocr
     strategy         TEXT NOT NULL DEFAULT 'least_inflight', -- least_inflight|round_robin
     fallback_offline TEXT,                       -- model id for known-but-down spill
     compliance_gdpr  INTEGER NOT NULL DEFAULT 1, -- 0/1 (advisory UI warning)

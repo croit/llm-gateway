@@ -666,6 +666,7 @@ fn config_to_pool_row(name: &str, cfg: &UpstreamPoolConfig, sort_order: i64) -> 
         crate::server::upstreams::config::PoolKind::Embedding => "embedding",
         crate::server::upstreams::config::PoolKind::Image => "image",
         crate::server::upstreams::config::PoolKind::Speech => "speech",
+        crate::server::upstreams::config::PoolKind::Ocr => "ocr",
     };
     let strategy_str = match cfg.strategy {
         crate::server::upstreams::config::PickerStrategy::LeastInflight => "least_inflight",

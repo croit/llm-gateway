@@ -129,6 +129,9 @@ pub enum PoolKind {
     /// unless an operator configures a `kind = "speech"` pool — voice mode only
     /// appears when one exists, mirroring how transcription degrades.
     Speech,
+    /// Dedicated document OCR. This is an internal capability pool; it is
+    /// not exposed as a normal chat model endpoint.
+    Ocr,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -276,7 +279,7 @@ impl FallbackConfig {
             PoolKind::Image => self.image.as_deref(),
             // Speech has no unknown-model fallback: a mistyped voice/model just
             // surfaces the backend's own error. No sensible cross-substitution.
-            PoolKind::Speech => None,
+            PoolKind::Speech | PoolKind::Ocr => None,
         }
     }
 }

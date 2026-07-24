@@ -6,8 +6,7 @@
 //! The first OCR backend is Baidu's Unlimited-OCR, exposed through an
 //! OpenAI-compatible chat-completions endpoint. PDF rasterization stays in
 //! [`crate::server::pdf`]; this module only owns the wire request and response
-//! handling. Routing currently uses the chat pool until a dedicated `ocr`
-//! pool kind is added to the admin topology.
+//! handling. OCR requests use the dedicated `ocr` upstream pool.
 
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -75,7 +74,7 @@ pub async fn recognize(
     }
 
     let acquired = upstreams
-        .acquire_for(model, PoolKind::Chat)
+        .acquire_for(model, PoolKind::Ocr)
         .map_err(|source| OcrError::Route {
             model: model.to_string(),
             source,
@@ -158,7 +157,7 @@ mod tests {
         pools.insert(
             "ocr".to_string(),
             UpstreamPoolConfig {
-                kind: PoolKind::Chat,
+                kind: PoolKind::Ocr,
                 strategy: PickerStrategy::LeastInflight,
                 backend: vec![BackendConfig {
                     name: "ocr".into(),
