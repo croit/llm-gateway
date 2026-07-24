@@ -130,6 +130,30 @@ pub async fn copy_object(
     Ok(())
 }
 
+/// DELETE the object at `<key_prefix>/<turn_id>/<filename>`. Used when a
+/// user removes an attachment from a chat message — the marker is dropped
+/// from the turn content, then this reclaims the bytes. S3 DELETE is
+/// idempotent (a missing key still returns 2xx), so a double-remove or a
+/// marker whose object was never stored isn't an error.
+pub async fn delete(cfg: &S3Config, turn_id: &str, filename: &str) -> Result<(), AttachmentError> {
+    if filename.is_empty() || filename.contains('/') {
+        return Err(AttachmentError::BadFilename(filename.to_string()));
+    }
+    let bucket = open_bucket(cfg)?;
+    let key = object_key(&cfg.key_prefix, turn_id, filename);
+    let resp = bucket
+        .delete_object(&key)
+        .await
+        .map_err(AttachmentError::Client)?;
+    let status = resp.status_code();
+    if !(200..300).contains(&status) {
+        return Err(AttachmentError::Client(S3Error::Io(std::io::Error::other(
+            format!("s3 DELETE returned status {status}"),
+        ))));
+    }
+    Ok(())
+}
+
 fn open_bucket(cfg: &S3Config) -> Result<Bucket, AttachmentError> {
     let access = cfg
         .access_key()

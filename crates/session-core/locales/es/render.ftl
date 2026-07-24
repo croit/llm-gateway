@@ -17,6 +17,8 @@ render-attachment-unavailable-meta = no disponible
 render-attachment-open-title = Abrir { $filename } · { $mime } · { $size }
 render-attachment-title = { $filename } · { $mime } · { $size }
 render-attachment-chip-title = { $mime } · { $size }
+render-attachment-remove-aria = Eliminar adjunto
+render-attachment-remove-confirm = ¿Eliminar { $filename }? Esta acción no se puede deshacer.
 
 # Título de cada medio generado en una respuesta con varios medios, para
 # poder referirse a ellos («convierte la 2.ª imagen en un vídeo»).

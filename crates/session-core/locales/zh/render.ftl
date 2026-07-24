@@ -17,6 +17,8 @@ render-attachment-unavailable-meta = 不可用
 render-attachment-open-title = 打开 { $filename } · { $mime } · { $size }
 render-attachment-title = { $filename } · { $mime } · { $size }
 render-attachment-chip-title = { $mime } · { $size }
+render-attachment-remove-aria = 删除附件
+render-attachment-remove-confirm = 删除 { $filename }？此操作无法撤销。
 
 # 多媒体回复中每个生成媒体的标签，便于引用（“把第 2 张图片做成视频”）。
 render-media-label = { $kind ->

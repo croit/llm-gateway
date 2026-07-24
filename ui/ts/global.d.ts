@@ -50,6 +50,16 @@ declare global {
             fillModel(form: HTMLFormElement): boolean;
             editStart(turnId: string): void;
             editCancel(turnId: string): void;
+            /** Attach button on an edit form → open its file input. */
+            editPickFiles(btn: HTMLElement): void;
+            /** Change handler on the edit form's file input. */
+            editFilesPicked(evt: Event): void;
+            editDragOver(evt: DragEvent): void;
+            editDragLeave(evt: DragEvent): void;
+            editDrop(evt: DragEvent): void;
+            /** Paste handler on the edit form — grabs pasted files
+             *  (e.g. a screenshot) into that form's attachments. */
+            editPaste(evt: ClipboardEvent): void;
         };
         /**
          * Browser geolocation sharing. `share(btn)` requests the

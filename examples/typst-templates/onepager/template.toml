@@ -69,6 +69,38 @@ literally, so do not clutter the text with needless backslashes. Only escape a \
 lone _ or * that you want to show as a literal symbol between spaces."""
 
 [[field]]
+name = "image"
+required = false
+description = """
+Optional: ONE image to place in the one-pager — a photo, chart, diagram, \
+screenshot, or logo. The value MUST be the attachment reference as its ENTIRE \
+value: \"att:<turn>/<file>\" (get ids from `list_attachments`; fetch a web image \
+with `load_image_url` first). Do NOT embed the ref inside the body text — it is \
+only staged when it is the whole value of THIS field. The image flows in the \
+page and never overlaps the text. Leave unset for no image."""
+
+[[field]]
+name = "image_size"
+required = false
+description = """
+How wide the `image` prints, relative to the text column: \"small\" (~40%), \
+\"medium\" (~65%), \"large\" (~85%, the default), or \"full\" (100% — spans the \
+whole content width for a near-full-page visual). Ignored when `image` is unset."""
+
+[[field]]
+name = "image_caption"
+required = false
+description = "Optional one-line caption printed under the `image` (small, muted italic). Leave unset for no caption."
+
+[[field]]
+name = "image_position"
+required = false
+description = """
+Where the `image` sits relative to the body: \"bottom\" (after the body text, \
+the default) or \"top\" (between the title and the body). Ignored when `image` \
+is unset."""
+
+[[field]]
 name = "language"
 required = false
 description = """

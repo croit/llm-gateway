@@ -1399,20 +1399,25 @@ pub async fn chat_edit(
         .or_else(|| crate::server::geoip::peer_ip(&req));
     let secure =
         crate::server::geoip::transport_is_secure(req.headers(), &state.config.gateway.public_url);
+    // Snapshot the content-type before consuming the request — the edit
+    // form now posts `multipart/form-data` (so it can carry pasted/dropped
+    // attachments, exactly like the composer); older cached clients may
+    // still post plain urlencoded.
+    let content_type = req
+        .headers()
+        .get(rama::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let (_, body) = req.into_parts();
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
         Err(msg) => return sse_error_response(&msg),
     };
-    let form: EditForm = match serde_urlencoded::from_bytes(&body) {
-        Ok(f) => f,
-        Err(err) => return sse_error_response(&format!("malformed form: {err}")),
-    };
-    let new_text = form.message.trim();
-    if new_text.is_empty() {
-        return sse_error_response(&t(lang, "chat-error-message-must-not-be-empty"));
-    }
 
+    // Verify ownership + role BEFORE parsing multipart — parsing uploads
+    // any attachment bytes to S3 under this turn's prefix, and we won't do
+    // that for a turn the caller doesn't own or that isn't theirs to edit.
     let turn = match load_owned_turn(&state, &user, &id, &turn_id, lang).await {
         Ok(t) => t,
         Err(resp) => return resp,
@@ -1420,8 +1425,34 @@ pub async fn chat_edit(
     if turn.role != chat::TurnRole::User {
         return sse_error_response(&t(lang, "chat-error-edit-own-messages-only"));
     }
+
+    // The edited message text + any newly attached files. Multipart carries
+    // attachments (uploaded here, their markers appended to the text);
+    // urlencoded is the text-only fallback.
+    let (model, new_text) = if content_type.starts_with("multipart/form-data") {
+        let submit = match parse_chat_submit(&content_type, body, &turn_id, &state).await {
+            Ok(s) => s,
+            Err(msg) => return sse_error_response(&msg),
+        };
+        // `submit.user_text` already carries the existing content (incl. any
+        // prior attachment markers the textarea preserved); append markers
+        // for the freshly attached files. Build the text before moving
+        // `submit.model` out (it borrows `submit`).
+        let text = augment_user_text(&turn_id, &submit);
+        (submit.model, text)
+    } else {
+        let form: EditForm = match serde_urlencoded::from_bytes(&body) {
+            Ok(f) => f,
+            Err(err) => return sse_error_response(&format!("malformed form: {err}")),
+        };
+        (form.model, form.message.trim().to_string())
+    };
+    if new_text.is_empty() {
+        return sse_error_response(&t(lang, "chat-error-message-must-not-be-empty"));
+    }
+
     // Rewrite the message, drop everything below it, regenerate.
-    if let Err(err) = chat::update_user_turn_content(&state.db, &id, &turn_id, new_text).await {
+    if let Err(err) = chat::update_user_turn_content(&state.db, &id, &turn_id, &new_text).await {
         return sse_error_response(&err.to_string());
     }
     if let Err(err) = chat::delete_turns_from_seq(&state.db, &id, turn.seq + 1).await {
@@ -1431,7 +1462,7 @@ pub async fn chat_edit(
         state,
         user,
         id,
-        form.model,
+        model,
         RequestCtx {
             client_ip,
             secure,
@@ -1440,6 +1471,95 @@ pub async fn chat_edit(
         lang,
     )
     .await
+}
+
+/// Path for `POST /chat/{id}/turns/{turn_id}/attachment/{filename}/remove`.
+/// `filename` arrives percent-decoded (same as the `chat_attachment`
+/// proxy route).
+#[derive(serde::Deserialize)]
+pub struct AttachmentRemovePath {
+    pub id: String,
+    pub turn_id: String,
+    pub filename: String,
+}
+
+/// Remove a single attachment from a message: drop its `[gw-attachment …]`
+/// marker from the turn's content, reclaim the S3 object, and patch the
+/// re-rendered turn back into the page. Unlike edit/retry this does NOT
+/// regenerate anything — the user just doesn't want that file there
+/// anymore. Works on both user uploads (`user_content`) and model-produced
+/// files like generated images (`content`).
+pub async fn chat_attachment_remove(
+    Path(AttachmentRemovePath {
+        id,
+        turn_id,
+        filename,
+    }): Path<AttachmentRemovePath>,
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    let (_session, user) = match require_session_or_redirect(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let lang = Lang::from_headers(req.headers());
+    let turn = match load_owned_turn(&state, &user, &id, &turn_id, lang).await {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+
+    // User uploads live in `user_content`; model-generated files (e.g.
+    // `generate_image`) live in `content`. Rewrite whichever column owns
+    // this turn's markers.
+    let is_user = turn.role == chat::TurnRole::User;
+    let content = if is_user {
+        turn.user_content.clone().unwrap_or_default()
+    } else {
+        turn.content.clone().unwrap_or_default()
+    };
+    let new_content =
+        session_core::attachments::remove_markers_where(&content, |a| a.filename == filename);
+    let write = if is_user {
+        chat::update_user_turn_content(&state.db, &id, &turn_id, &new_content)
+            .await
+            .map(|_| ())
+    } else {
+        chat::set_content(&state.db, &turn_id, &new_content).await
+    };
+    if let Err(err) = write {
+        return sse_error_response(&err.to_string());
+    }
+
+    // Reclaim the bytes. Best-effort: the marker is already gone, so a
+    // failed delete only leaves an orphaned object (idempotent DELETE
+    // makes a later retry safe) — never fail the user's action over it.
+    if let Some(cfg) = state.config.chat.s3.as_ref()
+        && let Err(err) = chat_attachments::delete(cfg, &turn_id, &filename).await
+    {
+        tracing::warn!(error = %err, %turn_id, %filename, "attachment S3 delete (marker already removed)");
+    }
+
+    // Re-render the affected turn and patch it in place — no regeneration.
+    let selector = format!("#turn-{turn_id}");
+    let html = if is_user {
+        let updated = match chat::get_turn(&state.db, &id, &turn_id).await {
+            Ok(Some(t)) => t,
+            _ => return sse_error_response(&t(lang, "chat-error-message-not-found")),
+        };
+        session_core::render::render_user_turn(&updated, Some("/chat"), lang).to_string()
+    } else {
+        let turns = match chat::list_turns(&state.db, &id).await {
+            Ok(t) => t,
+            Err(err) => return sse_error_response(&err.to_string()),
+        };
+        match turns.into_iter().find(|t| t.turn.id == turn_id) {
+            Some(tw) => {
+                session_core::render::render_assistant_turn(&tw, Some("/chat"), lang).to_string()
+            }
+            None => return sse_error_response(&t(lang, "chat-error-message-not-found")),
+        }
+    };
+    sse_response(&[sse_patch(Some(&selector), Some("outer"), &html)])
 }
 
 /// Request-derived bits the worker needs that aren't part of the chat
@@ -1887,6 +2007,21 @@ async fn parse_chat_submit(
     let mut attachments: Vec<UploadedAttachment> = Vec::new();
     let mut voice = false;
 
+    // Track the filenames already claimed under this turn so each upload
+    // lands on a distinct S3 key. Seeded with any filenames already
+    // attached to the turn (empty on the new-message path; populated when
+    // editing a turn that already has attachments). Without this, several
+    // clipboard-pasted images — the browser names every one `image.png` —
+    // upload to the SAME key and overwrite each other, so every marker
+    // ends up pointing at the last image. Dedup renames the collisions to
+    // `image-2.png`, `image-3.png`, … exactly like `reserve_filename`.
+    let existing_content = chat::get_content(&state.db, turn_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let mut used_names = session_core::attachments::existing_filenames(&existing_content);
+
     while let Some(field) = mp.next_field().await.map_err(|e| e.to_string())? {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
@@ -1919,6 +2054,20 @@ async fn parse_chat_submit(
                          in gateway.toml)"
                         .to_string()
                 })?;
+                // Nameless blobs (some drag/paste sources) get a
+                // mime-appropriate default before dedup so we never upload
+                // an empty-named object.
+                let desired = if filename.trim().is_empty() {
+                    format!(
+                        "pasted{}",
+                        chat_attachments::ext_for_mime(&mime).unwrap_or(".bin")
+                    )
+                } else {
+                    filename
+                };
+                let filename =
+                    session_core::attachments::dedupe_filename_against(&used_names, &desired);
+                used_names.insert(filename.clone());
                 let outcome = chat_attachments::upload(cfg, turn_id, &filename, &mime, bytes)
                     .await
                     .map_err(|e| format!("upload `{filename}`: {e}"))?;

@@ -16,6 +16,8 @@ render-attachment-unavailable-meta = unavailable
 render-attachment-open-title = Open { $filename } · { $mime } · { $size }
 render-attachment-title = { $filename } · { $mime } · { $size }
 render-attachment-chip-title = { $mime } · { $size }
+render-attachment-remove-aria = Remove attachment
+render-attachment-remove-confirm = Remove { $filename }? This can't be undone.
 
 # Caption on each generated media tile in a multi-media reply, so the
 # reader can reference it ("turn the 2nd image into a video"). Numbered

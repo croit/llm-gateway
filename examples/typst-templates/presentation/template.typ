@@ -558,6 +558,12 @@
   }
 }
 
+// Map an optional per-slide `size` (small|medium|large|full) to a media height.
+// Shared by `l-media` (framed) and `l-image`. `full` is nearly the whole slide.
+#let media-height(s, default-key: "large") = (
+  small: 6cm, medium: 9cm, large: 12cm, full: 14.5cm,
+).at(s.at("size", default: default-key), default: 12cm)
+
 #let l-media(p, s, n) = {
   let img = s.at("image", default: "")
   let framed = s.at("frame", default: false)
@@ -567,7 +573,9 @@
     place(top + left, dx: PADX, dy: 1.15cm, logo-img(p))
     let title = s.at("title", default: "")
     if title != "" { place(top + left, dx: PADX, dy: 2.7cm, text(size: 26pt, weight: 600, fill: p.fg)[#title]) }
-    place(center + horizon, dy: -0.2cm, box(width: 21cm, device-frame(img, h: 9.4cm)))
+    // `size` scales the framed screenshot (default keeps the original 9.4cm).
+    let h = (small: 6cm, medium: 8cm, large: 9.4cm, full: 11cm).at(s.at("size", default: "large"), default: 9.4cm)
+    place(center + horizon, dy: -0.2cm, box(width: 21cm, device-frame(img, h: h)))
     let cap = s.at("caption", default: "")
     if cap != "" { place(center + horizon, dy: 5.7cm, text(size: 13pt, fill: p.muted)[#cap]) }
     footer-row(p, n)
@@ -595,6 +603,29 @@
     footer-row(white-logo, n, on-grad: true)
   }
 }
+
+// A single image on its own clean slide — centred, sized via `size`, NO browser
+// chrome and NO text overlay (unlike full-bleed `l-media`). Optional `title`
+// above and `caption` below sit in the flow, so nothing ever covers the image.
+// `fit: "contain"` inside a fixed box guarantees the whole image shows, uncropped
+// and without overflowing the slide. Use this for a diagram/photo/chart that
+// should read large and unobstructed.
+#let l-image(p, n, s) = chrome(p, n, s, align(center + horizon, {
+  let img = s.at("image", default: "")
+  let title = s.at("title", default: "")
+  let cap = s.at("caption", default: "")
+  let framed = s.at("frame", default: false)
+  let h = media-height(s)
+  if title != "" { text(size: 26pt, weight: 600, fill: p.fg)[#title]; v(0.5cm) }
+  if img != "" {
+    if framed {
+      box(width: 100%, device-frame(img, h: h))
+    } else {
+      box(width: 100%, height: h, image(img, width: 100%, height: 100%, fit: "contain"))
+    }
+  }
+  if cap != "" { v(0.35cm); text(size: 13pt, fill: p.muted)[#cap] }
+}))
 
 #let l-team(p, n, s) = chrome(p, n, s, {
   text(size: 30pt, weight: 600, fill: p.fg)[#s.at("title", default: "")]
@@ -824,6 +855,6 @@
   let p = palette(theme)
   let lay = s.at("layout", default: "content")
   page(fill: p.bg, {
-    if lay == "cover" { l-cover(p, s) } else if lay == "section" { l-section(p, n, s) } else if lay == "agenda" { l-agenda(p, n, s) } else if lay == "cards" { l-cards(p, n, s) } else if lay == "split" { l-split(p, n, s) } else if lay == "stats" { l-stats(p, n, s) } else if lay == "dashboard" { l-dashboard(p, n, s) } else if lay == "comparison" { l-comparison(p, n, s) } else if lay == "process" { l-process(p, n, s) } else if lay == "quote" { l-quote(p, n, s) } else if lay == "media" { l-media(p, s, n) } else if lay == "team" { l-team(p, n, s) } else if lay == "table" { l-table(p, n, s) } else if lay == "diagram" { l-diagram(p, n, s) } else if lay == "statement" { l-statement(p, n, s) } else if lay == "bignumber" { l-bignumber(p, n, s) } else if lay == "logos" { l-logos(p, n, s) } else if lay == "gallery" { l-gallery(p, n, s) } else if lay == "timeline" { l-timeline(p, n, s) } else if lay == "cta-panel" { l-cta-panel(p, n, s) } else if lay == "closing" { l-closing(p, n, s) } else { l-content(p, n, s) }
+    if lay == "cover" { l-cover(p, s) } else if lay == "section" { l-section(p, n, s) } else if lay == "agenda" { l-agenda(p, n, s) } else if lay == "cards" { l-cards(p, n, s) } else if lay == "split" { l-split(p, n, s) } else if lay == "stats" { l-stats(p, n, s) } else if lay == "dashboard" { l-dashboard(p, n, s) } else if lay == "comparison" { l-comparison(p, n, s) } else if lay == "process" { l-process(p, n, s) } else if lay == "quote" { l-quote(p, n, s) } else if lay == "media" { l-media(p, s, n) } else if lay == "image" { l-image(p, n, s) } else if lay == "team" { l-team(p, n, s) } else if lay == "table" { l-table(p, n, s) } else if lay == "diagram" { l-diagram(p, n, s) } else if lay == "statement" { l-statement(p, n, s) } else if lay == "bignumber" { l-bignumber(p, n, s) } else if lay == "logos" { l-logos(p, n, s) } else if lay == "gallery" { l-gallery(p, n, s) } else if lay == "timeline" { l-timeline(p, n, s) } else if lay == "cta-panel" { l-cta-panel(p, n, s) } else if lay == "closing" { l-closing(p, n, s) } else { l-content(p, n, s) }
   })
 }

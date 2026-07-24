@@ -243,6 +243,7 @@ pub fn requires_chat_session(tool_id: &str) -> bool {
         || tool_id == "generate_image"
         || tool_id == "edit_image"
         || tool_id == "generate_qr_code"
+        || tool_id == "load_image_url"
 }
 
 /// `mcp__<server>__<tool>` → `mcp__<server>` (the per-server toggle key).
@@ -266,7 +267,7 @@ fn category_for(tool_id: &str) -> Category {
         "fetch_attachment" | "upload_attachment" | "list_attachments" | "read_skill" => {
             Category::Documents
         }
-        "generate_image" | "edit_image" | "generate_qr_code" => Category::Media,
+        "generate_image" | "edit_image" | "generate_qr_code" | "load_image_url" => Category::Media,
         "rag_search" | "rag_list_collections" => Category::Knowledge,
         "run_in_sandbox"
         | "generate_document"
@@ -373,6 +374,12 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Lets the assistant create an image from a text description — diagrams, mockups, \
              illustrations, or marketing visuals — and drop it straight into its reply for you \
              to download or reuse.",
+        ),
+        "load_image_url" => (
+            "Load image from a URL",
+            "Lets the assistant download an image from a web address and keep it as a reusable \
+             file in the conversation — so it can embed that image in a generated document \
+             (e.g. a logo in a letter) or reuse it in a later reply.",
         ),
         "edit_image" => (
             "Image editing",

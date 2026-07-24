@@ -32,6 +32,7 @@ pub mod fetch_url;
 pub mod generate_image;
 pub mod json_patch;
 pub mod list_attachments;
+pub mod load_image_url;
 pub mod location;
 pub mod lookup_ip;
 pub mod mcp;

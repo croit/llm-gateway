@@ -24,6 +24,29 @@
 // "de" for a German one-pager). The footer is generic, so no entity switch.
 #let lang = inputs.at("language", default: "en")
 
+// ---- Optional content image ------------------------------------------------
+// The model may place ONE image in the one-pager (a photo, chart, diagram,
+// screenshot, logo, …) at a chosen size, flowing in the page — never
+// overlapping the text. `image` is an `att:<turn>/<file>` attachment ref (or a
+// template-relative asset path); `image_size` picks the width; `image_position`
+// puts it above or below the body.
+#let doc-image = inputs.at("image", default: "")
+#let img-width = (
+  small: 40%, medium: 65%, large: 85%, full: 100%,
+).at(inputs.at("image_size", default: "large"), default: 85%)
+#let img-caption = inputs.at("image_caption", default: "")
+#let img-pos = inputs.at("image_position", default: "bottom")
+#let render-doc-image() = {
+  if doc-image != "" {
+    v(6mm)
+    align(center, image(doc-image, width: img-width))
+    if img-caption != "" {
+      v(2mm)
+      align(center, text(size: 9pt, fill: muted, style: "italic")[#img-caption])
+    }
+  }
+}
+
 // ---- Page (generic brand footer with page numbers) -------------------------
 #set page(
   paper: "a4",
@@ -93,8 +116,14 @@
 
 #v(7mm)
 
+// Content image above the body when requested.
+#if img-pos == "top" { render-doc-image(); v(7mm) }
+
 // ---- Body: native Typst markup ---------------------------------------------
 // Rendered with eval(mode: "markup"): *bold*, _italic_, `= headings`, `- ` / `+ `
 // lists, #link(...), #table(...) all style themselves via the show rules above.
 // Paragraphs stay blank-line separated; a lone newline is a space.
 #eval(inputs.body, mode: "markup")
+
+// Content image below the body (the default position).
+#if img-pos != "top" { render-doc-image() }

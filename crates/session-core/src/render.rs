@@ -309,7 +309,13 @@ pub fn render_user_turn(turn: &Turn, actions: Option<&str>, lang: Lang) -> Html 
                 }),
             })
             .collect();
-        let items = render_body(&pieces, lang);
+        // Per-attachment removal is offered on the same gate as the edit
+        // affordance: only when actions are shown (owner, not a shared
+        // read-only view). `{base}/{session}/turns/{turn}/attachment` is
+        // the per-turn prefix; `render_attachment` appends `/{file}/remove`.
+        let remove_prefix =
+            actions.map(|base| format!("{base}/{}/turns/{}/attachment", turn.session_id, turn.id));
+        let items = render_body(&pieces, remove_prefix.as_deref(), lang);
         html! {
             div(class: "chat-msg__body") {
                 for item in items.iter() { (item.clone()) }
@@ -368,6 +374,8 @@ fn render_user_edit(turn: &Turn, base: &str, content: &str, lang: Lang) -> Html 
     let edit_label = t(lang, "render-edit-button");
     let save_label = t(lang, "render-edit-save");
     let cancel_label = t(lang, "render-edit-cancel");
+    let attach_aria = t(lang, "render-composer-attach-aria");
+    let attach_title = t(lang, "render-composer-attach-title");
     html! {
         div(class: "chat-msg__actions") {
             button(
@@ -378,21 +386,59 @@ fn render_user_edit(turn: &Turn, base: &str, content: &str, lang: Lang) -> Html 
                 (edit_label)
             }
         }
+        // `enctype=multipart/form-data` + the hidden file input let this
+        // form carry pasted/dropped/picked attachments, exactly like the
+        // main composer. `@post(url, {contentType:'form'})` (see
+        // `action_submit`) then serialises it as multipart so `chat_edit`
+        // can upload them. The paste/drop/pick handlers in
+        // `chat/actions.ts` are scoped to this form (not a singleton id),
+        // so every message's edit form manages its own attachments.
         form(
             action: (edit_url),
             method: "post",
+            enctype: "multipart/form-data",
             class: "chat-msg__edit",
-            "data-on:submit__prevent": (submit)
+            "data-on:submit__prevent": (submit),
+            "data-on:dragover__prevent": "window.chatActions.editDragOver(evt)",
+            "data-on:dragleave__prevent": "window.chatActions.editDragLeave(evt)",
+            "data-on:drop__prevent": "window.chatActions.editDrop(evt)",
+            "data-on:paste": "window.chatActions.editPaste(evt)"
         ) {
             input(type: "hidden", name: "model");
+            // Hidden file input — `name="attachment"` so `chat_edit`'s
+            // multipart parser picks it up; `multiple` accepts batch picks.
+            input(
+                name: "attachment",
+                type: "file",
+                multiple: "multiple",
+                hidden: "hidden",
+                "data-on:change": "window.chatActions.editFilesPicked(evt)"
+            );
+            // Chip strip — `chat-composer__chips` for the shared styling
+            // (incl. `:empty` hide); `chat-msg__edit-chips` is the hook
+            // the edit handlers query it by.
+            div(class: "chat-composer__chips chat-msg__edit-chips") {}
             textarea(name: "message", class: "chat-msg__edit-textarea") { (content) }
             div(class: "chat-msg__edit-actions") {
-                button(type: "submit", class: "btn btn-sm btn-primary") { (save_label) }
+                // Attach button — opens the hidden file input. Left of the
+                // Save/Cancel cluster (which stays right-aligned).
                 button(
                     type: "button",
-                    class: "btn btn-sm btn-ghost",
-                    "data-on:click": (cancel)
-                ) { (cancel_label) }
+                    class: "btn btn-sm btn-circle btn-ghost chat-msg__edit-attach",
+                    "data-on:click": "window.chatActions.editPickFiles(el)",
+                    "aria-label": (attach_aria),
+                    title: (attach_title)
+                ) {
+                    (icons::paperclip(16))
+                }
+                span(class: "chat-msg__edit-actions-main") {
+                    button(type: "submit", class: "btn btn-sm btn-primary") { (save_label) }
+                    button(
+                        type: "button",
+                        class: "btn btn-sm btn-ghost",
+                        "data-on:click": (cancel)
+                    ) { (cancel_label) }
+                }
             }
         }
     }
@@ -408,11 +454,34 @@ fn render_user_edit(turn: &Turn, base: &str, content: &str, lang: Lang) -> Html 
 /// side) linked through to the full-res URL. Audio and video get native
 /// browser controls; everything else gets a neutral chip with a
 /// mime-aware icon + filename + byte size.
-fn render_attachment(att: &crate::attachments::ParsedAttachment, lang: Lang) -> Html {
+fn render_attachment(
+    att: &crate::attachments::ParsedAttachment,
+    remove_prefix: Option<&str>,
+    lang: Lang,
+) -> Html {
     let url = att.url.clone();
     let filename = att.filename.clone();
     let mime = att.mime.clone();
     let size = format_bytes(att.size);
+    // The per-attachment remove (×) control — only when `remove_prefix` is
+    // set (owner viewing their own conversation; None for shared/read-only
+    // views). The POST target is `<prefix>/<filename>/remove`; the filename
+    // is percent-encoded so spaces / unicode don't break the URL path.
+    let remove_btn = remove_prefix.map(|prefix| {
+        let remove_url = format!("{prefix}/{}/remove", urlencode_path_segment(&filename));
+        render_attachment_remove(&remove_url, &filename, lang)
+    });
+    // Every attachment sits in a `position: relative` wrapper so the ×
+    // can pin to its top-right corner regardless of media type.
+    let wrap = |inner: Html| {
+        html! {
+            div(class: "chat-msg__attachment") {
+                (inner)
+                if let Some(btn) = remove_btn.clone() { (btn) }
+            }
+        }
+        .to_html()
+    };
     if att.is_image() {
         let alt = filename.clone();
         // A preview image (e.g. a typst render's PNG) clicks through to
@@ -439,12 +508,14 @@ fn render_attachment(att: &crate::attachments::ParsedAttachment, lang: Lang) -> 
                 ]),
             ),
         };
-        return html! {
-            a(href: (href), target: "_blank", rel: "noopener", class: "chat-msg__attachment-image") {
-                img(src: (url), alt: (alt), title: (title), loading: "lazy");
+        return wrap(
+            html! {
+                a(href: (href), target: "_blank", rel: "noopener", class: "chat-msg__attachment-image") {
+                    img(src: (url), alt: (alt), title: (title), loading: "lazy");
+                }
             }
-        }
-        .to_html();
+            .to_html(),
+        );
     }
     if mime.starts_with("video/") {
         let title = t_args(
@@ -456,21 +527,23 @@ fn render_attachment(att: &crate::attachments::ParsedAttachment, lang: Lang) -> 
                 ("size", size.clone().into()),
             ]),
         );
-        return html! {
-            div(class: "chat-msg__attachment-player") {
-                video(
-                    src: (url.clone()),
-                    controls: "controls",
-                    preload: "metadata",
-                    title: (title)
-                ) {}
-                a(href: (url), target: "_blank", rel: "noopener", class: "chat-msg__attachment-player-meta") {
-                    span(class: "chat-msg__attachment-name") { (filename) }
-                    span(class: "chat-msg__attachment-meta") { (size) }
+        return wrap(
+            html! {
+                div(class: "chat-msg__attachment-player") {
+                    video(
+                        src: (url.clone()),
+                        controls: "controls",
+                        preload: "metadata",
+                        title: (title)
+                    ) {}
+                    a(href: (url), target: "_blank", rel: "noopener", class: "chat-msg__attachment-player-meta") {
+                        span(class: "chat-msg__attachment-name") { (filename) }
+                        span(class: "chat-msg__attachment-meta") { (size) }
+                    }
                 }
             }
-        }
-        .to_html();
+            .to_html(),
+        );
     }
     if mime.starts_with("audio/") {
         let title = t_args(
@@ -482,41 +555,89 @@ fn render_attachment(att: &crate::attachments::ParsedAttachment, lang: Lang) -> 
                 ("size", size.clone().into()),
             ]),
         );
-        return html! {
-            div(class: "chat-msg__attachment-player chat-msg__attachment-player--audio") {
-                audio(
-                    src: (url.clone()),
-                    controls: "controls",
-                    preload: "metadata",
-                    title: (title)
-                ) {}
-                a(href: (url), target: "_blank", rel: "noopener", class: "chat-msg__attachment-player-meta") {
-                    span(class: "chat-msg__attachment-name") { (filename) }
-                    span(class: "chat-msg__attachment-meta") { (size) }
+        return wrap(
+            html! {
+                div(class: "chat-msg__attachment-player chat-msg__attachment-player--audio") {
+                    audio(
+                        src: (url.clone()),
+                        controls: "controls",
+                        preload: "metadata",
+                        title: (title)
+                    ) {}
+                    a(href: (url), target: "_blank", rel: "noopener", class: "chat-msg__attachment-player-meta") {
+                        span(class: "chat-msg__attachment-name") { (filename) }
+                        span(class: "chat-msg__attachment-meta") { (size) }
+                    }
                 }
             }
-        }
-        .to_html();
+            .to_html(),
+        );
     }
     let chip_title = t_args(
         lang,
         "render-attachment-chip-title",
         &i18n::args([("mime", mime.clone().into()), ("size", size.clone().into())]),
     );
+    wrap(
+        html! {
+            a(
+                href: (url.clone()),
+                target: "_blank",
+                rel: "noopener",
+                class: "chat-msg__attachment-chip",
+                title: (chip_title)
+            ) {
+                span(class: "chat-msg__attachment-icon") { (icons::paperclip(14)) }
+                span(class: "chat-msg__attachment-name") { (filename) }
+                span(class: "chat-msg__attachment-meta") { (size) }
+            }
+        }
+        .to_html(),
+    )
+}
+
+/// The hover "×" control that removes one attachment from a message.
+/// Confirms, then `@post`s to the removal endpoint whose SSE response
+/// re-renders this turn without the attachment (and reclaims the S3
+/// object server-side). No hidden form / JS glue — datastar's `@post`
+/// handles the request and the element patch.
+fn render_attachment_remove(remove_url: &str, filename: &str, lang: Lang) -> Html {
+    let confirm = t_args(
+        lang,
+        "render-attachment-remove-confirm",
+        &i18n::args([("filename", filename.to_string().into())]),
+    );
+    let aria = t(lang, "render-attachment-remove-aria");
+    let confirm_js = serde_json::to_string(&confirm).expect("String always serialises");
+    let directive = format!("confirm({confirm_js}) && @post('{remove_url}')");
     html! {
-        a(
-            href: (url.clone()),
-            target: "_blank",
-            rel: "noopener",
-            class: "chat-msg__attachment-chip",
-            title: (chip_title)
+        button(
+            type: "button",
+            class: "chat-msg__attachment-remove",
+            "aria-label": (aria),
+            title: (aria),
+            "data-on:click": (directive)
         ) {
-            span(class: "chat-msg__attachment-icon") { (icons::paperclip(14)) }
-            span(class: "chat-msg__attachment-name") { (filename) }
-            span(class: "chat-msg__attachment-meta") { (size) }
+            "×"
         }
     }
     .to_html()
+}
+
+/// Percent-encode a filename as a single URL path segment for the
+/// removal endpoint — mirrors the gateway's `proxy_url` encoding so a
+/// name with spaces / unicode survives the round-trip. The upload path
+/// rejects `/`, so the name is always one path component.
+fn urlencode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// The gallery "kind" of an attachment — `Some("image"|"video"|"audio")`
@@ -556,9 +677,10 @@ fn render_media_tile(
     kind: &str,
     n: usize,
     numbered: bool,
+    remove_prefix: Option<&str>,
     lang: Lang,
 ) -> Html {
-    let inner = render_attachment(att, lang);
+    let inner = render_attachment(att, remove_prefix, lang);
     if !numbered {
         return html! { div(class: "chat-media") { (inner) } }.to_html();
     }
@@ -586,7 +708,7 @@ fn render_media_tile(
 /// Grouping + numbering only engage when the body holds 2+ media — a lone
 /// image/video renders inline exactly as before, so the single-media and
 /// text-only cases (and their streaming-morph output) are unchanged.
-fn render_body(pieces: &[BodyPiece], lang: Lang) -> Vec<Html> {
+fn render_body(pieces: &[BodyPiece], remove_prefix: Option<&str>, lang: Lang) -> Vec<Html> {
     let total_media = pieces
         .iter()
         .filter(|p| matches!(p, BodyPiece::Media(_)))
@@ -596,7 +718,9 @@ fn render_body(pieces: &[BodyPiece], lang: Lang) -> Vec<Html> {
             .iter()
             .map(|p| match p {
                 BodyPiece::Block(h) => h.clone(),
-                BodyPiece::File(att) | BodyPiece::Media(att) => render_attachment(att, lang),
+                BodyPiece::File(att) | BodyPiece::Media(att) => {
+                    render_attachment(att, remove_prefix, lang)
+                }
             })
             .collect();
     }
@@ -611,7 +735,7 @@ fn render_body(pieces: &[BodyPiece], lang: Lang) -> Vec<Html> {
                 i += 1;
             }
             BodyPiece::File(att) => {
-                out.push(render_attachment(att, lang));
+                out.push(render_attachment(att, remove_prefix, lang));
                 i += 1;
             }
             BodyPiece::Media(_) => {
@@ -624,7 +748,7 @@ fn render_body(pieces: &[BodyPiece], lang: Lang) -> Vec<Html> {
                         *c += 1;
                         *c
                     };
-                    tiles.push(render_media_tile(att, kind, n, true, lang));
+                    tiles.push(render_media_tile(att, kind, n, true, remove_prefix, lang));
                     i += 1;
                 }
                 out.push(
@@ -738,7 +862,11 @@ pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: La
             },
         })
         .collect();
-    let body_items = render_body(&body_pieces, lang);
+    // Attachments the model produced (generated images, uploaded files)
+    // are removable on the same owner gate as the retry affordance.
+    let remove_prefix =
+        actions.map(|base| format!("{base}/{}/turns/{}/attachment", turn.session_id, turn.id));
+    let body_items = render_body(&body_pieces, remove_prefix.as_deref(), lang);
     let has_reasoning = !reasoning.is_empty();
 
     html! {
@@ -2184,6 +2312,78 @@ mod tests {
     }
 
     #[test]
+    fn edit_form_carries_attachment_affordances() {
+        // The inline edit form must accept pasted/dropped/picked files just
+        // like the main composer: multipart enctype, the paste handler, a
+        // named file input, and a chip strip. Regression guard for the
+        // "can't paste an image while editing" bug.
+        let turn = conv_turn(0, TurnRole::User, "hello").turn;
+        let html = render_user_turn(&turn, Some("/chat"), Lang::En).to_string();
+        assert!(
+            html.contains("multipart/form-data"),
+            "edit form must be multipart: {html}"
+        );
+        assert!(
+            html.contains("window.chatActions.editPaste"),
+            "edit form must wire the paste handler: {html}"
+        );
+        assert!(
+            html.contains(r#"name="attachment""#),
+            "edit form needs the attachment file input: {html}"
+        );
+        assert!(
+            html.contains("chat-msg__edit-chips"),
+            "edit form needs the chip strip hook: {html}"
+        );
+    }
+
+    #[test]
+    fn owner_gets_per_attachment_remove_control() {
+        // A user viewing their own message can remove an attachment; the ×
+        // posts to the per-attachment endpoint the router serves.
+        let content = format!("look\n\n{}\n\n", media_marker("pic.png", "image/png"));
+        let turn = conv_turn(0, TurnRole::User, &content).turn;
+        let html = render_user_turn(&turn, Some("/chat"), Lang::En).to_string();
+        assert!(
+            html.contains("chat-msg__attachment-remove"),
+            "remove control expected: {html}"
+        );
+        assert!(
+            html.contains("/chat/s1/turns/t0/attachment/pic.png/remove"),
+            "remove must post to the per-attachment endpoint: {html}"
+        );
+        assert!(
+            html.contains("@post("),
+            "removal uses datastar @post: {html}"
+        );
+    }
+
+    #[test]
+    fn readonly_view_has_no_remove_control() {
+        // Shared / read-only view (no actions) must not offer removal.
+        let content = format!("look\n\n{}\n\n", media_marker("pic.png", "image/png"));
+        let turn = conv_turn(0, TurnRole::User, &content).turn;
+        let html = render_user_turn(&turn, None, Lang::En).to_string();
+        assert!(
+            !html.contains("chat-msg__attachment-remove"),
+            "no remove control for read-only viewers: {html}"
+        );
+    }
+
+    #[test]
+    fn generated_image_on_assistant_turn_is_removable() {
+        // Removal also covers model-produced files (e.g. generate_image),
+        // which live on the assistant turn's `content`.
+        let content = format!("done\n\n{}\n\n", media_marker("gen.png", "image/png"));
+        let tw = conv_turn(0, TurnRole::Assistant, &content);
+        let html = render_assistant_turn(&tw, Some("/chat"), Lang::En).to_string();
+        assert!(
+            html.contains("/chat/s1/turns/t0/attachment/gen.png/remove"),
+            "assistant-generated attachment must be removable: {html}"
+        );
+    }
+
+    #[test]
     fn multiple_media_render_as_numbered_gallery() {
         // Three generated images in one reply must lay out side by side
         // (one `chat-media-gallery`) with per-kind "Image N" captions so the
@@ -2254,7 +2454,7 @@ mod tests {
             size: 19600,
             link: None,
         };
-        let rendered = render_attachment(&pdf, Lang::En).to_string();
+        let rendered = render_attachment(&pdf, None, Lang::En).to_string();
         assert!(
             rendered.contains("/chat/attachment/turn-A/letter.pdf"),
             "expected the real download link: {rendered}"
@@ -2274,7 +2474,7 @@ mod tests {
             size: 1000,
             link: None,
         };
-        let rendered_img = render_attachment(&png, Lang::En).to_string();
+        let rendered_img = render_attachment(&png, None, Lang::En).to_string();
         assert!(
             rendered_img.contains("<img"),
             "a valid session image should be rendered inline: {rendered_img}"
@@ -2298,8 +2498,8 @@ mod tests {
             link: None,
         };
 
-        let video_html = render_attachment(&video, Lang::En).to_string();
-        let audio_html = render_attachment(&audio, Lang::En).to_string();
+        let video_html = render_attachment(&video, None, Lang::En).to_string();
+        let audio_html = render_attachment(&audio, None, Lang::En).to_string();
 
         assert!(
             video_html.contains("<video"),

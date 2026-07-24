@@ -14,7 +14,7 @@ fields take lightweight Typst markup (see MARKUP & ESCAPING below).
 Before you build the deck, plan the narrative: a typical deck opens with a \
 `cover`, may use `agenda`, groups content with `section` dividers, carries the \
 message on `content`/`split`/`cards`/`stats`/`comparison`/`process`/`bignumber`/ \
-`quote`/`media`/`gallery`/`timeline`/`logos`/`team`/`table`/`diagram`, and ends \
+`quote`/`media`/`image`/`gallery`/`timeline`/`logos`/`team`/`table`/`diagram`, and ends \
 with `closing`. ONE idea per slide. Keep it tight: ≤6 bullets, ≤4 cards/stats \
 per row, ≤6 process steps, ≤8 table rows (there is NO auto-pagination — content \
 that overflows the slide height is simply cut off, so split long material across \
@@ -49,7 +49,8 @@ LAYOUTS AND THEIR FIELDS (✱ = required):
 • process — horizontal steps. title✱, steps✱[{label✱, detail?}] (2–6)
 • bignumber — one hero metric. value✱, title✱, body?
 • quote — quote✱, attribution✱, attribution_role?, style? ("default" = left, gradient text | "hero" = big white centred quote, the example.com hero look)
-• media — image showcase. image? (omit → gradient + centred statement), frame? (true → centred screenshot inside a browser/device frame instead of full-bleed), title✱, caption?
+• media — image showcase. image? (omit → gradient + centred statement), frame? (true → centred screenshot inside a browser/device frame instead of full-bleed), size? ("small"|"medium"|"large"|"full", scales the framed screenshot), title✱, caption?
+• image — ONE image alone on a clean slide: centred, NO browser chrome and NO text overlay (unlike full-bleed `media`), so the picture reads large and unobstructed. image✱, size? ("small"|"medium"|"large" (default)|"full" ≈ whole slide), title? (above, in the flow), caption? (below), frame? (wrap in the browser chrome). Use this for a diagram/photo/chart that should dominate the slide without text on top of it.
 • gallery — image grid. title✱, items✱[{image?, caption?}], per_row (default 3). Omitted image → gradient tile.
 • timeline — vertical roadmap. title✱, milestones✱[{label✱, date?, detail?}]
 • logos — "trusted by" wall. title✱, logos✱[strings], per_row (default 4)

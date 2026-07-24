@@ -17,6 +17,8 @@ render-attachment-unavailable-meta = indisponible
 render-attachment-open-title = Ouvrir { $filename } · { $mime } · { $size }
 render-attachment-title = { $filename } · { $mime } · { $size }
 render-attachment-chip-title = { $mime } · { $size }
+render-attachment-remove-aria = Supprimer la pièce jointe
+render-attachment-remove-confirm = Supprimer { $filename } ? Action irréversible.
 
 # Légende de chaque média généré dans une réponse multi-médias, pour pouvoir
 # y faire référence (« transforme la 2e image en vidéo »).

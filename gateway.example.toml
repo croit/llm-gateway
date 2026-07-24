@@ -133,6 +133,7 @@ enabled = true
 #          "list_document_versions", "restore_document_version",
 #          "list_attachments",   # conversation file inventory (reuse instead of regenerate)
 #          "generate_qr_code",   # native QR codes (PNG/SVG, colors, optional logo)
+#          "load_image_url",     # fetch an image from a URL, keep as reusable attachment
 #          "generate_image"]  # image gen; only offered when an image-kind pool is configured
 # # Skill names this role may load (see [skills] below). "*" = all loaded
 # # skills; omit/empty to grant none. Requires the `read_skill` tool too,

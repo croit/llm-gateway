@@ -17,6 +17,8 @@ render-attachment-unavailable-meta = недоступно
 render-attachment-open-title = Открыть { $filename } · { $mime } · { $size }
 render-attachment-title = { $filename } · { $mime } · { $size }
 render-attachment-chip-title = { $mime } · { $size }
+render-attachment-remove-aria = Удалить вложение
+render-attachment-remove-confirm = Удалить { $filename }? Это действие нельзя отменить.
 
 # Подпись к каждому сгенерированному медиа в ответе с несколькими медиа,
 # чтобы на него можно было сослаться («сделай видео из 2-й картинки»).

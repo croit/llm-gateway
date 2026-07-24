@@ -17,6 +17,8 @@ render-attachment-unavailable-meta = nicht verfügbar
 render-attachment-open-title = { $filename } öffnen · { $mime } · { $size }
 render-attachment-title = { $filename } · { $mime } · { $size }
 render-attachment-chip-title = { $mime } · { $size }
+render-attachment-remove-aria = Anhang entfernen
+render-attachment-remove-confirm = { $filename } entfernen? Das kann nicht rückgängig gemacht werden.
 
 # Beschriftung jeder generierten Medienkachel in einer Antwort mit mehreren
 # Medien, damit man darauf verweisen kann („mach aus dem 2. Bild ein Video").

@@ -313,6 +313,11 @@ fn target_for_key(key: &str) -> EnableTarget {
             "Fetch a web page",
             "fetch a specific http(s) URL and read its contents (text, JSON, images)",
         ),
+        "load_image_url" => (
+            "Load image from a URL",
+            "download an image from an http(s) URL and store it as a reusable attachment — \
+             embed it in a typst render via `att:<id>` or reuse it later",
+        ),
         "wikipedia" => (
             "Wikipedia lookup",
             "fetch the summary of a Wikipedia article",

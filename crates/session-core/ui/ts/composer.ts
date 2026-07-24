@@ -29,6 +29,16 @@
 // shrunk to: validate non-empty, flip the streaming signal, and clear
 // the textarea once the server's initial SSE event lands.
 
+import {
+    type AttachmentEls,
+    addFiles,
+    currentFiles,
+    filesFromClipboard,
+    filesFromDataTransfer,
+    refreshChips,
+    setFiles,
+} from './attachments.js';
+
 // `pendingClear` is set the moment a non-empty submit fires and
 // cleared by the first conversation mutation that arrives after that
 // submit (= the server's SSE response landing). The autoscroll
@@ -49,106 +59,24 @@ const getFileInput = (): HTMLInputElement | null =>
 const getChipStrip = (): HTMLElement | null =>
     document.getElementById('chat-attachments-chips');
 
-/** True iff `name` looks like a file we'd inline as text. Mirrors
- *  the backend's `chat_attachments::is_inline_text` heuristic so the
- *  chip can show a slightly different label for code-ish files. */
-const looksLikeText = (mime: string, name: string): boolean => {
-    if (mime.startsWith('text/')) return true;
-    const ext = name.split('.').pop()?.toLowerCase() ?? '';
-    return [
-        'csv','tsv','json','jsonl','ndjson','yaml','yml','toml','xml',
-        'md','markdown','rst','txt','log','sql',
-        'sh','bash','zsh','py','rs','ts','tsx','js','jsx','go','java',
-        'kt','swift','rb','php','c','h','cpp','cc','hpp','css','html','htm',
-        'ini','cfg','conf',
-    ].includes(ext);
-};
-
-const formatBytes = (n: number): string => {
-    if (n < 1024) return `${n} B`;
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-};
-
-const refreshChips = (): void => {
+/** The composer's singleton `{input, strip}` pair, or null if either is
+ *  absent (e.g. a page without a live composer). All attachment logic
+ *  lives in the shared `attachments.ts`; this just resolves the two
+ *  elements the composer owns. */
+const els = (): AttachmentEls | null => {
     const input = getFileInput();
     const strip = getChipStrip();
-    if (!input || !strip) return;
-    const files = input.files ? Array.from(input.files) : [];
-    strip.innerHTML = '';
-    files.forEach((f, idx) => {
-        const chip = document.createElement('span');
-        chip.className = 'chat-composer__chip';
-        chip.title = `${f.name} (${f.type || 'unknown'}, ${formatBytes(f.size)})`;
-        const label = document.createElement('span');
-        label.className = 'chat-composer__chip-label';
-        const kind = f.type.startsWith('image/')
-            ? '🖼'
-            : looksLikeText(f.type, f.name)
-              ? '📄'
-              : '📦';
-        label.textContent = `${kind} ${f.name}`;
-        chip.appendChild(label);
-        const meta = document.createElement('span');
-        meta.className = 'chat-composer__chip-size';
-        meta.textContent = formatBytes(f.size);
-        chip.appendChild(meta);
-        const close = document.createElement('button');
-        close.type = 'button';
-        close.className = 'chat-composer__chip-remove';
-        close.setAttribute('aria-label', `Remove ${f.name}`);
-        close.textContent = '×';
-        close.addEventListener('click', (e) => {
-            e.preventDefault();
-            removeAttachmentAt(idx);
-        });
-        chip.appendChild(close);
-        strip.appendChild(chip);
-    });
+    return input && strip ? { input, strip } : null;
 };
 
-/** Replace the file input's `.files` with a new FileList built from
- *  `files`. The DataTransfer trick is the only cross-browser way to
- *  programmatically assign a FileList — direct construction isn't
- *  allowed. */
-const setFiles = (files: File[]): void => {
+const composerFiles = (): File[] => {
     const input = getFileInput();
-    if (!input) return;
-    const dt = new DataTransfer();
-    files.forEach((f) => dt.items.add(f));
-    input.files = dt.files;
-    refreshChips();
-};
-
-const currentFiles = (): File[] => {
-    const input = getFileInput();
-    if (!input || !input.files) return [];
-    return Array.from(input.files);
-};
-
-const addFiles = (incoming: File[]): void => {
-    if (incoming.length === 0) return;
-    const existing = currentFiles();
-    const dedupKey = (f: File) => `${f.name}/${f.size}/${f.lastModified}`;
-    const seen = new Set(existing.map(dedupKey));
-    const merged = [...existing];
-    incoming.forEach((f) => {
-        const k = dedupKey(f);
-        if (!seen.has(k)) {
-            seen.add(k);
-            merged.push(f);
-        }
-    });
-    setFiles(merged);
-};
-
-const removeAttachmentAt = (idx: number): void => {
-    const next = currentFiles().filter((_, i) => i !== idx);
-    setFiles(next);
+    return input ? currentFiles(input) : [];
 };
 
 const clearAttachments = (): void => {
-    setFiles([]);
+    const e = els();
+    if (e) setFiles(e, []);
 };
 
 const openFilePicker = (): void => {
@@ -160,12 +88,8 @@ const onFilesPicked = (evt: Event): void => {
     if (!input || !input.files) return;
     // Picker assigns its own FileList directly; we just need to
     // re-paint the chip strip.
-    refreshChips();
-};
-
-const filesFromDataTransfer = (dt: DataTransfer | null): File[] => {
-    if (!dt) return [];
-    return Array.from(dt.files);
+    const strip = getChipStrip();
+    if (strip) refreshChips({ input, strip });
 };
 
 const onDragOver = (evt: DragEvent): void => {
@@ -179,33 +103,24 @@ const onDragLeave = (evt: DragEvent): void => {
 const onDrop = (evt: DragEvent): void => {
     const form = evt.currentTarget as HTMLElement | null;
     form?.classList.remove('chat-composer--drag');
+    const e = els();
+    if (!e) return;
     const files = filesFromDataTransfer(evt.dataTransfer);
-    if (files.length > 0) addFiles(files);
+    if (files.length > 0) addFiles(e, files);
 };
 const onPaste = (evt: ClipboardEvent): void => {
-    const data = evt.clipboardData;
-    if (!data) return;
-    const files: File[] = [];
-    // `clipboardData.items` is the modern path — it surfaces every
-    // pasted entry, including image bytes copied with the OS's
-    // screenshot shortcut. Each item has either `kind: 'file'` or
-    // `kind: 'string'`; we keep only files.
-    for (let i = 0; i < data.items.length; i++) {
-        const item = data.items[i];
-        if (item.kind === 'file') {
-            const f = item.getAsFile();
-            if (f) files.push(f);
-        }
-    }
+    const e = els();
+    if (!e) return;
+    const files = filesFromClipboard(evt.clipboardData);
     if (files.length > 0) {
         evt.preventDefault();
-        addFiles(files);
+        addFiles(e, files);
     }
 };
 
 const onSubmit = (_evt: Event): boolean => {
     const msg = getMessageInput();
-    const hasFiles = currentFiles().length > 0;
+    const hasFiles = composerFiles().length > 0;
     const text = msg?.value.trim() ?? '';
     // Allow attachment-only submits (e.g. drop a screenshot, hit
     // send): the backend still expects a message field but accepts

@@ -244,6 +244,23 @@
 // rules above. Paragraphs stay blank-line separated; a lone newline is a space.
 #eval(paras.join("\n\n"), mode: "markup")
 
+// ---- Optional inline figure ------------------------------------------------
+// The model may include ONE image (chart, photo, diagram, screenshot) between
+// the body and the closing, at a chosen width — centred and flowing so it never
+// overlaps the text. `image` is an `att:<turn>/<file>` ref (or an asset path).
+#let doc-image = inputs.at("image", default: "")
+#if doc-image != "" {
+  let img-width = (small: 40%, medium: 60%, large: 80%).at(
+    inputs.at("image_size", default: "medium"), default: 60%)
+  let img-caption = inputs.at("image_caption", default: "")
+  v(5mm)
+  align(center, image(doc-image, width: img-width))
+  if img-caption != "" {
+    v(2mm)
+    align(center, text(size: 9pt, fill: muted, style: "italic")[#img-caption])
+  }
+}
+
 #v(5mm)
 
 // ---- Closing + signature ---------------------------------------------------

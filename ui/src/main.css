@@ -1372,6 +1372,50 @@
     .chat-msg__prose {
         margin: 0;
     }
+    /* Wrapper around every attachment so the hover "×" remove control
+     * can pin to its top-right corner regardless of media type. */
+    .chat-msg__attachment {
+        position: relative;
+        display: inline-block;
+        max-width: 100%;
+    }
+    .chat-msg__attachment-remove {
+        position: absolute;
+        top: 0.25rem;
+        right: 0.25rem;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 1.5rem;
+        height: 1.5rem;
+        border-radius: 9999px;
+        background: color-mix(in oklch, var(--color-base-100) 85%, transparent);
+        color: var(--color-base-content);
+        border: 1px solid var(--color-base-300);
+        font-size: 1rem;
+        line-height: 1;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 0.12s ease;
+        z-index: 2;
+    }
+    .chat-msg__attachment:hover .chat-msg__attachment-remove,
+    .chat-msg__attachment-remove:focus-visible {
+        opacity: 1;
+    }
+    @media (hover: hover) {
+        .chat-msg__attachment-remove:hover {
+            background: color-mix(in oklch, var(--color-error) 85%, transparent);
+            color: var(--color-error-content);
+            border-color: transparent;
+        }
+    }
+    /* No hover on touch — keep the control reachable. */
+    @media (hover: none) {
+        .chat-msg__attachment-remove {
+            opacity: 0.9;
+        }
+    }
     .chat-msg__attachment-image {
         display: block;
         max-width: 100%;
@@ -1599,7 +1643,19 @@
     .chat-msg__edit-actions {
         display: flex;
         gap: 0.5rem;
-        justify-content: flex-end;
+        align-items: center;
+        /* Attach button on the left, Save/Cancel cluster on the right. */
+        justify-content: space-between;
+    }
+    .chat-msg__edit-actions-main {
+        display: flex;
+        gap: 0.5rem;
+    }
+    /* Drag-target outline on an edit form — mirrors `.chat-composer--drag`.
+     * Toggled by the editDragOver/editDragLeave handlers in actions.ts. */
+    .chat-msg__edit--drag .chat-msg__edit-textarea {
+        border-color: color-mix(in oklch, var(--color-primary) 60%, transparent);
+        box-shadow: 0 0 0 3px color-mix(in oklch, var(--color-primary) 20%, transparent);
     }
     /* Assistant bubbles are full-width with no chrome. `position:
      * relative` anchors the absolutely-positioned hover Retry action. */

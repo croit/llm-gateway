@@ -160,6 +160,10 @@ async fn main() -> anyhow::Result<()> {
         .with(srv::tools::echo::Echo)
         .with(srv::tools::time::CurrentTimestamp)
         .with(srv::tools::fetch_url::FetchUrl)
+        // Fetch an image from a URL and keep it as a reusable attachment
+        // (so it can be embedded in a later typst render). Always on — the
+        // runtime guard errors cleanly off the chat path / without [chat.s3].
+        .with(srv::tools::load_image_url::LoadImageUrl)
         .with(srv::tools::fetch_attachment::FetchAttachment::new(
             sandbox_client.clone(),
         ))
