@@ -17,6 +17,11 @@ max_tokens  output limit
 ngram_window 128 for one image, 1024 for multi-page documents
 ```
 
+The sidecar exposes `GET /healthz` for the gateway backend health path. Configure
+the gateway backend with `health_path = "/healthz"`, `probe_models = false`,
+and list `baidu/Unlimited-OCR` as its static model. The sidecar is not itself a
+model-discovery endpoint.
+
 The response is JSON with either `markdown` or `text`:
 
 ```json
