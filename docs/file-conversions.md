@@ -11,6 +11,10 @@ which tool/engine does each job, and — importantly — what each path can and
   structured content** (a sandbox python extractor: titles, text, bullets,
   tables, notes) and any embedded images are re-attached as `att:` refs the
   model can carry into a render.
+- PDF rasterization is bounded and configurable through the shared
+  `server::pdf::RenderSettings` API. The existing default remains eight pages
+  at approximately 1240x1754 pixels; OCR consumers can select a different
+  bounded profile without changing the normal vision fallback.
 - **Producing documents:** two families —
   1. **Markdown → PDF/DOCX/PPTX** via `generate_document` (pandoc). Fast, generic,
      unbranded.

@@ -42,6 +42,27 @@ pub const DEFAULT_MAX_RENDER_PAGES: usize = 8;
 /// (`set_maximum_height` only clamps absurdly tall pages).
 const RENDER_TARGET_WIDTH: i32 = 1240;
 const RENDER_MAX_HEIGHT: i32 = 1754;
+const MAX_RENDER_TARGET_WIDTH: i32 = 4096;
+const MAX_RENDER_HEIGHT: i32 = 8192;
+const MAX_RENDER_PAGES: usize = 64;
+
+/// Bounded rasterization settings shared by vision and OCR consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderSettings {
+    pub max_pages: usize,
+    pub target_width: i32,
+    pub max_height: i32,
+}
+
+impl Default for RenderSettings {
+    fn default() -> Self {
+        Self {
+            max_pages: DEFAULT_MAX_RENDER_PAGES,
+            target_width: RENDER_TARGET_WIDTH,
+            max_height: RENDER_MAX_HEIGHT,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PdfError {
@@ -89,19 +110,49 @@ pub struct RenderedPages {
 /// native library gets [`PdfError::RendererUnavailable`] and the tool
 /// falls back to a note rather than killing the request.
 pub fn render_pages(bytes: &[u8], max_pages: usize) -> Result<RenderedPages, PdfError> {
+    render_pages_with_settings(
+        bytes,
+        RenderSettings {
+            max_pages,
+            ..RenderSettings::default()
+        },
+    )
+}
+
+/// Rasterise PDF pages with explicit output bounds.
+///
+/// The settings are deliberately bounded by the caller so a malformed or
+/// unexpectedly large document cannot turn one attachment fetch into an
+/// unbounded memory allocation. Run on a blocking thread; pdfium handles are
+/// not `Send`.
+pub fn render_pages_with_settings(
+    bytes: &[u8],
+    settings: RenderSettings,
+) -> Result<RenderedPages, PdfError> {
+    if settings.target_width <= 0
+        || settings.target_width > MAX_RENDER_TARGET_WIDTH
+        || settings.max_height <= 0
+        || settings.max_height > MAX_RENDER_HEIGHT
+        || settings.max_pages > MAX_RENDER_PAGES
+    {
+        return Err(PdfError::Render(format!(
+            "PDF render settings must stay within {MAX_RENDER_PAGES} pages and {MAX_RENDER_TARGET_WIDTH}x{MAX_RENDER_HEIGHT} pixels"
+        )));
+    }
+
     let pdfium = bind_pdfium()?;
     let doc = pdfium
         .load_pdf_from_byte_slice(bytes, None)
         .map_err(|e| PdfError::Render(e.to_string()))?;
 
     let config = PdfRenderConfig::new()
-        .set_target_width(RENDER_TARGET_WIDTH)
-        .set_maximum_height(RENDER_MAX_HEIGHT);
+        .set_target_width(settings.target_width)
+        .set_maximum_height(settings.max_height);
 
     let total_pages = doc.pages().len() as usize;
     let mut pages = Vec::new();
     for (idx, page) in doc.pages().iter().enumerate() {
-        if pages.len() >= max_pages {
+        if pages.len() >= settings.max_pages {
             break;
         }
         let image = page
@@ -223,6 +274,29 @@ mod tests {
     fn extract_text_errors_on_garbage() {
         let err = extract_text(b"this is not a pdf at all").unwrap_err();
         assert!(matches!(err, PdfError::TextExtraction(_)), "{err:?}");
+    }
+
+    #[test]
+    fn render_settings_have_safe_defaults() {
+        let settings = RenderSettings::default();
+        assert_eq!(settings.max_pages, DEFAULT_MAX_RENDER_PAGES);
+        assert_eq!(settings.target_width, 1240);
+        assert_eq!(settings.max_height, 1754);
+    }
+
+    #[test]
+    fn render_settings_reject_unbounded_dimensions_before_loading_pdfium() {
+        let err = match render_pages_with_settings(
+            b"not a pdf",
+            RenderSettings {
+                target_width: MAX_RENDER_TARGET_WIDTH + 1,
+                ..RenderSettings::default()
+            },
+        ) {
+            Ok(_) => panic!("unbounded dimensions must be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, PdfError::Render(message) if message.contains("within")));
     }
 
     #[test]
