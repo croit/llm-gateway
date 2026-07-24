@@ -299,6 +299,133 @@ fn proxy_tool_ctx(
     }
 }
 
+/// One upstream round for the buffered `/v1` tool loop: acquire a slot for
+/// `model`, POST the (already model-rewritten) `body_value`, and return the
+/// upstream status + raw bytes. Emits exactly one usage row per attempt —
+/// including a 502 row on a transport/read failure, matching `forward` — so
+/// error accounting stays consistent across paths. Factored out of the
+/// `run_with_tools` closure in [`chat_completions`] so that ~70-line
+/// acquire/send/emit dance is named instead of nested three closures deep.
+async fn forward_one_round(
+    state: &Arc<RamaState>,
+    model: &str,
+    access: &crate::server::upstreams::PoolAccess,
+    headers: &HeaderMap,
+    rec: &RecordParams,
+    body_value: Value,
+) -> Result<(u16, Bytes), LoopError> {
+    let acquired = state
+        .upstreams
+        .acquire_for_access(model, PoolKind::Chat, access)
+        .map_err(|e| LoopError::Upstream(e.to_string()))?;
+    let backend_name = acquired.backend().name.clone();
+    let started = Instant::now();
+    let serialized = serde_json::to_vec(&body_value)
+        .map_err(|e| LoopError::Upstream(format!("serialise: {e}")))?;
+    let url = format!("{}/chat/completions", acquired.backend().base_url);
+    let mut http = state.http.post(&url);
+    for (name, value) in headers {
+        if is_request_header_forwarded(name) {
+            http = http.header(name.as_str(), value);
+        }
+    }
+    http = http.header("content-type", "application/json");
+    if let Some(key) = acquired.backend().api_key.as_deref() {
+        http = http.bearer_auth(key);
+    }
+    // A backend was contacted, so the call is counted either way — a
+    // transport/read failure records a 502 row (parallel to `forward`).
+    let resp = match http.body(serialized).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            drop(acquired);
+            rec.emit(
+                &state.usage,
+                &backend_name,
+                StatusCode::BAD_GATEWAY.as_u16(),
+                started,
+                (None, None, None),
+            );
+            return Err(LoopError::Upstream(e.to_string()));
+        }
+    };
+    let status = resp.status().as_u16();
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            drop(acquired);
+            rec.emit(
+                &state.usage,
+                &backend_name,
+                StatusCode::BAD_GATEWAY.as_u16(),
+                started,
+                (None, None, None),
+            );
+            return Err(LoopError::Upstream(e.to_string()));
+        }
+    };
+    drop(acquired);
+    rec.emit(
+        &state.usage,
+        &backend_name,
+        status,
+        started,
+        tokens_from_bytes(&bytes),
+    );
+    Ok((status, bytes))
+}
+
+/// Byte-faithful `/v1/chat/completions` passthrough for a caller with no
+/// gateway tool grants: resolve the model, apply admin defaults, rewrite the
+/// outgoing `model` to the real id, and stream the upstream response through
+/// 1:1 (any client-driven tool loop is left untouched). Factored out of
+/// [`chat_completions`] so its prologue reads as prologue + a three-way
+/// dispatch.
+async fn chat_bytedumb(
+    state: &Arc<RamaState>,
+    user: &UserCtx,
+    model: &str,
+    access: &crate::server::upstreams::PoolAccess,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // `route` resolves aliases + the two fallbacks and returns a structured
+    // `RouteError`, so `route_error_response` maps an unknown model straight
+    // to 404 `model_not_found` (and known-but-down to 503). Acquires the slot
+    // up front so the resolved real id is known before we touch the body.
+    let acquired = match state.upstreams.route_access(model, PoolKind::Chat, access) {
+        Ok(a) => a,
+        Err(e) => return route_error_response(e),
+    };
+    let real_model = acquired.resolved_model().to_string();
+    // Admin sampling/reasoning defaults key on the *real* model id (so an
+    // alias inherits the target's defaults). Client keys still win —
+    // `apply_defaults` only fills missing top-level fields. Then rewrite the
+    // outgoing `model` to the real id (upstreams don't know the alias).
+    let body =
+        crate::server::model_defaults::apply_defaults_to_bytes(&state.db, &real_model, body).await;
+    let body = rewrite_model_in_bytes(body, &real_model);
+    let rec = RecordParams::v1(
+        user,
+        UsageKind::Chat,
+        real_model.clone(),
+        state
+            .upstreams
+            .enforce_limits_for_model(&real_model, PoolKind::Chat),
+    );
+    let resp = forward_streaming(
+        state,
+        acquired,
+        Method::POST,
+        "chat/completions",
+        headers,
+        body,
+        rec,
+    )
+    .await;
+    with_resolved_model_header(resp, model, &real_model)
+}
+
 pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     // Source IP for `get_user_location`: proxy header (behind a load
     // balancer) first, else the direct TCP socket peer. Captured before
@@ -375,45 +502,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     // reach routes as `UnknownModel` → 404, identical to a nonexistent model.
     let access = state.pool_access_for(&user.roles);
     if allowed_tools.is_empty() {
-        // `route` resolves aliases + the two fallbacks and returns a structured
-        // `RouteError`, so `route_error_response` maps an unknown model straight
-        // to 404 `model_not_found` (and known-but-down to 503). Acquires the
-        // slot up front so the resolved real id is known before we touch the body.
-        let acquired = match state
-            .upstreams
-            .route_access(&model, PoolKind::Chat, &access)
-        {
-            Ok(a) => a,
-            Err(e) => return route_error_response(e),
-        };
-        let real_model = acquired.resolved_model().to_string();
-        // Admin sampling/reasoning defaults key on the *real* model id (so an
-        // alias inherits the target's defaults). Client keys still win —
-        // `apply_defaults` only fills missing top-level fields. Then rewrite the
-        // outgoing `model` to the real id (upstreams don't know the alias).
-        let body =
-            crate::server::model_defaults::apply_defaults_to_bytes(&state.db, &real_model, body)
-                .await;
-        let body = rewrite_model_in_bytes(body, &real_model);
-        let rec = RecordParams::v1(
-            &user,
-            UsageKind::Chat,
-            real_model.clone(),
-            state
-                .upstreams
-                .enforce_limits_for_model(&real_model, PoolKind::Chat),
-        );
-        let resp = forward_streaming(
-            &state,
-            acquired,
-            Method::POST,
-            "chat/completions",
-            parts.headers,
-            body,
-            rec,
-        )
-        .await;
-        return with_resolved_model_header(resp, &model, &real_model);
+        return chat_bytedumb(&state, &user, &model, &access, parts.headers, body).await;
     }
 
     // Gateway-tool path. Resolve aliases + fallback once, up front: the tool
@@ -499,82 +588,24 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     )
     .with_comfyui(comfyui.as_ref());
 
-    let outcome = runner::run_with_tools(
-        &tool_source,
-        &allowed_tools,
-        &tool_ctx,
-        request_body,
-        move |body_value| {
-            let state = state_clone.clone();
-            let model = model_clone.clone();
-            let access = access_clone.clone();
-            let headers = headers_clone.clone();
-            let rec = rec.clone();
-            async move {
-                let acquired = state
-                    .upstreams
-                    .acquire_for_access(&model, PoolKind::Chat, &access)
-                    .map_err(|e| LoopError::Upstream(e.to_string()))?;
-                let backend_name = acquired.backend().name.clone();
-                let started = Instant::now();
-                let serialized = serde_json::to_vec(&body_value)
-                    .map_err(|e| LoopError::Upstream(format!("serialise: {e}")))?;
-                let url = format!("{}/chat/completions", acquired.backend().base_url);
-                let mut http = state.http.post(&url);
-                for (name, value) in &headers {
-                    if is_request_header_forwarded(name) {
-                        http = http.header(name.as_str(), value);
-                    }
+    let outcome =
+        runner::run_with_tools(
+            &tool_source,
+            &allowed_tools,
+            &tool_ctx,
+            request_body,
+            move |body_value| {
+                let state = state_clone.clone();
+                let model = model_clone.clone();
+                let access = access_clone.clone();
+                let headers = headers_clone.clone();
+                let rec = rec.clone();
+                async move {
+                    forward_one_round(&state, &model, &access, &headers, &rec, body_value).await
                 }
-                http = http.header("content-type", "application/json");
-                if let Some(key) = acquired.backend().api_key.as_deref() {
-                    http = http.bearer_auth(key);
-                }
-                // A backend was contacted, so the call is counted either way
-                // — a transport/read failure records a 502 row (parallel to
-                // `forward`), keeping error accounting consistent across paths.
-                let resp = match http.body(serialized).send().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        drop(acquired);
-                        rec.emit(
-                            &state.usage,
-                            &backend_name,
-                            StatusCode::BAD_GATEWAY.as_u16(),
-                            started,
-                            (None, None, None),
-                        );
-                        return Err(LoopError::Upstream(e.to_string()));
-                    }
-                };
-                let status = resp.status().as_u16();
-                let bytes = match resp.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        drop(acquired);
-                        rec.emit(
-                            &state.usage,
-                            &backend_name,
-                            StatusCode::BAD_GATEWAY.as_u16(),
-                            started,
-                            (None, None, None),
-                        );
-                        return Err(LoopError::Upstream(e.to_string()));
-                    }
-                };
-                drop(acquired);
-                rec.emit(
-                    &state.usage,
-                    &backend_name,
-                    status,
-                    started,
-                    tokens_from_bytes(&bytes),
-                );
-                Ok((status, bytes))
-            }
-        },
-    )
-    .await;
+            },
+        )
+        .await;
 
     let outcome = match outcome {
         Ok(o) => o,
