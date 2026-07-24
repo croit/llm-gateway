@@ -58,10 +58,7 @@ pub async fn tools_index(State(state): State<Arc<RamaState>>, req: Request) -> R
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
 
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
 
     let entries = entries_for_user(&state, &user.roles);
     let disabled = user_tool_prefs::disabled_for_user(&state.db, &user.id)
@@ -132,10 +129,7 @@ struct ToggleForm {
 /// race a read-modify-write.
 pub async fn tools_toggle(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: ToggleForm = match read_form(body).await {
         Ok(f) => f,

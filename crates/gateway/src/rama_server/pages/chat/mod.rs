@@ -58,10 +58,7 @@ mod title;
 // GET /chat — redirect to latest (or new) session.
 
 pub async fn chat_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let datastar = is_datastar_request(req.headers());
     let theme = Theme::from_headers(req.headers());
     let lang = Lang::from_headers(req.headers());
@@ -108,10 +105,7 @@ pub async fn chat_session_view(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let datastar = is_datastar_request(req.headers());
     let theme = Theme::from_headers(req.headers());
     let lang = Lang::from_headers(req.headers());
@@ -316,10 +310,7 @@ async fn render_chat_response(
 // POST /chat/sessions — new session + nav to it.
 
 pub async fn chat_session_create(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let datastar = is_datastar_request(req.headers());
     let new_session = match chat::create_session(&state.db, &user.id).await {
         Ok(s) => s,
@@ -350,10 +341,7 @@ pub async fn chat_session_delete(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let datastar = is_datastar_request(req.headers());
     let lang = Lang::from_headers(req.headers());
     let deleted = match chat::delete_session(&state.db, &user.id, &session_id).await {
@@ -392,10 +380,7 @@ pub async fn chat_share_toggle(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let datastar = is_datastar_request(req.headers());
     let lang = Lang::from_headers(req.headers());
     // Owner-only on both reads and writes: get_session is owner-scoped, and
@@ -458,10 +443,7 @@ pub async fn chat_session_pin(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let datastar = is_datastar_request(req.headers());
     let lang = Lang::from_headers(req.headers());
     // Owner-only on both reads and writes: get_session is owner-scoped, and
@@ -525,10 +507,7 @@ struct SearchQuery {
 }
 
 pub async fn chat_search(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let datastar = is_datastar_request(req.headers());
     let lang = Lang::from_headers(req.headers());
 
@@ -581,10 +560,7 @@ pub async fn chat_capabilities_toggle(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     // Owner-only: get_session is owner-scoped, so a non-owner POST finds no
     // session and bounces with no effect.
     if let Ok(None) | Err(_) = chat::get_session(&state.db, &user.id, &session_id).await {
@@ -707,10 +683,7 @@ pub async fn chat_effort_set(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     if let Ok(None) | Err(_) = chat::get_session(&state.db, &user.id, &session_id).await {
         return see_other("/chat");
     }
@@ -874,10 +847,7 @@ pub async fn chat_fork(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let datastar = is_datastar_request(req.headers());
     let lang = Lang::from_headers(req.headers());
 
@@ -957,10 +927,7 @@ pub async fn chat_message_send(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let lang = Lang::from_headers(req.headers());
 
     // Make sure the user owns this session.
@@ -1173,10 +1140,7 @@ pub async fn chat_tail(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let lang = Lang::from_headers(req.headers());
 
     // Confirm the session is readable (owned or shared) + that there's
@@ -1227,10 +1191,7 @@ pub async fn chat_document_view(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     match chat::get_session_readable(&state.db, &user.id, &session_id).await {
         Ok(Some(_)) => {}
         Ok(None) => return empty_sse_response(),
@@ -1274,10 +1235,7 @@ pub async fn chat_cancel(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     chat_cancel_turn(&state.chats, &user.id, &session_id);
     empty_sse_response()
 }
@@ -1339,10 +1297,7 @@ pub async fn chat_retry(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let lang = Lang::from_headers(req.headers());
     let client_ip = crate::server::geoip::client_ip(req.headers())
         .or_else(|| crate::server::geoip::peer_ip(&req));
@@ -1390,10 +1345,7 @@ pub async fn chat_edit(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let lang = Lang::from_headers(req.headers());
     let client_ip = crate::server::geoip::client_ip(req.headers())
         .or_else(|| crate::server::geoip::peer_ip(&req));
@@ -1498,10 +1450,7 @@ pub async fn chat_attachment_remove(
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let lang = Lang::from_headers(req.headers());
     let turn = match load_owned_turn(&state, &user, &id, &turn_id, lang).await {
         Ok(t) => t,

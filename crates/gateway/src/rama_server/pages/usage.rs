@@ -57,10 +57,7 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
     let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let admin = is_admin(&state, &user);
 
     let q: UsageQuery = req

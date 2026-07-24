@@ -64,10 +64,7 @@ pub async fn tokens_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
 
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let list = match tokens::list_for_user(&state.db, &user.id).await {
         Ok(l) => l,
         Err(err) => {
@@ -124,10 +121,7 @@ fn sse_toast_response(kind: FlashKind, message: impl Into<String>) -> Response {
 
 pub async fn tokens_create(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
@@ -234,10 +228,7 @@ pub async fn tokens_revoke(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     match tokens::revoke(&state.db, &user.id, &token_id).await {
         Ok(true) => {
             let Some(row_html) =
@@ -275,10 +266,7 @@ pub async fn tokens_rotate(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     // Find the live token so we can preserve its name + configured TTL.
     let list = match tokens::list_for_user(&state.db, &user.id).await {
         Ok(l) => l,
@@ -345,10 +333,7 @@ pub async fn tokens_delete(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     match tokens::delete_if_revoked(&state.db, &user.id, &token_id).await {
         Ok(true) => {
             let selector = format!("#token-row-{token_id}");
@@ -401,10 +386,7 @@ pub async fn tokens_tools_master(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: MasterForm = match read_form(body).await {
         Ok(f) => f,
@@ -448,10 +430,7 @@ pub async fn tokens_mcp_policy(
 ) -> Response {
     use crate::server::db::user_mcp::{AskOverApi, set_token_policy};
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: MasterForm = match read_form(body).await {
         Ok(f) => f,
@@ -500,10 +479,7 @@ pub async fn tokens_tools_toggle(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: ToolToggleForm = match read_form(body).await {
         Ok(f) => f,

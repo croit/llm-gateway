@@ -45,10 +45,7 @@ pub async fn integrations_index(State(state): State<Arc<RamaState>>, req: Reques
     let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
 
     let connectors = mcp_catalog::list_enabled(&state.db)
         .await
@@ -121,10 +118,7 @@ pub async fn integrations_connect(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let connector = match mcp_catalog::get(&state.db, &key).await {
         Ok(Some(c)) if c.enabled => c,
         _ => {
@@ -324,10 +318,7 @@ pub async fn integrations_callback(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     if let Some(err) = params.error {
         let desc = params.error_description.unwrap_or_default();
         return internal_error_html(
@@ -517,10 +508,7 @@ pub async fn integrations_connect_token(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let connector = match mcp_catalog::get(&state.db, &key).await {
         Ok(Some(c)) if c.enabled => c,
         _ => {
@@ -604,10 +592,7 @@ pub async fn integrations_retry(
     Path(key): Path<String>,
     req: Request,
 ) -> Response {
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     state.mcp.invalidate(&user.id, &key).await;
     redirect("/integrations")
 }
@@ -621,10 +606,7 @@ pub async fn integrations_disconnect(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     if let Err(err) = user_mcp::delete_connection(&state.db, &user.id, &key).await {
         return internal_error_html(
             &user.email,
@@ -654,10 +636,7 @@ pub async fn integrations_tool_mode(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: ToolModeForm = match read_form(body).await {
         Ok(f) => f,
@@ -696,10 +675,7 @@ pub async fn integrations_tools_all(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: ToolsAllForm = match read_form(body).await {
         Ok(f) => f,

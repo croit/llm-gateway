@@ -186,10 +186,7 @@ pub async fn users_impersonate(State(state): State<Arc<RamaState>>, req: Request
 /// Not admin-gated: the live identity is the target. A no-op redirect for
 /// an ordinary (non-impersonation) session.
 pub async fn impersonate_stop(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let (session, target) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, target) = require_session!(state, req);
     let Some(admin_id) = session.impersonator_id.clone() else {
         // Not impersonating — nothing to stop.
         return see_other("/");

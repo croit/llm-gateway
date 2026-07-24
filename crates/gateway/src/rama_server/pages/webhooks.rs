@@ -432,10 +432,7 @@ pub async fn webhooks_index(State(state): State<Arc<RamaState>>, req: Request) -
     let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let hooks = match webhooks::list_for_user(&state.db, &user.id).await {
         Ok(h) => h,
         Err(err) => {
@@ -467,10 +464,7 @@ pub async fn webhooks_index(State(state): State<Arc<RamaState>>, req: Request) -
 /// trigger URL once, and prepends the new row.
 pub async fn webhooks_create(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: WebhookForm = match super::read_form(body).await {
         Ok(f) => f,
@@ -527,10 +521,7 @@ pub async fn webhooks_edit_form(
     let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let hook = match webhooks::get(&state.db, &user.id, &id).await {
         Ok(Some(h)) => h,
         Ok(None) => return forbidden_html(&user.email, "no such webhook"),
@@ -566,10 +557,7 @@ pub async fn webhooks_update(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: WebhookForm = match super::read_form(body).await {
         Ok(f) => f,
@@ -612,10 +600,7 @@ pub async fn webhooks_toggle(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     let hook = match webhooks::get(&state.db, &user.id, &id).await {
         Ok(Some(h)) => h,
         Ok(None) => return toast(FlashKind::Error, t(lang, "webhooks-toast-not-found")),
@@ -657,10 +642,7 @@ pub async fn webhooks_rotate(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     let (secret, secret_hash) = token::mint_webhook();
     match webhooks::rotate_secret(&state.db, &user.id, &id, &secret_hash).await {
         Ok(true) => {
@@ -688,10 +670,7 @@ pub async fn webhooks_delete(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     match webhooks::delete(&state.db, &user.id, &id).await {
         Ok(true) => {
             let selector = format!("#wh-row-{id}");
@@ -725,10 +704,7 @@ pub async fn webhooks_rerun_form(
     let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let hook = match webhooks::get(&state.db, &user.id, &id).await {
         Ok(Some(h)) => h,
         Ok(None) => return forbidden_html(&user.email, "no such webhook"),
@@ -784,10 +760,7 @@ pub async fn webhooks_rerun(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: RerunForm = match super::read_form(body).await {
         Ok(f) => f,
@@ -910,10 +883,7 @@ pub async fn webhooks_runs(
     let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let hook = match webhooks::get(&state.db, &user.id, &id).await {
         Ok(Some(h)) => h,
         Ok(None) => return forbidden_html(&user.email, "no such webhook"),

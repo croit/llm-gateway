@@ -51,10 +51,7 @@ pub async fn memory_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
 
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
 
     let memories = user_memories::list_for_user(&state.db, &user.id, LIST_LIMIT)
         .await
@@ -112,10 +109,7 @@ fn parse_fields(lang: Lang, kind: &str, content: &str) -> Result<(MemoryKind, St
 /// its kind's list and resets the form.
 pub async fn memory_create(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: CreateForm = match read_form(body).await {
         Ok(f) => f,
@@ -163,10 +157,7 @@ pub async fn memory_edit(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: EditForm = match read_form(body).await {
         Ok(f) => f,
@@ -218,10 +209,7 @@ pub async fn memory_delete(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_session, user) = require_session!(state, req);
     match user_memories::delete(&state.db, &user.id, &id).await {
         Ok(true) => {
             let selector = format!("#mem-row-{id}");

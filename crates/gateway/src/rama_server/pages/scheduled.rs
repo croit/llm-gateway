@@ -218,10 +218,7 @@ pub async fn scheduled_index(State(state): State<Arc<RamaState>>, req: Request) 
     let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let actions = match scheduled::list_for_user(&state.db, &user.id).await {
         Ok(a) => a,
         Err(err) => {
@@ -253,10 +250,7 @@ pub async fn scheduled_index(State(state): State<Arc<RamaState>>, req: Request) 
 /// POST /scheduled — create from the builder form.
 pub async fn scheduled_create(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: CreateForm = match super::read_form(body).await {
         Ok(f) => f,
@@ -330,10 +324,7 @@ pub async fn scheduled_edit_form(
     let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let action = match scheduled::get(&state.db, &user.id, &id).await {
         Ok(Some(a)) => a,
         Ok(None) => return super::forbidden_html(&user.email, "no such scheduled action"),
@@ -370,10 +361,7 @@ pub async fn scheduled_update(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: CreateForm = match super::read_form(body).await {
         Ok(f) => f,
@@ -435,10 +423,7 @@ pub async fn scheduled_toggle(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     let action = match scheduled::get(&state.db, &user.id, &id).await {
         Ok(Some(a)) => a,
         Ok(None) => return toast(FlashKind::Error, t(lang, "scheduled-toast-not-found")),
@@ -488,10 +473,7 @@ pub async fn scheduled_delete(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     match scheduled::delete(&state.db, &user.id, &id).await {
         Ok(true) => {
             let selector = format!("#sched-row-{id}");

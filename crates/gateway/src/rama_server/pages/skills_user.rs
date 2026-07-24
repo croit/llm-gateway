@@ -62,10 +62,7 @@ pub async fn user_skills_index(State(state): State<Arc<RamaState>>, req: Request
     let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let selected = selected_skill_param(&req);
     let mode = if has_flag(&req, "new") {
         Mode::New
@@ -97,10 +94,7 @@ pub async fn user_skills_upload(State(state): State<Arc<RamaState>>, req: Reques
     let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let impersonating = session.impersonator_id.is_some();
     let Some(store) = state.user_skills.clone() else {
         return err_page(
@@ -201,10 +195,7 @@ pub async fn user_skills_save(State(state): State<Arc<RamaState>>, req: Request)
     let lang = Lang::from_headers(req.headers());
     let nav = NavSections::from_headers(req.headers());
     let datastar = is_datastar_request(req.headers());
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let impersonating = session.impersonator_id.is_some();
     let Some(store) = state.user_skills.clone() else {
         return err_page(
@@ -319,10 +310,7 @@ struct SaveForm {
 /// POST /skills/delete — remove one of this user's private skills by `name`
 /// (form field, not path — rama lowercases path segments). Redirects back.
 pub async fn user_skills_delete(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let (session, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (session, user) = require_session!(state, req);
     let _ = session;
     let Some(store) = state.user_skills.clone() else {
         return see_other("/skills");
@@ -348,10 +336,7 @@ struct DeleteForm {
 /// GET /skills/download?skill=<name> — re-package one of this user's private
 /// skills as a `.skill` archive.
 pub async fn user_skills_download(State(state): State<Arc<RamaState>>, req: Request) -> Response {
-    let (_, user) = match require_session_or_redirect(&state, &req).await {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
+    let (_, user) = require_session!(state, req);
     let Some(name) = selected_skill_param(&req) else {
         return see_other("/skills");
     };

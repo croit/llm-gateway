@@ -27,6 +27,27 @@ use crate::rama_server::session::Session;
 use crate::rama_server::state::RamaState;
 use crate::server::db::users;
 
+/// Resolve the caller's session or bail out of the handler. Expands to the
+/// `require_session_or_redirect` match that early-`return`s the redirect
+/// `Response` on failure — replacing the ~45 hand-written copies of that
+/// 4-line block across the page handlers. The binding stays at the call site,
+/// so every shape works:
+/// `let (session, user) = require_session!(state, req);`
+/// `let (_, user) = require_session!(state, req);`
+///
+/// Defined before the `mod …;` page declarations below so textual macro
+/// scoping makes it available in every page submodule without an import.
+/// `require_session_or_redirect` resolves in the caller's scope (each handler
+/// already has it in scope), so no extra `use` is needed there either.
+macro_rules! require_session {
+    ($state:expr, $req:expr) => {
+        match require_session_or_redirect(&$state, &$req).await {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        }
+    };
+}
+
 // Two CSS classes (`.chat-prose` and `.thinking-prose`) carry the
 // markdown styling for chat replies + reasoning blocks. See
 // `ui/src/main.css` for the rule set — both share one parameterised
