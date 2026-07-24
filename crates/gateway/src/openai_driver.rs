@@ -234,6 +234,153 @@ impl SessionDriver for OpenAiDriver {
     }
 }
 
+async fn classify_and_dispatch_tool_calls(
+    d: &OpenAiDriver,
+    ctx: &SessionContext,
+    tool_source: &crate::server::tools::mcp::manager::CompositeToolSource<'_>,
+    collected: &[ToolCallAcc],
+    allowed_tools: &[String],
+    disabled_keys: &std::collections::HashSet<String>,
+) -> Result<
+    (
+        Vec<serde_json::Value>,
+        Vec<runner::ToolCallRef>,
+        Vec<(String, String)>,
+    ),
+    TurnError,
+> {
+    let mut assistant_tool_calls: Vec<serde_json::Value> = Vec::new();
+    let mut call_refs: Vec<runner::ToolCallRef> = Vec::new();
+    // Calls refused because the tool is user-disabled: (id, reason). Each
+    // still needs a `tool` message so the assistant turn's tool_calls all
+    // resolve — appended after the assistant message below.
+    let mut refused: Vec<(String, String)> = Vec::new();
+    for acc in collected {
+        chat::insert_running_tool_call(
+            &d.state.db,
+            &ctx.assistant_turn_id,
+            &acc.id,
+            &acc.name,
+            &acc.arguments,
+        )
+        .await
+        .map_err(persist_err(
+            "insert_running_tool_call",
+            &ctx.assistant_turn_id,
+        ))?;
+        let _ = ctx.broadcast.send(TurnUpdate::Tick);
+
+        assistant_tool_calls.push(serde_json::json!({
+            "id": acc.id.clone(),
+            "type": "function",
+            "function": {
+                "name": acc.name.clone(),
+                // Normalise before replaying upstream: an empty/garbage
+                // args string (common for no-arg tools like
+                // `rag_list_collections`) 400s a strict re-parse.
+                "arguments": runner::normalize_tool_arguments(&acc.arguments),
+            }
+        }));
+        if crate::server::tools::ToolSource::contains(tool_source, &acc.name) {
+            let key = crate::server::tools::catalog::entry_key_for(&acc.name);
+            // Hard block: the user switched this tool off for the
+            // conversation. Don't run it, don't auto-enable it — answer
+            // the call with a refusal the model can read and adapt to.
+            if disabled_keys.contains(key) {
+                let reason = "This tool is disabled by the user for this conversation; it cannot be \
+                         used here.";
+                if let Err(err) = chat::complete_tool_call(
+                    &d.state.db,
+                    &ctx.assistant_turn_id,
+                    &acc.id,
+                    reason,
+                    ToolCallStatus::Errored,
+                )
+                .await
+                {
+                    tracing::warn!(error = %err, tool = %acc.name, "recording refused tool call");
+                }
+                let _ = ctx.broadcast.send(TurnUpdate::Tick);
+                refused.push((acc.id.clone(), reason.to_string()));
+                continue;
+            }
+            // Implicit miss-recovery: the model called a tool whose
+            // schema wasn't in this round's tools array — it's
+            // guessing from training (`fetch_url(url=...)` is the
+            // common case). Write a sticky enablement row so the
+            // schema appears in the next round's tools array; the
+            // call itself still runs with whatever args the model
+            // produced (often correct for well-known tools; if not,
+            // the InvalidArgs reply now has a real schema to retry
+            // against). Same round-trip cost as if the model had
+            // called `enable_tools` itself.
+            if !allowed_tools.contains(&acc.name)
+                && let Some(session_id) = d.tool_ctx.session_id.as_deref()
+            {
+                if let Err(err) = crate::server::db::chat_session_tools::set(
+                    &d.state.db,
+                    session_id,
+                    key,
+                    true,
+                    "auto-call",
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %err, tool = %acc.name, key,
+                        "auto-enable on direct call: persist failed"
+                    );
+                } else {
+                    tracing::info!(
+                        tool = %acc.name, key,
+                        "auto-enabled tool the model called without going through enable_tools"
+                    );
+                }
+            }
+            call_refs.push(runner::ToolCallRef {
+                id: acc.id.clone(),
+                name: acc.name.clone(),
+                arguments_raw: acc.arguments.clone(),
+            });
+        } else {
+            // The model called a tool we don't own — almost always a name
+            // it invented (the common case is an MCP capability id called
+            // as if it were a tool, instead of through the connector's
+            // `invoke_capability`). Left alone, the 'running' row we just
+            // inserted renders as "Calling" forever and the call goes
+            // unanswered. Complete it as errored and reply with a message
+            // the model can recover from — exactly like the user-disabled
+            // path above (so the assistant turn's tool_calls all resolve
+            // and a single unknown call no longer dead-ends the turn).
+            let reason = format!(
+                "No tool named `{}` is available in this conversation. Only call tools that \
+                     were provided to you. If you meant to use an MCP capability, call the \
+                     connector's invocation tool (e.g. `invoke_capability`) with the capability \
+                     id as an argument — do not call the capability id as if it were its own tool.",
+                acc.name
+            );
+            if let Err(err) = chat::complete_tool_call(
+                &d.state.db,
+                &ctx.assistant_turn_id,
+                &acc.id,
+                &reason,
+                ToolCallStatus::Errored,
+            )
+            .await
+            {
+                tracing::warn!(error = %err, tool = %acc.name, "recording unknown tool call");
+            }
+            let _ = ctx.broadcast.send(TurnUpdate::Tick);
+            tracing::debug!(
+                wire_name = %acc.name,
+                "chat-stream got tool_call for a tool we don't own; answered with an error"
+            );
+            refused.push((acc.id.clone(), reason));
+        }
+    }
+    Ok((assistant_tool_calls, call_refs, refused))
+}
+
 async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnError> {
     // Build the upstream message list from DB. We include every
     // completed turn before the in-progress one. Tool calls aren't
@@ -828,135 +975,15 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             }
             None => Default::default(),
         };
-        let mut assistant_tool_calls: Vec<serde_json::Value> = Vec::new();
-        let mut call_refs: Vec<runner::ToolCallRef> = Vec::new();
-        // Calls refused because the tool is user-disabled: (id, reason). Each
-        // still needs a `tool` message so the assistant turn's tool_calls all
-        // resolve — appended after the assistant message below.
-        let mut refused: Vec<(String, String)> = Vec::new();
-        for acc in &collected {
-            chat::insert_running_tool_call(
-                &d.state.db,
-                &ctx.assistant_turn_id,
-                &acc.id,
-                &acc.name,
-                &acc.arguments,
-            )
-            .await
-            .map_err(persist_err(
-                "insert_running_tool_call",
-                &ctx.assistant_turn_id,
-            ))?;
-            let _ = ctx.broadcast.send(TurnUpdate::Tick);
-
-            assistant_tool_calls.push(serde_json::json!({
-                "id": acc.id.clone(),
-                "type": "function",
-                "function": {
-                    "name": acc.name.clone(),
-                    // Normalise before replaying upstream: an empty/garbage
-                    // args string (common for no-arg tools like
-                    // `rag_list_collections`) 400s a strict re-parse.
-                    "arguments": runner::normalize_tool_arguments(&acc.arguments),
-                }
-            }));
-            if crate::server::tools::ToolSource::contains(&tool_source, &acc.name) {
-                let key = crate::server::tools::catalog::entry_key_for(&acc.name);
-                // Hard block: the user switched this tool off for the
-                // conversation. Don't run it, don't auto-enable it — answer
-                // the call with a refusal the model can read and adapt to.
-                if disabled_keys.contains(key) {
-                    let reason = "This tool is disabled by the user for this conversation; it cannot be \
-                         used here.";
-                    if let Err(err) = chat::complete_tool_call(
-                        &d.state.db,
-                        &ctx.assistant_turn_id,
-                        &acc.id,
-                        reason,
-                        ToolCallStatus::Errored,
-                    )
-                    .await
-                    {
-                        tracing::warn!(error = %err, tool = %acc.name, "recording refused tool call");
-                    }
-                    let _ = ctx.broadcast.send(TurnUpdate::Tick);
-                    refused.push((acc.id.clone(), reason.to_string()));
-                    continue;
-                }
-                // Implicit miss-recovery: the model called a tool whose
-                // schema wasn't in this round's tools array — it's
-                // guessing from training (`fetch_url(url=...)` is the
-                // common case). Write a sticky enablement row so the
-                // schema appears in the next round's tools array; the
-                // call itself still runs with whatever args the model
-                // produced (often correct for well-known tools; if not,
-                // the InvalidArgs reply now has a real schema to retry
-                // against). Same round-trip cost as if the model had
-                // called `enable_tools` itself.
-                if !allowed_tools.contains(&acc.name)
-                    && let Some(session_id) = d.tool_ctx.session_id.as_deref()
-                {
-                    if let Err(err) = crate::server::db::chat_session_tools::set(
-                        &d.state.db,
-                        session_id,
-                        key,
-                        true,
-                        "auto-call",
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %err, tool = %acc.name, key,
-                            "auto-enable on direct call: persist failed"
-                        );
-                    } else {
-                        tracing::info!(
-                            tool = %acc.name, key,
-                            "auto-enabled tool the model called without going through enable_tools"
-                        );
-                    }
-                }
-                call_refs.push(runner::ToolCallRef {
-                    id: acc.id.clone(),
-                    name: acc.name.clone(),
-                    arguments_raw: acc.arguments.clone(),
-                });
-            } else {
-                // The model called a tool we don't own — almost always a name
-                // it invented (the common case is an MCP capability id called
-                // as if it were a tool, instead of through the connector's
-                // `invoke_capability`). Left alone, the 'running' row we just
-                // inserted renders as "Calling" forever and the call goes
-                // unanswered. Complete it as errored and reply with a message
-                // the model can recover from — exactly like the user-disabled
-                // path above (so the assistant turn's tool_calls all resolve
-                // and a single unknown call no longer dead-ends the turn).
-                let reason = format!(
-                    "No tool named `{}` is available in this conversation. Only call tools that \
-                     were provided to you. If you meant to use an MCP capability, call the \
-                     connector's invocation tool (e.g. `invoke_capability`) with the capability \
-                     id as an argument — do not call the capability id as if it were its own tool.",
-                    acc.name
-                );
-                if let Err(err) = chat::complete_tool_call(
-                    &d.state.db,
-                    &ctx.assistant_turn_id,
-                    &acc.id,
-                    &reason,
-                    ToolCallStatus::Errored,
-                )
-                .await
-                {
-                    tracing::warn!(error = %err, tool = %acc.name, "recording unknown tool call");
-                }
-                let _ = ctx.broadcast.send(TurnUpdate::Tick);
-                tracing::debug!(
-                    wire_name = %acc.name,
-                    "chat-stream got tool_call for a tool we don't own; answered with an error"
-                );
-                refused.push((acc.id.clone(), reason));
-            }
-        }
+        let (assistant_tool_calls, call_refs, refused) = classify_and_dispatch_tool_calls(
+            d,
+            &ctx,
+            &tool_source,
+            &collected,
+            &allowed_tools,
+            &disabled_keys,
+        )
+        .await?;
         if call_refs.is_empty() && refused.is_empty() {
             return Ok(());
         }
