@@ -19,7 +19,7 @@ const MAX_PAGES_PER_REQUEST: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum OcrError {
-    #[error("routing OCR model `{model}` through the chat pool: {source}")]
+    #[error("routing OCR model `{model}` through the OCR pool: {source}")]
     Route {
         model: String,
         #[source]
@@ -82,16 +82,18 @@ pub async fn recognize(
     let real_model = acquired.resolved_model().to_string();
     let backend = acquired.backend();
     let url = format!("{}/chat/completions", backend.base_url);
-    let content = build_content(&options.prompt, pages);
+    let prompt = if pages.len() == 1 {
+        format!("<image>{}", options.prompt)
+    } else {
+        "<image>Multi page parsing.".to_string()
+    };
     let body = json!({
         "model": real_model,
-        "messages": [{"role": "user", "content": content}],
+        "messages": [{"role": "user", "content": build_content(&prompt, pages)}],
         "temperature": 0,
         "max_tokens": options.max_tokens,
         "skip_special_tokens": false,
-        "images_config": {"image_mode": if pages.len() == 1 { "gundam" } else { "base" }},
-        "custom_logit_processor": "DeepseekOCRNoRepeatNGramLogitProcessor",
-        "custom_params": {
+        "vllm_xargs": {
             "ngram_size": 35,
             "window_size": options.ngram_window,
         },
@@ -116,10 +118,11 @@ pub async fn recognize(
 }
 
 fn build_content(prompt: &str, pages: &[OcrPage]) -> Vec<Value> {
-    let mut content = vec![json!({
+    let mut content = Vec::with_capacity(pages.len() + 1);
+    content.push(json!({
         "type": "text",
-        "text": format!("<image>{prompt}"),
-    })];
+        "text": prompt,
+    }));
     content.extend(pages.iter().map(|page| {
         json!({
             "type": "image_url",
@@ -139,7 +142,23 @@ fn parse_content(bytes: &[u8]) -> Result<String, OcrError> {
         .and_then(Value::as_str)
         .filter(|content| !content.is_empty())
         .ok_or_else(|| OcrError::Parse("response contains no text content".to_string()))?;
-    Ok(content.to_string())
+    Ok(clean_grounding_tokens(content))
+}
+
+fn clean_grounding_tokens(mut content: &str) -> String {
+    let mut cleaned = String::with_capacity(content.len());
+    while let Some(start) = content.find("<|det|>") {
+        cleaned.push_str(&content[..start]);
+        content = &content[start + "<|det|>".len()..];
+        if let Some(end) = content.find("<|/det|>") {
+            content = &content[end + "<|/det|>".len()..];
+        } else {
+            content = "";
+            break;
+        }
+    }
+    cleaned.push_str(content);
+    cleaned.replace("<|ref|>", "").replace("<|/ref|>", "")
 }
 
 #[cfg(test)]
@@ -188,7 +207,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .and(body_partial_json(json!({"model": "unlimited-ocr"})))
+            .and(body_partial_json(json!({
+                "model": "unlimited-ocr",
+                "skip_special_tokens": false,
+                "vllm_xargs": {"ngram_size": 35, "window_size": 1024}
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "choices": [{"message": {"content": "# Page one\n\nText"}}]
             })))
@@ -224,5 +247,13 @@ mod tests {
     fn parse_content_rejects_missing_text() {
         let err = parse_content(br#"{"choices":[{"message":{}}]}"#).unwrap_err();
         assert!(matches!(err, OcrError::Parse(message) if message.contains("no text")));
+    }
+
+    #[test]
+    fn clean_grounding_tokens_keeps_references_and_drops_coordinates() {
+        assert_eq!(
+            clean_grounding_tokens("<|ref|>Invoice<|/ref|> <|det|>1,2,3<|/det|>"),
+            "Invoice "
+        );
     }
 }
