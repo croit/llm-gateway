@@ -53,6 +53,7 @@ Every tool is **RBAC-gated per role**, and each user can flip their own grants o
 |---|---|---|
 | **Web & retrieval** | `search_web`, `fetch_url`, `wikipedia` | Search the web (SearXNG or Brave), fetch any URL (text → UTF-8, images → viewable, other binary → metadata), and pull encyclopedic summaries. |
 | **Documents** | `fetch_attachment`, `upload_attachment`, `list_attachments`, `typst_*` | Read files the user attached — including **two-tier PDF** reading (extract the text layer first; rasterize scanned pages for a vision model if that comes back empty) — attach files back into its own reply, list every file in the conversation (uploads + earlier tool outputs) so assets get **reused instead of regenerated** (attachments resolve by id *or* bare filename, newest wins), and render **PDF/PNG documents** from operator-defined Typst templates (invoices, letters, reports). |
+| **Automatic document OCR** *(opt-in)* | `baidu/Unlimited-OCR` via the internal `ocr` pool | Send uploaded PDFs/images to the PDF-aware OCR sidecar, which converts PDFs internally and adds the result as untrusted document context. The feature is inactive unless `[chat.ocr].enabled = true` and a healthy `ocr` backend are both configured. See [`docs/ocr.md`](docs/ocr.md). |
 | **Document canvas** | `create_document`, `edit_document`, … | Build up a long document (report, spec, article) across turns and edit it section-by-section in a live side panel, then export it to PDF/DOCX/PPTX — instead of regenerating the whole thing every reply. Every change is a new version; the model can list the history and roll back (`list_document_versions`, `restore_document_version`), and several documents can coexist per conversation. Formats: markdown, text, html, json, toml, **typst** (draft the source in the canvas, render via `render_typst`/`export_document` — sections anchor on `=` headings), and yaml (text-edited so comments survive). See [`docs/file-conversions.md`](docs/file-conversions.md). |
 | **Images** | `generate_image`, `edit_image` | Generate an image from a text prompt (diagrams, mockups, marketing visuals) and, where the backend supports it, edit an existing image (image-to-image) — rendered inline in the reply. Routes to an `image`-kind upstream pool (any OpenAI `/images/*`-compatible backend: a hosted provider or a self-hosted model). `edit_image` appears only when a backend advertises edit support, and is refused against non-GDPR-compliant backends. |
 | **QR codes** | `generate_qr_code` | Generate a QR code natively in the gateway (no sandbox, no backend) — URLs, WiFi access, vCard/MeCard contacts, `mailto:`/`tel:`/`geo:`, SEPA GiroCode payments — as PNG or SVG, with custom colors and an optional centered logo from a chat attachment (error correction auto-raised to H). Attached inline in the reply. |
@@ -275,6 +276,7 @@ Optional blocks, each documented inline in `gateway.example.toml`:
 
 - `[rbac]` + `[[roles]]` — map OIDC claim values to roles, and gate models/tools per role.
 - `[chat.s3]` — store chat attachments in S3 / MinIO / R2 / Backblaze B2 (see below).
+- `[chat.ocr]` — opt into automatic PDF/image OCR through a configured internal `ocr` pool (see [`docs/ocr.md`](docs/ocr.md)).
 - `[typst]` — register document-rendering tools from a templates directory.
 - `[sandbox]` — enable the code-execution + document tools by pointing at a sandbox-runner service (see [`docs/sandbox.md`](docs/sandbox.md)).
 - `[geoip]` — IP→location for the `get_user_location` tool (IP2Location LITE database).
@@ -307,6 +309,12 @@ Notes:
 - The bucket can stay **fully private** (no public-read ACL, no presign capability needed on the credentials): the gateway fetches every byte **server-side** and hands it to the upstream LLM inline — images as a `data:` URI in the request, other files as text. So `endpoint` only needs to be reachable from the **gateway**, not from the upstream LLM's network. Path-style requests are always used, so DNS-style bucket subdomains aren't required; the same shape works for MinIO, Backblaze B2, and R2.
 - Capability gating isn't done at the gateway — wire only multi-modal chat models into the pools. A mismatch surfaces as the upstream's own error in the chat bubble.
 - Past-turn attachments are stripped from the replayed history (kept as `[attached: name.ext (omitted)]` stubs) so the context window stays bounded.
+
+When automatic OCR is enabled, the current turn's PDF and image attachments are
+sent to the internal OCR sidecar before the chat request. The sidecar owns PDF
+conversion and calls Unlimited-OCR; the original upload remains available to
+the model. If no healthy `ocr` backend is configured, the gateway does not fetch
+the attachment for OCR and does not expose an OCR capability to the model.
 
 ### RAG (codebase search)
 
@@ -442,7 +450,7 @@ Operational notes:
 
 ### Docker Compose
 
-For hosts running Docker rather than podman, [`deploy/compose.example.yml`](deploy/compose.example.yml) is the equivalent stack (gateway + self-hosted **Google Workspace** MCP server, plus the sandbox runner and egress proxy under the `sandbox` profile).
+For hosts running Docker rather than podman, [`deploy/compose.example.yml`](deploy/compose.example.yml) is the equivalent stack (gateway + self-hosted **Google Workspace** MCP server, plus the sandbox runner and egress proxy under the `sandbox` profile). The optional PDF OCR sidecar starts under the `ocr` profile; it requires `OCR_VLLM_BASE_URL` pointing at an Unlimited-OCR vLLM service.
 
 All deployment-relevant docs — both methods, every component, the full Google Workspace connector setup — live in **[`deploy/README.md`](deploy/README.md)**.
 
