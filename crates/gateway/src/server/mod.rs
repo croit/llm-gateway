@@ -23,6 +23,7 @@ pub mod headless;
 pub mod image_gen;
 pub mod limits;
 pub mod model_defaults;
+pub mod ocr;
 pub mod pdf;
 pub mod push;
 pub mod rag;
