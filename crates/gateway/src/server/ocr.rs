@@ -3,20 +3,17 @@
 
 //! Internal document-OCR adapter.
 //!
-//! The first OCR backend is Baidu's Unlimited-OCR, exposed through an
-//! OpenAI-compatible chat-completions endpoint. PDF rasterization stays in
-//! [`crate::server::pdf`]; this module only owns the wire request and response
-//! handling. OCR requests use the dedicated `ocr` upstream pool.
+//! The first OCR backend is a document-aware sidecar around Baidu's
+//! Unlimited-OCR. The sidecar owns PDF rasterization and model-specific
+//! inference; this module owns only the internal multipart contract and
+//! response handling. OCR requests use the dedicated `ocr` upstream pool.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use thiserror::Error;
 
-use crate::server::chat_attachments::to_data_uri;
 use crate::server::upstreams::{PoolKind, RouteError, UpstreamRegistry};
 
 const OCR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
-const MAX_PAGES_PER_REQUEST: usize = 64;
-
 #[derive(Debug, Error)]
 pub enum OcrError {
     #[error("routing OCR model `{model}` through the OCR pool: {source}")]
@@ -31,14 +28,6 @@ pub enum OcrError {
     UpstreamStatus { status: u16, body: String },
     #[error("parsing OCR response: {0}")]
     Parse(String),
-    #[error("OCR request contains {got} pages; the limit is {max}")]
-    TooManyPages { got: usize, max: usize },
-}
-
-#[derive(Debug, Clone)]
-pub struct OcrPage {
-    pub page_number: usize,
-    pub png: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,21 +47,20 @@ impl Default for OcrOptions {
     }
 }
 
-/// Parse ordered PNG pages with an Unlimited-OCR-compatible upstream.
-pub async fn recognize(
+/// Send the original document to the OCR sidecar.
+///
+/// The sidecar owns PDF/image decoding and may use the official
+/// `infer.py --pdf` wrapper. The gateway therefore never pretends that the
+/// OpenAI-compatible vLLM endpoint accepts `application/pdf` directly.
+pub async fn recognize_document(
     http: &reqwest::Client,
     upstreams: &UpstreamRegistry,
     model: &str,
-    pages: &[OcrPage],
+    filename: &str,
+    mime: &str,
+    bytes: Vec<u8>,
     options: &OcrOptions,
 ) -> Result<String, OcrError> {
-    if pages.len() > MAX_PAGES_PER_REQUEST {
-        return Err(OcrError::TooManyPages {
-            got: pages.len(),
-            max: MAX_PAGES_PER_REQUEST,
-        });
-    }
-
     let acquired = upstreams
         .acquire_for(model, PoolKind::Ocr)
         .map_err(|source| OcrError::Route {
@@ -81,25 +69,18 @@ pub async fn recognize(
         })?;
     let real_model = acquired.resolved_model().to_string();
     let backend = acquired.backend();
-    let url = format!("{}/chat/completions", backend.base_url);
-    let prompt = if pages.len() == 1 {
-        format!("<image>{}", options.prompt)
-    } else {
-        "<image>Multi page parsing.".to_string()
-    };
-    let body = json!({
-        "model": real_model,
-        "messages": [{"role": "user", "content": build_content(&prompt, pages)}],
-        "temperature": 0,
-        "max_tokens": options.max_tokens,
-        "skip_special_tokens": false,
-        "vllm_xargs": {
-            "ngram_size": 35,
-            "window_size": options.ngram_window,
-        },
-    });
-
-    let mut request = http.post(url).timeout(OCR_TIMEOUT).json(&body);
+    let url = format!("{}/ocr", backend.base_url);
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(filename.to_string())
+        .mime_str(mime)
+        .map_err(|err| OcrError::Parse(format!("invalid attachment MIME `{mime}`: {err}")))?;
+    let form = reqwest::multipart::Form::new()
+        .text("model", real_model)
+        .text("prompt", options.prompt.clone())
+        .text("max_tokens", options.max_tokens.to_string())
+        .text("ngram_window", options.ngram_window.to_string())
+        .part("file", part);
+    let mut request = http.post(url).timeout(OCR_TIMEOUT).multipart(form);
     if let Some(key) = backend.api_key.as_deref() {
         request = request.bearer_auth(key);
     }
@@ -117,28 +98,12 @@ pub async fn recognize(
     parse_content(&bytes)
 }
 
-fn build_content(prompt: &str, pages: &[OcrPage]) -> Vec<Value> {
-    let mut content = Vec::with_capacity(pages.len() + 1);
-    content.push(json!({
-        "type": "text",
-        "text": prompt,
-    }));
-    content.extend(pages.iter().map(|page| {
-        json!({
-            "type": "image_url",
-            "image_url": {
-                "url": to_data_uri("image/png", &page.png),
-            },
-        })
-    }));
-    content
-}
-
 fn parse_content(bytes: &[u8]) -> Result<String, OcrError> {
     let body: Value = serde_json::from_slice(bytes)
         .map_err(|err| OcrError::Parse(format!("invalid JSON: {err}")))?;
     let content = body
-        .pointer("/choices/0/message/content")
+        .get("markdown")
+        .or_else(|| body.get("text"))
         .and_then(Value::as_str)
         .filter(|content| !content.is_empty())
         .ok_or_else(|| OcrError::Parse("response contains no text content".to_string()))?;
@@ -168,7 +133,7 @@ mod tests {
     use crate::server::upstreams::config::{BackendConfig, PickerStrategy, UpstreamPoolConfig};
     use serde_json::json;
     use std::collections::HashMap;
-    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn registry(url: &str) -> std::sync::Arc<UpstreamRegistry> {
@@ -203,37 +168,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recognize_sends_ordered_images_and_returns_markdown() {
+    async fn recognize_sends_original_document_and_returns_markdown() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .and(body_partial_json(json!({
-                "model": "unlimited-ocr",
-                "skip_special_tokens": false,
-                "vllm_xargs": {"ngram_size": 35, "window_size": 1024}
-            })))
+            .and(path("/v1/ocr"))
+            .and(wiremock::matchers::body_string_contains("unlimited-ocr"))
+            .and(wiremock::matchers::body_string_contains("document.pdf"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{"message": {"content": "# Page one\n\nText"}}]
+                "markdown": "# Page one\n\nText"
             })))
             .expect(1)
             .mount(&server)
             .await;
 
         let client = reqwest::Client::new();
-        let output = recognize(
+        let output = recognize_document(
             &client,
             &registry(&server.uri()),
             "unlimited-ocr",
-            &[
-                OcrPage {
-                    page_number: 1,
-                    png: vec![1, 2, 3],
-                },
-                OcrPage {
-                    page_number: 2,
-                    png: vec![4, 5, 6],
-                },
-            ],
+            "document.pdf",
+            "application/pdf",
+            vec![1, 2, 3],
             &OcrOptions::default(),
         )
         .await
