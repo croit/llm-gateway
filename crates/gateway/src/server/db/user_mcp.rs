@@ -114,17 +114,6 @@ pub struct NewConnection {
     pub token_url: Option<String>,
 }
 
-fn parse_ts(s: String, column: &'static str) -> Result<Timestamp, DbError> {
-    s.parse().map_err(|e: jiff::Error| DbError::Decode {
-        column,
-        source: e.into(),
-    })
-}
-
-fn parse_opt_ts(s: Option<String>, column: &'static str) -> Result<Option<Timestamp>, DbError> {
-    s.map(|s| parse_ts(s, column)).transpose()
-}
-
 fn map_conn(row: &SqliteRow) -> Result<Connection, DbError> {
     let scopes_json: String = row.try_get("scopes_json")?;
     Ok(Connection {
@@ -136,15 +125,18 @@ fn map_conn(row: &SqliteRow) -> Result<Connection, DbError> {
         access_token_nonce: row.try_get("access_token_nonce")?,
         refresh_token_ct: row.try_get("refresh_token_ct")?,
         refresh_token_nonce: row.try_get("refresh_token_nonce")?,
-        token_expires_at: parse_opt_ts(row.try_get("token_expires_at")?, "token_expires_at")?,
+        token_expires_at: super::parse_optional_ts(
+            row.try_get("token_expires_at")?,
+            "token_expires_at",
+        )?,
         scopes: serde_json::from_str(&scopes_json).unwrap_or_default(),
         dcr_client_id: row.try_get("dcr_client_id")?,
         dcr_client_secret_ct: row.try_get("dcr_client_secret_ct")?,
         dcr_client_secret_nonce: row.try_get("dcr_client_secret_nonce")?,
         token_url: row.try_get("token_url")?,
         last_error: row.try_get("last_error")?,
-        created_at: parse_ts(row.try_get("created_at")?, "created_at")?,
-        updated_at: parse_ts(row.try_get("updated_at")?, "updated_at")?,
+        created_at: super::parse_ts(row.try_get("created_at")?, "created_at")?,
+        updated_at: super::parse_ts(row.try_get("updated_at")?, "updated_at")?,
     })
 }
 
@@ -424,7 +416,7 @@ pub async fn take_pending(pool: &Pool, state: &str) -> Result<Option<PendingOaut
         .bind(state)
         .execute(pool)
         .await?;
-    let expires = parse_ts(row.try_get("expires_at")?, "expires_at")?;
+    let expires = super::parse_ts(row.try_get("expires_at")?, "expires_at")?;
     if Timestamp::now() > expires {
         return Ok(None);
     }

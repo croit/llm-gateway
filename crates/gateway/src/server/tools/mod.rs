@@ -130,6 +130,33 @@ pub struct ToolContext {
     pub sandbox_lease: Option<std::sync::Arc<sandbox::SandboxLease>>,
 }
 
+#[cfg(test)]
+impl ToolContext {
+    /// Minimal [`ToolContext`] for unit tests: the given DB pool, a dummy
+    /// user (`"u"`, no roles), and every optional handle `None` (no S3,
+    /// geoip, indexer, image-gen, sandbox, chat turn/session). Replaces the
+    /// 13-field literal that used to be copied into ~25 tool test modules.
+    /// Override individual fields with struct-update syntax:
+    /// `ToolContext { roles: vec!["admin".into()], ..ToolContext::for_test(pool) }`.
+    pub fn for_test(db: crate::server::db::Pool) -> Self {
+        Self {
+            user_id: "u".into(),
+            roles: vec![],
+            db,
+            s3: None,
+            assistant_turn_id: None,
+            session_id: None,
+            client_ip: None,
+            geoip: None,
+            chat_feedback: None,
+            attachment_reservations: None,
+            indexer: None,
+            image_gen: None,
+            sandbox_lease: None,
+        }
+    }
+}
+
 /// Chat-only handles a tool needs to run an interactive prompt while a
 /// turn is streaming: push UI onto the live SSE stream (`broadcast`,
 /// via `TurnUpdate::Inject`) and await the browser's reply (`hub`). Only

@@ -34,6 +34,7 @@ use crate::server::db::usage::{self, UnitUsage, UsageKind, UsageRecord, UsageSou
 use crate::server::speech::{self, SpokenMarkers};
 use crate::server::tools::ToolContext;
 use crate::server::tools::ToolSource;
+use crate::server::tools::runner::ToolCallAcc;
 use crate::server::tools::runner::{self, LoopError};
 use crate::server::upstreams::registry::{Acquired, RouteError};
 use crate::server::upstreams::{AcquireError, PoolKind};
@@ -247,6 +248,57 @@ fn prefer_positive(primary: Option<f64>, fallback: Option<f64>) -> Option<f64> {
 /// Responses on the buffered gateway-tool path carry an
 /// `x-gateway-tool-rounds` header so operators can tell at a glance
 /// whether the loop fired.
+/// Build the per-request [`ToolContext`] for the `/v1` proxy tool loops.
+///
+/// Unlike the chat-UI driver's `build_tool_context`, the proxy paths have no
+/// persisted chat turn — so there is no `session_id`/`assistant_turn_id`, no
+/// filename reservation set, and no live browser to prompt (`chat_feedback`).
+/// Both the buffered (`chat_completions`) and streaming
+/// (`forward_streaming_with_tools`) loops build the context through here so
+/// the ~15-field literal lives in exactly one place and can't drift.
+fn proxy_tool_ctx(
+    state: &Arc<RamaState>,
+    user_id: String,
+    roles: Vec<String>,
+    client_ip: Option<String>,
+) -> ToolContext {
+    ToolContext {
+        user_id,
+        roles,
+        db: state.db.clone(),
+        s3: state
+            .config
+            .chat
+            .s3
+            .as_ref()
+            .map(|cfg| std::sync::Arc::new(cfg.clone())),
+        // No persistent chat turn on the proxy paths.
+        assistant_turn_id: None,
+        session_id: None,
+        client_ip,
+        geoip: state.geoip.clone(),
+        // No live turn / browser to prompt on the proxy paths.
+        chat_feedback: None,
+        // No turn → nothing to reserve filenames against. The upload tools
+        // refuse to run here anyway (they require `assistant_turn_id`).
+        attachment_reservations: None,
+        indexer: state.indexer.clone(),
+        image_gen: Some(crate::server::image_gen::ImageGenerator::new(
+            state.upstreams.clone(),
+            state.http.clone(),
+            state.usage.clone(),
+            state.db.clone(),
+        )),
+        // Per-request sandbox lease (the /v1 loop = one turn), so a client's
+        // multi-round `run_in_sandbox` reuses one container. `None` when the
+        // sandbox isn't configured. Released when the loop ends (see runner).
+        sandbox_lease: state
+            .sandbox_client
+            .clone()
+            .map(crate::server::tools::sandbox::SandboxLease::new),
+    }
+}
+
 pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     // Source IP for `get_user_location`: proxy header (behind a load
     // balancer) first, else the direct TCP socket peer. Captured before
@@ -415,42 +467,12 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
         .await;
         return with_resolved_model_header(resp, &model, &real_model);
     }
-    let tool_ctx = ToolContext {
-        user_id: user.user_id.clone(),
-        roles: user.roles.clone(),
-        db: state.db.clone(),
-        s3: state
-            .config
-            .chat
-            .s3
-            .as_ref()
-            .map(|cfg| std::sync::Arc::new(cfg.clone())),
-        // No persistent chat turn on the proxy paths.
-        assistant_turn_id: None,
-        session_id: None,
-        client_ip: client_ip.clone(),
-        geoip: state.geoip.clone(),
-        // No live turn / browser to prompt on the proxy paths.
-        chat_feedback: None,
-        // No turn → nothing to reserve filenames against. The
-        // upload tools refuse to run here anyway (they require
-        // `assistant_turn_id`), so this branch never fires.
-        attachment_reservations: None,
-        indexer: state.indexer.clone(),
-        image_gen: Some(crate::server::image_gen::ImageGenerator::new(
-            state.upstreams.clone(),
-            state.http.clone(),
-            state.usage.clone(),
-            state.db.clone(),
-        )),
-        // Per-request sandbox lease (the /v1 loop = one turn), so a client's
-        // multi-round `run_in_sandbox` reuses one container. `None` when the
-        // sandbox isn't configured. Released when the loop ends (see runner).
-        sandbox_lease: state
-            .sandbox_client
-            .clone()
-            .map(crate::server::tools::sandbox::SandboxLease::new),
-    };
+    let tool_ctx = proxy_tool_ctx(
+        &state,
+        user.user_id.clone(),
+        user.roles.clone(),
+        client_ip.clone(),
+    );
     let state_clone = state.clone();
     let model_clone = real_model.clone();
     let access_clone = access.clone();
@@ -2014,41 +2036,7 @@ async fn forward_streaming_with_tools(
         obj.insert("stream".into(), Value::Bool(true));
     }
 
-    let tool_ctx = ToolContext {
-        user_id: user.user_id.clone(),
-        roles: user.roles.clone(),
-        db: state.db.clone(),
-        s3: state
-            .config
-            .chat
-            .s3
-            .as_ref()
-            .map(|cfg| std::sync::Arc::new(cfg.clone())),
-        // No persistent chat turn on the proxy paths.
-        assistant_turn_id: None,
-        session_id: None,
-        client_ip,
-        geoip: state.geoip.clone(),
-        // No live turn / browser to prompt on the proxy paths.
-        chat_feedback: None,
-        // No turn → no reservations needed. See sibling site above.
-        attachment_reservations: None,
-        indexer: state.indexer.clone(),
-        image_gen: Some(crate::server::image_gen::ImageGenerator::new(
-            state.upstreams.clone(),
-            state.http.clone(),
-            state.usage.clone(),
-            state.db.clone(),
-        )),
-        // Per-request sandbox lease (the /v1 loop = one turn), so a client's
-        // multi-round `run_in_sandbox` reuses one container. `None` when the
-        // sandbox isn't configured. Freed explicitly at the end of
-        // `drive_streaming_tool_loop` (the `Drop` guard + TTL sweeper back it).
-        sandbox_lease: state
-            .sandbox_client
-            .clone()
-            .map(crate::server::tools::sandbox::SandboxLease::new),
-    };
+    let tool_ctx = proxy_tool_ctx(&state, user.user_id.clone(), user.roles.clone(), client_ip);
 
     // One usage row per upstream round; built here where the bearer's
     // identity + token are known, finished off inside the loop.
@@ -2108,13 +2096,6 @@ async fn forward_streaming_with_tools(
 // runner, and the chat driver can't drift apart on round limits.
 use runner::MAX_TOOL_ROUNDS as STREAM_TOOL_LOOP_MAX_ROUNDS;
 
-#[derive(Default)]
-struct StreamToolCallAcc {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
 /// Top-level envelope fields lifted off the upstream's own SSE chunks so
 /// any chunk we synthesize (see [`synth_client_tool_call_chunks`]) carries
 /// the same `id` / `created` / `model` / `system_fingerprint` the client
@@ -2164,7 +2145,7 @@ impl ChunkMeta {
 /// returned ready to send; the caller appends the terminating `[DONE]`.
 fn synth_client_tool_call_chunks(
     meta: &ChunkMeta,
-    tool_acc: &BTreeMap<usize, StreamToolCallAcc>,
+    tool_acc: &BTreeMap<usize, ToolCallAcc>,
 ) -> Vec<Bytes> {
     let tool_calls: Vec<Value> = tool_acc
         .iter()
@@ -2335,7 +2316,7 @@ async fn drive_streaming_tool_loop_inner(
         }
         let status_code = upstream.status().as_u16();
 
-        let mut tool_acc: BTreeMap<usize, StreamToolCallAcc> = BTreeMap::new();
+        let mut tool_acc: BTreeMap<usize, ToolCallAcc> = BTreeMap::new();
         let mut chunk_meta = ChunkMeta::default();
         let mut byte_buf: Vec<u8> = Vec::new();
         // Per-round repetition guards. A degenerate loop in either channel
@@ -2409,20 +2390,7 @@ async fn drive_streaming_tool_loop_inner(
                         for tc in tcs {
                             let index =
                                 tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                            let entry = tool_acc.entry(index).or_default();
-                            if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
-                                entry.id = id.to_string();
-                            }
-                            if let Some(name) =
-                                tc.pointer("/function/name").and_then(|n| n.as_str())
-                            {
-                                entry.name = name.to_string();
-                            }
-                            if let Some(args) =
-                                tc.pointer("/function/arguments").and_then(|a| a.as_str())
-                            {
-                                entry.arguments.push_str(args);
-                            }
+                            tool_acc.entry(index).or_default().absorb(tc);
                         }
                     }
                     if let Some(fr) = v
@@ -2885,7 +2853,7 @@ mod tests {
         let mut acc = BTreeMap::new();
         acc.insert(
             0,
-            StreamToolCallAcc {
+            ToolCallAcc {
                 id: "call_a".into(),
                 name: "client_tool".into(),
                 arguments: r#"{"x":1}"#.into(),

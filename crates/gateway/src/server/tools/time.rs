@@ -142,18 +142,7 @@ mod tests {
         }
         ToolContext {
             user_id: user_id.into(),
-            roles: vec![],
-            db: pool.clone(),
-            s3: None,
-            assistant_turn_id: None,
-            session_id: None,
-            client_ip: None,
-            geoip: None,
-            chat_feedback: None,
-            attachment_reservations: None,
-            indexer: None,
-            image_gen: None,
-            sandbox_lease: None,
+            ..ToolContext::for_test(pool.clone())
         }
     }
 

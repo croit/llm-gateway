@@ -36,6 +36,38 @@ use serde_json::{Value, json};
 
 use crate::server::tools::{Tool, ToolContext, ToolError, ToolSource};
 
+/// Streaming accumulator for one tool call, folded from its SSE delta
+/// fragments. OpenAI-compatible backends stream a tool call as a sequence of
+/// partial `delta.tool_calls[]` chunks: `id` and `function.name` usually
+/// arrive once, `function.arguments` split across many chunks. This buffers
+/// them into a complete call. One source of truth shared by the chat-UI
+/// driver (`openai_driver`) and the `/v1` streaming proxy so both accumulate
+/// byte-for-byte identically.
+#[derive(Default)]
+pub struct ToolCallAcc {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+impl ToolCallAcc {
+    /// Fold one streamed `tool_calls[]` fragment into this accumulator.
+    /// `id` / `function.name` overwrite (last-writer-wins, matching the
+    /// backends' single-shot delivery of those fields); `function.arguments`
+    /// is appended (it streams in pieces).
+    pub fn absorb(&mut self, tc: &Value) {
+        if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+            self.id = id.to_string();
+        }
+        if let Some(name) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
+            self.name = name.to_string();
+        }
+        if let Some(args) = tc.pointer("/function/arguments").and_then(|a| a.as_str()) {
+            self.arguments.push_str(args);
+        }
+    }
+}
+
 /// Hard cap on tool-call rounds per turn — the single source of truth shared
 /// by every tool loop (this buffered runner, the chat-UI driver, and the `/v1`
 /// streaming proxy) so the caps can't silently diverge again.
@@ -671,21 +703,7 @@ mod tests {
         let pool = crate::server::db::open(std::path::Path::new(":memory:"))
             .await
             .unwrap();
-        ToolContext {
-            user_id: "u".into(),
-            roles: vec![],
-            db: pool,
-            s3: None,
-            assistant_turn_id: None,
-            session_id: None,
-            client_ip: None,
-            geoip: None,
-            chat_feedback: None,
-            attachment_reservations: None,
-            indexer: None,
-            image_gen: None,
-            sandbox_lease: None,
-        }
+        ToolContext::for_test(pool)
     }
 
     fn registry() -> ToolRegistry {

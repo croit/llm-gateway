@@ -16,6 +16,14 @@ cargo-binstall = "latest"
 # CI does not use sccache; GitHub Actions caches the cargo registry + target/
 # via Swatinem/rust-cache instead.
 "cargo:sccache" = "latest"
+# cargo-nextest is the workspace test runner (`mise run test`). It runs the
+# ~37 integration-test binaries with far more parallelism than `cargo test`
+# and gives a compact per-test report. Kept in the committed toolset (not
+# just mise.local.toml) so CI's `mise install` provisions it before
+# `mise run ci` → `test`. Note: nextest does not run doctests; the codebase
+# has none that execute (the only ` ``` ` fences are `text` blocks), so no
+# separate `cargo test --doc` step is needed. Add one here if that changes.
+"cargo:cargo-nextest" = "latest"
 # Node is here for the Tailwind v4 + daisyUI CSS build in `ui/`, and for the
 # `node:test`-driven e2e suite in `e2e/`.
 node = "24"
@@ -147,14 +155,14 @@ depends = ["build-assets"]
 run = "cargo run --example dev_ui -p gateway"
 
 [tasks.test]
-description = "Run the workspace tests."
+description = "Run the workspace tests (cargo-nextest — parallel, compact report)."
 depends = ["build-assets"]
-run = "cargo test --workspace"
+run = "cargo nextest run --workspace"
 
 [tasks.test-nocapture]
 description = "Run tests with stdout/stderr visible."
 depends = ["build-assets"]
-run = "cargo test --workspace -- --nocapture"
+run = "cargo nextest run --workspace --no-capture"
 
 [tasks.lint]
 description = "Clippy + rustfmt + tsc --noEmit."
@@ -163,6 +171,10 @@ run = [
     "cargo fmt --all -- --check",
     "cargo clippy --workspace --all-targets -- -D warnings",
 ]
+
+[tasks.lint-panics]
+description = "Advisory: flag panic-prone `.unwrap()`/`.expect()` in library/binary code (warnings only — NOT part of `ci`). The main `lint` gate runs clippy with `-D warnings`, so promoting these workspace-wide would turn every one of the ~2000 existing (mostly test/mutex/infallible) sites into a hard error. This task instead surfaces them as warnings so new panic sites in request-handling paths are visible in review without a mass rewrite. Excludes test targets (`--all-targets` is intentionally omitted)."
+run = "cargo clippy --workspace -- -W clippy::unwrap_used -W clippy::expect_used"
 
 [tasks.ci]
 description = "Everything CI runs: lint + test + release build of the gateway binary. mise fans out via the DAG."

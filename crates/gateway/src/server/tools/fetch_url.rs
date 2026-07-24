@@ -229,21 +229,7 @@ mod tests {
 
     async fn ctx() -> ToolContext {
         let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
-        ToolContext {
-            user_id: "u".into(),
-            roles: vec![],
-            db: pool,
-            s3: None,
-            assistant_turn_id: None,
-            session_id: None,
-            client_ip: None,
-            geoip: None,
-            chat_feedback: None,
-            attachment_reservations: None,
-            indexer: None,
-            image_gen: None,
-            sandbox_lease: None,
-        }
+        ToolContext::for_test(pool)
     }
 
     #[tokio::test]

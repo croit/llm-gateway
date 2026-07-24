@@ -761,23 +761,11 @@ mod tests {
     }
 
     async fn chatless_ctx() -> ToolContext {
-        ToolContext {
-            user_id: "u".into(),
-            roles: vec![],
-            db: crate::server::db::open(std::path::Path::new(":memory:"))
+        ToolContext::for_test(
+            crate::server::db::open(std::path::Path::new(":memory:"))
                 .await
                 .unwrap(),
-            s3: None,
-            assistant_turn_id: None,
-            session_id: None,
-            client_ip: None,
-            geoip: None,
-            chat_feedback: None,
-            attachment_reservations: None,
-            indexer: None,
-            image_gen: None,
-            sandbox_lease: None,
-        }
+        )
     }
 
     #[tokio::test]

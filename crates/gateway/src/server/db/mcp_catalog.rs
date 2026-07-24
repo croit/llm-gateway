@@ -163,13 +163,6 @@ pub struct ConnectorInput {
     pub allowed_groups: Vec<String>,
 }
 
-fn parse_ts(s: String, column: &'static str) -> Result<Timestamp, DbError> {
-    s.parse().map_err(|e: jiff::Error| DbError::Decode {
-        column,
-        source: e.into(),
-    })
-}
-
 fn map_row(row: &SqliteRow) -> Result<Connector, DbError> {
     let scopes_json: String = row.try_get("scopes_json")?;
     let scopes: Vec<String> = serde_json::from_str(&scopes_json).unwrap_or_default();
@@ -197,8 +190,8 @@ fn map_row(row: &SqliteRow) -> Result<Connector, DbError> {
         },
         enabled: row.try_get::<i64, _>("enabled")? != 0,
         seeded: row.try_get::<i64, _>("seeded")? != 0,
-        created_at: parse_ts(row.try_get("created_at")?, "created_at")?,
-        updated_at: parse_ts(row.try_get("updated_at")?, "updated_at")?,
+        created_at: super::parse_ts(row.try_get("created_at")?, "created_at")?,
+        updated_at: super::parse_ts(row.try_get("updated_at")?, "updated_at")?,
     })
 }
 

@@ -39,6 +39,84 @@ use super::{Tool, ToolContext, ToolError, ToolFuture};
 use crate::server::chat_attachments::{self, AttachmentRef};
 use crate::server::config::SandboxConfig;
 
+/// Model-facing description of the `run_in_sandbox` tool. Extracted to a
+/// module const so `RunInSandbox::schema` reads as structure (the JSON
+/// argument schema) rather than being dominated by this ~70-line prose block
+/// — the two are edited for entirely different reasons (what the sandbox can
+/// do vs. the tool's argument shape).
+const RUN_IN_SANDBOX_DESC: &str = "Run Python or shell in a secure, isolated sandbox (a throwaway VM \
+     scoped to this conversation turn) and get back stdout, stderr, and \
+     any files it produced — like a capable system-engineer shell. Use it to \
+     inspect/debug large or compressed log files, analyze data, work \
+     with office documents, convert between file formats, run CLI \
+     tools, and generate files. \
+     Python libs: pandas, numpy, scipy, scikit-learn, statsmodels, \
+     sympy, polars, pyarrow, duckdb, matplotlib/seaborn, \
+     openpyxl/xlsxwriter/xlrd, python-docx, python-pptx, odfpy, \
+     typ2pptx (Typst→editable .pptx: real text/shapes/gradients — \
+     compile the .typ with its fonts on TYPST_FONT_PATHS, run \
+     `typ2pptx in.typ --root <dir> --detect-paragraphs -o out.pptx`; \
+     if the deck's font comes out as Consolas, set the run typeface to \
+     the real font name in ppt/slides/*.xml), \
+     pypdf/pdfplumber/pymupdf, reportlab (outline fonts only — \
+     emoji need `pdfmetrics.registerFont(TTFont('NotoEmoji', \
+     '/usr/share/fonts/truetype/notoemoji/NotoEmoji.ttf'))`, \
+     monochrome; for COLOR emoji or mixed Latin+CJK+emoji PDFs \
+     prefer weasyprint or typst — their font fallback handles it, \
+     e.g. Noto Sans CJK JP covers Latin+Japanese+Chinese and Noto \
+     Color Emoji chains in automatically), img2pdf, pillow, opencv, \
+     pytesseract (OCR), segno + qrcode (QR codes in generated \
+     documents; for a standalone QR code prefer the faster \
+     `generate_qr_code` tool), \
+     sqlalchemy/psycopg/pymysql, scapy, lxml, \
+     beautifulsoup4, requests. \
+     CLI tools: ripgrep (rg), jq, yq, jc, awk/sed, duckdb + sqlite3 \
+     (SQL over CSV/JSON/Parquet/large logs), ffmpeg, imagemagick, vips, \
+     tesseract (OCR), tshark/tcpdump (read .pcap), graphviz (dot), \
+     LibreOffice (`soffice --headless` for office↔pdf), pandoc, typst \
+     (with the offline `@preview/gribouille` ggplot-style charts \
+     package), excalirender (`.excalidraw` scene → svg/png/pdf), \
+     ghostscript/qpdf, poppler-utils (pdftotext/pdftoppm), \
+     gzip/zstd/xz/bzip2/7z, git, curl/wget, dig/rsync, file/xxd, lnav, \
+     and a C toolchain (gcc/make). Headless chromium is available too. \
+     Fonts: the common document families are installed — Calibri/\
+     Cambria/Arial/Times metric substitutes (Carlito, Caladea, \
+     Liberation), Inter, Roboto, Open Sans, Lato, Montserrat, \
+     Poppins, Oswald, Raleway, Work Sans, Nunito, EB Garamond, \
+     Merriweather, Playfair Display, IBM Plex, JetBrains Mono, \
+     Fira Code, Noto (incl. CJK + emoji) — `fc-list : family` \
+     shows all. \
+     The sandbox PERSISTS for this turn: files you write to the \
+     working directory, and scratch state survive between calls, so \
+     you can iterate — run something, read the output, adjust, and \
+     run again — instead of cramming everything into one call. Set \
+     `fresh: true` to start over in a clean container (also required \
+     to change `network`, which is fixed when the container starts). \
+     Files a user uploaded this turn are ALREADY waiting \
+     in the working directory under their original names — just open \
+     them. To also work on a file from earlier in the conversation — \
+     including files a previous sandbox/render call produced — pass \
+     its id (from an `[attached … id=\"<turn>/<file>\"]` stub) or \
+     simply its filename in `attachments`; it gets fetched into the \
+     working directory too. REUSE existing files this way instead of \
+     regenerating them. \
+     The result's `staged_files` lists what's in the directory and \
+     `available_attachments` lists other files you can pull in by id. \
+     The environment is a FIXED image: everything listed above is \
+     preinstalled, and NOTHING can be installed — never try \
+     pip/apt/npm install (there is normally no network, and the \
+     sandbox is discarded at the end of the turn). If a library is \
+     missing, solve the task with the preinstalled ones. Network \
+     is OFF unless you set `network: true` (and the operator enabled \
+     egress); without it web access fails. Write files \
+     to the current working directory to return them to the user. \
+     When stdout/stderr is large you get a small preview plus a \
+     `full_output_ref` — call read_sandbox_output with that ref to \
+     grep/page the rest instead of pulling it all into context. Best \
+     practice: filter/aggregate in-sandbox (grep, awk, duckdb, \
+     head/tail) and print a concise summary rather than dumping raw \
+     data.";
+
 /// Shared HTTP client + config for the sandbox tool family. Held behind an
 /// `Arc` so the generic tool and each specialized wrapper share one
 /// connection pool.
@@ -900,78 +978,7 @@ impl Tool for RunInSandbox {
     fn schema(&self) -> ToolDef {
         ToolDef::function(
             self.id(),
-            "Run Python or shell in a secure, isolated sandbox (a throwaway VM \
-             scoped to this conversation turn) and get back stdout, stderr, and \
-             any files it produced — like a capable system-engineer shell. Use it to \
-             inspect/debug large or compressed log files, analyze data, work \
-             with office documents, convert between file formats, run CLI \
-             tools, and generate files. \
-             Python libs: pandas, numpy, scipy, scikit-learn, statsmodels, \
-             sympy, polars, pyarrow, duckdb, matplotlib/seaborn, \
-             openpyxl/xlsxwriter/xlrd, python-docx, python-pptx, odfpy, \
-             typ2pptx (Typst→editable .pptx: real text/shapes/gradients — \
-             compile the .typ with its fonts on TYPST_FONT_PATHS, run \
-             `typ2pptx in.typ --root <dir> --detect-paragraphs -o out.pptx`; \
-             if the deck's font comes out as Consolas, set the run typeface to \
-             the real font name in ppt/slides/*.xml), \
-             pypdf/pdfplumber/pymupdf, reportlab (outline fonts only — \
-             emoji need `pdfmetrics.registerFont(TTFont('NotoEmoji', \
-             '/usr/share/fonts/truetype/notoemoji/NotoEmoji.ttf'))`, \
-             monochrome; for COLOR emoji or mixed Latin+CJK+emoji PDFs \
-             prefer weasyprint or typst — their font fallback handles it, \
-             e.g. Noto Sans CJK JP covers Latin+Japanese+Chinese and Noto \
-             Color Emoji chains in automatically), img2pdf, pillow, opencv, \
-             pytesseract (OCR), segno + qrcode (QR codes in generated \
-             documents; for a standalone QR code prefer the faster \
-             `generate_qr_code` tool), \
-             sqlalchemy/psycopg/pymysql, scapy, lxml, \
-             beautifulsoup4, requests. \
-             CLI tools: ripgrep (rg), jq, yq, jc, awk/sed, duckdb + sqlite3 \
-             (SQL over CSV/JSON/Parquet/large logs), ffmpeg, imagemagick, vips, \
-             tesseract (OCR), tshark/tcpdump (read .pcap), graphviz (dot), \
-             LibreOffice (`soffice --headless` for office↔pdf), pandoc, typst \
-             (with the offline `@preview/gribouille` ggplot-style charts \
-             package), excalirender (`.excalidraw` scene → svg/png/pdf), \
-             ghostscript/qpdf, poppler-utils (pdftotext/pdftoppm), \
-             gzip/zstd/xz/bzip2/7z, git, curl/wget, dig/rsync, file/xxd, lnav, \
-             and a C toolchain (gcc/make). Headless chromium is available too. \
-             Fonts: the common document families are installed — Calibri/\
-             Cambria/Arial/Times metric substitutes (Carlito, Caladea, \
-             Liberation), Inter, Roboto, Open Sans, Lato, Montserrat, \
-             Poppins, Oswald, Raleway, Work Sans, Nunito, EB Garamond, \
-             Merriweather, Playfair Display, IBM Plex, JetBrains Mono, \
-             Fira Code, Noto (incl. CJK + emoji) — `fc-list : family` \
-             shows all. \
-             The sandbox PERSISTS for this turn: files you write to the \
-             working directory, and scratch state survive between calls, so \
-             you can iterate — run something, read the output, adjust, and \
-             run again — instead of cramming everything into one call. Set \
-             `fresh: true` to start over in a clean container (also required \
-             to change `network`, which is fixed when the container starts). \
-             Files a user uploaded this turn are ALREADY waiting \
-             in the working directory under their original names — just open \
-             them. To also work on a file from earlier in the conversation — \
-             including files a previous sandbox/render call produced — pass \
-             its id (from an `[attached … id=\"<turn>/<file>\"]` stub) or \
-             simply its filename in `attachments`; it gets fetched into the \
-             working directory too. REUSE existing files this way instead of \
-             regenerating them. \
-             The result's `staged_files` lists what's in the directory and \
-             `available_attachments` lists other files you can pull in by id. \
-             The environment is a FIXED image: everything listed above is \
-             preinstalled, and NOTHING can be installed — never try \
-             pip/apt/npm install (there is normally no network, and the \
-             sandbox is discarded at the end of the turn). If a library is \
-             missing, solve the task with the preinstalled ones. Network \
-             is OFF unless you set `network: true` (and the operator enabled \
-             egress); without it web access fails. Write files \
-             to the current working directory to return them to the user. \
-             When stdout/stderr is large you get a small preview plus a \
-             `full_output_ref` — call read_sandbox_output with that ref to \
-             grep/page the rest instead of pulling it all into context. Best \
-             practice: filter/aggregate in-sandbox (grep, awk, duckdb, \
-             head/tail) and print a concise summary rather than dumping raw \
-             data.",
+            RUN_IN_SANDBOX_DESC,
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -2609,21 +2616,7 @@ mod tests {
 
     async fn ctx() -> ToolContext {
         let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
-        ToolContext {
-            user_id: "u".into(),
-            roles: vec![],
-            db: pool,
-            s3: None,
-            assistant_turn_id: None,
-            session_id: None,
-            client_ip: None,
-            geoip: None,
-            chat_feedback: None,
-            attachment_reservations: None,
-            indexer: None,
-            image_gen: None,
-            sandbox_lease: None,
-        }
+        ToolContext::for_test(pool)
     }
 
     fn client(runner_url: String) -> Arc<SandboxClient> {

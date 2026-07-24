@@ -79,12 +79,7 @@ fn take_safe_content(buf: &mut String) -> String {
 // is now per-conversation (derived from the effort level); see
 // `server::reasoning::Effort::max_rounds`.
 
-#[derive(Default)]
-struct ToolCallAcc {
-    id: String,
-    name: String,
-    arguments: String,
-}
+use crate::server::tools::runner::ToolCallAcc;
 
 /// Ensure every tool call in one round has a non-empty id that is unique
 /// *within the turn*. Some OpenAI-compatible backends (qwen / vLLM are the
@@ -759,20 +754,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                         for tc in tcs {
                             let index =
                                 tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                            let entry = tool_acc.entry(index).or_default();
-                            if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
-                                entry.id = id.to_string();
-                            }
-                            if let Some(name) =
-                                tc.pointer("/function/name").and_then(|n| n.as_str())
-                            {
-                                entry.name = name.to_string();
-                            }
-                            if let Some(args) =
-                                tc.pointer("/function/arguments").and_then(|a| a.as_str())
-                            {
-                                entry.arguments.push_str(args);
-                            }
+                            tool_acc.entry(index).or_default().absorb(tc);
                         }
                     }
                 }

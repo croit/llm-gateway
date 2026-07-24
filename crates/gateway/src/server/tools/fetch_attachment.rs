@@ -736,21 +736,7 @@ mod tests {
         let pool = crate::server::db::open(std::path::Path::new(":memory:"))
             .await
             .unwrap();
-        let ctx = ToolContext {
-            user_id: "u".into(),
-            roles: vec![],
-            db: pool,
-            s3: None,
-            assistant_turn_id: None,
-            session_id: None,
-            client_ip: None,
-            geoip: None,
-            chat_feedback: None,
-            attachment_reservations: None,
-            indexer: None,
-            image_gen: None,
-            sandbox_lease: None,
-        };
+        let ctx = ToolContext::for_test(pool);
         let err = FetchAttachment::new(None)
             .run(ctx, json!({"id": "t-1/x.csv"}))
             .await

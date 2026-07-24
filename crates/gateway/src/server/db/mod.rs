@@ -69,6 +69,26 @@ pub enum DbError {
     Crypto(#[from] crate::server::crypto::CryptoError),
 }
 
+/// Parse a stored timestamp string from column `column`, mapping a parse
+/// failure to [`DbError::Decode`]. The single home for timestamp decoding
+/// across the gateway's `db` submodules — mirrors the same helper in
+/// `session-core::db`, but returns the gateway's own [`DbError`] (the two
+/// crates have distinct error types, so the helper can't be shared directly).
+pub(crate) fn parse_ts(s: String, column: &'static str) -> Result<jiff::Timestamp, DbError> {
+    s.parse().map_err(|e: jiff::Error| DbError::Decode {
+        column,
+        source: e.into(),
+    })
+}
+
+/// [`parse_ts`] for a nullable column: `None` stays `None`, `Some` is parsed.
+pub(crate) fn parse_optional_ts(
+    s: Option<String>,
+    column: &'static str,
+) -> Result<Option<jiff::Timestamp>, DbError> {
+    s.map(|s| parse_ts(s, column)).transpose()
+}
+
 /// Opens (or creates) a SQLite database at `path` and runs migrations.
 ///
 /// Pass `:memory:` to use an in-memory database. Used by tests.

@@ -48,19 +48,6 @@ impl From<Token> for TokenView {
     }
 }
 
-fn parse_optional_ts(
-    s: Option<String>,
-    column: &'static str,
-) -> Result<Option<Timestamp>, DbError> {
-    s.map(|s| {
-        s.parse().map_err(|e: jiff::Error| DbError::Decode {
-            column,
-            source: e.into(),
-        })
-    })
-    .transpose()
-}
-
 fn map_row(row: &SqliteRow) -> Result<Token, DbError> {
     let id: String = row.try_get("id")?;
     let user_id: String = row.try_get("user_id")?;
@@ -77,20 +64,10 @@ fn map_row(row: &SqliteRow) -> Result<Token, DbError> {
         user_id,
         name,
         hash,
-        created_at: created_at_s
-            .parse()
-            .map_err(|e: jiff::Error| DbError::Decode {
-                column: "created_at",
-                source: e.into(),
-            })?,
-        last_used_at: parse_optional_ts(last_used_at_s, "last_used_at")?,
-        expires_at: expires_at_s
-            .parse()
-            .map_err(|e: jiff::Error| DbError::Decode {
-                column: "expires_at",
-                source: e.into(),
-            })?,
-        revoked_at: parse_optional_ts(revoked_at_s, "revoked_at")?,
+        created_at: super::parse_ts(created_at_s, "created_at")?,
+        last_used_at: super::parse_optional_ts(last_used_at_s, "last_used_at")?,
+        expires_at: super::parse_ts(expires_at_s, "expires_at")?,
+        revoked_at: super::parse_optional_ts(revoked_at_s, "revoked_at")?,
         tools_enabled: tools_enabled != 0,
     })
 }
