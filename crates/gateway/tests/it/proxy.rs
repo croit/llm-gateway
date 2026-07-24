@@ -5,7 +5,7 @@
 //! policy, model resolution, and response relay against a wiremock
 //! upstream.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use gateway::server::upstreams::PoolKind;

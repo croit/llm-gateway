@@ -17,7 +17,7 @@
 //! back set, the `users` row is upserted with the claimed roles, and
 //! the next `/api/v0/me` request with that cookie is authenticated.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

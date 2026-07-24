@@ -11,7 +11,7 @@
 //!     /v1/chat/completions calls see the merged defaults.
 //!   - `POST /admin/models/clear` deletes the stored overrides row.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use gateway::server::db::{model_defaults as db_defaults, users};

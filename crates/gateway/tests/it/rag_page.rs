@@ -6,7 +6,7 @@
 //! Auth model: admin-gated. Anonymous → 302 redirect to /auth/login;
 //! signed-in non-admin → 403; admin → 200 with the table.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use jiff::Timestamp;

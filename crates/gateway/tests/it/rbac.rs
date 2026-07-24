@@ -21,7 +21,7 @@
 //! our own route gate (`route_access` / `acquire_for_access`) — never from the
 //! upstream — which is what makes "restricted ⇒ 404" a real enforcement signal.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::sync::Arc;

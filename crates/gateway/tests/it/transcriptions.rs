@@ -7,7 +7,7 @@
 //! boundary-preserving forward to the upstream. wiremock acts as the
 //! upstream "whisper" backend.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use gateway::server::upstreams::config::PoolKind;

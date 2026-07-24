@@ -5,7 +5,7 @@
 //! and the identity info that used to live on the dashboard now sits in
 //! a low-key "Account" section on the /tokens page.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use rama::http::{Method, StatusCode};

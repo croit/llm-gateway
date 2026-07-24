@@ -4,7 +4,7 @@
 //! Chat sharing: a `shared` session is read-only-readable by any signed-in
 //! user who knows its UUID; mutations (incl. re-sharing) stay owner-only.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

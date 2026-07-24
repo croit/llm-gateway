@@ -4,7 +4,7 @@
 //! /theme/toggle + /lang + flash cookie roundtrip + the session-authed
 //! transcription mirror. All are part of the chrome the chat page expects.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::sync::Arc;

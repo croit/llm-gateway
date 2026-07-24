@@ -13,7 +13,7 @@
 //!     impersonation banner shows on authed pages while impersonating and
 //!     is absent for an ordinary session.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use gateway::server::db::{audit, users};

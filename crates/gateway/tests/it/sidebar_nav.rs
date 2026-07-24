@@ -17,7 +17,7 @@
 //!     cookie — not just the toggle event — so the fold state survives a
 //!     reload.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use gateway::server::db::users;

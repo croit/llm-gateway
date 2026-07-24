@@ -6,7 +6,7 @@
 //! is recipient-only — the owner gets no clone action, and a non-shared
 //! chat can't be forked by anyone but its owner-less viewers (i.e. nobody).
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

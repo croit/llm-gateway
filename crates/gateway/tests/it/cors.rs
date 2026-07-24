@@ -10,7 +10,7 @@
 //! `router::service`), so a regression — e.g. dropping the layer or the
 //! error-response decoration — fails CI.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use rama::http::{Body, Method, Request, StatusCode, header};

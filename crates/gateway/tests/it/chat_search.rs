@@ -17,7 +17,7 @@
 //!   - The no-JS GET (no datastar header) returns a full HTML results page,
 //!     not a redirect that silently drops the query.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

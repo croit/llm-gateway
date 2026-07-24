@@ -5,7 +5,7 @@
 //! test in the suite — also doubles as a smoke check that the test
 //! scaffolding (state, router, serve) hangs together.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use rama::http::{Method, StatusCode};

@@ -14,7 +14,7 @@
 //!     `configured: false` and the admin page renders the "Not configured"
 //!     card.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use gateway::rama_server::RamaState;

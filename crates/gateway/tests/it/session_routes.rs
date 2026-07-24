@@ -3,7 +3,7 @@
 
 //! /api/v0/* — session-authed JSON endpoints (token CRUD, /me).
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use rama::http::{Body, Method, Request, StatusCode};

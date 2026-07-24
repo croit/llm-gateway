@@ -9,7 +9,7 @@
 //! itself is unit-tested in `server::push`; here we only exercise the HTTP
 //! contract and the enabled-vs-disabled branches.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use gateway::rama_server::RamaState;

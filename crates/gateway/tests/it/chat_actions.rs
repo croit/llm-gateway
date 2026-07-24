@@ -7,7 +7,7 @@
 //! turn); the regenerated content itself streams async and isn't under
 //! test here.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

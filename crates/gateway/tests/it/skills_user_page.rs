@@ -6,7 +6,7 @@
 //! does. End-to-end through the real router (auth gate, form POST, re-render),
 //! the wiring the unit tests can't cover.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use rama::http::{Body, Method, Request, StatusCode};

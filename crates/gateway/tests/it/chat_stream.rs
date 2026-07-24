@@ -8,7 +8,7 @@
 //! produce DB content and outer-mode patches arrive on the wire) as
 //! well as the empty / anonymous / no-[DONE] edge cases.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -8,7 +8,7 @@
 //! upstreams pool is wired here), but the API doesn't depend on it —
 //! everything it does runs through the rag DB tables.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use rama::http::{Body, Method, Request, StatusCode};

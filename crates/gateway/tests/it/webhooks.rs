@@ -15,7 +15,7 @@
 //! live model. `open_session` (which appends the payload) runs *before* the
 //! drive, so the payload assertions hold regardless of the model outcome.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use gateway::server::auth::token;

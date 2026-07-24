@@ -9,7 +9,7 @@
 //! The cron evaluator and the data-layer CRUD are unit-tested in
 //! `server::scheduled`; this file pins the HTTP surface.
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use gateway::server::scheduled;

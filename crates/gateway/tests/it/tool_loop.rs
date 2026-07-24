@@ -9,7 +9,7 @@
 //! between rounds, append the result to the messages, and relay the
 //! final response with `x-gateway-tool-rounds: 1`.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::sync::Arc;

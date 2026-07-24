@@ -5,7 +5,7 @@
 //! pinned conversations float to the top of the sidebar list. Pinning is a
 //! pure UI affordance — owner-only, never affects readability.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

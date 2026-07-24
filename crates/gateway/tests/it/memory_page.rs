@@ -4,7 +4,7 @@
 //! The per-user `/memory` page: inspect memories grouped by kind, add,
 //! edit, and delete them — all scoped to the session user.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

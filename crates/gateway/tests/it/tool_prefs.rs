@@ -5,7 +5,7 @@
 //! one off, and confirm the choice persists so the request path can
 //! honour it.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 use std::sync::Arc;

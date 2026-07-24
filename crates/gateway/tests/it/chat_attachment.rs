@@ -12,7 +12,7 @@
 //! call, so the test harness can exercise them with a default
 //! `Config` (no `[chat.s3]`).
 
-mod common;
+use crate::common;
 
 use common::Service as _;
 use rama::http::{Body, Method, Request, StatusCode};
