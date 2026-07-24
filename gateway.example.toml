@@ -208,6 +208,18 @@ enabled = true
 # min_turns_to_compact   = 4       # anti-thrash: min newly-aged turns to re-summarise
 # summary_max_tokens     = 1024    # output-token cap for the summariser call
 
+# ---- Automatic document OCR -----------------------------------------------
+# Optional. The OCR pool points at the internal PDF-aware sidecar documented in
+# docs/ocr.md. The sidecar accepts the original PDF/image and calls the
+# Unlimited-OCR vLLM backend internally. OCR output is added to the current
+# user message as untrusted document data; the original attachment remains
+# available through fetch_attachment.
+# [chat.ocr]
+# enabled      = true
+# model        = "baidu/Unlimited-OCR"
+# max_tokens   = 32768
+# ngram_window = 1024
+
 # ---- Typst templates -------------------------------------------------------
 # Per-template tools (`typst_<id>`) the model can call to render
 # PDFs/letters/presentations in your corporate design. The gateway

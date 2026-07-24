@@ -18,6 +18,7 @@ deployment methods are provided — pick one:
 | **discord-mcp** | `ghcr.io/croit/discord-mcp` | Discord bot bridge (channel + DM tools, plus full-roster cache + `fuzz_search_members`) backing the seeded **global** Discord connector (enabled + pointed at this bridge in `/admin/connectors`, see below). Our fork of `SaseQ/discord-mcp`. Optional. |
 | **sandbox-runner** | `ghcr.io/croit/llm-gateway-sandbox-runner` | Code-execution runner (`run_in_sandbox` etc.). Optional; needs gVisor. |
 | **egress-proxy** | `docker.io/ubuntu/squid` | Allowlisting proxy for networked sandbox runs. Optional. |
+| **ocr-sidecar** | local `deploy/ocr-sidecar` image | PDF-aware Unlimited-OCR adapter. Optional; needs an external Unlimited-OCR vLLM service. |
 | sandbox workload | `ghcr.io/croit/llm-gateway-sandbox` | The "gold image" the runner spawns per job (pulled by the runner, not run directly). |
 
 Secrets and per-host config live in env files + a config TOML; the SQLite DB
@@ -38,6 +39,8 @@ $EDITOR deploy/gateway.env deploy/google-workspace-mcp.env deploy/gateway.toml
 
 docker compose -f deploy/compose.example.yml up -d                 # gateway + workspace MCP
 docker compose -f deploy/compose.example.yml --profile sandbox up -d  # + sandbox runner + egress
+OCR_VLLM_BASE_URL=http://host.docker.internal:8000/v1 \
+  docker compose -f deploy/compose.example.yml --profile ocr up -d  # + PDF OCR sidecar
 ```
 
 Relative paths in the compose file resolve against `deploy/`, so the env/config
@@ -70,6 +73,16 @@ enable --now gateway.service`.
 - **Secrets** (`gateway.env`): `GATEWAY_SESSION_KEY`, `GATEWAY_OIDC_CLIENT_SECRET`,
   optional `GATEWAY_ENCRYPTION_KEY` (encrypts per-user connector tokens at rest), and any
   per-upstream `<POOL>_API_KEY`.
+
+## Document OCR
+
+The OCR sidecar is inactive unless all of the following are true:
+
+1. The sidecar is running with `OCR_VLLM_BASE_URL` pointing at an Unlimited-OCR vLLM server.
+2. An `ocr` pool and backend are configured at `/admin/upstreams`, pointing at `http://ocr-sidecar:9100` with `baidu/Unlimited-OCR` in its model list.
+3. `[chat.ocr].enabled = true` is set in `gateway.toml`.
+
+Without an available `ocr` backend the gateway neither fetches attachments for OCR nor sends OCR tools or models to an LLM. The sidecar accepts the original PDF/image at `/ocr`, converts PDFs internally, and calls vLLM with the model-specific request recipe. See [`../docs/ocr.md`](../docs/ocr.md).
 
 ---
 

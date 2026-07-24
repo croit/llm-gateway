@@ -539,10 +539,34 @@ pub struct TypstConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ChatConfig {
     pub s3: Option<S3Config>,
+    /// Optional automatic OCR enrichment for image/PDF attachments. The OCR
+    /// pool must point at the document-aware OCR sidecar.
+    #[serde(default)]
+    pub ocr: OcrConfig,
     /// Automatic conversation compaction — summarise a session's oldest turns
     /// once its replayed context grows past a fraction of the model's window.
     #[serde(default)]
     pub compaction: CompactionConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OcrConfig {
+    pub enabled: bool,
+    pub model: Option<String>,
+    pub max_tokens: usize,
+    pub ngram_window: usize,
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            max_tokens: 32_768,
+            ngram_window: 1_024,
+        }
+    }
 }
 
 /// Tunables for automatic conversation compaction. All optional with sane

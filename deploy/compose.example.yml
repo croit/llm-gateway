@@ -11,6 +11,7 @@
 #   sandbox-runner        code-execution runner (profile: sandbox)
 #   egress-proxy          allowlisting squid for networked sandbox runs
 #                         (profile: sandbox)
+#   ocr-sidecar           PDF-aware Unlimited-OCR adapter (profile: ocr)
 #
 # SANDBOX ISOLATION: the runner spawns each job as a sibling container via the
 # host Docker socket with `--runtime=runsc` (gVisor). Unlike remote *podman*,
@@ -77,6 +78,28 @@ services:
       - /tmp
     cap_drop:
       - ALL
+    security_opt:
+      - "no-new-privileges:true"
+
+  # PDF-aware OCR adapter. It accepts the gateway's internal /ocr multipart
+  # contract, converts PDFs with PyMuPDF, and calls a separately deployed
+  # Unlimited-OCR vLLM server. Profile: ocr.
+  ocr-sidecar:
+    build:
+      context: ./ocr-sidecar
+      dockerfile: Containerfile
+    profiles:
+      - ocr
+    restart: unless-stopped
+    expose:
+      - "9100"
+    environment:
+      VLLM_BASE_URL: ${OCR_VLLM_BASE_URL:?set OCR_VLLM_BASE_URL to the Unlimited-OCR vLLM /v1 URL}
+      VLLM_API_KEY: ${OCR_VLLM_API_KEY:-}
+      OCR_MODEL: ${OCR_MODEL:-baidu/Unlimited-OCR}
+    read_only: true
+    tmpfs:
+      - /tmp
     security_opt:
       - "no-new-privileges:true"
 
