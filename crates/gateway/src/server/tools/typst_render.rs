@@ -352,7 +352,7 @@ async fn render_and_attach(
         .into_iter()
         .map(|(k, v)| (k, apply_replacements(&v, &reps)))
         .collect();
-    let mut render_data = apply_reps_to_value(data, &reps)?;
+    let render_data = apply_reps_to_value(data, &reps)?;
 
     // With staged images, compile against a temp root = a copy of the template
     // dir + the staged files, so `image("uploads/…")` resolves alongside the
@@ -376,34 +376,15 @@ async fn render_and_attach(
     // and a retry that still fails — surfaces the ORIGINAL stderr unchanged, so
     // the model sees the real problem and iterates. Compile errors map to
     // InvalidArgs (nudge the model to fix its input); other errors to Failed.
-    let mut auto_escaped: usize = 0;
-    let mut edit_base_escaped: Option<Value> = None;
-    let compile_failed =
-        |msg: String| ToolError::InvalidArgs(format!("typst compile failed:\n{msg}"));
-    let rendered = match typst::compile(template, &inputs, preview_page, staging_path).await {
-        Ok(r) => r,
-        Err(typst::CompileError::Failed(msg)) if is_unescaped_at_error(&msg) => {
-            let (esc_render, n) = escape_unescaped_ats(&render_data);
-            if n == 0 {
-                // Signature matched but there was no unescaped `@` to fix
-                // (some other unresolved reference) — don't retry blindly.
-                return Err(compile_failed(msg));
-            }
-            let esc_inputs = inputs_from_data(template, &esc_render)?;
-            match typst::compile(template, &esc_inputs, preview_page, staging_path).await {
-                Ok(r) => {
-                    let (esc_base, _) = escape_unescaped_ats(data);
-                    edit_base_escaped = Some(esc_base);
-                    render_data = esc_render;
-                    auto_escaped = n;
-                    r
-                }
-                Err(_) => return Err(compile_failed(msg)),
-            }
-        }
-        Err(typst::CompileError::Failed(msg)) => return Err(compile_failed(msg)),
-        Err(other) => return Err(ToolError::Failed(other.to_string())),
-    };
+    let (rendered, render_data, edit_base_escaped, auto_escaped) = compile_with_at_fixup(
+        template,
+        &inputs,
+        render_data,
+        data,
+        preview_page,
+        staging_path,
+    )
+    .await?;
 
     // Same-turn dedup, race-safe across concurrent tool calls: a second
     // typst call (or a sibling `upload_attachment` claiming e.g.
@@ -461,18 +442,17 @@ async fn render_and_attach(
     let mut pptx_out = None;
     let mut pptx_error: Option<String> = None;
     if let (Some(cfg), Some(sandbox)) = (template.pptx.as_ref(), sandbox) {
-        match convert_to_pptx(sandbox, template, cfg, &render_data, &staged).await {
-            Ok(bytes) => {
-                match chat_attachments::upload(s3, turn_id, &pptx_name, PPTX_MIME, bytes).await {
-                    Ok(out) => pptx_out = Some(out),
-                    Err(e) => pptx_error = Some(format!("upload pptx: {e}")),
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, template = %template.id, "pptx export failed");
-                pptx_error = Some(e.to_string());
-            }
-        }
+        (pptx_out, pptx_error) = export_pptx(
+            s3,
+            turn_id,
+            &pptx_name,
+            sandbox,
+            template,
+            cfg,
+            &render_data,
+            &staged,
+        )
+        .await;
     }
 
     // Optional editable-Word export (`[docx]`): compile the template to HTML
@@ -483,29 +463,10 @@ async fn render_and_attach(
     let mut odt_out = None;
     let mut docx_error: Option<String> = None;
     if let (Some(cfg), Some(sandbox)) = (template.docx.as_ref(), sandbox) {
-        match convert_to_docx(sandbox, template, cfg, &inputs, &staged).await {
-            Ok((docx_bytes, odt_bytes)) => {
-                match chat_attachments::upload(s3, turn_id, &docx_name, DOCX_MIME, docx_bytes).await
-                {
-                    Ok(out) => docx_out = Some(out),
-                    Err(e) => docx_error = Some(format!("upload docx: {e}")),
-                }
-                // ODT is a best-effort bonus format; an upload hiccup only skips
-                // it (the docx already landed).
-                if let Some(odt_bytes) = odt_bytes {
-                    match chat_attachments::upload(s3, turn_id, &odt_name, ODT_MIME, odt_bytes)
-                        .await
-                    {
-                        Ok(out) => odt_out = Some(out),
-                        Err(e) => tracing::warn!(error = %e, "upload odt"),
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, template = %template.id, "docx export failed");
-                docx_error = Some(e.to_string());
-            }
-        }
+        (docx_out, odt_out, docx_error) = export_docx(
+            s3, turn_id, &docx_name, &odt_name, sandbox, template, cfg, &inputs, &staged,
+        )
+        .await;
     }
 
     // Visible markers in one chunk: the PDF chip, the PNG preview
@@ -614,6 +575,124 @@ async fn render_and_attach(
         });
     }
     Ok(result)
+}
+
+/// Compile `template` with `inputs`, with the one auto-recovery the tool
+/// descriptions warn hardest about: if the compile fails because Typst read an
+/// unescaped `@` (an email / @-handle) as a cross-reference — by far the most
+/// common failure — escape the stray `@`s in the data and recompile ONCE. On
+/// that recovery the escaped variant becomes the source of truth for every
+/// downstream consumer, so a later `_edit` stays consistent: it is returned as
+/// the new render data plus an escaped edit-base (`Some` only when the retry
+/// fired). Any other failure — and a retry that still fails — surfaces the
+/// ORIGINAL stderr unchanged so the model sees the real problem. Compile
+/// errors map to `InvalidArgs` (nudge the model to fix its input); anything
+/// else to `Failed`. Returns `(rendered, render_data, edit_base_escaped,
+/// auto_escaped_count)`.
+async fn compile_with_at_fixup(
+    template: &Template,
+    inputs: &[(String, String)],
+    render_data: Value,
+    data: &Value,
+    preview_page: u32,
+    staging_path: Option<&Path>,
+) -> Result<(typst::Rendered, Value, Option<Value>, usize), ToolError> {
+    let compile_failed =
+        |msg: String| ToolError::InvalidArgs(format!("typst compile failed:\n{msg}"));
+    match typst::compile(template, inputs, preview_page, staging_path).await {
+        Ok(r) => Ok((r, render_data, None, 0)),
+        Err(typst::CompileError::Failed(msg)) if is_unescaped_at_error(&msg) => {
+            let (esc_render, n) = escape_unescaped_ats(&render_data);
+            if n == 0 {
+                // Signature matched but there was no unescaped `@` to fix
+                // (some other unresolved reference) — don't retry blindly.
+                return Err(compile_failed(msg));
+            }
+            let esc_inputs = inputs_from_data(template, &esc_render)?;
+            match typst::compile(template, &esc_inputs, preview_page, staging_path).await {
+                Ok(r) => {
+                    let (esc_base, _) = escape_unescaped_ats(data);
+                    Ok((r, esc_render, Some(esc_base), n))
+                }
+                Err(_) => Err(compile_failed(msg)),
+            }
+        }
+        Err(typst::CompileError::Failed(msg)) => Err(compile_failed(msg)),
+        Err(other) => Err(ToolError::Failed(other.to_string())),
+    }
+}
+
+/// Best-effort editable-PowerPoint export for a template that opts in
+/// (`[pptx]`). Returns `(uploaded, error_note)`: a sandbox or upload hiccup
+/// must never fail the render — the PDF + preview already landed — so it comes
+/// back as a note string instead of an `Err`.
+#[allow(clippy::too_many_arguments)]
+async fn export_pptx(
+    s3: &crate::server::config::S3Config,
+    turn_id: &str,
+    pptx_name: &str,
+    sandbox: &SandboxClient,
+    template: &Template,
+    cfg: &PptxExport,
+    render_data: &Value,
+    staged: &[(String, Vec<u8>)],
+) -> (Option<chat_attachments::UploadOutcome>, Option<String>) {
+    match convert_to_pptx(sandbox, template, cfg, render_data, staged).await {
+        Ok(bytes) => match chat_attachments::upload(s3, turn_id, pptx_name, PPTX_MIME, bytes).await
+        {
+            Ok(out) => (Some(out), None),
+            Err(e) => (None, Some(format!("upload pptx: {e}"))),
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, template = %template.id, "pptx export failed");
+            (None, Some(e.to_string()))
+        }
+    }
+}
+
+/// Best-effort editable-Word export (`[docx]`): compile the template to HTML
+/// and convert to `.docx` (+ a bonus `.odt`) via pandoc + brand-font embedding.
+/// Returns `(docx, odt, error_note)` — same best-effort contract as
+/// [`export_pptx`]; a failed `.odt` upload is only logged (the `.docx` already
+/// landed).
+#[allow(clippy::too_many_arguments)]
+async fn export_docx(
+    s3: &crate::server::config::S3Config,
+    turn_id: &str,
+    docx_name: &str,
+    odt_name: &str,
+    sandbox: &SandboxClient,
+    template: &Template,
+    cfg: &DocxExport,
+    inputs: &[(String, String)],
+    staged: &[(String, Vec<u8>)],
+) -> (
+    Option<chat_attachments::UploadOutcome>,
+    Option<chat_attachments::UploadOutcome>,
+    Option<String>,
+) {
+    match convert_to_docx(sandbox, template, cfg, inputs, staged).await {
+        Ok((docx_bytes, odt_bytes)) => {
+            let mut docx_out = None;
+            let mut docx_error = None;
+            match chat_attachments::upload(s3, turn_id, docx_name, DOCX_MIME, docx_bytes).await {
+                Ok(out) => docx_out = Some(out),
+                Err(e) => docx_error = Some(format!("upload docx: {e}")),
+            }
+            let mut odt_out = None;
+            if let Some(odt_bytes) = odt_bytes {
+                match chat_attachments::upload(s3, turn_id, odt_name, ODT_MIME, odt_bytes).await {
+                    Ok(out) => odt_out = Some(out),
+                    Err(e) => tracing::warn!(error = %e, "upload odt"),
+                }
+            }
+            (docx_out, odt_out, docx_error)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, template = %template.id, "docx export failed");
+            (None, None, Some(e.to_string()))
+        }
+    }
 }
 
 /// MIME for a `.pptx` (OOXML presentation).
