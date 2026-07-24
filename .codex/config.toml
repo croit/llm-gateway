@@ -1,0 +1,5 @@
+[mcp_servers.croit-erp]
+url = "https://erp.croit.io/api/mcp"
+
+[mcp_servers.croit-erp.http_headers]
+Authorization = "Bearer crp_eacb4603ce7b3d6ee1a9785bf632d3037996903aa12a3703"
