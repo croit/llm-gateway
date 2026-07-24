@@ -27,7 +27,7 @@ use session_core::driver::{SessionContext, SessionDriver, TurnError};
 use session_core::workers::TurnUpdate;
 
 use crate::rama_server::state::RamaState;
-use crate::server::db::usage::{self, UsageKind, UsageRecord, UsageSource};
+use crate::server::db::usage::{UsageKind, UsageRecord, UsageSource};
 use crate::server::tools::{ToolContext, runner};
 
 /// Reasoning tags some vLLM reasoning-parser configs leak into the *content*
@@ -610,16 +610,12 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             let Ok(chunk) = chunk else { break 'chunks };
             byte_buf.extend_from_slice(&chunk);
 
-            while let Some(idx) = byte_buf.windows(2).position(|w| w == b"\n\n") {
-                let event_bytes: Vec<u8> = byte_buf.drain(..idx + 2).collect();
-                let event = String::from_utf8_lossy(&event_bytes[..event_bytes.len() - 2]);
+            while let Some(event_bytes) = crate::server::sse::next_event(&mut byte_buf) {
+                let event = String::from_utf8_lossy(&event_bytes);
                 for line in event.lines() {
-                    let Some(payload) = line.strip_prefix("data:").map(str::trim_start) else {
+                    let Some(payload) = crate::server::sse::data_payload(line) else {
                         continue;
                     };
-                    if payload == "[DONE]" {
-                        continue;
-                    }
                     let v: serde_json::Value = match serde_json::from_str(payload) {
                         Ok(v) => v,
                         Err(_) => continue,
@@ -627,8 +623,8 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                     // The trailing usage frame carries token counts and an
                     // empty `choices` — grab it before the delta guard below
                     // skips choice-less frames.
-                    if v.get("usage").is_some_and(|u| !u.is_null()) {
-                        round_tokens = usage::usage_from_value(&v);
+                    if let Some(t) = crate::server::sse::usage_tokens(&v) {
+                        round_tokens = t;
                     }
                     let delta = match v.pointer("/choices/0/delta") {
                         Some(d) => d,

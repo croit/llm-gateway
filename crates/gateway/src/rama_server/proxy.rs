@@ -1900,40 +1900,29 @@ async fn forward_streaming(
         'frames: while let Some(frame) = upstream_stream.next().await {
             let Ok(frame) = frame else { break };
             buf.extend_from_slice(&frame);
-            while let Some(idx) = buf.windows(2).position(|w| w == b"\n\n") {
-                let event: Vec<u8> = buf.drain(..idx + 2).collect();
+            while let Some(event) = crate::server::sse::next_event(&mut buf) {
                 let text = String::from_utf8_lossy(&event);
                 let mut is_usage_only = false;
                 for line in text.lines() {
-                    let Some(payload) = line.strip_prefix("data:").map(str::trim_start) else {
+                    let Some(payload) = crate::server::sse::data_payload(line) else {
                         continue;
                     };
-                    if payload == "[DONE]" {
-                        continue;
-                    }
                     let Ok(v) = serde_json::from_str::<Value>(payload) else {
                         continue;
                     };
-                    if v.get("usage").is_some_and(|u| !u.is_null()) {
-                        tokens = usage::usage_from_value(&v);
+                    if let Some(t) = crate::server::sse::usage_tokens(&v) {
+                        tokens = t;
                         // OpenAI's trailing usage frame carries empty `choices`;
                         // a usage riding a content chunk keeps its choice.
                         is_usage_only = v.pointer("/choices/0").is_none();
                     }
-                    if let Some(t) = v
-                        .pointer("/choices/0/delta/content")
-                        .and_then(|c| c.as_str())
+                    let delta = crate::server::sse::ChatDelta::new(&v);
+                    if let Some(t) = delta.content()
                         && content_guard.push(t)
                     {
                         looped = true;
                     }
-                    if let Some(t) = v
-                        .pointer("/choices/0/delta/reasoning_content")
-                        .and_then(|c| c.as_str())
-                        .or_else(|| {
-                            v.pointer("/choices/0/delta/reasoning")
-                                .and_then(|c| c.as_str())
-                        })
+                    if let Some(t) = delta.reasoning()
                         && reasoning_guard.push(t)
                     {
                         looped = true;
@@ -2337,14 +2326,17 @@ async fn drive_streaming_tool_loop_inner(
             // SSE events are separated by `\n\n`. Parse each complete
             // event out of the buffer; whatever's left is a partial
             // event for the next chunk to extend.
-            while let Some(idx) = byte_buf.windows(2).position(|w| w == b"\n\n") {
-                let event_bytes: Vec<u8> = byte_buf.drain(..idx + 2).collect();
+            while let Some(event_bytes) = crate::server::sse::next_event(&mut byte_buf) {
                 let event_str = String::from_utf8_lossy(&event_bytes);
 
                 let mut is_done = false;
                 let mut hide_event = false;
 
                 for line in event_str.lines() {
+                    // NB: this loop needs the `[DONE]` sentinel itself (it
+                    // suppresses the upstream terminator and emits its own),
+                    // so it can't use `sse::data_payload`, which folds `[DONE]`
+                    // into "no payload".
                     let Some(payload) = line.strip_prefix("data:").map(str::trim_start) else {
                         continue;
                     };
@@ -2356,36 +2348,26 @@ async fn drive_streaming_tool_loop_inner(
                         continue;
                     };
                     chunk_meta.absorb(&v);
-                    if v.get("usage").is_some_and(|u| !u.is_null()) {
-                        round_tokens = usage::usage_from_value(&v);
+                    if let Some(t) = crate::server::sse::usage_tokens(&v) {
+                        round_tokens = t;
                         // Hide the trailing usage-only frame (empty `choices`)
                         // from a client that didn't opt into it.
                         if suppress_usage_frame && v.pointer("/choices/0").is_none() {
                             hide_event = true;
                         }
                     }
-                    if let Some(t) = v
-                        .pointer("/choices/0/delta/content")
-                        .and_then(|c| c.as_str())
+                    let delta = crate::server::sse::ChatDelta::new(&v);
+                    if let Some(t) = delta.content()
                         && content_guard.push(t)
                     {
                         return Err(crate::loop_guard::LOOP_MESSAGE.to_string());
                     }
-                    if let Some(t) = v
-                        .pointer("/choices/0/delta/reasoning_content")
-                        .and_then(|c| c.as_str())
-                        .or_else(|| {
-                            v.pointer("/choices/0/delta/reasoning")
-                                .and_then(|c| c.as_str())
-                        })
+                    if let Some(t) = delta.reasoning()
                         && reasoning_guard.push(t)
                     {
                         return Err(crate::loop_guard::LOOP_MESSAGE.to_string());
                     }
-                    if let Some(tcs) = v
-                        .pointer("/choices/0/delta/tool_calls")
-                        .and_then(|t| t.as_array())
-                    {
+                    if let Some(tcs) = delta.tool_calls() {
                         hide_event = true;
                         for tc in tcs {
                             let index =
