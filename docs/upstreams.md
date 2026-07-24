@@ -30,6 +30,13 @@ A **backend** belongs to one pool and carries a name, base URL, an API key (ente
 
 A **speech** pool also takes an optional voice map — one voice id per spoken language (lowercase ISO-639-1), plus a default used when no language matches; voice mode resolves the voice from the language the STT detected. Unlike other kinds, a speech pool has **no unknown-model fallback** — a mistyped model or voice just surfaces the backend's own error. The chat UI's voice mode appears only when both a speech pool and a transcription model exist (see [`ui.md`](ui.md)).
 
+An **ocr** pool is used internally for document parsing and is not exposed through
+the public chat model list. For Unlimited-OCR on vLLM, use the dedicated
+`vllm/vllm-openai:unlimited-ocr` image and register
+`vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor` with the
+server's `--logits_processors` option. The gateway sends the per-request
+`vllm_xargs` values required by the recipe.
+
 There is no static model table: each backend's `/models` response is the source of truth for what it serves. API keys are stored encrypted at rest; the optional env-var fallback is the only place key material comes from the environment.
 
 For aliases and the two fallback mechanisms, see [Model aliases](#model-aliases) and [Fallback models](#fallback-models) below.
