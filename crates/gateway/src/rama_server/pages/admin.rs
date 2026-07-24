@@ -138,6 +138,7 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
         (PoolKind::Image, "image"),
         (PoolKind::Speech, "speech"),
         (PoolKind::Transcription, "transcription"),
+        (PoolKind::Ocr, "ocr"),
     ] {
         for (name, alias_target) in state.upstreams.models_with_alias_target(kind) {
             if chat_names.contains(name.as_str()) || !seen.insert(name.clone()) {

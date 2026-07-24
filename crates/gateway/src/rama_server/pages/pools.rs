@@ -40,7 +40,14 @@ use crate::server::db::upstreams_config::{self, PoolRow, VoiceRow};
 
 /// Pool kinds, matching the `snake_case` the `db_bridge` parser recognises.
 /// Shared with the upstreams page's kind `<select>`.
-pub(super) const KINDS: &[&str] = &["chat", "transcription", "embedding", "image", "speech"];
+pub(super) const KINDS: &[&str] = &[
+    "chat",
+    "transcription",
+    "embedding",
+    "image",
+    "speech",
+    "ocr",
+];
 /// Picker strategies, matching the `db_bridge` parser.
 pub(super) const STRATEGIES: &[&str] = &["least_inflight", "round_robin"];
 /// Kinds that support an unknown-model fallback (speech deliberately has none —
