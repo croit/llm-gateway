@@ -46,7 +46,7 @@ pub enum DbError {
         #[source]
         source: sqlx::Error,
     },
-    #[error("running migrations")]
+    #[error("running migrations: {source}")]
     Migrate {
         #[source]
         source: sqlx::migrate::MigrateError,
