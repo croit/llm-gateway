@@ -7,7 +7,7 @@
 //!
 //! - [`TypstRenderTool`] (`typst_<id>`) — the manifest's declared
 //!   fields become its JSON schema; on invocation we hand the validated
-//!   key/value pairs to [`crate::server::typst::compile`], then splice
+//!   key/value pairs to [`gateway_core::server::typst::compile`], then splice
 //!   the `.pdf` (deliverable) + a `.png` page-1 preview into the
 //!   assistant's `content`. The preview clicks through to the PDF. The
 //!   field values are also uploaded as a hidden `.json` (no chat chip)
@@ -34,11 +34,13 @@ use session_core::db as chat;
 use shared::api::ToolDef;
 use shared::sandbox::{InputFile, Language, RunRequest};
 
-use super::sandbox::{SandboxClient, b64};
-use super::{Tool, ToolContext, ToolError, ToolFuture, ToolResult};
-use crate::server::chat_attachments;
-use crate::server::db::documents::{self, DocumentFormat};
-use crate::server::typst::{self, DefaultSource, DocxExport, FieldType, PptxExport, Template};
+use gateway_core::server::chat_attachments;
+use gateway_core::server::db::documents::{self, DocumentFormat};
+use gateway_core::server::tools::sandbox::{SandboxClient, b64};
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture, ToolResult};
+use gateway_core::server::typst::{
+    self, DefaultSource, DocxExport, FieldType, PptxExport, Template,
+};
 
 pub struct TypstRenderTool {
     template: Arc<Template>,
@@ -285,7 +287,7 @@ impl Tool for TypstRenderTool {
             }
 
             if wants_identity(&template, &arg_map) {
-                match crate::server::db::users::find_by_id(&ctx.db, &ctx.user_id).await {
+                match gateway_core::server::db::users::find_by_id(&ctx.db, &ctx.user_id).await {
                     Ok(Some(u)) => apply_identity_defaults(
                         &template,
                         &mut arg_map,
@@ -334,7 +336,7 @@ impl Tool for TypstRenderTool {
 async fn render_and_attach(
     ctx: &ToolContext,
     turn_id: &str,
-    s3: &crate::server::config::S3Config,
+    s3: &gateway_core::server::config::S3Config,
     template: &Template,
     inputs: Vec<(String, String)>,
     data: &Value,
@@ -628,7 +630,7 @@ async fn compile_with_at_fixup(
 /// back as a note string instead of an `Err`.
 #[allow(clippy::too_many_arguments)]
 async fn export_pptx(
-    s3: &crate::server::config::S3Config,
+    s3: &gateway_core::server::config::S3Config,
     turn_id: &str,
     pptx_name: &str,
     sandbox: &SandboxClient,
@@ -657,7 +659,7 @@ async fn export_pptx(
 /// landed).
 #[allow(clippy::too_many_arguments)]
 async fn export_docx(
-    s3: &crate::server::config::S3Config,
+    s3: &gateway_core::server::config::S3Config,
     turn_id: &str,
     docx_name: &str,
     odt_name: &str,
@@ -1121,7 +1123,7 @@ fn apply_reps_to_value(data: &Value, reps: &[(String, String)]) -> Result<Value,
 /// render inputs/data. A missing / malformed ref is a hard error so the model
 /// fixes the ref instead of silently rendering a broken image.
 async fn stage_att_refs(
-    s3: &crate::server::config::S3Config,
+    s3: &gateway_core::server::config::S3Config,
     data: &Value,
 ) -> Result<(Vec<(String, Vec<u8>)>, Vec<(String, String)>), ToolError> {
     let mut tokens = Vec::new();
@@ -2116,7 +2118,7 @@ fn describe_value(v: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::typst::Field;
+    use gateway_core::server::typst::Field;
     use std::path::PathBuf;
 
     fn stub_template() -> Template {
@@ -2761,7 +2763,7 @@ mod tests {
 
     #[test]
     fn pptx_tool_id_suffixes_render_id_and_requires_base() {
-        let cfg = std::sync::Arc::new(crate::server::config::SandboxConfig {
+        let cfg = std::sync::Arc::new(gateway_core::server::config::SandboxConfig {
             enabled: true,
             runner_url: "http://127.0.0.1:1".into(),
             timeout_secs: 30,

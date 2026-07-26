@@ -17,15 +17,15 @@ use gateway_core::server::rbac::Resolver;
 use gateway_core::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
 use gateway_core::server::tools::ToolRegistry;
 use gateway_core::server::tools::echo::Echo;
-use gateway_core::server::tools::fetch_url::FetchUrl;
-use gateway_core::server::tools::memory::{Recall, Remember};
-use gateway_core::server::tools::search_web::SearchWeb;
 use gateway_core::server::tools::time::CurrentTimestamp;
 use gateway_core::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
 use gateway_core::server::{AppState, Config};
+use gateway_tools::fetch_url::FetchUrl;
+use gateway_tools::memory::{Recall, Remember};
+use gateway_tools::search_web::SearchWeb;
 use jiff::{SignedDuration, Timestamp};
 use rama::http::{Body, Method, Request, StatusCode};
 use serde_json::json;

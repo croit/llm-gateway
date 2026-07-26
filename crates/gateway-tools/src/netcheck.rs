@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use super::{Tool, ToolContext, ToolError, ToolFuture};
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const USER_AGENT: &str = concat!("llm-gateway/", env!("CARGO_PKG_VERSION"), " netcheck");

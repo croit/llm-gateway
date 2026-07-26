@@ -34,11 +34,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use super::catalog::{
+use gateway_core::server::tools::catalog::{
     BOOTSTRAP_TOOL_ID, COMFYUI_KEY, TYPST_PREFIX, entry_key_for, is_hidden, prettify,
 };
-use super::mcp::MCP_ID_PREFIX;
-use super::{Tool, ToolContext, ToolError, ToolFuture, ToolRegistry};
+use gateway_core::server::tools::mcp::MCP_ID_PREFIX;
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture, ToolRegistry};
 
 /// One enableable group as advertised in this tool's schema. Key matches
 /// `entry_key_for` output, so `chat_session_tools` writes line up with the
@@ -59,7 +59,7 @@ pub struct EnableTools {
     /// currently loaded. ComfyUI tools aren't in the static `ToolRegistry`
     /// (they're discovered from `[comfyui] content_dir`), so without this
     /// hook the model would never see the toggle and couldn't enable it.
-    comfyui_store: Option<Arc<crate::server::comfyui::ComfyuiStore>>,
+    comfyui_store: Option<Arc<gateway_core::server::comfyui::ComfyuiStore>>,
 }
 
 impl EnableTools {
@@ -79,7 +79,10 @@ impl EnableTools {
     /// key then appears in the schema description listing whichever workflows
     /// are currently loaded — and the model can pass it to `enable_tools`
     /// to turn the whole ComfyUI family on.
-    pub fn with_comfyui_store(mut self, store: Arc<crate::server::comfyui::ComfyuiStore>) -> Self {
+    pub fn with_comfyui_store(
+        mut self,
+        store: Arc<gateway_core::server::comfyui::ComfyuiStore>,
+    ) -> Self {
         self.comfyui_store = Some(store);
         self
     }
@@ -223,7 +226,7 @@ impl Tool for EnableTools {
             // than being a default it can override. A DB hiccup degrades open
             // (empty set) — refusing a turn over a transient read would be
             // worse than letting an enable through.
-            let disabled = crate::server::db::chat_session_tools::disabled_keys_for_session(
+            let disabled = gateway_core::server::db::chat_session_tools::disabled_keys_for_session(
                 &ctx.db, session_id,
             )
             .await
@@ -249,7 +252,7 @@ impl Tool for EnableTools {
                     skipped.push(json!({ "key": key, "reason": "unknown key" }));
                     continue;
                 }
-                if let Err(err) = crate::server::db::chat_session_tools::set(
+                if let Err(err) = gateway_core::server::db::chat_session_tools::set(
                     &ctx.db, session_id, key, true, "model",
                 )
                 .await
@@ -435,10 +438,10 @@ fn target_for_key(key: &str) -> EnableTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::db;
-    use crate::server::tools::fetch_url::FetchUrl;
-    use crate::server::tools::search_web::SearchWeb;
-    use crate::server::tools::time::CurrentTimestamp;
+    use crate::fetch_url::FetchUrl;
+    use crate::search_web::SearchWeb;
+    use gateway_core::server::db;
+    use gateway_core::server::tools::time::CurrentTimestamp;
 
     async fn ctx(pool: db::Pool, session_id: Option<String>) -> ToolContext {
         ToolContext {
@@ -498,7 +501,7 @@ mod tests {
         // `company_echo` is a smoke-test tool listed in `catalog::HIDDEN`; it
         // stays granted via RBAC but must never appear as an enableable key
         // (same gate the `/tools` page applies).
-        use crate::server::tools::echo::Echo;
+        use gateway_core::server::tools::echo::Echo;
         let reg = ToolRegistry::new().with(Echo).with(FetchUrl);
         let et = EnableTools::from_registry(&reg);
         let keys: Vec<&str> = et.catalog.iter().map(|t| t.key.as_str()).collect();
@@ -514,13 +517,13 @@ mod tests {
         // Regression: rag_* used to fall through to the "see your /tools page"
         // default one-liner, so the model couldn't tell it could search the
         // indexed codebase/docs.
-        use crate::server::tools::rag::{RagListCollections, RagSearch};
+        use crate::rag::{RagListCollections, RagSearch};
         let reg = ToolRegistry::new()
             .with(RagListCollections::new(std::sync::Arc::new(
-                crate::server::rbac::Resolver::empty(),
+                gateway_core::server::rbac::Resolver::empty(),
             )))
             .with(RagSearch::new(std::sync::Arc::new(
-                crate::server::rbac::Resolver::empty(),
+                gateway_core::server::rbac::Resolver::empty(),
             )));
         let et = EnableTools::from_registry(&reg);
         let rag = et
@@ -538,7 +541,7 @@ mod tests {
 
     #[test]
     fn snapshot_collapses_memory_ids_to_one_key() {
-        use crate::server::tools::memory::{Recall, Remember};
+        use crate::memory::{Recall, Remember};
         let reg = ToolRegistry::new().with(Remember).with(Recall);
         let et = EnableTools::from_registry(&reg);
         let keys: Vec<&str> = et.catalog.iter().map(|t| t.key.as_str()).collect();
@@ -584,9 +587,10 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(enabled, vec!["mcp__gitlab"]);
-        let on = crate::server::db::chat_session_tools::enabled_keys_for_session(&pool, "s1")
-            .await
-            .unwrap();
+        let on =
+            gateway_core::server::db::chat_session_tools::enabled_keys_for_session(&pool, "s1")
+                .await
+                .unwrap();
         assert!(on.contains("mcp__gitlab"));
     }
 
@@ -605,9 +609,10 @@ mod tests {
             .unwrap();
         let enabled = out["enabled"].as_array().unwrap();
         assert_eq!(enabled.len(), 2);
-        let on = crate::server::db::chat_session_tools::enabled_keys_for_session(&pool, "s1")
-            .await
-            .unwrap();
+        let on =
+            gateway_core::server::db::chat_session_tools::enabled_keys_for_session(&pool, "s1")
+                .await
+                .unwrap();
         assert!(on.contains("fetch_url"));
         assert!(on.contains("search_web"));
     }
@@ -619,7 +624,7 @@ mod tests {
         // lands in `skipped`, not `enabled`, and no on-row is written.
         let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
         seed_session(&pool, "s1").await;
-        crate::server::db::chat_session_tools::set(&pool, "s1", "fetch_url", false, "user")
+        gateway_core::server::db::chat_session_tools::set(&pool, "s1", "fetch_url", false, "user")
             .await
             .unwrap();
         let reg = ToolRegistry::new().with(FetchUrl).with(SearchWeb);
@@ -643,12 +648,13 @@ mod tests {
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0]["key"], "fetch_url");
         // The block stands — still off, never flipped on.
-        let on = crate::server::db::chat_session_tools::enabled_keys_for_session(&pool, "s1")
-            .await
-            .unwrap();
+        let on =
+            gateway_core::server::db::chat_session_tools::enabled_keys_for_session(&pool, "s1")
+                .await
+                .unwrap();
         assert!(!on.contains("fetch_url"));
         assert!(
-            crate::server::db::chat_session_tools::disabled_keys_for_session(&pool, "s1")
+            gateway_core::server::db::chat_session_tools::disabled_keys_for_session(&pool, "s1")
                 .await
                 .unwrap()
                 .contains("fetch_url")
@@ -704,11 +710,11 @@ mod tests {
         // The "everything is lazy" invariant: a fresh session sees just
         // `enable_tools` in its tools array, until the model (or the
         // driver's auto-enable path) writes a chat_session_tools row.
-        use crate::server::config::Config;
-        use crate::server::rbac::Resolver;
-        use crate::server::rbac::config::{RbacConfig, RoleConfig};
-        use crate::server::state::AppState;
-        use crate::server::upstreams::UpstreamRegistry;
+        use gateway_core::server::config::Config;
+        use gateway_core::server::rbac::Resolver;
+        use gateway_core::server::rbac::config::{RbacConfig, RoleConfig};
+        use gateway_core::server::state::AppState;
+        use gateway_core::server::upstreams::UpstreamRegistry;
         let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
         seed_session(&pool, "s1").await;
         let reg =
@@ -751,7 +757,7 @@ mod tests {
         // After the model enables `fetch_url`, both bootstrap and the
         // newly-enabled tool surface — bootstrap first (cache-stable
         // prefix).
-        crate::server::db::chat_session_tools::set(&pool, "s1", "fetch_url", true, "model")
+        gateway_core::server::db::chat_session_tools::set(&pool, "s1", "fetch_url", true, "model")
             .await
             .unwrap();
         let allowed = state

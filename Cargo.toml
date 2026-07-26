@@ -4,6 +4,7 @@ members = [
     "crates/shared",
     "crates/session-core",
     "crates/gateway-core",
+    "crates/gateway-tools",
     "crates/gateway-web",
     "crates/gateway",
     "crates/sandbox-runner",

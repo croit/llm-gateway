@@ -163,9 +163,9 @@ fn is_openai_function_name(id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::echo::Echo;
-    use super::super::time::CurrentTimestamp;
     use super::*;
+    use crate::server::tools::echo::Echo;
+    use crate::server::tools::time::CurrentTimestamp;
 
     #[test]
     fn empty_registry() {

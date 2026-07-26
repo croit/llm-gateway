@@ -35,12 +35,16 @@ only on the ones beneath it, so an edit recompiles that crate and what sits abov
 it — never what sits below.
 
 ```
-gateway          bin + router/proxy/api/oidc      ← thinnest, most-edited glue
-   ├── gateway-web    server-rendered HTML pages   ← pure sink, nothing below it uses it
-   └── gateway-core   application body (server/, openai_driver, RamaState)
+gateway            bin + router/proxy/api/oidc     ← thinnest, most-edited glue
+   ├── gateway-web     server-rendered HTML pages  ← pure sinks: nothing below
+   ├── gateway-tools   the tool implementations    ←   these two uses them
+   └── gateway-core    application body (server/, openai_driver, RamaState)
           ├── session-core   chat-UI substrate
           └── shared         OpenAI wire types
 ```
+
+`gateway-web` and `gateway-tools` are siblings — neither depends on the other, so
+a page edit doesn't rebuild the tools and vice versa.
 
 **Rule of thumb when adding code:** put it as high in the stack as it will go. A
 thing only belongs in `gateway-core` if something below the page layer actually
@@ -64,7 +68,8 @@ The application body — everything the HTTP surface stands on. Two modules:
 - `db/` — sqlx, tables for users / tokens / sessions / pending_logins.
 - `rbac/` — role lookup + per-user allowed-tool computation.
 - `state.rs` — `AppState` (`Arc<UpstreamRegistry>`, `Arc<ToolRegistry>`, `Arc<Resolver>`, db pool, optional `Arc<OidcClient>`, the `reqwest::Client`).
-- `tools/` — `Tool` trait, `ToolRegistry`, the round-loop runner, and the tool implementations.
+- `tools/` — the tool *machinery*: the `Tool` trait and `ToolContext`, the `ToolRegistry`, the round-loop `runner`, the `catalog` (tool id → group → toggle key), the MCP connection manager, and the sandbox client. The implementations live in `gateway-tools`; `echo` and `get_current_timestamp` stay here as the canonical trivial tools that half the core tests build registries out of.
+- `document_canvas.rs` — renders the chat document canvas. Below both its callers on purpose: the chat page (`gateway-web`) and the document tools' live SSE inject (`gateway-tools`).
 - `upstreams/` — pool registry, backend health probes, RAII `Acquired` guard for in-flight accounting.
 - the feature subsystems: `rag/`, `skills.rs`, `comfyui/`, `push/`, `scheduled/`, `limits/`, `usage/`, `geoip/`, `webhooks.rs`, `typst.rs`, `image_gen.rs`, `chat_attachments.rs`.
 - `migrations/` (crate root) — the sqlx migration set, embedded by `db/mod.rs`'s `sqlx::migrate!`.
@@ -78,6 +83,20 @@ router need, which is why it sits below both:
 
 `openai_driver.rs` is the `session_core::SessionDriver` implementation that drives
 a streaming OpenAI chat completion for the chat pages.
+
+### `crates/gateway-tools`
+The tool implementations — one module per tool family (`fetch_url`,
+`fetch_attachment`, `search_web`, `typst_render`, `document`, `rag`, `memory`,
+`qr`, `netcheck`, …). Each holds `Tool` impls; they plug into the machinery in
+`gateway-core` and are registered into the `ToolRegistry` that `gateway`'s
+`main.rs` builds.
+
+A pure sink like `gateway-web`, and a sibling of it. Two tests live in
+`tests/` rather than beside their code because they span both layers — the
+catalog-grouping and `AppState`-authorization tests need the machinery from
+`gateway-core` *and* the real concrete tools from here. A unit test inside
+`gateway-core` can't reach them: a `cfg(test)` build of a crate is a separate
+crate instance, so its types don't unify with a dependent crate's.
 
 ### `crates/gateway-web`
 The server-rendered HTML: `pages/`, split per route. `mod.rs` carries the shared

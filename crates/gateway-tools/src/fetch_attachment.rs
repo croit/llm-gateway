@@ -25,7 +25,7 @@
 //!   model actually re-see the image. No bytes cross the wire to
 //!   the LLM provider in inline form; just the (time-limited)
 //!   presigned URL the upstream fetches itself.
-//! - **PDF**: two model-driven tiers (see [`crate::server::pdf`]).
+//! - **PDF**: two model-driven tiers (see [`gateway_core::server::pdf`]).
 //!   `mode="text"` (default) extracts the text layer and returns it
 //!   like any text file. `mode="images"` rasterises the pages and
 //!   returns them as `image_url` parts — the escalation path the
@@ -42,12 +42,12 @@ use std::sync::Arc;
 
 use shared::sandbox::{InputFile, Language, RunRequest};
 
-use super::sandbox::{SandboxClient, b64};
-use super::{
+use gateway_core::server::chat_attachments::{self, BinaryDisposition, PayloadLimits};
+use gateway_core::server::pdf::{self, PdfError};
+use gateway_core::server::tools::sandbox::{SandboxClient, b64};
+use gateway_core::server::tools::{
     Tool, ToolContext, ToolError, ToolFuture, tool_content_parts, truncate_on_char_boundary,
 };
-use crate::server::chat_attachments::{self, BinaryDisposition, PayloadLimits};
-use crate::server::pdf::{self, PdfError};
 
 /// Hard cap on text returned to the model — shared with `fetch_url`
 /// so both tools have the same contract. 4 MB is generous enough
@@ -196,7 +196,7 @@ print(json.dumps(res, ensure_ascii=False))
 async fn extract_office(
     sandbox: &SandboxClient,
     ctx: &ToolContext,
-    s3: &crate::server::config::S3Config,
+    s3: &gateway_core::server::config::S3Config,
     turn_id: &str,
     ext: &str,
     bytes: Vec<u8>,
@@ -962,7 +962,7 @@ mod tests {
 
     #[tokio::test]
     async fn errors_cleanly_when_s3_not_configured() {
-        let pool = crate::server::db::open(std::path::Path::new(":memory:"))
+        let pool = gateway_core::server::db::open(std::path::Path::new(":memory:"))
             .await
             .unwrap();
         let ctx = ToolContext::for_test(pool);
@@ -978,7 +978,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_malformed_id_before_touching_s3() {
-        let pool = crate::server::db::open(std::path::Path::new(":memory:"))
+        let pool = gateway_core::server::db::open(std::path::Path::new(":memory:"))
             .await
             .unwrap();
         let ctx = ToolContext {
@@ -987,14 +987,16 @@ mod tests {
             db: pool,
             // Deliberately Some so we'd reach the s3 call if validation slipped —
             // the test asserts we don't get that far.
-            s3: Some(std::sync::Arc::new(crate::server::config::S3Config {
-                endpoint: "http://127.0.0.1:1".into(),
-                region: "us-east-1".into(),
-                bucket: "b".into(),
-                access_key_env: "FETCH_ATTACHMENT_TEST_NOT_SET".into(),
-                secret_key_env: "FETCH_ATTACHMENT_TEST_NOT_SET".into(),
-                key_prefix: "chat-attachments".into(),
-            })),
+            s3: Some(std::sync::Arc::new(
+                gateway_core::server::config::S3Config {
+                    endpoint: "http://127.0.0.1:1".into(),
+                    region: "us-east-1".into(),
+                    bucket: "b".into(),
+                    access_key_env: "FETCH_ATTACHMENT_TEST_NOT_SET".into(),
+                    secret_key_env: "FETCH_ATTACHMENT_TEST_NOT_SET".into(),
+                    key_prefix: "chat-attachments".into(),
+                },
+            )),
             assistant_turn_id: None,
             session_id: None,
             client_ip: None,
@@ -1018,7 +1020,7 @@ mod tests {
     // `read_pdf` takes bytes directly (the S3 fetch happens upstream of it),
     // so these pin the text/images contract end-to-end without a bucket.
 
-    use crate::server::pdf::test_support::{blank_pdf, hello_pdf};
+    use gateway_core::server::pdf::test_support::{blank_pdf, hello_pdf};
 
     #[test]
     fn mode_defaults_to_text_and_parses_images() {
@@ -1092,7 +1094,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            crate::server::pdf::test_support::multipage_pdf(6),
+            gateway_core::server::pdf::test_support::multipage_pdf(6),
             FetchMode::Text,
             4096,
             PageRange::parse(Some(3), Some(4)).unwrap(),
@@ -1115,7 +1117,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            crate::server::pdf::test_support::multipage_pdf(3),
+            gateway_core::server::pdf::test_support::multipage_pdf(3),
             FetchMode::Text,
             4096,
             PageRange::parse(Some(2), Some(2)).unwrap(),
@@ -1134,7 +1136,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            crate::server::pdf::test_support::multipage_pdf(10),
+            gateway_core::server::pdf::test_support::multipage_pdf(10),
             FetchMode::Text,
             4096,
             PageRange::parse(Some(1), Some(2)).unwrap(),
@@ -1153,7 +1155,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            crate::server::pdf::test_support::multipage_pdf(2),
+            gateway_core::server::pdf::test_support::multipage_pdf(2),
             FetchMode::Text,
             4096,
             PageRange::parse(Some(50), None).unwrap(),
@@ -1176,7 +1178,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            crate::server::pdf::test_support::multipage_pdf(3),
+            gateway_core::server::pdf::test_support::multipage_pdf(3),
             FetchMode::Text,
             4096,
             PageRange::parse(Some(2), Some(99)).unwrap(),
@@ -1195,7 +1197,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            crate::server::pdf::test_support::multipage_pdf(20),
+            gateway_core::server::pdf::test_support::multipage_pdf(20),
             FetchMode::Text,
             60,
             PageRange::parse(Some(1), Some(20)).unwrap(),
@@ -1217,7 +1219,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            crate::server::pdf::test_support::multipage_pdf(10),
+            gateway_core::server::pdf::test_support::multipage_pdf(10),
             FetchMode::Text,
             20,
             PageRange::parse(None, None).unwrap(),
@@ -1242,7 +1244,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            crate::server::pdf::test_support::multipage_pdf(2),
+            gateway_core::server::pdf::test_support::multipage_pdf(2),
             FetchMode::Images,
             4096,
             PageRange::parse(Some(50), None).unwrap(),

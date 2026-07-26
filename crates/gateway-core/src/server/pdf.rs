@@ -218,12 +218,14 @@ fn bind_pdfium() -> Result<Pdfium, PdfError> {
 /// helper is visible to both). Built byte-by-byte — with a correct
 /// xref table + `startxref`, which lopdf (under `pdf-extract`)
 /// requires — so the tests need no fixture file or installed renderer.
-#[cfg(test)]
-pub(crate) mod test_support {
+/// Test-support fixtures. Not `#[cfg(test)]`-gated, and `pub` rather than
+/// `pub(crate)`, because `fetch_attachment`'s tests live in `gateway-tools` —
+/// see the note on [`ToolContext::for_test`](crate::server::tools::ToolContext::for_test).
+pub mod test_support {
     /// Assemble a PDF from object bodies (1-indexed), computing the
     /// xref offsets from the real byte layout. Object 1 must be the
     /// `/Catalog`.
-    fn assemble(objs: &[String]) -> Vec<u8> {
+    pub fn assemble(objs: &[String]) -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
         let mut offsets = Vec::with_capacity(objs.len());
@@ -251,7 +253,7 @@ pub(crate) mod test_support {
 
     /// A born-digital PDF whose single page carries the literal text
     /// "Hello PDF" in its content stream.
-    pub(crate) fn hello_pdf() -> Vec<u8> {
+    pub fn hello_pdf() -> Vec<u8> {
         let stream = "BT /F1 24 Tf 72 700 Td (Hello PDF) Tj ET\n";
         assemble(&[
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
@@ -271,7 +273,7 @@ pub(crate) mod test_support {
     /// text `Page <i> body`. Used to exercise page-range reads, where a
     /// single-page fixture can't tell "returned the right window" from
     /// "returned everything".
-    pub(crate) fn multipage_pdf(n: usize) -> Vec<u8> {
+    pub fn multipage_pdf(n: usize) -> Vec<u8> {
         assert!(n >= 1, "need at least one page");
         // Object layout: 1 = catalog, 2 = pages tree, 3 = font, then one
         // /Page + one content stream per page.
@@ -303,7 +305,7 @@ pub(crate) mod test_support {
     /// A valid one-page PDF with an empty content stream — i.e. no
     /// extractable text, the way a scanned/image-only PDF looks to the
     /// text tier.
-    pub(crate) fn blank_pdf() -> Vec<u8> {
+    pub fn blank_pdf() -> Vec<u8> {
         assemble(&[
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
             "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),

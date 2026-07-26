@@ -23,7 +23,7 @@ use std::net::IpAddr;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use super::{Tool, ToolContext, ToolError, ToolFuture};
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 pub struct LookupIp;
 
@@ -125,7 +125,11 @@ impl Tool for LookupIp {
 /// top (same shape as `get_user_location`'s IP branch). `host` carries the
 /// original hostname when the target was resolved via DNS, so the model can
 /// say "example.com (93.184.216.34) is in …".
-fn found_payload(geo: &crate::server::geoip::GeoLocation, ip: IpAddr, host: Option<&str>) -> Value {
+fn found_payload(
+    geo: &gateway_core::server::geoip::GeoLocation,
+    ip: IpAddr,
+    host: Option<&str>,
+) -> Value {
     let mut out = serde_json::to_value(geo).unwrap_or_else(|_| json!({}));
     if let Some(map) = out.as_object_mut() {
         map.insert("known".into(), json!(true));
@@ -167,9 +171,9 @@ async fn resolve_host(host: &str) -> Vec<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::db;
+    use gateway_core::server::db;
 
-    async fn ctx(geoip: Option<crate::server::geoip::GeoIp>) -> ToolContext {
+    async fn ctx(geoip: Option<gateway_core::server::geoip::GeoIp>) -> ToolContext {
         let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
         ToolContext {
             user_id: "u".into(),

@@ -27,9 +27,9 @@ use serde_json::{Value, json};
 use session_core::db as chat;
 use shared::api::ToolDef;
 
-use super::sandbox::b64;
-use super::{Tool, ToolContext, ToolError, ToolFuture};
-use crate::server::chat_attachments;
+use gateway_core::server::chat_attachments;
+use gateway_core::server::tools::sandbox::b64;
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Byte-mode capacity of the largest QR code (version 40) at EC level L.
 /// Anything longer can never encode; reject it with a clear message
@@ -590,7 +590,7 @@ impl Tool for GenerateQrCode {
 /// the bytes must decode as an image with an enabled codec.
 async fn fetch_logo(
     ctx: &ToolContext,
-    s3: &crate::server::config::S3Config,
+    s3: &gateway_core::server::config::S3Config,
     id: &str,
 ) -> Result<DynamicImage, ToolError> {
     let session_id = ctx.session_id.as_deref().ok_or_else(|| {
@@ -762,7 +762,7 @@ mod tests {
 
     async fn chatless_ctx() -> ToolContext {
         ToolContext::for_test(
-            crate::server::db::open(std::path::Path::new(":memory:"))
+            gateway_core::server::db::open(std::path::Path::new(":memory:"))
                 .await
                 .unwrap(),
         )

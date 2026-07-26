@@ -32,12 +32,13 @@ use gateway_core::server::config::{FeedbackConfig, GatewayConfig, SkillsConfig};
 use gateway_core::server::rbac::RoleConfig;
 use gateway_core::server::rbac::{Resolver, config::RbacConfig, config::RoleMapping};
 use gateway_core::server::skills::{SkillStore, UserSkillStore};
-use gateway_core::server::tools::{ToolRegistry, echo, fetch_url, read_skill, search_web, time};
+use gateway_core::server::tools::{ToolRegistry, echo, time};
 use gateway_core::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
 use gateway_core::server::{AppState, Config, db};
+use gateway_tools::{fetch_url, read_skill, search_web};
 use jiff::{Timestamp, ToSpan};
 use rama::net::address::SocketAddress;
 use wiremock::matchers::{method, path};

@@ -163,6 +163,7 @@
  * the tools tree (the only server code that emits HTML), or its utility
  * classes (`btn-xs`, `border-l-warning`, …) silently drop out of the
  * bundle and the injected markup renders unstyled. */
+@source "../../crates/gateway-tools/src/**/*.rs";
 @source "../../crates/gateway-core/src/server/tools/**/*.rs";
 @source "../../crates/session-core/src/**/*.rs";
 @source "../../crates/session-core/ui/ts/**/*.ts";

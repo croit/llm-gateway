@@ -67,7 +67,7 @@ services:
       - gateway.env
     environment:
       GATEWAY_CONFIG: /etc/gateway/config.toml
-      RUST_LOG: info,gateway=info,gateway_core=info,gateway_web=info
+      RUST_LOG: info,gateway=info,gateway_core=info,gateway_tools=info,gateway_web=info
     volumes:
       # Mind [db].path = /var/lib/gateway/gateway.sqlite and, on Docker Desktop,
       # point model upstreams in gateway.toml at host.docker.internal.

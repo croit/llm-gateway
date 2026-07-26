@@ -751,16 +751,19 @@ mod tests {
                 is_default: false,
             }],
             mappings: vec![("g-dev".into(), "developers".into())],
-            tool_grants: vec![("developers".into(), "search_web".into())],
+            // `company_echo` rather than a "real" tool id: this asserts that a
+            // DB tool_grant resolves against the registry at all, and `Echo` is
+            // the canonical trivial tool that stays in this crate.
+            tool_grants: vec![("developers".into(), "company_echo".into())],
         });
         assert_eq!(
             r.role_ids_for(&["g-dev".into()]),
             vec!["developers".to_string()]
         );
-        let reg = ToolRegistry::new().with(crate::server::tools::search_web::SearchWeb);
+        let reg = ToolRegistry::new().with(crate::server::tools::echo::Echo);
         assert_eq!(
             r.allowed_tools(&["developers".into()], &reg),
-            vec!["search_web".to_string()]
+            vec!["company_echo".to_string()]
         );
     }
 }

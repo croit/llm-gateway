@@ -8,7 +8,7 @@
 //! Let the model build up a long document (a guide, a spec, a config) over
 //! many turns and change one passage at a time, instead of regenerating
 //! the whole thing each round. The document lives in the `documents` store
-//! (see [`crate::server::db::documents`]), not in the chat transcript, so
+//! (see [`gateway_core::server::db::documents`]), not in the chat transcript, so
 //! the model never has to hold the whole thing in context: it reads slices
 //! and edits by anchor.
 //!
@@ -27,10 +27,10 @@
 use serde_json::Value;
 use shared::api::ToolDef;
 
-use super::json_patch;
-use super::text_edit::{self, Edit};
-use super::{Tool, ToolContext, ToolError, ToolFuture};
-use crate::server::db::documents::{self, DocumentFormat, EditKind};
+use crate::json_patch;
+use crate::text_edit::{self, Edit};
+use gateway_core::server::db::documents::{self, DocumentFormat, EditKind};
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Largest document we accept (in bytes of content). Generous for a
 /// long-form guide; guards against a single runaway tool call.
@@ -58,48 +58,6 @@ fn require_session(ctx: &ToolContext) -> Result<&str, ToolError> {
     })
 }
 
-/// Render the session's canvas panel (the active = most-recently-updated
-/// document, or `active_id` if given, at `version` or latest) to an HTML
-/// string. `Ok(None)` when the session has no documents. Shared by the
-/// initial page render, the live SSE inject, and the doc/version-switch
-/// route so all three stay byte-identical.
-pub async fn render_canvas_html(
-    pool: &crate::server::db::Pool,
-    session_id: &str,
-    active_id: Option<&str>,
-    version: Option<i64>,
-    lang: session_core::i18n::Lang,
-) -> Result<Option<String>, crate::server::db::DbError> {
-    let docs = documents::list_for_session(pool, session_id).await?;
-    if docs.is_empty() {
-        return Ok(None);
-    }
-    // Default to the most-recently-updated document (list is ordered).
-    let active = active_id.unwrap_or(&docs[0].id);
-    let Some((doc, ver)) = documents::get_version(pool, session_id, active, version).await? else {
-        // Asked for a doc/version that isn't in this session — fall back
-        // to the latest document so the panel never renders empty.
-        return Box::pin(render_canvas_html(pool, session_id, None, None, lang)).await;
-    };
-    let all_docs: Vec<(String, String)> = docs
-        .iter()
-        .map(|d| (d.id.clone(), d.title.clone()))
-        .collect();
-    let canvas = session_core::render::DocCanvas {
-        session_id,
-        active_id: &doc.id,
-        title: &doc.title,
-        format: doc.format.as_str(),
-        version: ver.version,
-        max_version: doc.current_ver,
-        content: &ver.content,
-        all_docs,
-    };
-    Ok(Some(session_core::render::render_document_canvas(
-        &canvas, lang,
-    )))
-}
-
 /// Push the freshly-changed canvas to the live chat page, if anyone's
 /// watching. Best-effort: off the chat path (no `chat_feedback`) or with
 /// no live subscriber it's a no-op, and the panel renders on the next full
@@ -118,7 +76,7 @@ async fn live_update(ctx: &ToolContext, session_id: &str, active_id: &str) {
     // same as `internal_error_html`/`forbidden_html` do for request-less
     // render paths. The panel picks up the viewer's real language on the
     // next full page load or nav-patch, both of which do derive it.
-    let html = match render_canvas_html(
+    let html = match gateway_core::server::document_canvas::render_canvas_html(
         &ctx.db,
         session_id,
         Some(active_id),
@@ -1202,9 +1160,9 @@ mod tests {
 
     // --- canvas render wiring (pins the panel ↔ route contract) ---------
 
-    async fn seeded_pool() -> crate::server::db::Pool {
+    async fn seeded_pool() -> gateway_core::server::db::Pool {
         use std::path::Path;
-        let pool = crate::server::db::open(Path::new(":memory:"))
+        let pool = gateway_core::server::db::open(Path::new(":memory:"))
             .await
             .unwrap();
         sqlx::query(
@@ -1229,10 +1187,16 @@ mod tests {
         let pool = seeded_pool().await;
         // No documents yet → no panel.
         assert!(
-            render_canvas_html(&pool, "s1", None, None, session_core::i18n::Lang::En)
-                .await
-                .unwrap()
-                .is_none()
+            gateway_core::server::document_canvas::render_canvas_html(
+                &pool,
+                "s1",
+                None,
+                None,
+                session_core::i18n::Lang::En
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
 
         let id = documents::new_id();
@@ -1249,16 +1213,22 @@ mod tests {
         .await
         .unwrap();
 
-        let html = render_canvas_html(&pool, "s1", None, None, session_core::i18n::Lang::En)
-            .await
-            .unwrap()
-            .unwrap();
+        let html = gateway_core::server::document_canvas::render_canvas_html(
+            &pool,
+            "s1",
+            None,
+            None,
+            session_core::i18n::Lang::En,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(html.contains("RGW Guide"), "title shown: {html}");
         assert!(html.contains("document-canvas"), "panel class present");
         assert!(html.contains("<h1"), "markdown rendered to HTML: {html}");
     }
 
-    fn ctx(pool: crate::server::db::Pool, session_id: &str) -> ToolContext {
+    fn ctx(pool: gateway_core::server::db::Pool, session_id: &str) -> ToolContext {
         ToolContext {
             user_id: "u1".into(),
             roles: vec!["user".into()],
@@ -1458,10 +1428,16 @@ mod tests {
             .await
             .unwrap();
 
-        let html = render_canvas_html(&pool, "s1", None, None, session_core::i18n::Lang::En)
-            .await
-            .unwrap()
-            .unwrap();
+        let html = gateway_core::server::document_canvas::render_canvas_html(
+            &pool,
+            "s1",
+            None,
+            None,
+            session_core::i18n::Lang::En,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         // The @get target must be the path the router serves
         // (`/chat/{id}/document/{doc_id}`) so the panel's switcher reaches a
         // real route. This is the UI-directive ↔ endpoint contract.

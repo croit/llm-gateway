@@ -21,36 +21,13 @@ use shared::api::ToolDef;
 use thiserror::Error;
 
 pub mod catalog;
-pub mod currency;
-pub mod document;
 pub mod echo;
-pub mod edit_image;
-pub mod enable_tools;
 pub mod feedback;
-pub mod fetch_attachment;
-pub mod fetch_url;
-pub mod generate_image;
-pub mod html_text;
-pub mod json_patch;
-pub mod list_attachments;
-pub mod load_image_url;
-pub mod location;
-pub mod lookup_ip;
 pub mod mcp;
-pub mod memory;
-pub mod netcheck;
-pub mod qr;
-pub mod rag;
-pub mod read_skill;
 pub mod registry;
 pub mod runner;
 pub mod sandbox;
-pub mod search_web;
-pub mod text_edit;
 pub mod time;
-pub mod typst_render;
-pub mod upload_attachment;
-pub mod wikipedia;
 
 pub use registry::{ToolRegistry, ToolSource};
 
@@ -137,7 +114,11 @@ pub struct ToolContext {
     pub crypto: Option<std::sync::Arc<crate::server::crypto::Crypto>>,
 }
 
-#[cfg(test)]
+/// Test-support constructor. Not `#[cfg(test)]`-gated because the tool
+/// implementations that use it live in `gateway-tools`, a *different* crate —
+/// a `cfg(test)` build of this crate is a separate crate instance whose types
+/// wouldn't unify with theirs. Unused in production builds (the linker drops
+/// it); it is not part of the runtime API.
 impl ToolContext {
     /// Minimal [`ToolContext`] for unit tests: the given DB pool, a dummy
     /// user (`"u"`, no roles), and every optional handle `None` (no S3,
@@ -265,7 +246,7 @@ pub fn tool_content_parts(parts: Vec<Value>) -> Value {
 /// Shared by every tool that caps text it hands back to the model
 /// (`fetch_attachment`'s PDF text tier, `fetch_url`'s HTML extraction),
 /// so the byte-cap semantics can't drift between them.
-pub(crate) fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
+pub fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
     if s.len() <= max_bytes {
         return (s, false);
     }

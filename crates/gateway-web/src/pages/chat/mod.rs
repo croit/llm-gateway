@@ -218,7 +218,7 @@ async fn render_chat_response(
     // The session's document canvas (active = most-recently-updated
     // document), pre-rendered to HTML for the always-present slot. `None`
     // when the conversation has no documents.
-    let document_canvas_html = gateway_core::server::tools::document::render_canvas_html(
+    let document_canvas_html = gateway_core::server::document_canvas::render_canvas_html(
         &state.db, &active.id, None, None, lang,
     )
     .await
@@ -1223,7 +1223,7 @@ pub async fn chat_document_view(
         Err(err) => return sse_error_response(&err.to_string()),
     };
     let version = req.uri().query().and_then(parse_version_query);
-    let html = match gateway_core::server::tools::document::render_canvas_html(
+    let html = match gateway_core::server::document_canvas::render_canvas_html(
         &state.db,
         &session_id,
         Some(&doc_id),
