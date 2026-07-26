@@ -15,6 +15,7 @@ use crate::common;
 
 use common::Service as _;
 use gateway::server::db::{model_defaults as db_defaults, users};
+use gateway::server::search_settings;
 use jiff::Timestamp;
 use rama::http::{Body, Method, Request, StatusCode};
 
@@ -360,4 +361,199 @@ async fn price_only_save_preserves_other_model_settings() {
     assert_eq!(row.context_window, Some(32_768));
     assert_eq!(row.capabilities.vision, Some(true));
     assert!(row.defaults_toml.contains("temperature"));
+}
+
+// ---------------------------------------------------------------------------
+// Web-search settings (`POST /admin/models/search`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn non_admin_search_save_is_403_and_writes_nothing() {
+    let state = common::state_with_chat_pool("http://unused.invalid").await;
+    let cookie = common::seed_session(&state, "bob", "bob@example.com").await;
+    let db = state.db.clone();
+    let app = common::app(state);
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/admin/models/search",
+            &cookie,
+            Some("provider=brave&brave_api_key=leak-me"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        gateway::server::db::app_settings::get(&db, search_settings::BRAVE_KEY_KEY)
+            .await
+            .unwrap()
+            .is_none(),
+        "a non-admin must not be able to write the search key"
+    );
+}
+
+#[tokio::test]
+async fn admin_saves_provider_and_url() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "root").await;
+    let db = state.db.clone();
+    let crypto = state.crypto.clone();
+    let app = common::app(state);
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/admin/models/search",
+            &cookie,
+            Some("provider=searxng&searxng_url=https%3A%2F%2Fsearx.example.com%2F"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let s = search_settings::load(&db, &crypto).await.unwrap();
+    assert_eq!(s.provider, search_settings::SearchProvider::Searxng);
+    assert_eq!(s.searxng_url.as_deref(), Some("https://searx.example.com"));
+}
+
+#[tokio::test]
+async fn admin_rejects_an_unknown_provider() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "root").await;
+    let db = state.db.clone();
+    let app = common::app(state);
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/admin/models/search",
+            &cookie,
+            Some("provider=altavista"),
+        ))
+        .await
+        .unwrap();
+    // Handled as a flash, not a hard error — but nothing may be persisted.
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        gateway::server::db::app_settings::get(&db, search_settings::PROVIDER_KEY)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn brave_key_is_stored_sealed_and_a_blank_resave_keeps_it() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "root").await;
+    let db = state.db.clone();
+    let crypto = state.crypto.clone();
+    let app = common::app(state);
+
+    // First save writes the key.
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/admin/models/search",
+            &cookie,
+            Some("provider=brave&brave_api_key=bsk-secret"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Sealed at rest: the row must not contain the plaintext.
+    let raw = gateway::server::db::app_settings::get(&db, search_settings::BRAVE_KEY_KEY)
+        .await
+        .unwrap()
+        .expect("key row");
+    assert!(!raw.contains("bsk-secret"), "stored in plaintext: {raw}");
+    assert_eq!(
+        search_settings::load(&db, &crypto)
+            .await
+            .unwrap()
+            .brave_api_key
+            .as_deref(),
+        Some("bsk-secret")
+    );
+
+    // Re-saving the form with a blank key field must NOT wipe it — the
+    // operator can't read the value back, so a blank means "unchanged".
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/admin/models/search",
+            &cookie,
+            Some("provider=brave&searxng_url=&brave_api_key="),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        search_settings::load(&db, &crypto)
+            .await
+            .unwrap()
+            .brave_api_key
+            .as_deref(),
+        Some("bsk-secret"),
+        "a blank key field must keep the stored key"
+    );
+}
+
+#[tokio::test]
+async fn clear_checkbox_removes_the_brave_key() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "root").await;
+    let db = state.db.clone();
+    let crypto = state.crypto.clone();
+    search_settings::set_brave_key(&db, &crypto, "bsk-secret")
+        .await
+        .unwrap();
+    let app = common::app(state);
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/admin/models/search",
+            &cookie,
+            Some("provider=brave&brave_api_key=&clear_brave_key=1"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        search_settings::load(&db, &crypto)
+            .await
+            .unwrap()
+            .brave_api_key
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn rendered_page_shows_the_search_card_without_the_key() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "root").await;
+    search_settings::set_provider(&state.db, search_settings::SearchProvider::Brave)
+        .await
+        .unwrap();
+    search_settings::set_brave_key(&state.db, &state.crypto, "bsk-secret")
+        .await
+        .unwrap();
+    search_settings::set_searxng_url(&state.db, "https://searx.example.com")
+        .await
+        .unwrap();
+    let app = common::app(state);
+    let resp = app
+        .serve(req_with_cookie(Method::GET, "/admin/models", &cookie, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = String::from_utf8(common::read_body(resp).await.to_vec()).unwrap();
+    assert!(body.contains("Web search"), "search card missing");
+    // Initial-load state, not just the POST path: the stored provider and URL
+    // must come back pre-selected on a plain page load.
+    assert!(
+        body.contains(r#"value="brave" selected="selected""#),
+        "stored provider not preselected"
+    );
+    assert!(body.contains("https://searx.example.com"), "url not shown");
+    // The secret itself must never reach the page.
+    assert!(!body.contains("bsk-secret"), "the key leaked into the HTML");
 }

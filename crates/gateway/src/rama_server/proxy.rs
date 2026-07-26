@@ -296,6 +296,7 @@ fn proxy_tool_ctx(
             .sandbox_client
             .clone()
             .map(crate::server::tools::sandbox::SandboxLease::new),
+        crypto: Some(state.crypto.clone()),
     }
 }
 

@@ -216,6 +216,7 @@ mod tests {
             indexer: None,
             image_gen: None,
             sandbox_lease: None,
+            crypto: None,
         }
     }
 

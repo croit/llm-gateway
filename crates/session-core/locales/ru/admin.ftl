@@ -124,3 +124,20 @@ admin-cap-fallback-tools = Резерв для инструментов
 # Перезагрузка топологии upstream ("Apply changes" на /admin/upstreams).
 admin-reloaded = перезагружено { $pools } pools, { $backends } backends
 admin-reload-error = ошибка перезагрузки: { $err }
+
+# Бэкенд веб-поиска (инструмент `search_web`).
+admin-search-heading = Веб-поиск
+admin-search-intro = Какой бэкенд отвечает на инструмент `search_web`. SearXNG требует только базовый URL и не стоит ничего за запрос, если вы поднимаете свой экземпляр; Brave требует ключ API. Ключ шифруется при хранении.
+admin-search-provider-label = Провайдер
+admin-search-provider-searxng = SearXNG (самостоятельный хостинг)
+admin-search-provider-brave = Brave Search API
+admin-search-searxng-url-label = Базовый URL SearXNG
+admin-search-searxng-url-placeholder = https://searxng.example.com
+admin-search-brave-key-label = Ключ API Brave
+admin-search-brave-key-placeholder = оставьте пустым, чтобы сохранить текущий ключ
+admin-search-brave-key-set = Ключ сохранён (в зашифрованном виде).
+admin-search-brave-key-unset = Ключ не сохранён.
+admin-search-brave-key-clear = Удалить сохранённый ключ
+admin-search-save = Сохранить веб-поиск
+admin-search-saved = настройки веб-поиска сохранены
+admin-search-unknown-provider = неизвестный провайдер поиска `{ $provider }`

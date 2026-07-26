@@ -52,6 +52,12 @@ pub struct RenderSettings {
     pub max_pages: usize,
     pub target_width: i32,
     pub max_height: i32,
+    /// 1-based page to start at. Together with `max_pages` this is the
+    /// window the caller gets. Without it a document longer than
+    /// `max_pages` had its tail permanently out of reach — the renderer
+    /// always started at page 1, so page 150 of a scan could not be
+    /// looked at by any sequence of calls. `0` is treated as `1`.
+    pub first_page: usize,
 }
 
 impl Default for RenderSettings {
@@ -60,6 +66,7 @@ impl Default for RenderSettings {
             max_pages: DEFAULT_MAX_RENDER_PAGES,
             target_width: RENDER_TARGET_WIDTH,
             max_height: RENDER_MAX_HEIGHT,
+            first_page: 1,
         }
     }
 }
@@ -85,6 +92,18 @@ pub enum PdfError {
 /// decides what an empty result means). Run on a blocking thread.
 pub fn extract_text(bytes: &[u8]) -> Result<String, PdfError> {
     pdf_extract::extract_text_from_mem(bytes).map_err(|e| PdfError::TextExtraction(e.to_string()))
+}
+
+/// Lift the text layer out page by page: entry `i` is page `i + 1`. Lets
+/// the caller serve a page range instead of the whole document, so a long
+/// PDF's tail is reachable rather than being cut off by a byte cap. Run on
+/// a blocking thread.
+///
+/// Costs the same parse as [`extract_text`], so callers that don't need
+/// per-page granularity should stay on the simpler function.
+pub fn extract_text_pages(bytes: &[u8]) -> Result<Vec<String>, PdfError> {
+    pdf_extract::extract_text_from_mem_by_pages(bytes)
+        .map_err(|e| PdfError::TextExtraction(e.to_string()))
 }
 
 /// One rasterised PDF page, PNG-encoded.
@@ -150,10 +169,16 @@ pub fn render_pages_with_settings(
         .set_maximum_height(settings.max_height);
 
     let total_pages = doc.pages().len() as usize;
+    let first_page = settings.first_page.max(1);
     let mut pages = Vec::new();
     for (idx, page) in doc.pages().iter().enumerate() {
         if pages.len() >= settings.max_pages {
             break;
+        }
+        // Skip ahead to the requested window. Cheap: no rendering happens
+        // for skipped pages, only the iterator advances.
+        if idx + 1 < first_page {
+            continue;
         }
         let image = page
             .render_with_config(&config)
@@ -242,6 +267,39 @@ pub(crate) mod test_support {
         ])
     }
 
+    /// A born-digital PDF with `n` pages, page `i` carrying the literal
+    /// text `Page <i> body`. Used to exercise page-range reads, where a
+    /// single-page fixture can't tell "returned the right window" from
+    /// "returned everything".
+    pub(crate) fn multipage_pdf(n: usize) -> Vec<u8> {
+        assert!(n >= 1, "need at least one page");
+        // Object layout: 1 = catalog, 2 = pages tree, 3 = font, then one
+        // /Page + one content stream per page.
+        let first_page_obj = 4;
+        let kids: Vec<String> = (0..n)
+            .map(|i| format!("{} 0 R", first_page_obj + i * 2))
+            .collect();
+        let mut objs = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            format!("<< /Type /Pages /Kids [{}] /Count {n} >>", kids.join(" ")),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        for i in 0..n {
+            let content_obj = first_page_obj + i * 2 + 1;
+            objs.push(format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Contents {content_obj} 0 R \
+                 /Resources << /Font << /F1 3 0 R >> >> >>"
+            ));
+            let stream = format!("BT /F1 24 Tf 72 700 Td (Page {} body) Tj ET\n", i + 1);
+            objs.push(format!(
+                "<< /Length {} >>\nstream\n{stream}\nendstream",
+                stream.len()
+            ));
+        }
+        assemble(&objs)
+    }
+
     /// A valid one-page PDF with an empty content stream — i.e. no
     /// extractable text, the way a scanned/image-only PDF looks to the
     /// text tier.
@@ -282,6 +340,93 @@ mod tests {
         assert_eq!(settings.max_pages, DEFAULT_MAX_RENDER_PAGES);
         assert_eq!(settings.target_width, 1240);
         assert_eq!(settings.max_height, 1754);
+        assert_eq!(settings.first_page, 1);
+    }
+
+    #[test]
+    fn extract_text_pages_splits_per_page() {
+        let pages = extract_text_pages(&test_support::multipage_pdf(5))
+            .expect("multipage fixture should parse");
+        assert_eq!(pages.len(), 5);
+        for (i, page) in pages.iter().enumerate() {
+            assert!(
+                page.contains(&format!("Page {} body", i + 1)),
+                "page {} was {page:?}",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn extract_text_pages_errors_on_garbage() {
+        let err = extract_text_pages(b"not a pdf").unwrap_err();
+        assert!(matches!(err, PdfError::TextExtraction(_)), "{err:?}");
+    }
+
+    #[test]
+    fn render_honours_first_page_window() {
+        // Without the renderer we can't assert on pixels, but the window
+        // arithmetic is what regressed before — assert it whenever pdfium
+        // happens to be available, and skip cleanly when it isn't.
+        let pdf = test_support::multipage_pdf(6);
+        match render_pages_with_settings(
+            &pdf,
+            RenderSettings {
+                first_page: 3,
+                max_pages: 2,
+                ..RenderSettings::default()
+            },
+        ) {
+            Ok(rendered) => {
+                assert_eq!(rendered.total_pages, 6);
+                let numbers: Vec<usize> = rendered.pages.iter().map(|p| p.page_number).collect();
+                assert_eq!(numbers, vec![3, 4]);
+            }
+            Err(PdfError::RendererUnavailable(_)) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_page_beyond_the_document_renders_nothing() {
+        let pdf = test_support::multipage_pdf(2);
+        match render_pages_with_settings(
+            &pdf,
+            RenderSettings {
+                first_page: 99,
+                ..RenderSettings::default()
+            },
+        ) {
+            Ok(rendered) => {
+                assert_eq!(rendered.total_pages, 2);
+                assert!(rendered.pages.is_empty());
+            }
+            Err(PdfError::RendererUnavailable(_)) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_page_zero_behaves_like_one() {
+        let pdf = test_support::multipage_pdf(3);
+        match render_pages_with_settings(
+            &pdf,
+            RenderSettings {
+                first_page: 0,
+                max_pages: 1,
+                ..RenderSettings::default()
+            },
+        ) {
+            Ok(rendered) => {
+                assert_eq!(
+                    rendered.pages.first().map(|p| p.page_number),
+                    Some(1),
+                    "0 must be normalised to the first page"
+                );
+            }
+            Err(PdfError::RendererUnavailable(_)) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

@@ -81,6 +81,25 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("recording topology seed marker: {e:#}"))?;
     }
 
+    // Web-search settings used to be env-only. Take over whatever the
+    // environment still carries into any setting that's still empty, then
+    // treat the DB as the only source of truth (the import logs which vars it
+    // took, and which it ignored because the DB already had a value). Non-fatal:
+    // a failure here leaves search unconfigured, which the tool reports
+    // cleanly — it must not stop the gateway from booting.
+    match srv::search_settings::import_env_once(&db, &crypto).await {
+        Ok(vars) if !vars.is_empty() => tracing::info!(
+            imported = ?vars,
+            "migrated web-search settings from the environment into the database; \
+             configure them at /admin/models from now on"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not migrate web-search settings from the environment"
+        ),
+    }
+
     // Build the registry from the DB snapshot (falls back to empty if the DB
     // has no pools — e.g. a fresh install the admin hasn't configured yet).
     let snapshot = srv::db::upstreams_config::load_snapshot(&db)

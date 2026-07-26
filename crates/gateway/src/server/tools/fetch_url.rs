@@ -25,7 +25,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use super::{Tool, ToolContext, ToolError, ToolFuture, tool_content_parts};
+use super::{
+    Tool, ToolContext, ToolError, ToolFuture, html_text, tool_content_parts,
+    truncate_on_char_boundary,
+};
 use crate::server::chat_attachments::{self, BinaryDisposition, PayloadLimits};
 
 /// Hard cap on the response body we keep — generous (4 MB) so we
@@ -49,6 +52,9 @@ struct FetchArgs {
     /// Optional cap on bytes returned. Clamped to `HARD_MAX_BYTES`.
     #[serde(default)]
     max_bytes: Option<usize>,
+    /// Skip HTML→text extraction and return the markup verbatim.
+    #[serde(default)]
+    raw: bool,
 }
 
 impl Tool for FetchUrl {
@@ -60,11 +66,15 @@ impl Tool for FetchUrl {
         ToolDef::function(
             self.id(),
             "Fetch a URL with an HTTP GET and return the response body. \
-             Text-ish responses (HTML, JSON, plain text, code, etc.) come \
-             back as decoded UTF-8 in `content`. Images come back as a \
-             visible `image_url` part you can look at. Other binary content \
-             (PDF, zip, audio, …) returns metadata only; ask the user to \
-             provide the file directly if you need its bytes.",
+             HTML pages are reduced to their readable text (headings, \
+             paragraphs, lists, links, tables and code survive; scripts, \
+             styles and markup are stripped) — pass `raw: true` if you \
+             actually need the markup. Other text-ish responses (JSON, \
+             plain text, code, etc.) come back as decoded UTF-8 in \
+             `content`. Images come back as a visible `image_url` part you \
+             can look at. Other binary content (PDF, zip, audio, …) returns \
+             metadata only; ask the user to provide the file directly if you \
+             need its bytes.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -79,8 +89,21 @@ impl Tool for FetchUrl {
                         "minimum": 1,
                         "maximum": HARD_MAX_BYTES,
                         "description": "Optional cap on bytes returned for \
-                                        text content. Defaults to the full \
-                                        response body up to 4 MB (the hard cap)."
+                                        text content. Applied to the \
+                                        extracted text, not the raw markup. \
+                                        Defaults to the full response body up \
+                                        to 4 MB (the hard cap)."
+                    },
+                    "raw": {
+                        "type": "boolean",
+                        "description": "Return HTML markup verbatim instead of \
+                                        extracted text. Default false. Only \
+                                        set this when you need the markup \
+                                        itself — reading `<meta>` tags, \
+                                        checking which scripts a page loads, \
+                                        debugging a selector. It is far more \
+                                        expensive; for reading a page's \
+                                        content leave it off."
                     }
                 }
             }),
@@ -90,7 +113,7 @@ impl Tool for FetchUrl {
     fn run<'a>(&'a self, _ctx: ToolContext, args: Value) -> ToolFuture<'a> {
         Box::pin(async move {
             let args: FetchArgs = serde_json::from_value(args).map_err(|e| {
-                ToolError::InvalidArgs(format!("expected {{url, max_bytes?}}: {e}"))
+                ToolError::InvalidArgs(format!("expected {{url, max_bytes?, raw?}}: {e}"))
             })?;
 
             // Reject anything that isn't http(s) up front. Saves a
@@ -144,6 +167,45 @@ impl Tool for FetchUrl {
                 .await
                 .map_err(|e| ToolError::Failed(format!("read body: {e}")))?
                 .to_vec();
+
+            // HTML gets reduced to readable text *before* the byte cap is
+            // applied. The other order is actively harmful: capping raw
+            // markup at 4 MB (or at a model-supplied 50 KB) usually cuts
+            // somewhere inside `<head>`, so the page's actual prose never
+            // makes it into the result at all.
+            if !args.raw && html_text::is_html(&content_type) {
+                let original_len = bytes.len();
+                let extracted = html_text::extract(&String::from_utf8_lossy(&bytes));
+                let extracted_len = extracted.len();
+                let (slice, truncated) = truncate_on_char_boundary(&extracted, cap);
+                let content = slice.to_string();
+                let returned_len = content.len();
+                let empty = content.trim().is_empty();
+                let mut body = json!({
+                    "url": final_url,
+                    "status": status,
+                    "content_type": content_type,
+                    "kind": "text",
+                    "extraction": "html-text",
+                    "content": content,
+                    "bytes_returned": returned_len,
+                    "bytes_extracted": extracted_len,
+                    "bytes_original": original_len,
+                    "truncated": truncated,
+                });
+                // A page that renders its content client-side extracts to
+                // nothing. Say so and name the two ways forward, otherwise
+                // the model reads an empty string as "the page is empty".
+                if empty {
+                    body["note"] = json!(
+                        "The page carried no readable text — it most likely \
+                         renders its content with JavaScript. Retry with \
+                         `raw: true` to inspect the markup, or use \
+                         `capture_webpage` to load it in a real browser."
+                    );
+                }
+                return Ok(body);
+            }
 
             // No filename to disambiguate octet-stream — the URL
             // path could carry one, but `classify_payload` falls
@@ -232,18 +294,26 @@ mod tests {
         ToolContext::for_test(pool)
     }
 
-    #[tokio::test]
-    async fn html_response_lands_in_content_field() {
-        let server = MockServer::start().await;
+    /// Mount a single GET route and return its full URL.
+    async fn serve(server: &MockServer, route: &str, body: &str, content_type: &str) -> String {
         Mock::given(method("GET"))
-            .and(path("/page"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(
-                "<html><body>hi</body></html>".as_bytes(),
-                "text/html; charset=utf-8",
-            ))
-            .mount(&server)
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body.as_bytes(), content_type))
+            .mount(server)
             .await;
-        let url = format!("{}/page", server.uri());
+        format!("{}{route}", server.uri())
+    }
+
+    #[tokio::test]
+    async fn html_response_lands_in_content_field_as_extracted_text() {
+        let server = MockServer::start().await;
+        let url = serve(
+            &server,
+            "/page",
+            "<html><body>hi</body></html>",
+            "text/html; charset=utf-8",
+        )
+        .await;
         let out = FetchUrl
             .run(ctx().await, json!({"url": url}))
             .await
@@ -251,8 +321,117 @@ mod tests {
         assert_eq!(out["status"], 200);
         assert_eq!(out["kind"], "text");
         assert_eq!(out["content_type"], "text/html");
-        assert!(out["content"].as_str().unwrap().contains("hi"));
+        assert_eq!(out["extraction"], "html-text");
+        // The markup is gone; the text is not.
+        assert_eq!(out["content"], "hi");
         assert_eq!(out["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn html_extraction_strips_scripts_and_styles() {
+        let server = MockServer::start().await;
+        let page = "<html><head><style>.a{color:red}</style>\
+                    <script>trackEverything()</script></head>\
+                    <body><nav><a href=\"/home\">Home</a></nav>\
+                    <h1>Install</h1><p>Run the installer.</p></body></html>";
+        let url = serve(&server, "/doc", page, "text/html").await;
+        let out = FetchUrl
+            .run(ctx().await, json!({"url": url}))
+            .await
+            .unwrap();
+        let content = out["content"].as_str().unwrap();
+        assert!(content.contains("# Install"), "{content}");
+        assert!(content.contains("Run the installer."), "{content}");
+        assert!(!content.contains("trackEverything"), "{content}");
+        assert!(!content.contains("color:red"), "{content}");
+        // Reported so the tool-call log shows what the extraction saved.
+        let extracted = out["bytes_extracted"].as_u64().unwrap();
+        let original = out["bytes_original"].as_u64().unwrap();
+        assert!(extracted < original, "{extracted} should be < {original}");
+    }
+
+    #[tokio::test]
+    async fn raw_true_returns_markup_verbatim() {
+        let server = MockServer::start().await;
+        let page = "<html><head><script>keep_me()</script></head><body>hi</body></html>";
+        let url = serve(&server, "/raw", page, "text/html").await;
+        let out = FetchUrl
+            .run(ctx().await, json!({"url": url, "raw": true}))
+            .await
+            .unwrap();
+        assert_eq!(out["kind"], "text");
+        // No extraction marker on the raw path, and the markup survives.
+        assert!(out.get("extraction").is_none(), "{out:?}");
+        assert_eq!(out["content"], page);
+    }
+
+    #[tokio::test]
+    async fn max_bytes_applies_to_extracted_text_not_raw_markup() {
+        // The whole point of extracting first: a page whose <head> alone
+        // exceeds the cap must still return its prose. Capping the markup
+        // first would have returned nothing but `<head>` fragments.
+        let server = MockServer::start().await;
+        let mut page = String::from("<html><head><style>");
+        page.push_str(&"x".repeat(5_000));
+        page.push_str("</style></head><body><p>The actual answer.</p></body></html>");
+        let url = serve(&server, "/big", &page, "text/html").await;
+        let out = FetchUrl
+            .run(ctx().await, json!({"url": url, "max_bytes": 1_000}))
+            .await
+            .unwrap();
+        assert_eq!(out["content"], "The actual answer.");
+        assert_eq!(out["truncated"], false);
+        assert!(out["bytes_original"].as_u64().unwrap() > 5_000);
+    }
+
+    #[tokio::test]
+    async fn extracted_text_over_cap_is_truncated_and_flagged() {
+        let server = MockServer::start().await;
+        let page = format!("<p>{}</p>", "word ".repeat(1_000));
+        let url = serve(&server, "/long", &page, "text/html").await;
+        let out = FetchUrl
+            .run(ctx().await, json!({"url": url, "max_bytes": 100}))
+            .await
+            .unwrap();
+        assert_eq!(out["truncated"], true);
+        assert_eq!(out["bytes_returned"], 100);
+        assert!(out["bytes_extracted"].as_u64().unwrap() > 100);
+    }
+
+    #[tokio::test]
+    async fn js_only_page_gets_an_actionable_note() {
+        // An SPA shell extracts to nothing. Without the note the model reads
+        // an empty string as "this page has no content".
+        let server = MockServer::start().await;
+        let page = "<html><body><div id=\"root\"></div>\
+                    <script>render()</script></body></html>";
+        let url = serve(&server, "/spa", page, "text/html").await;
+        let out = FetchUrl
+            .run(ctx().await, json!({"url": url}))
+            .await
+            .unwrap();
+        assert_eq!(out["content"], "");
+        let note = out["note"].as_str().unwrap_or_default();
+        assert!(note.contains("raw"), "{note}");
+        assert!(note.contains("capture_webpage"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn xhtml_is_extracted_too() {
+        let server = MockServer::start().await;
+        let url = serve(
+            &server,
+            "/xhtml",
+            "<html><body><p>text</p><script>x()</script></body></html>",
+            "application/xhtml+xml",
+        )
+        .await;
+        let out = FetchUrl
+            .run(ctx().await, json!({"url": url}))
+            .await
+            .unwrap();
+        assert_eq!(out["extraction"], "html-text");
+        assert_eq!(out["content"], "text");
     }
 
     #[tokio::test]
@@ -273,6 +452,8 @@ mod tests {
             .unwrap();
         assert_eq!(out["kind"], "text");
         assert!(out["content"].as_str().unwrap().contains("\"ok\":true"));
+        // Extraction is HTML-only — JSON must not be rewritten.
+        assert!(out.get("extraction").is_none(), "{out:?}");
     }
 
     #[tokio::test]

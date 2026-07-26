@@ -42,7 +42,10 @@ typst = "0.15.0"
 RUST_BACKTRACE = "1"
 RUST_LOG = "info,gateway=debug"
 # Secrets (API keys, tokens) go in the gitignored `mise.local.toml`, not
-# here — see `BRAVE_SEARCH_API_KEY` there. For the optional GeoIP
+# here. Web-search settings are the exception in the other direction: they
+# live in the DB and are set under "Web search" on /admin/models (the legacy
+# SEARCH_PROVIDER / SEARXNG_URL / BRAVE_SEARCH_API_KEY vars are imported once
+# at first boot, then ignored). For the optional GeoIP
 # auto-updater (the `get_user_location` tool), set the IP2Location LITE
 # download token in `mise.local.toml`; `gateway.toml`'s `[geoip]
 # update_token_env` names which var to read (default below):

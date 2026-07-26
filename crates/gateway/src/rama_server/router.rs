@@ -159,6 +159,7 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/admin/models/save", pages::admin_models_save)
         .with_post("/admin/models/clear", pages::admin_models_clear)
         .with_post("/admin/models/defaults", pages::admin_models_defaults_save)
+        .with_post("/admin/models/search", pages::admin_models_search_save)
         .with_post("/admin/upstreams/reload", pages::admin_upstreams_reload)
         .with_get("/admin/limits", pages::admin_limits_index)
         .with_post("/admin/limits", pages::admin_limits_save)

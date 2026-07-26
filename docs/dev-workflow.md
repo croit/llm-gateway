@@ -66,7 +66,9 @@ There's no WASM step, no `dx`, no hot reload of HTML — the rama server serves 
 Env config is layered through mise, not a `.env` file:
 
 - **`mise.toml` `[env]`** holds the non-secret defaults committed to the repo (`RUST_BACKTRACE=1`, `RUST_LOG=info,gateway=debug`).
-- **`mise.local.toml` `[env]`** holds secrets and machine-local overrides — it is **gitignored**. This is where local dev keys go: `GATEWAY_SESSION_KEY`, `GATEWAY_OIDC_CLIENT_SECRET`, provider keys (`OPENAI_API_KEY`, `ZAI_API_KEY`, …), `BRAVE_SEARCH_API_KEY`, `SEARCH_PROVIDER`, etc.
+- **`mise.local.toml` `[env]`** holds secrets and machine-local overrides — it is **gitignored**. This is where local dev keys go: `GATEWAY_SESSION_KEY`, `GATEWAY_OIDC_CLIENT_SECRET`, `GATEWAY_ENCRYPTION_KEY`, provider keys (`OPENAI_API_KEY`, `ZAI_API_KEY`, …), etc.
+
+Web-search settings are **not** environment variables any more. Provider, SearXNG URL, and Brave API key live in the database and are set under **Web search** on `/admin/models` (the key sealed at rest like every other gateway secret). `SEARCH_PROVIDER`, `SEARXNG_URL`, and `BRAVE_SEARCH_API_KEY` are still read **once**, at first boot, to fill settings that are still empty — after that they're ignored and the gateway logs that it ignored them.
 
 Secrets never live in `gateway.toml`. The config holds only the *names* of environment variables (e.g. `api_key_env = "GPU01_KEY"`, `session_key_env = "GATEWAY_SESSION_KEY"`); the gateway reads the actual values from its environment at startup.
 

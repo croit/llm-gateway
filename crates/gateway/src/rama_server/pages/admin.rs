@@ -44,6 +44,7 @@ use crate::server::db::model_defaults as db;
 use crate::server::feature_defaults::{self, Feature};
 use crate::server::model_defaults as merge;
 use crate::server::reasoning::ReasoningStyle;
+use crate::server::search_settings::{self, SearchProvider, SearchSettingsView};
 use crate::server::upstreams::PoolKind;
 
 /// GET /admin/models — the default-models card + a single filterable list of
@@ -167,12 +168,28 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     }
 
     let defaults = defaults_rows(&state).await;
+    // A DB read failure here must not blank the whole page — fall back to the
+    // built-in defaults so the card still renders (and the operator can fix
+    // the setting), same posture as the per-model rows above.
+    let search = search_settings::view(&state.db)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "loading web-search settings");
+            SearchSettingsView {
+                provider: SearchProvider::default(),
+                searxng_url: None,
+                brave_key_set: false,
+            }
+        });
     let currency = &state.config.usage.currency;
     let all_models = state.upstreams.all_models();
     let body = render_models_body(
         lang,
         currency,
-        &defaults,
+        PageSettings {
+            defaults: &defaults,
+            search: &search,
+        },
         &rows,
         &aliases,
         &other,
@@ -545,6 +562,77 @@ pub async fn models_defaults_save(State(state): State<Arc<RamaState>>, req: Requ
     toast(FlashKind::Success, msg)
 }
 
+/// POST /admin/models/search — persist the web-search backend settings.
+///
+/// The Brave key follows the same convention as backend API keys: a blank
+/// field keeps the stored value (so re-saving the form doesn't wipe a secret
+/// the operator can't read back), and an explicit `clear_brave_key` checkbox
+/// is the only way to remove it.
+pub async fn models_search_save(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let form: SearchForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(err) => {
+            return toast(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "admin-malformed-form",
+                    &i18n::args([("err", err.to_string().into())]),
+                ),
+            );
+        }
+    };
+    let Some(provider) = SearchProvider::from_wire(&form.provider) else {
+        return toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-search-unknown-provider",
+                &i18n::args([("provider", form.provider.clone().into())]),
+            ),
+        );
+    };
+
+    let db_err = |err: crate::server::db::DbError| {
+        toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "admin-db-error",
+                &i18n::args([("err", err.to_string().into())]),
+            ),
+        )
+    };
+    if let Err(err) = search_settings::set_provider(&state.db, provider).await {
+        return db_err(err);
+    }
+    if let Err(err) = search_settings::set_searxng_url(&state.db, &form.searxng_url).await {
+        return db_err(err);
+    }
+    // Blank + no clear request = leave the stored key alone.
+    let key = form.brave_api_key.trim();
+    if form.clear_brave_key.is_some() {
+        if let Err(err) = search_settings::set_brave_key(&state.db, &state.crypto, "").await {
+            return db_err(err);
+        }
+    } else if !key.is_empty()
+        && let Err(err) = search_settings::set_brave_key(&state.db, &state.crypto, key).await
+    {
+        return db_err(err);
+    }
+
+    toast(FlashKind::Success, t(lang, "admin-search-saved"))
+}
+
 /// POST /admin/upstreams/reload — rebuild the upstream registry from the DB
 /// topology (pools, backends, fallbacks) and re-spawn health probes. The "Apply
 /// changes" button on `/admin/upstreams`. On success it clears the in-memory
@@ -623,6 +711,19 @@ struct DefaultsForm {
 #[derive(serde::Deserialize)]
 struct ClearForm {
     model_name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SearchForm {
+    provider: String,
+    #[serde(default)]
+    searxng_url: String,
+    #[serde(default)]
+    brave_api_key: String,
+    /// Present (as `Some("1")`) only when the checkbox was ticked — an
+    /// unchecked checkbox isn't submitted at all.
+    #[serde(default)]
+    clear_brave_key: Option<String>,
 }
 
 /// The consolidated per-model save form. Every field is optional / blank =
@@ -842,6 +943,90 @@ fn render_defaults_card(lang: Lang, rows: &[FeatureDefaultRow]) -> Html {
     .to_html()
 }
 
+/// The "Web search" card: which backend answers `search_web`, plus its
+/// credentials. Posts to `/admin/models/search`.
+///
+/// These settings used to be environment variables (`SEARCH_PROVIDER`,
+/// `SEARXNG_URL`, `BRAVE_SEARCH_API_KEY`); they now live in the DB with the
+/// Brave key sealed at rest, like every other gateway secret.
+fn render_search_card(lang: Lang, view: &SearchSettingsView) -> Html {
+    let action = "/admin/models/search";
+    let provider_opts = [
+        super::select_option(
+            SearchProvider::Searxng.as_str(),
+            &t(lang, "admin-search-provider-searxng"),
+            view.provider == SearchProvider::Searxng,
+        ),
+        super::select_option(
+            SearchProvider::Brave.as_str(),
+            &t(lang, "admin-search-provider-brave"),
+            view.provider == SearchProvider::Brave,
+        ),
+    ];
+    // Whether a key exists is safe to show; the key itself never is.
+    let key_state = if view.brave_key_set {
+        t(lang, "admin-search-brave-key-set")
+    } else {
+        t(lang, "admin-search-brave-key-unset")
+    };
+    let url_value = view.searxng_url.clone().unwrap_or_default();
+    let clear_key = super::bool_checkbox(
+        "clear_brave_key",
+        "1",
+        &t(lang, "admin-search-brave-key-clear"),
+        false,
+        false,
+    );
+    html! {
+        article(class: "card border border-base-300 bg-base-100") {
+            div(class: "card-body gap-3") {
+                header(class: "flex flex-col gap-1") {
+                    h2(class: "card-title text-base") { (t(lang, "admin-search-heading")) }
+                    p(class: "text-base-content/70 text-sm") { (t(lang, "admin-search-intro")) }
+                }
+                form(method: "post", action: (action), class: "flex flex-col gap-3 m-0") {
+                    div(class: "grid grid-cols-1 md:grid-cols-2 gap-4") {
+                        label(class: "flex flex-col gap-1") {
+                            span(class: "label-text text-xs") { (t(lang, "admin-search-provider-label")) }
+                            select(name: "provider", class: "select select-bordered select-sm w-full") {
+                                for o in provider_opts.iter() { (o.clone()) }
+                            }
+                        }
+                        label(class: "flex flex-col gap-1") {
+                            span(class: "label-text text-xs") { (t(lang, "admin-search-searxng-url-label")) }
+                            input(
+                                type: "url",
+                                name: "searxng_url",
+                                value: (url_value),
+                                placeholder: (t(lang, "admin-search-searxng-url-placeholder")),
+                                class: "input input-bordered input-sm w-full"
+                            );
+                        }
+                    }
+                    div(class: "flex flex-col gap-1") {
+                        span(class: "label-text text-xs") { (t(lang, "admin-search-brave-key-label")) }
+                        input(
+                            type: "password",
+                            name: "brave_api_key",
+                            autocomplete: "off",
+                            placeholder: (t(lang, "admin-search-brave-key-placeholder")),
+                            class: "input input-bordered input-sm w-full"
+                        );
+                        span(class: "text-base-content/60 text-xs") { (key_state) }
+                        (clear_key)
+                    }
+                    div(class: "flex justify-end") {
+                        button(type: "submit", class: "btn btn-primary btn-sm") {
+                            (t(lang, "admin-search-save"))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
 // ---------------------------------------------------------------------------
 // Page body + model list
 // ---------------------------------------------------------------------------
@@ -851,10 +1036,18 @@ fn render_defaults_card(lang: Lang, rows: &[FeatureDefaultRow]) -> Html {
 /// `grid-cols-[…]` utility.
 const ROW_GRID: &str = "display:grid;grid-template-columns:minmax(170px,1.6fr) 82px 108px 84px 128px minmax(110px,1.1fr) 18px;gap:10px;align-items:center";
 
+/// The deployment-wide settings cards that sit above the model list. Grouped
+/// into one struct so adding a card doesn't grow `render_models_body`'s
+/// parameter list (which is already at clippy's ceiling).
+struct PageSettings<'a> {
+    defaults: &'a [FeatureDefaultRow],
+    search: &'a SearchSettingsView,
+}
+
 fn render_models_body(
     lang: Lang,
     currency: &str,
-    defaults: &[FeatureDefaultRow],
+    settings: PageSettings<'_>,
     rows: &[ModelRow],
     aliases: &[AliasRow],
     other: &[OtherModelRow],
@@ -875,7 +1068,8 @@ fn render_models_body(
                     (t(lang, "admin-intro-suffix"))
                 }
             }
-            (render_defaults_card(lang, defaults))
+            (render_defaults_card(lang, settings.defaults))
+            (render_search_card(lang, settings.search))
             (render_model_list(lang, currency, rows, aliases, other, all_models))
         }
     }
@@ -1568,6 +1762,82 @@ mod tests {
             html.contains(r#"value="glm-4.7" selected="selected""#),
             "{html}"
         );
+    }
+
+    fn search_view(provider: SearchProvider, url: Option<&str>, key: bool) -> SearchSettingsView {
+        SearchSettingsView {
+            provider,
+            searxng_url: url.map(str::to_owned),
+            brave_key_set: key,
+        }
+    }
+
+    #[test]
+    fn search_card_posts_to_its_endpoint_and_marks_the_current_provider() {
+        let html = render_search_card(
+            Lang::En,
+            &search_view(SearchProvider::Brave, Some("https://s.example"), false),
+        )
+        .to_string();
+        assert!(html.contains(r#"action="/admin/models/search""#), "{html}");
+        assert!(
+            html.contains(r#"value="brave" selected="selected""#),
+            "{html}"
+        );
+        // Exactly one option is preselected — the bool-attr trap would render
+        // `selected="false"` on the other, which browsers still honour.
+        assert_eq!(html.matches(r#"selected="selected""#).count(), 1, "{html}");
+        assert!(html.contains(r#"value="https://s.example""#), "{html}");
+    }
+
+    #[test]
+    fn search_card_defaults_to_searxng_when_nothing_is_stored() {
+        let html = render_search_card(Lang::En, &search_view(SearchProvider::Searxng, None, false))
+            .to_string();
+        assert!(
+            html.contains(r#"value="searxng" selected="selected""#),
+            "{html}"
+        );
+        assert_eq!(html.matches(r#"selected="selected""#).count(), 1, "{html}");
+    }
+
+    #[test]
+    fn search_card_key_field_is_write_only_and_reports_whether_a_key_exists() {
+        let with_key =
+            render_search_card(Lang::En, &search_view(SearchProvider::Brave, None, true))
+                .to_string();
+        assert!(with_key.contains(r#"type="password""#), "{with_key}");
+        // The field must never be pre-filled — not even with a placeholder
+        // that looks like a value.
+        assert!(
+            !with_key.contains(r#"name="brave_api_key" value="#),
+            "key field must have no value attribute: {with_key}"
+        );
+        assert!(with_key.contains("A key is stored"), "{with_key}");
+
+        let without =
+            render_search_card(Lang::En, &search_view(SearchProvider::Brave, None, false))
+                .to_string();
+        assert!(without.contains("No key stored"), "{without}");
+    }
+
+    #[test]
+    fn search_card_clear_checkbox_starts_unchecked() {
+        let html = render_search_card(Lang::En, &search_view(SearchProvider::Brave, None, true))
+            .to_string();
+        assert!(html.contains(r#"name="clear_brave_key""#), "{html}");
+        // Unchecked means the attribute is absent entirely (see bool_checkbox).
+        assert!(!html.contains("checked="), "{html}");
+    }
+
+    #[test]
+    fn search_form_treats_an_absent_checkbox_as_no_clear() {
+        let form: SearchForm =
+            serde_urlencoded::from_str("provider=brave&searxng_url=&brave_api_key=").unwrap();
+        assert!(form.clear_brave_key.is_none());
+        let ticked: SearchForm =
+            serde_urlencoded::from_str("provider=brave&clear_brave_key=1").unwrap();
+        assert_eq!(ticked.clear_brave_key.as_deref(), Some("1"));
     }
 
     #[test]

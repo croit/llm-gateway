@@ -30,6 +30,7 @@ pub mod feedback;
 pub mod fetch_attachment;
 pub mod fetch_url;
 pub mod generate_image;
+pub mod html_text;
 pub mod json_patch;
 pub mod list_attachments;
 pub mod load_image_url;
@@ -128,6 +129,12 @@ pub struct ToolContext {
     /// deployments), where sandbox calls stay single-use. The driver releases
     /// it at turn end. See [`sandbox::SandboxLease`].
     pub sandbox_lease: Option<std::sync::Arc<sandbox::SandboxLease>>,
+    /// The at-rest encryption key, cloned from `AppState`. Tools that read a
+    /// sealed operator setting out of `app_settings` need it — currently
+    /// `search_web`, for the Brave API key. `None` on paths that never wired
+    /// one up (unit tests), where such a setting reads as "not configured"
+    /// and the tool reports that rather than failing opaquely.
+    pub crypto: Option<std::sync::Arc<crate::server::crypto::Crypto>>,
 }
 
 #[cfg(test)]
@@ -153,6 +160,7 @@ impl ToolContext {
             indexer: None,
             image_gen: None,
             sandbox_lease: None,
+            crypto: None,
         }
     }
 }
@@ -207,6 +215,8 @@ impl std::fmt::Debug for ToolContext {
                 "sandbox_lease",
                 &self.sandbox_lease.as_ref().map(|_| "<SandboxLease>"),
             )
+            // Never print the key material itself.
+            .field("crypto", &self.crypto.as_ref().map(|_| "<Crypto>"))
             .finish()
     }
 }
@@ -246,6 +256,24 @@ pub const TOOL_CONTENT_PARTS_KEY: &str = "__gateway_tool_content_parts";
 /// verbatim).
 pub fn tool_content_parts(parts: Vec<Value>) -> Value {
     serde_json::json!({ TOOL_CONTENT_PARTS_KEY: parts })
+}
+
+/// Truncate `s` to at most `max_bytes`, snapping back to the nearest
+/// UTF-8 char boundary so we never split a multibyte codepoint.
+/// Returns the slice plus whether anything was dropped.
+///
+/// Shared by every tool that caps text it hands back to the model
+/// (`fetch_attachment`'s PDF text tier, `fetch_url`'s HTML extraction),
+/// so the byte-cap semantics can't drift between them.
+pub(crate) fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
+    if s.len() <= max_bytes {
+        return (s, false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], true)
 }
 
 /// Read the parts back out of a tool result body if the tool used

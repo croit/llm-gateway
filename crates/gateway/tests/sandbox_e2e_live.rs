@@ -125,6 +125,7 @@ fn ctx(pool: db::Pool, asst_turn: &str) -> ToolContext {
         indexer: None,
         image_gen: None,
         sandbox_lease: None,
+        crypto: None,
     }
 }
 
