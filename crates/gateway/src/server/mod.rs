@@ -30,6 +30,7 @@ pub mod rag;
 pub mod rbac;
 pub mod reasoning;
 pub mod scheduled;
+pub mod search_settings;
 pub mod skills;
 pub mod speech;
 pub mod sse;

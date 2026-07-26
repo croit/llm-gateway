@@ -123,3 +123,20 @@ admin-cap-fallback-tools = 工具回退
 # 上游拓扑重新加载（/admin/upstreams 上的 “Apply changes” 按钮）。
 admin-reloaded = 已重新加载 { $pools } 个 pools、{ $backends } 个 backends
 admin-reload-error = 重新加载失败：{ $err }
+
+# 网页搜索后端（`search_web` 工具）。
+admin-search-heading = 网页搜索
+admin-search-intro = 由哪个后端响应助手的 `search_web` 工具。SearXNG 只需一个基础 URL，如果你自建实例则每次查询不产生费用；Brave 需要 API 密钥。密钥会加密存储。
+admin-search-provider-label = 提供方
+admin-search-provider-searxng = SearXNG（自建）
+admin-search-provider-brave = Brave Search API
+admin-search-searxng-url-label = SearXNG 基础 URL
+admin-search-searxng-url-placeholder = https://searxng.example.com
+admin-search-brave-key-label = Brave API 密钥
+admin-search-brave-key-placeholder = 留空以保留当前密钥
+admin-search-brave-key-set = 已存储密钥（加密）。
+admin-search-brave-key-unset = 未存储密钥。
+admin-search-brave-key-clear = 删除已存储的密钥
+admin-search-save = 保存网页搜索
+admin-search-saved = 网页搜索设置已保存
+admin-search-unknown-provider = 未知的搜索提供方 `{ $provider }`

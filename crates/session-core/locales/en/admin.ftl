@@ -131,3 +131,21 @@ admin-cap-fallback-tools = Fallback for tools
 # Upstream topology reload ("Apply changes" button on /admin/upstreams).
 admin-reloaded = reloaded { $pools } pools, { $backends } backends
 admin-reload-error = reload failed: { $err }
+
+# Web search backend (`search_web` tool). Formerly the SEARCH_PROVIDER /
+# SEARXNG_URL / BRAVE_SEARCH_API_KEY environment variables.
+admin-search-heading = Web search
+admin-search-intro = Which backend answers the assistant's `search_web` tool. SearXNG needs only a base URL and costs nothing per query if you run your own instance; Brave needs an API key. The key is encrypted at rest.
+admin-search-provider-label = Provider
+admin-search-provider-searxng = SearXNG (self-hosted)
+admin-search-provider-brave = Brave Search API
+admin-search-searxng-url-label = SearXNG base URL
+admin-search-searxng-url-placeholder = https://searxng.example.com
+admin-search-brave-key-label = Brave API key
+admin-search-brave-key-placeholder = leave blank to keep the current key
+admin-search-brave-key-set = A key is stored (encrypted).
+admin-search-brave-key-unset = No key stored.
+admin-search-brave-key-clear = Remove the stored key
+admin-search-save = Save web search
+admin-search-saved = web-search settings saved
+admin-search-unknown-provider = unknown search provider `{ $provider }`

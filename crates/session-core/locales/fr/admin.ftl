@@ -124,3 +124,20 @@ admin-cap-fallback-tools = Repli pour les outils
 # Rechargement de la topologie upstream ("Apply changes" sur /admin/upstreams).
 admin-reloaded = { $pools } pools, { $backends } backends rechargés
 admin-reload-error = échec du rechargement : { $err }
+
+# Backend de recherche web (outil `search_web`).
+admin-search-heading = Recherche web
+admin-search-intro = Quel backend répond à l'outil `search_web` de l'assistant. SearXNG ne nécessite qu'une URL de base et ne coûte rien par requête si vous hébergez votre propre instance ; Brave nécessite une clé d'API. La clé est chiffrée au repos.
+admin-search-provider-label = Fournisseur
+admin-search-provider-searxng = SearXNG (auto-hébergé)
+admin-search-provider-brave = Brave Search API
+admin-search-searxng-url-label = URL de base SearXNG
+admin-search-searxng-url-placeholder = https://searxng.example.com
+admin-search-brave-key-label = Clé d'API Brave
+admin-search-brave-key-placeholder = laisser vide pour conserver la clé actuelle
+admin-search-brave-key-set = Une clé est enregistrée (chiffrée).
+admin-search-brave-key-unset = Aucune clé enregistrée.
+admin-search-brave-key-clear = Supprimer la clé enregistrée
+admin-search-save = Enregistrer la recherche web
+admin-search-saved = paramètres de recherche web enregistrés
+admin-search-unknown-provider = fournisseur de recherche inconnu `{ $provider }`

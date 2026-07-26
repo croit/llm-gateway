@@ -200,6 +200,7 @@ pub fn build_tool_context(
             .sandbox_client
             .clone()
             .map(crate::server::tools::sandbox::SandboxLease::new),
+        crypto: Some(state.crypto.clone()),
     }
 }
 

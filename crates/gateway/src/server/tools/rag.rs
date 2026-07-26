@@ -469,6 +469,7 @@ mod tests {
             indexer: Some(indexer),
             image_gen: None,
             sandbox_lease: None,
+            crypto: None,
         }
     }
 

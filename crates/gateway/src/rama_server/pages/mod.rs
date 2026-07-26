@@ -1352,7 +1352,7 @@ mod admin;
 pub use admin::{
     models_clear as admin_models_clear, models_defaults_save as admin_models_defaults_save,
     models_index as admin_models_index, models_save as admin_models_save,
-    upstreams_reload as admin_upstreams_reload,
+    models_search_save as admin_models_search_save, upstreams_reload as admin_upstreams_reload,
 };
 
 // Merged upstream pools + backends page (`/admin/upstreams`). The GET page

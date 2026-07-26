@@ -43,7 +43,9 @@ use std::sync::Arc;
 use shared::sandbox::{InputFile, Language, RunRequest};
 
 use super::sandbox::{SandboxClient, b64};
-use super::{Tool, ToolContext, ToolError, ToolFuture, tool_content_parts};
+use super::{
+    Tool, ToolContext, ToolError, ToolFuture, tool_content_parts, truncate_on_char_boundary,
+};
 use crate::server::chat_attachments::{self, BinaryDisposition, PayloadLimits};
 use crate::server::pdf::{self, PdfError};
 
@@ -273,6 +275,58 @@ struct FetchArgs {
     max_bytes: Option<usize>,
     #[serde(default)]
     mode: FetchMode,
+    /// 1-based first PDF page to read (inclusive). PDF-only.
+    #[serde(default)]
+    page_from: Option<usize>,
+    /// 1-based last PDF page to read (inclusive). PDF-only.
+    #[serde(default)]
+    page_to: Option<usize>,
+}
+
+/// A validated, 1-based inclusive PDF page window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PageRange {
+    from: usize,
+    to: Option<usize>,
+}
+
+impl PageRange {
+    /// Validate the model-supplied window. Rejects a zero `page_from`
+    /// (pages are 1-based, and a 0 almost always means the model was
+    /// counting from zero — better to say so than to silently read a
+    /// different range) and an inverted range.
+    fn parse(from: Option<usize>, to: Option<usize>) -> Result<Self, ToolError> {
+        if from == Some(0) || to == Some(0) {
+            return Err(ToolError::InvalidArgs(
+                "page numbers are 1-based — page_from/page_to must be >= 1".into(),
+            ));
+        }
+        if let (Some(f), Some(t)) = (from, to)
+            && f > t
+        {
+            return Err(ToolError::InvalidArgs(format!(
+                "page_from ({f}) must not be greater than page_to ({t})"
+            )));
+        }
+        Ok(Self {
+            from: from.unwrap_or(1),
+            to,
+        })
+    }
+
+    /// Whether the caller asked for a specific window (rather than
+    /// "start at the beginning, give me what fits").
+    fn is_explicit(&self) -> bool {
+        self.from > 1 || self.to.is_some()
+    }
+
+    /// How many pages this window spans, capped at `ceiling`.
+    fn len_capped(&self, ceiling: usize) -> usize {
+        match self.to {
+            Some(to) => (to + 1).saturating_sub(self.from).min(ceiling),
+            None => ceiling,
+        }
+    }
 }
 
 /// How to read a PDF attachment. Ignored for non-PDF files (their
@@ -309,7 +363,11 @@ impl Tool for FetchAttachment {
              (cheap — use this first); if the result comes back empty or \
              garbled (a scanned / image-only PDF), call again with \
              `mode=\"images\"` to get the pages rendered as images you can \
-             actually see. Office files (`.docx`/`.pptx`/`.xlsx`) return \
+             actually see. Both PDF tiers accept `page_from`/`page_to` \
+             (1-based, inclusive) — a long document comes back one window at \
+             a time and the result tells you which pages you got out of how \
+             many, so page on with `page_from` set past the last one you \
+             read. Office files (`.docx`/`.pptx`/`.xlsx`) return \
              `kind:\"document_structure\"` — the verbatim content (titles, \
              text, bullets, tables, notes) plus `image_refs` for any embedded \
              images; use this to re-author an upload into a branded template \
@@ -348,6 +406,22 @@ impl Tool for FetchAttachment {
                                         pages to images for you to look at — \
                                         use it only when `text` returned no \
                                         usable text (a scanned PDF)."
+                    },
+                    "page_from": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "PDF only: 1-based first page to read \
+                                        (inclusive). Use this to page through \
+                                        a long document — a result that says \
+                                        it returned pages 1–8 of 200 is read \
+                                        further with page_from: 9."
+                    },
+                    "page_to": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "PDF only: 1-based last page to read \
+                                        (inclusive). Omit to read as far as \
+                                        the per-call limit allows."
                     }
                 }
             }),
@@ -432,7 +506,17 @@ impl Tool for FetchAttachment {
             // page-images on escalation) instead of the generic
             // "binary — ask the user to re-upload" stub.
             if chat_attachments::is_pdf(&mime, filename) {
-                return read_pdf(&args.id, filename, &mime, fetched.bytes, args.mode, cap).await;
+                let pages = PageRange::parse(args.page_from, args.page_to)?;
+                return read_pdf(
+                    &args.id,
+                    filename,
+                    &mime,
+                    fetched.bytes,
+                    args.mode,
+                    cap,
+                    pages,
+                )
+                .await;
             }
 
             let limits = PayloadLimits {
@@ -531,9 +615,17 @@ async fn read_pdf(
     bytes: Vec<u8>,
     mode: FetchMode,
     text_cap: usize,
+    pages: PageRange,
 ) -> Result<Value, ToolError> {
     let original_len = bytes.len();
     match mode {
+        // An explicit window uses the per-page extractor so the requested
+        // pages are what gets returned. Without a window we stay on the
+        // whole-document path — same parse cost, but it keeps the default
+        // result byte-identical to what it has always been.
+        FetchMode::Text if pages.is_explicit() => {
+            read_pdf_text_range(id, filename, mime, bytes, text_cap, pages).await
+        }
         FetchMode::Text => {
             let text = tokio::task::spawn_blocking(move || pdf::extract_text(&bytes))
                 .await
@@ -556,6 +648,20 @@ async fn read_pdf(
                 })),
                 Ok(text) => {
                     let (slice, truncated) = truncate_on_char_boundary(&text, text_cap);
+                    // Only mention paging when it actually applies —
+                    // an untruncated document needs no follow-up call.
+                    let note = if truncated {
+                        "Extracted from the PDF text layer, and cut off at the \
+                         byte cap. Read further with page_from/page_to (1-based, \
+                         inclusive) rather than raising max_bytes. If the text \
+                         looks garbled (e.g. a scanned document), call again \
+                         with mode=\"images\"."
+                    } else {
+                        "Extracted from the PDF text layer. If this looks \
+                         incomplete or garbled (e.g. a scanned document), call \
+                         again with mode=\"images\" to read the pages as \
+                         rendered images."
+                    };
                     Ok(json!({
                         "id": id,
                         "filename": filename,
@@ -566,10 +672,7 @@ async fn read_pdf(
                         "bytes_returned": slice.len(),
                         "truncated": truncated,
                         "extracted_from": "pdf-text-layer",
-                        "note": "Extracted from the PDF text layer. If this \
-                                 looks incomplete or garbled (e.g. a scanned \
-                                 document), call again with mode=\"images\" \
-                                 to read the pages as rendered images.",
+                        "note": note,
                     }))
                 }
                 // Parse failure: the text crate choked on the document.
@@ -590,25 +693,42 @@ async fn read_pdf(
             }
         }
         FetchMode::Images => {
-            let rendered =
-                tokio::task::spawn_blocking(move || pdf::render_pages(&bytes, MAX_RENDER_PAGES))
-                    .await
-                    .map_err(|e| ToolError::Failed(format!("pdf rendering panicked: {e}")))?;
+            let settings = pdf::RenderSettings {
+                first_page: pages.from,
+                max_pages: pages.len_capped(MAX_RENDER_PAGES),
+                ..pdf::RenderSettings::default()
+            };
+            let rendered = tokio::task::spawn_blocking(move || {
+                pdf::render_pages_with_settings(&bytes, settings)
+            })
+            .await
+            .map_err(|e| ToolError::Failed(format!("pdf rendering panicked: {e}")))?;
             match rendered {
                 Ok(rendered) if !rendered.pages.is_empty() => {
-                    let shown = rendered.pages.len();
-                    let summary = if rendered.total_pages > shown {
+                    let total = rendered.total_pages;
+                    let first = rendered.pages[0].page_number;
+                    let last = rendered.pages[rendered.pages.len() - 1].page_number;
+                    let mut summary = if first == 1 && last == total {
                         format!(
-                            "Rendered the first {shown} of {} pages of `{filename}` \
-                             as images (id={id}).",
-                            rendered.total_pages,
+                            "Rendered all {total} page(s) of `{filename}` as images \
+                             (id={id})."
                         )
                     } else {
                         format!(
-                            "Rendered all {shown} page(s) of `{filename}` as images \
-                             (id={id})."
+                            "Rendered pages {first}–{last} of {total} of `{filename}` \
+                             as images (id={id})."
                         )
                     };
+                    // Spell out the exact next call. A bare "N of M" leaves
+                    // the model to infer that paging is possible at all,
+                    // which it reliably does not do.
+                    if last < total {
+                        summary.push_str(&format!(
+                            " To continue, call fetch_attachment again with \
+                             mode=\"images\" and page_from={}.",
+                            last + 1
+                        ));
+                    }
                     let mut parts = vec![json!({"type": "text", "text": summary})];
                     for page in &rendered.pages {
                         let uri = chat_attachments::to_data_uri("image/png", &page.png);
@@ -619,7 +739,13 @@ async fn read_pdf(
                     }
                     Ok(tool_content_parts(parts))
                 }
-                // Empty document — nothing to show.
+                // Nothing rendered. Distinguish "the document is empty" from
+                // "you asked for a window past its end" — the second is a
+                // fixable mistake and must not read as the first.
+                Ok(rendered) if rendered.total_pages > 0 => Err(ToolError::InvalidArgs(format!(
+                    "`{filename}` has {} page(s); page_from={} is past the end",
+                    rendered.total_pages, pages.from
+                ))),
                 Ok(_) => Ok(json!({
                     "id": id,
                     "filename": filename,
@@ -654,18 +780,121 @@ async fn read_pdf(
     }
 }
 
-/// Truncate `s` to at most `max_bytes`, snapping back to the nearest
-/// UTF-8 char boundary so we never split a multibyte codepoint.
-/// Returns the slice plus whether anything was dropped.
-fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
-    if s.len() <= max_bytes {
-        return (s, false);
+/// Serve an explicit page window from a PDF's text layer.
+///
+/// Split out from [`read_pdf`] because it answers a different question: not
+/// "what does this document say" but "what do pages 40–60 say". The page
+/// markers matter — a model asked to cite a page number can only do that if
+/// the result says which page each passage came from.
+async fn read_pdf_text_range(
+    id: &str,
+    filename: &str,
+    mime: &str,
+    bytes: Vec<u8>,
+    text_cap: usize,
+    range: PageRange,
+) -> Result<Value, ToolError> {
+    let original_len = bytes.len();
+    let extracted = tokio::task::spawn_blocking(move || pdf::extract_text_pages(&bytes))
+        .await
+        .map_err(|e| ToolError::Failed(format!("pdf text extraction panicked: {e}")))?;
+    let page_texts = match extracted {
+        Ok(pages) => pages,
+        // Same reasoning as the whole-document path: the render tier uses a
+        // different parser and may still manage this file.
+        Err(e) => {
+            return Ok(json!({
+                "id": id,
+                "filename": filename,
+                "mime": mime,
+                "size": original_len,
+                "kind": "pdf-error",
+                "note": format!(
+                    "Could not extract text from this PDF ({e}). Try calling \
+                     again with mode=\"images\" to render the pages, or ask the \
+                     user to re-upload."
+                ),
+            }));
+        }
+    };
+
+    let total_pages = page_texts.len();
+    if total_pages == 0 {
+        return Ok(json!({
+            "id": id,
+            "filename": filename,
+            "mime": mime,
+            "size": original_len,
+            "kind": "pdf-empty",
+            "note": "This PDF has no pages.",
+        }));
     }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+    if range.from > total_pages {
+        return Err(ToolError::InvalidArgs(format!(
+            "`{filename}` has {total_pages} page(s); page_from={} is past the end",
+            range.from
+        )));
     }
-    (&s[..end], true)
+    let last_requested = range.to.unwrap_or(total_pages).min(total_pages);
+
+    // Build the window, stopping early if the byte cap fills up — an
+    // arbitrarily wide `page_from: 1, page_to: 500` must not blow the cap.
+    let mut content = String::new();
+    let mut last_included = range.from - 1;
+    for page_no in range.from..=last_requested {
+        let body = page_texts[page_no - 1].trim();
+        let mut chunk = String::with_capacity(body.len() + 16);
+        if !content.is_empty() {
+            chunk.push_str("\n\n");
+        }
+        chunk.push_str(&format!("[page {page_no}]\n"));
+        chunk.push_str(body);
+        // Always take at least one page, even if it alone exceeds the cap;
+        // the truncation below then trims it. Returning zero pages for a
+        // valid request would be worse than returning a clipped one.
+        if !content.is_empty() && content.len() + chunk.len() > text_cap {
+            break;
+        }
+        content.push_str(&chunk);
+        last_included = page_no;
+    }
+
+    let (slice, clipped) = truncate_on_char_boundary(&content, text_cap);
+    let more = last_included < total_pages;
+    let mut note = format!(
+        "Text layer of pages {}–{last_included} of {total_pages}.",
+        range.from
+    );
+    if last_included < last_requested {
+        note.push_str(
+            " Stopped early at the byte cap — the requested range did not fit \
+             in one call.",
+        );
+    }
+    if more {
+        note.push_str(&format!(" Continue with page_from={}.", last_included + 1));
+    }
+    if slice.trim_start().starts_with("[page") && slice.trim().lines().count() <= 1 {
+        note.push_str(
+            " These pages carry no text layer — if the document is scanned, \
+             call again with mode=\"images\".",
+        );
+    }
+
+    Ok(json!({
+        "id": id,
+        "filename": filename,
+        "mime": mime,
+        "size": original_len,
+        "kind": "text",
+        "content": slice,
+        "bytes_returned": slice.len(),
+        "truncated": clipped || more,
+        "pages_returned": [range.from, last_included],
+        "total_pages": total_pages,
+        "extracted_from": "pdf-text-layer",
+        "note": note,
+    }))
 }
 
 /// Split `<turn_id>/<filename>` into its parts. Rejects ids with
@@ -775,6 +1004,7 @@ mod tests {
             indexer: None,
             image_gen: None,
             sandbox_lease: None,
+            crypto: None,
         };
         let err = FetchAttachment::new(None)
             .run(ctx, json!({"id": "nope"}))
@@ -810,6 +1040,226 @@ mod tests {
         assert_eq!(*modes, json!(["text", "images"]));
     }
 
+    #[test]
+    fn schema_advertises_page_range() {
+        let schema = FetchAttachment::new(None).schema();
+        let props = &schema.function.parameters["properties"];
+        assert_eq!(props["page_from"]["type"], "integer");
+        assert_eq!(props["page_from"]["minimum"], 1);
+        assert_eq!(props["page_to"]["type"], "integer");
+    }
+
+    #[test]
+    fn page_range_rejects_zero_and_inverted_ranges() {
+        assert!(matches!(
+            PageRange::parse(Some(0), None).unwrap_err(),
+            ToolError::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            PageRange::parse(None, Some(0)).unwrap_err(),
+            ToolError::InvalidArgs(_)
+        ));
+        assert!(matches!(
+            PageRange::parse(Some(9), Some(4)).unwrap_err(),
+            ToolError::InvalidArgs(_)
+        ));
+        // Equal bounds are a valid single-page window.
+        assert!(PageRange::parse(Some(4), Some(4)).is_ok());
+    }
+
+    #[test]
+    fn page_range_defaults_are_not_explicit() {
+        // The unwindowed default must keep taking the whole-document path,
+        // so existing callers see byte-identical results.
+        assert!(!PageRange::parse(None, None).unwrap().is_explicit());
+        assert!(PageRange::parse(Some(2), None).unwrap().is_explicit());
+        assert!(PageRange::parse(None, Some(2)).unwrap().is_explicit());
+    }
+
+    #[test]
+    fn page_range_len_is_capped() {
+        let r = PageRange::parse(Some(3), Some(6)).unwrap();
+        assert_eq!(r.len_capped(100), 4);
+        assert_eq!(r.len_capped(2), 2);
+        // Open-ended window falls back to the caller's ceiling.
+        let open = PageRange::parse(Some(3), None).unwrap();
+        assert_eq!(open.len_capped(8), 8);
+    }
+
+    #[tokio::test]
+    async fn pdf_text_range_returns_only_the_requested_pages() {
+        let out = read_pdf(
+            "t/doc.pdf",
+            "doc.pdf",
+            "application/pdf",
+            crate::server::pdf::test_support::multipage_pdf(6),
+            FetchMode::Text,
+            4096,
+            PageRange::parse(Some(3), Some(4)).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["kind"], "text");
+        let content = out["content"].as_str().unwrap();
+        assert!(content.contains("Page 3 body"), "{content}");
+        assert!(content.contains("Page 4 body"), "{content}");
+        assert!(!content.contains("Page 2 body"), "{content}");
+        assert!(!content.contains("Page 5 body"), "{content}");
+        assert_eq!(out["pages_returned"], json!([3, 4]));
+        assert_eq!(out["total_pages"], 6);
+    }
+
+    #[tokio::test]
+    async fn pdf_text_range_marks_page_numbers_for_citation() {
+        let out = read_pdf(
+            "t/doc.pdf",
+            "doc.pdf",
+            "application/pdf",
+            crate::server::pdf::test_support::multipage_pdf(3),
+            FetchMode::Text,
+            4096,
+            PageRange::parse(Some(2), Some(2)).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out["content"].as_str().unwrap().contains("[page 2]"),
+            "{out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pdf_text_range_tells_the_model_how_to_continue() {
+        let out = read_pdf(
+            "t/doc.pdf",
+            "doc.pdf",
+            "application/pdf",
+            crate::server::pdf::test_support::multipage_pdf(10),
+            FetchMode::Text,
+            4096,
+            PageRange::parse(Some(1), Some(2)).unwrap(),
+        )
+        .await
+        .unwrap();
+        let note = out["note"].as_str().unwrap();
+        assert!(note.contains("of 10"), "{note}");
+        assert!(note.contains("page_from=3"), "{note}");
+        assert_eq!(out["truncated"], true, "more pages remain: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn pdf_text_range_past_the_end_is_an_arg_error() {
+        let err = read_pdf(
+            "t/doc.pdf",
+            "doc.pdf",
+            "application/pdf",
+            crate::server::pdf::test_support::multipage_pdf(2),
+            FetchMode::Text,
+            4096,
+            PageRange::parse(Some(50), None).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ToolError::InvalidArgs(msg) => {
+                assert!(msg.contains("2 page(s)"), "{msg}");
+                assert!(msg.contains("past the end"), "{msg}");
+            }
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pdf_text_range_clamps_page_to_at_the_document_end() {
+        // Asking for more than exists is not an error — it reads to the end.
+        let out = read_pdf(
+            "t/doc.pdf",
+            "doc.pdf",
+            "application/pdf",
+            crate::server::pdf::test_support::multipage_pdf(3),
+            FetchMode::Text,
+            4096,
+            PageRange::parse(Some(2), Some(99)).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["pages_returned"], json!([2, 3]));
+        assert_eq!(out["truncated"], false, "read to the end: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn pdf_text_range_stops_at_the_byte_cap_and_says_so() {
+        // A wide window must not blow the cap; it returns what fits and
+        // names the page to resume from.
+        let out = read_pdf(
+            "t/doc.pdf",
+            "doc.pdf",
+            "application/pdf",
+            crate::server::pdf::test_support::multipage_pdf(20),
+            FetchMode::Text,
+            60,
+            PageRange::parse(Some(1), Some(20)).unwrap(),
+        )
+        .await
+        .unwrap();
+        let last = out["pages_returned"][1].as_u64().unwrap();
+        assert!(last < 20, "should have stopped early, got {last}");
+        let note = out["note"].as_str().unwrap();
+        assert!(note.contains("byte cap"), "{note}");
+        assert!(note.contains(&format!("page_from={}", last + 1)), "{note}");
+    }
+
+    #[tokio::test]
+    async fn pdf_default_text_path_reports_paging_when_truncated() {
+        // No explicit window: the whole-document path still has to tell the
+        // model that page_from/page_to exist, or it will just raise max_bytes.
+        let out = read_pdf(
+            "t/doc.pdf",
+            "doc.pdf",
+            "application/pdf",
+            crate::server::pdf::test_support::multipage_pdf(10),
+            FetchMode::Text,
+            20,
+            PageRange::parse(None, None).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["truncated"], true);
+        assert!(
+            out["note"].as_str().unwrap().contains("page_from"),
+            "{out:?}"
+        );
+        // Whole-document path: no per-page bookkeeping in the result.
+        assert!(out.get("pages_returned").is_none(), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn pdf_images_range_past_the_end_is_an_arg_error_or_unavailable() {
+        // With pdfium present this must be an InvalidArgs (not "pdf-empty",
+        // which would read as "the document has no pages"). Without the
+        // native library the render tier is unavailable — also acceptable.
+        let out = read_pdf(
+            "t/doc.pdf",
+            "doc.pdf",
+            "application/pdf",
+            crate::server::pdf::test_support::multipage_pdf(2),
+            FetchMode::Images,
+            4096,
+            PageRange::parse(Some(50), None).unwrap(),
+        )
+        .await;
+        match out {
+            Err(ToolError::InvalidArgs(msg)) => {
+                assert!(msg.contains("past the end"), "{msg}");
+            }
+            Ok(v) => assert_eq!(
+                v["kind"], "pdf-render-unavailable",
+                "only the missing-pdfium degradation is acceptable here: {v:?}"
+            ),
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn pdf_text_mode_returns_extracted_text() {
         let out = read_pdf(
@@ -819,6 +1269,7 @@ mod tests {
             hello_pdf(),
             FetchMode::Text,
             4096,
+            PageRange::parse(None, None).unwrap(),
         )
         .await
         .unwrap();
@@ -841,6 +1292,7 @@ mod tests {
             blank_pdf(),
             FetchMode::Text,
             4096,
+            PageRange::parse(None, None).unwrap(),
         )
         .await
         .unwrap();
@@ -863,6 +1315,7 @@ mod tests {
             hello_pdf(),
             FetchMode::Images,
             4096,
+            PageRange::parse(None, None).unwrap(),
         )
         .await
         .unwrap();

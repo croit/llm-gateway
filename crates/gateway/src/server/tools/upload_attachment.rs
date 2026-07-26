@@ -247,6 +247,7 @@ mod tests {
             indexer: None,
             image_gen: None,
             sandbox_lease: None,
+            crypto: None,
         };
         let err = UploadAttachment
             .run(
@@ -284,6 +285,7 @@ mod tests {
             indexer: None,
             image_gen: None,
             sandbox_lease: None,
+            crypto: None,
         };
         let err = UploadAttachment
             .run(
