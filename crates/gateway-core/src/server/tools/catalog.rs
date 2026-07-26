@@ -70,7 +70,14 @@ const DOCUMENT_KEY: &str = "document";
 /// Tools that exist for smoke tests / internal plumbing and shouldn't
 /// clutter a user's tool list. They stay granted via RBAC; they're just
 /// not presented as a toggle.
-const HIDDEN: &[&str] = &["company_echo"];
+///
+/// `enable_tools` belongs here because its toggle could never do anything:
+/// `AppState::allowed_tools_for_session` force-keeps [`BOOTSTRAP_TOOL_ID`]
+/// regardless of the per-conversation enabled set, so a switch for it would
+/// be inert — and it rendered with its model-facing description, since
+/// internal plumbing has no hand-written display copy. `capability_domains`
+/// already skipped it; `entries` did not.
+const HIDDEN: &[&str] = &["company_echo", BOOTSTRAP_TOOL_ID];
 
 /// Display grouping for the tool list. Ordered by [`Category::order`]
 /// so the page renders sections deterministically.
@@ -229,11 +236,18 @@ pub fn is_hidden(tool_id: &str) -> bool {
 /// (`"… only available inside a chat session"`) off the chat path because
 /// there is no assistant turn / conversation to attach their output to:
 /// the per-template typst render family (`typst_*`), the document-canvas
-/// tools (incl. `export_document`), `upload_attachment`, and the image tools
-/// (`generate_image` / `edit_image`). The `/v1`
+/// tools (incl. `export_document`), `upload_attachment`, the image tools
+/// (`generate_image` / `edit_image`), and `read_sandbox_output` (it resolves
+/// a `full_output_ref` against the *current turn's* attachments). The `/v1`
 /// proxy paths have no session, so they must NOT advertise these — else the
 /// model picks one and gets an error instead of a completion. Single source
 /// of truth so the advertise filter can't drift from the runtime gate.
+///
+/// Deliberately *not* listed: `render_typst` needs a session only when the
+/// call references a canvas document, which is one optional argument among
+/// several — off-chat it still renders model-supplied source. Same for the
+/// sandbox tools that merely *prefer* a turn to attach files to: they fall
+/// back to returning a URL instead of an attachment ref.
 pub fn requires_chat_session(tool_id: &str) -> bool {
     tool_id.starts_with(TYPST_PREFIX)
         || tool_id.starts_with(COMFYUI_PREFIX)
@@ -244,6 +258,7 @@ pub fn requires_chat_session(tool_id: &str) -> bool {
         || tool_id == "edit_image"
         || tool_id == "generate_qr_code"
         || tool_id == "load_image_url"
+        || tool_id == "read_sandbox_output"
 }
 
 /// `mcp__<server>__<tool>` → `mcp__<server>` (the per-server toggle key).
@@ -260,7 +275,13 @@ fn mcp_server_key(tool_id: &str) -> &str {
 /// Display category for a tool id. Unknown / future tools fall into
 /// `Utility` and render as their own 1:1 row — a graceful default that
 /// never hides a newly added tool.
-fn category_for(tool_id: &str) -> Category {
+///
+/// Public so the tool-inventory drift guard can assert that no registered id
+/// lands in `Utility` by accident. That is
+/// exactly how `convert_document` and `edit_presentation` sat in the wrong
+/// group with LLM-facing descriptions: the graceful default is also a silent
+/// one, so it needs a test rather than a reviewer noticing.
+pub fn category_for(tool_id: &str) -> Category {
     match tool_id {
         "search_web" | "fetch_url" | "lookup_ip" | "dns_lookup" | "whois_lookup" | "tls_cert"
         | "wikipedia" => Category::Web,
@@ -271,6 +292,8 @@ fn category_for(tool_id: &str) -> Category {
         "rag_search" | "rag_list_collections" => Category::Knowledge,
         "run_in_sandbox"
         | "generate_document"
+        | "convert_document"
+        | "edit_presentation"
         | "capture_webpage"
         | "read_sandbox_output"
         | "render_excalidraw"
@@ -295,6 +318,16 @@ fn short_description(full: &str) -> String {
         Some(end) => full[..=end].trim().to_string(),
         None => full.trim().to_string(),
     }
+}
+
+/// Whether `tool_id` has hand-written, user-facing display copy.
+///
+/// `false` means the `/tools` page falls back to the tool's *model-facing*
+/// schema description, which reads as jargon in a settings list. The
+/// inventory drift guard asserts this holds for every registered 1:1 row, so
+/// a new tool can't ship with LLM prose in the UI.
+pub fn has_display_copy(tool_id: &str) -> bool {
+    display_meta(tool_id).is_some()
 }
 
 /// Curated, user-facing `(title, description)` for a known tool id. The
@@ -425,6 +458,18 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Document generation",
             "Lets the assistant turn its writing into a finished PDF, Word, or PowerPoint \
              file you can download — built in the sandbox from Markdown.",
+        ),
+        "convert_document" => (
+            "File conversion",
+            "Lets the assistant convert a file you uploaded — PowerPoint, Word, Excel, ODF, \
+             PDF — into PDF, Word, plain text, HTML, or one image per page, and hand the \
+             result back to download.",
+        ),
+        "edit_presentation" => (
+            "Edit a PowerPoint",
+            "Lets the assistant change a PowerPoint file you uploaded and return the edited \
+             deck — rewriting slide text or swapping images while keeping the original \
+             layout and theme, instead of rebuilding the deck from scratch.",
         ),
         "capture_webpage" => (
             "Web page capture",
@@ -670,6 +715,109 @@ mod tests {
     use crate::server::tools::echo::Echo;
     use crate::server::tools::search_web::SearchWeb;
     use crate::server::tools::time::CurrentTimestamp;
+
+    /// Every sandbox tool belongs in "Code & Sandbox". `convert_document` and
+    /// `edit_presentation` used to be missing from the arm and fell through to
+    /// `Utility` — the `DOCUMENT_IDS` doc comment even claimed they were
+    /// handled here, which is how it went unnoticed.
+    #[test]
+    fn every_sandbox_tool_is_categorised_as_code() {
+        for id in [
+            "run_in_sandbox",
+            "generate_document",
+            "convert_document",
+            "edit_presentation",
+            "capture_webpage",
+            "read_sandbox_output",
+            "render_excalidraw",
+            "render_typst",
+        ] {
+            assert_eq!(
+                category_for(id),
+                Category::Code,
+                "`{id}` must be grouped with the sandbox tools, not fall through to Utility"
+            );
+        }
+    }
+
+    /// The sandbox tools that share the "document" toggle key are the canvas
+    /// ones only — `export_document` is in `DOCUMENT_IDS`, but
+    /// `generate_document` / `convert_document` must stay separate so enabling
+    /// the canvas doesn't silently enable the sandbox.
+    #[test]
+    fn sandbox_document_tools_do_not_share_the_canvas_toggle() {
+        assert_eq!(entry_key_for("export_document"), DOCUMENT_KEY);
+        assert_eq!(entry_key_for("generate_document"), "generate_document");
+        assert_eq!(entry_key_for("convert_document"), "convert_document");
+    }
+
+    #[test]
+    fn sandbox_tools_have_hand_written_display_copy() {
+        // Without this the /tools page shows the model-facing schema text.
+        for id in ["convert_document", "edit_presentation"] {
+            assert!(
+                has_display_copy(id),
+                "`{id}` needs plain-language display copy, not its LLM description"
+            );
+        }
+    }
+
+    /// `read_sandbox_output` resolves its `full_output_ref` against the
+    /// *current turn's* attachments and hard-fails without one, so the `/v1`
+    /// proxy paths must not advertise it — every call there would error.
+    #[test]
+    fn read_sandbox_output_is_chat_only() {
+        assert!(requires_chat_session("read_sandbox_output"));
+    }
+
+    /// The bootstrap must not be presented as a toggle: the session-level
+    /// allow-list force-keeps it, so the switch could never take effect, and
+    /// it has no display copy so it rendered as LLM prose under "Utility".
+    #[test]
+    fn the_bootstrap_tool_is_never_a_toggle_row() {
+        assert!(is_hidden(BOOTSTRAP_TOOL_ID));
+        let reg = ToolRegistry::new().with(CurrentTimestamp);
+        let rows = entries(
+            &reg,
+            &[
+                BOOTSTRAP_TOOL_ID.to_string(),
+                "get_current_timestamp".into(),
+            ],
+            &[],
+            &[],
+        );
+        assert_eq!(
+            rows.iter().filter(|e| e.key == BOOTSTRAP_TOOL_ID).count(),
+            0,
+            "enable_tools must not render a row: {rows:?}"
+        );
+        assert_eq!(rows.len(), 1, "the other tool still renders: {rows:?}");
+    }
+
+    /// The counterpart: tools that merely degrade off-chat must stay
+    /// advertised there. `render_typst` needs a session only when the call
+    /// references a canvas document; `run_in_sandbox` returns a URL instead of
+    /// an attachment ref. Marking them chat-only would remove working
+    /// capability from every API caller.
+    #[test]
+    fn tools_that_only_degrade_off_chat_stay_advertised() {
+        for id in [
+            "render_typst",
+            "render_excalidraw",
+            "run_in_sandbox",
+            "generate_document",
+            "convert_document",
+            "capture_webpage",
+            "search_web",
+            "fetch_url",
+            "fetch_attachment",
+        ] {
+            assert!(
+                !requires_chat_session(id),
+                "`{id}` works off the chat path and must stay advertised on /v1"
+            );
+        }
+    }
 
     #[test]
     fn each_typst_template_is_its_own_key_variants_collapse_to_it() {
