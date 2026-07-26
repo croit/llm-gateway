@@ -891,6 +891,7 @@ mod tests {
             attachment_reservations: None,
             indexer: Some(indexer),
             image_gen: None,
+            ocr: None,
             sandbox_lease: None,
             crypto: None,
             push: None,

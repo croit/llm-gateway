@@ -214,11 +214,22 @@ enabled = true
 # Unlimited-OCR vLLM backend internally. OCR output is added to the current
 # user message as untrusted document data; the original attachment remains
 # available through fetch_attachment.
+# Results are cached by document hash + model + prompt version + settings, so a
+# document is recognised once and reused on later turns and after a restart.
 # [chat.ocr]
 # enabled      = true
-# model        = "baidu/Unlimited-OCR"
-# max_tokens   = 32768
-# ngram_window = 1024
+# model        = "baidu/Unlimited-OCR"   # omit to use whatever the ocr pool serves
+# max_tokens   = 32768    # output-token cap per inference call
+# ngram_window = 1024     # Unlimited-OCR repetition-control window
+# max_bytes    = 33554432 # 32 MiB — larger uploads skip OCR entirely
+# max_pages    = 64       # longer documents are recognised in part and say so
+# dpi          = 300      # PDF rasterisation DPI (part of the cache key)
+# max_output_chars = 400000  # ceiling on recognised text kept per document
+# timeout_secs = 1200     # wall clock for one document, rasterisation included
+# max_concurrency = 2     # documents in flight gateway-wide
+# auto_min_text_chars_per_page = 40  # scan detector: chars/page that count as
+#                                    # born-digital (fewer than half the pages
+#                                    # clearing it => treat as a scan)
 
 # ---- Typst templates -------------------------------------------------------
 # Per-template tools (`typst_<id>`) the model can call to render

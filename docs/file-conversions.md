@@ -33,7 +33,7 @@ which tool/engine does each job, and — importantly — what each path can and
 
 | Tool | Direction | Engine | What it does |
 |---|---|---|---|
-| `fetch_attachment` | read upload → model | in-proc + pdfium + sandbox | Text-ish files → UTF-8; images → viewable; **PDF** → text layer, or rasterized pages for a vision model; **Office** (`.docx`/`.pptx`/`.xlsx`) → **verbatim structured JSON** (python-pptx/docx/openpyxl in the sandbox) with embedded images re-attached as `att:` refs. |
+| `fetch_attachment` | read upload → model | in-proc + pdfium + sandbox (+ OCR backend) | Text-ish files → UTF-8; images → viewable (or recognised with `mode="ocr"`); **PDF** → text layer, rasterized pages for a vision model, or OCR text (`mode="ocr"` / `mode="auto"`); **Office** (`.docx`/`.pptx`/`.xlsx`) → **verbatim structured JSON** (python-pptx/docx/openpyxl in the sandbox) with embedded images re-attached as `att:` refs. |
 | `convert_document` | upload → file | LibreOffice (`soffice`) | Uploaded Office/PDF → `pdf`/`docx`/`txt`/`html`/`images` (one PNG per page). Use for the *look* (`images`) or a plain-PDF of the original; `fetch_attachment` is now the better route for the *content*. |
 | `generate_document` | Markdown → file | pandoc (+weasyprint for PDF) | Markdown → `pdf`/`docx`/`pptx`. Generic, quick, **unbranded**. |
 | `typst_letter` / `typst_onepager` / `typst_presentation` | structured input → file | typst | Renders a **branded** PDF + PNG preview from operator-defined templates. Also emits an editable export (below). |
@@ -55,8 +55,8 @@ Each path below: **how it's done**, and the **expectation / limitation**.
 | Upload | How | Expectation / limitation |
 |---|---|---|
 | `.md`, `.txt`, `.csv`, `.json`, code | `fetch_attachment` → UTF-8 text | Full fidelity; the model sees the raw text. |
-| `.pdf` | `fetch_attachment` (text tier; image tier for scans) | Text-layer PDFs read cleanly; scanned PDFs fall back to a vision model per page. Layout/table structure is approximate. |
-| images | `fetch_attachment` → inline image for a vision model | Model can *see* it; no OCR-to-text unless it reads the image. |
+| `.pdf` | `fetch_attachment` (text tier; image or OCR tier for scans) | Text-layer PDFs read cleanly. A scan goes to the vision model per page, or — with [document OCR](ocr.md) configured — to the OCR backend, which is also the only route for a non-vision model. Layout/table structure is approximate. |
+| images | `fetch_attachment` → inline image for a vision model | Model can *see* it. With [document OCR](ocr.md) configured, uploaded images are also recognised to text automatically (and on demand via `mode="ocr"`), which is how a text-only model reads one. |
 | `.docx`, `.pptx`, `.xlsx` | **`fetch_attachment`** → verbatim structured JSON (+ `att:` image refs) | The primary path: a sandbox extractor returns titles/text/bullets/tables/notes with **no rewording**, and embedded images come back as `att:` refs to drop into a render. Use `convert_document(images)` on top only when the model needs to *see* the original layout. `.odt` and other Office variants still go via `convert_document`. |
 
 ### Producing a document

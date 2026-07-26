@@ -53,7 +53,7 @@ Every tool is **RBAC-gated per role**, and each user can flip their own grants o
 |---|---|---|
 | **Web & retrieval** | `search_web`, `fetch_url`, `wikipedia` | Search the web (SearXNG or Brave — configured under **Web search** on `/admin/models`, with optional per-query domain and recency filters), fetch any URL (**HTML is reduced to readable text** — headings, lists, links, tables and code survive, scripts and markup don't, so a page costs a few KB instead of a few hundred; `raw: true` when the markup itself is the point — images → viewable, other binary → metadata), and pull encyclopedic summaries. |
 | **Documents** | `fetch_attachment`, `upload_attachment`, `list_attachments`, `typst_*` | Read files the user attached — including **two-tier PDF** reading (extract the text layer first; rasterize scanned pages for a vision model if that comes back empty) with **page ranges** so a long document is read one window at a time instead of only its first pages — attach files back into its own reply, list every file in the conversation (uploads + earlier tool outputs) so assets get **reused instead of regenerated** (attachments resolve by id *or* bare filename, newest wins), and render **PDF/PNG documents** from operator-defined Typst templates (invoices, letters, reports). |
-| **Automatic document OCR** *(opt-in)* | `baidu/Unlimited-OCR` via the internal `ocr` pool | Send uploaded PDFs/images to the PDF-aware OCR sidecar, which converts PDFs internally and adds the result as untrusted document context. The feature is inactive unless `[chat.ocr].enabled = true` and a healthy `ocr` backend are both configured. See [`docs/ocr.md`](docs/ocr.md). |
+| **Automatic document OCR** *(opt-in)* | `baidu/Unlimited-OCR` via the internal `ocr` pool | Send uploaded images, and PDFs without a usable text layer, to the PDF-aware OCR sidecar and add the result as untrusted document context — cached by document hash, page-ordered, metered, with per-document status in the chat UI. The feature is inactive unless `[chat.ocr].enabled = true` and a healthy `ocr` backend are both configured. See [`docs/ocr.md`](docs/ocr.md). |
 | **Document canvas** | `create_document`, `edit_document`, `delete_document`, … | Build up a long document (report, spec, article) across turns and edit it section-by-section in a live side panel, then export it to PDF/DOCX/PPTX — instead of regenerating the whole thing every reply. Every change is a new version; the model can list the history and roll back (`list_document_versions`, `restore_document_version`), and several documents can coexist per conversation. Abandoned drafts can be **cleared away without losing anything**: `delete_document` is a soft delete — the document leaves the canvas and the model's listing but keeps its history, and `undelete_document` brings it back. Formats: markdown, text, html, json, toml, **typst** (draft the source in the canvas, render via `render_typst`/`export_document` — sections anchor on `=` headings), and yaml (text-edited so comments survive). See [`docs/file-conversions.md`](docs/file-conversions.md). |
 | **Images** | `generate_image`, `edit_image` | Generate an image from a text prompt (diagrams, mockups, marketing visuals) and, where the backend supports it, edit an existing image (image-to-image) — rendered inline in the reply. Routes to an `image`-kind upstream pool (any OpenAI `/images/*`-compatible backend: a hosted provider or a self-hosted model). `edit_image` appears only when a backend advertises edit support, and is refused against non-GDPR-compliant backends. |
 | **QR codes** | `generate_qr_code` | Generate a QR code natively in the gateway (no sandbox, no backend) — URLs, WiFi access, vCard/MeCard contacts, `mailto:`/`tel:`/`geo:`, SEPA GiroCode payments — as PNG or SVG, with custom colors and an optional centered logo from a chat attachment (error correction auto-raised to H). Attached inline in the reply. |
@@ -313,11 +313,18 @@ Notes:
 - Capability gating isn't done at the gateway — wire only multi-modal chat models into the pools. A mismatch surfaces as the upstream's own error in the chat bubble.
 - Past-turn attachments are stripped from the replayed history (kept as `[attached: name.ext (omitted)]` stubs) so the context window stays bounded.
 
-When automatic OCR is enabled, the current turn's PDF and image attachments are
-sent to the internal OCR sidecar before the chat request. The sidecar owns PDF
-conversion and calls Unlimited-OCR; the original upload remains available to
-the model. If no healthy `ocr` backend is configured, the gateway does not fetch
-the attachment for OCR and does not expose an OCR capability to the model.
+When automatic OCR is enabled, the current turn's image attachments — and any
+PDF whose text layer is too thin to trust — are sent to the internal OCR sidecar
+before the chat request. The sidecar owns PDF conversion and calls
+Unlimited-OCR; recognised text arrives in the user message as clearly delimited
+untrusted document data, and the original upload stays available through
+`fetch_attachment` (which also gains `mode="ocr"` and `mode="auto"`). Results are
+cached by document hash, so the same document is recognised once and reused on
+later turns and across restarts, and each run shows up as a `document_ocr` row
+in the turn's activity list with queued/running/completed/failed status. If no
+healthy `ocr` backend is configured, the gateway does not fetch the attachment
+for OCR and does not expose an OCR capability to the model. See
+[`docs/ocr.md`](docs/ocr.md).
 
 ### RAG (codebase search)
 

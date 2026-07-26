@@ -97,6 +97,10 @@ services:
       VLLM_BASE_URL: ${OCR_VLLM_BASE_URL:?set OCR_VLLM_BASE_URL to the Unlimited-OCR vLLM /v1 URL}
       VLLM_API_KEY: ${OCR_VLLM_API_KEY:-}
       OCR_MODEL: ${OCR_MODEL:-baidu/Unlimited-OCR}
+      # One inference call per page (default) keeps page numbers and survives a
+      # single page failing. Set to 1 for one multi-image call per document:
+      # cheaper, but the answer has no page structure. See docs/ocr.md.
+      OCR_MULTI_IMAGE: ${OCR_MULTI_IMAGE:-0}
     read_only: true
     tmpfs:
       - /tmp
