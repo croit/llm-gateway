@@ -19,6 +19,7 @@
 //! binary's wiring depends on it, so adding or editing a tool is a leaf-crate
 //! rebuild. See `docs/architecture.md`.
 
+pub mod ask_user;
 pub mod currency;
 pub mod document;
 pub mod edit_image;

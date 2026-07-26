@@ -48,6 +48,9 @@ const NOT_REAL_TOOLS: &[&str] = &["mcp__demo__echo"];
 /// real category for genuinely miscellaneous tools, so this test pins *which*
 /// ones rather than banning it. A new id landing here unannounced is the bug.
 const EXPECTED_UTILITY: &[&str] = &[
+    // Asking the user a question is an interaction primitive, not a
+    // capability area of its own.
+    "ask_user",
     "company_echo",
     "convert_currency",
     "enable_tools",

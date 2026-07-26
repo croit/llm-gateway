@@ -41,6 +41,7 @@ message rather than being absent.
 | `company_echo` | — | *(hidden)* | Smoke test for the tool-call loop. Hidden from `/tools` and from `enable_tools` via `is_hidden`; still RBAC-grantable. |
 | `get_current_timestamp` | — | `get_current_timestamp` | Timezone-aware current date/time, from the caller's `users.timezone`. |
 | `convert_currency` | — | `convert_currency` | Currency conversion at daily ECB reference rates. |
+| `ask_user` | yes | `ask_user` | Ask the user a short question mid-turn and wait for the answer, instead of guessing. Needs a live chat turn *and* someone watching it; times out and reports `answered: false` otherwise. |
 | `get_user_location` | — | `get_user_location` | Caller's location: a browser GPS prompt when a live chat turn is watching, else coarse GeoIP. |
 | `generate_qr_code` | yes | `generate_qr_code` | QR codes (URL, WiFi, vCard, SEPA) as PNG/SVG, rendered in-process. |
 | `search_web` | — | `search_web` | Web search via SearXNG or Brave, with optional domain and recency filters. Backend configured on `/admin/models`. |
@@ -63,10 +64,14 @@ message rather than being absent.
 | `rag_search` | — | `rag_search` | Hybrid search (dense kNN fused with FTS5/BM25) over an indexed collection. Returns chunks with path, line range, score. |
 | `rag_list_collections` | — | `rag_list_collections` | Discover which collections exist before searching them. |
 | `remember` | — | `memory` | Persist a durable fact about the user. |
-| `recall` | — | `memory` | Retrieve everything remembered about the user. |
+| `recall` | — | `memory` | Retrieve everything remembered about the user, each with its `id`. |
+| `update_memory` | — | `memory` | Correct a stored fact in place, addressed by the id `recall` returned. |
+| `forget` | — | `memory` | Delete a stored fact by id. |
 
-The canvas tools and the memory pair collapse to the `document` and `memory`
-keys respectively — see `DOCUMENT_IDS` / `MEMORY_IDS` in `catalog`.
+The canvas tools and the four memory tools collapse to the `document` and
+`memory` keys respectively — see `DOCUMENT_IDS` / `MEMORY_IDS` in `catalog`.
+Turning `memory` off has to remove the mutating tools too, not just the
+read/write pair.
 
 ## Conditionally registered
 

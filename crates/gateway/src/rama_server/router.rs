@@ -274,6 +274,7 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
             "/api/v0/me/location/feedback/{turn_id}",
             api::location_feedback,
         )
+        .with_post("/api/v0/me/ask/feedback/{turn_id}", api::ask_feedback)
         .with_get("/api/v0/rag/collections", rag_api::list_collections)
         .with_post("/api/v0/rag/collections", rag_api::create_collection)
         .with_get("/api/v0/rag/collections/{id}", rag_api::get_collection)

@@ -29,7 +29,16 @@ pub struct RamaState {
     /// `get_user_location` parks on it while waiting for the user to
     /// share a precise position; `POST /api/v0/me/location/feedback/{id}`
     /// resolves it. See `server::tools::feedback`.
-    pub location_feedback: Arc<crate::server::tools::feedback::FeedbackHub>,
+    pub location_feedback: Arc<
+        crate::server::tools::feedback::FeedbackHub<crate::server::tools::feedback::BrowserFix>,
+    >,
+    /// The same rendezvous for `ask_user`: the tool parks on it after
+    /// injecting a question, and `POST /api/v0/me/ask/feedback/{id}` resolves
+    /// it. A separate hub (not a shared one keyed only by turn id) so the two
+    /// endpoints can't un-park each other's tool — a turn can legitimately
+    /// have both pending.
+    pub ask_feedback:
+        Arc<crate::server::tools::feedback::FeedbackHub<crate::server::tools::feedback::AskReply>>,
     /// Fire-and-forget usage-metrics sink. The proxy, chat driver, and
     /// scheduler hand it a `UsageRecord` per upstream call; a background
     /// task batches the writes. `disabled()` when `[usage] enabled = false`,
@@ -61,6 +70,7 @@ impl RamaState {
             sessions,
             chats: Arc::new(SessionWorkers::default()),
             location_feedback: Arc::new(crate::server::tools::feedback::FeedbackHub::default()),
+            ask_feedback: Arc::new(crate::server::tools::feedback::FeedbackHub::default()),
             usage,
             enforcer,
             topology_dirty: Arc::new(AtomicU32::new(0)),

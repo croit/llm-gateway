@@ -79,7 +79,9 @@ dependency doesn't change the trait signature:
 - **Optional subsystems** — `geoip`, `indexer` (RAG), `image_gen`,
   `sandbox_lease` (one container per turn, so successive `run_in_sandbox` calls
   share `/work`), `chat_feedback` (push UI onto the live SSE stream and await a
-  browser reply; `get_user_location` uses it).
+  browser reply — `get_user_location` asks for a position, `ask_user` asks a
+  question; one hub per reply shape, so the two endpoints can't un-park each
+  other's tool).
 
 Every optional field is `None` where that subsystem isn't configured, and tools
 are expected to degrade with a clear message rather than assume. Tools never

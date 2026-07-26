@@ -78,6 +78,18 @@ declare global {
             declineForTurn(turnId: string): Promise<void>;
         };
         /**
+         * Mid-turn question prompts from the assistant's `ask_user` tool.
+         * `pick` selects an option (and submits straight away unless the
+         * question is multi-select), `submit` sends the picked options plus any
+         * typed text, `dismiss` skips. Called from `data-on:*` on the injected
+         * `#ask-prompt-{turnId}` card. Owned by `ui/ts/ask.ts`.
+         */
+        ask: {
+            pick(turnId: string, btn: HTMLElement, multi: boolean): void;
+            submit(turnId: string): Promise<void>;
+            dismiss(turnId: string): Promise<void>;
+        };
+        /**
          * Web Push opt-in for turn-complete notifications. `enable(btn)`
          * requests permission + subscribes this browser and registers it with
          * the gateway; `disable(btn)` unsubscribes and forgets it. Called from

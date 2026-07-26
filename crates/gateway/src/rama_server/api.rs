@@ -507,6 +507,11 @@ pub async fn clear_location(State(state): State<Arc<RamaState>>, req: Request) -
 /// or "not now" (body `{ "denied": true }`) on the prompt the tool
 /// injected. Resolves the parked tool via the feedback hub; a shared
 /// position is also persisted so the next turn skips the prompt.
+///
+/// Verifies the turn belongs to the caller — see [`ask_feedback`] for why a
+/// session cookie alone isn't enough. Here it matters twice over: an answer
+/// also *persists a position on the user row*, so without the check a
+/// logged-in user could write a location onto whoever owns the turn.
 pub async fn location_feedback(
     State(state): State<Arc<RamaState>>,
     Path(turn_id): Path<String>,
@@ -543,6 +548,17 @@ pub async fn location_feedback(
         }
     };
 
+    // Only the turn's own user may answer it. An unknown turn is reported the
+    // same way as someone else's, so this can't be used to probe for live turns.
+    match session_core::db::user_for_turn(&state.db, &turn_id).await {
+        Ok(Some(owner)) if owner == session.user_id => {}
+        Ok(_) => return invalid_request("no such pending prompt"),
+        Err(err) => {
+            tracing::warn!(error = %err, "location_feedback user_for_turn");
+            return internal_error("could not verify the prompt");
+        }
+    }
+
     let fix = if parsed.denied {
         BrowserFix::Declined
     } else {
@@ -564,6 +580,91 @@ pub async fn location_feedback(
     // Whoever's parked on this turn (if anyone — the tool may have timed
     // out) gets the reply. We don't treat "no one waiting" as an error.
     state.location_feedback.resolve(&turn_id, fix);
+    json_ok(&json!({ "ok": true }))
+}
+
+/// POST /api/v0/me/ask/feedback/{turn_id} — answer an in-flight `ask_user`
+/// question for assistant turn `turn_id`.
+///
+/// Posted by `ask.ts` when the user picks an option, types an answer, or skips.
+/// Body is `{choices: [..], text: "..."}` for an answer or `{"dismissed": true}`
+/// to skip. Resolves the parked tool via the ask feedback hub.
+///
+/// Unlike [`location_feedback`], this **verifies the turn belongs to the
+/// caller**. A session cookie alone is not enough: without the check any
+/// logged-in user who learned a turn id could answer someone else's question,
+/// injecting text straight into another user's model context. Turn ids are
+/// UUIDs so it isn't trivially exploitable, but "hard to guess" is not an
+/// authorisation model.
+pub async fn ask_feedback(
+    State(state): State<Arc<RamaState>>,
+    Path(turn_id): Path<String>,
+    req: Request,
+) -> Response {
+    use gateway_runtime::server::tools::feedback::AskReply;
+
+    let session = match require_session(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return invalid_request(&msg),
+    };
+    #[derive(serde::Deserialize)]
+    struct Body {
+        #[serde(default)]
+        choices: Vec<String>,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        dismissed: bool,
+    }
+    let parsed: Body = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(err) => {
+            return invalid_request(&format!(
+                "expected {{choices, text}} or {{\"dismissed\":true}}: {err}"
+            ));
+        }
+    };
+
+    // Only the turn's own user may answer it. An unknown turn is reported the
+    // same way as someone else's, so this can't be used to probe for live turns.
+    match session_core::db::user_for_turn(&state.db, &turn_id).await {
+        Ok(Some(owner)) if owner == session.user_id => {}
+        Ok(_) => return invalid_request("no such pending question"),
+        Err(err) => {
+            tracing::warn!(error = %err, "ask_feedback user_for_turn");
+            return internal_error("could not verify the question");
+        }
+    }
+
+    let reply = if parsed.dismissed {
+        AskReply::Dismissed
+    } else {
+        let choices: Vec<String> = parsed
+            .choices
+            .into_iter()
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        let text = parsed
+            .text
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        // An empty answer is a dismissal in disguise; treating it as an answer
+        // would hand the model `answered: true` with nothing in it.
+        if choices.is_empty() && text.is_none() {
+            AskReply::Dismissed
+        } else {
+            AskReply::Answered { choices, text }
+        }
+    };
+    // Whoever's parked on this turn (if anyone — the tool may have timed out)
+    // gets the reply. "No one waiting" is not an error.
+    state.ask_feedback.resolve(&turn_id, reply);
     json_ok(&json!({ "ok": true }))
 }
 
