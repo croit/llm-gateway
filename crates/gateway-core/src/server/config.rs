@@ -549,13 +549,49 @@ pub struct ChatConfig {
     pub compaction: CompactionConfig,
 }
 
+/// Automatic document OCR. Off by default; even switched on, nothing happens
+/// unless a healthy `kind = "ocr"` pool serves a model.
+///
+/// Every limit here exists because OCR is the most expensive derived artefact
+/// the gateway produces — an unbounded scan is N vision-model calls on someone
+/// else's page count — so the defaults are deliberately conservative and an
+/// operator raises them knowingly.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OcrConfig {
     pub enabled: bool,
+    /// OCR model id. `None` uses whatever the `ocr` pool advertises, which is
+    /// the right default for the single-backend case.
     pub model: Option<String>,
+    /// Output-token cap per OCR inference call.
     pub max_tokens: usize,
+    /// Unlimited-OCR's repetition-control window.
     pub ngram_window: usize,
+    /// Largest document accepted for OCR. Bigger uploads are left to the
+    /// normal attachment path (the model can still fetch them).
+    pub max_bytes: usize,
+    /// Page ceiling per document. A longer document is recognised up to this
+    /// many pages and reported as partial rather than refused — a truncated
+    /// 200-page contract is more useful than nothing.
+    pub max_pages: usize,
+    /// Rasterisation DPI the sidecar renders PDF pages at. Part of the cache
+    /// identity: changing it invalidates cached results.
+    pub dpi: u32,
+    /// Ceiling on recognised text kept per document. Guards the chat context
+    /// (and the cache row) against a pathological OCR run.
+    pub max_output_chars: usize,
+    /// Wall-clock budget for one document's OCR, including the sidecar's own
+    /// rasterisation and per-page inference.
+    pub timeout_secs: u64,
+    /// How many documents may be OCR'd at once across the whole gateway. The
+    /// backend is a GPU service; queueing is better than thrashing it.
+    pub max_concurrency: usize,
+    /// Auto-mode scan detector: a PDF page carrying at least this many
+    /// non-whitespace characters in its text layer counts as "born digital".
+    /// A document where fewer than half the pages clear the bar is treated as
+    /// scanned and sent to OCR. Character counting (rather than words or any
+    /// language-specific signal) keeps this working for every script.
+    pub auto_min_text_chars_per_page: usize,
 }
 
 impl Default for OcrConfig {
@@ -565,6 +601,13 @@ impl Default for OcrConfig {
             model: None,
             max_tokens: 32_768,
             ngram_window: 1_024,
+            max_bytes: 32 * 1024 * 1024,
+            max_pages: 64,
+            dpi: 300,
+            max_output_chars: 400_000,
+            timeout_secs: 20 * 60,
+            max_concurrency: 2,
+            auto_min_text_chars_per_page: 40,
         }
     }
 }

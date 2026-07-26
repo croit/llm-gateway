@@ -51,7 +51,7 @@ message rather than being absent.
 | `dns_lookup` | — | `dns_lookup` | DNS records over DoH. |
 | `whois_lookup` | — | `whois_lookup` | Domain registration via RDAP. |
 | `tls_cert` | — | `tls_cert` | TLS certificate inspection (issuer, validity, days to expiry, SANs). |
-| `fetch_attachment` | — | `fetch_attachment` | Read an attachment. Two-tier PDF reading (text layer, then rasterised pages) with `page_from`/`page_to`; Office files return structured content. |
+| `fetch_attachment` | — | `fetch_attachment` | Read an attachment. Tiered PDF reading — text layer, rasterised pages, `mode="ocr"` (gateway OCR, images too), `mode="auto"` (text-or-OCR) — with `page_from`/`page_to`; Office files return structured content. |
 | `upload_attachment` | yes | `upload_attachment` | Attach a model-generated file to the reply. |
 | `list_attachments` | yes | `list_attachments` | Inventory of the conversation's files, so assets get reused instead of regenerated. |
 | `load_image_url` | yes | `load_image_url` | Fetch an image from a URL and keep it as a reusable conversation attachment. |

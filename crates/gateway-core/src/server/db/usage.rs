@@ -64,6 +64,11 @@ pub enum UsageKind {
     Transcription,
     Image,
     Speech,
+    /// Document OCR through the internal `ocr` pool. Metered like chat (the
+    /// backend is a vision LLM and reports token usage), with the page count
+    /// carried in `input_units` so an operator can see how much document work
+    /// a user's uploads caused.
+    Ocr,
 }
 
 impl UsageKind {
@@ -74,6 +79,7 @@ impl UsageKind {
             UsageKind::Transcription => "transcription",
             UsageKind::Image => "image",
             UsageKind::Speech => "speech",
+            UsageKind::Ocr => "ocr",
         }
     }
 }
