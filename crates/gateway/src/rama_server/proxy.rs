@@ -290,6 +290,9 @@ fn proxy_tool_ctx(
             state.usage.clone(),
             state.db.clone(),
         )),
+        // Shared with the chat path: a `/v1` client asking for OCR text hits
+        // the same derivative cache and the same concurrency gate.
+        ocr: Some(state.ocr.clone()),
         // Per-request sandbox lease (the /v1 loop = one turn), so a client's
         // multi-round `run_in_sandbox` reuses one container. `None` when the
         // sandbox isn't configured. Released when the loop ends (see runner).

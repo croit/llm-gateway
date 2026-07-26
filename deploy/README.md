@@ -82,7 +82,16 @@ The OCR sidecar is inactive unless all of the following are true:
 2. An `ocr` pool and backend are configured at `/admin/upstreams`, pointing at `http://ocr-sidecar:9100` with `baidu/Unlimited-OCR` in its model list.
 3. `[chat.ocr].enabled = true` is set in `gateway.toml`.
 
-Without an available `ocr` backend the gateway neither fetches attachments for OCR nor sends OCR tools or models to an LLM. The sidecar accepts the original PDF/image at `/ocr`, converts PDFs internally, and calls vLLM with the model-specific request recipe. See [`../docs/ocr.md`](../docs/ocr.md).
+Without an available `ocr` backend the gateway neither fetches attachments for OCR nor sends OCR tools or models to an LLM. The sidecar accepts the original PDF/image at `/ocr`, converts PDFs internally, and calls vLLM with the model-specific request recipe.
+
+Operationally worth knowing:
+
+- Results are cached in the gateway's `ocr_derivatives` table by document hash + model + prompt version + settings, so a document costs one OCR run no matter how many turns reference it, and the cache survives restarts. Changing `dpi`, `max_tokens`, `ngram_window`, `max_pages`, or `max_output_chars` invalidates it by design.
+- The sidecar issues one inference call **per page** by default (page numbers survive, one bad page doesn't lose the document). `OCR_MULTI_IMAGE=1` switches to one call per document.
+- OCR work is metered like any upstream call: `usage_events` rows with `kind = "ocr"`, tokens from the sidecar, and pages in `input_units`. Cache hits cost nothing and are not recorded.
+- `[chat.ocr] max_concurrency` bounds documents in flight gateway-wide; everything else queues (visibly, in the chat UI).
+
+See [`../docs/ocr.md`](../docs/ocr.md).
 
 ---
 

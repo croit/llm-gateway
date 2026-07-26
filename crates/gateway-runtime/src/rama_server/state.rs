@@ -44,6 +44,15 @@ pub struct RamaState {
     /// task batches the writes. `disabled()` when `[usage] enabled = false`,
     /// where `emit` is a no-op. See `server::usage`.
     pub usage: UsageHandle,
+    /// Automatic document OCR: the derivative cache, the limits, the shared
+    /// concurrency gate, and the usage accounting. Always present — the
+    /// service reports itself unavailable when `[chat.ocr] enabled = false` or
+    /// no healthy `ocr` pool serves a model, and the chat path then behaves
+    /// exactly as it did before OCR existed. Lives here (not on `AppState`)
+    /// because it needs the usage sink, and it must be *one* instance:
+    /// per-request services would each get their own semaphore and bound
+    /// nothing.
+    pub ocr: gateway_features::server::ocr::OcrService,
     /// Rate-limit / quota gate, consulted by the `/v1` proxy, the chat send
     /// path, and the scheduler before a call runs. Reads the same DB; a no-op
     /// when `[limits] enabled = false` or the caller has no rules. See
@@ -65,6 +74,7 @@ impl RamaState {
             inner.db.clone(),
             inner.config.limits.enabled,
         ));
+        let ocr = build_ocr(&inner, &usage);
         Self {
             inner,
             sessions,
@@ -72,6 +82,7 @@ impl RamaState {
             location_feedback: Arc::new(crate::server::tools::feedback::FeedbackHub::default()),
             ask_feedback: Arc::new(crate::server::tools::feedback::FeedbackHub::default()),
             usage,
+            ocr,
             enforcer,
             topology_dirty: Arc::new(AtomicU32::new(0)),
         }
@@ -99,6 +110,9 @@ impl RamaState {
     /// Swap in a different usage sink. Mainly for tests, which build state
     /// with a disabled handle and opt into a live metered one.
     pub fn with_usage(mut self, usage: UsageHandle) -> Self {
+        // Rebuild the OCR service against the new sink: it captured the old
+        // one, and a test that opts into metering expects OCR rows too.
+        self.ocr = build_ocr(&self.inner, &usage);
         self.usage = usage;
         self
     }
@@ -110,6 +124,19 @@ impl RamaState {
         self.inner = self.inner.with_push(push);
         self
     }
+}
+
+/// Build the shared OCR service from an [`AppState`]'s config + handles.
+/// Constructing it is cheap and never fails: an unconfigured service simply
+/// reports itself unavailable.
+fn build_ocr(inner: &AppState, usage: &UsageHandle) -> gateway_features::server::ocr::OcrService {
+    gateway_features::server::ocr::OcrService::new(
+        inner.config.chat.ocr.clone(),
+        inner.upstreams.clone(),
+        inner.http.clone(),
+        usage.clone(),
+        inner.db.clone(),
+    )
 }
 
 impl Deref for RamaState {

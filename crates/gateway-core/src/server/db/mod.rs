@@ -24,6 +24,7 @@ pub mod limits;
 pub mod mcp_audit;
 pub mod mcp_catalog;
 pub mod model_defaults;
+pub mod ocr_derivatives;
 pub mod push_subscriptions;
 pub mod rag;
 pub mod skill_grants;
