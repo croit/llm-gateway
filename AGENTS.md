@@ -172,6 +172,7 @@ Start in [`docs/README.md`](docs/README.md) for the index. The topical docs:
 | OpenAI-compat endpoints, streaming, transcription | [`docs/gateway-api.md`](docs/gateway-api.md) |
 | Multi-provider routing, load balancing, health checks | [`docs/upstreams.md`](docs/upstreams.md) |
 | Tool registry, role→tool mapping, execution loop | [`docs/tools-rbac.md`](docs/tools-rbac.md) |
+| Which tools exist, their gates and toggle keys | [`docs/tools-inventory.md`](docs/tools-inventory.md) |
 | Web UI — plait + daisyUI + datastar SSE patterns | [`docs/ui.md`](docs/ui.md) |
 | Testing strategy and required coverage | [`docs/testing.md`](docs/testing.md) |
 | Error handling — types, messages, OpenAI mapping | [`docs/errors.md`](docs/errors.md) |

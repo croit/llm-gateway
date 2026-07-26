@@ -40,6 +40,7 @@ mod sidebar_nav;
 mod skills_user_page;
 mod tool_loop;
 mod tool_prefs;
+mod tools_inventory;
 mod transcriptions;
 mod typst_compile;
 mod ui_chrome;
