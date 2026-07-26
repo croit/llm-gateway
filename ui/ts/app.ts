@@ -29,6 +29,7 @@ import './chat/thinking-timer.js';
 import './clipboard.js';
 import './canvas.js';
 import './geo.js';
+import './ask.js';
 import './push.js';
 import './feedback.js';
 import { initFeedbackCapture } from './feedback-capture.js';

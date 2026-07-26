@@ -148,13 +148,16 @@ impl ToolContext {
 
 /// Chat-only handles a tool needs to run an interactive prompt while a
 /// turn is streaming: push UI onto the live SSE stream (`broadcast`,
-/// via `TurnUpdate::Inject`) and await the browser's reply (`hub`). Only
-/// populated on the chat-page path — proxy / bearer callers have no
-/// browser and no live turn to prompt against.
+/// via `TurnUpdate::Inject`) and await the browser's reply (one hub per
+/// reply shape). Only populated on the chat-page path — proxy / bearer
+/// callers have no browser and no live turn to prompt against.
 #[derive(Clone)]
 pub struct ChatFeedback {
     pub broadcast: tokio::sync::broadcast::Sender<session_core::workers::TurnUpdate>,
-    pub hub: std::sync::Arc<feedback::FeedbackHub>,
+    /// Where `get_user_location` parks waiting for a position.
+    pub hub: std::sync::Arc<feedback::FeedbackHub<feedback::BrowserFix>>,
+    /// Where `ask_user` parks waiting for an answer to a question.
+    pub ask_hub: std::sync::Arc<feedback::FeedbackHub<feedback::AskReply>>,
     /// Whether the browser is on a secure context (so `navigator.
     /// geolocation` is actually allowed). When false, the tool skips the
     /// futile precise-location prompt, warns inline, and falls back to

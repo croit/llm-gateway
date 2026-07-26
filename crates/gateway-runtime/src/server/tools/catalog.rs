@@ -28,10 +28,13 @@ pub use gateway_core::server::tool_naming::{
 /// rejects template ids ending in any of them so the strip is unambiguous.
 const TYPST_VARIANT_SUFFIXES: &[&str] = &["_edit", "_read", "_pptx"];
 
-/// The `remember` + `recall` tools are two halves of one capability, so
-/// they collapse to a single "memory" toggle — one switch turns
-/// per-user memory on or off as a whole.
-const MEMORY_IDS: &[&str] = &["remember", "recall"];
+/// The memory tools are facets of one capability, so they collapse to a
+/// single "memory" toggle — one switch turns per-user memory on or off as a
+/// whole. `update_memory` and `forget` belong on the same switch as
+/// `remember`: a user who turns memory off must not be left with tools that
+/// can still mutate the store, and one who turns it on needs the store to be
+/// correctable, not append-only.
+const MEMORY_IDS: &[&str] = &["remember", "recall", "update_memory", "forget"];
 const MEMORY_KEY: &str = "memory";
 
 /// The document-canvas tools are one capability — building up and editing
@@ -225,6 +228,8 @@ pub fn requires_chat_session(tool_id: &str) -> bool {
         || tool_id == "generate_qr_code"
         || tool_id == "load_image_url"
         || tool_id == "read_sandbox_output"
+        // Needs a live turn *and* a human watching it to answer.
+        || tool_id == "ask_user"
 }
 
 /// `mcp__<server>__<tool>` → `mcp__<server>` (the per-server toggle key).
@@ -267,11 +272,16 @@ pub fn category_for(tool_id: &str) -> Category {
         _ if tool_id.starts_with(TYPST_PREFIX) => Category::Templates,
         _ if tool_id.starts_with(COMFYUI_PREFIX) => Category::ComfyMedia,
         _ if DOCUMENT_IDS.contains(&tool_id) => Category::Documents,
-        "remember" | "recall" => Category::Memory,
+        // Against the list, not literals: adding a fifth memory tool must not
+        // be able to categorise it as Utility by omission. (It could, until
+        // `update_memory` and `forget` landed and the drift guard said so.)
+        _ if MEMORY_IDS.contains(&tool_id) => Category::Memory,
         _ if tool_id.starts_with(crate::server::tools::mcp::MCP_ID_PREFIX) => {
             Category::Integrations
         }
-        // `get_user_location` and any future tool fall here.
+        // `get_user_location`, `ask_user` and any future tool fall here. The
+        // inventory guard pins the expected set, so a *new* id landing here is
+        // caught rather than silently accepted.
         _ => Category::Utility,
     }
 }
@@ -334,6 +344,12 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Current date & time",
             "Gives the assistant today's date and the current time in your timezone — for \
              questions like \"what's due today\" or scheduling.",
+        ),
+        "ask_user" => (
+            "Clarifying questions",
+            "Lets the assistant ask you a short question mid-answer — which option you \
+             meant, which file to use — and wait for your reply, instead of guessing and \
+             producing work you did not want.",
         ),
         "get_user_location" => (
             "Your location",
@@ -541,10 +557,12 @@ pub fn entries(
                 out.push(ToolEntry {
                     key: MEMORY_KEY.to_string(),
                     title: "Memory".to_string(),
-                    tech: "remember + recall".to_string(),
+                    tech: MEMORY_IDS.join(" + "),
                     description: "Lets the assistant remember durable facts about you \
-                                  (preferences, ongoing projects) and recall them in later \
-                                  conversations. Stored only for your account."
+                                  (preferences, ongoing projects), recall them in later \
+                                  conversations, and correct or delete one when it changes. \
+                                  Stored only for your account; you can review and edit \
+                                  everything on the Memory page."
                         .to_string(),
                     category: Category::Memory,
                 });
@@ -734,6 +752,21 @@ mod tests {
     /// `read_sandbox_output` resolves its `full_output_ref` against the
     /// *current turn's* attachments and hard-fails without one, so the `/v1`
     /// proxy paths must not advertise it — every call there would error.
+    /// Every memory tool shares the one toggle *and* the one category. Both
+    /// used to be spelled out as literals, so adding `update_memory` /
+    /// `forget` left them in `Utility` and outside the switch.
+    #[test]
+    fn every_memory_tool_shares_the_toggle_and_the_category() {
+        for id in MEMORY_IDS {
+            assert_eq!(entry_key_for(id), MEMORY_KEY, "`{id}` toggle key");
+            assert_eq!(category_for(id), Category::Memory, "`{id}` category");
+        }
+        // And the mutating pair is really in the list — a toggle that leaves
+        // them on would let a user who disabled memory still have it written.
+        assert!(MEMORY_IDS.contains(&"forget"));
+        assert!(MEMORY_IDS.contains(&"update_memory"));
+    }
+
     #[test]
     fn read_sandbox_output_is_chat_only() {
         assert!(requires_chat_session("read_sandbox_output"));

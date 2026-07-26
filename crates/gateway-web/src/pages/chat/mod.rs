@@ -1582,12 +1582,14 @@ async fn spawn_assistant_worker(
         session_id.to_string(),
         assistant_turn_id.to_string(),
         req.client_ip,
-        // Chat path: hand the tool the live turn's broadcast + the
-        // feedback hub so `get_user_location` can prompt the browser
-        // for a precise position and wait for the reply.
+        // Chat path: hand the tools the live turn's broadcast + the feedback
+        // hubs, so `get_user_location` can prompt for a precise position and
+        // `ask_user` can ask a question — both mid-turn, both waiting for the
+        // browser's reply.
         Some(gateway_runtime::server::tools::ChatFeedback {
             broadcast: worker.broadcast.clone(),
             hub: state.location_feedback.clone(),
+            ask_hub: state.ask_feedback.clone(),
             secure: req.secure,
         }),
     );

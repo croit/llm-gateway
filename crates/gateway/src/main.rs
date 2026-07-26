@@ -196,8 +196,17 @@ async fn main() -> anyhow::Result<()> {
         .with(gateway_tools::list_attachments::ListAttachments)
         .with(gateway_tools::search_web::SearchWeb)
         .with(gateway_tools::location::GetUserLocation)
+        // Mid-turn question prompt. Configuration-free; the runtime gate is
+        // `chat_feedback` being present, so it errors cleanly off the chat path
+        // (and `requires_chat_session` keeps it out of the /v1 tool list).
+        .with(gateway_tools::ask_user::AskUser)
         .with(gateway_tools::memory::Remember)
         .with(gateway_tools::memory::Recall)
+        // Correcting a memory needs no config either, and without these the
+        // store is append-only: a changed fact could only be answered by a
+        // second, contradicting memory.
+        .with(gateway_tools::memory::UpdateMemory)
+        .with(gateway_tools::memory::Forget)
         // Read-only public-data lookups — no secrets, no writes, safe to
         // leave always-on.
         .with(gateway_tools::netcheck::DnsLookup)
