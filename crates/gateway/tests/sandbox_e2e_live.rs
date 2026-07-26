@@ -125,6 +125,7 @@ fn ctx(pool: db::Pool, asst_turn: &str) -> ToolContext {
         indexer: None,
         image_gen: None,
         sandbox_lease: None,
+        browser_lease: None,
         crypto: None,
         push: None,
         model: None,
@@ -240,4 +241,159 @@ async fn run_in_sandbox_auto_stages_round_upload() {
         "staged_files missing the round deck: {out}"
     );
     eprintln!("PASS run_in_sandbox: round upload auto-staged and read inside the sandbox");
+}
+
+// ---------------------------------------------------------------------------
+// browse_page against a real runner.
+//
+// The unit tests cover argument validation and what the driver says. What they
+// cannot cover is the claim the tool rests on: that a daemon started detached
+// inside a leased container is STILL THERE for the next tool call, with its
+// browser and page state intact. That is a property of podman + gVisor +
+// Playwright, not of our Rust.
+//
+// Runs WITHOUT egress on purpose, driving `read` on the browser's blank start
+// page rather than a real site: the mechanism under test (daemon boot, socket
+// reuse, cross-call state) is identical either way, and this way the test works
+// on a runner with no network — which is what most deployments look like.
+//
+// Needs a runner that supports LEASES (`container_id` in the response). Against
+// an older runner the persistence half is skipped with a loud message rather
+// than silently passing.
+//
+//   RUN_SANDBOX_E2E=1 RUNNER_URL=http://127.0.0.1:19000 \
+//   cargo test -p gateway --test sandbox_e2e_live -- --nocapture browse_page
+
+use gateway_runtime::server::tools::sandbox::{BrowsePage, SandboxLease};
+
+/// A context carrying a real browser lease against the configured runner.
+fn browser_ctx(pool: db::Pool, lease: Arc<SandboxLease>) -> ToolContext {
+    ToolContext {
+        browser_lease: Some(lease),
+        ..ctx(pool, "t-browse")
+    }
+}
+
+#[tokio::test]
+async fn browse_page_session_survives_across_calls() {
+    if !enabled() {
+        eprintln!("skipping: set RUN_SANDBOX_E2E=1 to run the live sandbox E2E");
+        return;
+    }
+    let client = client();
+    // The tool refuses without egress, and this runner may not report any.
+    // Probe so the refusal (if it comes) is the real one rather than a stale
+    // `EGRESS_UNKNOWN` guess.
+    client.probe_capabilities().await;
+    let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+    let lease = SandboxLease::new(client.clone());
+    let tool = BrowsePage(client.clone());
+
+    // Call 1: boots the daemon (Chromium cold start) and reads the blank page.
+    let first = tool
+        .run(
+            browser_ctx(pool.clone(), lease.clone()),
+            json!({"action": "read"}),
+        )
+        .await;
+    let first = match first {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e.to_string();
+            // Two shapes of the same condition: the tool's own refusal (a
+            // runner that *reported* no egress) and the runner's 400 (an older
+            // runner that reports nothing, so the tool optimistically tried).
+            if msg.contains("no network egress") || msg.contains("egress requested but not") {
+                eprintln!(
+                    "SKIP: this runner cannot grant egress, so browse_page cannot run. \
+                     Set SANDBOX_EGRESS_NETWORK + SANDBOX_EGRESS_PROXY on the runner to \
+                     exercise it ({msg})"
+                );
+                return;
+            }
+            panic!("browse_page read failed: {msg}");
+        }
+    };
+    eprintln!(
+        "first call: {}",
+        serde_json::to_string_pretty(&first).unwrap()
+    );
+    assert_eq!(first["action"], "read");
+    assert!(
+        first.get("url").is_some(),
+        "the daemon must report the page url: {first}"
+    );
+    assert!(
+        first.get("elements").is_some(),
+        "a read must return the element list (even if empty): {first}"
+    );
+
+    // Call 2: proves the daemon (and therefore Chromium) is still alive. If the
+    // runner granted a lease, this reuses the same container — the actual
+    // persistence claim. Without lease support every call gets a fresh
+    // container, so the assertion below would only prove the daemon boots.
+    let second = tool
+        .run(
+            browser_ctx(pool.clone(), lease.clone()),
+            json!({"action": "read"}),
+        )
+        .await
+        .expect("second browse_page call");
+    eprintln!(
+        "second call: {}",
+        serde_json::to_string_pretty(&second).unwrap()
+    );
+    assert_eq!(second["action"], "read");
+    assert!(
+        second.get("error").is_none(),
+        "the session must still answer on the second call: {second}"
+    );
+
+    // The decisive step, when an allowlisted URL is available: navigate, then
+    // `read` in a SEPARATE call. Two `read`s of `about:blank` would look
+    // identical whether or not state persisted — only a navigation proves the
+    // second call reached the same browser. Needs a URL the operator's egress
+    // allowlist permits, so it's opt-in:
+    //   BROWSE_E2E_URL=https://pypi.org/simple/
+    let Ok(url) = std::env::var("BROWSE_E2E_URL") else {
+        eprintln!(
+            "PASS (partial): daemon booted and answered two successive calls. Set              BROWSE_E2E_URL=<an allowlisted url> to also prove page state persists."
+        );
+        lease.release().await;
+        return;
+    };
+
+    let nav = tool
+        .run(
+            browser_ctx(pool.clone(), lease.clone()),
+            json!({"action": "navigate", "url": url}),
+        )
+        .await
+        .expect("navigate");
+    eprintln!("navigate: {}", serde_json::to_string_pretty(&nav).unwrap());
+    assert_eq!(nav["http_status"], 200, "navigation did not succeed: {nav}");
+    let navigated_to = nav["url"].as_str().unwrap_or_default().to_string();
+    assert!(navigated_to.starts_with("http"), "{nav}");
+
+    let after = tool
+        .run(
+            browser_ctx(pool.clone(), lease.clone()),
+            json!({"action": "read"}),
+        )
+        .await
+        .expect("read after navigate");
+    assert_eq!(
+        after["url"].as_str().unwrap_or_default(),
+        navigated_to,
+        "a separate call must land on the SAME page — state did not persist: {after}"
+    );
+    assert!(
+        !after["text"].as_str().unwrap_or_default().is_empty(),
+        "the persisted page should still have its text: {after}"
+    );
+    eprintln!(
+        "PASS browse_page: navigated in one call, still on {navigated_to} in the next          (page text {} chars) — the session really persists",
+        after["text"].as_str().unwrap_or_default().len()
+    );
+    lease.release().await;
 }

@@ -12,7 +12,8 @@ tools:
 |---|---|
 | `run_in_sandbox` | Run arbitrary Python or shell; returns stdout/stderr + any files written. |
 | `generate_document` | Markdown → PDF / DOCX / PPTX via pandoc (a safe preset). |
-| `capture_webpage` | Headless-chromium screenshot / PDF / text of a URL (needs egress). |
+| `capture_webpage` | Headless-chromium screenshot / PDF / text of a URL — one shot, no interaction (needs egress). |
+| `browse_page` | A browser session that stays open across tool calls: navigate, read, click, fill, screenshot, console (needs egress). See [Browser sessions](#browser-sessions-browse_page). |
 | `convert_document` | Convert an uploaded file (pptx/docx/xlsx/odf/pdf) to PDF / DOCX / TXT / HTML / per-slide images via LibreOffice. |
 | `edit_presentation` | Modify an uploaded `.pptx` with python-pptx (`input.pptx` → `output.pptx`). |
 | `render_excalidraw` | Render an Excalidraw scene (model-authored or uploaded `.excalidraw`/`.json`) to SVG / PNG / PDF via excalirender. |
@@ -157,7 +158,9 @@ Edit `sandbox-image/Containerfile` to add or trim tools, then rebuild/push.
   pool of pre-booted sandboxes hides cold-start latency.
 - **Default-deny network:** a sandbox has no network unless the call requests
   it *and* the operator wired an egress proxy, which only forwards to an
-  allowlist.
+  allowlist. The gateway *asks the runner* whether egress exists and stops
+  advertising the web tools when it doesn't — see
+  [Egress and the capability probe](#egress-and-the-capability-probe).
 
 Because gateway↔runner is just HTTP, the runner tier can live on separate
 hosts and scale independently (each runner uses its own host's local podman) —
@@ -229,6 +232,110 @@ Mechanics:
   so when the cap is reached a keep-alive request still runs its job
   single-use and simply returns no `container_id` (the turn gracefully loses
   persistence rather than the runner over-committing host RAM).
+
+### Egress and the capability probe
+
+Whether a sandbox can reach the network is decided **on the runner**, by two
+environment variables it is deployed with:
+
+| Variable | Effect |
+|---|---|
+| `SANDBOX_EGRESS_NETWORK` | Podman network attached to a container when a call asks for egress. Empty (the default) = **no network for any call**, whatever the caller requests. |
+| `SANDBOX_EGRESS_PROXY` | Value injected as `HTTP_PROXY`/`HTTPS_PROXY`. Empty = nothing to proxy through. |
+
+Nothing in the *gateway's* config can see those, which used to cause a
+concrete defect: `capture_webpage` was registered whenever `[sandbox]` was
+enabled, so on a runner without egress it was offered to the model and **every
+call failed** with `network egress requested but not configured on this
+runner`. The model cannot tell "misconfigured" from "wrong tool for the job",
+so it would keep trying.
+
+So the gateway asks. At startup it reads `GET /healthz` on the runner, which
+answers with its capabilities:
+
+```json
+{"status": "ok", "egress": true}
+```
+
+and that answer decides what the model is offered:
+
+- **`egress: false`** → `capture_webpage` and `browse_page` are **not
+  registered at all**, and `run_in_sandbox`'s schema carries **no `network`
+  property**, with a description that states there is no network rather than
+  implying a permission the model could ask for. (Absent beats always-failing —
+  the rule in [`tools-inventory.md`](tools-inventory.md).)
+- **`egress: true`** → both tools register, and `network` appears as an option
+  on `run_in_sandbox`.
+- **No answer** (runner down at boot, or older than this field) → treated as
+  *available*. Withdrawing a capability needs positive evidence; an unreachable
+  runner breaks every sandbox tool anyway, so hiding a subset would turn a
+  transient outage into an apparent permanent capability loss.
+
+The probe runs **once**, at gateway startup. Egress changes when an operator
+edits a unit file and restarts things — at which point the gateway restarts too
+— and a capability set that shifted underneath a running conversation would be
+worse than a slightly stale one. So: **after enabling egress, restart the
+gateway**, or the web tools stay hidden.
+
+Verify the runner's side:
+
+```sh
+curl -s http://10.88.0.1:9000/healthz     # → {"status":"ok","egress":true}
+```
+
+and the gateway's side, in its startup log:
+
+```
+registered sandbox tools runner=http://10.88.0.1:9000 egress=true
+```
+
+### Browser sessions (`browse_page`)
+
+`capture_webpage` is one shot: launch Chromium, load a URL, return a
+screenshot/PDF/text, destroy the container. Anything behind an *interaction* —
+a consent banner, a login form, pagination, a button — is unreachable that way.
+
+`browse_page` keeps a session open across tool calls within a turn. Actions:
+`navigate`, `read`, `click`, `fill`, `screenshot`, `back`, `console`, `close`.
+The model addresses elements by **number**: `read` returns the page text plus a
+numbered list of the interactive elements (tagging them in the live DOM), and
+`click`/`fill` reference those numbers — raw CSS selectors are guesswork for a
+model and fail silently.
+
+**How the session persists.** Chromium is owned by a small daemon started
+inside the turn's leased container; each tool call is a thin client that talks
+to it over a **Unix socket** in `/tmp`. It is a Unix socket rather than
+Chromium's `--remote-debugging-port` because a container created with
+`--network none` has its **loopback interface down** (`lo: <LOOPBACK> mtu 0`) —
+nothing inside can reach `127.0.0.1`, so a TCP transport cannot work there.
+Chromium keeps running because the daemon does, and the daemon lives exactly as
+long as the container: releasing the lease at turn end is what stops it.
+
+`browse_page` holds its **own** lease, separate from `run_in_sandbox`'s. The
+runner fixes a container's network posture at creation, so the code lease
+recreates its container whenever a call flips `network` — which would kill the
+browser every time the model ran an ordinary offline `run_in_sandbox` between
+two browse calls. Budget one extra container per browsing turn (it counts
+against `SANDBOX_MAX_LEASES`).
+
+**Operational notes.**
+
+- Chromium runs **inside** the gVisor sandbox — kernel `4.19.0-gvisor`, uid
+  1001, isolated PID namespace. It is launched with `--no-sandbox`, which
+  disables *Chromium's own* internal sandbox: it needs privileges this
+  container deliberately withholds and generally fails to initialise under
+  gVisor. The container is the security boundary, so this loses one layer of
+  defence-in-depth *inside* an already-strong one. `capture_webpage` has always
+  run this way.
+- Page content is **untrusted input**. Results are labelled as such, and the
+  tool's description tells the model to treat instructions found in a page as
+  data to report, never as instructions to follow. A stateful browser driven by
+  model-chosen actions over attacker-controllable content is exactly why the
+  egress allowlist is not optional.
+- JS dialogs (`alert`/`confirm`) would wedge a Playwright session
+  unrecoverably, so the daemon auto-dismisses them from the moment it starts.
+- Chromium's cold start dominates the first call of a session; later calls in
+  the same turn skip it.
 
 ## Pieces in this repo
 
@@ -381,7 +488,10 @@ Quadlet. (`/dev/kvm` is not required — gVisor runs entirely in userspace.)
    ```
    For egress also uncomment `SANDBOX_EGRESS_NETWORK=sandbox-egress` +
    `SANDBOX_EGRESS_PROXY=http://egress-proxy:3128` in `sandbox-runner.service`
-   and start `egress-proxy.service`.
+   and start `egress-proxy.service`. Then **restart the gateway** — it probes
+   the runner's capabilities once at startup, so until it does, `browse_page` /
+   `capture_webpage` stay hidden and `run_in_sandbox` shows no `network`
+   option. See [Egress and the capability probe](#egress-and-the-capability-probe).
 
 4. **Point the gateway at the runner.** No gateway network change is needed —
    it already reaches the bridge gateway IP over the default podman network. In
@@ -541,7 +651,10 @@ role and toggleable per user/token on the `/tools` page — default-off.
 `SANDBOX_POOL_SIZE`, `SANDBOX_MAX_CONCURRENT`, `SANDBOX_TIMEOUT_SECS`,
 `SANDBOX_MAX_TIMEOUT_SECS`, `SANDBOX_MEMORY`, `SANDBOX_CPUS`, `SANDBOX_PIDS_LIMIT`,
 `SANDBOX_WORK_SIZE`, `SANDBOX_TMP_SIZE`, `SANDBOX_MAX_OUTPUT_BYTES`,
-`SANDBOX_EGRESS_NETWORK`, `SANDBOX_EGRESS_PROXY`, `SANDBOX_LEASE_TTL_SECS`
+`SANDBOX_EGRESS_NETWORK`, `SANDBOX_EGRESS_PROXY` (these two also decide which
+tools the gateway offers at all — see
+[Egress and the capability probe](#egress-and-the-capability-probe)),
+`SANDBOX_LEASE_TTL_SECS`
 (default 600 — idle-lease reap TTL; keep it above `SANDBOX_MAX_TIMEOUT_SECS`),
 `SANDBOX_MAX_LEASES` (default 6 — cap on simultaneously kept-alive containers;
 see [Per-turn container reuse](#per-turn-container-reuse)).
@@ -612,7 +725,9 @@ in-sandbox) rather than dumping raw data.
   `no-new-privileges` are already set.
 - **Egress is default-deny** and, when enabled, allowlist-only via squid on an
   `Internal=true` network — a sandbox can reach *only* the proxy, which
-  forwards *only* to `allowlist.txt`. Runtime `pip install` works against the
+  forwards *only* to `allowlist.txt`. When it is off, the network-dependent
+  tools are not advertised to the model at all (capability probe, above), so
+  "off" means invisible rather than failing. Runtime `pip install` works against the
   PyPI entries; add scraping/API hosts deliberately.
 - **A per-turn `run_in_sandbox` lease with egress stays networked for the whole
   turn** (previously every egress job was single-use). The allowlist still

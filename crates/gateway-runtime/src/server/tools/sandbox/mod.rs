@@ -90,8 +90,7 @@ const RUN_IN_SANDBOX_DESC: &str = "Run Python or shell in a secure, isolated san
      working directory, and scratch state survive between calls, so \
      you can iterate — run something, read the output, adjust, and \
      run again — instead of cramming everything into one call. Set \
-     `fresh: true` to start over in a clean container (also required \
-     to change `network`, which is fixed when the container starts). \
+     `fresh: true` to start over in a clean container. \
      Files a user uploaded this turn are ALREADY waiting \
      in the working directory under their original names — just open \
      them. To also work on a file from earlier in the conversation — \
@@ -106,9 +105,7 @@ const RUN_IN_SANDBOX_DESC: &str = "Run Python or shell in a secure, isolated san
      preinstalled, and NOTHING can be installed — never try \
      pip/apt/npm install (there is normally no network, and the \
      sandbox is discarded at the end of the turn). If a library is \
-     missing, solve the task with the preinstalled ones. Network \
-     is OFF unless you set `network: true` (and the operator enabled \
-     egress); without it web access fails. Write files \
+     missing, solve the task with the preinstalled ones. Write files \
      to the current working directory to return them to the user. \
      When stdout/stderr is large you get a small preview plus a \
      `full_output_ref` — call read_sandbox_output with that ref to \
@@ -116,6 +113,34 @@ const RUN_IN_SANDBOX_DESC: &str = "Run Python or shell in a secure, isolated san
      practice: filter/aggregate in-sandbox (grep, awk, duckdb, \
      head/tail) and print a concise summary rather than dumping raw \
      data.";
+
+/// Appended to [`RUN_IN_SANDBOX_DESC`] when the runner can grant egress.
+const RUN_IN_SANDBOX_NET_ON: &str = " Network is OFF by default: set \
+     `network: true` for a run that needs web access. It is fixed when the \
+     container starts, so changing it mid-turn also needs `fresh: true`.";
+
+/// Appended instead when the runner positively reports no egress.
+///
+/// Stated as a property of the environment rather than as a missing option,
+/// because a model told "you may not" retries and argues, while a model told
+/// "there is no network here" adapts. The `network` argument is absent from
+/// the schema in this case, so mentioning it at all would only invite a call
+/// that gets rejected as an unknown property.
+const RUN_IN_SANDBOX_NET_OFF: &str = " This sandbox has NO network at all: \
+     web requests, downloads and installs are impossible, so don't attempt \
+     them or suggest that a retry might work. Everything must come from the \
+     preinstalled libraries and the files in the working directory.";
+
+/// The model-facing description, which depends on whether this deployment's
+/// runner can grant egress.
+pub(crate) fn run_in_sandbox_desc(egress: bool) -> String {
+    let suffix = if egress {
+        RUN_IN_SANDBOX_NET_ON
+    } else {
+        RUN_IN_SANDBOX_NET_OFF
+    };
+    format!("{RUN_IN_SANDBOX_DESC}{suffix}")
+}
 
 /// Shared HTTP client + config for the sandbox tool family. Held behind an
 /// `Arc` so the generic tool and each specialized wrapper share one
@@ -126,7 +151,17 @@ pub struct SandboxClient {
     /// links on the API path. Cloned from `config.gateway.public_url`.
     public_url: String,
     http: reqwest::Client,
+    /// What the runner said about egress on the last probe. Three-state, and
+    /// the distinction matters: see [`SandboxClient::egress_available`].
+    egress: std::sync::atomic::AtomicU8,
 }
+
+/// Encoding for [`SandboxClient::egress`]. An atomic rather than a lock: it is
+/// read on every `schema()` call (once per advertised tool list) and written
+/// once at boot.
+const EGRESS_UNKNOWN: u8 = 0;
+const EGRESS_YES: u8 = 1;
+const EGRESS_NO: u8 = 2;
 
 impl SandboxClient {
     pub fn new(cfg: Arc<SandboxConfig>, public_url: String) -> Arc<Self> {
@@ -143,7 +178,62 @@ impl SandboxClient {
             cfg,
             public_url,
             http,
+            egress: std::sync::atomic::AtomicU8::new(EGRESS_UNKNOWN),
         })
+    }
+
+    /// Ask the runner what it can do, and remember the answer.
+    ///
+    /// Called once at boot. Not refreshed: egress is a deployment property
+    /// (a podman network + a proxy), so it changes when an operator edits a
+    /// unit file and restarts things — at which point the gateway restarts
+    /// too. A periodic re-probe would buy a capability set that changes under
+    /// a running conversation, which is worse than a stale one.
+    ///
+    /// Never fatal. An unreachable runner leaves the state `UNKNOWN`, which
+    /// [`Self::egress_available`] reads optimistically — see there for why.
+    pub async fn probe_capabilities(&self) {
+        use std::sync::atomic::Ordering;
+        let url = format!("{}/healthz", self.cfg.runner_url.trim_end_matches('/'));
+        let health = match self.http.get(&url).send().await {
+            Ok(resp) => resp.json::<shared::sandbox::RunnerHealth>().await.ok(),
+            Err(e) => {
+                tracing::warn!(error = %e,
+                    "sandbox runner health probe failed; assuming egress is available \
+                     (the runner is unreachable, so every sandbox tool is failing anyway)");
+                None
+            }
+        };
+        match health.and_then(|h| h.egress) {
+            Some(true) => {
+                self.egress.store(EGRESS_YES, Ordering::Relaxed);
+                tracing::info!("sandbox runner grants network egress; web tools enabled");
+            }
+            Some(false) => {
+                self.egress.store(EGRESS_NO, Ordering::Relaxed);
+                tracing::info!(
+                    "sandbox runner has NO network egress configured \
+                     (SANDBOX_EGRESS_NETWORK unset): capture_webpage / browse_page will not \
+                     be offered, and run_in_sandbox will not advertise `network`"
+                );
+            }
+            None => tracing::warn!(
+                "sandbox runner did not report its egress capability (older runner?); \
+                 assuming it is available"
+            ),
+        }
+    }
+
+    /// Whether to offer capabilities that need the network.
+    ///
+    /// `true` unless the runner *positively said no*. Unknown counts as
+    /// available on purpose: the only ways to land there are a runner that is
+    /// down (in which case every sandbox tool fails regardless, and hiding
+    /// some of them would just make a transient outage look like a permanent
+    /// capability loss) or one older than the health field. Withdrawing tools
+    /// needs evidence; keeping them needs none.
+    pub fn egress_available(&self) -> bool {
+        self.egress.load(std::sync::atomic::Ordering::Relaxed) != EGRESS_NO
     }
 
     /// Wall-clock ceiling the tool runner should allow around a sandbox
@@ -974,6 +1064,7 @@ impl TextFile {
     }
 }
 
+mod browse;
 mod capture;
 mod convert_edit;
 mod generate_export;
@@ -981,6 +1072,7 @@ mod read;
 mod render;
 mod run;
 
+pub use browse::*;
 pub use capture::*;
 pub use convert_edit::*;
 pub use generate_export::*;

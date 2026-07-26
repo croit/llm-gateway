@@ -297,6 +297,13 @@ fn proxy_tool_ctx(
             .sandbox_client
             .clone()
             .map(gateway_runtime::server::tools::sandbox::SandboxLease::new),
+        // The browser session's own container (see `ToolContext`), only where
+        // the runner reports egress. Released with the loop, below.
+        browser_lease: state
+            .sandbox_client
+            .clone()
+            .filter(|c| c.egress_available())
+            .map(gateway_runtime::server::tools::sandbox::SandboxLease::new),
         crypto: Some(state.crypto.clone()),
         // Push works without a chat turn — it lands on the user's phone, not
         // in a conversation — so a /v1 caller's model can notify too. Still
@@ -2233,6 +2240,7 @@ async fn drive_streaming_tool_loop(
     // buffered path's `run_with_tools` wrapper (the `Drop` guard is only the
     // backstop). Clone the lease handle out before `tool_ctx` is moved in.
     let lease = tool_ctx.sandbox_lease.clone();
+    let browser = tool_ctx.browser_lease.clone();
     let out = drive_streaming_tool_loop_inner(
         state,
         model,
@@ -2246,6 +2254,9 @@ async fn drive_streaming_tool_loop(
     )
     .await;
     if let Some(lease) = &lease {
+        lease.release().await;
+    }
+    if let Some(lease) = &browser {
         lease.release().await;
     }
     out

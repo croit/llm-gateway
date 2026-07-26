@@ -22,8 +22,7 @@ use rama::http::service::web::response::{IntoResponse, Json};
 use rama::http::{Request, Response, StatusCode, header};
 use rama::layer::{ArcLayer, Layer};
 use rama::net::address::SocketAddress;
-use serde_json::json;
-use shared::sandbox::{RunError, RunRequest};
+use shared::sandbox::{RunError, RunRequest, RunnerHealth};
 
 use crate::pool::{Pool, RunnerError};
 
@@ -35,9 +34,21 @@ pub struct RunnerState {
 
 pub fn router(state: Arc<RunnerState>) -> Router<Arc<RunnerState>> {
     Router::new_with_state(state)
-        .with_get("/healthz", async || Json(json!({"status": "ok"})))
+        // `/healthz` doubles as the capability probe: the gateway reads
+        // `egress` at boot and stops advertising the network-dependent tools
+        // when this runner has no egress wired, instead of offering the model
+        // a tool whose every call must fail. See `RunnerHealth`.
+        .with_get("/healthz", healthz)
         .with_post("/run", run)
         .with_delete("/container/{id}", release_container)
+}
+
+/// GET /healthz — liveness plus the runner's capabilities.
+async fn healthz(State(state): State<Arc<RunnerState>>) -> Json<RunnerHealth> {
+    Json(RunnerHealth {
+        status: "ok".into(),
+        egress: Some(state.pool.config().egress_available()),
+    })
 }
 
 /// DELETE /container/{id} — release a kept-alive (leased) container. The

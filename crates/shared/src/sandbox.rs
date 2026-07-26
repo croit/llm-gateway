@@ -48,6 +48,29 @@ pub struct InputFile {
     pub content_b64: String,
 }
 
+/// What the runner reports about itself on `GET /healthz`.
+///
+/// Exists so the gateway can stop advertising tools the runner cannot serve.
+/// Egress is a *deployment* property of the runner (a podman network plus an
+/// allowlisting proxy), invisible to the gateway's own config — so without
+/// this, `capture_webpage` is offered on a runner with no network and every
+/// call fails with `network egress requested but not configured`. That is the
+/// same defect class as advertising a chat-only tool on `/v1`: a guaranteed
+/// error where the model cannot tell "misconfigured" from "wrong tool".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RunnerHealth {
+    pub status: String,
+    /// Whether this runner can grant network egress at all.
+    ///
+    /// `None` when the field is absent — an older runner that predates this
+    /// field. Deliberately three-state rather than defaulting to `false`: a
+    /// missing field means *unknown*, and treating unknown as "no egress"
+    /// would silently withdraw working tools the moment a deployment lags a
+    /// version behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<bool>,
+}
+
 /// A code-execution request. `timeout_secs` and `network` are requests,
 /// not guarantees: the runner clamps the timeout to its configured
 /// maximum and only grants egress when it has an allowlist configured

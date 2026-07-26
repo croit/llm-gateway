@@ -15,96 +15,108 @@ impl Tool for RunInSandbox {
     }
 
     fn schema(&self) -> ToolDef {
+        // Whether this deployment's runner can grant egress decides both the
+        // wording and whether `network` exists as an option at all. Advertising
+        // a `network` flag a runner will reject buys nothing: the model spends a
+        // round discovering it, and cannot tell "misconfigured" from "wrong
+        // tool for the job".
+        let egress = self.0.egress_available();
+        let mut properties = json!({
+            "language": {
+                "type": "string", "enum": ["python", "bash"],
+                "description": "Interpreter for `code`."
+            },
+            "code": {
+                "type": "string",
+                "description": "The program to run. Write output files to the \
+                                current working directory to return them."
+            },
+            "files": {
+                "type": "array",
+                "description": "Optional UTF-8 text files to place in the working \
+                                directory before running.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "content"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "content": {"type": "string"}
+                    }
+                }
+            },
+            "attachments": {
+                "type": "array",
+                "description": "Optional chat attachments to fetch into the working \
+                                directory (binary-safe — use this for uploaded \
+                                .pptx/.xlsx/.pdf/images/zip you want to process). \
+                                The current turn's uploads are staged automatically; \
+                                list ids here only to pull in files from EARLIER in \
+                                the conversation (see `available_attachments` in a \
+                                prior result).",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id"],
+                    "properties": {
+                        "id": {"type": "string", "description": "Attachment id \
+                               `<turn>/<file>` from an attachment stub, or just the \
+                               filename of a file from earlier in this conversation \
+                               (newest match wins)."},
+                        "name": {"type": "string", "description": "Optional filename \
+                                 to give the file in the working directory."}
+                    }
+                }
+            },
+            "documents": {
+                "type": "array",
+                "description": "Canvas documents (from `create_document`) to \
+                                materialize into the working directory — resolved \
+                                server-side, so use this instead of pasting large \
+                                content into `files`.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["document_id"],
+                    "properties": {
+                        "document_id": {"type": "string", "description": "Id from \
+                                        `create_document`."},
+                        "version": {"type": "integer", "description": "Specific \
+                                    version (default: latest)."},
+                        "name": {"type": "string", "description": "Filename in the \
+                                 working directory (default: `<title>.<ext>`)."}
+                    }
+                }
+            },
+            "fresh": {
+                "type": "boolean",
+                "description": "Discard the current sandbox and start from a clean \
+                                one (drops anything earlier calls this turn wrote to \
+                                the working directory). Default false. Use it to \
+                                reset state."
+            }
+        });
+        if egress && let Some(props) = properties.as_object_mut() {
+            props.insert(
+                "network".into(),
+                json!({
+                    "type": "boolean",
+                    "description": "Request network egress for this run (web access, \
+                                    NOT for installing packages — nothing can be \
+                                    installed). Default false. Fixed when the sandbox \
+                                    starts, so to change it mid-turn also set \
+                                    `fresh: true`."
+                }),
+            );
+        }
         ToolDef::function(
             self.id(),
-            RUN_IN_SANDBOX_DESC,
+            run_in_sandbox_desc(egress),
             json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["language", "code"],
-                "properties": {
-                    "language": {
-                        "type": "string", "enum": ["python", "bash"],
-                        "description": "Interpreter for `code`."
-                    },
-                    "code": {
-                        "type": "string",
-                        "description": "The program to run. Write output files to the \
-                                        current working directory to return them."
-                    },
-                    "files": {
-                        "type": "array",
-                        "description": "Optional UTF-8 text files to place in the working \
-                                        directory before running.",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["name", "content"],
-                            "properties": {
-                                "name": {"type": "string"},
-                                "content": {"type": "string"}
-                            }
-                        }
-                    },
-                    "attachments": {
-                        "type": "array",
-                        "description": "Optional chat attachments to fetch into the working \
-                                        directory (binary-safe — use this for uploaded \
-                                        .pptx/.xlsx/.pdf/images/zip you want to process). \
-                                        The current turn's uploads are staged automatically; \
-                                        list ids here only to pull in files from EARLIER in \
-                                        the conversation (see `available_attachments` in a \
-                                        prior result).",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["id"],
-                            "properties": {
-                                "id": {"type": "string", "description": "Attachment id \
-                                       `<turn>/<file>` from an attachment stub, or just the \
-                                       filename of a file from earlier in this conversation \
-                                       (newest match wins)."},
-                                "name": {"type": "string", "description": "Optional filename \
-                                         to give the file in the working directory."}
-                            }
-                        }
-                    },
-                    "documents": {
-                        "type": "array",
-                        "description": "Canvas documents (from `create_document`) to \
-                                        materialize into the working directory — resolved \
-                                        server-side, so use this instead of pasting large \
-                                        content into `files`.",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["document_id"],
-                            "properties": {
-                                "document_id": {"type": "string", "description": "Id from \
-                                                `create_document`."},
-                                "version": {"type": "integer", "description": "Specific \
-                                            version (default: latest)."},
-                                "name": {"type": "string", "description": "Filename in the \
-                                         working directory (default: `<title>.<ext>`)."}
-                            }
-                        }
-                    },
-                    "network": {
-                        "type": "boolean",
-                        "description": "Request network egress for this run (web access, \
-                                        NOT for installing packages). Default false; only \
-                                        honored if the operator configured an egress \
-                                        allowlist. Fixed when the sandbox starts — to \
-                                        change it mid-turn, also set `fresh: true`."
-                    },
-                    "fresh": {
-                        "type": "boolean",
-                        "description": "Discard the current sandbox and start from a clean \
-                                        one (drops anything earlier calls this turn wrote to \
-                                        the working directory). Default false. Use it to \
-                                        reset state, or to change `network`."
-                    }
-                }
+                "properties": properties,
             }),
         )
     }
@@ -118,6 +130,17 @@ impl Tool for RunInSandbox {
             })?;
             if args.code.trim().is_empty() {
                 return Err(ToolError::InvalidArgs("code must be non-empty".into()));
+            }
+            // `network` isn't in the schema when the runner has no egress, but a
+            // model working from a stale tool list can still send it. Refuse
+            // here rather than spending a container on the runner's 400.
+            if args.network && !self.0.egress_available() {
+                return Err(ToolError::InvalidArgs(
+                    "this gateway's sandbox has no network egress configured, so \
+                     `network` cannot be granted. Solve the task offline with the \
+                     preinstalled libraries and the files in the working directory."
+                        .into(),
+                ));
             }
             // Stage the round's uploads + any named attachments first, then
             // canvas documents, then the model's inline text files (so an

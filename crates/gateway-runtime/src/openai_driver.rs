@@ -217,6 +217,15 @@ pub fn build_tool_context(state: &Arc<RamaState>, facts: TurnFacts) -> ToolConte
             .sandbox_client
             .clone()
             .map(crate::server::tools::sandbox::SandboxLease::new),
+        // A second lease for `browse_page`'s browser, so an ordinary offline
+        // `run_in_sandbox` between two browse calls can't recreate the
+        // container out from under it. Only where the runner has egress — a
+        // browser that can't reach anything is not worth a container.
+        browser_lease: state
+            .sandbox_client
+            .clone()
+            .filter(|c| c.egress_available())
+            .map(crate::server::tools::sandbox::SandboxLease::new),
         crypto: Some(state.crypto.clone()),
         // One notification per turn, latched in the context the driver builds
         // per turn. `None` when push isn't configured; `notify_user` then says
@@ -239,6 +248,11 @@ impl SessionDriver for OpenAiDriver {
         // `SandboxLease` `Drop` guard + the runner's TTL sweeper are the
         // backstops; this is the prompt, normal path.
         if let Some(lease) = &self.tool_ctx.sandbox_lease {
+            lease.release().await;
+        }
+        // Same for the browser container: releasing it is what actually stops
+        // Chromium, since the process only lives as long as the container.
+        if let Some(lease) = &self.tool_ctx.browser_lease {
             lease.release().await;
         }
         // On a clean, non-cancelled completion, check whether this session's
