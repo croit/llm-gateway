@@ -37,10 +37,10 @@ use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use gateway_core::rama_server::session::Session;
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::users;
-use gateway_core::server::github::{self, IssueInput};
 use gateway_core::server::upstreams::PoolKind;
+use gateway_features::server::github::{self, IssueInput};
+use gateway_runtime::rama_server::state::RamaState;
 
 // ---------------------------------------------------------------------------
 // Small JSON helpers (these endpoints are fetch'd, not Datastar-driven).

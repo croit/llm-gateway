@@ -1,0 +1,54 @@
+[package]
+name = "gateway-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The request runtime: the tool API (Tool trait, ToolContext, registry, catalog,
+# runner, MCP manager, sandbox client), `AppState`/`RamaState`, the streaming chat
+# driver, and the workers that need state. `gateway-tools` and `gateway-web` both
+# sit above this and neither depends on the other. See docs/architecture.md.
+
+[dependencies]
+gateway-core = { path = "../gateway-core" }
+gateway-features = { path = "../gateway-features" }
+shared = { path = "../shared" }
+session-core = { path = "../session-core" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+jiff = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+reqwest = { workspace = true }
+sqlx = { workspace = true }
+toml = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+base64 = "0.22"
+tempfile = { workspace = true }
+regex = { workspace = true }
+# Rama wire types + the datastar SSE helpers the driver emits.
+rama = { workspace = true }
+# MCP client: stdio + streamable-HTTP transports. `reqwest` feature is required
+# because rmcp pulls its own reqwest, which Cargo does not feature-unify with
+# the workspace one, so it would otherwise have no TLS backend.
+rmcp = { version = "1.7", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+# `tls_cert`: a raw rustls handshake with verification off so the tool can
+# inspect the presented certificate, plus x509 parsing.
+tokio-rustls = { workspace = true }
+x509-parser = "0.16"
+image = { workspace = true }
+zip = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }

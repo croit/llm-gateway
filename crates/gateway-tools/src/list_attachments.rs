@@ -17,8 +17,8 @@
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use gateway_core::server::chat_attachments;
-use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
+use gateway_features::server::chat_attachments;
+use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 pub struct ListAttachments;
 

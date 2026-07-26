@@ -25,7 +25,7 @@
 //!   model actually re-see the image. No bytes cross the wire to
 //!   the LLM provider in inline form; just the (time-limited)
 //!   presigned URL the upstream fetches itself.
-//! - **PDF**: two model-driven tiers (see [`gateway_core::server::pdf`]).
+//! - **PDF**: two model-driven tiers (see [`gateway_features::server::pdf`]).
 //!   `mode="text"` (default) extracts the text layer and returns it
 //!   like any text file. `mode="images"` rasterises the pages and
 //!   returns them as `image_url` parts — the escalation path the
@@ -42,10 +42,10 @@ use std::sync::Arc;
 
 use shared::sandbox::{InputFile, Language, RunRequest};
 
-use gateway_core::server::chat_attachments::{self, BinaryDisposition, PayloadLimits};
-use gateway_core::server::pdf::{self, PdfError};
-use gateway_core::server::tools::sandbox::{SandboxClient, b64};
-use gateway_core::server::tools::{
+use gateway_features::server::chat_attachments::{self, BinaryDisposition, PayloadLimits};
+use gateway_features::server::pdf::{self, PdfError};
+use gateway_runtime::server::tools::sandbox::{SandboxClient, b64};
+use gateway_runtime::server::tools::{
     Tool, ToolContext, ToolError, ToolFuture, tool_content_parts, truncate_on_char_boundary,
 };
 
@@ -1020,7 +1020,7 @@ mod tests {
     // `read_pdf` takes bytes directly (the S3 fetch happens upstream of it),
     // so these pin the text/images contract end-to-end without a bucket.
 
-    use gateway_core::server::pdf::test_support::{blank_pdf, hello_pdf};
+    use gateway_features::server::pdf::test_support::{blank_pdf, hello_pdf};
 
     #[test]
     fn mode_defaults_to_text_and_parses_images() {
@@ -1094,7 +1094,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            gateway_core::server::pdf::test_support::multipage_pdf(6),
+            gateway_features::server::pdf::test_support::multipage_pdf(6),
             FetchMode::Text,
             4096,
             PageRange::parse(Some(3), Some(4)).unwrap(),
@@ -1117,7 +1117,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            gateway_core::server::pdf::test_support::multipage_pdf(3),
+            gateway_features::server::pdf::test_support::multipage_pdf(3),
             FetchMode::Text,
             4096,
             PageRange::parse(Some(2), Some(2)).unwrap(),
@@ -1136,7 +1136,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            gateway_core::server::pdf::test_support::multipage_pdf(10),
+            gateway_features::server::pdf::test_support::multipage_pdf(10),
             FetchMode::Text,
             4096,
             PageRange::parse(Some(1), Some(2)).unwrap(),
@@ -1155,7 +1155,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            gateway_core::server::pdf::test_support::multipage_pdf(2),
+            gateway_features::server::pdf::test_support::multipage_pdf(2),
             FetchMode::Text,
             4096,
             PageRange::parse(Some(50), None).unwrap(),
@@ -1178,7 +1178,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            gateway_core::server::pdf::test_support::multipage_pdf(3),
+            gateway_features::server::pdf::test_support::multipage_pdf(3),
             FetchMode::Text,
             4096,
             PageRange::parse(Some(2), Some(99)).unwrap(),
@@ -1197,7 +1197,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            gateway_core::server::pdf::test_support::multipage_pdf(20),
+            gateway_features::server::pdf::test_support::multipage_pdf(20),
             FetchMode::Text,
             60,
             PageRange::parse(Some(1), Some(20)).unwrap(),
@@ -1219,7 +1219,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            gateway_core::server::pdf::test_support::multipage_pdf(10),
+            gateway_features::server::pdf::test_support::multipage_pdf(10),
             FetchMode::Text,
             20,
             PageRange::parse(None, None).unwrap(),
@@ -1244,7 +1244,7 @@ mod tests {
             "t/doc.pdf",
             "doc.pdf",
             "application/pdf",
-            gateway_core::server::pdf::test_support::multipage_pdf(2),
+            gateway_features::server::pdf::test_support::multipage_pdf(2),
             FetchMode::Images,
             4096,
             PageRange::parse(Some(50), None).unwrap(),

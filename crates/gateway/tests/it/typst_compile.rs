@@ -11,7 +11,7 @@
 //! PDF + PNG bytes, and the bytes look right (PDF magic bytes,
 //! PNG signature, source file round-tripped).
 
-use gateway_core::server::typst as gw_typst;
+use gateway_features::server::typst as gw_typst;
 
 /// Skip the test body when typst isn't installed; lets CI machines
 /// without typst run the rest of the suite.

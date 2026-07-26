@@ -35,8 +35,8 @@ use super::{
 use session_core::chrome::{FlashKind, sse_response, sse_toast};
 use session_core::i18n::{self, Lang, t, t_args};
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::upstreams_config::{self, PoolRow, VoiceRow};
+use gateway_runtime::rama_server::state::RamaState;
 
 /// Pool kinds, matching the `snake_case` the `db_bridge` parser recognises.
 /// Shared with the upstreams page's kind `<select>`.

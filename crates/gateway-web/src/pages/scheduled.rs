@@ -36,8 +36,10 @@ use session_core::chrome::{
 use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
-use gateway_core::rama_server::state::RamaState;
-use gateway_core::server::scheduled::{self, EditAction, NewAction, ScheduledAction, cron::Cron};
+use gateway_runtime::rama_server::state::RamaState;
+use gateway_runtime::server::scheduled::{
+    self, EditAction, NewAction, ScheduledAction, cron::Cron,
+};
 
 // ---------------------------------------------------------------------------
 // Form types

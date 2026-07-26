@@ -7,10 +7,10 @@
 //! signed-in user manages their *own* skills here, invisible to other users.
 //! Ownership is the grant — a private skill is loadable in that user's chats
 //! with no RBAC role, and overlays the global operator skills (private shadows
-//! global on a name collision; see [`gateway_core::server::skills::combined_registry`]).
+//! global on a name collision; see [`gateway_features::server::skills::combined_registry`]).
 //!
 //! Two authoring paths, both landing in the same per-user store
-//! ([`gateway_core::server::skills::UserSkillStore`]):
+//! ([`gateway_features::server::skills::UserSkillStore`]):
 //!
 //!   - **Upload** a `.skill` archive (same shape the admin page accepts), or
 //!   - **write `SKILL.md` inline** in a textarea and save it.
@@ -28,9 +28,9 @@ use rama::http::{Request, Response};
 
 use super::skills::{percent_decode, read_upload_field, selected_skill_param};
 use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_session_or_redirect};
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::users::User;
-use gateway_core::server::skills::{self, UserSkillStore};
+use gateway_features::server::skills::{self, UserSkillStore};
+use gateway_runtime::rama_server::state::RamaState;
 use session_core::chrome::{
     NavSections, Theme, is_datastar_request, read_body_to_bytes, see_other,
 };

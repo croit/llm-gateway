@@ -31,13 +31,14 @@ use gateway::rama_server::{RamaState, SessionStore, router};
 use gateway_core::server::config::{FeedbackConfig, GatewayConfig, SkillsConfig};
 use gateway_core::server::rbac::RoleConfig;
 use gateway_core::server::rbac::{Resolver, config::RbacConfig, config::RoleMapping};
-use gateway_core::server::skills::{SkillStore, UserSkillStore};
-use gateway_core::server::tools::{ToolRegistry, echo, time};
 use gateway_core::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
-use gateway_core::server::{AppState, Config, db};
+use gateway_core::server::{Config, db};
+use gateway_features::server::skills::{SkillStore, UserSkillStore};
+use gateway_runtime::server::AppState;
+use gateway_runtime::server::tools::{ToolRegistry, echo, time};
 use gateway_tools::{fetch_url, read_skill, search_web};
 use jiff::{Timestamp, ToSpan};
 use rama::net::address::SocketAddress;
@@ -528,7 +529,7 @@ async fn main() -> anyhow::Result<()> {
 /// `dev` user. In-memory DB, so this is rebuilt fresh on every launch.
 async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
     use gateway_core::server::db::rag;
-    use gateway_core::server::scheduled::{self, NewAction};
+    use gateway_runtime::server::scheduled::{self, NewAction};
     use session_core::attachments;
     use session_core::db::{self as chatdb, ToolCallStatus, TurnStatus};
 

@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use gateway_core::rama_server::session::Session;
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::rag as rag_db;
 use gateway_core::server::db::users;
+use gateway_runtime::rama_server::state::RamaState;
 
 /// Wire shape returned from every list / get / update response.
 #[derive(Serialize)]

@@ -33,9 +33,9 @@ use shared::api::{
 use uuid::Uuid;
 
 use gateway_core::rama_server::session::Session;
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::auth::token;
 use gateway_core::server::db::{token_tool_prefs, tokens, users};
+use gateway_runtime::rama_server::state::RamaState;
 use gateway_web::pages::{entries_for_roles, valid_keys};
 
 // ---------------------------------------------------------------------------
@@ -94,10 +94,10 @@ pub(crate) async fn me_response(state: &RamaState, user_id: &str) -> Response {
     if let Some(handle) = state.comfyui.as_ref() {
         let snapshot = handle.store.current();
         for id in &allowed_tool_ids {
-            if id.starts_with(gateway_core::server::tools::catalog::COMFYUI_PREFIX)
+            if id.starts_with(gateway_runtime::server::tools::catalog::COMFYUI_PREFIX)
                 && !allowed_tools.iter().any(|t| &t.id == id)
                 && let Some(manifest_id) =
-                    id.strip_prefix(gateway_core::server::tools::catalog::COMFYUI_PREFIX)
+                    id.strip_prefix(gateway_runtime::server::tools::catalog::COMFYUI_PREFIX)
                 && let Some(m) = snapshot.lookup(manifest_id)
             {
                 allowed_tools.push(shared::api::ToolSummary {
@@ -512,7 +512,7 @@ pub async fn location_feedback(
     Path(turn_id): Path<String>,
     req: Request,
 ) -> Response {
-    use gateway_core::server::tools::feedback::BrowserFix;
+    use gateway_runtime::server::tools::feedback::BrowserFix;
 
     let session = match require_session(&state, &req).await {
         Ok(s) => s,
@@ -655,7 +655,7 @@ pub async fn push_subscribe(State(state): State<Arc<RamaState>>, req: Request) -
     // Validate before storing: the gateway later POSTs to `endpoint` on turn
     // completion, so reject non-https / private / loopback targets (blind-SSRF
     // guard) and key material that could only ever fail to encrypt.
-    if let Err(msg) = gateway_core::server::push::validate_subscription(
+    if let Err(msg) = gateway_features::server::push::validate_subscription(
         &parsed.endpoint,
         &parsed.keys.p256dh,
         &parsed.keys.auth,

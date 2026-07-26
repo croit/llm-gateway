@@ -17,11 +17,11 @@
 
 use std::sync::Arc;
 
-use gateway_core::server::chat_attachments::{self, UploadOutcome};
 use gateway_core::server::config::{S3Config, SandboxConfig};
 use gateway_core::server::db;
-use gateway_core::server::tools::sandbox::{EditPresentation, RunInSandbox, SandboxClient};
-use gateway_core::server::tools::{Tool, ToolContext};
+use gateway_features::server::chat_attachments::{self, UploadOutcome};
+use gateway_runtime::server::tools::sandbox::{EditPresentation, RunInSandbox, SandboxClient};
+use gateway_runtime::server::tools::{Tool, ToolContext};
 use serde_json::json;
 
 fn enabled() -> bool {

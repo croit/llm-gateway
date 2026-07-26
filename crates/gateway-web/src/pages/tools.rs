@@ -30,9 +30,9 @@ use session_core::chrome::{
 };
 use session_core::i18n::{self, Lang, t, t_args};
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::{user_tool_prefs, users};
-use gateway_core::server::tools::catalog::ToolEntry;
+use gateway_runtime::rama_server::state::RamaState;
+use gateway_runtime::server::tools::catalog::ToolEntry;
 
 /// Where a `/tools` toggle posts + how its row id is namespaced. The
 /// prefix is `tool-row` so the DOM ids stay exactly as before the toggle

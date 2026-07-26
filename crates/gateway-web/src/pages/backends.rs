@@ -34,8 +34,8 @@ use super::{
 use session_core::chrome::{FlashKind, sse_response, sse_toast};
 use session_core::i18n::{self, Lang, t, t_args};
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::upstreams_config::{self, AliasRow, BackendRow};
+use gateway_runtime::rama_server::state::RamaState;
 
 /// Serialise a backend's aliases back into the textarea format
 /// (`name=target` per line, or a bare `name` for a target-less alias). Used by

@@ -30,10 +30,10 @@ use session_core::chrome::{NavSections, Theme, is_datastar_request};
 use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::limits::{Dimension, Window};
 use gateway_core::server::db::usage::{self, Aggregates, Filter, GroupCount, Period};
 use gateway_core::server::limits::LimitStatus;
+use gateway_runtime::rama_server::state::RamaState;
 
 /// Query string for the filter bar. All optional; empty strings collapse to
 /// "no filter". `scope=all` is the admin "all users" view (ignored for

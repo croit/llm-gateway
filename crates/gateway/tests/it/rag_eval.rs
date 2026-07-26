@@ -24,11 +24,11 @@ use std::sync::Arc;
 
 use gateway_core::server::db;
 use gateway_core::server::db::rag as rag_db;
-use gateway_core::server::rag::worker::{Indexer, IndexerConfig, search_chunks};
 use gateway_core::server::upstreams::{
     UpstreamRegistry,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
+use gateway_features::server::rag::worker::{Indexer, IndexerConfig, search_chunks};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -177,7 +177,7 @@ async fn seed_collection(
         )
         .await
         .unwrap();
-        let v = gateway_core::server::embeddings::embed(
+        let v = gateway_features::server::embeddings::embed(
             &reqwest::Client::new(),
             reg,
             EMBED_MODEL,

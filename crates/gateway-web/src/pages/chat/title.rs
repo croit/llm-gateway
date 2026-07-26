@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use session_core::TurnUpdate;
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::upstreams::PoolKind;
+use gateway_runtime::rama_server::state::RamaState;
 use session_core::db as chat;
 
 /// Hard char cap on the generated title. The sidebar's 18rem column

@@ -27,9 +27,9 @@ use shared::api::ToolDef;
 use std::sync::Arc;
 
 use gateway_core::server::db::rag as rag_db;
-use gateway_core::server::rag::worker;
 use gateway_core::server::rbac::Resolver;
-use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
+use gateway_features::server::rag::worker;
+use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Holds the RBAC resolver so it can filter collections to the ones the
 /// caller's gateway groups permit (per-collection `allowed_groups`).
@@ -364,12 +364,12 @@ async fn resolve_search(
 mod tests {
     use super::*;
     use gateway_core::server::db;
-    use gateway_core::server::embeddings;
-    use gateway_core::server::rag::worker::{Indexer, IndexerConfig, search_chunks};
     use gateway_core::server::upstreams::{
         UpstreamRegistry,
         config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
     };
+    use gateway_features::server::embeddings;
+    use gateway_features::server::rag::worker::{Indexer, IndexerConfig, search_chunks};
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;

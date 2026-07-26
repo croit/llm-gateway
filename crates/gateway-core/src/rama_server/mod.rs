@@ -9,10 +9,7 @@
 //! [`session::SessionStore`], the `/v1` bearer middleware in [`auth`], and the
 //! [`cors`] layer. The routes, the proxy, and the JSON API live in `gateway`.
 
-pub mod auth;
 pub mod cors;
 pub mod session;
-pub mod state;
 
 pub use session::SessionStore;
-pub use state::RamaState;

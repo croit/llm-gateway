@@ -34,11 +34,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use gateway_core::server::tools::catalog::{
+use gateway_runtime::server::tools::catalog::{
     BOOTSTRAP_TOOL_ID, COMFYUI_KEY, TYPST_PREFIX, entry_key_for, is_hidden, prettify,
 };
-use gateway_core::server::tools::mcp::MCP_ID_PREFIX;
-use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture, ToolRegistry};
+use gateway_runtime::server::tools::mcp::MCP_ID_PREFIX;
+use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture, ToolRegistry};
 
 /// One enableable group as advertised in this tool's schema. Key matches
 /// `entry_key_for` output, so `chat_session_tools` writes line up with the
@@ -59,7 +59,7 @@ pub struct EnableTools {
     /// currently loaded. ComfyUI tools aren't in the static `ToolRegistry`
     /// (they're discovered from `[comfyui] content_dir`), so without this
     /// hook the model would never see the toggle and couldn't enable it.
-    comfyui_store: Option<Arc<gateway_core::server::comfyui::ComfyuiStore>>,
+    comfyui_store: Option<Arc<gateway_features::server::comfyui::ComfyuiStore>>,
 }
 
 impl EnableTools {
@@ -81,7 +81,7 @@ impl EnableTools {
     /// to turn the whole ComfyUI family on.
     pub fn with_comfyui_store(
         mut self,
-        store: Arc<gateway_core::server::comfyui::ComfyuiStore>,
+        store: Arc<gateway_features::server::comfyui::ComfyuiStore>,
     ) -> Self {
         self.comfyui_store = Some(store);
         self
@@ -441,7 +441,7 @@ mod tests {
     use crate::fetch_url::FetchUrl;
     use crate::search_web::SearchWeb;
     use gateway_core::server::db;
-    use gateway_core::server::tools::time::CurrentTimestamp;
+    use gateway_runtime::server::tools::time::CurrentTimestamp;
 
     async fn ctx(pool: db::Pool, session_id: Option<String>) -> ToolContext {
         ToolContext {
@@ -501,7 +501,7 @@ mod tests {
         // `company_echo` is a smoke-test tool listed in `catalog::HIDDEN`; it
         // stays granted via RBAC but must never appear as an enableable key
         // (same gate the `/tools` page applies).
-        use gateway_core::server::tools::echo::Echo;
+        use gateway_runtime::server::tools::echo::Echo;
         let reg = ToolRegistry::new().with(Echo).with(FetchUrl);
         let et = EnableTools::from_registry(&reg);
         let keys: Vec<&str> = et.catalog.iter().map(|t| t.key.as_str()).collect();
@@ -713,8 +713,8 @@ mod tests {
         use gateway_core::server::config::Config;
         use gateway_core::server::rbac::Resolver;
         use gateway_core::server::rbac::config::{RbacConfig, RoleConfig};
-        use gateway_core::server::state::AppState;
         use gateway_core::server::upstreams::UpstreamRegistry;
+        use gateway_runtime::server::state::AppState;
         let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
         seed_session(&pool, "s1").await;
         let reg =

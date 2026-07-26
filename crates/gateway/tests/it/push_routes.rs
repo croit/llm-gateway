@@ -15,7 +15,7 @@ use common::Service as _;
 use gateway::rama_server::RamaState;
 use gateway_core::server::crypto::Crypto;
 use gateway_core::server::db::push_subscriptions;
-use gateway_core::server::push::PushSender;
+use gateway_features::server::push::PushSender;
 use rama::http::{Body, Method, Request, StatusCode};
 use std::sync::Arc;
 

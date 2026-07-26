@@ -24,8 +24,8 @@ use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use gateway_core::rama_server::session::Session;
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::users;
+use gateway_runtime::rama_server::state::RamaState;
 
 /// Resolve the caller's session or bail out of the handler. Expands to the
 /// `require_session_or_redirect` match that early-`return`s the redirect

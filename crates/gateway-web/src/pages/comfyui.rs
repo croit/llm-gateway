@@ -21,9 +21,9 @@ use session_core::i18n::Lang;
 use session_core::icons;
 
 use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_admin_or_403};
-use gateway_core::rama_server::state::RamaState;
-use gateway_core::server::comfyui::{ComfyuiStore, ReloadReport, WorkflowManifest};
 use gateway_core::server::db::users::User;
+use gateway_features::server::comfyui::{ComfyuiStore, ReloadReport, WorkflowManifest};
+use gateway_runtime::rama_server::state::RamaState;
 
 /// GET /admin/comfyui — render the current catalog snapshot.
 pub async fn comfyui_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {
@@ -133,7 +133,7 @@ async fn render_page(
     impersonating: bool,
     flash: Option<&str>,
 ) -> Response {
-    let jobs = gateway_core::server::comfyui::jobs::recent(&state.db, 20)
+    let jobs = gateway_features::server::comfyui::jobs::recent(&state.db, 20)
         .await
         .unwrap_or_default();
     let body = render_body(lang, state.comfyui.as_deref(), flash, &jobs);
@@ -163,9 +163,9 @@ async fn render_page(
 
 fn render_body(
     _lang: Lang,
-    handle: Option<&gateway_core::server::comfyui::ComfyuiHandle>,
+    handle: Option<&gateway_runtime::server::comfyui_tool::ComfyuiHandle>,
     flash: Option<&str>,
-    jobs: &[gateway_core::server::comfyui::jobs::ComfyuiJob],
+    jobs: &[gateway_features::server::comfyui::jobs::ComfyuiJob],
 ) -> Html {
     let header: Html = html! {
         div(class: "flex items-center justify-between mb-6") {
@@ -374,7 +374,7 @@ fn render_workflow_row(m: &WorkflowManifest) -> Html {
     .to_html()
 }
 
-fn jobs_card(jobs: &[gateway_core::server::comfyui::jobs::ComfyuiJob]) -> Html {
+fn jobs_card(jobs: &[gateway_features::server::comfyui::jobs::ComfyuiJob]) -> Html {
     if jobs.is_empty() {
         return plait::Html::new_unchecked(String::new());
     }

@@ -21,12 +21,13 @@ use std::sync::Arc;
 
 use gateway::rama_server::{RamaState, SessionStore, router::service};
 use gateway_core::server::rbac::Resolver;
-use gateway_core::server::tools::ToolRegistry;
 use gateway_core::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
-use gateway_core::server::{AppState, Config, db};
+use gateway_core::server::{Config, db};
+use gateway_runtime::server::AppState;
+use gateway_runtime::server::tools::ToolRegistry;
 // `Service::serve` is the call-router-directly entry point that lets
 // us drive the rama Router without binding a socket. Re-exported here
 // so each test file gets it via `use common::*;`.
@@ -73,7 +74,7 @@ fn state_from_registry(db_pool: db::Pool, registry: Arc<upstreams::UpstreamRegis
 /// Skills feature enabled: a global store at `root` plus a per-user store at
 /// `root/.users`. For the `/skills` (per-user private skills) page tests.
 pub async fn state_with_user_skills(root: std::path::PathBuf) -> RamaState {
-    use gateway_core::server::skills::{SkillStore, UserSkillStore};
+    use gateway_features::server::skills::{SkillStore, UserSkillStore};
     let db_pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
     let registry = upstreams::UpstreamRegistry::new(&HashMap::new()).unwrap();
     let tools = Arc::new(ToolRegistry::new());
@@ -235,7 +236,8 @@ pub async fn state_with_admin_rbac(upstream_url: &str) -> RamaState {
 /// (empty content dir from a tempdir). For the `/admin/comfyui` route
 /// tests.
 pub async fn state_with_admin_rbac_and_comfyui(upstream_url: &str) -> RamaState {
-    use gateway_core::server::comfyui::{Client, ComfyuiHandle, ComfyuiStore};
+    use gateway_features::server::comfyui::{Client, ComfyuiStore};
+    use gateway_runtime::server::comfyui_tool::ComfyuiHandle;
     let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
 
     let mut pools = HashMap::new();
@@ -300,7 +302,7 @@ pub async fn state_with_admin_rbac_and_comfyui(upstream_url: &str) -> RamaState 
         s3: None,
         max_concurrent_jobs: 1,
         job_slots: Arc::new(tokio::sync::Semaphore::new(1)),
-        chat_updates: gateway_core::server::comfyui::ChatUpdateRegistry::default(),
+        chat_updates: gateway_features::server::comfyui::ChatUpdateRegistry::default(),
     });
     let app = AppState::new(config, pool.clone(), registry, tools, rbac).with_comfyui(comfyui);
     let sessions = SessionStore::new(pool, TEST_SECRET);

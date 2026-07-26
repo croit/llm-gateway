@@ -7,7 +7,7 @@
 //! image, addressed by its `<turn_id>/<filename>` id) plus a text
 //! instruction, the gateway fetches those bytes server-side, routes them to a
 //! `kind = "image"` backend that advertises edit support (via
-//! [`gateway_core::server::image_gen::ImageGenerator::edit`]), and splices the
+//! [`gateway_features::server::image_gen::ImageGenerator::edit`]), and splices the
 //! result back into the reply as an inline attachment — same rendering path
 //! as `generate_image` / `upload_attachment`.
 //!
@@ -20,10 +20,10 @@ use serde_json::{Value, json};
 use session_core::db as chat;
 use shared::api::ToolDef;
 
-use gateway_core::server::chat_attachments;
 use gateway_core::server::db::usage::UsageSource;
-use gateway_core::server::image_gen::UsageMeta;
-use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
+use gateway_features::server::chat_attachments;
+use gateway_features::server::image_gen::UsageMeta;
+use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 pub struct EditImage;
 

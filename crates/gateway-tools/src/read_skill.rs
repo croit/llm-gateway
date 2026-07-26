@@ -31,14 +31,16 @@ use serde_json::{Value, json};
 use shared::api::ToolDef;
 
 use gateway_core::server::rbac::Resolver;
-use gateway_core::server::skills::{SkillRegistry, SkillStore, UserSkillStore, combined_registry};
-use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
+use gateway_features::server::skills::{
+    SkillRegistry, SkillStore, UserSkillStore, combined_registry,
+};
+use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Tool id — also the OpenAI function name and the `/tools` toggle key.
 /// Defined in `catalog` (which stays below the tool impls, since `AppState`
 /// needs it) and re-exported here so call sites beside the tool keep the
 /// obvious import path.
-pub use gateway_core::server::tools::catalog::READ_SKILL_ID;
+pub use gateway_runtime::server::tools::catalog::READ_SKILL_ID;
 
 pub struct ReadSkill {
     store: Arc<SkillStore>,
@@ -204,7 +206,7 @@ impl Tool for ReadSkill {
 mod tests {
     use super::*;
     use gateway_core::server::rbac::config::{RbacConfig, RoleConfig};
-    use gateway_core::server::skills::{SkillStore, UserSkillStore};
+    use gateway_features::server::skills::{SkillStore, UserSkillStore};
     use std::path::{Path, PathBuf};
 
     fn write_skill(parent: &Path, name: &str) -> PathBuf {

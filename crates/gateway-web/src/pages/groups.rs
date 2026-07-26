@@ -28,8 +28,8 @@ use session_core::chrome::{
 use session_core::i18n::{Lang, t};
 use session_core::icons;
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::{gateway_groups, skill_grants};
+use gateway_runtime::rama_server::state::RamaState;
 
 /// A group flattened for rendering: its definition plus its current grants.
 struct GroupView {

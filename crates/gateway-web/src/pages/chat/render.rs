@@ -16,7 +16,7 @@ use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 use session_core::render;
 
-use gateway_core::server::chat_attachments::AttachmentRef;
+use gateway_features::server::chat_attachments::AttachmentRef;
 
 /// One selectable chat model + its data-handling flags. `gdpr`/`nda` are
 /// `true` (clear) for the common case; a `false` drives the dropdown-label
@@ -528,7 +528,8 @@ pub(super) fn render_assets_panel(assets: &[AttachmentRef], lang: Lang) -> Html 
 }
 
 fn render_asset_card(asset: &AttachmentRef, lang: Lang) -> Html {
-    let url = gateway_core::server::chat_attachments::proxy_url(&asset.turn_id, &asset.filename);
+    let url =
+        gateway_features::server::chat_attachments::proxy_url(&asset.turn_id, &asset.filename);
     let size = render::format_bytes(asset.size);
     let is_image = asset.mime.starts_with("image/");
     let is_video = asset.mime.starts_with("video/");

@@ -29,8 +29,8 @@ use session_core::chrome::{
 use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::user_memories::{self, Memory, MemoryKind};
+use gateway_runtime::rama_server::state::RamaState;
 
 /// Sanity bound on how many memories we render at once. Far above any
 /// realistic per-user count; just keeps a runaway store from rendering

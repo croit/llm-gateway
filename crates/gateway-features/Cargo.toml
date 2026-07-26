@@ -1,0 +1,57 @@
+[package]
+name = "gateway-features"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The gateway's optional subsystems: RAG, skills, ComfyUI, push, geoip, typst
+# discovery, image gen, chat attachments, embeddings, speech, PDF, OCR, search
+# settings. Stands on `gateway-core` and knows nothing about AppState or the tool
+# registry, which is what lets it sit below `gateway-runtime`.
+# See docs/architecture.md.
+
+[dependencies]
+gateway-core = { path = "../gateway-core" }
+shared = { path = "../shared" }
+session-core = { path = "../session-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+jiff = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+sqlx = { workspace = true }
+toml = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
+base64 = "0.22"
+tempfile = { workspace = true }
+# Chat-attachment uploader (S3 or S3-compatible).
+rust-s3 = { workspace = true }
+# Web Push: VAPID signing (P-256 ECDSA) + RFC 8291 payload encryption
+# (P-256 ECDH -> HKDF-SHA256 -> AES-128-GCM).
+aes-gcm = "0.10"
+p256 = { version = "0.13", features = ["ecdh"] }
+hkdf = "0.12"
+sha2 = { workspace = true }
+# GeoIP: the LITE DB11 BIN reader, its hot-reload watcher, and the unpacker for
+# the optional weekly updater.
+ip2location = { workspace = true }
+notify = { workspace = true }
+zip = { workspace = true }
+# Vector index for RAG (one mmap'd index per collection).
+usearch = { workspace = true }
+# PDF text tier (pure Rust) + the pdfium image tier for scanned documents.
+pdf-extract = { workspace = true }
+pdfium-render = { workspace = true }
+image = { workspace = true }
+# Rama wire types the subsystems hand back (bodies, header maps).
+rama = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }

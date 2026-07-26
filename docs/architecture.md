@@ -35,20 +35,36 @@ only on the ones beneath it, so an edit recompiles that crate and what sits abov
 it — never what sits below.
 
 ```
-gateway            bin + router/proxy/api/oidc     ← thinnest, most-edited glue
-   ├── gateway-web     server-rendered HTML pages  ← pure sinks: nothing below
-   ├── gateway-tools   the tool implementations    ←   these two uses them
-   └── gateway-core    application body (server/, openai_driver, RamaState)
-          ├── session-core   chat-UI substrate
-          └── shared         OpenAI wire types
+gateway            bin + router/proxy/api/oidc      6.5k  ← thinnest, most-edited glue
+   ├── gateway-web     server-rendered HTML pages  25.5k  ← siblings: neither
+   └── gateway-tools   the tool implementations    14.5k  ←   depends on the other
+          └── gateway-runtime  tool API + AppState/RamaState + chat driver   14.7k
+                 ├── gateway-features  RAG, skills, ComfyUI, push, geoip, …  13.9k
+                 └── gateway-core      db, config, crypto, rbac, upstreams   22.1k
+                        ├── session-core   chat-UI substrate
+                        └── shared         OpenAI wire types
 ```
 
-`gateway-web` and `gateway-tools` are siblings — neither depends on the other, so
-a page edit doesn't rebuild the tools and vice versa.
+What that buys, in lines that must recompile after a one-line edit:
 
-**Rule of thumb when adding code:** put it as high in the stack as it will go. A
-thing only belongs in `gateway-core` if something below the page layer actually
-needs it. Moving a module *down* is what makes builds slow again.
+| edit site | recompiled |
+|---|---|
+| pre-split monolith | **97,310** (one unit) |
+| `gateway` | 6,510 |
+| `gateway-tools` | 21,041 |
+| `gateway-web` | 32,017 |
+| `gateway-runtime` | 61,266 |
+| `gateway-features` | 75,124 |
+| `gateway-core` | 97,189 |
+
+The gains are front-loaded deliberately: the layers that churn most (pages, tools,
+glue — about 60% of file touches over six months) are the cheapest to rebuild, and
+`gateway-core` — the one that still costs a full rebuild — is the least-edited.
+
+**Rule of thumb when adding code:** put it as high in the stack as it will go.
+Something only belongs in `gateway-core` if code below the feature layer genuinely
+needs it. Pushing a module downward for convenience is what makes builds slow
+again.
 
 ### `crates/shared`
 Pure data types, no I/O:
@@ -59,44 +75,61 @@ Pure data types, no I/O:
 Depends only on `serde`, `serde_json`, `thiserror`.
 
 ### `crates/gateway-core`
-The application body — everything the HTTP surface stands on. Two modules:
-
-**`server/` — framework-neutral building blocks.** No routing here:
-- `auth/oidc.rs` — hand-rolled OIDC client (discovery + JWKS-verified ID tokens, runs on reqwest).
+The base layer — the things everything else stands on, and the least-edited code
+in the tree. No routing, no `AppState`, no tool registry:
+- `auth/oidc.rs` — hand-rolled OIDC client (discovery + JWKS-verified ID tokens, on reqwest).
 - `auth/token.rs` — gateway-token mint/hash helpers.
 - `config.rs` — typed `[upstream_pools]`, `[[models]]`, `[oidc]`, `[rbac]` schema.
-- `db/` — sqlx, tables for users / tokens / sessions / pending_logins.
-- `rbac/` — role lookup + per-user allowed-tool computation.
-- `state.rs` — `AppState` (`Arc<UpstreamRegistry>`, `Arc<ToolRegistry>`, `Arc<Resolver>`, db pool, optional `Arc<OidcClient>`, the `reqwest::Client`).
-- `tools/` — the tool *machinery*: the `Tool` trait and `ToolContext`, the `ToolRegistry`, the round-loop `runner`, the `catalog` (tool id → group → toggle key), the MCP connection manager, and the sandbox client. The implementations live in `gateway-tools`; `echo` and `get_current_timestamp` stay here as the canonical trivial tools that half the core tests build registries out of.
-- `document_canvas.rs` — renders the chat document canvas. Below both its callers on purpose: the chat page (`gateway-web`) and the document tools' live SSE inject (`gateway-tools`).
+- `db/` — sqlx; users / tokens / sessions / prefs / usage / …, plus `migrations/` at the crate root, embedded by `db/mod.rs`'s `sqlx::migrate!`.
+- `crypto.rs` — AES-256-GCM at-rest sealing for DB-stored secrets.
+- `rbac/` — role lookup and grant resolution. It filters grants against the tool and skill registries through the [`GrantableSet`] trait (two methods, used via generics) rather than depending on them, which is what lets RBAC sit at the bottom while the registries live two layers up.
 - `upstreams/` — pool registry, backend health probes, RAII `Acquired` guard for in-flight accounting.
-- the feature subsystems: `rag/`, `skills.rs`, `comfyui/`, `push/`, `scheduled/`, `limits/`, `usage/`, `geoip/`, `webhooks.rs`, `typst.rs`, `image_gen.rs`, `chat_attachments.rs`.
-- `migrations/` (crate root) — the sqlx migration set, embedded by `db/mod.rs`'s `sqlx::migrate!`.
+- `reasoning.rs`, `model_defaults.rs`, `feature_defaults.rs` — per-model capability and effort tables.
+- `tool_naming.rs` — the well-known tool ids/prefixes (`comfyui_`, `typst_`, `enable_tools`, `read_skill`) and the slug→title humaniser. Down here because RBAC, the typst discovery pass, and the catalog all need it and they're on three different layers.
+- `usage/`, `limits/` — the metrics sink and the rate-limit/quota enforcer.
+- `rama_server/session.rs` — signed-cookie + sqlite session store, plus the `is_safe_return_to` redirect guard the OIDC callback and the page chrome both need; `rama_server/cors.rs` — the CORS layer. Neither needs `AppState`, so both stay here.
 
-**`rama_server/` — the shared rama handles.** Only what *both* the pages and the
-router need, which is why it sits below both:
-- `state.rs` — `RamaState` wraps `AppState` (via `Deref`) and adds the `SessionStore`, worker registry, usage sink, and rate-limit enforcer.
-- `session.rs` — hand-rolled signed-cookie + sqlite session store (replaces `tower-sessions`), plus the `is_safe_return_to` redirect guard both the OIDC callback and the page chrome's login links need.
-- `auth.rs` — `require_bearer` helper for the `/v1/*` routes.
-- `cors.rs` — the CORS layer.
+### `crates/gateway-features`
+The optional subsystems — what a deployment switches on in `gateway.toml` and can
+run entirely without: `rag/`, `skills.rs`, `comfyui/` (client, store, manifest,
+runner, scheduler), `push/`, `github/`, `geoip/`, `typst.rs`, `image_gen.rs`,
+`chat_attachments.rs`, `embeddings.rs`, `speech.rs`, `pdf.rs`, `ocr.rs`,
+`search_settings.rs`, and `document_canvas.rs` (the chat canvas renderer, shared
+by the chat page above and the document tools above).
 
-`openai_driver.rs` is the `session_core::SessionDriver` implementation that drives
-a streaming OpenAI chat completion for the chat pages.
+Each stands on `gateway-core` and knows nothing about `AppState`, the tool
+registry, or routing. That ignorance is the whole point — it's what lets this
+layer sit below the runtime. A reference from here up into `gateway-runtime`
+collapses the split.
+
+### `crates/gateway-runtime`
+Where the world gets tied together:
+- `server/tools/` — the tool *machinery*: the `Tool` trait and `ToolContext`, the `ToolRegistry`, the round-loop `runner`, the `catalog` (tool id → group → toggle key), the MCP connection manager, and the sandbox client. Implementations live in `gateway-tools`, above; `echo` and `get_current_timestamp` stay here as the canonical trivial tools that the registry/runner tests build registries out of.
+- `server/state.rs` — `AppState`: the db pool, config, `Arc<UpstreamRegistry>`, `Arc<ToolRegistry>`, `Arc<Resolver>`, and the optional feature handles (RAG indexer, skills, ComfyUI, push, geoip, sandbox client, MCP manager).
+- `rama_server/state.rs` — `RamaState` wraps `AppState` (via `Deref`) and adds the session store, worker registry, usage sink and rate-limit enforcer; `rama_server/auth.rs` — `require_bearer` for `/v1/*`.
+- `openai_driver.rs` — the `session_core::SessionDriver` impl that streams a chat completion, plus `loop_guard.rs`.
+- `server/{scheduled,webhooks,compaction,headless}` — the background workers that need state.
+- `server/comfyui_tool.rs` — the ComfyUI `Tool`/`ToolSource` impls and the `ComfyuiHandle` that `AppState` holds. Split out of `gateway-features`' `comfyui/` because it needs the tool API.
+
+`gateway-tools` and `gateway-web` both sit on this and neither depends on the
+other, so a tool edit and a page edit stay independent.
 
 ### `crates/gateway-tools`
 The tool implementations — one module per tool family (`fetch_url`,
 `fetch_attachment`, `search_web`, `typst_render`, `document`, `rag`, `memory`,
 `qr`, `netcheck`, …). Each holds `Tool` impls; they plug into the machinery in
-`gateway-core` and are registered into the `ToolRegistry` that `gateway`'s
+`gateway-runtime` and are registered into the `ToolRegistry` that `gateway`'s
 `main.rs` builds.
 
 A pure sink like `gateway-web`, and a sibling of it. Two tests live in
 `tests/` rather than beside their code because they span both layers — the
 catalog-grouping and `AppState`-authorization tests need the machinery from
-`gateway-core` *and* the real concrete tools from here. A unit test inside
-`gateway-core` can't reach them: a `cfg(test)` build of a crate is a separate
-crate instance, so its types don't unify with a dependent crate's.
+`gateway-runtime` *and* the real concrete tools from here. A unit test inside
+`gateway-runtime` can't reach them: a `cfg(test)` build of a crate is a separate
+crate instance, so its types don't unify with a dependent crate's. That same
+constraint is why a handful of test-support helpers (`ToolContext::for_test`,
+`pdf::test_support`, `comfyui::Client::with_http`) are plain `pub` rather than
+`#[cfg(test)]`.
 
 ### `crates/gateway-web`
 The server-rendered HTML: `pages/`, split per route. `mod.rs` carries the shared

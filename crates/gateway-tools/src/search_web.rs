@@ -21,7 +21,7 @@
 //! environment variables are imported into the database once at boot and
 //! ignored from then on — see [`search_settings::import_env_once`].
 //!
-//! [`search_settings`]: gateway_core::server::search_settings
+//! [`search_settings`]: gateway_features::server::search_settings
 
 use std::time::Duration;
 
@@ -29,8 +29,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use gateway_core::server::search_settings::{self, SearchProvider, SearchSettings};
-use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
+use gateway_features::server::search_settings::{self, SearchProvider, SearchSettings};
+use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_N_RESULTS: usize = 5;

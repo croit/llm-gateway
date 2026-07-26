@@ -27,18 +27,18 @@ use std::time::Instant;
 use jiff::Timestamp;
 
 use crate::rama_server::vad;
-use gateway_core::rama_server::auth::require_bearer;
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::auth::UserCtx;
 use gateway_core::server::db::usage::{self, UnitUsage, UsageKind, UsageRecord, UsageSource};
-use gateway_core::server::speech::{self, SpokenMarkers};
-use gateway_core::server::tools::ToolContext;
-use gateway_core::server::tools::ToolSource;
-use gateway_core::server::tools::runner::ToolCallAcc;
-use gateway_core::server::tools::runner::{self, LoopError};
 use gateway_core::server::upstreams::registry::{Acquired, RouteError};
 use gateway_core::server::upstreams::{AcquireError, PoolKind};
 use gateway_core::server::usage::UsageHandle;
+use gateway_features::server::speech::{self, SpokenMarkers};
+use gateway_runtime::rama_server::auth::require_bearer;
+use gateway_runtime::rama_server::state::RamaState;
+use gateway_runtime::server::tools::ToolContext;
+use gateway_runtime::server::tools::ToolSource;
+use gateway_runtime::server::tools::runner::ToolCallAcc;
+use gateway_runtime::server::tools::runner::{self, LoopError};
 use session_core::i18n::{Lang, t};
 
 /// Identity + classification for a usage measurement, built once per
@@ -190,8 +190,8 @@ fn response_metrics(kind: UsageKind, bytes: &Bytes) -> (TokenUsage, UnitUsage) {
         units.input = value.get("duration").and_then(Value::as_f64);
     }
     if kind == UsageKind::Image {
-        units.output =
-            gateway_core::server::image_gen::image_output_units_from_value(&value).or(units.output);
+        units.output = gateway_features::server::image_gen::image_output_units_from_value(&value)
+            .or(units.output);
     }
     (usage::usage_from_value(&value), units)
 }
@@ -215,7 +215,7 @@ fn request_units(kind: UsageKind, body: &Bytes) -> UnitUsage {
 }
 
 fn image_edit_units(fields: &[MultipartField]) -> Option<f64> {
-    gateway_core::server::image_gen::image_units(
+    gateway_features::server::image_gen::image_units(
         fields
             .iter()
             .filter(|field| field.name == "image" || field.name == "image[]")
@@ -283,7 +283,7 @@ fn proxy_tool_ctx(
         // refuse to run here anyway (they require `assistant_turn_id`).
         attachment_reservations: None,
         indexer: state.indexer.clone(),
-        image_gen: Some(gateway_core::server::image_gen::ImageGenerator::new(
+        image_gen: Some(gateway_features::server::image_gen::ImageGenerator::new(
             state.upstreams.clone(),
             state.http.clone(),
             state.usage.clone(),
@@ -295,7 +295,7 @@ fn proxy_tool_ctx(
         sandbox_lease: state
             .sandbox_client
             .clone()
-            .map(gateway_core::server::tools::sandbox::SandboxLease::new),
+            .map(gateway_runtime::server::tools::sandbox::SandboxLease::new),
         crypto: Some(state.crypto.clone()),
     }
 }
@@ -432,8 +432,8 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     // Source IP for `get_user_location`: proxy header (behind a load
     // balancer) first, else the direct TCP socket peer. Captured before
     // we split the request so the socket extension is still reachable.
-    let client_ip = gateway_core::server::geoip::client_ip(req.headers())
-        .or_else(|| gateway_core::server::geoip::peer_ip(&req));
+    let client_ip = gateway_features::server::geoip::client_ip(req.headers())
+        .or_else(|| gateway_features::server::geoip::peer_ip(&req));
     let (parts, body) = req.into_parts();
     let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
@@ -476,13 +476,13 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
                 &user.user_id,
                 &role_ids,
                 is_admin,
-                gateway_core::server::tools::mcp::manager::AskContext::Api {
+                gateway_runtime::server::tools::mcp::manager::AskContext::Api {
                     token_id: &user.token_id,
                 },
             )
             .await
     } else {
-        gateway_core::server::tools::mcp::manager::UserMcpLayer::default()
+        gateway_runtime::server::tools::mcp::manager::UserMcpLayer::default()
     };
     state.union_mcp_tool_ids(&mut allowed_tools, &user_mcp);
 
@@ -491,7 +491,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     // family, the document-canvas tools, and `upload_attachment` can't run
     // here — advertising them just lets the model pick one and hit a
     // "only available inside a chat session" error instead of a completion.
-    allowed_tools.retain(|id| !gateway_core::server::tools::catalog::requires_chat_session(id));
+    allowed_tools.retain(|id| !gateway_runtime::server::tools::catalog::requires_chat_session(id));
 
     // Byte-dumb proxy: only when the user has no gateway tool grants.
     // There's nothing to inject, so route bytes 1:1 and leave any
@@ -584,8 +584,8 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     let comfyui = state
         .comfyui
         .as_ref()
-        .map(|h| gateway_core::server::comfyui::ComfyuiToolSource::new((**h).clone()));
-    let tool_source = gateway_core::server::tools::mcp::manager::CompositeToolSource::new(
+        .map(|h| gateway_runtime::server::comfyui_tool::ComfyuiToolSource::new((**h).clone()));
+    let tool_source = gateway_runtime::server::tools::mcp::manager::CompositeToolSource::new(
         state.tools.as_ref(),
         &user_mcp,
     )
@@ -1775,7 +1775,7 @@ async fn forward(
 fn loop_error_chunk() -> Bytes {
     Bytes::from(format!(
         "data: {}\n\n",
-        json!({"error": {"message": gateway_core::loop_guard::LOOP_MESSAGE, "type": "loop_detected"}})
+        json!({"error": {"message": gateway_runtime::loop_guard::LOOP_MESSAGE, "type": "loop_detected"}})
     ))
 }
 
@@ -1816,7 +1816,7 @@ fn force_usage_in_body(body: Bytes) -> (Bytes, bool) {
 /// Streaming variant of `forward` — used by /v1/chat/completions so SSE
 /// (`stream: true`) responses unfold token-by-token to the client
 /// instead of buffering. Relays each upstream frame 1:1 while tapping the
-/// deltas through a [`gateway_core::loop_guard::LoopGuard`]; the `Acquired` RAII
+/// deltas through a [`gateway_runtime::loop_guard::LoopGuard`]; the `Acquired` RAII
 /// guard rides along in the relay task so the in-flight slot stays
 /// reserved for the stream's lifetime. Same header policy as `forward`.
 async fn forward_streaming(
@@ -1921,8 +1921,8 @@ async fn forward_streaming(
         let _slot = acquired;
         let mut upstream_stream = upstream.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
-        let mut content_guard = gateway_core::loop_guard::LoopGuard::new();
-        let mut reasoning_guard = gateway_core::loop_guard::LoopGuard::new();
+        let mut content_guard = gateway_runtime::loop_guard::LoopGuard::new();
+        let mut reasoning_guard = gateway_runtime::loop_guard::LoopGuard::new();
         let mut looped = false;
         // Token counts ride the trailing `usage` frame, which we forced on via
         // `force_usage_in_body`. We forward at SSE-event granularity (not raw
@@ -2038,15 +2038,15 @@ async fn forward_streaming_with_tools(
     client_ip: Option<String>,
     mut request_body: Value,
     allowed_tools: Vec<String>,
-    user_mcp: gateway_core::server::tools::mcp::manager::UserMcpLayer,
+    user_mcp: gateway_runtime::server::tools::mcp::manager::UserMcpLayer,
 ) -> Response {
     // Use the layer built once by the caller (same ids it advertised) for
     // injection here and for dispatch inside the loop.
     let comfyui = state
         .comfyui
         .as_ref()
-        .map(|h| gateway_core::server::comfyui::ComfyuiToolSource::new((**h).clone()));
-    let tool_source = gateway_core::server::tools::mcp::manager::CompositeToolSource::new(
+        .map(|h| gateway_runtime::server::comfyui_tool::ComfyuiToolSource::new((**h).clone()));
+    let tool_source = gateway_runtime::server::tools::mcp::manager::CompositeToolSource::new(
         state.tools.as_ref(),
         &user_mcp,
     )
@@ -2208,7 +2208,7 @@ async fn drive_streaming_tool_loop(
     client_headers: HeaderMap,
     tool_ctx: ToolContext,
     rec: RecordParams,
-    user_mcp: gateway_core::server::tools::mcp::manager::UserMcpLayer,
+    user_mcp: gateway_runtime::server::tools::mcp::manager::UserMcpLayer,
     access: gateway_core::server::upstreams::PoolAccess,
     tx: &mut mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
@@ -2243,7 +2243,7 @@ async fn drive_streaming_tool_loop_inner(
     client_headers: HeaderMap,
     tool_ctx: ToolContext,
     rec: RecordParams,
-    user_mcp: gateway_core::server::tools::mcp::manager::UserMcpLayer,
+    user_mcp: gateway_runtime::server::tools::mcp::manager::UserMcpLayer,
     access: gateway_core::server::upstreams::PoolAccess,
     tx: &mut mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
@@ -2254,8 +2254,8 @@ async fn drive_streaming_tool_loop_inner(
     let comfyui = state
         .comfyui
         .as_ref()
-        .map(|h| gateway_core::server::comfyui::ComfyuiToolSource::new((**h).clone()));
-    let tool_source = gateway_core::server::tools::mcp::manager::CompositeToolSource::new(
+        .map(|h| gateway_runtime::server::comfyui_tool::ComfyuiToolSource::new((**h).clone()));
+    let tool_source = gateway_runtime::server::tools::mcp::manager::CompositeToolSource::new(
         state.tools.as_ref(),
         &user_mcp,
     )
@@ -2347,8 +2347,8 @@ async fn drive_streaming_tool_loop_inner(
         // ends the stream cleanly (error chunk + [DONE]) instead of running
         // until the token ceiling. Repetition-based only, so a long but
         // progressing answer is never cut short.
-        let mut content_guard = gateway_core::loop_guard::LoopGuard::new();
-        let mut reasoning_guard = gateway_core::loop_guard::LoopGuard::new();
+        let mut content_guard = gateway_runtime::loop_guard::LoopGuard::new();
+        let mut reasoning_guard = gateway_runtime::loop_guard::LoopGuard::new();
         // Token counts ride the trailing `usage` frame when the client opted
         // into `stream_options.include_usage` (we never inject it on /v1).
         let mut round_tokens: (Option<i64>, Option<i64>, Option<i64>) = (None, None, None);
@@ -2395,12 +2395,12 @@ async fn drive_streaming_tool_loop_inner(
                     if let Some(t) = delta.content()
                         && content_guard.push(t)
                     {
-                        return Err(gateway_core::loop_guard::LOOP_MESSAGE.to_string());
+                        return Err(gateway_runtime::loop_guard::LOOP_MESSAGE.to_string());
                     }
                     if let Some(t) = delta.reasoning()
                         && reasoning_guard.push(t)
                     {
-                        return Err(gateway_core::loop_guard::LOOP_MESSAGE.to_string());
+                        return Err(gateway_runtime::loop_guard::LOOP_MESSAGE.to_string());
                     }
                     if let Some(tcs) = delta.tool_calls() {
                         hide_event = true;

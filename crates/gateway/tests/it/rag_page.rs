@@ -329,11 +329,12 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
     // Build a state around that registry, otherwise mirroring
     // state_with_admin_rbac.
     use gateway::rama_server::{RamaState, SessionStore};
+    use gateway_core::server::Config;
     use gateway_core::server::db;
     use gateway_core::server::rbac::Resolver;
     use gateway_core::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
-    use gateway_core::server::tools::ToolRegistry;
-    use gateway_core::server::{AppState, Config};
+    use gateway_runtime::server::AppState;
+    use gateway_runtime::server::tools::ToolRegistry;
     let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
     let tools = Arc::new(ToolRegistry::new());
     let rbac = Arc::new(

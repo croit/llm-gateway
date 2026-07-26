@@ -14,6 +14,8 @@ publish.workspace = true
 
 [dependencies]
 gateway-core = { path = "../gateway-core" }
+gateway-features = { path = "../gateway-features" }
+gateway-runtime = { path = "../gateway-runtime" }
 shared = { path = "../shared" }
 session-core = { path = "../session-core" }
 serde = { workspace = true }
