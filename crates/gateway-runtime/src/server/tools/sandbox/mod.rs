@@ -887,6 +887,16 @@ async fn stage_documents(
     let mut staged = Vec::new();
     for d in wanted {
         match documents::get_version(&ctx.db, session_id, &d.document_id, d.version).await {
+            Ok(Some((doc, _))) if doc.is_deleted() => {
+                // Resolvable but deleted: skip it with a note rather than
+                // staging content the user removed. A note (not an error) —
+                // the rest of the run is still worth doing.
+                notes.push(format!(
+                    "Skipped canvas document `{}`: it is deleted. Call                      `undelete_document` first if you meant to use it.",
+                    d.document_id
+                ));
+                continue;
+            }
             Ok(Some((doc, ver))) => {
                 let name = match d.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     Some(n) => match sanitize_filename(n) {

@@ -42,6 +42,7 @@ message rather than being absent.
 | `get_current_timestamp` | — | `get_current_timestamp` | Timezone-aware current date/time, from the caller's `users.timezone`. |
 | `convert_currency` | — | `convert_currency` | Currency conversion at daily ECB reference rates. |
 | `ask_user` | yes | `ask_user` | Ask the user a short question mid-turn and wait for the answer, instead of guessing. Needs a live chat turn *and* someone watching it; times out and reports `answered: false` otherwise. |
+| `notify_user` | — | `notify_user` | Send the user a Web Push notification (long work finished, a scheduled action found something). Deliberately *not* chat-only — a notification lands on a device, not in a conversation, so it also works from the headless scheduler. Hard limit of **one per turn**, latched in `PushNotifier`; errors clearly when `[push]` is unconfigured or the user has no subscribed device. |
 | `get_user_location` | — | `get_user_location` | Caller's location: a browser GPS prompt when a live chat turn is watching, else coarse GeoIP. |
 | `generate_qr_code` | yes | `generate_qr_code` | QR codes (URL, WiFi, vCard, SEPA) as PNG/SVG, rendered in-process. |
 | `search_web` | — | `search_web` | Web search via SearXNG or Brave, with optional domain and recency filters. Backend configured on `/admin/models`. |
@@ -61,17 +62,34 @@ message rather than being absent.
 | `list_documents` | yes | `document` | List the conversation's canvas documents. |
 | `list_document_versions` | yes | `document` | Version history of a canvas document. |
 | `restore_document_version` | yes | `document` | Roll a canvas document back to an earlier version. |
-| `rag_search` | — | `rag_search` | Hybrid search (dense kNN fused with FTS5/BM25) over an indexed collection. Returns chunks with path, line range, score. |
+| `delete_document` | yes | `document` | Soft-delete a canvas document: hidden from the canvas and from `list_documents`, version history kept, reversible. |
+| `undelete_document` | yes | `document` | Undo a `delete_document`. Deliberately *not* named `restore_document` — that would sit one suffix away from `restore_document_version`, which does something else entirely. |
+| `schedule_action` | yes | `schedule` | Create a recurring prompt (5-field cron + IANA timezone, defaulting to `users.timezone`). Validates with `Cron::parse` and returns `describe()` + the next 3 run times, so a wrong-but-valid expression is caught before the first run. Inherits the turn's model from `ToolContext.model`; **always** creates the action with tools off. |
+| `list_scheduled_actions` | — | `schedule` | The caller's own scheduled actions, each with the same human schedule preview. Read-only, so it works off-chat. |
+| `delete_scheduled_action` | yes | `schedule` | Delete one of the caller's actions. Another user's id is reported as missing, not forbidden (no existence leak). |
+| `rag_search` | — | `rag_search` | Hybrid search (dense kNN fused with FTS5/BM25) over an indexed collection. Returns chunks with path, line range, score. Optional `path_glob` scopes it to part of the corpus — filtered inside the query on the lexical side, and after kNN candidate generation on the dense side (which is why the candidate pool widens when it is set). |
+| `rag_grep` | — | `rag_grep` | Regex scan over an indexed collection's chunk text: matching lines with file, line number and context. For patterns BM25 cannot express (`TODO\(.*\)`, `impl .* for Tool`). Full scan with no index behind it, so it is bounded by result / row / wall-clock limits and reports which one it hit. |
 | `rag_list_collections` | — | `rag_list_collections` | Discover which collections exist before searching them. |
 | `remember` | — | `memory` | Persist a durable fact about the user. |
 | `recall` | — | `memory` | Retrieve everything remembered about the user, each with its `id`. |
 | `update_memory` | — | `memory` | Correct a stored fact in place, addressed by the id `recall` returned. |
 | `forget` | — | `memory` | Delete a stored fact by id. |
 
-The canvas tools and the four memory tools collapse to the `document` and
-`memory` keys respectively — see `DOCUMENT_IDS` / `MEMORY_IDS` in `catalog`.
-Turning `memory` off has to remove the mutating tools too, not just the
-read/write pair.
+The canvas tools, the four memory tools and the three scheduling tools
+collapse to the `document`, `memory` and `schedule` keys respectively — see
+`DOCUMENT_IDS` / `MEMORY_IDS` / `SCHEDULE_IDS` in `catalog`. Turning `memory`
+off has to remove the mutating tools too, not just the read/write pair; the
+same reasoning groups `list_scheduled_actions` with the two tools that change
+a schedule, since "can see my schedule but not change it" is not a
+distinction anyone configures.
+
+`schedule_action` and `delete_scheduled_action` are chat-only for a reason
+that isn't about attaching output: both require an `ask_user` confirmation,
+because the action they write later runs **as the user**, unattended, until
+removed. That makes a scheduled action a persistent prompt-injection vector,
+so a human has to approve it — which also means a scheduled run cannot create
+further scheduled actions (the headless worker has a session but nobody
+watching, so the confirmation goes unanswered and the write is refused).
 
 ## Conditionally registered
 
@@ -97,6 +115,23 @@ Gated so the model is never offered a tool whose every call could only answer
 `export_document` is the one sandbox tool that rides the canvas `document`
 toggle: it exports a canvas document, so it belongs to that capability from
 the user's point of view even though it needs the sandbox to run.
+
+**`render_typst` is deliberately not chat-only, even though part of it needs a
+session.** It renders either inline `source` or a `document_id` from the canvas.
+The inline path is the common one and works fine on `/v1`; only the
+`document_id` path needs a chat session, and it fails there with a message
+naming the reason ("canvas documents are only available inside a chat session")
+rather than a generic error. Marking the whole tool chat-only would remove a
+working capability from the proxy paths to protect an argument the model
+wouldn't have a use for there — a `/v1` caller has no canvas to reference. Same
+reasoning applies to `run_in_sandbox`'s optional canvas-document staging, which
+degrades to a note instead of failing the run. `export_document` is different
+and *is* chat-only: a canvas document is its only possible input.
+
+All three refuse a **soft-deleted** document explicitly. `documents::get`
+resolves deleted rows on purpose (see `delete_document`), so without that check
+a stale id would quietly produce an export, a PDF, or a staged file from work
+the user threw away.
 
 ## Dynamic families
 

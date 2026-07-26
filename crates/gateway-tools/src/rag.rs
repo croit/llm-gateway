@@ -10,6 +10,12 @@
 //!     indexed. Returns name + description + status so the model can
 //!     tell ready-to-search from still-indexing.
 //!
+//!   * [`RagGrep`] — regex retrieval. `rag_search` is hybrid, so exact
+//!     identifiers are already findable there; what BM25 cannot express is a
+//!     *pattern* (`TODO\(.*\)`, `impl .* for Tool`). This scans chunk text
+//!     with a compiled regex and returns matching lines with context, bounded
+//!     by result / row / time limits because there is no index behind it.
+//!
 //!   * [`RagSearch`] — the actual retrieval. Embeds the query through
 //!     the collection's configured embedding model, runs a k-NN search
 //!     against the per-collection usearch index, joins back to the
@@ -24,6 +30,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use gateway_core::server::db::rag as rag_db;
@@ -164,6 +171,9 @@ struct SearchArgs {
     git_ref: Option<String>,
     #[serde(default)]
     top_k: Option<u32>,
+    /// Glob restricting which indexed paths may match. See the schema.
+    #[serde(default)]
+    path_glob: Option<String>,
 }
 
 const TOP_K_DEFAULT: u32 = 5;
@@ -219,6 +229,20 @@ impl Tool for RagSearch {
                                         `qemu-server`); for a versioned one a branch \
                                         / tag / commit. See `rag_list_collections`."
                     },
+                    "path_glob": {
+                        "type": "string",
+                        "description": "Optional path filter, so you can scope a search to \
+                                        part of the corpus: `src/osd/*` (everything under \
+                                        that directory, at any depth), `*.rs`, \
+                                        `*/tests/*`. Matched against the indexed file path \
+                                        with glob syntax (`*` any characters, `?` one, \
+                                        `[abc]` a set) and case-sensitively. On an \
+                                        aggregate collection paths start with the source \
+                                        repo, e.g. `pve-manager/*`. Narrows the search \
+                                        rather than guaranteeing every match under the \
+                                        path — leave it off unless the user pointed at a \
+                                        specific area."
+                    },
                     "top_k": {
                         "type": "integer",
                         "minimum": 1,
@@ -236,30 +260,19 @@ impl Tool for RagSearch {
             let args: SearchArgs = serde_json::from_value(args).map_err(|e| {
                 ToolError::InvalidArgs(format!(
                     "expected {{query: string, collection: string, ref?: string, \
-                     top_k?: integer}}: {e}"
+                     top_k?: integer, path_glob?: string}}: {e}"
                 ))
             })?;
             let indexer = ctx
                 .indexer
                 .as_ref()
                 .ok_or_else(|| ToolError::Failed("RAG is not configured on this gateway".into()))?;
-            let collection = rag_db::find_collection_by_name(indexer.db(), &args.collection)
-                .await
-                .map_err(|e| ToolError::Failed(format!("looking up collection: {e}")))?
-                // A collection the caller's groups don't permit is reported as
-                // "not found" — identical to a nonexistent one, so a restricted
-                // collection can't be probed for existence or searched by name.
-                .filter(|c| {
-                    let role_ids = self.rbac.role_ids_for(&ctx.roles);
-                    self.rbac.resource_allowed(&role_ids, &c.allowed_groups)
-                })
-                .ok_or_else(|| {
-                    ToolError::Failed(format!(
-                        "no RAG collection named `{}` — call rag_list_collections to discover \
-                         which collections this gateway has indexed",
-                        args.collection
-                    ))
-                })?;
+            // A collection the caller's groups don't permit is reported as
+            // "not found" — identical to a nonexistent one, so a restricted
+            // collection can't be probed for existence or searched by name.
+            // Shared with `rag_grep` so the two can't drift apart.
+            let collection =
+                resolve_collection(&self.rbac, indexer.db(), &ctx.roles, &args.collection).await?;
 
             // Aggregate collections default to a larger result set (they span
             // many repos, and one search covers them all); an explicit
@@ -284,17 +297,427 @@ impl Tool for RagSearch {
                 .await
                 .map_err(|e| ToolError::Failed(format!("embedding query: {e}")))?;
 
-            let hits = worker::search_chunks(indexer, &rref, &args.query, &query_vec, top_k)
-                .await
-                .map_err(|e| ToolError::Failed(format!("searching index: {e}")))?;
+            let path_glob = validate_glob(args.path_glob.as_deref())?;
+            let hits = worker::search_chunks(
+                indexer,
+                &rref,
+                &args.query,
+                &query_vec,
+                top_k,
+                path_glob.as_deref(),
+            )
+            .await
+            .map_err(|e| ToolError::Failed(format!("searching index: {e}")))?;
+            let empty = hits.is_empty();
             let results: Vec<Value> = hits.into_iter().map(hit_json).collect();
-            Ok(json!({
+            let mut out = json!({
                 "collection": collection.name,
                 "ref": rref.git_ref,
                 "hits": results,
-            }))
+            });
+            if let Some(glob) = &path_glob {
+                out["path_glob"] = json!(glob);
+                if empty {
+                    // Distinguish "nothing matches the query" from "the filter
+                    // excluded everything" — otherwise the model concludes the
+                    // corpus has no answer when it only mis-scoped the path.
+                    out["note"] = json!(format!(
+                        "No hits under `{glob}`. The filter may be wrong (check the path \
+                         shape with a search without `path_glob`, or note that an \
+                         aggregate collection prefixes paths with the source repo) — \
+                         retry unscoped before concluding the corpus doesn't cover this."
+                    ));
+                }
+            }
+            Ok(out)
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// rag_grep
+
+/// Regex search over an indexed collection's chunk text.
+///
+/// `rag_search` is already hybrid — dense kNN fused with FTS5/BM25 — so exact
+/// identifiers *are* findable. What BM25 cannot express is a **pattern**: it
+/// tokenises, so `TODO\(.*\)`, `impl .* for Tool` and `#\[cfg\(test\)\]` have
+/// no query that finds them, and "show me every call site shaped like this" has
+/// no tool at all.
+///
+/// The trade-off is the cost profile: this is a full scan over chunk text with
+/// no index to lean on, so it is bounded three ways at once (matches, rows
+/// scanned, wall clock) and reports which bound it hit. A partial answer the
+/// model knows is partial beats a complete one that took the gateway down.
+pub struct RagGrep {
+    rbac: Arc<Resolver>,
+}
+
+impl RagGrep {
+    pub fn new(rbac: Arc<Resolver>) -> Self {
+        Self { rbac }
+    }
+}
+
+#[derive(Deserialize)]
+struct GrepArgs {
+    pattern: String,
+    collection: String,
+    #[serde(default, rename = "ref")]
+    git_ref: Option<String>,
+    #[serde(default)]
+    path_glob: Option<String>,
+    #[serde(default)]
+    max_results: Option<u32>,
+    #[serde(default)]
+    ignore_case: bool,
+    #[serde(default)]
+    context_lines: Option<u32>,
+}
+
+const GREP_MAX_RESULTS_DEFAULT: u32 = 40;
+const GREP_MAX_RESULTS_CAP: u32 = 200;
+const GREP_CONTEXT_LINES_CAP: u32 = 5;
+/// Longest pattern we compile. Long patterns aren't dangerous (the `regex`
+/// crate is linear-time by construction — there is no catastrophic
+/// backtracking to trigger), this is just a sanity bound.
+const GREP_MAX_PATTERN_LEN: usize = 500;
+/// Compiled-program size ceiling. Guards the one thing a pattern *can* blow
+/// up: memory, via a huge bounded repetition like `a{1000}{1000}`.
+const GREP_REGEX_SIZE_LIMIT: usize = 1 << 20;
+/// Rows pulled per batch of the scan. Big enough to amortise the round trip,
+/// small enough that the time budget is checked often.
+const GREP_BATCH: usize = 500;
+/// Hard ceiling on rows examined, whatever the time budget says.
+const GREP_MAX_CHUNKS: usize = 50_000;
+/// Wall-clock budget for the scan.
+const GREP_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl Tool for RagGrep {
+    fn id(&self) -> &str {
+        "rag_grep"
+    }
+
+    fn schema(&self) -> ToolDef {
+        ToolDef::function(
+            self.id(),
+            "Search an indexed collection with a REGULAR EXPRESSION and get back \
+             matching lines with their file, line number and surrounding context \
+             — the equivalent of `grep -rn` over the corpus. \
+             \
+             Use it when you need a pattern rather than a meaning: every `TODO(...)`, \
+             every `impl ... for Tool`, every call site of a macro, every line \
+             matching a config-key shape. For \"how does X work\" or \"where is Y \
+             handled\", use `rag_search` instead — it is hybrid (semantic AND exact \
+             keyword), so plain identifiers are already covered there, and it ranks \
+             results by relevance while this tool just reports every match in \
+             corpus order. \
+             \
+             This is a full scan with no index behind it, so scope it: pass a \
+             `path_glob` when you know the area, and keep the pattern specific. It \
+             stops at the result, row or time limit and tells you when it did — a \
+             `truncated` result means \"narrow it\", not \"that's all there is\".",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["pattern", "collection"],
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Rust/RE2-syntax regular expression, matched against \
+                                        each line individually (so `^` and `$` anchor to a \
+                                        line, and there is no lookahead/backreference). \
+                                        Remember to escape regex metacharacters when you \
+                                        mean them literally: `TODO\\(.*\\)`, \
+                                        `#\\[cfg\\(test\\)\\]`."
+                    },
+                    "collection": {
+                        "type": "string",
+                        "description": "Name of the indexed collection. Get the list with \
+                                        `rag_list_collections`."
+                    },
+                    "ref": {
+                        "type": "string",
+                        "description": "Which ref/source to scan. Omit for the collection's \
+                                        default, exactly as in `rag_search`."
+                    },
+                    "path_glob": {
+                        "type": "string",
+                        "description": "Path filter, e.g. `src/osd/*`, `*.rs`, `*/tests/*`. \
+                                        Glob syntax, case-sensitive, matched against the \
+                                        indexed path (on an aggregate collection paths \
+                                        start with the source repo). Strongly preferred \
+                                        when you know roughly where to look — it is what \
+                                        keeps the scan cheap."
+                    },
+                    "ignore_case": {
+                        "type": "boolean",
+                        "description": "Match case-insensitively. Default false, like grep."
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": GREP_CONTEXT_LINES_CAP,
+                        "description": "Lines of surrounding context per match (default 2, \
+                                        max 5). Context is limited to the indexed chunk the \
+                                        match falls in, so it can be shorter than asked \
+                                        for near a chunk boundary."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": GREP_MAX_RESULTS_CAP,
+                        "description": "Stop after this many matching lines. Default 40, \
+                                        max 200."
+                    }
+                }
+            }),
+        )
+    }
+
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let args: GrepArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::InvalidArgs(format!(
+                    "expected {{pattern: string, collection: string, ref?: string, \
+                     path_glob?: string, ignore_case?: boolean, context_lines?: integer, \
+                     max_results?: integer}}: {e}"
+                ))
+            })?;
+
+            if args.pattern.trim().is_empty() {
+                return Err(ToolError::InvalidArgs("`pattern` must not be empty".into()));
+            }
+            if args.pattern.len() > GREP_MAX_PATTERN_LEN {
+                return Err(ToolError::InvalidArgs(format!(
+                    "`pattern` is too long (max {GREP_MAX_PATTERN_LEN} characters)"
+                )));
+            }
+            // Compile before touching the DB: a bad pattern is the model's to
+            // fix, and the regex crate's error names the offending position.
+            let re = regex::RegexBuilder::new(&args.pattern)
+                .case_insensitive(args.ignore_case)
+                .size_limit(GREP_REGEX_SIZE_LIMIT)
+                .build()
+                .map_err(|e| {
+                    ToolError::InvalidArgs(format!(
+                        "`pattern` is not a valid regular expression: {e}"
+                    ))
+                })?;
+
+            let indexer = ctx
+                .indexer
+                .as_ref()
+                .ok_or_else(|| ToolError::Failed("RAG is not configured on this gateway".into()))?;
+            // Identical resolution (and identical "not found" for a collection
+            // the caller's groups don't permit) as `rag_search` — a new tool
+            // must not become a way to probe for restricted collections.
+            let collection =
+                resolve_collection(&self.rbac, indexer.db(), &ctx.roles, &args.collection).await?;
+            let rref = resolve_search(indexer.db(), &collection, args.git_ref.as_deref()).await?;
+            let store = indexer
+                .collection_store(rref.id, &rref.data_uuid)
+                .await
+                .map_err(|e| ToolError::Failed(format!("opening collection store: {e}")))?;
+
+            let path_glob = validate_glob(args.path_glob.as_deref())?;
+            let max_results = args
+                .max_results
+                .unwrap_or(GREP_MAX_RESULTS_DEFAULT)
+                .clamp(1, GREP_MAX_RESULTS_CAP) as usize;
+            let context_lines =
+                args.context_lines.unwrap_or(2).min(GREP_CONTEXT_LINES_CAP) as usize;
+
+            let scan = grep_scan(
+                &store,
+                rref.collection_id,
+                path_glob.as_deref(),
+                &re,
+                max_results,
+                context_lines,
+            )
+            .await?;
+
+            let mut out = json!({
+                "collection": collection.name,
+                "ref": rref.git_ref,
+                "pattern": args.pattern,
+                "matches": scan.matches,
+                "match_count": scan.matches.len(),
+                "chunks_scanned": scan.chunks_scanned,
+            });
+            if let Some(glob) = &path_glob {
+                out["path_glob"] = json!(glob);
+            }
+            if let Some(reason) = scan.stopped_because {
+                out["truncated"] = json!(true);
+                out["note"] = json!(match reason {
+                    StopReason::Results => format!(
+                        "Stopped at the {max_results}-match limit; there are more. Narrow the \
+                         pattern or add a `path_glob` rather than raising the limit."
+                    ),
+                    StopReason::Rows => format!(
+                        "Stopped after scanning {GREP_MAX_CHUNKS} chunks — the rest of the \
+                         collection was NOT examined. Add a `path_glob` to scope the scan."
+                    ),
+                    StopReason::Time => format!(
+                        "Stopped after {}s — the rest of the collection was NOT examined. \
+                         Add a `path_glob`, or use `rag_search` if a semantic query would do.",
+                        GREP_TIME_BUDGET.as_secs()
+                    ),
+                });
+            } else if scan.matches.is_empty() {
+                out["note"] = json!(
+                    "No lines matched, and the whole scope was scanned. Check the pattern's \
+                     escaping, or try `rag_search` — it finds identifiers and phrasing that \
+                     an exact pattern misses."
+                );
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// Why a scan stopped early. Reported to the model, because "40 matches" means
+/// something very different when there were 41 versus when the clock ran out
+/// halfway through the corpus.
+#[derive(Debug, PartialEq, Eq)]
+enum StopReason {
+    /// Enough matches found; the scan was cut short with more to find.
+    Results,
+    /// The row ceiling hit — part of the scope was never examined.
+    Rows,
+    /// The wall-clock budget ran out — likewise.
+    Time,
+}
+
+struct GrepScan {
+    matches: Vec<Value>,
+    chunks_scanned: usize,
+    stopped_because: Option<StopReason>,
+}
+
+/// Page through the collection's chunks and collect matching lines.
+///
+/// Chunking uses an overlapping window, so one source line can appear in two
+/// chunks — matches are de-duplicated on `(path, line)` so a match near a
+/// boundary is reported once.
+async fn grep_scan(
+    store: &gateway_core::server::db::Pool,
+    collection_id: i64,
+    path_glob: Option<&str>,
+    re: &regex::Regex,
+    max_results: usize,
+    context_lines: usize,
+) -> Result<GrepScan, ToolError> {
+    let started = std::time::Instant::now();
+    let mut matches: Vec<Value> = Vec::new();
+    let mut seen: HashSet<(String, i64)> = HashSet::new();
+    let mut chunks_scanned = 0usize;
+    let mut after_id = 0i64;
+    let mut stopped_because = None;
+
+    'scan: loop {
+        if started.elapsed() >= GREP_TIME_BUDGET {
+            stopped_because = Some(StopReason::Time);
+            break;
+        }
+        if chunks_scanned >= GREP_MAX_CHUNKS {
+            stopped_because = Some(StopReason::Rows);
+            break;
+        }
+        let batch = rag_db::scan_chunks(store, collection_id, path_glob, after_id, GREP_BATCH)
+            .await
+            .map_err(|e| ToolError::Failed(format!("scanning chunks: {e}")))?;
+        if batch.is_empty() {
+            break;
+        }
+        for chunk in &batch {
+            after_id = chunk.id;
+            chunks_scanned += 1;
+            let lines: Vec<&str> = chunk.content.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                if !re.is_match(line) {
+                    continue;
+                }
+                let line_no = chunk.start_line + idx as i64;
+                if !seen.insert((chunk.file_path.clone(), line_no)) {
+                    continue;
+                }
+                let from = idx.saturating_sub(context_lines);
+                let to = (idx + context_lines + 1).min(lines.len());
+                matches.push(json!({
+                    "file_path": chunk.file_path,
+                    "line": line_no,
+                    "text": line,
+                    "context": lines[from..to].join("\n"),
+                    "context_start_line": chunk.start_line + from as i64,
+                }));
+                if matches.len() >= max_results {
+                    stopped_because = Some(StopReason::Results);
+                    break 'scan;
+                }
+            }
+            // Checked per chunk, not only per batch: one pathological chunk
+            // shouldn't be able to overshoot the budget by a whole batch.
+            if started.elapsed() >= GREP_TIME_BUDGET {
+                stopped_because = Some(StopReason::Time);
+                break 'scan;
+            }
+        }
+    }
+
+    Ok(GrepScan {
+        matches,
+        chunks_scanned,
+        stopped_because,
+    })
+}
+
+/// Resolve a collection by name, applying the per-collection group ACL.
+///
+/// Shared by `rag_search` and `rag_grep` so the two can't drift: a collection
+/// the caller's groups don't permit must be reported as *not found*, identical
+/// to a nonexistent one, or the error message becomes an existence oracle.
+async fn resolve_collection(
+    rbac: &Resolver,
+    db: &gateway_core::server::db::Pool,
+    roles: &[String],
+    name: &str,
+) -> Result<rag_db::Collection, ToolError> {
+    rag_db::find_collection_by_name(db, name)
+        .await
+        .map_err(|e| ToolError::Failed(format!("looking up collection: {e}")))?
+        .filter(|c| {
+            let role_ids = rbac.role_ids_for(roles);
+            rbac.resource_allowed(&role_ids, &c.allowed_groups)
+        })
+        .ok_or_else(|| {
+            ToolError::Failed(format!(
+                "no RAG collection named `{name}` — call rag_list_collections to discover \
+                 which collections this gateway has indexed"
+            ))
+        })
+}
+
+/// Bound and normalise a caller-supplied path glob.
+///
+/// Only a length cap and an emptiness check: GLOB has no injection surface
+/// here (it is a bound parameter, not interpolated SQL) and no pathological
+/// patterns — SQLite's matcher is a bounded backtracker over a pattern we cap.
+/// A blank string is treated as "no filter" rather than "match nothing",
+/// because a model passing `""` means the former.
+fn validate_glob(raw: Option<&str>) -> Result<Option<String>, ToolError> {
+    const MAX_GLOB_LEN: usize = 200;
+    let Some(glob) = raw.map(str::trim).filter(|g| !g.is_empty()) else {
+        return Ok(None);
+    };
+    if glob.len() > MAX_GLOB_LEN {
+        return Err(ToolError::InvalidArgs(format!(
+            "`path_glob` is too long (max {MAX_GLOB_LEN} characters)"
+        )));
+    }
+    Ok(Some(glob.to_string()))
 }
 
 /// Render one search hit. The `score` is hybrid (dense + lexical)
@@ -470,6 +893,8 @@ mod tests {
             image_gen: None,
             sandbox_lease: None,
             crypto: None,
+            push: None,
+            model: None,
         }
     }
 
@@ -722,7 +1147,7 @@ mod tests {
         .unwrap()
         .pop()
         .unwrap();
-        let raw = search_chunks(&indexer, &r, "alpha please", &q, 5)
+        let raw = search_chunks(&indexer, &r, "alpha please", &q, 5, None)
             .await
             .unwrap();
         assert!(!raw.is_empty(), "lower layer returned no hits");
@@ -928,6 +1353,386 @@ mod tests {
             ToolError::Failed(msg) => assert!(msg.contains("rag_list_collections"), "{msg}"),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // path scoping + rag_grep
+
+    fn open_resolver() -> Arc<gateway_core::server::rbac::Resolver> {
+        Arc::new(gateway_core::server::rbac::Resolver::empty())
+    }
+
+    /// A ready, searchable versioned collection holding `files` — each entry a
+    /// `(path, content)` pair indexed as ONE chunk starting at line 1, with its
+    /// embedding added to the vector index so both retrieval sides work.
+    async fn seeded_collection(
+        name: &str,
+        files: &[(&str, &str)],
+    ) -> (db::Pool, Indexer, MockServer) {
+        let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+        let upstream = embedding_upstream().await;
+        let reg = registry(&upstream.uri());
+        let indexer = Indexer::new(
+            pool.clone(),
+            Arc::clone(&reg),
+            reqwest::Client::new(),
+            IndexerConfig {
+                data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
+                ..IndexerConfig::default()
+            },
+        );
+        let c = rag_db::create_collection(
+            &pool,
+            &rag_db::NewCollection {
+                name: name.into(),
+                description: None,
+                git_url: "https://example.invalid".into(),
+                git_ref: "main".into(),
+                pat: None,
+                embedding_model: "embed-test".into(),
+                include_globs: vec![],
+                exclude_globs: vec![],
+                chunk_size: 100,
+                chunk_overlap: 10,
+                search_mode: rag_db::SearchMode::Versioned,
+            },
+        )
+        .await
+        .unwrap();
+        let r = rag_db::add_ref(&pool, c.id, "main", None, true)
+            .await
+            .unwrap();
+        let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
+        let idx = indexer.open_index(r.id, &r.data_uuid, Some(4)).unwrap();
+        for (i, (path, content)) in files.iter().enumerate() {
+            let vid = i as i64 + 1;
+            let f = rag_db::upsert_file(&store, c.id, path, "hash")
+                .await
+                .unwrap();
+            rag_db::insert_chunks(
+                &store,
+                c.id,
+                &[rag_db::NewChunk {
+                    file_id: f,
+                    chunk_index: 0,
+                    start_line: 1,
+                    end_line: content.lines().count().max(1) as i64,
+                    content: (*content).into(),
+                    vector_id: vid,
+                }],
+            )
+            .await
+            .unwrap();
+            let v = embeddings::embed(
+                &reqwest::Client::new(),
+                &reg,
+                "embed-test",
+                &[(*content).to_string()],
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+            idx.add(vid, &v).unwrap();
+        }
+        drop(idx);
+        rag_db::set_ref_status(&pool, r.id, rag_db::CollectionStatus::Indexing)
+            .await
+            .unwrap();
+        rag_db::swap_ref_index(&pool, r.id, &r.data_uuid, "deadbeef")
+            .await
+            .unwrap();
+        (pool, indexer, upstream)
+    }
+
+    /// The point of variant A: the same query, scoped to a subtree, returns
+    /// only what lives there — and the filter has to apply on *both* retrieval
+    /// sides, or the excluded file comes back through whichever side skipped it.
+    #[tokio::test]
+    async fn path_glob_scopes_a_search_to_the_matching_subtree() {
+        let (_pool, indexer, _up) = seeded_collection(
+            "code",
+            &[
+                ("src/osd/alpha.rs", "alpha alpha"),
+                ("docs/alpha.md", "alpha alpha"),
+            ],
+        )
+        .await;
+
+        // Unscoped: both files are candidates.
+        let out = RagSearch::new(open_resolver())
+            .run(
+                ctx_with(indexer.clone()),
+                json!({"query": "alpha please", "collection": "code"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["hits"].as_array().unwrap().len(), 2, "{out:?}");
+        assert!(
+            out.get("path_glob").is_none(),
+            "no filter, no echo: {out:?}"
+        );
+
+        // Scoped: only the one under src/osd.
+        let out = RagSearch::new(open_resolver())
+            .run(
+                ctx_with(indexer),
+                json!({
+                    "query": "alpha please", "collection": "code",
+                    "path_glob": "src/osd/*"
+                }),
+            )
+            .await
+            .unwrap();
+        let hits = out["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "{out:?}");
+        assert_eq!(hits[0]["file_path"], "src/osd/alpha.rs");
+        assert_eq!(
+            out["path_glob"], "src/osd/*",
+            "the scope must be echoed back"
+        );
+    }
+
+    /// A glob that matches nothing must not read as "the corpus has no answer"
+    /// — that is the failure mode that makes a model give up on a good corpus.
+    #[tokio::test]
+    async fn a_glob_matching_nothing_tells_the_model_to_retry_unscoped() {
+        let (_pool, indexer, _up) =
+            seeded_collection("code", &[("src/alpha.rs", "alpha alpha")]).await;
+        let out = RagSearch::new(open_resolver())
+            .run(
+                ctx_with(indexer),
+                json!({
+                    "query": "alpha please", "collection": "code",
+                    "path_glob": "nowhere/*"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(out["hits"].as_array().unwrap().is_empty(), "{out:?}");
+        let note = out["note"].as_str().unwrap();
+        assert!(note.contains("unscoped"), "{note}");
+    }
+
+    #[test]
+    fn a_blank_glob_means_no_filter_not_match_nothing() {
+        assert_eq!(validate_glob(Some("  ")).unwrap(), None);
+        assert_eq!(validate_glob(None).unwrap(), None);
+        assert_eq!(
+            validate_glob(Some(" src/* ")).unwrap().as_deref(),
+            Some("src/*")
+        );
+        assert!(validate_glob(Some(&"a".repeat(500))).is_err());
+    }
+
+    /// The capability `rag_search` cannot provide: a pattern, with line numbers
+    /// and context, in corpus order.
+    #[tokio::test]
+    async fn grep_returns_matching_lines_with_line_numbers_and_context() {
+        let (_pool, indexer, _up) = seeded_collection(
+            "code",
+            &[(
+                "src/osd.rs",
+                "fn one() {}\n// TODO(martin): fix this\nfn two() {}\n",
+            )],
+        )
+        .await;
+        let out = RagGrep::new(open_resolver())
+            .run(
+                ctx_with(indexer),
+                json!({"pattern": r"TODO\(.*\)", "collection": "code"}),
+            )
+            .await
+            .unwrap();
+        let matches = out["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1, "{out:?}");
+        assert_eq!(matches[0]["file_path"], "src/osd.rs");
+        // Chunk starts at line 1, the match is the second line.
+        assert_eq!(matches[0]["line"], 2, "{out:?}");
+        assert!(
+            matches[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("TODO(martin)"),
+            "{out:?}"
+        );
+        // Context reaches the surrounding lines.
+        let ctx_text = matches[0]["context"].as_str().unwrap();
+        assert!(
+            ctx_text.contains("fn one()") && ctx_text.contains("fn two()"),
+            "{ctx_text}"
+        );
+        assert!(out.get("truncated").is_none(), "nothing was cut: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn grep_honours_the_path_filter() {
+        let (_pool, indexer, _up) = seeded_collection(
+            "code",
+            &[
+                ("src/osd.rs", "// TODO(a): here\n"),
+                ("docs/notes.md", "// TODO(b): there\n"),
+            ],
+        )
+        .await;
+        let out = RagGrep::new(open_resolver())
+            .run(
+                ctx_with(indexer),
+                json!({"pattern": "TODO", "collection": "code", "path_glob": "src/*"}),
+            )
+            .await
+            .unwrap();
+        let matches = out["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1, "{out:?}");
+        assert_eq!(matches[0]["file_path"], "src/osd.rs");
+    }
+
+    /// Case sensitivity is grep's, not the embedder's — and the flag has to
+    /// actually reach the compiled pattern.
+    #[tokio::test]
+    async fn grep_is_case_sensitive_unless_asked_otherwise() {
+        let (_pool, indexer, _up) =
+            seeded_collection("code", &[("src/a.rs", "let Timeout = 5;\n")]).await;
+
+        let out = RagGrep::new(open_resolver())
+            .run(
+                ctx_with(indexer.clone()),
+                json!({"pattern": "timeout", "collection": "code"}),
+            )
+            .await
+            .unwrap();
+        assert!(out["matches"].as_array().unwrap().is_empty(), "{out:?}");
+
+        let out = RagGrep::new(open_resolver())
+            .run(
+                ctx_with(indexer),
+                json!({"pattern": "timeout", "collection": "code", "ignore_case": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["matches"].as_array().unwrap().len(), 1, "{out:?}");
+    }
+
+    /// Hitting the result cap must be reported, not silently look like the
+    /// whole answer — "5 matches" and "5 matches, there are more" lead to very
+    /// different next steps.
+    #[tokio::test]
+    async fn grep_reports_when_it_stopped_at_the_result_limit() {
+        let body = (0..20)
+            .map(|i| format!("// TODO({i})"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (_pool, indexer, _up) = seeded_collection("code", &[("src/a.rs", &body)]).await;
+        let out = RagGrep::new(open_resolver())
+            .run(
+                ctx_with(indexer),
+                json!({"pattern": "TODO", "collection": "code", "max_results": 3}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["matches"].as_array().unwrap().len(), 3, "{out:?}");
+        assert_eq!(out["truncated"], true, "{out:?}");
+        assert!(
+            out["note"].as_str().unwrap().contains("more"),
+            "the note must say there are more: {out:?}"
+        );
+    }
+
+    /// A model that mis-escapes a pattern should get the regex error back, not
+    /// a scan of the whole corpus for a literal.
+    #[tokio::test]
+    async fn grep_rejects_an_invalid_pattern_before_touching_the_index() {
+        let (_pool, indexer, _up) = seeded_collection("code", &[("src/a.rs", "x")]).await;
+        let err = RagGrep::new(open_resolver())
+            .run(
+                ctx_with(indexer),
+                json!({"pattern": "TODO(unclosed", "collection": "code"}),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidArgs(msg) => {
+                assert!(msg.contains("not a valid regular expression"), "{msg}")
+            }
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        }
+        assert!(
+            RagGrep::new(open_resolver())
+                .run(
+                    ToolContext::for_test(
+                        db::open(std::path::Path::new(":memory:")).await.unwrap()
+                    ),
+                    json!({"pattern": "", "collection": "code"}),
+                )
+                .await
+                .is_err(),
+            "an empty pattern must be refused too"
+        );
+    }
+
+    /// The no-existence-leak property, which a *new* tool over the same corpus
+    /// is exactly how you'd lose: a collection the caller's groups don't permit
+    /// must be indistinguishable from one that doesn't exist.
+    #[tokio::test]
+    async fn grep_reports_a_forbidden_collection_as_missing() {
+        let (pool, indexer, _up) = seeded_collection("secret", &[("src/a.rs", "TODO x")]).await;
+        let c = rag_db::find_collection_by_name(&pool, "secret")
+            .await
+            .unwrap()
+            .unwrap();
+        rag_db::set_allowed_groups(&pool, c.id, &["ops".to_string()])
+            .await
+            .unwrap();
+
+        // Caller has no roles, so no group grants it.
+        let err = RagGrep::new(open_resolver())
+            .run(
+                ctx_with(indexer.clone()),
+                json!({"pattern": "TODO", "collection": "secret"}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no RAG collection named `secret`"),
+            "must read as nonexistent: {err}"
+        );
+
+        // Byte-identical to a genuinely unknown name — that identity is the
+        // property, not just the wording of either message.
+        let unknown = RagGrep::new(open_resolver())
+            .run(
+                ctx_with(indexer),
+                json!({"pattern": "TODO", "collection": "secret"}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, unknown);
+    }
+
+    /// Path scoping must not become a way around the same ACL.
+    #[tokio::test]
+    async fn search_reports_a_forbidden_collection_as_missing() {
+        let (pool, indexer, _up) = seeded_collection("secret", &[("src/a.rs", "alpha")]).await;
+        let c = rag_db::find_collection_by_name(&pool, "secret")
+            .await
+            .unwrap()
+            .unwrap();
+        rag_db::set_allowed_groups(&pool, c.id, &["ops".to_string()])
+            .await
+            .unwrap();
+        let err = RagSearch::new(open_resolver())
+            .run(
+                ctx_with(indexer),
+                json!({
+                    "query": "alpha", "collection": "secret", "path_glob": "src/*"
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no RAG collection named `secret`"), "{err}");
     }
 
     #[test]

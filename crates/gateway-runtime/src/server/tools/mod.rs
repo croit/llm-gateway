@@ -112,6 +112,18 @@ pub struct ToolContext {
     /// one up (unit tests), where such a setting reads as "not configured"
     /// and the tool reports that rather than failing opaquely.
     pub crypto: Option<std::sync::Arc<gateway_core::server::crypto::Crypto>>,
+    /// Web Push handle plus this turn's one-notification budget, so
+    /// `notify_user` can reach the user's subscribed browsers. `None` when
+    /// push isn't configured (no VAPID key) — the tool then reports that
+    /// rather than failing opaquely. See [`PushNotifier`].
+    pub push: Option<PushNotifier>,
+    /// The model this turn is running on, when the path knows it. Carried so
+    /// a tool can act *as* the current model without reaching into global
+    /// state: `schedule_action` gives the action it creates the same model the
+    /// user is talking to, which is the only choice that doesn't surprise
+    /// them. `None` on paths that don't resolve one (unit tests), where a
+    /// tool needing it must ask for it explicitly or refuse.
+    pub model: Option<String>,
 }
 
 /// Test-support constructor. Not `#[cfg(test)]`-gated because the tool
@@ -142,7 +154,49 @@ impl ToolContext {
             image_gen: None,
             sandbox_lease: None,
             crypto: None,
+            push: None,
+            model: None,
         }
+    }
+}
+
+/// Web Push handle for `notify_user`, with the turn's notification budget
+/// attached.
+///
+/// The budget is the reason this is a struct rather than a bare
+/// `Arc<PushSender>`: a model in a tool loop that can push freely is spam on
+/// someone's phone, and repeated deliveries are how a VAPID key earns a bad
+/// reputation with the push services. One notification per turn is enforced
+/// here — not in `server::limits`, which counts tokens and cost per user over
+/// time and has no notion of a turn — because the latch has exactly the
+/// lifetime of the [`ToolContext`] the driver builds per turn.
+#[derive(Clone)]
+pub struct PushNotifier {
+    sender: std::sync::Arc<gateway_features::server::push::PushSender>,
+    /// Cleared for every fresh context, i.e. once per turn.
+    spent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PushNotifier {
+    pub fn new(sender: std::sync::Arc<gateway_features::server::push::PushSender>) -> Self {
+        Self {
+            sender,
+            spent: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Claim this turn's single notification. `true` for the first caller,
+    /// `false` for every later one.
+    ///
+    /// `swap` rather than load-then-store: tool calls in one round run
+    /// concurrently via `join_all`, so two `notify_user` calls could both
+    /// observe "unspent" and both send.
+    pub fn claim(&self) -> bool {
+        !self.spent.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn sender(&self) -> &gateway_features::server::push::PushSender {
+        &self.sender
     }
 }
 

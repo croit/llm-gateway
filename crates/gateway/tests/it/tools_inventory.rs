@@ -48,9 +48,10 @@ const NOT_REAL_TOOLS: &[&str] = &["mcp__demo__echo"];
 /// real category for genuinely miscellaneous tools, so this test pins *which*
 /// ones rather than banning it. A new id landing here unannounced is the bug.
 const EXPECTED_UTILITY: &[&str] = &[
-    // Asking the user a question is an interaction primitive, not a
-    // capability area of its own.
+    // Asking the user a question and notifying them are interaction
+    // primitives, not capability areas of their own.
     "ask_user",
+    "notify_user",
     "company_echo",
     "convert_currency",
     "enable_tools",
@@ -134,7 +135,8 @@ fn id_impls(src: &str, corpus: &[String]) -> Vec<IdImpl> {
         let Some(close) = body.find('}') else {
             continue;
         };
-        let body = body[..close].trim();
+        let body = strip_line_comments(&body[..close]);
+        let body = body.trim();
         if let Some(lit) = body
             .strip_prefix('"')
             .and_then(|rest| rest.split_once('"'))
@@ -155,6 +157,20 @@ fn id_impls(src: &str, corpus: &[String]) -> Vec<IdImpl> {
         }
     }
     out
+}
+
+/// Drop `//` comment lines from an `fn id` body.
+///
+/// A comment explaining *why* an id is spelled the way it is belongs next to
+/// the id (`undelete_document` has one), and the naive scan would otherwise
+/// read the comment text as the body and panic. Only whole comment lines are
+/// removed: a `//` inside the string literal itself would have to follow the
+/// opening quote on the same line, and no id contains one.
+fn strip_line_comments(body: &str) -> String {
+    body.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Resolve `const <name>: &str = "<value>";` inside the same file.

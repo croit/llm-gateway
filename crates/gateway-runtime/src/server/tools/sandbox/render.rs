@@ -402,6 +402,16 @@ impl Tool for RenderTypst {
                                     args.version
                                 ))
                             })?;
+                    // Deletion hides a document but leaves it resolvable, so
+                    // rendering one has to be refused explicitly — otherwise a
+                    // stale id from earlier in the turn silently produces a PDF
+                    // from a document the user removed.
+                    if doc.is_deleted() {
+                        return Err(ToolError::InvalidArgs(format!(
+                            "canvas document `{doc_id}` is deleted — call \
+                             `undelete_document` first if you want to render it"
+                        )));
+                    }
                     if doc.format != DocumentFormat::Typst {
                         return Err(ToolError::InvalidArgs(format!(
                             "canvas document `{doc_id}` is `{}` — render_typst needs a \

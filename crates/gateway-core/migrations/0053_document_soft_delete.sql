@@ -1,0 +1,21 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (C) 2026 croit GmbH
+--
+-- Soft delete for canvas documents.
+--
+-- The canvas could create and edit but never clean up: an abandoned draft or
+-- a failed first attempt stayed in `list_documents` for the life of the
+-- conversation and cost context on every later call.
+--
+-- Deletion is a tombstone rather than a DELETE because the canvas's core
+-- promise is that every change is a new version and nothing is ever lost --
+-- a hard delete would drop the whole version history with the row (the
+-- `document_versions` FK cascades). With `deleted_at` set, the document
+-- disappears from listings and from the canvas panel, stays readable by id,
+-- and `undelete_document` brings it back with its history intact.
+--
+-- NULL = live. Any timestamp = deleted at that moment. No index: documents
+-- are only ever queried by session (already indexed) or by primary key, and
+-- a conversation holds a handful of them.
+
+ALTER TABLE documents ADD COLUMN deleted_at TEXT;

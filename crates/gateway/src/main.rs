@@ -200,6 +200,17 @@ async fn main() -> anyhow::Result<()> {
         // `chat_feedback` being present, so it errors cleanly off the chat path
         // (and `requires_chat_session` keeps it out of the /v1 tool list).
         .with(gateway_tools::ask_user::AskUser)
+        // Reach the user when they aren't watching: a finished long job, or a
+        // scheduled action that found something. Runtime-gated on `[push]`
+        // being configured plus a subscribed device, so it stays registered
+        // (and RBAC-grantable) on deployments without push.
+        .with(gateway_tools::notify_user::NotifyUser)
+        // Reach the existing cron stack from a conversation. Create + delete
+        // require an `ask_user` confirmation (and so are chat-only); listing
+        // works anywhere. Actions created here always run without tools.
+        .with(gateway_tools::schedule::ScheduleAction)
+        .with(gateway_tools::schedule::ListScheduledActions)
+        .with(gateway_tools::schedule::DeleteScheduledAction)
         .with(gateway_tools::memory::Remember)
         .with(gateway_tools::memory::Recall)
         // Correcting a memory needs no config either, and without these the
@@ -219,6 +230,9 @@ async fn main() -> anyhow::Result<()> {
         // stable across deployments where `[rag]` is only sometimes set.
         .with(gateway_tools::rag::RagListCollections::new(rbac.clone()))
         .with(gateway_tools::rag::RagSearch::new(rbac.clone()))
+        // Regex over the same indexed corpus, for patterns BM25 can't express
+        // (`TODO\(.*\)`, `impl .* for Tool`). Same per-collection group ACL.
+        .with(gateway_tools::rag::RagGrep::new(rbac.clone()))
         // Document canvas — build up and incrementally edit long documents
         // across turns. Content lives in the `documents` store, not S3, so
         // these need no extra config; off the chat path they error cleanly.
@@ -229,6 +243,11 @@ async fn main() -> anyhow::Result<()> {
         .with(gateway_tools::document::EditDocumentSection)
         .with(gateway_tools::document::ListDocumentVersions)
         .with(gateway_tools::document::RestoreDocumentVersion)
+        // Soft delete, so the canvas can be cleaned up without breaking its
+        // "nothing is ever lost" promise — the tombstone keeps the version
+        // history and `undelete_document` reverses it.
+        .with(gateway_tools::document::DeleteDocument)
+        .with(gateway_tools::document::UndeleteDocument)
         // QR codes render natively in-process (no sandbox, no upstream), so
         // the tool is always on; it needs [chat.s3] at runtime to deliver
         // the file and errors cleanly without it.

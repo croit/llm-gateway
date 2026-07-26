@@ -1139,30 +1139,115 @@ pub async fn max_vector_id(pool: &Pool, collection_id: i64) -> Result<Option<i64
 /// prose can never trip FTS5's MATCH operator grammar, and so recall
 /// stays wide — BM25 ranking sorts out precision. An empty/too-short
 /// query yields no hits.
+/// `path_glob` (SQLite GLOB syntax, matched against the file's indexed path)
+/// narrows the search to part of the corpus. It is applied **inside** the
+/// query rather than to the results: filtering afterwards would let the
+/// `LIMIT` fill up with matches from elsewhere and return nothing for a
+/// perfectly good path-scoped search.
 pub async fn lexical_search(
     pool: &Pool,
     collection_id: i64,
     query: &str,
     limit: usize,
+    path_glob: Option<&str>,
 ) -> Result<Vec<i64>, DbError> {
     let match_query = fts_match_query(query);
     if match_query.is_empty() {
         return Ok(Vec::new());
     }
-    let rows: Vec<i64> = sqlx::query_scalar(
+    // The path lives on `rag_files`, so the join (and the extra bind) only
+    // appear when a filter was asked for — the unfiltered query stays exactly
+    // as cheap as it was.
+    let sql = if path_glob.is_some() {
+        r#"SELECT c.vector_id
+           FROM rag_chunks_fts
+           JOIN rag_chunks c ON c.id = rag_chunks_fts.rowid
+           JOIN rag_files f ON f.id = c.file_id
+           WHERE rag_chunks_fts MATCH ?1 AND c.collection_id = ?2
+                 AND f.path GLOB ?4
+           ORDER BY bm25(rag_chunks_fts) ASC
+           LIMIT ?3"#
+    } else {
         r#"SELECT c.vector_id
            FROM rag_chunks_fts
            JOIN rag_chunks c ON c.id = rag_chunks_fts.rowid
            WHERE rag_chunks_fts MATCH ?1 AND c.collection_id = ?2
            ORDER BY bm25(rag_chunks_fts) ASC
-           LIMIT ?3"#,
-    )
-    .bind(&match_query)
-    .bind(collection_id)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await?;
+           LIMIT ?3"#
+    };
+    let mut query = sqlx::query_scalar(sql)
+        .bind(&match_query)
+        .bind(collection_id)
+        .bind(limit as i64);
+    if let Some(glob) = path_glob {
+        query = query.bind(glob.to_string());
+    }
+    let rows: Vec<i64> = query.fetch_all(pool).await?;
     Ok(rows)
+}
+
+/// Which of `vector_ids` belong to files whose path matches `path_glob`.
+///
+/// The companion to the filter above, for the dense side: the vector index
+/// holds no metadata, so a path-scoped search has to take the kNN candidates
+/// and ask the store which of them are in scope. Returns a set (order comes
+/// from the caller's candidate ranking, which this must not disturb).
+pub async fn vector_ids_matching_path(
+    pool: &Pool,
+    collection_id: i64,
+    vector_ids: &[i64],
+    path_glob: &str,
+) -> Result<std::collections::HashSet<i64>, DbError> {
+    if vector_ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let placeholders = vec!["?"; vector_ids.len()].join(",");
+    let sql = format!(
+        "SELECT c.vector_id \
+         FROM rag_chunks c JOIN rag_files f ON f.id = c.file_id \
+         WHERE c.collection_id = ? AND f.path GLOB ? \
+               AND c.vector_id IN ({placeholders})"
+    );
+    let mut query = sqlx::query_scalar(&sql).bind(collection_id).bind(path_glob);
+    for vid in vector_ids {
+        query = query.bind(vid);
+    }
+    let rows: Vec<i64> = query.fetch_all(pool).await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Stream chunk rows for a full scan (the `rag_grep` regex path), oldest file
+/// first so results come back in a stable, path-grouped order.
+///
+/// `after_id` is a keyset cursor: pass the last `Chunk::id` from the previous
+/// batch. Keyset rather than OFFSET because the scan is bounded by a *time*
+/// budget as well as a row budget — the caller stops when either runs out, and
+/// re-scanning skipped rows on every page would make the row budget lie.
+pub async fn scan_chunks(
+    pool: &Pool,
+    collection_id: i64,
+    path_glob: Option<&str>,
+    after_id: i64,
+    limit: usize,
+) -> Result<Vec<Chunk>, DbError> {
+    let sql = format!(
+        "SELECT c.id, c.collection_id, c.file_id, f.path AS file_path, \
+                c.chunk_index, c.start_line, c.end_line, c.content, c.vector_id \
+         FROM rag_chunks c JOIN rag_files f ON f.id = c.file_id \
+         WHERE c.collection_id = ? AND c.id > ?{} \
+         ORDER BY c.id ASC LIMIT ?",
+        if path_glob.is_some() {
+            " AND f.path GLOB ?"
+        } else {
+            ""
+        }
+    );
+    let mut query = sqlx::query(&sql).bind(collection_id).bind(after_id);
+    if let Some(glob) = path_glob {
+        query = query.bind(glob);
+    }
+    let rows = query.bind(limit as i64).fetch_all(pool).await?;
+    rows.iter().map(map_chunk_row).collect()
 }
 
 /// Turn arbitrary user text into a safe FTS5 MATCH expression: lowercase
@@ -1399,7 +1484,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let hits = lexical_search(&store, 1, "osd op timeout", 10)
+        let hits = lexical_search(&store, 1, "osd op timeout", 10, None)
             .await
             .unwrap();
         assert_eq!(

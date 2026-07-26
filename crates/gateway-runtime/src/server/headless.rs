@@ -89,12 +89,17 @@ pub struct DriveParams {
 pub async fn drive(state: &Arc<RamaState>, p: DriveParams) {
     let tool_ctx = crate::openai_driver::build_tool_context(
         state,
-        p.user_id.clone(),
-        p.roles,
-        p.session_id.clone(),
-        p.assistant_turn_id.clone(),
-        None, // headless: no client IP
-        None, // headless: no interactive feedback channel
+        crate::openai_driver::TurnFacts {
+            user_id: p.user_id.clone(),
+            roles: p.roles,
+            session_id: p.session_id.clone(),
+            assistant_turn_id: p.assistant_turn_id.clone(),
+            // Headless: no request, so no client IP, and nobody watching the
+            // stream to answer an interactive prompt.
+            client_ip: None,
+            chat_feedback: None,
+            model: Some(p.model.clone()),
+        },
     );
     let driver = Box::new(crate::openai_driver::OpenAiDriver {
         state: state.clone(),

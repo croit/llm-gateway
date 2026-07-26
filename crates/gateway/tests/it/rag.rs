@@ -258,7 +258,7 @@ async fn indexer_clones_chunks_embeds_then_search_returns_right_chunk() {
     .pop()
     .unwrap();
 
-    let hits = search_chunks(&indexer, &after, "please find alpha", &query_vec, 5)
+    let hits = search_chunks(&indexer, &after, "please find alpha", &query_vec, 5, None)
         .await
         .unwrap();
     assert!(!hits.is_empty(), "search returned no hits");
@@ -369,7 +369,7 @@ async fn reindex_after_edit_drops_old_chunks_and_picks_up_new_content() {
     .unwrap()
     .pop()
     .unwrap();
-    let hits = search_chunks(&indexer, &r, "gamma please", &qvec, 5)
+    let hits = search_chunks(&indexer, &r, "gamma please", &qvec, 5, None)
         .await
         .unwrap();
     assert!(!hits.is_empty());

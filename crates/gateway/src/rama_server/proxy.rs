@@ -261,6 +261,7 @@ fn proxy_tool_ctx(
     user_id: String,
     roles: Vec<String>,
     client_ip: Option<String>,
+    model: Option<String>,
 ) -> ToolContext {
     ToolContext {
         user_id,
@@ -297,6 +298,14 @@ fn proxy_tool_ctx(
             .clone()
             .map(gateway_runtime::server::tools::sandbox::SandboxLease::new),
         crypto: Some(state.crypto.clone()),
+        // Push works without a chat turn — it lands on the user's phone, not
+        // in a conversation — so a /v1 caller's model can notify too. Still
+        // one notification per request: the latch rides this context.
+        push: state
+            .push
+            .clone()
+            .map(gateway_runtime::server::tools::PushNotifier::new),
+        model,
     }
 }
 
@@ -564,6 +573,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
         user.user_id.clone(),
         user.roles.clone(),
         client_ip.clone(),
+        Some(real_model.clone()),
     );
     let state_clone = state.clone();
     let model_clone = real_model.clone();
@@ -2060,7 +2070,13 @@ async fn forward_streaming_with_tools(
         obj.insert("stream".into(), Value::Bool(true));
     }
 
-    let tool_ctx = proxy_tool_ctx(&state, user.user_id.clone(), user.roles.clone(), client_ip);
+    let tool_ctx = proxy_tool_ctx(
+        &state,
+        user.user_id.clone(),
+        user.roles.clone(),
+        client_ip,
+        Some(model.clone()),
+    );
 
     // One usage row per upstream round; built here where the bearer's
     // identity + token are known, finished off inside the loop.

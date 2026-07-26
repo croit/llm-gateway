@@ -3,7 +3,8 @@
 
 //! The document canvas tools — `create_document`, `edit_document`,
 //! `read_document`, `list_documents`, `edit_document_section`,
-//! `list_document_versions`, `restore_document_version`.
+//! `list_document_versions`, `restore_document_version`,
+//! `delete_document`, `undelete_document`.
 //!
 //! Let the model build up a long document (a guide, a spec, a config) over
 //! many turns and change one passage at a time, instead of regenerating
@@ -19,6 +20,12 @@
 //!   * `json` / `toml` — an RFC 6902 JSON Patch ([`super::json_patch`]),
 //!     the same machinery the Typst edit tool uses; TOML is parsed to
 //!     JSON, patched, and reserialised.
+//!
+//! `delete_document` is a tombstone, not a DELETE (see migration
+//! `0053_document_soft_delete`): the document leaves the canvas and every
+//! listing but keeps its history, stays readable by id, and comes back via
+//! `undelete_document`. Since `documents::get` still resolves a deleted
+//! document, every *writing* tool here guards with [`require_live`].
 //!
 //! Every edit appends a version, so the canvas keeps a scrubbable history.
 //! On the chat path each create/edit pushes a live patch to the canvas
@@ -56,6 +63,25 @@ fn require_session(ctx: &ToolContext) -> Result<&str, ToolError> {
                 .into(),
         )
     })
+}
+
+/// Refuse to mutate a soft-deleted document.
+///
+/// `documents::get`/`get_version` resolve deleted documents on purpose (that
+/// is what keeps them readable and restorable), so every *writing* tool has
+/// to check. Without this an edit would silently append versions to a
+/// document the model can no longer see in `list_documents` — and the canvas
+/// would never show the result.
+fn require_live(doc: &documents::Document) -> Result<(), ToolError> {
+    if doc.is_deleted() {
+        return Err(ToolError::InvalidArgs(format!(
+            "document `{}` is deleted, so it can't be changed. Call \
+             `undelete_document` first if you want it back, or \
+             `create_document` for a fresh one.",
+            doc.id
+        )));
+    }
+    Ok(())
 }
 
 /// Push the freshly-changed canvas to the live chat page, if anyone's
@@ -107,6 +133,55 @@ async fn live_update(ctx: &ToolContext, session_id: &str, active_id: &str) {
     let _ = fb.broadcast.send(session_core::workers::TurnUpdate::Inject(
         std::sync::Arc::new(frame.into()),
     ));
+}
+
+/// Tell the live chat page the conversation has no documents left, after the
+/// last one was deleted.
+///
+/// The counterpart to [`live_update`]: that one always has a panel to render,
+/// while this one has to *remove* it. Emptying `#document-canvas-slot` alone
+/// would leave the header toggle and the "Document" tab pointing at nothing,
+/// so the frame also fires `gwcanvasdocgone`; the shell's handler clears
+/// `hasDocument`, recomputes `hasCanvas` from `hasAssets` (only the client
+/// knows whether this turn produced assets) and closes the panel if there is
+/// now nothing at all to show.
+async fn live_canvas_cleared(ctx: &ToolContext) {
+    let Some(fb) = ctx.chat_feedback.as_ref() else {
+        return;
+    };
+    if fb.broadcast.receiver_count() == 0 {
+        return;
+    }
+    let mut frame =
+        session_core::chrome::sse_patch(Some("#document-canvas-slot"), Some("inner"), "").to_vec();
+    frame.extend_from_slice(&session_core::chrome::sse_script(
+        "window.dispatchEvent(new CustomEvent('gwcanvasdocgone'));",
+    ));
+    let _ = fb.broadcast.send(session_core::workers::TurnUpdate::Inject(
+        std::sync::Arc::new(frame.into()),
+    ));
+}
+
+/// Refresh the canvas after a delete/undelete: show whatever document the
+/// conversation has left (preferring `prefer_id` when it's still live), or
+/// tear the panel down when there is none.
+async fn live_after_delete(ctx: &ToolContext, session_id: &str, prefer_id: Option<&str>) {
+    match documents::list_for_session(&ctx.db, session_id, false).await {
+        Ok(docs) if docs.is_empty() => live_canvas_cleared(ctx).await,
+        Ok(docs) => {
+            // `render_canvas_html` already ignores an `active_id` that isn't
+            // live, but picking the id here keeps the panel on the document
+            // the model just restored rather than the newest one.
+            let active = prefer_id
+                .filter(|id| docs.iter().any(|d| d.id == *id))
+                .unwrap_or(&docs[0].id)
+                .to_string();
+            live_update(ctx, session_id, &active).await;
+        }
+        // Transient read error: leave the panel alone; the next page load
+        // reconciles from the DB.
+        Err(_) => {}
+    }
 }
 
 /// Parse + reserialise a structured document through an RFC 6902 patch.
@@ -391,6 +466,7 @@ impl Tool for EditDocument {
                          call `list_documents` to see the ids"
                     ))
                 })?;
+            require_live(&doc)?;
 
             let new_content = match doc.format.edit_kind() {
                 EditKind::Text => {
@@ -492,6 +568,19 @@ impl Tool for ReadDocument {
                 "latest_version": doc.current_ver,
                 "total_chars": total_chars,
             });
+            // A deleted document stays readable, but the model must know it is
+            // in the bin — otherwise it would report on a document the user no
+            // longer sees in the canvas, or try to edit it and hit a refusal.
+            // Its own key rather than `note`: the slicing paths below set
+            // `note` for truncation and missing sections, and would clobber it.
+            if doc.is_deleted() {
+                result["deleted"] = serde_json::json!(true);
+                result["deleted_note"] = serde_json::json!(
+                    "This document is deleted: it's hidden from the canvas and from \
+                     `list_documents`, and can't be edited. Call `undelete_document` \
+                     to bring it back."
+                );
+            }
 
             if let Some(grep) = obj
                 .get("grep")
@@ -570,27 +659,51 @@ impl Tool for ListDocuments {
             self.id(),
             "List the documents you've created in this conversation (id, title, \
              format, current version). Use it to find a `document_id` to edit or \
-             read when you've lost track of it.",
-            serde_json::json!({ "type": "object", "additionalProperties": false, "properties": {} }),
+             read when you've lost track of it. Deleted documents are left out \
+             unless you pass `include_deleted`.",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "include_deleted": {
+                        "type": "boolean",
+                        "description": "Also list documents you deleted with \
+                                        `delete_document` (each marked `deleted: true`). \
+                                        Use it to find the id to pass to \
+                                        `undelete_document`. Defaults to false."
+                    }
+                }
+            }),
         )
     }
 
-    fn run<'a>(&'a self, ctx: ToolContext, _args: Value) -> ToolFuture<'a> {
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
         Box::pin(async move {
             let session_id = require_session(&ctx)?.to_string();
-            let docs = documents::list_for_session(&ctx.db, &session_id)
+            let include_deleted = args
+                .get("include_deleted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let docs = documents::list_for_session(&ctx.db, &session_id, include_deleted)
                 .await
                 .map_err(|e| ToolError::Failed(format!("listing documents: {e}")))?;
             let items: Vec<Value> = docs
                 .iter()
                 .map(|d| {
-                    serde_json::json!({
+                    let mut item = serde_json::json!({
                         "document_id": d.id,
                         "title": d.title,
                         "format": d.format.as_str(),
                         "version": d.current_ver,
                         "updated_at": d.updated_at.to_string(),
-                    })
+                    });
+                    // Only present on tombstones, so a normal listing stays as
+                    // compact as it was before soft delete existed.
+                    if let Some(at) = d.deleted_at {
+                        item["deleted"] = serde_json::json!(true);
+                        item["deleted_at"] = serde_json::json!(at.to_string());
+                    }
+                    item
                 })
                 .collect();
             Ok(serde_json::json!({ "documents": items }))
@@ -715,6 +828,7 @@ impl Tool for RestoreDocumentVersion {
                              conversation — call `list_document_versions` to see the history"
                         ))
                     })?;
+            require_live(&doc)?;
             if version == doc.current_ver {
                 return Err(ToolError::InvalidArgs(format!(
                     "version {version} is already the current version — nothing to restore"
@@ -814,6 +928,7 @@ impl Tool for EditDocumentSection {
                         "no document `{document_id}` in this conversation"
                     ))
                 })?;
+            require_live(&doc)?;
             let Some(level) = heading_level_fn(doc.format) else {
                 return Err(ToolError::InvalidArgs(format!(
                     "section edits work on markdown and typst documents; `{document_id}` is {}",
@@ -848,6 +963,179 @@ impl Tool for EditDocumentSection {
                 "version": updated.current_ver,
                 "action": if existed { "replaced" } else { "added" },
                 "chars": new_content.chars().count(),
+            }))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// delete_document / undelete_document
+
+/// Pull `document_id` out of a one-required-field argument object.
+fn document_id_arg(args: &Value) -> Result<&str, ToolError> {
+    args.get("document_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ToolError::InvalidArgs("`document_id` is required".into()))
+}
+
+pub struct DeleteDocument;
+
+impl Tool for DeleteDocument {
+    fn id(&self) -> &str {
+        "delete_document"
+    }
+
+    fn schema(&self) -> ToolDef {
+        ToolDef::function(
+            self.id(),
+            "Delete a document from the canvas — use it for a draft that went \
+             nowhere or a document you replaced, so `list_documents` stays \
+             about what actually matters. The delete is reversible: the \
+             document and its full version history are kept, it just \
+             disappears from the canvas and from listings. \
+             `undelete_document` brings it back. Deleting the user's work \
+             without being asked to is not tidying up — only remove documents \
+             you created in this conversation and no longer need, or ones the \
+             user asked you to remove.",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["document_id"],
+                "properties": {
+                    "document_id": {
+                        "type": "string",
+                        "description": "The id from `create_document` or `list_documents`."
+                    }
+                }
+            }),
+        )
+    }
+
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let session_id = require_session(&ctx)?.to_string();
+            let document_id = document_id_arg(&args)?.to_string();
+
+            // Distinguish "no such document" from "already deleted": both make
+            // `soft_delete` return false, and the model needs different advice.
+            let existing = documents::get(&ctx.db, &session_id, &document_id)
+                .await
+                .map_err(|e| ToolError::Failed(format!("reading document: {e}")))?
+                .ok_or_else(|| {
+                    ToolError::InvalidArgs(format!(
+                        "no document `{document_id}` in this conversation — \
+                         call `list_documents` to see the ids"
+                    ))
+                })?;
+            if existing.is_deleted() {
+                return Ok(serde_json::json!({
+                    "document_id": document_id,
+                    "deleted": true,
+                    "status": "That document was already deleted; nothing changed.",
+                }));
+            }
+
+            if !documents::soft_delete(&ctx.db, &session_id, &document_id)
+                .await
+                .map_err(|e| ToolError::Failed(format!("deleting document: {e}")))?
+            {
+                // Lost a race with a concurrent delete in the same turn.
+                return Ok(serde_json::json!({
+                    "document_id": document_id,
+                    "deleted": true,
+                    "status": "That document was already deleted; nothing changed.",
+                }));
+            }
+
+            live_after_delete(&ctx, &session_id, None).await;
+
+            Ok(serde_json::json!({
+                "document_id": document_id,
+                "title": existing.title,
+                "deleted": true,
+                "status": "Document deleted and removed from the canvas. Its version \
+                           history is kept — `undelete_document` with this id restores it, \
+                           and `list_documents` with `include_deleted` still shows it.",
+            }))
+        })
+    }
+}
+
+pub struct UndeleteDocument;
+
+impl Tool for UndeleteDocument {
+    fn id(&self) -> &str {
+        // Deliberately not `restore_document`: `restore_document_version`
+        // already exists and rolls content back to an earlier revision. Two
+        // tools differing by a suffix invite the model to pick the wrong one,
+        // whereas `undelete_document` can only pair with `delete_document`.
+        "undelete_document"
+    }
+
+    fn schema(&self) -> ToolDef {
+        ToolDef::function(
+            self.id(),
+            "Bring back a document you deleted with `delete_document`, with its \
+             version history intact — it reappears in the canvas and in \
+             `list_documents`. Find the id with `list_documents` and \
+             `include_deleted: true`. This is NOT version rollback: to go back \
+             to an earlier revision of a live document, use \
+             `restore_document_version`.",
+            serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["document_id"],
+                "properties": {
+                    "document_id": {
+                        "type": "string",
+                        "description": "The id of the deleted document — from \
+                                        `list_documents` with `include_deleted: true`."
+                    }
+                }
+            }),
+        )
+    }
+
+    fn run<'a>(&'a self, ctx: ToolContext, args: Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let session_id = require_session(&ctx)?.to_string();
+            let document_id = document_id_arg(&args)?.to_string();
+
+            let existing = documents::get(&ctx.db, &session_id, &document_id)
+                .await
+                .map_err(|e| ToolError::Failed(format!("reading document: {e}")))?
+                .ok_or_else(|| {
+                    ToolError::InvalidArgs(format!(
+                        "no document `{document_id}` in this conversation — call \
+                         `list_documents` with `include_deleted: true` to see the ids"
+                    ))
+                })?;
+            if !existing.is_deleted() {
+                return Ok(serde_json::json!({
+                    "document_id": document_id,
+                    "title": existing.title,
+                    "deleted": false,
+                    "status": "That document isn't deleted — it's already in the canvas. \
+                               (To go back to an earlier revision, use \
+                               `restore_document_version`.)",
+                }));
+            }
+
+            documents::undelete(&ctx.db, &session_id, &document_id)
+                .await
+                .map_err(|e| ToolError::Failed(format!("restoring document: {e}")))?;
+
+            live_after_delete(&ctx, &session_id, Some(&document_id)).await;
+
+            Ok(serde_json::json!({
+                "document_id": document_id,
+                "title": existing.title,
+                "deleted": false,
+                "version": existing.current_ver,
+                "status": "Document restored and shown in the canvas again, at the same \
+                           version it had when you deleted it.",
             }))
         })
     }
@@ -973,6 +1261,233 @@ fn replace_or_append_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Create a document through the tool and return its id.
+    async fn create_doc(c: &ToolContext, title: &str) -> String {
+        let out = CreateDocument
+            .run(
+                c.clone(),
+                serde_json::json!({
+                    "title": title,
+                    "format": "markdown",
+                    "content": "# Draft\n\nbody\n",
+                }),
+            )
+            .await
+            .unwrap();
+        out["document_id"].as_str().unwrap().to_string()
+    }
+
+    async fn list_ids(c: &ToolContext, include_deleted: bool) -> Vec<String> {
+        let args = if include_deleted {
+            serde_json::json!({"include_deleted": true})
+        } else {
+            serde_json::json!({})
+        };
+        let out = ListDocuments.run(c.clone(), args).await.unwrap();
+        out["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["document_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The whole point of the tool: a deleted draft stops appearing in the
+    /// listing the model reads on every later call, but is still there.
+    #[tokio::test]
+    async fn delete_hides_from_the_default_listing_and_undelete_brings_it_back() {
+        let c = ctx(seeded_pool().await, "s1");
+        let keep = create_doc(&c, "Keep").await;
+        let drop = create_doc(&c, "Drop").await;
+
+        let out = DeleteDocument
+            .run(c.clone(), serde_json::json!({"document_id": drop}))
+            .await
+            .unwrap();
+        assert_eq!(out["deleted"], true, "{out:?}");
+
+        let live = list_ids(&c, false).await;
+        assert_eq!(live, vec![keep.clone()], "deleted document still listed");
+        let all = list_ids(&c, true).await;
+        assert!(
+            all.contains(&drop),
+            "include_deleted must surface it: {all:?}"
+        );
+
+        // The tombstone is marked, so the model can tell the two apart.
+        let out = ListDocuments
+            .run(c.clone(), serde_json::json!({"include_deleted": true}))
+            .await
+            .unwrap();
+        let row = out["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["document_id"] == serde_json::json!(drop))
+            .unwrap()
+            .clone();
+        assert_eq!(row["deleted"], true, "{row:?}");
+        assert!(row["deleted_at"].is_string(), "{row:?}");
+
+        let out = UndeleteDocument
+            .run(c.clone(), serde_json::json!({"document_id": drop}))
+            .await
+            .unwrap();
+        assert_eq!(out["deleted"], false, "{out:?}");
+        let live = list_ids(&c, false).await;
+        assert_eq!(live.len(), 2, "{live:?}");
+    }
+
+    /// Deleting keeps the content and the history — that is what makes it a
+    /// soft delete rather than a DELETE, and it is why `read_document` still
+    /// works afterwards.
+    #[tokio::test]
+    async fn a_deleted_document_stays_readable_with_its_history() {
+        let c = ctx(seeded_pool().await, "s1");
+        let id = create_doc(&c, "Draft").await;
+        EditDocument
+            .run(
+                c.clone(),
+                serde_json::json!({
+                    "document_id": id,
+                    "edits": [{"find": "body", "replace": "revised"}],
+                }),
+            )
+            .await
+            .unwrap();
+        DeleteDocument
+            .run(c.clone(), serde_json::json!({"document_id": id}))
+            .await
+            .unwrap();
+
+        let out = ReadDocument
+            .run(c.clone(), serde_json::json!({"document_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out["deleted"], true,
+            "read must flag the tombstone: {out:?}"
+        );
+        assert!(
+            out["content"].as_str().unwrap().contains("revised"),
+            "{out:?}"
+        );
+        let hist = ListDocumentVersions
+            .run(c.clone(), serde_json::json!({"document_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(hist["versions"].as_array().unwrap().len(), 2, "{hist:?}");
+    }
+
+    /// A deleted document must not be editable: the model can't see it in
+    /// `list_documents` and the canvas won't show the result, so an accepted
+    /// edit would write versions nobody ever observes.
+    #[tokio::test]
+    async fn writing_tools_refuse_a_deleted_document() {
+        let c = ctx(seeded_pool().await, "s1");
+        let id = create_doc(&c, "Draft").await;
+        DeleteDocument
+            .run(c.clone(), serde_json::json!({"document_id": id}))
+            .await
+            .unwrap();
+
+        let edit = EditDocument
+            .run(
+                c.clone(),
+                serde_json::json!({
+                    "document_id": id,
+                    "edits": [{"find": "body", "replace": "nope"}],
+                }),
+            )
+            .await;
+        let err = edit.unwrap_err().to_string();
+        assert!(
+            err.contains("deleted") && err.contains("undelete_document"),
+            "the error must point at the fix: {err}"
+        );
+
+        let section = EditDocumentSection
+            .run(
+                c.clone(),
+                serde_json::json!({
+                    "document_id": id,
+                    "heading": "Draft",
+                    "content": "# Draft\n\nnope\n",
+                }),
+            )
+            .await;
+        assert!(section.is_err(), "section edit must refuse too");
+
+        let restore = RestoreDocumentVersion
+            .run(
+                c.clone(),
+                serde_json::json!({"document_id": id, "version": 1}),
+            )
+            .await;
+        assert!(restore.is_err(), "version rollback must refuse too");
+    }
+
+    /// Both tools report honestly when they changed nothing, instead of
+    /// claiming a success the model would relay to the user.
+    #[tokio::test]
+    async fn repeat_calls_and_unknown_ids_are_reported_truthfully() {
+        let c = ctx(seeded_pool().await, "s1");
+        let id = create_doc(&c, "Draft").await;
+
+        // Undeleting a live document is a no-op, not an error.
+        let out = UndeleteDocument
+            .run(c.clone(), serde_json::json!({"document_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(out["deleted"], false, "{out:?}");
+        assert!(
+            out["status"].as_str().unwrap().contains("isn't deleted"),
+            "{out:?}"
+        );
+
+        DeleteDocument
+            .run(c.clone(), serde_json::json!({"document_id": id}))
+            .await
+            .unwrap();
+        let out = DeleteDocument
+            .run(c.clone(), serde_json::json!({"document_id": id}))
+            .await
+            .unwrap();
+        assert!(
+            out["status"].as_str().unwrap().contains("already deleted"),
+            "{out:?}"
+        );
+
+        let err = DeleteDocument
+            .run(c.clone(), serde_json::json!({"document_id": "doc_nope"}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no document"), "{err}");
+    }
+
+    /// Off the chat path there is no conversation to scope a document to, so
+    /// these refuse rather than deleting something from a session they guessed.
+    #[tokio::test]
+    async fn delete_and_undelete_need_a_chat_session() {
+        // `for_test` leaves `session_id` at `None` — the proxy/bearer shape.
+        let off_chat = ToolContext::for_test(seeded_pool().await);
+        assert!(
+            DeleteDocument
+                .run(
+                    off_chat.clone(),
+                    serde_json::json!({"document_id": "doc_x"})
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            UndeleteDocument
+                .run(off_chat, serde_json::json!({"document_id": "doc_x"}))
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn structured_patch_roundtrips_json() {
@@ -1244,6 +1759,8 @@ mod tests {
             image_gen: None,
             sandbox_lease: None,
             crypto: None,
+            push: None,
+            model: None,
         }
     }
 

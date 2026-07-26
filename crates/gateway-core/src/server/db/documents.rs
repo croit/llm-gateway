@@ -139,6 +139,18 @@ pub struct Document {
     pub current_ver: i64,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    /// `Some` once the document has been soft-deleted (see [`soft_delete`]).
+    /// A deleted document is hidden from listings and from the canvas panel
+    /// but still resolves by id, so it stays readable and can be restored
+    /// with its version history intact.
+    pub deleted_at: Option<Timestamp>,
+}
+
+impl Document {
+    /// Convenience for the common check: is this document in the bin?
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
 }
 
 /// One immutable revision of a document's content.
@@ -159,6 +171,12 @@ fn parse_ts(s: &str, column: &'static str) -> Result<Timestamp, DbError> {
     })
 }
 
+/// The column list every `Document`-returning query selects. Kept in one
+/// place so adding a field can't leave one query behind returning a row
+/// [`map_doc`] then fails to decode.
+const DOC_COLUMNS: &str =
+    "id, session_id, title, format, current_ver, created_at, updated_at, deleted_at";
+
 fn map_doc(row: &SqliteRow) -> Result<Document, DbError> {
     let format: String = row.try_get("format")?;
     Ok(Document {
@@ -169,6 +187,11 @@ fn map_doc(row: &SqliteRow) -> Result<Document, DbError> {
         current_ver: row.try_get("current_ver")?,
         created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
         updated_at: parse_ts(&row.try_get::<String, _>("updated_at")?, "updated_at")?,
+        deleted_at: row
+            .try_get::<Option<String>, _>("deleted_at")?
+            .as_deref()
+            .map(|s| parse_ts(s, "deleted_at"))
+            .transpose()?,
     })
 }
 
@@ -238,21 +261,59 @@ pub async fn create(
         current_ver: 1,
         created_at: now,
         updated_at: now,
+        deleted_at: None,
     })
 }
 
 /// Fetch a document's metadata, scoped to its session. `None` if it
 /// doesn't exist or belongs to another conversation.
+///
+/// Soft-deleted documents **are** returned — deletion hides a document from
+/// listings, it doesn't make it unresolvable, which is what lets it be read
+/// and restored afterwards. Callers that mutate must check
+/// [`Document::is_deleted`] themselves.
 pub async fn get(pool: &Pool, session_id: &str, id: &str) -> Result<Option<Document>, DbError> {
-    let row = sqlx::query(
-        r#"SELECT id, session_id, title, format, current_ver, created_at, updated_at
-           FROM documents WHERE id = ? AND session_id = ?"#,
-    )
+    let row = sqlx::query(&format!(
+        "SELECT {DOC_COLUMNS} FROM documents WHERE id = ? AND session_id = ?"
+    ))
     .bind(id)
     .bind(session_id)
     .fetch_optional(pool)
     .await?;
     row.as_ref().map(map_doc).transpose()
+}
+
+/// Soft-delete a document: hide it from listings and the canvas panel while
+/// keeping the row and its full version history. Scoped to the session.
+///
+/// Returns `false` when nothing changed — no such document in this
+/// conversation, or it was already deleted — so a caller can tell the model
+/// the truth instead of reporting a success it didn't cause.
+pub async fn soft_delete(pool: &Pool, session_id: &str, id: &str) -> Result<bool, DbError> {
+    let res = sqlx::query(
+        r#"UPDATE documents SET deleted_at = ?
+           WHERE id = ? AND session_id = ? AND deleted_at IS NULL"#,
+    )
+    .bind(Timestamp::now().to_string())
+    .bind(id)
+    .bind(session_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Undo a [`soft_delete`]. Returns `false` when there was nothing to
+/// restore (unknown document, or it was never deleted).
+pub async fn undelete(pool: &Pool, session_id: &str, id: &str) -> Result<bool, DbError> {
+    let res = sqlx::query(
+        r#"UPDATE documents SET deleted_at = NULL
+           WHERE id = ? AND session_id = ? AND deleted_at IS NOT NULL"#,
+    )
+    .bind(id)
+    .bind(session_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Fetch a specific version's content. `version` of `None` resolves to
@@ -370,11 +431,25 @@ pub async fn list_versions(
 }
 
 /// All documents in a session, most recently updated first.
-pub async fn list_for_session(pool: &Pool, session_id: &str) -> Result<Vec<Document>, DbError> {
-    let rows = sqlx::query(
-        r#"SELECT id, session_id, title, format, current_ver, created_at, updated_at
-           FROM documents WHERE session_id = ? ORDER BY updated_at DESC"#,
-    )
+///
+/// `include_deleted` is an explicit parameter rather than a second function
+/// so every call site has to state which it means: the canvas panel and the
+/// model's `list_documents` want live documents only, while "what did I
+/// delete?" needs the tombstones too.
+pub async fn list_for_session(
+    pool: &Pool,
+    session_id: &str,
+    include_deleted: bool,
+) -> Result<Vec<Document>, DbError> {
+    let filter = if include_deleted {
+        ""
+    } else {
+        "AND deleted_at IS NULL"
+    };
+    let rows = sqlx::query(&format!(
+        "SELECT {DOC_COLUMNS} FROM documents
+         WHERE session_id = ? {filter} ORDER BY updated_at DESC"
+    ))
     .bind(session_id)
     .fetch_all(pool)
     .await?;
@@ -531,7 +606,92 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(list_for_session(&pool, "s2").await.unwrap().is_empty());
-        assert_eq!(list_for_session(&pool, "s1").await.unwrap().len(), 1);
+        assert!(
+            list_for_session(&pool, "s2", false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(list_for_session(&pool, "s1", false).await.unwrap().len(), 1);
+    }
+
+    /// A soft-deleted document leaves every listing, stays resolvable by id
+    /// (so it can still be read and restored), and comes back intact.
+    #[tokio::test]
+    async fn soft_delete_hides_from_listings_but_keeps_the_document() {
+        let pool = open(Path::new(":memory:")).await.unwrap();
+        seed_session(&pool, "s1").await;
+        let id = new_id();
+        create(
+            &pool,
+            &id,
+            "s1",
+            "u1",
+            "Draft",
+            DocumentFormat::Markdown,
+            "v1",
+            None,
+        )
+        .await
+        .unwrap();
+        append_version(&pool, "s1", &id, "v2", Some("edited"), None)
+            .await
+            .unwrap();
+
+        assert!(soft_delete(&pool, "s1", &id).await.unwrap());
+        // Gone from the default listing, present when asked for explicitly.
+        assert!(
+            list_for_session(&pool, "s1", false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let with_deleted = list_for_session(&pool, "s1", true).await.unwrap();
+        assert_eq!(with_deleted.len(), 1);
+        assert!(with_deleted[0].is_deleted());
+        // Still resolvable and readable, history untouched.
+        let doc = get(&pool, "s1", &id).await.unwrap().unwrap();
+        assert!(doc.is_deleted());
+        let (_, ver) = get_version(&pool, "s1", &id, None).await.unwrap().unwrap();
+        assert_eq!(ver.content, "v2");
+        assert_eq!(list_versions(&pool, "s1", &id).await.unwrap().len(), 2);
+
+        // Deleting twice reports "nothing changed" rather than a fake success.
+        assert!(!soft_delete(&pool, "s1", &id).await.unwrap());
+
+        assert!(undelete(&pool, "s1", &id).await.unwrap());
+        assert_eq!(list_for_session(&pool, "s1", false).await.unwrap().len(), 1);
+        assert!(!get(&pool, "s1", &id).await.unwrap().unwrap().is_deleted());
+        // Nothing to restore the second time.
+        assert!(!undelete(&pool, "s1", &id).await.unwrap());
+    }
+
+    /// Both mutations are session-scoped: a foreign conversation can neither
+    /// delete nor resurrect a document it doesn't own.
+    #[tokio::test]
+    async fn soft_delete_and_undelete_are_session_scoped() {
+        let pool = open(Path::new(":memory:")).await.unwrap();
+        seed_session(&pool, "s1").await;
+        seed_session(&pool, "s2").await;
+        let id = new_id();
+        create(
+            &pool,
+            &id,
+            "s1",
+            "u1",
+            "Doc",
+            DocumentFormat::Text,
+            "x",
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!soft_delete(&pool, "s2", &id).await.unwrap());
+        assert!(!get(&pool, "s1", &id).await.unwrap().unwrap().is_deleted());
+
+        assert!(soft_delete(&pool, "s1", &id).await.unwrap());
+        assert!(!undelete(&pool, "s2", &id).await.unwrap());
+        assert!(get(&pool, "s1", &id).await.unwrap().unwrap().is_deleted());
     }
 }

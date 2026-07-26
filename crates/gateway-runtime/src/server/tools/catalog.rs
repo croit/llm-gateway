@@ -51,8 +51,22 @@ const DOCUMENT_IDS: &[&str] = &[
     "edit_document_section",
     "list_document_versions",
     "restore_document_version",
+    "delete_document",
+    "undelete_document",
 ];
 const DOCUMENT_KEY: &str = "document";
+
+/// The scheduled-action tools are one capability — "let the assistant manage
+/// my recurring prompts" — so they collapse to a single toggle. Splitting them
+/// would let a user grant `list` without `create`, which is not a distinction
+/// anyone reasons about, and would leave the model able to see a schedule it
+/// cannot change.
+const SCHEDULE_IDS: &[&str] = &[
+    "schedule_action",
+    "list_scheduled_actions",
+    "delete_scheduled_action",
+];
+const SCHEDULE_KEY: &str = "schedule";
 
 /// Tools that exist for smoke tests / internal plumbing and shouldn't
 /// clutter a user's tool list. They stay granted via RBAC; they're just
@@ -88,6 +102,10 @@ pub enum Category {
     /// Sandboxed code execution (`run_in_sandbox` + its presets).
     Code,
     Memory,
+    /// Recurring prompts the user has scheduled (`schedule_action` and
+    /// friends) — a capability area of its own because the thing being
+    /// configured outlives the conversation that configured it.
+    Scheduling,
     /// Tools bridged from an external MCP server (`mcp__*`).
     Integrations,
     Utility,
@@ -105,6 +123,7 @@ impl Category {
             Category::Knowledge => "Knowledge base",
             Category::Code => "Code & Sandbox",
             Category::Memory => "Memory",
+            Category::Scheduling => "Scheduled actions",
             Category::Integrations => "Integrations",
             Category::Utility => "Utility",
         }
@@ -121,8 +140,9 @@ impl Category {
             Category::Knowledge => 5,
             Category::Code => 6,
             Category::Memory => 7,
-            Category::Integrations => 8,
-            Category::Utility => 9,
+            Category::Scheduling => 8,
+            Category::Integrations => 9,
+            Category::Utility => 10,
         }
     }
 }
@@ -179,6 +199,8 @@ pub fn entry_key_for(tool_id: &str) -> &str {
         MEMORY_KEY
     } else if DOCUMENT_IDS.contains(&tool_id) {
         DOCUMENT_KEY
+    } else if SCHEDULE_IDS.contains(&tool_id) {
+        SCHEDULE_KEY
     } else if tool_id.starts_with(COMFYUI_PREFIX) {
         // All comfyui_* tools collapse to the single "comfyui" toggle,
         // so the user enables/disables the whole family at once.
@@ -230,6 +252,12 @@ pub fn requires_chat_session(tool_id: &str) -> bool {
         || tool_id == "read_sandbox_output"
         // Needs a live turn *and* a human watching it to answer.
         || tool_id == "ask_user"
+        // Creating or deleting a scheduled action needs a human "yes" (the
+        // action later runs *as the user*, unattended), and that confirmation
+        // is an `ask_user` card — so these need the same live chat turn.
+        // Listing is read-only and stays available off-chat.
+        || tool_id == "schedule_action"
+        || tool_id == "delete_scheduled_action"
 }
 
 /// `mcp__<server>__<tool>` → `mcp__<server>` (the per-server toggle key).
@@ -260,7 +288,7 @@ pub fn category_for(tool_id: &str) -> Category {
             Category::Documents
         }
         "generate_image" | "edit_image" | "generate_qr_code" | "load_image_url" => Category::Media,
-        "rag_search" | "rag_list_collections" => Category::Knowledge,
+        "rag_search" | "rag_grep" | "rag_list_collections" => Category::Knowledge,
         "run_in_sandbox"
         | "generate_document"
         | "convert_document"
@@ -276,10 +304,12 @@ pub fn category_for(tool_id: &str) -> Category {
         // be able to categorise it as Utility by omission. (It could, until
         // `update_memory` and `forget` landed and the drift guard said so.)
         _ if MEMORY_IDS.contains(&tool_id) => Category::Memory,
+        _ if SCHEDULE_IDS.contains(&tool_id) => Category::Scheduling,
         _ if tool_id.starts_with(crate::server::tools::mcp::MCP_ID_PREFIX) => {
             Category::Integrations
         }
-        // `get_user_location`, `ask_user` and any future tool fall here. The
+        // `get_user_location`, `ask_user`, `notify_user` and any future tool
+        // fall here. The
         // inventory guard pins the expected set, so a *new* id landing here is
         // caught rather than silently accepted.
         _ => Category::Utility,
@@ -344,6 +374,13 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Current date & time",
             "Gives the assistant today's date and the current time in your timezone — for \
              questions like \"what's due today\" or scheduling.",
+        ),
+        "notify_user" => (
+            "Push notifications",
+            "Lets the assistant send you a notification on your phone or desktop when you \
+             are not watching the conversation — long work finished, or a scheduled action \
+             found something you should know. Limited to one per reply, and it needs a \
+             device you enabled notifications on.",
         ),
         "ask_user" => (
             "Clarifying questions",
@@ -418,6 +455,12 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Lets the assistant semantically search the repositories and documents indexed \
              into this gateway — your own codebase, docs, or data — and quote the matching \
              passages, instead of guessing or searching the public web.",
+        ),
+        "rag_grep" => (
+            "Knowledge-base pattern search",
+            "Lets the assistant search the indexed repositories with a regular expression and \
+             get back the matching lines with file and line number — for \"every place that \
+             looks like this\", where a meaning-based search can't express the pattern.",
         ),
         "rag_list_collections" => (
             "List knowledge bases",
@@ -528,6 +571,7 @@ pub fn entries(
     let mut comfyui_seen = false;
     let mut memory_seen = false;
     let mut document_seen = false;
+    let mut schedule_seen = false;
     let mut mcp_servers_seen: HashSet<String> = HashSet::new();
 
     for id in allowed {
@@ -544,7 +588,9 @@ pub fn entries(
                     description: "Lets the assistant build up a long document (a guide, spec, or \
                                   config) in a live side panel and edit it one passage at a time \
                                   across turns — instead of rewriting the whole thing each reply. \
-                                  Keeps a full version history the assistant can roll back to."
+                                  Keeps a full version history the assistant can roll back to, \
+                                  and lets it clear away drafts it no longer needs (deleted \
+                                  documents keep their history and can be brought back)."
                         .to_string(),
                     category: Category::Documents,
                 });
@@ -565,6 +611,24 @@ pub fn entries(
                                   everything on the Memory page."
                         .to_string(),
                     category: Category::Memory,
+                });
+            }
+            continue;
+        }
+        if SCHEDULE_IDS.contains(&id.as_str()) {
+            if !schedule_seen {
+                schedule_seen = true;
+                out.push(ToolEntry {
+                    key: SCHEDULE_KEY.to_string(),
+                    title: "Scheduled actions".to_string(),
+                    tech: SCHEDULE_IDS.join(" + "),
+                    description: "Lets the assistant set up recurring prompts for you — a \
+                                  weekly summary, a monthly reminder — and list or remove \
+                                  them. It always asks you to confirm before creating or \
+                                  deleting one, and a schedule it creates runs without \
+                                  tools. Manage them yourself on the Scheduled page."
+                        .to_string(),
+                    category: Category::Scheduling,
                 });
             }
             continue;

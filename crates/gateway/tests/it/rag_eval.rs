@@ -260,7 +260,9 @@ async fn hybrid_recovers_exact_identifier_that_dense_only_misses() {
 
     // Hybrid: the lexical side matches osd/op/timeout against
     // `osd_op_timeout` and RRF lifts it into the results.
-    let hits = search_chunks(&indexer, &r, query, &qvec, 5).await.unwrap();
+    let hits = search_chunks(&indexer, &r, query, &qvec, 5, None)
+        .await
+        .unwrap();
     let files: Vec<&str> = hits.iter().map(|(c, _)| c.file_path.as_str()).collect();
     assert!(
         files.contains(&"src/common/options/global.yaml.in"),
@@ -326,7 +328,7 @@ async fn lexical_alone_answers_when_vector_index_is_absent() {
     .unwrap();
 
     let qvec = vec![0.0_f32; 4]; // no index to search anyway
-    let hits = search_chunks(&indexer, &r, "osd op timeout", &qvec, 5)
+    let hits = search_chunks(&indexer, &r, "osd op timeout", &qvec, 5, None)
         .await
         .unwrap();
     let files: Vec<&str> = hits.iter().map(|(c, _)| c.file_path.as_str()).collect();

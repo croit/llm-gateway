@@ -145,28 +145,43 @@ pub struct OpenAiDriver {
     pub voice_mode: bool,
 }
 
-/// Build the per-turn [`ToolContext`] for a persisted chat session. This
-/// is the single home for the chat-page and headless-scheduler wirings,
-/// which agree on everything except the two interactive-only handles:
+/// Build the per-turn [`ToolContext`] for a persisted chat session — the single
+/// home for the chat-page and headless-scheduler wirings, which agree on
+/// everything except the per-turn facts in [`TurnFacts`].
+/// The per-turn facts [`build_tool_context`] can't derive from `RamaState`.
 ///
-/// - `client_ip` — the caller's source IP (chat path has one; the
-///   scheduler has no request, so `None`).
-/// - `chat_feedback` — the live SSE + feedback-hub handles that let
-///   `get_user_location` prompt the browser mid-turn (chat path only;
-///   `None` headless, where nobody is watching to answer).
-///
-/// `roles` carries the user's RBAC grant, which is also the tool gate:
-/// pass the real roles to grant the user's normal tools, or an empty
-/// slice to run with no tools at all (the scheduler's "tools off").
-pub fn build_tool_context(
-    state: &Arc<RamaState>,
-    user_id: String,
-    roles: Vec<String>,
-    session_id: String,
-    assistant_turn_id: String,
-    client_ip: Option<String>,
-    chat_feedback: Option<crate::server::tools::ChatFeedback>,
-) -> ToolContext {
+/// A struct rather than a positional argument list: `client_ip` and `model` are
+/// both `Option<String>`, so as parameters they would sit next to each other
+/// with nothing but order to tell them apart — a swap the compiler would accept
+/// and no test would obviously catch.
+pub struct TurnFacts {
+    pub user_id: String,
+    /// The user's RBAC grant, which is also the tool gate: the real roles to
+    /// grant their normal tools, or an empty vec to run with no tools at all
+    /// (the scheduler's "tools off").
+    pub roles: Vec<String>,
+    pub session_id: String,
+    pub assistant_turn_id: String,
+    /// The caller's source IP. `None` headless — the scheduler has no request.
+    pub client_ip: Option<String>,
+    /// Live SSE + feedback hubs, so `get_user_location` and `ask_user` can
+    /// prompt mid-turn. `None` headless, where nobody is watching to answer.
+    pub chat_feedback: Option<crate::server::tools::ChatFeedback>,
+    /// The model this turn runs on, so a tool that creates work to be run
+    /// *later* (`schedule_action`) inherits it instead of guessing a pool id.
+    pub model: Option<String>,
+}
+
+pub fn build_tool_context(state: &Arc<RamaState>, facts: TurnFacts) -> ToolContext {
+    let TurnFacts {
+        user_id,
+        roles,
+        session_id,
+        assistant_turn_id,
+        client_ip,
+        chat_feedback,
+        model,
+    } = facts;
     ToolContext {
         user_id,
         roles,
@@ -203,6 +218,14 @@ pub fn build_tool_context(
             .clone()
             .map(crate::server::tools::sandbox::SandboxLease::new),
         crypto: Some(state.crypto.clone()),
+        // One notification per turn, latched in the context the driver builds
+        // per turn. `None` when push isn't configured; `notify_user` then says
+        // so instead of silently doing nothing.
+        push: state
+            .push
+            .clone()
+            .map(crate::server::tools::PushNotifier::new),
+        model,
     }
 }
 
