@@ -154,6 +154,7 @@ mod tests {
             indexer: None,
             image_gen: None,
             sandbox_lease: None,
+            browser_lease: None,
             crypto: None,
             push: None,
             model: None,

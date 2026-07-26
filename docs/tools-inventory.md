@@ -107,7 +107,8 @@ Gated so the model is never offered a tool whose every call could only answer
 | `export_document` | `[sandbox] enabled` | yes | `document` |
 | `convert_document` | `[sandbox] enabled` | — | `convert_document` |
 | `edit_presentation` | `[sandbox] enabled` | — | `edit_presentation` |
-| `capture_webpage` | `[sandbox] enabled` | — | `capture_webpage` |
+| `capture_webpage` | `[sandbox] enabled` **and** the runner reports egress | — | `capture_webpage` |
+| `browse_page` | `[sandbox] enabled` **and** the runner reports egress | — | `browse_page` |
 | `render_typst` | `[sandbox] enabled` | — | `render_typst` |
 | `render_excalidraw` | `[sandbox] enabled` | — | `render_excalidraw` |
 | `read_sandbox_output` | `[sandbox] enabled` | yes | `read_sandbox_output` |
@@ -115,6 +116,34 @@ Gated so the model is never offered a tool whose every call could only answer
 `export_document` is the one sandbox tool that rides the canvas `document`
 toggle: it exports a canvas document, so it belongs to that capability from
 the user's point of view even though it needs the sandbox to run.
+
+### Egress is a *runner* capability, not gateway config
+
+Whether a sandbox can reach the network is decided by the **runner's**
+deployment (`SANDBOX_EGRESS_NETWORK` + `SANDBOX_EGRESS_PROXY`), which nothing
+in the gateway's own config can see. So the gateway asks: at boot it reads
+`GET /healthz` on the runner, which reports `egress: true|false`
+(`shared::sandbox::RunnerHealth`), and remembers the answer for the process
+lifetime.
+
+That answer changes what the model is offered:
+
+- **No egress** → `capture_webpage` and `browse_page` are **not registered**
+  at all, and `run_in_sandbox`'s schema has **no `network` property**, with a
+  description that states plainly there is no network rather than implying a
+  permission the model could ask for. This is the "absent beats
+  always-failing" rule below: before this, `capture_webpage` was advertised on
+  an offline runner and every call failed with `network egress requested but
+  not configured on this runner`.
+- **Egress** → both tools register and `network` appears as an option.
+- **Unknown** (runner unreachable at boot, or one older than the health field)
+  → treated as *available*. Withdrawing capabilities needs positive evidence;
+  an unreachable runner breaks every sandbox tool anyway, so hiding a subset
+  would turn a transient outage into an apparent permanent capability loss.
+
+Not re-probed: egress changes when an operator edits a unit file and restarts
+things, and a capability set that shifted under a running conversation would be
+worse than a slightly stale one.
 
 **`render_typst` is deliberately not chat-only, even though part of it needs a
 session.** It renders either inline `source` or a `document_id` from the canvas.

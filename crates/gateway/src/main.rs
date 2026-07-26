@@ -368,17 +368,35 @@ async fn main() -> anyhow::Result<()> {
             let client = sandbox_client
                 .clone()
                 .expect("sandbox_client is built when [sandbox] is enabled");
+            // Ask the runner what it can do before deciding what to register.
+            // Egress is a property of the *runner's* deployment (a podman
+            // network + an allowlisting proxy) that this config can't see, so
+            // without asking we would offer web tools on an offline runner and
+            // every call would fail. Unreachable runner → treated as capable;
+            // see `SandboxClient::egress_available`.
+            client.probe_capabilities().await;
+            let egress = client.egress_available();
             tool_registry = tool_registry
                 .with(rt::tools::sandbox::RunInSandbox(client.clone()))
                 .with(rt::tools::sandbox::GenerateDocument(client.clone()))
                 .with(rt::tools::sandbox::ExportDocument(client.clone()))
-                .with(rt::tools::sandbox::CaptureWebpage(client.clone()))
                 .with(rt::tools::sandbox::ConvertDocument(client.clone()))
                 .with(rt::tools::sandbox::EditPresentation(client.clone()))
                 .with(rt::tools::sandbox::RenderExcalidraw(client.clone()))
-                .with(rt::tools::sandbox::RenderTypst(client))
+                .with(rt::tools::sandbox::RenderTypst(client.clone()))
                 .with(rt::tools::sandbox::ReadSandboxOutput);
-            tracing::info!(runner = %sandbox_cfg.runner_url, "registered sandbox tools");
+            // Web tools need egress by definition — every call would fail
+            // without it, so absent beats always-failing (the rule in
+            // docs/tools-inventory.md).
+            if egress {
+                tool_registry = tool_registry
+                    .with(rt::tools::sandbox::CaptureWebpage(client.clone()))
+                    .with(rt::tools::sandbox::BrowsePage(client));
+            }
+            tracing::info!(
+                runner = %sandbox_cfg.runner_url, egress,
+                "registered sandbox tools"
+            );
         }
         Some(_) => tracing::info!("[sandbox] enabled = false — sandbox tools not registered"),
         None => tracing::info!("no [sandbox] config — sandbox tools not registered"),

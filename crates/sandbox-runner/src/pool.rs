@@ -85,6 +85,12 @@ pub struct Pool {
 }
 
 impl Pool {
+    /// The runner's configuration, so the HTTP layer can report capabilities
+    /// (`/healthz`) without holding a second `Arc<Config>`.
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
     pub fn new(backend: Arc<dyn ContainerBackend>, cfg: Arc<Config>) -> Arc<Self> {
         let permits = cfg.max_concurrent.max(1);
         Arc::new(Self {

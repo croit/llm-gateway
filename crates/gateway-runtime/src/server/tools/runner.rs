@@ -139,6 +139,10 @@ where
     if let Some(lease) = &ctx.sandbox_lease {
         lease.release().await;
     }
+    // The browser container too: Chromium only stops when its container does.
+    if let Some(lease) = &ctx.browser_lease {
+        lease.release().await;
+    }
     out
 }
 

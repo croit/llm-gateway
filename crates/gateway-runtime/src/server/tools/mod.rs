@@ -106,6 +106,15 @@ pub struct ToolContext {
     /// deployments), where sandbox calls stay single-use. The driver releases
     /// it at turn end. See [`sandbox::SandboxLease`].
     pub sandbox_lease: Option<std::sync::Arc<sandbox::SandboxLease>>,
+    /// A *second* container lease, held for `browse_page`'s long-lived
+    /// browser. Separate from [`Self::sandbox_lease`] on purpose: the runner
+    /// fixes a container's network posture at creation, so the code lease
+    /// recreates its container whenever a call flips `network` — which would
+    /// kill the browser every time the model ran an ordinary offline
+    /// `run_in_sandbox` between two browse calls. `Some` only where the
+    /// sandbox is configured *and* its runner reports egress (a browser with
+    /// no network is pointless). Released at turn end like the other lease.
+    pub browser_lease: Option<std::sync::Arc<sandbox::SandboxLease>>,
     /// The at-rest encryption key, cloned from `AppState`. Tools that read a
     /// sealed operator setting out of `app_settings` need it — currently
     /// `search_web`, for the Brave API key. `None` on paths that never wired
@@ -153,6 +162,7 @@ impl ToolContext {
             indexer: None,
             image_gen: None,
             sandbox_lease: None,
+            browser_lease: None,
             crypto: None,
             push: None,
             model: None,

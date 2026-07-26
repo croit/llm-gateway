@@ -294,6 +294,7 @@ pub fn category_for(tool_id: &str) -> Category {
         | "convert_document"
         | "edit_presentation"
         | "capture_webpage"
+        | "browse_page"
         | "read_sandbox_output"
         | "render_excalidraw"
         | "render_typst" => Category::Code,
@@ -495,6 +496,13 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Lets the assistant change a PowerPoint file you uploaded and return the edited \
              deck — rewriting slide text or swapping images while keeping the original \
              layout and theme, instead of rebuilding the deck from scratch.",
+        ),
+        "browse_page" => (
+            "Browse a website",
+            "Lets the assistant drive a real browser across several steps — click a link, \
+             fill a form, get past a consent banner, look at the next page — instead of only \
+             being able to read a page once. Needs the operator to have enabled sandbox \
+             network access.",
         ),
         "capture_webpage" => (
             "Web page capture",
