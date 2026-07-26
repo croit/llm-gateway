@@ -10,7 +10,7 @@
 use crate::common;
 
 use common::Service as _;
-use gateway::server::upstreams::config::PoolKind;
+use gateway_core::server::upstreams::config::PoolKind;
 use rama::http::{Body, Method, Request, StatusCode};
 use serde_json::json;
 use wiremock::matchers::{method, path};
@@ -91,8 +91,8 @@ async fn happy_path_relays_text() {
 
 #[tokio::test]
 async fn provider_duration_is_priced_for_transcription() {
-    use gateway::server::db::model_defaults::{self, PricingUnit};
-    use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
+    use gateway_core::server::db::model_defaults::{self, PricingUnit};
+    use gateway_core::server::db::usage::{Filter, Period, aggregate, period_bounds};
     use jiff::Timestamp;
 
     let upstream = MockServer::start().await;
@@ -115,7 +115,7 @@ async fn provider_duration_is_priced_for_transcription() {
     )
     .await
     .unwrap();
-    let metered = gateway::server::usage::spawn(state.db.clone(), 90);
+    let metered = gateway_core::server::usage::spawn(state.db.clone(), 90);
     let state = state.with_usage(metered);
     let db = state.db.clone();
     let bearer = common::seed_user_with_token(&state, "alice").await;

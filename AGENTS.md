@@ -21,7 +21,7 @@ Built on **rama 0.3** (HTTP server + router + middleware), **plait** (inline-in-
 ├── AGENTS.md                    # this file
 ├── README.md                    # human-facing — keep current with deploy story
 ├── mise.toml                    # toolchain pin + build/test/lint tasks
-├── Cargo.toml                   # workspace manifest (4 members)
+├── Cargo.toml                   # workspace manifest (6 members)
 ├── Dockerfile                   # gateway runtime image
 ├── docs/                        # detailed design docs (index in docs/README.md)
 ├── ui/                          # Tailwind v4 + daisyUI v5 → app.css; TS bundle for gateway
@@ -33,15 +33,36 @@ Built on **rama 0.3** (HTTP server + router + middleware), **plait** (inline-in-
     │   │                            tables), Plait renderers (markdown + lumis-highlighted
     │   │                            code), SSE primitives, icons
     │   └── ui/ts/                   composer + scroll TS
-    └── gateway/                 # the OpenAI-compatible proxy
+    ├── gateway-core/            # the gateway's application body
+    ├── gateway-web/             # the server-rendered HTML pages
+    ├── gateway/                 # the binary: router, proxy, api, main
+    └── sandbox-runner/          # the sandboxed-tool execution service
 ```
 
-Inside `crates/gateway/src/`:
+### The gateway crate stack
+
+The gateway is one binary assembled from three layered crates. This is **load
+bearing for build speed**, not cosmetic: it used to be ~108k lines in one
+compilation unit, so editing any file re-ran the whole frontend + codegen. Each
+crate depends only on the ones beneath it.
 
 ```
-main.rs                   # boot: config → state → SessionStore → OIDC → rama serve
+gateway          bin + router/proxy/api/oidc      ← thinnest, most-edited glue
+   ├── gateway-web    server-rendered HTML pages   ← pure sink; nothing below uses it
+   └── gateway-core   application body (server/, openai_driver, RamaState)
+```
+
+**When adding code, put it as high in the stack as it will go.** Something only
+belongs in `gateway-core` if code below the page layer actually needs it. Adding a
+reference from `gateway-core` to a page — or pushing a module downward for
+convenience — makes every build slow again. See [`docs/architecture.md`](docs/architecture.md#crate-boundaries).
+
+Inside `crates/gateway-core/src/`:
+
+```
 openai_driver.rs          # SessionDriver impl: OpenAI streaming chat-completions
-server/                   # framework-neutral building blocks (no rama/axum imports):
+migrations/               # (crate root) sqlx migration set, embedded by db/mod.rs
+server/                   # framework-neutral building blocks (no routing):
     auth/oidc.rs              hand-rolled OIDC client (reqwest)
     auth/token.rs             gateway-token mint/hash helpers
     config.rs                 [upstream_pools] + [[models]] + [oidc] schema
@@ -49,25 +70,45 @@ server/                   # framework-neutral building blocks (no rama/axum impo
                               moved to session-core, gateway just runs the migration
     rbac/                     role → tool/model resolution
     state.rs                  AppState
-    tools/                    Tool trait + Echo/CurrentTime + the runner loop
+    tools/                    Tool trait + the tool impls + the runner loop
     upstreams/                pool registry, health probes, RAII Acquired guard
-rama_server/              # rama-flavoured I/O surface (routes, middleware, pages):
+    rag/ skills.rs comfyui/ push/ scheduled/ limits/ usage/ geoip/ webhooks.rs …
+rama_server/              # the shared rama handles both layers above need:
     state.rs                  RamaState (wraps AppState + adds SessionStore)
-    router.rs                 the rama::http::service::web::Router builder
+    session.rs                signed-cookie + sqlite session store; is_safe_return_to
     auth.rs                   require_bearer for /v1/*
-    session.rs                hand-rolled signed-cookie + sqlite session store
-    proxy.rs                  /v1/{models,chat/completions,audio/transcriptions}
-    api.rs                    session-authed /api/v0/* JSON endpoints
-    pages/                    plait-rendered HTML
-      mod.rs                  shared chrome — layout, nav, theme, SSE framing, Flash
-      chat/                   gateway-side chat handler (delegates to session_core::worker
+    cors.rs                   the CORS layer
+```
+
+Inside `crates/gateway-web/src/`:
+
+```
+build_info.rs             # git SHA / version label (build.rs stamps it) — page chrome only
+pages/                    # plait-rendered HTML
+    mod.rs                    shared chrome — layout, nav, theme, SSE framing, Flash
+    chat/                     gateway-side chat handler (delegates to session_core::worker
                               + OpenAiDriver). render.rs is the gateway's page-chrome
                               wrapper around session_core::render
-      tokens.rs               /tokens CRUD + row / minted-banner renderers
-      dashboard.rs            /  handler + body
-    oidc_handlers.rs          /auth/{login,callback,logout}
-    assets.rs                 include_bytes! for app.css + datastar.js + app.js + pcm-recorder.js
+    tokens.rs                 /tokens CRUD + row / minted-banner renderers
+    admin.rs + siblings       the /admin/* screens
 ```
+
+Inside `crates/gateway/src/`:
+
+```
+main.rs                   # boot: config → state → SessionStore → OIDC → rama serve
+rama_server/              # routing glue only:
+    router.rs                 the rama::http::service::web::Router builder
+    proxy.rs                  /v1/{models,chat/completions,audio/transcriptions,…}
+    api.rs                    session-authed /api/v0/* JSON endpoints
+    oidc_handlers.rs          /auth/{login,callback,logout}
+    rag_api.rs sandbox_api.rs comfyui_api.rs
+    vad.rs                    silence trimming ahead of Whisper
+tests/it/                 # integration suite — builds the router, serves requests in-process
+```
+
+Static assets (`app.css`, `datastar.js`, `app.js`, `pcm-recorder.js`) are
+`include_bytes!`'d and served through `session_core::assets`.
 
 ## Hard rules — do not violate without asking
 

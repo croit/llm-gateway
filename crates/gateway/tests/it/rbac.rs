@@ -29,13 +29,13 @@ use std::sync::Arc;
 use common::Service as _;
 use gateway::rama_server::router::service;
 use gateway::rama_server::{RamaState, SessionStore};
-use gateway::server::rbac::Resolver;
-use gateway::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
-use gateway::server::upstreams::{
+use gateway_core::server::rbac::Resolver;
+use gateway_core::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
+use gateway_core::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
-use gateway::server::{AppState, Config, db};
+use gateway_core::server::{AppState, Config, db};
 use rama::http::{Body, Method, Request, StatusCode};
 use serde_json::json;
 use wiremock::matchers::method;
@@ -206,7 +206,7 @@ async fn fixture(restrict_kind: PoolKind, groups: &[&str]) -> (Fixture, Principa
     common::seed_pool_models(&registry, "voice", 0, &[TX_MODEL]);
 
     let db_pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
-    let tools = Arc::new(gateway::server::tools::ToolRegistry::new());
+    let tools = Arc::new(gateway_core::server::tools::ToolRegistry::new());
     let app = AppState::new(
         Config::default(),
         db_pool.clone(),
@@ -218,7 +218,7 @@ async fn fixture(restrict_kind: PoolKind, groups: &[&str]) -> (Fixture, Principa
     let state = RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     );
 
     let admin = seed_principal(&state, "admin", &["platform-admins"]).await;
@@ -244,8 +244,8 @@ struct Principals {
 }
 
 async fn seed_principal(state: &RamaState, id: &str, roles: &[&str]) -> Principal {
-    use gateway::server::auth::token;
-    use gateway::server::db::{tokens, users};
+    use gateway_core::server::auth::token;
+    use gateway_core::server::db::{tokens, users};
     use jiff::{SignedDuration, Timestamp};
     use uuid::Uuid;
     let now = Timestamp::now();
@@ -670,7 +670,7 @@ async fn rag_collection_gating_matches_resolver() {
 
 #[tokio::test]
 async fn mcp_connector_gating() {
-    use gateway::server::db::mcp_catalog::{AuthKind, Connector, Scope};
+    use gateway_core::server::db::mcp_catalog::{AuthKind, Connector, Scope};
     use jiff::Timestamp;
     let mut c = Connector {
         key: "net-tools".into(),

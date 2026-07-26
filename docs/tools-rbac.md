@@ -17,7 +17,7 @@ This is **not** a passthrough or an MCP broker. The gateway *is* the tool runtim
 A tool is a type that implements:
 
 ```rust
-// crates/gateway/src/server/tools/mod.rs (sketch — final API TBD in implementation)
+// crates/gateway-core/src/server/tools/mod.rs (sketch — final API TBD in implementation)
 #[async_trait::async_trait]   // may swap for native async-in-traits once stabilized; see notes
 pub trait Tool: Send + Sync + 'static {
     fn id(&self) -> &'static str;             // stable id, e.g. "company_invoice_lookup"

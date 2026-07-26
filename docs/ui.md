@@ -7,7 +7,7 @@ The whole stack:
 | Layer | Tech | Lives in |
 |---|---|---|
 | HTTP server / router | rama 0.3 | `crates/gateway/src/rama_server/router.rs` |
-| HTML templates | plait `html!` macro | `crates/gateway/src/rama_server/pages/` (`mod.rs` chrome + `chat.rs` / `tokens.rs` / `dashboard.rs`) |
+| HTML templates | plait `html!` macro | `crates/gateway-web/src/pages/` (`mod.rs` chrome + `chat.rs` / `tokens.rs` / `dashboard.rs`) |
 | Reactivity (chat + tokens) | datastar 1.x (self-hosted, baked in via `include_bytes!`) | `crates/gateway/src/rama_server/assets.rs` |
 | Client-side glue | TypeScript (strict) bundled with esbuild | `ui/ts/` builds → `crates/gateway/assets/app.js` |
 | Styling | Tailwind v4 + daisyUI v5 | `ui/src/main.css` builds → `crates/gateway/assets/app.css` |
@@ -126,7 +126,7 @@ Don't reach for this pattern for anything a user would routinely encounter.
 Templates live in a directory module so each page sits in its own file:
 
 ```
-crates/gateway/src/rama_server/pages/
+crates/gateway-web/src/pages/
 ├── mod.rs       shared chrome — layout, nav, theme, SSE framing,
 │                 Flash, session gate, error pages, /login, /theme/toggle
 ├── chat/        multi-conversation chat (own directory because of size)
@@ -252,7 +252,7 @@ The form's `data-class` binding reactively un-toggles `chat-composer--streaming`
 
 ### Server-side helpers (`pages/mod.rs`)
 
-All in `crates/gateway/src/rama_server/pages/mod.rs`. Re-use these in new handlers — don't open-code SSE framing.
+All in `crates/gateway-web/src/pages/mod.rs`. Re-use these in new handlers — don't open-code SSE framing.
 
 | Helper | Use |
 |---|---|
@@ -380,7 +380,7 @@ The chat page is multi-conversation and DB-backed. Every turn (user, assistant, 
 | `chat_turns` | One row per message. `role='user'` carries the prompt; `role='assistant'` carries the streamed reply with `status` cycling through `in_progress → completed | cancelled | errored`. Accumulated `content` / `reasoning` strings, `reasoning_elapsed_ms`, optional `model`. |
 | `chat_tool_calls` | Side table; one assistant turn can fan out into many calls across model rounds. Status flips `running → completed | errored`. |
 
-All CRUD lives in `crates/gateway/src/server/db/chat.rs` with 14 unit tests against an in-memory pool.
+All CRUD lives in `crates/gateway-core/src/server/db/chat.rs` with 14 unit tests against an in-memory pool.
 
 **Worker** (`pages/chat/worker.rs::run_chat_turn`). One worker per user, alive while an assistant turn is producing. For each upstream delta:
 
@@ -481,7 +481,7 @@ The `window.*` surface is declared in `ui/ts/global.d.ts` (`interface Window { u
 
 The app is an installable PWA. The service worker lives at `crates/session-core/assets/sw.js` and is served **verbatim** — it is NOT one of esbuild's bundle entries (only `app.ts` + `pcm-recorder.ts` are), so it gets no type-checking or transpile; keep it hand-valid browser JS. It cache-firsts the immutable `/assets/*` bundles, network-firsts the PWA metadata/icons, passes streaming/API traffic through untouched, and never caches authed HTML (per-user, often SSE).
 
-Turn-complete **Web Push** rides on top: `sw.js` carries `push` + `notificationclick` handlers, `ui/ts/push.ts` (`window.gatewayPush`) does the opt-in + subscription dance behind the `/tokens` Notifications card, and the server half is [`server::push`](../crates/gateway/src/server/push/) (VAPID + RFC 8291) fired from `spawn_assistant_worker`. The card ships every string as `data-msg-*` attributes so its copy stays server-localized despite the logic being client-side; whether to actually show a notification is decided in the SW via `clients.matchAll` (suppressed when a focused tab already has that conversation open). See the README's *Notifications* section for the operator-facing view.
+Turn-complete **Web Push** rides on top: `sw.js` carries `push` + `notificationclick` handlers, `ui/ts/push.ts` (`window.gatewayPush`) does the opt-in + subscription dance behind the `/tokens` Notifications card, and the server half is [`server::push`](../crates/gateway-core/src/server/push/) (VAPID + RFC 8291) fired from `spawn_assistant_worker`. The card ships every string as `data-msg-*` attributes so its copy stays server-localized despite the logic being client-side; whether to actually show a notification is decided in the SW via `clients.matchAll` (suppressed when a focused tab already has that conversation open). See the README's *Notifications* section for the operator-facing view.
 
 ### When to reach for what
 

@@ -16,16 +16,16 @@ use std::sync::Arc;
 
 use common::Service as _;
 use gateway::rama_server::{RamaState, SessionStore, router::router};
-use gateway::server::config::Config;
-use gateway::server::db::{tokens, users};
-use gateway::server::rbac::Resolver;
-use gateway::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
-use gateway::server::tools::{ToolRegistry, echo::Echo, time::CurrentTimestamp};
-use gateway::server::upstreams::{
+use gateway_core::server::config::Config;
+use gateway_core::server::db::{tokens, users};
+use gateway_core::server::rbac::Resolver;
+use gateway_core::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
+use gateway_core::server::tools::{ToolRegistry, echo::Echo, time::CurrentTimestamp};
+use gateway_core::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
-use gateway::server::{AppState, db};
+use gateway_core::server::{AppState, db};
 use jiff::{SignedDuration, Timestamp};
 use rama::http::{Body, Method, Request, StatusCode};
 use serde_json::json;
@@ -102,13 +102,13 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
     RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     )
 }
 
 /// Seed a user with the OIDC role + a bearer token.
 async fn seed_engineer_with_bearer(state: &RamaState) -> String {
-    use gateway::server::auth::token;
+    use gateway_core::server::auth::token;
     let now = Timestamp::now();
     users::upsert(
         &state.db,

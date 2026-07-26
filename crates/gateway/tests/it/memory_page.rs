@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use common::Service as _;
 use gateway::rama_server::router::router;
-use gateway::server::db::user_memories::{self, MemoryKind};
+use gateway_core::server::db::user_memories::{self, MemoryKind};
 use rama::http::{Body, Method, Request, StatusCode};
 
 fn post_form(uri: &str, cookie: &str, body: &str) -> Request {

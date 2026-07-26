@@ -16,7 +16,7 @@ use anyhow::Context as _;
 use rama::net::address::SocketAddress;
 
 use gateway::rama_server::SessionStore;
-use gateway::server::{self as srv, AppState, Config};
+use gateway_core::server::{self as srv, AppState, Config};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -689,13 +689,13 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// loop on a transient network blip.
 async fn build_oidc_with_retry(
     config: &Config,
-) -> Option<Arc<gateway::server::auth::oidc::OidcClient>> {
+) -> Option<Arc<gateway_core::server::auth::oidc::OidcClient>> {
     let oidc_config = config.oidc.as_ref()?;
     let mut attempt = 0;
     let max_attempts = 5;
     loop {
         attempt += 1;
-        match gateway::server::auth::oidc::OidcClient::build(
+        match gateway_core::server::auth::oidc::OidcClient::build(
             oidc_config,
             &config.gateway.public_url,
         )

@@ -20,13 +20,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gateway::rama_server::{RamaState, SessionStore, router::service};
-use gateway::server::rbac::Resolver;
-use gateway::server::tools::ToolRegistry;
-use gateway::server::upstreams::{
+use gateway_core::server::rbac::Resolver;
+use gateway_core::server::tools::ToolRegistry;
+use gateway_core::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
-use gateway::server::{AppState, Config, db};
+use gateway_core::server::{AppState, Config, db};
 // `Service::serve` is the call-router-directly entry point that lets
 // us drive the rama Router without binding a socket. Re-exported here
 // so each test file gets it via `use common::*;`.
@@ -65,7 +65,7 @@ fn state_from_registry(db_pool: db::Pool, registry: Arc<upstreams::UpstreamRegis
     RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     )
 }
 
@@ -73,7 +73,7 @@ fn state_from_registry(db_pool: db::Pool, registry: Arc<upstreams::UpstreamRegis
 /// Skills feature enabled: a global store at `root` plus a per-user store at
 /// `root/.users`. For the `/skills` (per-user private skills) page tests.
 pub async fn state_with_user_skills(root: std::path::PathBuf) -> RamaState {
-    use gateway::server::skills::{SkillStore, UserSkillStore};
+    use gateway_core::server::skills::{SkillStore, UserSkillStore};
     let db_pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
     let registry = upstreams::UpstreamRegistry::new(&HashMap::new()).unwrap();
     let tools = Arc::new(ToolRegistry::new());
@@ -85,7 +85,7 @@ pub async fn state_with_user_skills(root: std::path::PathBuf) -> RamaState {
     RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     )
 }
 
@@ -235,7 +235,7 @@ pub async fn state_with_admin_rbac(upstream_url: &str) -> RamaState {
 /// (empty content dir from a tempdir). For the `/admin/comfyui` route
 /// tests.
 pub async fn state_with_admin_rbac_and_comfyui(upstream_url: &str) -> RamaState {
-    use gateway::server::comfyui::{Client, ComfyuiHandle, ComfyuiStore};
+    use gateway_core::server::comfyui::{Client, ComfyuiHandle, ComfyuiStore};
     let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
 
     let mut pools = HashMap::new();
@@ -269,7 +269,7 @@ pub async fn state_with_admin_rbac_and_comfyui(upstream_url: &str) -> RamaState 
     seed_pool_models(&registry, "pool", 0, &["model-a"]);
 
     let tools = Arc::new(ToolRegistry::new());
-    use gateway::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
+    use gateway_core::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
     let rbac_config = RbacConfig {
         default_role: None,
         mappings: vec![RoleMapping {
@@ -300,14 +300,14 @@ pub async fn state_with_admin_rbac_and_comfyui(upstream_url: &str) -> RamaState 
         s3: None,
         max_concurrent_jobs: 1,
         job_slots: Arc::new(tokio::sync::Semaphore::new(1)),
-        chat_updates: gateway::server::comfyui::ChatUpdateRegistry::default(),
+        chat_updates: gateway_core::server::comfyui::ChatUpdateRegistry::default(),
     });
     let app = AppState::new(config, pool.clone(), registry, tools, rbac).with_comfyui(comfyui);
     let sessions = SessionStore::new(pool, TEST_SECRET);
     RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     )
 }
 
@@ -318,7 +318,7 @@ pub async fn state_with_admin_rbac_no_impersonation(upstream_url: &str) -> RamaS
 }
 
 async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool) -> RamaState {
-    use gateway::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
+    use gateway_core::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
     let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
 
     let mut pools = HashMap::new();
@@ -376,7 +376,7 @@ async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool
     RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     )
 }
 
@@ -428,7 +428,7 @@ pub fn req(method: rama::http::Method, uri: &str) -> rama::http::Request {
 /// Seed a user + an active session, return the signed cookie value.
 /// Use the returned string as `Cookie: id=<value>` in subsequent requests.
 pub async fn seed_session(state: &RamaState, user_id: &str, email: &str) -> String {
-    use gateway::server::db::users;
+    use gateway_core::server::db::users;
     use jiff::Timestamp;
     let now = Timestamp::now();
     users::upsert(
@@ -452,8 +452,8 @@ pub async fn seed_session(state: &RamaState, user_id: &str, email: &str) -> Stri
 /// Seed a user + an active session + a bearer token. Returns the
 /// plaintext bearer suitable for an `Authorization: Bearer …` header.
 pub async fn seed_user_with_token(state: &RamaState, user_id: &str) -> String {
-    use gateway::server::auth::token;
-    use gateway::server::db::{tokens, users};
+    use gateway_core::server::auth::token;
+    use gateway_core::server::db::{tokens, users};
     use jiff::{SignedDuration, Timestamp};
     use uuid::Uuid;
     let now = Timestamp::now();

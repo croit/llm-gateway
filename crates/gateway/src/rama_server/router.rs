@@ -2,7 +2,7 @@
 // Copyright (C) 2026 croit GmbH
 
 //! Top-level rama Router. Mirrors the axum router shape in
-//! `crate::server::api::router` — same paths, same methods — but rebuilt
+//! `gateway_core::server::api::router` — same paths, same methods — but rebuilt
 //! against rama's `web::Router` and handler model.
 //!
 //! Three groups of routes wired below:
@@ -30,8 +30,8 @@ use rama::net::address::SocketAddress;
 use serde_json::json;
 
 use crate::rama_server::RamaState;
-use crate::rama_server::cors::V1CorsLayer;
 use crate::rama_server::{api, comfyui_api, oidc_handlers, pages, proxy, rag_api, sandbox_api};
+use gateway_core::rama_server::cors::V1CorsLayer;
 use session_core::assets;
 
 /// Builds the rama router. State is shared via `Arc` since handlers

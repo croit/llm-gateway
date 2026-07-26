@@ -24,15 +24,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::Service as _;
 use gateway::rama_server::{RamaState, SessionStore, router::router};
-use gateway::server::auth::oidc::OidcClient;
-use gateway::server::config::{Config, OidcConfig};
-use gateway::server::rbac::Resolver;
-use gateway::server::tools::ToolRegistry;
-use gateway::server::upstreams::{
+use gateway_core::server::auth::oidc::OidcClient;
+use gateway_core::server::config::{Config, OidcConfig};
+use gateway_core::server::rbac::Resolver;
+use gateway_core::server::tools::ToolRegistry;
+use gateway_core::server::upstreams::{
     self,
     config::{PoolKind, UpstreamPoolConfig},
 };
-use gateway::server::{AppState, db};
+use gateway_core::server::{AppState, db};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use rama::http::{Body, Method, Request, StatusCode};
 use rsa::pkcs1::EncodeRsaPrivateKey;
@@ -176,7 +176,7 @@ async fn state_with_oidc(idp_uri: &str, roles_claim: Option<&str>) -> RamaState 
     RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     )
 }
 

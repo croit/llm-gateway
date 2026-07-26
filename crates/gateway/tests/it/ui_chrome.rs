@@ -11,12 +11,12 @@ use std::sync::Arc;
 
 use common::Service as _;
 use gateway::rama_server::{RamaState, SessionStore, router::router};
-use gateway::server::AppState;
-use gateway::server::config::Config;
-use gateway::server::db;
-use gateway::server::rbac::Resolver;
-use gateway::server::tools::ToolRegistry;
-use gateway::server::upstreams::{
+use gateway_core::server::AppState;
+use gateway_core::server::config::Config;
+use gateway_core::server::db;
+use gateway_core::server::rbac::Resolver;
+use gateway_core::server::tools::ToolRegistry;
+use gateway_core::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
@@ -192,8 +192,8 @@ async fn app_js_loads_before_datastar_so_window_globals_exist() {
 
 #[tokio::test]
 async fn revoke_returns_sse_with_row_swap_and_toast() {
-    use gateway::server::auth::token;
-    use gateway::server::db::tokens;
+    use gateway_core::server::auth::token;
+    use gateway_core::server::db::tokens;
     use jiff::{SignedDuration, Timestamp};
     use uuid::Uuid;
 
@@ -285,8 +285,8 @@ async fn revoke_returns_sse_with_row_swap_and_toast() {
 
 #[tokio::test]
 async fn rotate_returns_sse_with_new_secret_and_row_swap() {
-    use gateway::server::auth::token;
-    use gateway::server::db::tokens;
+    use gateway_core::server::auth::token;
+    use gateway_core::server::db::tokens;
     use jiff::{SignedDuration, Timestamp};
     use uuid::Uuid;
 
@@ -427,7 +427,7 @@ async fn transcription_models_lists_discovered_models() {
     let state = RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     );
     let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
     let app = router(Arc::new(state));
@@ -509,7 +509,7 @@ async fn session_transcribe_forwards_multipart_to_upstream() {
     let state = RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     );
     let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
     let app = router(Arc::new(state));
@@ -639,7 +639,7 @@ async fn session_transcribe_rejects_too_short_audio() {
     let state = RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     );
     let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
     let app = router(Arc::new(state));

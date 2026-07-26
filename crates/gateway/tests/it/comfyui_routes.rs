@@ -18,7 +18,7 @@ use crate::common;
 
 use common::Service as _;
 use gateway::rama_server::RamaState;
-use gateway::server::db::users;
+use gateway_core::server::db::users;
 use jiff::Timestamp;
 use rama::http::{Body, Method, Request, StatusCode};
 
