@@ -99,6 +99,12 @@ pub struct ToolContext {
     /// paths (tests) that never wired one up, where the tool degrades to a
     /// clear `Failed("image generation not configured")`.
     pub image_gen: Option<gateway_features::server::image_gen::ImageGenerator>,
+    /// Document-OCR handle, cloned from the server state (one shared instance,
+    /// so its concurrency gate actually bounds concurrent runs).
+    /// `fetch_attachment` reaches it for `mode="auto"` / `mode="ocr"`. `None`
+    /// on paths (tests) that never wired one up, where those modes report that
+    /// OCR isn't configured instead of failing opaquely.
+    pub ocr: Option<gateway_features::server::ocr::OcrService>,
     /// The turn's sandbox-container lease, so successive `run_in_sandbox`
     /// calls reuse one container (persisting `/work` across a turn's rounds)
     /// instead of each running single-use. `Some` on the chat + proxy paths
@@ -161,6 +167,7 @@ impl ToolContext {
             attachment_reservations: None,
             indexer: None,
             image_gen: None,
+            ocr: None,
             sandbox_lease: None,
             browser_lease: None,
             crypto: None,
@@ -259,6 +266,7 @@ impl std::fmt::Debug for ToolContext {
                 "image_gen",
                 &self.image_gen.as_ref().map(|_| "<ImageGenerator>"),
             )
+            .field("ocr", &self.ocr.as_ref().map(|_| "<OcrService>"))
             .field(
                 "sandbox_lease",
                 &self.sandbox_lease.as_ref().map(|_| "<SandboxLease>"),

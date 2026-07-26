@@ -124,6 +124,7 @@ fn ctx(pool: db::Pool, asst_turn: &str) -> ToolContext {
         attachment_reservations: Some(chat_attachments::new_reservation_set()),
         indexer: None,
         image_gen: None,
+        ocr: None,
         sandbox_lease: None,
         browser_lease: None,
         crypto: None,

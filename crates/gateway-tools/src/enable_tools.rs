@@ -457,6 +457,7 @@ mod tests {
             attachment_reservations: None,
             indexer: None,
             image_gen: None,
+            ocr: None,
             sandbox_lease: None,
             browser_lease: None,
             crypto: None,
