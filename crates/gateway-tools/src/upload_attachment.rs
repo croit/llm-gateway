@@ -22,8 +22,8 @@ use serde_json::{Value, json};
 use session_core::db as chat;
 use shared::api::ToolDef;
 
-use gateway_core::server::chat_attachments;
-use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
+use gateway_features::server::chat_attachments;
+use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Hard cap on the decoded byte size of one upload. Mirrors the
 /// 30 s upload timeout in `chat_attachments` — keeps a runaway

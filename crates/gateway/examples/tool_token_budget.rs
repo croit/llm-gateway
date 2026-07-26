@@ -19,7 +19,7 @@
 
 use std::path::Path;
 
-use gateway_core::server::tools::{ToolRegistry, catalog};
+use gateway_runtime::server::tools::{ToolRegistry, catalog};
 
 /// Rough BPE density for dense JSON (lots of short tokens: braces,
 /// quotes, field names). Qwen/GPT-class tokenizers land ~3.5–4 chars
@@ -28,8 +28,8 @@ const CHARS_PER_TOKEN: f64 = 3.7;
 
 fn main() {
     let mut registry = ToolRegistry::new()
-        .with(gateway_core::server::tools::echo::Echo)
-        .with(gateway_core::server::tools::time::CurrentTimestamp)
+        .with(gateway_runtime::server::tools::echo::Echo)
+        .with(gateway_runtime::server::tools::time::CurrentTimestamp)
         .with(gateway_tools::fetch_url::FetchUrl)
         .with(gateway_tools::fetch_attachment::FetchAttachment::new(None))
         .with(gateway_tools::upload_attachment::UploadAttachment)
@@ -46,7 +46,7 @@ fn main() {
 
     // Discover typst templates the same way main.rs does, if present.
     let templates_dir = Path::new("examples/typst-templates");
-    match gateway_core::server::typst::discover_templates(templates_dir) {
+    match gateway_features::server::typst::discover_templates(templates_dir) {
         Ok(templates) => {
             for t in templates {
                 let t = std::sync::Arc::new(t);

@@ -22,9 +22,9 @@ use super::{
     NavItem, fetch_sidebar_chat, internal_error_html, nav_or_html_page, parse_csv, read_form,
     require_admin_or_403,
 };
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::mcp_audit::{self, McpToolEvent};
 use gateway_core::server::db::mcp_catalog::{self, AuthKind, Connector, ConnectorInput, Scope};
+use gateway_runtime::rama_server::state::RamaState;
 use session_core::chrome::{NavSections, Theme, is_datastar_request};
 use session_core::i18n::{self, Lang, t, t_args};
 

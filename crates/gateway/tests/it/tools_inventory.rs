@@ -29,7 +29,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use gateway_core::server::tools::catalog::{
+use gateway_runtime::server::tools::catalog::{
     self, COMFYUI_PREFIX, Category, TYPST_PREFIX, has_display_copy, requires_chat_session,
 };
 
@@ -59,11 +59,18 @@ const EXPECTED_UTILITY: &[&str] = &[
 /// dynamic families. Keyed by the file that implements them so a *new* dynamic
 /// family also has to be acknowledged here (and documented as a family in the
 /// inventory's "Dynamic families" table).
+/// Paths are crate-qualified suffixes so each entry also records which layer the
+/// family lives on — the impls sit above the tool machinery, the machinery in the
+/// runtime.
 const DYNAMIC_ID_IMPLS: &[&str] = &[
-    "tools/typst_render.rs", // typst_<template> + _edit/_read/_pptx
-    "tools/mcp/mod.rs",      // mcp__<server>__<tool>
-    "tools/mcp/manager.rs",  // AuditedTool — delegates to the wrapped tool
-    "comfyui/tool.rs",       // comfyui_<workflow>
+    // typst_<template> + _edit/_read/_pptx
+    "gateway-tools/src/typst_render.rs",
+    // mcp__<server>__<tool>
+    "gateway-runtime/src/server/tools/mcp/mod.rs",
+    // AuditedTool — delegates to the wrapped tool
+    "gateway-runtime/src/server/tools/mcp/manager.rs",
+    // comfyui_<workflow>
+    "gateway-runtime/src/server/comfyui_tool.rs",
 ];
 
 fn repo_root() -> PathBuf {
@@ -93,8 +100,11 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// One `fn id(&self) -> &str` implementation.
 enum IdImpl {
-    /// Returned a string literal, or a `const NAME: &str = "…"` resolved
-    /// within the same file.
+    /// Returned a string literal, or a `const NAME: &str = "…"` resolved from
+    /// the same file or, failing that, anywhere else in the workspace — the
+    /// well-known ids (`read_skill`, `enable_tools`) live in
+    /// `gateway_core::server::tool_naming` so that RBAC, the typst discovery
+    /// pass and the catalog can all reach them from different layers.
     Static(String),
     /// Returned something computed at runtime (`self.id`, `&self.registry_id`,
     /// `self.inner.id()`), i.e. a dynamic family.
@@ -102,8 +112,9 @@ enum IdImpl {
 }
 
 /// Parse every `Tool::id` impl in `src`. Handles the three shapes the codebase
-/// actually uses: a literal, a module const, and a runtime value.
-fn id_impls(src: &str) -> Vec<IdImpl> {
+/// actually uses: a literal, a const (declared here or in another crate), and a
+/// runtime value. `corpus` is every source file's text, for the cross-crate case.
+fn id_impls(src: &str, corpus: &[String]) -> Vec<IdImpl> {
     let mut out = Vec::new();
     for after in src
         .match_indices("fn id(&self) -> &str")
@@ -129,7 +140,9 @@ fn id_impls(src: &str) -> Vec<IdImpl> {
             out.push(IdImpl::Static(lit.to_string()));
         } else if body.starts_with("self") || body.starts_with("&self") {
             out.push(IdImpl::Dynamic);
-        } else if let Some(value) = const_value(src, body) {
+        } else if let Some(value) =
+            const_value(src, body).or_else(|| corpus.iter().find_map(|c| const_value(c, body)))
+        {
             out.push(IdImpl::Static(value));
         } else {
             panic!(
@@ -183,14 +196,18 @@ fn discovered_ids() -> BTreeSet<String> {
     let mut files = Vec::new();
     rust_sources(&root.join("crates"), &mut files);
 
+    let sources: Vec<String> = files
+        .iter()
+        .map(|p| std::fs::read_to_string(p).expect("read source"))
+        .collect();
+
     let mut ids = BTreeSet::new();
     let mut dynamic_files = BTreeSet::new();
-    for path in &files {
-        let src = std::fs::read_to_string(path).expect("read source");
+    for (path, src) in files.iter().zip(&sources) {
         if !src.contains("fn id(&self) -> &str") {
             continue;
         }
-        for imp in id_impls(&src) {
+        for imp in id_impls(src, &sources) {
             match imp {
                 IdImpl::Static(id) if NOT_REAL_TOOLS.contains(&id.as_str()) => {}
                 IdImpl::Static(id) => {

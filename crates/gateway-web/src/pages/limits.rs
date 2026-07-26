@@ -23,9 +23,9 @@ use session_core::chrome::{
 use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::limits::{self, Dimension, LimitRule, SubjectType, Window};
 use gateway_core::server::db::users;
+use gateway_runtime::rama_server::state::RamaState;
 
 /// GET /admin/limits — the add-form + a table of every configured rule.
 pub async fn limits_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {

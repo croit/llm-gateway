@@ -47,9 +47,9 @@ use session_core::{RegisterOutcome, TurnUpdate};
 use session_core::db as chat;
 use session_core::export;
 
-use gateway_core::rama_server::state::RamaState;
-use gateway_core::server::chat_attachments;
 use gateway_core::server::db::users::User;
+use gateway_features::server::chat_attachments;
+use gateway_runtime::rama_server::state::RamaState;
 
 mod render;
 mod title;
@@ -218,7 +218,7 @@ async fn render_chat_response(
     // The session's document canvas (active = most-recently-updated
     // document), pre-rendered to HTML for the always-present slot. `None`
     // when the conversation has no documents.
-    let document_canvas_html = gateway_core::server::document_canvas::render_canvas_html(
+    let document_canvas_html = gateway_features::server::document_canvas::render_canvas_html(
         &state.db, &active.id, None, None, lang,
     )
     .await
@@ -752,7 +752,7 @@ async fn build_capabilities(
     session_id: &str,
     lang: Lang,
 ) -> Vec<render::CapabilityRow> {
-    use gateway_core::server::tools::catalog::Category;
+    use gateway_runtime::server::tools::catalog::Category;
     use render::{CapKind, CapabilityRow, SKILL_ORDER, ToolState};
 
     let mut out: Vec<CapabilityRow> = Vec::new();
@@ -806,7 +806,7 @@ async fn build_capabilities(
             if !c.allows(&role_ids, admin) {
                 continue;
             }
-            let key = format!("{}{ck}", gateway_core::server::tools::mcp::MCP_ID_PREFIX);
+            let key = format!("{}{ck}", gateway_runtime::server::tools::mcp::MCP_ID_PREFIX);
             let state_tier = ToolState::from_row(states.get(&key).copied());
             let description = c.description.clone().unwrap_or_else(|| {
                 t_args(
@@ -981,9 +981,9 @@ pub async fn chat_message_send(
         .to_string();
     // Source IP for `get_user_location`, snapshotted before we consume
     // the request (and before the worker, which has no request in scope).
-    let client_ip = gateway_core::server::geoip::client_ip(req.headers())
-        .or_else(|| gateway_core::server::geoip::peer_ip(&req));
-    let secure = gateway_core::server::geoip::transport_is_secure(
+    let client_ip = gateway_features::server::geoip::client_ip(req.headers())
+        .or_else(|| gateway_features::server::geoip::peer_ip(&req));
+    let secure = gateway_features::server::geoip::transport_is_secure(
         req.headers(),
         &state.config.gateway.public_url,
     );
@@ -1223,7 +1223,7 @@ pub async fn chat_document_view(
         Err(err) => return sse_error_response(&err.to_string()),
     };
     let version = req.uri().query().and_then(parse_version_query);
-    let html = match gateway_core::server::document_canvas::render_canvas_html(
+    let html = match gateway_features::server::document_canvas::render_canvas_html(
         &state.db,
         &session_id,
         Some(&doc_id),
@@ -1324,9 +1324,9 @@ pub async fn chat_retry(
 ) -> Response {
     let (_session, user) = require_session!(state, req);
     let lang = Lang::from_headers(req.headers());
-    let client_ip = gateway_core::server::geoip::client_ip(req.headers())
-        .or_else(|| gateway_core::server::geoip::peer_ip(&req));
-    let secure = gateway_core::server::geoip::transport_is_secure(
+    let client_ip = gateway_features::server::geoip::client_ip(req.headers())
+        .or_else(|| gateway_features::server::geoip::peer_ip(&req));
+    let secure = gateway_features::server::geoip::transport_is_secure(
         req.headers(),
         &state.config.gateway.public_url,
     );
@@ -1374,9 +1374,9 @@ pub async fn chat_edit(
 ) -> Response {
     let (_session, user) = require_session!(state, req);
     let lang = Lang::from_headers(req.headers());
-    let client_ip = gateway_core::server::geoip::client_ip(req.headers())
-        .or_else(|| gateway_core::server::geoip::peer_ip(&req));
-    let secure = gateway_core::server::geoip::transport_is_secure(
+    let client_ip = gateway_features::server::geoip::client_ip(req.headers())
+        .or_else(|| gateway_features::server::geoip::peer_ip(&req));
+    let secure = gateway_features::server::geoip::transport_is_secure(
         req.headers(),
         &state.config.gateway.public_url,
     );
@@ -1575,7 +1575,7 @@ async fn spawn_assistant_worker(
     // uses the unfiltered per-user set. Everything but the two interactive
     // handles below is shared with the headless scheduler via
     // `build_tool_context`.
-    let tool_ctx = gateway_core::openai_driver::build_tool_context(
+    let tool_ctx = gateway_runtime::openai_driver::build_tool_context(
         state,
         user.id.clone(),
         user.roles.clone(),
@@ -1585,13 +1585,13 @@ async fn spawn_assistant_worker(
         // Chat path: hand the tool the live turn's broadcast + the
         // feedback hub so `get_user_location` can prompt the browser
         // for a precise position and wait for the reply.
-        Some(gateway_core::server::tools::ChatFeedback {
+        Some(gateway_runtime::server::tools::ChatFeedback {
             broadcast: worker.broadcast.clone(),
             hub: state.location_feedback.clone(),
             secure: req.secure,
         }),
     );
-    let driver = Box::new(gateway_core::openai_driver::OpenAiDriver {
+    let driver = Box::new(gateway_runtime::openai_driver::OpenAiDriver {
         state: state.clone(),
         tool_ctx,
         source: gateway_core::server::db::usage::UsageSource::Chat,
@@ -1645,7 +1645,7 @@ async fn notify_turn_complete(
     session_id: &str,
     assistant_turn_id: &str,
 ) {
-    use gateway_core::server::push::{PushMessage, SendOutcome};
+    use gateway_features::server::push::{PushMessage, SendOutcome};
     use session_core::db::TurnStatus;
 
     let Some(push) = state.push.clone() else {
@@ -2158,9 +2158,9 @@ pub async fn chat_export_pdf(
         base_url: &state.config.gateway.public_url,
     };
     let source = export::to_typst(&session, &turns, &opts);
-    match gateway_core::server::typst::compile_source(&source).await {
+    match gateway_features::server::typst::compile_source(&source).await {
         Ok(pdf) => download_response("application/pdf", &export_filename(&session, "pdf"), pdf),
-        Err(gateway_core::server::typst::CompileError::BinaryNotFound) => export_error(
+        Err(gateway_features::server::typst::CompileError::BinaryNotFound) => export_error(
             rama::http::StatusCode::SERVICE_UNAVAILABLE,
             &t(lang, "chat-error-pdf-export-unavailable"),
         ),

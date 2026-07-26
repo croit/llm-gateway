@@ -6,7 +6,7 @@
 //! Every browser-facing surface — the dashboard, `/chat`, `/tokens`, the
 //! `/admin/*` screens — plus the datastar SSE patch handlers that keep them
 //! live. Handlers take a
-//! [`gateway_core::RamaState`](gateway_core::rama_server::state::RamaState) and
+//! [`gateway_runtime::RamaState`](gateway_runtime::rama_server::state::RamaState) and
 //! return rama responses carrying plait-rendered HTML.
 //!
 //! This crate is a pure sink: nothing in `gateway-core` references it, and only

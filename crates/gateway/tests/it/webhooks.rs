@@ -19,7 +19,7 @@ use crate::common;
 
 use common::Service as _;
 use gateway_core::server::auth::token;
-use gateway_core::server::webhooks::{self, NewWebhook};
+use gateway_runtime::server::webhooks::{self, NewWebhook};
 use rama::http::{Body, Method, Request, StatusCode};
 use session_core::db as chat;
 

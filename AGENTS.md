@@ -21,7 +21,7 @@ Built on **rama 0.3** (HTTP server + router + middleware), **plait** (inline-in-
 ├── AGENTS.md                    # this file
 ├── README.md                    # human-facing — keep current with deploy story
 ├── mise.toml                    # toolchain pin + build/test/lint tasks
-├── Cargo.toml                   # workspace manifest (7 members)
+├── Cargo.toml                   # workspace manifest (9 members)
 ├── Dockerfile                   # gateway runtime image
 ├── docs/                        # detailed design docs (index in docs/README.md)
 ├── ui/                          # Tailwind v4 + daisyUI v5 → app.css; TS bundle for gateway
@@ -33,7 +33,9 @@ Built on **rama 0.3** (HTTP server + router + middleware), **plait** (inline-in-
     │   │                            tables), Plait renderers (markdown + lumis-highlighted
     │   │                            code), SSE primitives, icons
     │   └── ui/ts/                   composer + scroll TS
-    ├── gateway-core/            # the gateway's application body
+    ├── gateway-core/            # base: db, config, crypto, rbac, upstreams
+    ├── gateway-features/        # optional subsystems: rag, skills, comfyui, push, …
+    ├── gateway-runtime/         # tool API + AppState/RamaState + chat driver
     ├── gateway-tools/           # the tool implementations
     ├── gateway-web/             # the server-rendered HTML pages
     ├── gateway/                 # the binary: router, proxy, api, main
@@ -48,44 +50,77 @@ compilation unit, so editing any file re-ran the whole frontend + codegen. Each
 crate depends only on the ones beneath it.
 
 ```
-gateway            bin + router/proxy/api/oidc     ← thinnest, most-edited glue
-   ├── gateway-web     server-rendered HTML pages  ← pure sinks; nothing below
-   ├── gateway-tools   the tool implementations    ←   these two uses them
-   └── gateway-core    application body (server/, openai_driver, RamaState)
+gateway            bin + router/proxy/api/oidc      6.5k  ← thinnest, most-edited
+   ├── gateway-web     server-rendered HTML pages  25.5k  ← siblings: neither
+   └── gateway-tools   the tool implementations    14.5k  ←   depends on the other
+          └── gateway-runtime  tool API + AppState/RamaState + chat driver  14.7k
+                 ├── gateway-features  RAG, skills, ComfyUI, push, geoip, …  13.9k
+                 └── gateway-core      db, config, crypto, rbac, upstreams   22.1k
 ```
+
+Lines that must recompile after a one-line edit: `gateway` 6.5k, `gateway-tools`
+21k, `gateway-web` 32k, `gateway-runtime` 61k, `gateway-features` 75k,
+`gateway-core` 97k — against **97k for any edit** before the split. The gains are
+front-loaded on purpose: the layers that churn most are the cheapest to rebuild.
 
 `gateway-web` and `gateway-tools` are siblings: neither depends on the other, so
 editing a page doesn't rebuild the tools and vice versa.
+
+Two rules keep it that way, and both are easy to break by accident:
+1. **Put new code as high in the stack as it will go.** Something belongs in
+   `gateway-core` only if code below the feature layer genuinely needs it.
+2. **Never reference upward.** `gateway-features` must not name `AppState` or the
+   tool registry; `gateway-core` must not name a feature. One such reference
+   collapses a layer.
 
 **When adding code, put it as high in the stack as it will go.** Something only
 belongs in `gateway-core` if code below the page layer actually needs it. Adding a
 reference from `gateway-core` to a page — or pushing a module downward for
 convenience — makes every build slow again. See [`docs/architecture.md`](docs/architecture.md#crate-boundaries).
 
-Inside `crates/gateway-core/src/`:
+Inside `crates/gateway-core/src/` (base layer):
 
 ```
-openai_driver.rs          # SessionDriver impl: OpenAI streaming chat-completions
 migrations/               # (crate root) sqlx migration set, embedded by db/mod.rs
-server/                   # framework-neutral building blocks (no routing):
+server/
     auth/oidc.rs              hand-rolled OIDC client (reqwest)
     auth/token.rs             gateway-token mint/hash helpers
     config.rs                 [upstream_pools] + [[models]] + [oidc] schema
-    db/                       sqlx; tables for users/tokens/sessions/etc — chat_* tables
-                              moved to session-core, gateway just runs the migration
-    rbac/                     role → tool/model resolution
-    state.rs                  AppState
+    db/                       sqlx; users/tokens/sessions/prefs/usage — chat_* live
+                              in session-core, gateway just runs the migration
+    crypto.rs                 AES-256-GCM at-rest sealing
+    rbac/                     role → tool/model resolution; filters against the
+                              registries via the GrantableSet trait, so it can sit
+                              at the bottom while they live two layers up
+    upstreams/                pool registry, health probes, RAII Acquired guard
+    tool_naming.rs            well-known tool ids/prefixes + slug→title humaniser
+    usage/ limits/            metrics sink, rate-limit + quota enforcer
+rama_server/
+    session.rs                signed-cookie + sqlite session store; is_safe_return_to
+    cors.rs                   the CORS layer
+```
+
+Inside `crates/gateway-features/src/server/`: the optional subsystems — `rag/`,
+`skills.rs`, `comfyui/`, `push/`, `github/`, `geoip/`, `typst.rs`, `image_gen.rs`,
+`chat_attachments.rs`, `embeddings.rs`, `speech.rs`, `pdf.rs`, `ocr.rs`,
+`search_settings.rs`, `document_canvas.rs`. None of them may name `AppState` or the
+tool registry.
+
+Inside `crates/gateway-runtime/src/`:
+
+```
+openai_driver.rs          # SessionDriver impl: OpenAI streaming chat-completions
+loop_guard.rs
+server/
     tools/                    Tool trait, ToolContext, registry, catalog, runner,
                               MCP manager, sandbox client (impls: gateway-tools;
                               echo + time stay here as the test fixtures)
-    document_canvas.rs        chat canvas renderer (below both its callers)
-    upstreams/                pool registry, health probes, RAII Acquired guard
-    rag/ skills.rs comfyui/ push/ scheduled/ limits/ usage/ geoip/ webhooks.rs …
-rama_server/              # the shared rama handles both layers above need:
-    state.rs                  RamaState (wraps AppState + adds SessionStore)
-    session.rs                signed-cookie + sqlite session store; is_safe_return_to
+    state.rs                  AppState
+    comfyui_tool.rs           ComfyUI Tool/ToolSource impls + ComfyuiHandle
+    scheduled/ webhooks.rs compaction.rs headless.rs   state-dependent workers
+rama_server/
+    state.rs                  RamaState (wraps AppState + sessions/usage/limits)
     auth.rs                   require_bearer for /v1/*
-    cors.rs                   the CORS layer
 ```
 
 Inside `crates/gateway-tools/src/`: one module per tool family (`fetch_url`,

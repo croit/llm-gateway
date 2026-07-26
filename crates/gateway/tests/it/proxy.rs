@@ -812,12 +812,13 @@ async fn state_with_backend_api_key(
 
     use gateway::rama_server::{RamaState, SessionStore};
     use gateway_core::server::rbac::Resolver;
-    use gateway_core::server::tools::ToolRegistry;
     use gateway_core::server::upstreams::{
         self,
         config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
     };
-    use gateway_core::server::{AppState, Config, db};
+    use gateway_core::server::{Config, db};
+    use gateway_runtime::server::AppState;
+    use gateway_runtime::server::tools::ToolRegistry;
 
     const ENV_KEY: &str = "TEST_UPSTREAM_KEY";
     // SAFETY: integration tests run in the same process — this set
@@ -874,12 +875,13 @@ async fn state_with_alias_pool(upstream_url: &str) -> gateway::rama_server::Rama
 
     use gateway::rama_server::{RamaState, SessionStore};
     use gateway_core::server::rbac::Resolver;
-    use gateway_core::server::tools::ToolRegistry;
     use gateway_core::server::upstreams::{
         self,
         config::{AliasSpec, BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
     };
-    use gateway_core::server::{AppState, Config, db};
+    use gateway_core::server::{Config, db};
+    use gateway_runtime::server::AppState;
+    use gateway_runtime::server::tools::ToolRegistry;
 
     let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
     let mut pools = HashMap::new();

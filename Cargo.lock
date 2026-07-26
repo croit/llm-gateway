@@ -1851,6 +1851,8 @@ dependencies = [
  "anyhow",
  "earshot",
  "gateway-core",
+ "gateway-features",
+ "gateway-runtime",
  "gateway-tools",
  "gateway-web",
  "http-body-util",
@@ -1925,10 +1927,83 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-features"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "base64",
+ "gateway-core",
+ "hkdf",
+ "image",
+ "ip2location",
+ "jiff",
+ "notify",
+ "p256",
+ "pdf-extract",
+ "pdfium-render",
+ "rama",
+ "rand 0.9.4",
+ "reqwest 0.12.28",
+ "rust-s3",
+ "serde",
+ "serde_json",
+ "session-core",
+ "sha2 0.10.9",
+ "shared",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "url",
+ "usearch",
+ "uuid",
+ "wiremock",
+ "zip",
+]
+
+[[package]]
+name = "gateway-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "gateway-core",
+ "gateway-features",
+ "image",
+ "jiff",
+ "rama",
+ "rand 0.9.4",
+ "regex",
+ "reqwest 0.12.28",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "session-core",
+ "shared",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "toml 0.8.23",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+ "x509-parser 0.16.0",
+ "zip",
+]
+
+[[package]]
 name = "gateway-tools"
 version = "0.1.0"
 dependencies = [
  "gateway-core",
+ "gateway-features",
+ "gateway-runtime",
  "image",
  "jiff",
  "qrcode",
@@ -1955,6 +2030,8 @@ name = "gateway-web"
 version = "0.1.0"
 dependencies = [
  "gateway-core",
+ "gateway-features",
+ "gateway-runtime",
  "jiff",
  "multer",
  "plait",

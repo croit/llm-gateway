@@ -34,9 +34,9 @@ use session_core::chrome::{
 use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::rag as rag_db;
 use gateway_core::server::upstreams::PoolKind;
+use gateway_runtime::rama_server::state::RamaState;
 
 #[derive(Deserialize)]
 struct CreateForm {

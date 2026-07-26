@@ -32,11 +32,11 @@ use session_core::chrome::{
 use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::auth::token;
 use gateway_core::server::db::users::User;
 use gateway_core::server::db::{token_tool_prefs, tokens};
-use gateway_core::server::tools::catalog::ToolEntry;
+use gateway_runtime::rama_server::state::RamaState;
+use gateway_runtime::server::tools::catalog::ToolEntry;
 
 /// Where a per-token capability toggle posts + how its rows are
 /// namespaced (one list per token, so DOM ids can't collide).

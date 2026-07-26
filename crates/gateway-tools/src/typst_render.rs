@@ -7,7 +7,7 @@
 //!
 //! - [`TypstRenderTool`] (`typst_<id>`) — the manifest's declared
 //!   fields become its JSON schema; on invocation we hand the validated
-//!   key/value pairs to [`gateway_core::server::typst::compile`], then splice
+//!   key/value pairs to [`gateway_features::server::typst::compile`], then splice
 //!   the `.pdf` (deliverable) + a `.png` page-1 preview into the
 //!   assistant's `content`. The preview clicks through to the PDF. The
 //!   field values are also uploaded as a hidden `.json` (no chat chip)
@@ -34,13 +34,13 @@ use session_core::db as chat;
 use shared::api::ToolDef;
 use shared::sandbox::{InputFile, Language, RunRequest};
 
-use gateway_core::server::chat_attachments;
 use gateway_core::server::db::documents::{self, DocumentFormat};
-use gateway_core::server::tools::sandbox::{SandboxClient, b64};
-use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture, ToolResult};
-use gateway_core::server::typst::{
+use gateway_features::server::chat_attachments;
+use gateway_features::server::typst::{
     self, DefaultSource, DocxExport, FieldType, PptxExport, Template,
 };
+use gateway_runtime::server::tools::sandbox::{SandboxClient, b64};
+use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture, ToolResult};
 
 pub struct TypstRenderTool {
     template: Arc<Template>,
@@ -2118,7 +2118,7 @@ fn describe_value(v: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway_core::server::typst::Field;
+    use gateway_features::server::typst::Field;
     use std::path::PathBuf;
 
     fn stub_template() -> Template {

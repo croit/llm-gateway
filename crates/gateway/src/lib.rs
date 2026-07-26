@@ -10,7 +10,7 @@
 //!
 //! - [`gateway_core`] — the application body: config, DB, crypto, RBAC, the
 //!   upstream registry, the tool registry + tools, the feature subsystems, and
-//!   the shared [`gateway_core::RamaState`] handle.
+//!   the shared [`gateway_runtime::RamaState`] handle.
 //! - [`gateway_web`] — the server-rendered HTML pages and their datastar SSE
 //!   patch handlers.
 //!

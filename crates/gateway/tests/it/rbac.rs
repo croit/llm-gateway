@@ -35,7 +35,8 @@ use gateway_core::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
-use gateway_core::server::{AppState, Config, db};
+use gateway_core::server::{Config, db};
+use gateway_runtime::server::AppState;
 use rama::http::{Body, Method, Request, StatusCode};
 use serde_json::json;
 use wiremock::matchers::method;
@@ -206,7 +207,7 @@ async fn fixture(restrict_kind: PoolKind, groups: &[&str]) -> (Fixture, Principa
     common::seed_pool_models(&registry, "voice", 0, &[TX_MODEL]);
 
     let db_pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
-    let tools = Arc::new(gateway_core::server::tools::ToolRegistry::new());
+    let tools = Arc::new(gateway_runtime::server::tools::ToolRegistry::new());
     let app = AppState::new(
         Config::default(),
         db_pool.clone(),

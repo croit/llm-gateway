@@ -15,7 +15,7 @@ use crate::common;
 
 use common::Service as _;
 use gateway_core::server::db::{model_defaults as db_defaults, users};
-use gateway_core::server::search_settings;
+use gateway_features::server::search_settings;
 use jiff::Timestamp;
 use rama::http::{Body, Method, Request, StatusCode};
 

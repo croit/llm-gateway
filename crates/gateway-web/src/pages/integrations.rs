@@ -29,11 +29,11 @@ use super::{
     NavItem, fetch_sidebar_chat, forbidden_html, internal_error_html, is_admin, nav_or_html_page,
     read_form, require_session_or_redirect,
 };
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::auth::mcp_oauth::{self, Overrides};
 use gateway_core::server::db::mcp_catalog::{self, AuthKind, Connector};
 use gateway_core::server::db::user_mcp::{self, NewConnection, PendingOauth, ToolMode};
-use gateway_core::server::tools::mcp::manager::ToolInfo;
+use gateway_runtime::rama_server::state::RamaState;
+use gateway_runtime::server::tools::mcp::manager::ToolInfo;
 use session_core::chrome::{NavSections, Theme, is_datastar_request};
 use session_core::i18n::{self, Lang, t, t_args};
 

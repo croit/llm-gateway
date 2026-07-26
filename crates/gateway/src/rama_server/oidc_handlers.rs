@@ -21,8 +21,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use gateway_core::rama_server::session::{COOKIE_NAME, read_cookie};
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::users;
+use gateway_runtime::rama_server::state::RamaState;
 
 /// TTL for the in-flight `pending_logins` row. Generous because some
 /// IdPs (Authentik, Keycloak's account-linking flows) bounce the user

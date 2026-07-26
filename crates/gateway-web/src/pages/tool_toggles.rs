@@ -16,8 +16,8 @@ use std::collections::HashSet;
 
 use plait::{Html, ToHtml, html};
 
-use gateway_core::rama_server::state::RamaState;
-use gateway_core::server::tools::catalog::{self, Category, ToolEntry};
+use gateway_runtime::rama_server::state::RamaState;
+use gateway_runtime::server::tools::catalog::{self, Category, ToolEntry};
 
 /// What distinguishes one host page's toggle list from another's: the
 /// endpoint each row POSTs to and the prefix its `<div>` id carries (so

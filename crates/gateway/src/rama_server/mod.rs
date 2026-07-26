@@ -22,6 +22,7 @@ pub mod router;
 pub mod sandbox_api;
 pub mod vad;
 
-pub use gateway_core::rama_server::{RamaState, SessionStore, auth, cors, session, state};
+pub use gateway_core::rama_server::{SessionStore, cors, session};
+pub use gateway_runtime::rama_server::{RamaState, auth, state};
 pub use gateway_web::pages;
 pub use router::router;

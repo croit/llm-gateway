@@ -12,14 +12,14 @@
 //! trivial tools, so the tests that only need *a* registered tool stay put.)
 
 mod skill_overlay_tests {
-    use gateway_core::server::AppState;
     use gateway_core::server::config::Config;
     use gateway_core::server::db;
     use gateway_core::server::rbac::Resolver;
     use gateway_core::server::rbac::config::{RbacConfig, RoleConfig};
-    use gateway_core::server::skills::{Skill, SkillRegistry, SkillStore, UserSkillStore};
-    use gateway_core::server::tools::ToolRegistry;
     use gateway_core::server::upstreams::UpstreamRegistry;
+    use gateway_features::server::skills::{Skill, SkillRegistry, SkillStore, UserSkillStore};
+    use gateway_runtime::server::AppState;
+    use gateway_runtime::server::tools::ToolRegistry;
     use gateway_tools::enable_tools::EnableTools;
     use gateway_tools::read_skill::{READ_SKILL_ID, ReadSkill};
     use std::sync::Arc;
@@ -105,15 +105,15 @@ mod skill_overlay_tests {
 }
 
 mod token_gate_tests {
-    use gateway_core::server::AppState;
     use gateway_core::server::auth::UserCtx;
     use gateway_core::server::config::Config;
     use gateway_core::server::db::{self, token_tool_prefs};
     use gateway_core::server::rbac::Resolver;
     use gateway_core::server::rbac::config::{RbacConfig, RoleConfig};
-    use gateway_core::server::tools::ToolRegistry;
-    use gateway_core::server::tools::time::CurrentTimestamp;
     use gateway_core::server::upstreams::UpstreamRegistry;
+    use gateway_runtime::server::AppState;
+    use gateway_runtime::server::tools::ToolRegistry;
+    use gateway_runtime::server::tools::time::CurrentTimestamp;
     use gateway_tools::search_web::SearchWeb;
     use std::collections::HashMap;
     use std::path::Path;

@@ -5,7 +5,7 @@
 //!
 //! Each module holds `Tool` impls: the async functions the gateway exposes to
 //! the model through the OpenAI `tools` array. The machinery they plug into —
-//! the [`Tool`](gateway_core::server::tools::Tool) trait itself,
+//! the [`Tool`](gateway_runtime::server::tools::Tool) trait itself,
 //! `ToolContext`, the `ToolRegistry`, the round-loop `runner`, the `catalog`
 //! that groups ids into toggle keys, the MCP connection manager, and the
 //! sandbox client — stays in `gateway-core`, because `AppState` holds those or

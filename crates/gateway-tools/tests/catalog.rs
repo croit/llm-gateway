@@ -12,10 +12,10 @@
 //! trivial tools, so the tests that only need *a* registered tool stay put.)
 
 mod catalog_tests {
-    use gateway_core::server::tools::ToolRegistry;
-    use gateway_core::server::tools::catalog::*;
-    use gateway_core::server::tools::echo::Echo;
-    use gateway_core::server::tools::time::CurrentTimestamp;
+    use gateway_runtime::server::tools::ToolRegistry;
+    use gateway_runtime::server::tools::catalog::*;
+    use gateway_runtime::server::tools::echo::Echo;
+    use gateway_runtime::server::tools::time::CurrentTimestamp;
     use gateway_tools::search_web::SearchWeb;
     use std::collections::HashSet;
 

@@ -39,13 +39,13 @@ use session_core::chrome::{
 use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::model_defaults as db;
 use gateway_core::server::feature_defaults::{self, Feature};
 use gateway_core::server::model_defaults as merge;
 use gateway_core::server::reasoning::ReasoningStyle;
-use gateway_core::server::search_settings::{self, SearchProvider, SearchSettingsView};
 use gateway_core::server::upstreams::PoolKind;
+use gateway_features::server::search_settings::{self, SearchProvider, SearchSettingsView};
+use gateway_runtime::rama_server::state::RamaState;
 
 /// GET /admin/models — the default-models card + a single filterable list of
 /// every advertised model (chat, aliases, other kinds).

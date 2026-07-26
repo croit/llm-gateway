@@ -42,8 +42,8 @@ use session_core::i18n::{Lang, t};
 use session_core::icons;
 
 use gateway_core::rama_server::session::COOKIE_NAME;
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::{audit, users};
+use gateway_runtime::rama_server::state::RamaState;
 
 /// GET /admin/users — the roster + recent impersonation trail.
 pub async fn users_index(State(state): State<Arc<RamaState>>, req: Request) -> Response {

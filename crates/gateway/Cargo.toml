@@ -18,6 +18,8 @@ path = "src/main.rs"
 
 [dependencies]
 gateway-core = { path = "../gateway-core" }
+gateway-features = { path = "../gateway-features" }
+gateway-runtime = { path = "../gateway-runtime" }
 gateway-tools = { path = "../gateway-tools" }
 gateway-web = { path = "../gateway-web" }
 shared = { path = "../shared" }

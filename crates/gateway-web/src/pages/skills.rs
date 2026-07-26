@@ -6,7 +6,7 @@
 //! Skills are operator config discovered from `[skills] dir`, but unlike
 //! Typst templates they're managed live: an admin can **upload** a `.skill`
 //! archive and **delete** an installed skill, and the change takes effect
-//! immediately (the [`SkillStore`](gateway_core::server::skills::SkillStore) re-scans
+//! immediately (the [`SkillStore`](gateway_features::server::skills::SkillStore) re-scans
 //! and atomically swaps the registry — no gateway restart).
 //!
 //! It's a master-detail viewer: a left rail lists the loaded skills with the
@@ -68,9 +68,9 @@ pub async fn skills_download(State(state): State<Arc<RamaState>>, req: Request) 
     }
 }
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::skill_grants;
 use gateway_core::server::db::users::User;
+use gateway_runtime::rama_server::state::RamaState;
 
 /// One loaded skill, flattened for rendering.
 struct SkillView {

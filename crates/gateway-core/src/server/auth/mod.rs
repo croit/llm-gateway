@@ -5,7 +5,7 @@
 //! (framework-neutral) and gateway token minting/hashing helpers.
 //!
 //! Session cookies + bearer middleware are framework-specific and live in
-//! `crate::rama_server::session` + `crate::rama_server::auth`.
+//! `crate::rama_server::session` + `gateway_runtime::rama_server::auth`.
 
 pub mod mcp_oauth;
 pub mod oidc;

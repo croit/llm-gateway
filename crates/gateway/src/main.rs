@@ -16,7 +16,10 @@ use anyhow::Context as _;
 use rama::net::address::SocketAddress;
 
 use gateway::rama_server::SessionStore;
-use gateway_core::server::{self as srv, AppState, Config};
+use gateway_core::server::{self as srv, Config};
+use gateway_features::server as feat;
+use gateway_runtime::AppState;
+use gateway_runtime::server as rt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -87,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     // took, and which it ignored because the DB already had a value). Non-fatal:
     // a failure here leaves search unconfigured, which the tool reports
     // cleanly — it must not stop the gateway from booting.
-    match srv::search_settings::import_env_once(&db, &crypto).await {
+    match feat::search_settings::import_env_once(&db, &crypto).await {
         Ok(vars) if !vars.is_empty() => tracing::info!(
             imported = ?vars,
             "migrated web-search settings from the environment into the database; \
@@ -166,18 +169,18 @@ async fn main() -> anyhow::Result<()> {
     // the sandbox tools, the typst PPTX/DOCX-export path, AND fetch_attachment's
     // Office-file extractor. `None` leaves typst rendering PDF + preview only
     // and Office uploads unreadable (binary stub).
-    let sandbox_client: Option<Arc<srv::tools::sandbox::SandboxClient>> =
+    let sandbox_client: Option<Arc<rt::tools::sandbox::SandboxClient>> =
         match config.sandbox.as_ref() {
-            Some(c) if c.enabled => Some(srv::tools::sandbox::SandboxClient::new(
+            Some(c) if c.enabled => Some(rt::tools::sandbox::SandboxClient::new(
                 Arc::new(c.clone()),
                 config.gateway.public_url.clone(),
             )),
             _ => None,
         };
 
-    let mut tool_registry = srv::tools::ToolRegistry::new()
-        .with(srv::tools::echo::Echo)
-        .with(srv::tools::time::CurrentTimestamp)
+    let mut tool_registry = rt::tools::ToolRegistry::new()
+        .with(rt::tools::echo::Echo)
+        .with(rt::tools::time::CurrentTimestamp)
         .with(gateway_tools::fetch_url::FetchUrl)
         // Fetch an image from a URL and keep it as a reusable attachment
         // (so it can be embedded in a later typst render). Always on — the
@@ -265,13 +268,13 @@ async fn main() -> anyhow::Result<()> {
     // Display metadata for the discovered templates, for the per-template
     // toggle rows in the tool menu / `/tools` page (the human title isn't in
     // the tool schema). Stays empty when `[typst]` isn't configured.
-    let mut typst_metas: Vec<srv::tools::catalog::TemplateMeta> = Vec::new();
+    let mut typst_metas: Vec<rt::tools::catalog::TemplateMeta> = Vec::new();
     if let Some(typst_cfg) = config.typst.as_ref() {
         // Discover one tool per template directory. Failures here
         // are warnings, not errors: a broken templates_dir
         // shouldn't keep the gateway from booting. The static tool
         // surface above is still available.
-        match srv::typst::discover_templates(&typst_cfg.templates_dir) {
+        match feat::typst::discover_templates(&typst_cfg.templates_dir) {
             Ok(templates) => {
                 tracing::info!(
                     dir = %typst_cfg.templates_dir.display(),
@@ -289,7 +292,7 @@ async fn main() -> anyhow::Result<()> {
                     let pptx = t.pptx.is_some();
                     // The render id is the per-template toggle key (see
                     // `catalog::entry_key_for`); snapshot the display copy.
-                    typst_metas.push(srv::tools::catalog::TemplateMeta {
+                    typst_metas.push(rt::tools::catalog::TemplateMeta {
                         key: render_id.clone(),
                         title: t.title.clone(),
                         description: t.description.clone(),
@@ -327,7 +330,7 @@ async fn main() -> anyhow::Result<()> {
     }
     // MCP servers are no longer registered at boot: they live in the
     // admin-managed connector catalog (`/admin/connectors`) and are connected
-    // lazily per request by `srv::tools::mcp::manager` — global connectors as a
+    // lazily per request by `rt::tools::mcp::manager` — global connectors as a
     // shared connection, per-user connectors with the user's own credential.
     // Code-execution sandbox. Registered only when `[sandbox]` points at a
     // reachable sandbox-runner; the three tools share one HTTP client.
@@ -338,15 +341,15 @@ async fn main() -> anyhow::Result<()> {
                 .clone()
                 .expect("sandbox_client is built when [sandbox] is enabled");
             tool_registry = tool_registry
-                .with(srv::tools::sandbox::RunInSandbox(client.clone()))
-                .with(srv::tools::sandbox::GenerateDocument(client.clone()))
-                .with(srv::tools::sandbox::ExportDocument(client.clone()))
-                .with(srv::tools::sandbox::CaptureWebpage(client.clone()))
-                .with(srv::tools::sandbox::ConvertDocument(client.clone()))
-                .with(srv::tools::sandbox::EditPresentation(client.clone()))
-                .with(srv::tools::sandbox::RenderExcalidraw(client.clone()))
-                .with(srv::tools::sandbox::RenderTypst(client))
-                .with(srv::tools::sandbox::ReadSandboxOutput);
+                .with(rt::tools::sandbox::RunInSandbox(client.clone()))
+                .with(rt::tools::sandbox::GenerateDocument(client.clone()))
+                .with(rt::tools::sandbox::ExportDocument(client.clone()))
+                .with(rt::tools::sandbox::CaptureWebpage(client.clone()))
+                .with(rt::tools::sandbox::ConvertDocument(client.clone()))
+                .with(rt::tools::sandbox::EditPresentation(client.clone()))
+                .with(rt::tools::sandbox::RenderExcalidraw(client.clone()))
+                .with(rt::tools::sandbox::RenderTypst(client))
+                .with(rt::tools::sandbox::ReadSandboxOutput);
             tracing::info!(runner = %sandbox_cfg.runner_url, "registered sandbox tools");
         }
         Some(_) => tracing::info!("[sandbox] enabled = false — sandbox tools not registered"),
@@ -363,9 +366,9 @@ async fn main() -> anyhow::Result<()> {
     // from config — same source the rest of the registry sees. Build it now
     // from `[comfyui]`, before wiring the ComfyuiHandle onto AppState further
     // down.
-    let comfyui_store: Option<std::sync::Arc<srv::comfyui::ComfyuiStore>> =
+    let comfyui_store: Option<std::sync::Arc<feat::comfyui::ComfyuiStore>> =
         if let Some(comfyui_cfg) = config.comfyui.clone().filter(|c| c.enabled) {
-            let store = std::sync::Arc::new(srv::comfyui::ComfyuiStore::load(
+            let store = std::sync::Arc::new(feat::comfyui::ComfyuiStore::load(
                 comfyui_cfg.content_dir.clone(),
             ));
             tracing::info!(
@@ -392,7 +395,7 @@ async fn main() -> anyhow::Result<()> {
     // works without a restart; skill-less deployments (no `[skills]` block)
     // keep the exact same tool surface.
     let skill_store = config.skills.as_ref().map(|skills_cfg| {
-        let store = srv::skills::SkillStore::load(skills_cfg.dir.clone());
+        let store = feat::skills::SkillStore::load(skills_cfg.dir.clone());
         tracing::info!(
             dir = %skills_cfg.dir.display(),
             count = store.current().len(),
@@ -417,7 +420,7 @@ async fn main() -> anyhow::Result<()> {
                 "could not create private-skills directory — /skills will be hidden until it's accessible"
             );
         }
-        Arc::new(srv::skills::UserSkillStore::new(users_dir))
+        Arc::new(feat::skills::UserSkillStore::new(users_dir))
     });
     if let (Some(store), Some(user_store)) = (skill_store.as_ref(), user_skill_store.as_ref()) {
         tool_registry = tool_registry.with(gateway_tools::read_skill::ReadSkill::new(
@@ -465,7 +468,7 @@ async fn main() -> anyhow::Result<()> {
     // into the static `ToolRegistry`, so new workflows discovered via
     // reload don't need the registry to rebuild.
     if let Some(comfyui_cfg) = state.config.comfyui.clone().filter(|c| c.enabled) {
-        match srv::comfyui::Client::new(comfyui_cfg.base_url.clone()) {
+        match feat::comfyui::Client::new(comfyui_cfg.base_url.clone()) {
             Ok(client) => {
                 // The store was already built above — reuse the same
                 // Arc so live reloads stay visible to enable_tools.
@@ -479,8 +482,8 @@ async fn main() -> anyhow::Result<()> {
                 // only when `[chat.s3]` is unconfigured, in which case
                 // workflows with attachment-kind params fail cleanly.
                 let s3 = state.config.chat.s3.clone().map(std::sync::Arc::new);
-                let chat_updates = srv::comfyui::ChatUpdateRegistry::default();
-                let handle = std::sync::Arc::new(srv::comfyui::ComfyuiHandle {
+                let chat_updates = feat::comfyui::ChatUpdateRegistry::default();
+                let handle = std::sync::Arc::new(rt::comfyui_tool::ComfyuiHandle {
                     store: store.clone(),
                     client: client.clone(),
                     runner_poll_interval: std::time::Duration::from_millis(
@@ -505,7 +508,7 @@ async fn main() -> anyhow::Result<()> {
                 // assets from ComfyUI, re-hosts them in S3, and appends
                 // the attachment marker to the owning turn. Boot-tolerant:
                 // pending jobs survive in the DB across restarts.
-                let scheduler = srv::comfyui::ComfyuiScheduler::new(
+                let scheduler = feat::comfyui::ComfyuiScheduler::new(
                     state.db.clone(),
                     client.clone(),
                     state.config.chat.s3.clone().map(std::sync::Arc::new),
@@ -539,7 +542,7 @@ async fn main() -> anyhow::Result<()> {
     // wire the sender in. Disabled via `[push] enabled = false`; a keypair
     // failure logs and leaves push off rather than blocking boot.
     if state.config.push.enabled {
-        match srv::push::PushSender::new(
+        match feat::push::PushSender::new(
             &state.db,
             &state.crypto,
             state.config.push.contact.clone(),
@@ -561,9 +564,9 @@ async fn main() -> anyhow::Result<()> {
     // a file appears, and the (token-gated) weekly updater is a no-op
     // without a token. So this never blocks boot or fails the gateway.
     if let Some(geoip_cfg) = state.config.geoip.clone() {
-        let geo = srv::geoip::GeoIp::new(geoip_cfg.db_path.clone());
+        let geo = feat::geoip::GeoIp::new(geoip_cfg.db_path.clone());
         geo.watch();
-        srv::geoip::update::spawn(geoip_cfg.db_path.clone(), geoip_cfg.update_token());
+        feat::geoip::update::spawn(geoip_cfg.db_path.clone(), geoip_cfg.update_token());
         state = state.with_geoip(geo);
     }
 
@@ -577,12 +580,12 @@ async fn main() -> anyhow::Result<()> {
     // so the default `data/rag` works for local dev only — operators
     // point this at a subdirectory of the named volume.
     let rag_config = state.config.rag.clone().unwrap_or_default();
-    let indexer_config = srv::rag::worker::IndexerConfig {
+    let indexer_config = feat::rag::worker::IndexerConfig {
         data_dir: rag_config.data_dir,
         clone_concurrency: rag_config.clone_concurrency,
-        ..srv::rag::worker::IndexerConfig::default()
+        ..feat::rag::worker::IndexerConfig::default()
     };
-    let indexer = srv::rag::worker::Indexer::new(
+    let indexer = feat::rag::worker::Indexer::new(
         state.db.clone(),
         state.upstreams.clone(),
         state.http.clone(),
@@ -591,7 +594,7 @@ async fn main() -> anyhow::Result<()> {
     // Re-queue any ref left mid-build by a previous crash/restart and reap
     // orphaned build folders before the loop starts handling new work.
     indexer.recover_on_startup().await;
-    srv::rag::worker::spawn(indexer.clone());
+    feat::rag::worker::spawn(indexer.clone());
     state = state.with_indexer(indexer);
 
     // Usage metrics: a batched background writer + retention-prune task,
@@ -608,12 +611,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Scheduled actions: start the background loop that fires due actions
     // (the `scheduled_actions` table is created by migration 0021).
-    srv::scheduled::worker::spawn(state.clone());
+    rt::scheduled::worker::spawn(state.clone());
 
     // Per-user MCP connections: proactively refresh OAuth tokens before they
     // expire (and exercise idle refresh tokens) so connectors stay alive
     // without the user re-authenticating; also sweeps stale pending auths.
-    srv::tools::mcp::worker::spawn(state.clone());
+    rt::tools::mcp::worker::spawn(state.clone());
 
     let ip: std::net::IpAddr = std::env::var("IP")
         .ok()

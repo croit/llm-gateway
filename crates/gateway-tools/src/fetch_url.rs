@@ -26,8 +26,8 @@ use serde_json::{Value, json};
 use shared::api::ToolDef;
 
 use crate::html_text;
-use gateway_core::server::chat_attachments::{self, BinaryDisposition, PayloadLimits};
-use gateway_core::server::tools::{
+use gateway_features::server::chat_attachments::{self, BinaryDisposition, PayloadLimits};
+use gateway_runtime::server::tools::{
     Tool, ToolContext, ToolError, ToolFuture, tool_content_parts, truncate_on_char_boundary,
 };
 
@@ -486,7 +486,7 @@ mod tests {
         // splices the parts into the upstream `role:"tool"` message
         // as an array — what gets bridged to the LLM as an actual
         // image, not a garbage UTF-8 string.
-        let parts = gateway_core::server::tools::extract_content_parts(&out)
+        let parts = gateway_runtime::server::tools::extract_content_parts(&out)
             .expect("image branch must emit content-parts envelope");
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[1]["type"], "image_url");
@@ -551,7 +551,7 @@ mod tests {
         // Not a content-parts envelope — the image branch refused
         // to inline a 25 MB+ PNG and gave the model a metadata
         // record with a precise `kind`.
-        assert!(gateway_core::server::tools::extract_content_parts(&out).is_none());
+        assert!(gateway_runtime::server::tools::extract_content_parts(&out).is_none());
         assert_eq!(out["kind"], "image-too-large");
         assert_eq!(out["content_type"], "image/png");
         assert!(

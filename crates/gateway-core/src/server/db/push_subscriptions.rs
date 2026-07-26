@@ -8,7 +8,7 @@
 //! keys (`p256dh`, `auth`) needed to encrypt a payload for it. All three are
 //! stored verbatim: they authorize sending TO a browser, not acting AS the
 //! user, so they aren't gateway secrets. The send path
-//! ([`crate::server::push`]) reads a user's rows when a turn finalizes and
+//! (`gateway_features::push`) reads a user's rows when a turn finalizes and
 //! prunes any the push service reports gone.
 //!
 //! Schema lives in `migrations/0048_push_subscriptions.sql`.

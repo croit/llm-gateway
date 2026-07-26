@@ -27,9 +27,9 @@ use serde_json::{Value, json};
 use session_core::db as chat;
 use shared::api::ToolDef;
 
-use gateway_core::server::chat_attachments;
-use gateway_core::server::tools::sandbox::b64;
-use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
+use gateway_features::server::chat_attachments;
+use gateway_runtime::server::tools::sandbox::b64;
+use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Byte-mode capacity of the largest QR code (version 40) at EC level L.
 /// Anything longer can never encode; reject it with a clear message

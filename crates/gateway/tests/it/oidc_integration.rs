@@ -26,13 +26,14 @@ use common::Service as _;
 use gateway::rama_server::{RamaState, SessionStore, router::router};
 use gateway_core::server::auth::oidc::OidcClient;
 use gateway_core::server::config::{Config, OidcConfig};
+use gateway_core::server::db;
 use gateway_core::server::rbac::Resolver;
-use gateway_core::server::tools::ToolRegistry;
 use gateway_core::server::upstreams::{
     self,
     config::{PoolKind, UpstreamPoolConfig},
 };
-use gateway_core::server::{AppState, db};
+use gateway_runtime::server::AppState;
+use gateway_runtime::server::tools::ToolRegistry;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use rama::http::{Body, Method, Request, StatusCode};
 use rsa::pkcs1::EncodeRsaPrivateKey;

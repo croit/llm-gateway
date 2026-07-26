@@ -8,7 +8,6 @@ use thiserror::Error;
 
 use super::config::{RbacConfig, RoleConfig};
 use crate::server::db::gateway_groups::GroupSnapshot;
-use crate::server::tools::ToolRegistry;
 
 /// Synthetic group that `[gateway].bootstrap_admin_groups` resolve to. It is
 /// injected on every build/reload so a break-glass admin works regardless of
@@ -65,6 +64,32 @@ pub enum ResolveError {
     UnknownRoleInMapping(String),
     #[error("default_role `{0}` is not a defined role")]
     UnknownDefaultRole(String),
+}
+
+/// The registry surface RBAC needs in order to resolve a grant: enumerate every
+/// registered id (for a `*` grant) and check membership (for an explicit one).
+///
+/// A trait so the resolver can sit *below* the registries it filters against —
+/// `ToolRegistry` lives in `gateway-runtime` and `SkillRegistry` in
+/// `gateway-features`, both above this crate. It's used through generics, not
+/// `dyn`, so there's no vtable on the request path.
+pub trait GrantableSet {
+    /// Every registered id, in any order.
+    fn ids(&self) -> impl Iterator<Item = &str>;
+    /// Whether `id` is registered.
+    fn has(&self, id: &str) -> bool;
+}
+
+/// So call sites can pass the `Arc`-shared registries straight from `AppState`
+/// without dereferencing at every call.
+impl<T: GrantableSet + ?Sized> GrantableSet for std::sync::Arc<T> {
+    fn ids(&self) -> impl Iterator<Item = &str> {
+        (**self).ids()
+    }
+
+    fn has(&self, id: &str) -> bool {
+        (**self).has(id)
+    }
 }
 
 impl Resolver {
@@ -241,7 +266,7 @@ impl Resolver {
 
     /// Union of tool ids granted by any of the user's groups, filtered to
     /// registered tools. `*` expands to every registered tool.
-    pub fn allowed_tools(&self, role_ids: &[String], registry: &ToolRegistry) -> Vec<String> {
+    pub fn allowed_tools(&self, role_ids: &[String], registry: &impl GrantableSet) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let Ok(snap) = self.inner.read() else {
             return out;
@@ -257,7 +282,7 @@ impl Resolver {
                             out.push(id.to_string());
                         }
                     }
-                } else if registry.contains(tool) && !out.iter().any(|s| s == tool) {
+                } else if registry.has(tool) && !out.iter().any(|s| s == tool) {
                     out.push(tool.clone());
                 }
             }
@@ -284,7 +309,7 @@ impl Resolver {
             for tool in &group.tools {
                 if tool == "*" {
                     wildcard = true;
-                } else if tool.starts_with(crate::server::tools::catalog::COMFYUI_PREFIX)
+                } else if tool.starts_with(crate::server::tool_naming::COMFYUI_PREFIX)
                     && !specific.contains(tool)
                 {
                     specific.push(tool.clone());
@@ -312,11 +337,7 @@ impl Resolver {
     /// Union of skill names granted by any of the user's groups, filtered to
     /// loaded skills. `*` expands to every loaded skill. Sources both the config
     /// build path's per-group `skills` and the DB `skill_role_grants` overlay.
-    pub fn allowed_skills(
-        &self,
-        role_ids: &[String],
-        registry: &crate::server::skills::SkillRegistry,
-    ) -> Vec<String> {
+    pub fn allowed_skills(&self, role_ids: &[String], registry: &impl GrantableSet) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         if let Ok(snap) = self.inner.read() {
             for role_id in role_ids {
@@ -325,12 +346,12 @@ impl Resolver {
                 };
                 for skill in &group.skills {
                     if skill == "*" {
-                        for name in registry.names() {
+                        for name in registry.ids() {
                             if !out.iter().any(|s| s == name) {
                                 out.push(name.to_string());
                             }
                         }
-                    } else if registry.get(skill).is_some() && !out.iter().any(|s| s == skill) {
+                    } else if registry.has(skill) && !out.iter().any(|s| s == skill) {
                         out.push(skill.clone());
                     }
                 }
@@ -347,12 +368,12 @@ impl Resolver {
                     continue;
                 }
                 if skill == "*" {
-                    for name in registry.names() {
+                    for name in registry.ids() {
                         if !out.iter().any(|s| s == name) {
                             out.push(name.to_string());
                         }
                     }
-                } else if registry.get(skill).is_some() && !out.iter().any(|s| s == skill) {
+                } else if registry.has(skill) && !out.iter().any(|s| s == skill) {
                     out.push(skill.clone());
                 }
             }
@@ -431,7 +452,32 @@ fn apply_bootstrap(snapshot: &mut Snapshot, bootstrap: &[String]) {
 mod tests {
     use super::super::config::{RbacConfig, RoleConfig, RoleMapping};
     use super::*;
-    use crate::server::tools::{ToolRegistry, echo::Echo, time::CurrentTimestamp};
+
+    /// A bare set of registered ids. The resolver's contract is
+    /// "grant × registered ids → allowed", so the registries themselves are
+    /// irrelevant here — and they now live in crates *above* this one
+    /// (`ToolRegistry` in `gateway-runtime`, `SkillRegistry` in
+    /// `gateway-features`), which a unit test in this crate can't reach:
+    /// a `cfg(test)` build is a separate crate instance whose types wouldn't
+    /// unify with theirs. Testing against [`GrantableSet`] directly is both the
+    /// only option and the more focused one.
+    struct Registered(Vec<String>);
+
+    impl Registered {
+        fn of(ids: &[&str]) -> Self {
+            Self(ids.iter().map(|s| (*s).to_string()).collect())
+        }
+    }
+
+    impl GrantableSet for Registered {
+        fn ids(&self) -> impl Iterator<Item = &str> {
+            self.0.iter().map(String::as_str)
+        }
+
+        fn has(&self, id: &str) -> bool {
+            self.0.iter().any(|i| i == id)
+        }
+    }
 
     fn role(id: &str, tools: &[&str]) -> RoleConfig {
         RoleConfig {
@@ -463,14 +509,8 @@ mod tests {
         }
     }
 
-    fn skill_registry(names: &[&str]) -> crate::server::skills::SkillRegistry {
-        use crate::server::skills::Skill;
-        crate::server::skills::SkillRegistry::new(names.iter().map(|n| Skill {
-            name: (*n).to_string(),
-            title: (*n).to_string(),
-            description: "d".into(),
-            root: std::path::PathBuf::from("/nonexistent").join(n),
-        }))
+    fn skill_registry(names: &[&str]) -> Registered {
+        Registered::of(names)
     }
 
     fn mapping(claim: &str, value: &str, role: &str) -> RoleMapping {
@@ -616,7 +656,7 @@ mod tests {
 
     #[test]
     fn allowed_tools_unions_across_roles() {
-        let reg = ToolRegistry::new().with(Echo).with(CurrentTimestamp);
+        let reg = Registered::of(&["company_echo", "get_current_timestamp"]);
         let r = Resolver::build(
             RbacConfig::default(),
             vec![
@@ -633,7 +673,7 @@ mod tests {
 
     #[test]
     fn allowed_tools_wildcard_expands_to_all_registered() {
-        let reg = ToolRegistry::new().with(Echo).with(CurrentTimestamp);
+        let reg = Registered::of(&["company_echo", "get_current_timestamp"]);
         let r = Resolver::build(RbacConfig::default(), vec![role("admin", &["*"])]).unwrap();
         let tools = r.allowed_tools(&["admin".into()], &reg);
         assert_eq!(tools.len(), 2);
@@ -641,7 +681,7 @@ mod tests {
 
     #[test]
     fn allowed_tools_skips_unregistered_ids_silently() {
-        let reg = ToolRegistry::new().with(Echo);
+        let reg = Registered::of(&["company_echo"]);
         let r = Resolver::build(
             RbacConfig::default(),
             vec![role("user", &["company_echo", "company.does.not.exist"])],
@@ -653,7 +693,7 @@ mod tests {
 
     #[test]
     fn allowed_tools_ignores_unknown_role_ids() {
-        let reg = ToolRegistry::new().with(Echo);
+        let reg = Registered::of(&["company_echo"]);
         let r =
             Resolver::build(RbacConfig::default(), vec![role("user", &["company_echo"])]).unwrap();
         assert!(r.allowed_tools(&["nobody".into()], &reg).is_empty());
@@ -760,7 +800,7 @@ mod tests {
             r.role_ids_for(&["g-dev".into()]),
             vec!["developers".to_string()]
         );
-        let reg = ToolRegistry::new().with(crate::server::tools::echo::Echo);
+        let reg = Registered::of(&["company_echo"]);
         assert_eq!(
             r.allowed_tools(&["developers".into()], &reg),
             vec!["company_echo".to_string()]

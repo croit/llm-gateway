@@ -42,10 +42,10 @@ use session_core::chrome::{NavSections, Theme, is_datastar_request};
 use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
-use gateway_core::rama_server::state::RamaState;
 use gateway_core::server::db::upstreams_config::{self, BackendRow, PoolRow};
 use gateway_core::server::db::usage;
 use gateway_core::server::upstreams::AliasStatus;
+use gateway_runtime::rama_server::state::RamaState;
 
 /// Sparkline window: `BUCKETS` buckets of `BUCKET_MINUTES` each = the last hour
 /// in 5-minute steps (same as the old `/admin/backends` view).

@@ -30,7 +30,7 @@ use shared::api::ToolDef;
 use crate::json_patch;
 use crate::text_edit::{self, Edit};
 use gateway_core::server::db::documents::{self, DocumentFormat, EditKind};
-use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
+use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Largest document we accept (in bytes of content). Generous for a
 /// long-form guide; guards against a single runaway tool call.
@@ -76,7 +76,7 @@ async fn live_update(ctx: &ToolContext, session_id: &str, active_id: &str) {
     // same as `internal_error_html`/`forbidden_html` do for request-less
     // render paths. The panel picks up the viewer's real language on the
     // next full page load or nav-patch, both of which do derive it.
-    let html = match gateway_core::server::document_canvas::render_canvas_html(
+    let html = match gateway_features::server::document_canvas::render_canvas_html(
         &ctx.db,
         session_id,
         Some(active_id),
@@ -1187,7 +1187,7 @@ mod tests {
         let pool = seeded_pool().await;
         // No documents yet → no panel.
         assert!(
-            gateway_core::server::document_canvas::render_canvas_html(
+            gateway_features::server::document_canvas::render_canvas_html(
                 &pool,
                 "s1",
                 None,
@@ -1213,7 +1213,7 @@ mod tests {
         .await
         .unwrap();
 
-        let html = gateway_core::server::document_canvas::render_canvas_html(
+        let html = gateway_features::server::document_canvas::render_canvas_html(
             &pool,
             "s1",
             None,
@@ -1428,7 +1428,7 @@ mod tests {
             .await
             .unwrap();
 
-        let html = gateway_core::server::document_canvas::render_canvas_html(
+        let html = gateway_features::server::document_canvas::render_canvas_html(
             &pool,
             "s1",
             None,

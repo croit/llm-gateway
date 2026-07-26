@@ -8,7 +8,7 @@
 //! Run manually:
 //!   cargo test --package gateway --test comfyui_integration -- --nocapture --ignored
 
-use gateway_core::server::comfyui::{Client, Runner};
+use gateway_features::server::comfyui::{Client, Runner};
 use serde_json::json;
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ async fn text_to_image_against_real_comfyui() {
     // Manually load the manifest (the store's `load` does this, but
     // for a single-workflow test we can call it directly).
     let manifest =
-        gateway_core::server::comfyui::manifest::load(&content_dir).expect("manifest loads");
+        gateway_features::server::comfyui::manifest::load(&content_dir).expect("manifest loads");
 
     // Run the workflow with a simple prompt.
     let args = json!({

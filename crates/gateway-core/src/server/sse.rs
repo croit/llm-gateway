@@ -4,7 +4,7 @@
 //! Shared decoding for OpenAI-compatible Server-Sent Events (SSE) streams.
 //!
 //! Three call sites consume an upstream chat-completion SSE stream: the
-//! chat-UI driver ([`crate::openai_driver`]'s `run_one_turn`), the `/v1`
+//! chat-UI driver (`gateway_runtime::openai_driver`'s `run_one_turn`), the `/v1`
 //! byte-faithful relay (`rama_server::proxy::forward_streaming`), and the
 //! `/v1` streaming tool loop (`…::drive_streaming_tool_loop_inner`). They
 //! differ in *policy* — persist to the turn, relay verbatim, or

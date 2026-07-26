@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
+use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 // Wikipedia's API policy asks for a descriptive User-Agent.
