@@ -178,49 +178,49 @@ async fn main() -> anyhow::Result<()> {
     let mut tool_registry = srv::tools::ToolRegistry::new()
         .with(srv::tools::echo::Echo)
         .with(srv::tools::time::CurrentTimestamp)
-        .with(srv::tools::fetch_url::FetchUrl)
+        .with(gateway_tools::fetch_url::FetchUrl)
         // Fetch an image from a URL and keep it as a reusable attachment
         // (so it can be embedded in a later typst render). Always on — the
         // runtime guard errors cleanly off the chat path / without [chat.s3].
-        .with(srv::tools::load_image_url::LoadImageUrl)
-        .with(srv::tools::fetch_attachment::FetchAttachment::new(
+        .with(gateway_tools::load_image_url::LoadImageUrl)
+        .with(gateway_tools::fetch_attachment::FetchAttachment::new(
             sandbox_client.clone(),
         ))
-        .with(srv::tools::upload_attachment::UploadAttachment)
+        .with(gateway_tools::upload_attachment::UploadAttachment)
         // Inventory of the conversation's files (uploads + tool outputs), so
         // the model reuses existing assets instead of regenerating them.
         // Reads only the session's turn markers — no storage config needed.
-        .with(srv::tools::list_attachments::ListAttachments)
-        .with(srv::tools::search_web::SearchWeb)
-        .with(srv::tools::location::GetUserLocation)
-        .with(srv::tools::memory::Remember)
-        .with(srv::tools::memory::Recall)
+        .with(gateway_tools::list_attachments::ListAttachments)
+        .with(gateway_tools::search_web::SearchWeb)
+        .with(gateway_tools::location::GetUserLocation)
+        .with(gateway_tools::memory::Remember)
+        .with(gateway_tools::memory::Recall)
         // Read-only public-data lookups — no secrets, no writes, safe to
         // leave always-on.
-        .with(srv::tools::netcheck::DnsLookup)
-        .with(srv::tools::netcheck::WhoisLookup)
-        .with(srv::tools::netcheck::TlsCert)
-        .with(srv::tools::wikipedia::Wikipedia)
-        .with(srv::tools::currency::ConvertCurrency)
+        .with(gateway_tools::netcheck::DnsLookup)
+        .with(gateway_tools::netcheck::WhoisLookup)
+        .with(gateway_tools::netcheck::TlsCert)
+        .with(gateway_tools::wikipedia::Wikipedia)
+        .with(gateway_tools::currency::ConvertCurrency)
         // RAG. These tools are no-ops without the indexer wired into
         // AppState; registering them unconditionally keeps RBAC config
         // stable across deployments where `[rag]` is only sometimes set.
-        .with(srv::tools::rag::RagListCollections::new(rbac.clone()))
-        .with(srv::tools::rag::RagSearch::new(rbac.clone()))
+        .with(gateway_tools::rag::RagListCollections::new(rbac.clone()))
+        .with(gateway_tools::rag::RagSearch::new(rbac.clone()))
         // Document canvas — build up and incrementally edit long documents
         // across turns. Content lives in the `documents` store, not S3, so
         // these need no extra config; off the chat path they error cleanly.
-        .with(srv::tools::document::CreateDocument)
-        .with(srv::tools::document::EditDocument)
-        .with(srv::tools::document::ReadDocument)
-        .with(srv::tools::document::ListDocuments)
-        .with(srv::tools::document::EditDocumentSection)
-        .with(srv::tools::document::ListDocumentVersions)
-        .with(srv::tools::document::RestoreDocumentVersion)
+        .with(gateway_tools::document::CreateDocument)
+        .with(gateway_tools::document::EditDocument)
+        .with(gateway_tools::document::ReadDocument)
+        .with(gateway_tools::document::ListDocuments)
+        .with(gateway_tools::document::EditDocumentSection)
+        .with(gateway_tools::document::ListDocumentVersions)
+        .with(gateway_tools::document::RestoreDocumentVersion)
         // QR codes render natively in-process (no sandbox, no upstream), so
         // the tool is always on; it needs [chat.s3] at runtime to deliver
         // the file and errors cleanly without it.
-        .with(srv::tools::qr::GenerateQrCode);
+        .with(gateway_tools::qr::GenerateQrCode);
     // `lookup_ip` is GeoIP-only — unlike `get_user_location` (which also has
     // the browser-GPS path), it can do nothing without a database. Register
     // it only when `[geoip]` is configured, so the model is never offered a
@@ -228,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
     // not-yet-loaded file is fine: the handle hot-reloads (see below) and the
     // tool's own runtime guard returns a clean `known:false` in the gap.
     if config.geoip.is_some() {
-        tool_registry = tool_registry.with(srv::tools::lookup_ip::LookupIp);
+        tool_registry = tool_registry.with(gateway_tools::lookup_ip::LookupIp);
         tracing::info!(tool = "lookup_ip", "registered GeoIP lookup tool");
     } else {
         tracing::info!("no [geoip] config — lookup_ip tool not registered");
@@ -244,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
         .filter(|p| p.kind == srv::upstreams::PoolKind::Image)
         .collect();
     if !image_pools.is_empty() {
-        tool_registry = tool_registry.with(srv::tools::generate_image::GenerateImage);
+        tool_registry = tool_registry.with(gateway_tools::generate_image::GenerateImage);
         tracing::info!(tool = "generate_image", "registered image-generation tool");
     } else {
         tracing::info!("no image-kind upstream pool — generate_image tool not registered");
@@ -257,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .any(|p| p.backends.iter().any(|b| b.supports_edit()))
     {
-        tool_registry = tool_registry.with(srv::tools::edit_image::EditImage);
+        tool_registry = tool_registry.with(gateway_tools::edit_image::EditImage);
         tracing::info!(tool = "edit_image", "registered image-editing tool");
     } else {
         tracing::info!("no edit-capable image backend — edit_image tool not registered");
@@ -295,18 +295,19 @@ async fn main() -> anyhow::Result<()> {
                         description: t.description.clone(),
                     });
                     tool_registry = tool_registry
-                        .with(srv::tools::typst_render::TypstRenderTool::new(
+                        .with(gateway_tools::typst_render::TypstRenderTool::new(
                             t.clone(),
                             sandbox_client.clone(),
                         ))
-                        .with(srv::tools::typst_render::TypstEditTool::new(
+                        .with(gateway_tools::typst_render::TypstEditTool::new(
                             t.clone(),
                             sandbox_client.clone(),
                         ))
-                        .with(srv::tools::typst_render::TypstReadTool::new(t.clone()));
+                        .with(gateway_tools::typst_render::TypstReadTool::new(t.clone()));
                     if let (true, Some(sb)) = (pptx, sandbox_client.clone()) {
-                        tool_registry = tool_registry
-                            .with(srv::tools::typst_render::TypstPptxTool::new(t.clone(), sb));
+                        tool_registry = tool_registry.with(
+                            gateway_tools::typst_render::TypstPptxTool::new(t.clone(), sb),
+                        );
                     }
                     tracing::info!(
                         render = %render_id,
@@ -376,7 +377,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         };
-    let mut enable_tools = srv::tools::enable_tools::EnableTools::from_registry(&tool_registry);
+    let mut enable_tools = gateway_tools::enable_tools::EnableTools::from_registry(&tool_registry);
     if let Some(store) = comfyui_store.clone() {
         enable_tools = enable_tools.with_comfyui_store(store);
     }
@@ -419,7 +420,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(srv::skills::UserSkillStore::new(users_dir))
     });
     if let (Some(store), Some(user_store)) = (skill_store.as_ref(), user_skill_store.as_ref()) {
-        tool_registry = tool_registry.with(srv::tools::read_skill::ReadSkill::new(
+        tool_registry = tool_registry.with(gateway_tools::read_skill::ReadSkill::new(
             store.clone(),
             user_store.clone(),
             rbac.clone(),

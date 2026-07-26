@@ -40,7 +40,7 @@ typst = "0.15.0"
 
 [env]
 RUST_BACKTRACE = "1"
-RUST_LOG = "info,gateway=debug,gateway_core=debug,gateway_web=debug"
+RUST_LOG = "info,gateway=debug,gateway_core=debug,gateway_tools=debug,gateway_web=debug"
 # Secrets (API keys, tokens) go in the gitignored `mise.local.toml`, not
 # here. Web-search settings are the exception in the other direction: they
 # live in the DB and are set under "Web search" on /admin/models (the legacy
@@ -117,6 +117,7 @@ depends = ["npm-install"]
 sources = [
     "ui/src/main.css",
     "crates/gateway-web/src/**/*.rs",
+    "crates/gateway-tools/src/**/*.rs",
     "crates/gateway-core/src/**/*.rs",
     "crates/gateway/src/**/*.rs",
     "crates/session-core/src/**/*.rs",

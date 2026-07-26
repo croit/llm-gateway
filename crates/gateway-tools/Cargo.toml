@@ -1,0 +1,52 @@
+[package]
+name = "gateway-tools"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The gateway's tool implementations. Sits above `gateway-core` (which owns the
+# Tool trait, ToolContext, the registry, the catalog, the runner, the MCP manager
+# and the sandbox client) and beside `gateway-web`: only the binary's wiring
+# depends on it, so adding or editing a tool is a leaf-crate rebuild.
+# See docs/architecture.md.
+
+[dependencies]
+gateway-core = { path = "../gateway-core" }
+shared = { path = "../shared" }
+session-core = { path = "../session-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jiff = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+sqlx = { workspace = true }
+toml = { workspace = true }
+url = { workspace = true }
+# typst compile scratch dirs (one per render) + sandbox staging dirs.
+tempfile = { workspace = true }
+
+# `tls_cert`: a raw rustls handshake (no trust verification — we're *inspecting*
+# the presented cert, including expired / self-signed ones) + x509 parsing for
+# subject/issuer/SAN/validity.
+tokio-rustls = { workspace = true }
+x509-parser = "0.16"
+
+# `zip` packs the multi-file typst / document exports the render tools return.
+zip = { workspace = true }
+# `image` encodes rendered bitmaps to PNG for the vision `image_url` content
+# parts and decodes uploaded logo images for `generate_qr_code`.
+image = { workspace = true }
+# QR encoding for `generate_qr_code` (rendering is done in-tree via `image`, so
+# this stays a pure encoder dependency).
+qrcode = { workspace = true }
+
+[dev-dependencies]
+# QR *decoder* for the generate_qr_code tests: every rendered code is decoded
+# back and compared to the input, so a rendering regression (colors, logo
+# overlay, quiet zone) that breaks scannability fails the suite.
+rqrr = "0.10"
+# In-process HTTP mock standing in for the upstreams the tools call out to.
+wiremock = { workspace = true }

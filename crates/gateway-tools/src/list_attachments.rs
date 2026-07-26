@@ -17,8 +17,8 @@
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use super::{Tool, ToolContext, ToolError, ToolFuture};
-use crate::server::chat_attachments;
+use gateway_core::server::chat_attachments;
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 pub struct ListAttachments;
 
@@ -91,8 +91,8 @@ mod tests {
         assert_eq!(ListAttachments.id(), ListAttachments.schema().function.name);
     }
 
-    async fn pool_with_session() -> crate::server::db::Pool {
-        let pool = crate::server::db::open(std::path::Path::new(":memory:"))
+    async fn pool_with_session() -> gateway_core::server::db::Pool {
+        let pool = gateway_core::server::db::open(std::path::Path::new(":memory:"))
             .await
             .unwrap();
         sqlx::query(
@@ -113,7 +113,7 @@ mod tests {
     }
 
     async fn insert_turn(
-        pool: &crate::server::db::Pool,
+        pool: &gateway_core::server::db::Pool,
         id: &str,
         seq: i64,
         role: &str,
@@ -139,7 +139,7 @@ mod tests {
         .unwrap();
     }
 
-    fn ctx(pool: crate::server::db::Pool, session: Option<&str>) -> ToolContext {
+    fn ctx(pool: gateway_core::server::db::Pool, session: Option<&str>) -> ToolContext {
         ToolContext {
             user_id: "u1".into(),
             roles: vec![],

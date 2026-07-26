@@ -22,8 +22,8 @@ use serde_json::{Value, json};
 use session_core::db as chat;
 use shared::api::ToolDef;
 
-use super::{Tool, ToolContext, ToolError, ToolFuture};
-use crate::server::chat_attachments;
+use gateway_core::server::chat_attachments;
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Hard cap on the decoded byte size of one upload. Mirrors the
 /// 30 s upload timeout in `chat_attachments` — keeps a runaway
@@ -223,21 +223,23 @@ mod tests {
 
     #[tokio::test]
     async fn errors_when_no_assistant_turn() {
-        let pool = crate::server::db::open(std::path::Path::new(":memory:"))
+        let pool = gateway_core::server::db::open(std::path::Path::new(":memory:"))
             .await
             .unwrap();
         let ctx = ToolContext {
             user_id: "u".into(),
             roles: vec![],
             db: pool,
-            s3: Some(std::sync::Arc::new(crate::server::config::S3Config {
-                endpoint: "http://127.0.0.1:1".into(),
-                region: "us-east-1".into(),
-                bucket: "b".into(),
-                access_key_env: "UPLOAD_ATTACH_TEST_NOT_SET".into(),
-                secret_key_env: "UPLOAD_ATTACH_TEST_NOT_SET".into(),
-                key_prefix: "chat-attachments".into(),
-            })),
+            s3: Some(std::sync::Arc::new(
+                gateway_core::server::config::S3Config {
+                    endpoint: "http://127.0.0.1:1".into(),
+                    region: "us-east-1".into(),
+                    bucket: "b".into(),
+                    access_key_env: "UPLOAD_ATTACH_TEST_NOT_SET".into(),
+                    secret_key_env: "UPLOAD_ATTACH_TEST_NOT_SET".into(),
+                    key_prefix: "chat-attachments".into(),
+                },
+            )),
             assistant_turn_id: None,
             session_id: None,
             client_ip: None,
@@ -268,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn errors_when_s3_not_configured() {
-        let pool = crate::server::db::open(std::path::Path::new(":memory:"))
+        let pool = gateway_core::server::db::open(std::path::Path::new(":memory:"))
             .await
             .unwrap();
         let ctx = ToolContext {

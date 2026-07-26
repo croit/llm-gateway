@@ -30,19 +30,19 @@ fn main() {
     let mut registry = ToolRegistry::new()
         .with(gateway_core::server::tools::echo::Echo)
         .with(gateway_core::server::tools::time::CurrentTimestamp)
-        .with(gateway_core::server::tools::fetch_url::FetchUrl)
-        .with(gateway_core::server::tools::fetch_attachment::FetchAttachment::new(None))
-        .with(gateway_core::server::tools::upload_attachment::UploadAttachment)
-        .with(gateway_core::server::tools::search_web::SearchWeb)
-        .with(gateway_core::server::tools::location::GetUserLocation)
-        .with(gateway_core::server::tools::memory::Remember)
-        .with(gateway_core::server::tools::memory::Recall)
-        .with(gateway_core::server::tools::netcheck::DnsLookup)
-        .with(gateway_core::server::tools::netcheck::WhoisLookup)
-        .with(gateway_core::server::tools::netcheck::TlsCert)
-        .with(gateway_core::server::tools::wikipedia::Wikipedia)
-        .with(gateway_core::server::tools::currency::ConvertCurrency)
-        .with(gateway_core::server::tools::lookup_ip::LookupIp);
+        .with(gateway_tools::fetch_url::FetchUrl)
+        .with(gateway_tools::fetch_attachment::FetchAttachment::new(None))
+        .with(gateway_tools::upload_attachment::UploadAttachment)
+        .with(gateway_tools::search_web::SearchWeb)
+        .with(gateway_tools::location::GetUserLocation)
+        .with(gateway_tools::memory::Remember)
+        .with(gateway_tools::memory::Recall)
+        .with(gateway_tools::netcheck::DnsLookup)
+        .with(gateway_tools::netcheck::WhoisLookup)
+        .with(gateway_tools::netcheck::TlsCert)
+        .with(gateway_tools::wikipedia::Wikipedia)
+        .with(gateway_tools::currency::ConvertCurrency)
+        .with(gateway_tools::lookup_ip::LookupIp);
 
     // Discover typst templates the same way main.rs does, if present.
     let templates_dir = Path::new("examples/typst-templates");
@@ -53,13 +53,11 @@ fn main() {
                 // Token-budget report only needs the schemas; pptx export
                 // (sandbox) is irrelevant here, so pass None.
                 registry = registry
-                    .with(
-                        gateway_core::server::tools::typst_render::TypstRenderTool::new(
-                            t.clone(),
-                            None,
-                        ),
-                    )
-                    .with(gateway_core::server::tools::typst_render::TypstEditTool::new(t, None));
+                    .with(gateway_tools::typst_render::TypstRenderTool::new(
+                        t.clone(),
+                        None,
+                    ))
+                    .with(gateway_tools::typst_render::TypstEditTool::new(t, None));
             }
         }
         Err(e) => eprintln!("(no typst templates discovered at {templates_dir:?}: {e})"),

@@ -116,11 +116,8 @@ image = { workspace = true }
 qrcode = { workspace = true }
 
 [dev-dependencies]
-# QR *decoder* for the generate_qr_code tests: every rendered code is decoded
-# back and compared to the input, so a rendering regression (colors, logo
-# overlay, quiet zone) that breaks scannability fails the suite.
-rqrr = "0.10"
 # wiremock spins up an in-process HTTP mock that stands in for upstream
 # LLM backends, used by the unit tests that drive the tool runner and the
 # upstream registry without a real model server.
 wiremock = { workspace = true }
+

@@ -21,7 +21,7 @@
 //! environment variables are imported into the database once at boot and
 //! ignored from then on — see [`search_settings::import_env_once`].
 //!
-//! [`search_settings`]: crate::server::search_settings
+//! [`search_settings`]: gateway_core::server::search_settings
 
 use std::time::Duration;
 
@@ -29,8 +29,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use super::{Tool, ToolContext, ToolError, ToolFuture};
-use crate::server::search_settings::{self, SearchProvider, SearchSettings};
+use gateway_core::server::search_settings::{self, SearchProvider, SearchSettings};
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_N_RESULTS: usize = 5;
@@ -389,8 +389,8 @@ async fn brave(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::crypto::Crypto;
-    use crate::server::db;
+    use gateway_core::server::crypto::Crypto;
+    use gateway_core::server::db;
     use std::sync::Arc;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};

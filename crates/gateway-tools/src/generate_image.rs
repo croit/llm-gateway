@@ -4,7 +4,7 @@
 //! `generate_image` — text-to-image generation.
 //!
 //! The model describes an image; the gateway routes the request to a
-//! `kind = "image"` upstream pool (via [`crate::server::image_gen`]), gets the
+//! `kind = "image"` upstream pool (via [`gateway_core::server::image_gen`]), gets the
 //! bytes in hand (decoding `b64_json`, or fetching an upstream URL
 //! server-side), uploads them to the same S3 bucket chat attachments use, and
 //! splices a `[gw-attachment …]` marker into the assistant turn's `content` —
@@ -19,10 +19,10 @@ use serde_json::{Value, json};
 use session_core::db as chat;
 use shared::api::ToolDef;
 
-use super::{Tool, ToolContext, ToolError, ToolFuture};
-use crate::server::chat_attachments;
-use crate::server::db::usage::UsageSource;
-use crate::server::image_gen::UsageMeta;
+use gateway_core::server::chat_attachments;
+use gateway_core::server::db::usage::UsageSource;
+use gateway_core::server::image_gen::UsageMeta;
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 pub struct GenerateImage;
 
@@ -139,7 +139,7 @@ impl Tool for GenerateImage {
 
             let base = format!(
                 "generated-image{}",
-                crate::server::chat_attachments::ext_for_mime(&image.mime).unwrap_or(".png")
+                gateway_core::server::chat_attachments::ext_for_mime(&image.mime).unwrap_or(".png")
             );
             let filename =
                 chat_attachments::reserve_filename(&ctx.db, turn_id, reservations, &base)
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn ext_for_mime_maps_common_types() {
-        use crate::server::chat_attachments::ext_for_mime;
+        use gateway_core::server::chat_attachments::ext_for_mime;
         assert_eq!(ext_for_mime("image/png"), Some(".png"));
         assert_eq!(ext_for_mime("image/jpeg"), Some(".jpg"));
         assert_eq!(ext_for_mime("image/webp"), Some(".webp"));
@@ -203,7 +203,7 @@ mod tests {
         ToolContext {
             user_id: "u".into(),
             roles: vec![],
-            db: crate::server::db::open(std::path::Path::new(":memory:"))
+            db: gateway_core::server::db::open(std::path::Path::new(":memory:"))
                 .await
                 .unwrap(),
             s3: None,

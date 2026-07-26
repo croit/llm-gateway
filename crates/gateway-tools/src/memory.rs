@@ -17,8 +17,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use super::{Tool, ToolContext, ToolError, ToolFuture};
-use crate::server::db::user_memories::{self, MemoryKind};
+use gateway_core::server::db::user_memories::{self, MemoryKind};
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Parse a caller-supplied `kind` string into a [`MemoryKind`].
 /// `None`/absent → `Fact` (the generic bucket); an unrecognised string
@@ -177,7 +177,7 @@ impl Tool for Recall {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::db;
+    use gateway_core::server::db;
 
     async fn ctx(pool: &db::Pool, user_id: &str) -> ToolContext {
         ToolContext {

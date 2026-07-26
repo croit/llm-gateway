@@ -101,7 +101,7 @@ USER gateway
 # PDFIUM_LIB_PATH points the PDF reader at the bundled pdfium above.
 ENV IP=0.0.0.0 \
     PORT=8080 \
-    RUST_LOG=info,gateway=info,gateway_core=info,gateway_web=info \
+    RUST_LOG=info,gateway=info,gateway_core=info,gateway_tools=info,gateway_web=info \
     PDFIUM_LIB_PATH=/usr/local/lib/libpdfium.so
 
 EXPOSE 8080

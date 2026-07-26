@@ -30,12 +30,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use super::{Tool, ToolContext, ToolError, ToolFuture};
-use crate::server::rbac::Resolver;
-use crate::server::skills::{SkillRegistry, SkillStore, UserSkillStore, combined_registry};
+use gateway_core::server::rbac::Resolver;
+use gateway_core::server::skills::{SkillRegistry, SkillStore, UserSkillStore, combined_registry};
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Tool id — also the OpenAI function name and the `/tools` toggle key.
-pub const READ_SKILL_ID: &str = "read_skill";
+/// Defined in `catalog` (which stays below the tool impls, since `AppState`
+/// needs it) and re-exported here so call sites beside the tool keep the
+/// obvious import path.
+pub use gateway_core::server::tools::catalog::READ_SKILL_ID;
 
 pub struct ReadSkill {
     store: Arc<SkillStore>,
@@ -171,7 +174,7 @@ impl Tool for ReadSkill {
                     // Chat path only (proxy has no session); best-effort —
                     // a write hiccup just means the model reloads next turn.
                     if let Some(session_id) = ctx.session_id.as_deref()
-                        && let Err(err) = crate::server::db::chat_session_skills::record(
+                        && let Err(err) = gateway_core::server::db::chat_session_skills::record(
                             &ctx.db,
                             session_id,
                             &skill.name,
@@ -200,8 +203,8 @@ impl Tool for ReadSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::rbac::config::{RbacConfig, RoleConfig};
-    use crate::server::skills::{SkillStore, UserSkillStore};
+    use gateway_core::server::rbac::config::{RbacConfig, RoleConfig};
+    use gateway_core::server::skills::{SkillStore, UserSkillStore};
     use std::path::{Path, PathBuf};
 
     fn write_skill(parent: &Path, name: &str) -> PathBuf {
@@ -247,13 +250,13 @@ mod tests {
     }
 
     async fn ctx() -> ToolContext {
-        let pool = crate::server::db::open(Path::new(":memory:"))
+        let pool = gateway_core::server::db::open(Path::new(":memory:"))
             .await
             .unwrap();
         ctx_with(pool, None)
     }
 
-    fn ctx_with(pool: crate::server::db::Pool, session_id: Option<String>) -> ToolContext {
+    fn ctx_with(pool: gateway_core::server::db::Pool, session_id: Option<String>) -> ToolContext {
         ToolContext {
             user_id: "u1".into(),
             roles: vec!["user".into()],
@@ -272,7 +275,7 @@ mod tests {
         }
     }
 
-    async fn seed_session(pool: &crate::server::db::Pool, id: &str) {
+    async fn seed_session(pool: &gateway_core::server::db::Pool, id: &str) {
         sqlx::query(
             "INSERT INTO users (id, email, created_at, updated_at) \
              VALUES ('u1', 'u1@example.com', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z') \
@@ -313,7 +316,7 @@ mod tests {
         // Loading a skill's body in a chat session must persist it, so the
         // next turn's build_request_context re-injects its guidance.
         let dir = tempfile::tempdir().unwrap();
-        let pool = crate::server::db::open(Path::new(":memory:"))
+        let pool = gateway_core::server::db::open(Path::new(":memory:"))
             .await
             .unwrap();
         seed_session(&pool, "s1").await;
@@ -328,7 +331,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let loaded = crate::server::db::chat_session_skills::loaded_for_session(&pool, "s1")
+        let loaded = gateway_core::server::db::chat_session_skills::loaded_for_session(&pool, "s1")
             .await
             .unwrap();
         assert_eq!(loaded, vec!["brand".to_string()]);
@@ -339,7 +342,7 @@ mod tests {
         // Only a body load (`read_skill(name)`) marks the skill active; a
         // file pull doesn't, so a bare asset fetch can't pin a skill.
         let dir = tempfile::tempdir().unwrap();
-        let pool = crate::server::db::open(Path::new(":memory:"))
+        let pool = gateway_core::server::db::open(Path::new(":memory:"))
             .await
             .unwrap();
         seed_session(&pool, "s1").await;
@@ -355,7 +358,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            crate::server::db::chat_session_skills::loaded_for_session(&pool, "s1")
+            gateway_core::server::db::chat_session_skills::loaded_for_session(&pool, "s1")
                 .await
                 .unwrap()
                 .is_empty()

@@ -21,7 +21,7 @@ Built on **rama 0.3** (HTTP server + router + middleware), **plait** (inline-in-
 ├── AGENTS.md                    # this file
 ├── README.md                    # human-facing — keep current with deploy story
 ├── mise.toml                    # toolchain pin + build/test/lint tasks
-├── Cargo.toml                   # workspace manifest (6 members)
+├── Cargo.toml                   # workspace manifest (7 members)
 ├── Dockerfile                   # gateway runtime image
 ├── docs/                        # detailed design docs (index in docs/README.md)
 ├── ui/                          # Tailwind v4 + daisyUI v5 → app.css; TS bundle for gateway
@@ -34,6 +34,7 @@ Built on **rama 0.3** (HTTP server + router + middleware), **plait** (inline-in-
     │   │                            code), SSE primitives, icons
     │   └── ui/ts/                   composer + scroll TS
     ├── gateway-core/            # the gateway's application body
+    ├── gateway-tools/           # the tool implementations
     ├── gateway-web/             # the server-rendered HTML pages
     ├── gateway/                 # the binary: router, proxy, api, main
     └── sandbox-runner/          # the sandboxed-tool execution service
@@ -47,10 +48,14 @@ compilation unit, so editing any file re-ran the whole frontend + codegen. Each
 crate depends only on the ones beneath it.
 
 ```
-gateway          bin + router/proxy/api/oidc      ← thinnest, most-edited glue
-   ├── gateway-web    server-rendered HTML pages   ← pure sink; nothing below uses it
-   └── gateway-core   application body (server/, openai_driver, RamaState)
+gateway            bin + router/proxy/api/oidc     ← thinnest, most-edited glue
+   ├── gateway-web     server-rendered HTML pages  ← pure sinks; nothing below
+   ├── gateway-tools   the tool implementations    ←   these two uses them
+   └── gateway-core    application body (server/, openai_driver, RamaState)
 ```
+
+`gateway-web` and `gateway-tools` are siblings: neither depends on the other, so
+editing a page doesn't rebuild the tools and vice versa.
 
 **When adding code, put it as high in the stack as it will go.** Something only
 belongs in `gateway-core` if code below the page layer actually needs it. Adding a
@@ -70,7 +75,10 @@ server/                   # framework-neutral building blocks (no routing):
                               moved to session-core, gateway just runs the migration
     rbac/                     role → tool/model resolution
     state.rs                  AppState
-    tools/                    Tool trait + the tool impls + the runner loop
+    tools/                    Tool trait, ToolContext, registry, catalog, runner,
+                              MCP manager, sandbox client (impls: gateway-tools;
+                              echo + time stay here as the test fixtures)
+    document_canvas.rs        chat canvas renderer (below both its callers)
     upstreams/                pool registry, health probes, RAII Acquired guard
     rag/ skills.rs comfyui/ push/ scheduled/ limits/ usage/ geoip/ webhooks.rs …
 rama_server/              # the shared rama handles both layers above need:
@@ -79,6 +87,12 @@ rama_server/              # the shared rama handles both layers above need:
     auth.rs                   require_bearer for /v1/*
     cors.rs                   the CORS layer
 ```
+
+Inside `crates/gateway-tools/src/`: one module per tool family (`fetch_url`,
+`search_web`, `typst_render`, `document`, `rag`, `qr`, `netcheck`, …). Register a
+new tool in the `ToolRegistry` that `gateway`'s `main.rs` builds, and grant it in
+`[rbac]`. `tests/` holds the two test modules that need both the machinery and the
+real tools (catalog grouping, `AppState` authorization).
 
 Inside `crates/gateway-web/src/`:
 

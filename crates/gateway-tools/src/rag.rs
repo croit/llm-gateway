@@ -26,10 +26,10 @@ use shared::api::ToolDef;
 
 use std::sync::Arc;
 
-use super::{Tool, ToolContext, ToolError, ToolFuture};
-use crate::server::db::rag as rag_db;
-use crate::server::rag::worker;
-use crate::server::rbac::Resolver;
+use gateway_core::server::db::rag as rag_db;
+use gateway_core::server::rag::worker;
+use gateway_core::server::rbac::Resolver;
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Holds the RBAC resolver so it can filter collections to the ones the
 /// caller's gateway groups permit (per-collection `allowed_groups`).
@@ -317,7 +317,7 @@ fn hit_json((chunk, score): (rag_db::Chunk, f32)) -> Value {
 ///   the whole corpus. A caller-supplied `ref` is ignored in aggregate mode
 ///   (the index is merged; hit paths carry the source-repo prefix instead).
 async fn resolve_search(
-    db: &crate::server::db::Pool,
+    db: &gateway_core::server::db::Pool,
     collection: &rag_db::Collection,
     git_ref: Option<&str>,
 ) -> Result<rag_db::CollectionRef, ToolError> {
@@ -363,10 +363,10 @@ async fn resolve_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::db;
-    use crate::server::embeddings;
-    use crate::server::rag::worker::{Indexer, IndexerConfig, search_chunks};
-    use crate::server::upstreams::{
+    use gateway_core::server::db;
+    use gateway_core::server::embeddings;
+    use gateway_core::server::rag::worker::{Indexer, IndexerConfig, search_chunks};
+    use gateway_core::server::upstreams::{
         UpstreamRegistry,
         config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
     };
@@ -509,11 +509,12 @@ mod tests {
         .await
         .unwrap();
         // A collection with no searchable ref is not advertised.
-        let out =
-            RagListCollections::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
-                .run(ctx_with(indexer.clone()), json!({}))
-                .await
-                .unwrap();
+        let out = RagListCollections::new(std::sync::Arc::new(
+            gateway_core::server::rbac::Resolver::empty(),
+        ))
+        .run(ctx_with(indexer.clone()), json!({}))
+        .await
+        .unwrap();
         assert!(out["collections"].as_array().unwrap().is_empty());
 
         // Add a ref and bring it to ready → now listed with its refs.
@@ -527,11 +528,12 @@ mod tests {
             .await
             .unwrap();
 
-        let out =
-            RagListCollections::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
-                .run(ctx_with(indexer), json!({}))
-                .await
-                .unwrap();
+        let out = RagListCollections::new(std::sync::Arc::new(
+            gateway_core::server::rbac::Resolver::empty(),
+        ))
+        .run(ctx_with(indexer), json!({}))
+        .await
+        .unwrap();
         let cs = out["collections"].as_array().unwrap();
         assert_eq!(cs.len(), 1);
         assert_eq!(cs[0]["name"], "demo");
@@ -592,11 +594,12 @@ mod tests {
             }
         }
 
-        let out =
-            RagListCollections::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
-                .run(ctx_with(indexer), json!({}))
-                .await
-                .unwrap();
+        let out = RagListCollections::new(std::sync::Arc::new(
+            gateway_core::server::rbac::Resolver::empty(),
+        ))
+        .run(ctx_with(indexer), json!({}))
+        .await
+        .unwrap();
         let cs = out["collections"].as_array().unwrap();
         assert_eq!(cs.len(), 1);
         assert_eq!(cs[0]["mode"], "aggregate");
@@ -616,11 +619,12 @@ mod tests {
     #[tokio::test]
     async fn list_collections_without_indexer_is_clear_error() {
         let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
-        let err =
-            RagListCollections::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
-                .run(ctx_without_indexer(pool), json!({}))
-                .await
-                .unwrap_err();
+        let err = RagListCollections::new(std::sync::Arc::new(
+            gateway_core::server::rbac::Resolver::empty(),
+        ))
+        .run(ctx_without_indexer(pool), json!({}))
+        .await
+        .unwrap_err();
         match err {
             ToolError::Failed(msg) => assert!(msg.contains("RAG is not configured")),
             other => panic!("expected Failed, got {other:?}"),
@@ -723,13 +727,15 @@ mod tests {
             .unwrap();
         assert!(!raw.is_empty(), "lower layer returned no hits");
 
-        let out = RagSearch::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
-            .run(
-                ctx_with(indexer),
-                json!({ "query": "alpha please", "collection": "code", "top_k": 3 }),
-            )
-            .await
-            .unwrap();
+        let out = RagSearch::new(std::sync::Arc::new(
+            gateway_core::server::rbac::Resolver::empty(),
+        ))
+        .run(
+            ctx_with(indexer),
+            json!({ "query": "alpha please", "collection": "code", "top_k": 3 }),
+        )
+        .await
+        .unwrap();
         assert_eq!(out["collection"], "code");
         assert_eq!(out["ref"], "main");
         let hits = out["hits"].as_array().unwrap();
@@ -827,13 +833,15 @@ mod tests {
 
         // ONE query over the unified index — `alpha` ranks the pve-manager
         // chunk first, and the hit path is prefixed with its source repo.
-        let out = RagSearch::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
-            .run(
-                ctx_with(indexer),
-                json!({ "query": "alpha please", "collection": "proxmox", "top_k": 5 }),
-            )
-            .await
-            .unwrap();
+        let out = RagSearch::new(std::sync::Arc::new(
+            gateway_core::server::rbac::Resolver::empty(),
+        ))
+        .run(
+            ctx_with(indexer),
+            json!({ "query": "alpha please", "collection": "proxmox", "top_k": 5 }),
+        )
+        .await
+        .unwrap();
         assert_eq!(out["collection"], "proxmox");
         let hits = out["hits"].as_array().unwrap();
         assert!(!hits.is_empty(), "unified search returned no hits");
@@ -876,13 +884,15 @@ mod tests {
         rag_db::add_ref(&pool, c.id, "main", None, true)
             .await
             .unwrap();
-        let err = RagSearch::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
-            .run(
-                ctx_with(indexer),
-                json!({"query": "x", "collection": "still-pending"}),
-            )
-            .await
-            .unwrap_err();
+        let err = RagSearch::new(std::sync::Arc::new(
+            gateway_core::server::rbac::Resolver::empty(),
+        ))
+        .run(
+            ctx_with(indexer),
+            json!({"query": "x", "collection": "still-pending"}),
+        )
+        .await
+        .unwrap_err();
         match err {
             ToolError::Failed(msg) => {
                 assert!(msg.contains("not ready"), "{msg}");
@@ -905,13 +915,15 @@ mod tests {
                 ..IndexerConfig::default()
             },
         );
-        let err = RagSearch::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
-            .run(
-                ctx_with(indexer),
-                json!({"query": "x", "collection": "no-such-thing"}),
-            )
-            .await
-            .unwrap_err();
+        let err = RagSearch::new(std::sync::Arc::new(
+            gateway_core::server::rbac::Resolver::empty(),
+        ))
+        .run(
+            ctx_with(indexer),
+            json!({"query": "x", "collection": "no-such-thing"}),
+        )
+        .await
+        .unwrap_err();
         match err {
             ToolError::Failed(msg) => assert!(msg.contains("rag_list_collections"), "{msg}"),
             other => panic!("expected Failed, got {other:?}"),
@@ -921,19 +933,28 @@ mod tests {
     #[test]
     fn schema_ids_match() {
         assert_eq!(
-            RagListCollections::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
-                .id(),
-            RagListCollections::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
-                .schema()
-                .function
-                .name
+            RagListCollections::new(std::sync::Arc::new(
+                gateway_core::server::rbac::Resolver::empty()
+            ))
+            .id(),
+            RagListCollections::new(std::sync::Arc::new(
+                gateway_core::server::rbac::Resolver::empty()
+            ))
+            .schema()
+            .function
+            .name
         );
         assert_eq!(
-            RagSearch::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty())).id(),
-            RagSearch::new(std::sync::Arc::new(crate::server::rbac::Resolver::empty()))
-                .schema()
-                .function
-                .name
+            RagSearch::new(std::sync::Arc::new(
+                gateway_core::server::rbac::Resolver::empty()
+            ))
+            .id(),
+            RagSearch::new(std::sync::Arc::new(
+                gateway_core::server::rbac::Resolver::empty()
+            ))
+            .schema()
+            .function
+            .name
         );
     }
 }

@@ -21,8 +21,8 @@ use serde_json::{Value, json};
 use session_core::db as chat;
 use shared::api::ToolDef;
 
-use super::{Tool, ToolContext, ToolError, ToolFuture};
-use crate::server::chat_attachments;
+use gateway_core::server::chat_attachments;
+use gateway_core::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Storage ceiling for a fetched image. Matches `fetch_url`'s inline cap
 /// (25 MB) so the two image-from-web tools agree on what's "too big".
@@ -266,7 +266,7 @@ fn sanitize_stem(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::db;
+    use gateway_core::server::db;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

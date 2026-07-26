@@ -65,7 +65,7 @@ Volume=gateway.volume:/var/lib/gateway:z,U
 # Override the default `gateway.sqlite` (relative path → CWD which is /app
 # and would be ephemeral) to live on the persistent volume.
 Environment=GATEWAY_CONFIG=/etc/gateway/config.toml
-Environment=RUST_LOG=info,gateway=info,gateway_core=info,gateway_web=info
+Environment=RUST_LOG=info,gateway=info,gateway_core=info,gateway_tools=info,gateway_web=info
 
 # Drop all caps, no-new-privs, read-only root FS. The volume above + a small
 # tmpfs cover everything that needs to be writable.

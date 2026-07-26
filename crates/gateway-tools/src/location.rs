@@ -25,9 +25,9 @@
 use serde_json::{Value, json};
 use shared::api::ToolDef;
 
-use super::feedback::BrowserFix;
-use super::{ChatFeedback, Tool, ToolContext, ToolFuture};
-use crate::server::db::users;
+use gateway_core::server::db::users;
+use gateway_core::server::tools::feedback::BrowserFix;
+use gateway_core::server::tools::{ChatFeedback, Tool, ToolContext, ToolFuture};
 
 /// How recent a shared browser position must be to be trusted as the
 /// user's *current* location. A precise GPS fix goes stale as the user
@@ -250,7 +250,7 @@ fn prompt_card_html(turn_id: &str) -> String {
 /// Shape a coarse GeoIP result. `GeoLocation` already serialises only
 /// its populated fields (`skip_serializing_if = "Option::is_none"`), so
 /// start from that object and layer the tool-result envelope on top.
-fn ip_payload(geo: &crate::server::geoip::GeoLocation) -> Value {
+fn ip_payload(geo: &gateway_core::server::geoip::GeoLocation) -> Value {
     let mut out = serde_json::to_value(geo).unwrap_or_else(|_| json!({}));
     if let Some(map) = out.as_object_mut() {
         map.insert("known".into(), json!(true));
@@ -270,7 +270,7 @@ fn ip_payload(geo: &crate::server::geoip::GeoLocation) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::db;
+    use gateway_core::server::db;
     use jiff::Timestamp;
 
     async fn ctx_for(pool: db::Pool, user_id: &str) -> ToolContext {

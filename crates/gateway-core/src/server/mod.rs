@@ -15,6 +15,7 @@ pub mod compaction;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod document_canvas;
 pub mod embeddings;
 pub mod feature_defaults;
 pub mod geoip;

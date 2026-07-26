@@ -1851,6 +1851,7 @@ dependencies = [
  "anyhow",
  "earshot",
  "gateway-core",
+ "gateway-tools",
  "gateway-web",
  "http-body-util",
  "jiff",
@@ -1902,7 +1903,6 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "rmcp",
- "rqrr",
  "rust-s3",
  "serde",
  "serde_json",
@@ -1919,6 +1919,32 @@ dependencies = [
  "url",
  "usearch",
  "uuid",
+ "wiremock",
+ "x509-parser 0.16.0",
+ "zip",
+]
+
+[[package]]
+name = "gateway-tools"
+version = "0.1.0"
+dependencies = [
+ "gateway-core",
+ "image",
+ "jiff",
+ "qrcode",
+ "reqwest 0.12.28",
+ "rqrr",
+ "serde",
+ "serde_json",
+ "session-core",
+ "shared",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "toml 0.8.23",
+ "tracing",
+ "url",
  "wiremock",
  "x509-parser 0.16.0",
  "zip",

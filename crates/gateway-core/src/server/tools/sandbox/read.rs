@@ -205,7 +205,7 @@ pub(crate) fn slice_text(
 // artifacts. Self-contained to keep the tool off a base64 dependency,
 // matching the codecs in `chat_attachments` / `upload_attachment`.
 
-pub(crate) mod b64 {
+pub mod b64 {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     pub fn encode(bytes: &[u8]) -> String {

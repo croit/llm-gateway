@@ -65,7 +65,7 @@ There's no WASM step, no `dx`, no hot reload of HTML — the rama server serves 
 
 Env config is layered through mise, not a `.env` file:
 
-- **`mise.toml` `[env]`** holds the non-secret defaults committed to the repo (`RUST_BACKTRACE=1`, `RUST_LOG=info,gateway=debug,gateway_core=debug,gateway_web=debug`).
+- **`mise.toml` `[env]`** holds the non-secret defaults committed to the repo (`RUST_BACKTRACE=1`, `RUST_LOG=info,gateway=debug,gateway_core=debug,gateway_tools=debug,gateway_web=debug`).
 - **`mise.local.toml` `[env]`** holds secrets and machine-local overrides — it is **gitignored**. This is where local dev keys go: `GATEWAY_SESSION_KEY`, `GATEWAY_OIDC_CLIENT_SECRET`, `GATEWAY_ENCRYPTION_KEY`, provider keys (`OPENAI_API_KEY`, `ZAI_API_KEY`, …), etc.
 
 Web-search settings are **not** environment variables any more. Provider, SearXNG URL, and Brave API key live in the database and are set under **Web search** on `/admin/models` (the key sealed at rest like every other gateway secret). `SEARCH_PROVIDER`, `SEARXNG_URL`, and `BRAVE_SEARCH_API_KEY` are still read **once**, at first boot, to fill settings that are still empty — after that they're ignored and the gateway logs that it ignored them.
@@ -77,18 +77,19 @@ Which env vars each subsystem needs is documented in `docs/auth.md` (OIDC) and `
 ### `RUST_LOG` and the crate split
 
 A tracing target is the *crate* a span or event was emitted from, so the gateway
-now emits under three targets rather than one:
+now emits under four targets rather than one:
 
 | target | covers |
 |---|---|
 | `gateway` | router, `/v1` proxy, `/api/v0`, OIDC handlers, `main` |
-| `gateway_core` | config, DB, upstreams, RBAC, tools, RAG, skills, the chat driver |
+| `gateway_core` | config, DB, upstreams, RBAC, the tool registry/runner, RAG, skills, the chat driver |
+| `gateway_tools` | the tool implementations (`fetch_url`, `search_web`, typst, document, …) |
 | `gateway_web` | the HTML pages and their SSE patch handlers |
 
 A bare `RUST_LOG=info,gateway=debug` therefore only raises the level for the
 routing glue — page and tool logs stay at `info`. The committed defaults in
 `mise.toml`, `Dockerfile`, `deploy/compose.example.yml`, and
-`deploy/quadlet/gateway.container` all name the three targets explicitly.
+`deploy/quadlet/gateway.container` all name the four targets explicitly.
 
 **If you run the gateway from your own env or unit file, update `RUST_LOG` when
 you deploy this change** — an unchanged filter silently drops page and tool logs
