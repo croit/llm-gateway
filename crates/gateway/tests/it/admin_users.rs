@@ -16,7 +16,7 @@
 use crate::common;
 
 use common::Service as _;
-use gateway::server::db::{audit, users};
+use gateway_core::server::db::{audit, users};
 use jiff::Timestamp;
 use rama::http::{Body, Method, Request, Response, StatusCode};
 

@@ -19,10 +19,10 @@ use rama::http::{Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::rama_server::session::Session;
-use crate::rama_server::state::RamaState;
-use crate::server::db::rag as rag_db;
-use crate::server::db::users;
+use gateway_core::rama_server::session::Session;
+use gateway_core::rama_server::state::RamaState;
+use gateway_core::server::db::rag as rag_db;
+use gateway_core::server::db::users;
 
 /// Wire shape returned from every list / get / update response.
 #[derive(Serialize)]
@@ -230,8 +230,8 @@ pub async fn create_collection(State(state): State<Arc<RamaState>>, req: Request
 /// True when `err` is a SQLite UNIQUE-constraint violation; reaches
 /// through the `DbError::Query(sqlx::Error::Database(...))` envelope
 /// because `DbError`'s `Display` is intentionally terse (`"query"`).
-fn is_unique_violation(err: &crate::server::db::DbError) -> bool {
-    use crate::server::db::DbError;
+fn is_unique_violation(err: &gateway_core::server::db::DbError) -> bool {
+    use gateway_core::server::db::DbError;
     let DbError::Query(sqlx::Error::Database(db_err)) = err else {
         return false;
     };

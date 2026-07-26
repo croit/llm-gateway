@@ -1,0 +1,126 @@
+[package]
+name = "gateway-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The gateway's application body: config, DB + migrations, crypto, RBAC,
+# upstream registry, tool registry + tools, the feature subsystems, and the
+# shared `AppState`/`RamaState` handles. Everything here is below the HTML
+# presentation layer (`gateway-web`) and the routing glue (`gateway`), so a
+# page or router edit never recompiles it. See docs/architecture.md.
+
+[dependencies]
+shared = { path = "../shared" }
+session-core = { path = "../session-core" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+jiff = { workspace = true }
+tracing = { workspace = true }
+
+# Rama HTTP framework. Used here only for the wire types the framework-neutral
+# building blocks hand back and forth (`Body`, `Request`, header maps) plus the
+# datastar SSE helpers — the routing and middleware live in `gateway`.
+rama = { workspace = true }
+# Fenced-code / structured-output scanning in the sandbox `read` tool's
+# `--regex` mode. See `docs/dependencies.md`.
+regex = { workspace = true }
+
+# MCP (Model Context Protocol) client. Lets the gateway connect to external
+# MCP servers — over stdio (subprocess) or streamable HTTP — and surface
+# their tools to the model alongside the built-in ones (see
+# `server::tools::mcp`). `default-features = false` drops the server side +
+# derive macros we don't use; the HTTP transport's reqwest shares the
+# workspace reqwest (inheriting rustls-tls) via Cargo feature unification.
+rmcp = { version = "1.7", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    # rmcp pulls its OWN reqwest (0.13, separate from the workspace's 0.12), so
+    # Cargo feature-unification does NOT give it a TLS backend. Without this the
+    # transport's reqwest can't speak https → every remote MCP connection fails
+    # with hyper's "invalid URL, scheme is not http". This enables rustls on it.
+    "reqwest",
+] }
+
+# Async + I/O. `net` is enabled for the `tls_cert` tool's raw TCP connect
+# (the rest of the workspace pulls it transitively, but we depend on it
+# directly so the build doesn't rely on feature unification).
+tokio = { workspace = true, features = ["net"] }
+reqwest = { workspace = true }
+# Lock-free hot-reload for the upstream registry. Already a transitive dep
+# via rama; listed directly so we can `use arc_swap` without feature luck.
+arc-swap = "1"
+toml = { workspace = true }
+
+# Chat-attachment uploader. Each user-message file lands at
+# `<key_prefix>/<turn_id>/<filename>` in the configured bucket; the
+# resulting object URL goes into the model's `image_url` content
+# parts (and into the `[attached: …]` marker we keep in user_text
+# for replay).
+rust-s3 = { workspace = true }
+
+# Persistence + crypto + IDs.
+sqlx = { workspace = true }
+jsonwebtoken = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }
+# AES-256-GCM at-rest encryption for per-user MCP OAuth tokens + admin-stored
+# connector client secrets (see `server::crypto`). Key from $GATEWAY_ENCRYPTION_KEY,
+# else derived from the session secret. AES-128-GCM (same crate) also encrypts
+# Web Push payloads (`server::push`, RFC 8291).
+aes-gcm = "0.10"
+# Web Push (`server::push`): VAPID signing (P-256 ECDSA / ES256) + RFC 8291
+# payload encryption (P-256 ECDH → HKDF-SHA256 → AES-128-GCM). p256 supplies
+# both ECDSA and ECDH; hkdf the key schedule; base64 the URL-safe wire coding.
+p256 = { version = "0.13", features = ["ecdh"] }
+hkdf = "0.12"
+base64 = "0.22"
+# typst compile scratch dirs (one per render) + RAG index staging.
+tempfile = { workspace = true }
+
+# `tls_cert` tool: a raw rustls handshake (no trust verification — we're
+# *inspecting* the presented cert, including expired/self-signed ones) +
+# x509 parsing for subject/issuer/SAN/validity.
+tokio-rustls = { workspace = true }
+x509-parser = "0.16"
+
+# GeoIP: client-IP → location lookup for the `get_user_location` tool.
+# `ip2location` reads the IP2Location LITE DB11 BIN; `notify` hot-reloads it
+# on change; `zip` unpacks the LITE distribution for the optional updater.
+ip2location = { workspace = true }
+notify = { workspace = true }
+zip = { workspace = true }
+
+# Vector index for the RAG subsystem (one index per collection, mmap'd).
+usearch = { workspace = true }
+
+# PDF reading for the `fetch_attachment` tool. `pdf-extract` is the pure-Rust
+# text tier; `pdfium-render` + `image` rasterise pages to PNG for the
+# vision escalation tier (pdfium loaded dynamically at runtime — see the
+# workspace Cargo.toml for the licensing + native-lib rationale).
+pdf-extract = { workspace = true }
+pdfium-render = { workspace = true }
+image = { workspace = true }
+
+# QR encoding for the `generate_qr_code` tool (rendering is done in-tree
+# via `image`, so this stays a pure encoder dependency).
+qrcode = { workspace = true }
+
+[dev-dependencies]
+# QR *decoder* for the generate_qr_code tests: every rendered code is decoded
+# back and compared to the input, so a rendering regression (colors, logo
+# overlay, quiet zone) that breaks scannability fails the suite.
+rqrr = "0.10"
+# wiremock spins up an in-process HTTP mock that stands in for upstream
+# LLM backends, used by the unit tests that drive the tool runner and the
+# upstream registry without a real model server.
+wiremock = { workspace = true }

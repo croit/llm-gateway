@@ -12,7 +12,7 @@
 use crate::common;
 
 use common::Service as _;
-use gateway::server::scheduled;
+use gateway_core::server::scheduled;
 use rama::http::{Body, Method, Request, StatusCode};
 
 /// Build a urlencoded, cookie-authed form request (what datastar's

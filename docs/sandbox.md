@@ -235,7 +235,7 @@ Mechanics:
 | Path | What |
 |---|---|
 | `crates/sandbox-runner/` | The runner service (warm pool, podman + OCI-runtime orchestration, `/run` API). |
-| `crates/gateway/src/server/tools/sandbox.rs` | The gateway sandbox tools. |
+| `crates/gateway-core/src/server/tools/sandbox.rs` | The gateway sandbox tools. |
 | `crates/shared/src/sandbox.rs` | The runner↔gateway wire contract. |
 | `sandbox-image/` | The gold workload image (`Containerfile` + `sandbox-agent`). |
 | `deploy/sandbox-runner/Containerfile` | The runner image — built by CI; the host runner binary is extracted from it. |

@@ -3,7 +3,7 @@
 
 //! `/api/v0/*` — session-authenticated endpoints used by the web UI.
 //!
-//! Ported from `crate::server::api::tokens` and `chat`. Same wire shapes
+//! Ported from `gateway_core::server::api::tokens` and `chat`. Same wire shapes
 //! (the wire types live in `shared::api`); the only difference is the
 //! auth boundary: tower-sessions → our hand-rolled `SessionStore`, and
 //! axum extractors → rama `Request` + path/query extractors.
@@ -32,11 +32,11 @@ use shared::api::{
 };
 use uuid::Uuid;
 
-use crate::rama_server::pages::{entries_for_roles, valid_keys};
-use crate::rama_server::session::Session;
-use crate::rama_server::state::RamaState;
-use crate::server::auth::token;
-use crate::server::db::{token_tool_prefs, tokens, users};
+use gateway_core::rama_server::session::Session;
+use gateway_core::rama_server::state::RamaState;
+use gateway_core::server::auth::token;
+use gateway_core::server::db::{token_tool_prefs, tokens, users};
+use gateway_web::pages::{entries_for_roles, valid_keys};
 
 // ---------------------------------------------------------------------------
 // Session gate
@@ -94,10 +94,10 @@ pub(crate) async fn me_response(state: &RamaState, user_id: &str) -> Response {
     if let Some(handle) = state.comfyui.as_ref() {
         let snapshot = handle.store.current();
         for id in &allowed_tool_ids {
-            if id.starts_with(crate::server::tools::catalog::COMFYUI_PREFIX)
+            if id.starts_with(gateway_core::server::tools::catalog::COMFYUI_PREFIX)
                 && !allowed_tools.iter().any(|t| &t.id == id)
                 && let Some(manifest_id) =
-                    id.strip_prefix(crate::server::tools::catalog::COMFYUI_PREFIX)
+                    id.strip_prefix(gateway_core::server::tools::catalog::COMFYUI_PREFIX)
                 && let Some(m) = snapshot.lookup(manifest_id)
             {
                 allowed_tools.push(shared::api::ToolSummary {
@@ -385,7 +385,7 @@ pub async fn transcription_models(State(state): State<Arc<RamaState>>, req: Requ
     }
     let models = state
         .upstreams
-        .models_for_kind(crate::server::upstreams::PoolKind::Transcription);
+        .models_for_kind(gateway_core::server::upstreams::PoolKind::Transcription);
     json_ok(&json!({ "data": models }))
 }
 
@@ -512,7 +512,7 @@ pub async fn location_feedback(
     Path(turn_id): Path<String>,
     req: Request,
 ) -> Response {
-    use crate::server::tools::feedback::BrowserFix;
+    use gateway_core::server::tools::feedback::BrowserFix;
 
     let session = match require_session(&state, &req).await {
         Ok(s) => s,
@@ -655,14 +655,14 @@ pub async fn push_subscribe(State(state): State<Arc<RamaState>>, req: Request) -
     // Validate before storing: the gateway later POSTs to `endpoint` on turn
     // completion, so reject non-https / private / loopback targets (blind-SSRF
     // guard) and key material that could only ever fail to encrypt.
-    if let Err(msg) = crate::server::push::validate_subscription(
+    if let Err(msg) = gateway_core::server::push::validate_subscription(
         &parsed.endpoint,
         &parsed.keys.p256dh,
         &parsed.keys.auth,
     ) {
         return invalid_request(&msg);
     }
-    if let Err(err) = crate::server::db::push_subscriptions::upsert(
+    if let Err(err) = gateway_core::server::db::push_subscriptions::upsert(
         &state.db,
         &session.user_id,
         &parsed.endpoint,
@@ -702,7 +702,7 @@ pub async fn push_unsubscribe(State(state): State<Arc<RamaState>>, req: Request)
     };
     // Scoped to the caller: a user can only forget their OWN subscription, so
     // knowing another user's (opaque) endpoint can't be used to unsubscribe them.
-    if let Err(err) = crate::server::db::push_subscriptions::delete_by_endpoint(
+    if let Err(err) = gateway_core::server::db::push_subscriptions::delete_by_endpoint(
         &state.db,
         &session.user_id,
         &parsed.endpoint,

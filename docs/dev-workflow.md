@@ -46,7 +46,7 @@ Anything not covered: add a task to `mise.toml` rather than typing the raw comma
 `mise run dev` runs `cargo run --package gateway`. On startup the binary:
 
 - binds the address from the `IP` / `PORT` env vars (defaults `127.0.0.1` / `8080`);
-- resolves its config file in this order: `$GATEWAY_CONFIG` → `./gateway.toml` → `/etc/gateway/config.toml` (see `Config::resolve_path` in `crates/gateway/src/server/config.rs`). If none is found it boots with built-in defaults (no upstreams, no OIDC);
+- resolves its config file in this order: `$GATEWAY_CONFIG` → `./gateway.toml` → `/etc/gateway/config.toml` (see `Config::resolve_path` in `crates/gateway-core/src/server/config.rs`). If none is found it boots with built-in defaults (no upstreams, no OIDC);
 - opens the SQLite database at `[db].path` (default `gateway.sqlite`) and runs migrations;
 - builds the upstream registry and spawns the health probes;
 - builds the OIDC client if an `[oidc]` block is configured, otherwise starts without login.
@@ -65,7 +65,7 @@ There's no WASM step, no `dx`, no hot reload of HTML — the rama server serves 
 
 Env config is layered through mise, not a `.env` file:
 
-- **`mise.toml` `[env]`** holds the non-secret defaults committed to the repo (`RUST_BACKTRACE=1`, `RUST_LOG=info,gateway=debug`).
+- **`mise.toml` `[env]`** holds the non-secret defaults committed to the repo (`RUST_BACKTRACE=1`, `RUST_LOG=info,gateway=debug,gateway_core=debug,gateway_web=debug`).
 - **`mise.local.toml` `[env]`** holds secrets and machine-local overrides — it is **gitignored**. This is where local dev keys go: `GATEWAY_SESSION_KEY`, `GATEWAY_OIDC_CLIENT_SECRET`, `GATEWAY_ENCRYPTION_KEY`, provider keys (`OPENAI_API_KEY`, `ZAI_API_KEY`, …), etc.
 
 Web-search settings are **not** environment variables any more. Provider, SearXNG URL, and Brave API key live in the database and are set under **Web search** on `/admin/models` (the key sealed at rest like every other gateway secret). `SEARCH_PROVIDER`, `SEARXNG_URL`, and `BRAVE_SEARCH_API_KEY` are still read **once**, at first boot, to fill settings that are still empty — after that they're ignored and the gateway logs that it ignored them.
@@ -73,6 +73,27 @@ Web-search settings are **not** environment variables any more. Provider, SearXN
 Secrets never live in `gateway.toml`. The config holds only the *names* of environment variables (e.g. `api_key_env = "GPU01_KEY"`, `session_key_env = "GATEWAY_SESSION_KEY"`); the gateway reads the actual values from its environment at startup.
 
 Which env vars each subsystem needs is documented in `docs/auth.md` (OIDC) and `docs/upstreams.md` (provider keys).
+
+### `RUST_LOG` and the crate split
+
+A tracing target is the *crate* a span or event was emitted from, so the gateway
+now emits under three targets rather than one:
+
+| target | covers |
+|---|---|
+| `gateway` | router, `/v1` proxy, `/api/v0`, OIDC handlers, `main` |
+| `gateway_core` | config, DB, upstreams, RBAC, tools, RAG, skills, the chat driver |
+| `gateway_web` | the HTML pages and their SSE patch handlers |
+
+A bare `RUST_LOG=info,gateway=debug` therefore only raises the level for the
+routing glue — page and tool logs stay at `info`. The committed defaults in
+`mise.toml`, `Dockerfile`, `deploy/compose.example.yml`, and
+`deploy/quadlet/gateway.container` all name the three targets explicitly.
+
+**If you run the gateway from your own env or unit file, update `RUST_LOG` when
+you deploy this change** — an unchanged filter silently drops page and tool logs
+to whatever the global default is. Note the underscores: crate names are
+normalised, so it's `gateway_core`, not `gateway-core`.
 
 `GATEWAY_SESSION_KEY` — 64 hex chars (32 bytes) for the session-cookie HMAC. When it's unset the binary falls back to an ephemeral random key with a warning; that's fine locally but every restart invalidates open sessions. Generate a stable one with `openssl rand -hex 32`.
 

@@ -18,10 +18,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use gateway::server::db::{self, rag as rag_db};
-use gateway::server::embeddings;
-use gateway::server::rag::worker::{Indexer, IndexerConfig, search_chunks};
-use gateway::server::upstreams::{
+use gateway_core::server::db::{self, rag as rag_db};
+use gateway_core::server::embeddings;
+use gateway_core::server::rag::worker::{Indexer, IndexerConfig, search_chunks};
+use gateway_core::server::upstreams::{
     UpstreamRegistry,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };

@@ -14,8 +14,8 @@
 use crate::common;
 
 use common::Service as _;
-use gateway::server::db::{model_defaults as db_defaults, users};
-use gateway::server::search_settings;
+use gateway_core::server::db::{model_defaults as db_defaults, users};
+use gateway_core::server::search_settings;
 use jiff::Timestamp;
 use rama::http::{Body, Method, Request, StatusCode};
 
@@ -384,7 +384,7 @@ async fn non_admin_search_save_is_403_and_writes_nothing() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert!(
-        gateway::server::db::app_settings::get(&db, search_settings::BRAVE_KEY_KEY)
+        gateway_core::server::db::app_settings::get(&db, search_settings::BRAVE_KEY_KEY)
             .await
             .unwrap()
             .is_none(),
@@ -432,7 +432,7 @@ async fn admin_rejects_an_unknown_provider() {
     // Handled as a flash, not a hard error — but nothing may be persisted.
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(
-        gateway::server::db::app_settings::get(&db, search_settings::PROVIDER_KEY)
+        gateway_core::server::db::app_settings::get(&db, search_settings::PROVIDER_KEY)
             .await
             .unwrap()
             .is_none()
@@ -460,7 +460,7 @@ async fn brave_key_is_stored_sealed_and_a_blank_resave_keeps_it() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Sealed at rest: the row must not contain the plaintext.
-    let raw = gateway::server::db::app_settings::get(&db, search_settings::BRAVE_KEY_KEY)
+    let raw = gateway_core::server::db::app_settings::get(&db, search_settings::BRAVE_KEY_KEY)
         .await
         .unwrap()
         .expect("key row");

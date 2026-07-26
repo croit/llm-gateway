@@ -8,7 +8,7 @@
 use crate::common;
 
 use common::Service as _;
-use gateway::server::upstreams::PoolKind;
+use gateway_core::server::upstreams::PoolKind;
 use rama::http::{Body, Method, Request, StatusCode};
 use serde_json::json;
 use wiremock::matchers::{method, path};
@@ -99,7 +99,7 @@ async fn v1_chat_completions_relays_through_upstream() {
 
 #[tokio::test]
 async fn v1_chat_blocked_by_quota_returns_429() {
-    use gateway::server::db::limits::{self, Dimension, SubjectType, Window};
+    use gateway_core::server::db::limits::{self, Dimension, SubjectType, Window};
 
     let upstream = MockServer::start().await;
     // The backend never needs to answer — enforcement fires before routing.
@@ -140,7 +140,7 @@ async fn v1_chat_blocked_by_quota_returns_429() {
 
 #[tokio::test]
 async fn v1_chat_completion_records_a_usage_row() {
-    use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
+    use gateway_core::server::db::usage::{Filter, Period, aggregate, period_bounds};
     use jiff::Timestamp;
 
     let upstream = MockServer::start().await;
@@ -155,7 +155,7 @@ async fn v1_chat_completion_records_a_usage_row() {
 
     // Opt into a live metered usage sink (the harness default is disabled).
     let state = common::state_with_chat_pool(&upstream.uri()).await;
-    let metered = gateway::server::usage::spawn(state.db.clone(), 90);
+    let metered = gateway_core::server::usage::spawn(state.db.clone(), 90);
     let state = state.with_usage(metered);
     let db = state.db.clone();
     let bearer = common::seed_user_with_token(&state, "alice").await;
@@ -274,7 +274,7 @@ async fn v1_images_generations_without_bearer_is_401() {
 
 #[tokio::test]
 async fn v1_images_generations_records_image_usage_row() {
-    use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
+    use gateway_core::server::db::usage::{Filter, Period, aggregate, period_bounds};
     use jiff::Timestamp;
 
     let upstream = MockServer::start().await;
@@ -287,16 +287,16 @@ async fn v1_images_generations_records_image_usage_row() {
         .await;
 
     let state = common::state_with_pool(&upstream.uri(), PoolKind::Image, "glm-image").await;
-    gateway::server::db::model_defaults::set_pricing_with_unit(
+    gateway_core::server::db::model_defaults::set_pricing_with_unit(
         &state.db,
         "glm-image",
         None,
         Some(0.75),
-        gateway::server::db::model_defaults::PricingUnit::Images,
+        gateway_core::server::db::model_defaults::PricingUnit::Images,
     )
     .await
     .unwrap();
-    let metered = gateway::server::usage::spawn(state.db.clone(), 90);
+    let metered = gateway_core::server::usage::spawn(state.db.clone(), 90);
     let state = state.with_usage(metered);
     let db = state.db.clone();
     let bearer = common::seed_user_with_token(&state, "alice").await;
@@ -330,8 +330,8 @@ async fn v1_images_generations_records_image_usage_row() {
 
 #[tokio::test]
 async fn v1_image_edits_count_all_input_images() {
-    use gateway::server::db::model_defaults::{self, PricingUnit};
-    use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
+    use gateway_core::server::db::model_defaults::{self, PricingUnit};
+    use gateway_core::server::db::usage::{Filter, Period, aggregate, period_bounds};
     use jiff::Timestamp;
 
     let upstream = MockServer::start().await;
@@ -352,7 +352,7 @@ async fn v1_image_edits_count_all_input_images() {
     )
     .await
     .unwrap();
-    let metered = gateway::server::usage::spawn(state.db.clone(), 90);
+    let metered = gateway_core::server::usage::spawn(state.db.clone(), 90);
     let state = state.with_usage(metered);
     let db = state.db.clone();
     let bearer = common::seed_user_with_token(&state, "alice").await;
@@ -391,8 +391,8 @@ async fn v1_image_edits_count_all_input_images() {
 
 #[tokio::test]
 async fn v1_speech_records_character_usage_for_costs() {
-    use gateway::server::db::model_defaults::{self, PricingUnit};
-    use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
+    use gateway_core::server::db::model_defaults::{self, PricingUnit};
+    use gateway_core::server::db::usage::{Filter, Period, aggregate, period_bounds};
     use jiff::Timestamp;
 
     let upstream = MockServer::start().await;
@@ -412,7 +412,7 @@ async fn v1_speech_records_character_usage_for_costs() {
     )
     .await
     .unwrap();
-    let metered = gateway::server::usage::spawn(state.db.clone(), 90);
+    let metered = gateway_core::server::usage::spawn(state.db.clone(), 90);
     let state = state.with_usage(metered);
     let db = state.db.clone();
     let bearer = common::seed_user_with_token(&state, "alice").await;
@@ -811,13 +811,13 @@ async fn state_with_backend_api_key(
     use std::sync::Arc;
 
     use gateway::rama_server::{RamaState, SessionStore};
-    use gateway::server::rbac::Resolver;
-    use gateway::server::tools::ToolRegistry;
-    use gateway::server::upstreams::{
+    use gateway_core::server::rbac::Resolver;
+    use gateway_core::server::tools::ToolRegistry;
+    use gateway_core::server::upstreams::{
         self,
         config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
     };
-    use gateway::server::{AppState, Config, db};
+    use gateway_core::server::{AppState, Config, db};
 
     const ENV_KEY: &str = "TEST_UPSTREAM_KEY";
     // SAFETY: integration tests run in the same process — this set
@@ -862,7 +862,7 @@ async fn state_with_backend_api_key(
     RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     )
 }
 
@@ -873,13 +873,13 @@ async fn state_with_alias_pool(upstream_url: &str) -> gateway::rama_server::Rama
     use std::sync::Arc;
 
     use gateway::rama_server::{RamaState, SessionStore};
-    use gateway::server::rbac::Resolver;
-    use gateway::server::tools::ToolRegistry;
-    use gateway::server::upstreams::{
+    use gateway_core::server::rbac::Resolver;
+    use gateway_core::server::tools::ToolRegistry;
+    use gateway_core::server::upstreams::{
         self,
         config::{AliasSpec, BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
     };
-    use gateway::server::{AppState, Config, db};
+    use gateway_core::server::{AppState, Config, db};
 
     let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
     let mut pools = HashMap::new();
@@ -918,7 +918,7 @@ async fn state_with_alias_pool(upstream_url: &str) -> gateway::rama_server::Rama
     RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     )
 }
 

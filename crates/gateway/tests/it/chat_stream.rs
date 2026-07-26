@@ -15,12 +15,12 @@ use std::sync::Arc;
 
 use common::Service as _;
 use gateway::rama_server::{RamaState, SessionStore, router::router};
-use gateway::server::AppState;
-use gateway::server::config::Config;
-use gateway::server::db;
-use gateway::server::rbac::Resolver;
-use gateway::server::tools::ToolRegistry;
-use gateway::server::upstreams::{
+use gateway_core::server::AppState;
+use gateway_core::server::config::Config;
+use gateway_core::server::db;
+use gateway_core::server::rbac::Resolver;
+use gateway_core::server::tools::ToolRegistry;
+use gateway_core::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
@@ -91,7 +91,7 @@ async fn state_with_streaming_chat(upstream_uri: &str) -> RamaState {
     RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     )
 }
 
@@ -205,7 +205,7 @@ async fn message_send_emits_initial_bubbles_and_finalizes_signal() {
 
 #[tokio::test]
 async fn chat_turn_records_a_usage_row_with_source_chat() {
-    use gateway::server::db::usage::{Filter, Period, aggregate, period_bounds};
+    use gateway_core::server::db::usage::{Filter, Period, aggregate, period_bounds};
     use jiff::Timestamp;
 
     // Content deltas, then the trailing `usage` frame the driver asks for via
@@ -222,7 +222,7 @@ async fn chat_turn_records_a_usage_row_with_source_chat() {
 
     // Opt into a live metered sink before wrapping the state in an Arc.
     let state = state_with_streaming_chat(&upstream.uri()).await;
-    let metered = gateway::server::usage::spawn(state.db.clone(), 90);
+    let metered = gateway_core::server::usage::spawn(state.db.clone(), 90);
     let state = state.with_usage(metered);
     let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
     let session = chat::create_session(&state.db, "alice").await.unwrap();

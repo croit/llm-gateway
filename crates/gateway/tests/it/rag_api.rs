@@ -44,7 +44,7 @@ fn create_body() -> &'static str {
 /// `admin_models.rs`. Must be paired with `state_with_admin_rbac`, whose
 /// resolver maps the `"admin"` OIDC value to an admin-flagged role.
 async fn seed_admin(state: &gateway::rama_server::RamaState, user_id: &str) -> String {
-    use gateway::server::db::users;
+    use gateway_core::server::db::users;
     use jiff::Timestamp;
     let cookie = common::seed_session(state, user_id, &format!("{user_id}@example.com")).await;
     let now = Timestamp::now();
@@ -190,7 +190,7 @@ async fn full_create_get_list_update_reindex_delete_round_trip() {
     {
         // Move status off 'pending' by writing the DB directly so we
         // can prove reindex flips it back.
-        use gateway::server::db::rag as rag_db;
+        use gateway_core::server::db::rag as rag_db;
         rag_db::mark_failed(&db, id, "manual force").await.unwrap();
     }
     let resp = app

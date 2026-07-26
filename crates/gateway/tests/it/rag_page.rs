@@ -32,7 +32,7 @@ async fn seed_session_with_roles(
     email: &str,
     roles: Vec<String>,
 ) -> String {
-    use gateway::server::db::users;
+    use gateway_core::server::db::users;
     let now = Timestamp::now();
     users::upsert(
         &state.db,
@@ -163,7 +163,7 @@ async fn admin_reindex_flips_status_back_to_pending() {
         seed_session_with_roles(&state, "boss", "boss@example.com", vec!["admin".into()]).await;
     // Seed a collection directly through the DB so we don't depend on
     // the create path.
-    use gateway::server::db::rag as rag_db;
+    use gateway_core::server::db::rag as rag_db;
     let c = rag_db::create_collection(
         &state.db,
         &rag_db::NewCollection {
@@ -208,7 +208,7 @@ async fn admin_delete_removes_row() {
     let state = common::state_with_admin_rbac("http://unused.invalid").await;
     let cookie =
         seed_session_with_roles(&state, "boss", "boss@example.com", vec!["admin".into()]).await;
-    use gateway::server::db::rag as rag_db;
+    use gateway_core::server::db::rag as rag_db;
     let c = rag_db::create_collection(
         &state.db,
         &rag_db::NewCollection {
@@ -255,7 +255,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
     // state_with_admin_rbac wires a Chat pool only; the RAG page falls back
     // to a text input there. Construct a state with an embedding pool seeded
     // so the dropdown branch is exercised end-to-end.
-    use gateway::server::upstreams::{
+    use gateway_core::server::upstreams::{
         UpstreamRegistry,
         config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
     };
@@ -329,11 +329,11 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
     // Build a state around that registry, otherwise mirroring
     // state_with_admin_rbac.
     use gateway::rama_server::{RamaState, SessionStore};
-    use gateway::server::db;
-    use gateway::server::rbac::Resolver;
-    use gateway::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
-    use gateway::server::tools::ToolRegistry;
-    use gateway::server::{AppState, Config};
+    use gateway_core::server::db;
+    use gateway_core::server::rbac::Resolver;
+    use gateway_core::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
+    use gateway_core::server::tools::ToolRegistry;
+    use gateway_core::server::{AppState, Config};
     let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
     let tools = Arc::new(ToolRegistry::new());
     let rbac = Arc::new(
@@ -361,7 +361,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
     let state = RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     );
 
     let cookie =
@@ -387,7 +387,7 @@ async fn admin_edit_form_then_update_round_trip() {
     let state = common::state_with_admin_rbac("http://unused.invalid").await;
     let cookie =
         seed_session_with_roles(&state, "boss", "boss@example.com", vec!["admin".into()]).await;
-    use gateway::server::db::rag as rag_db;
+    use gateway_core::server::db::rag as rag_db;
     let c = rag_db::create_collection(
         &state.db,
         &rag_db::NewCollection {
@@ -471,7 +471,7 @@ async fn update_with_empty_pat_keeps_existing_pat() {
     let state = common::state_with_admin_rbac("http://unused.invalid").await;
     let cookie =
         seed_session_with_roles(&state, "boss", "boss@example.com", vec!["admin".into()]).await;
-    use gateway::server::db::rag as rag_db;
+    use gateway_core::server::db::rag as rag_db;
     let c = rag_db::create_collection(
         &state.db,
         &rag_db::NewCollection {
@@ -521,7 +521,7 @@ async fn cancel_edit_returns_display_row_without_saving() {
     let state = common::state_with_admin_rbac("http://unused.invalid").await;
     let cookie =
         seed_session_with_roles(&state, "boss", "boss@example.com", vec!["admin".into()]).await;
-    use gateway::server::db::rag as rag_db;
+    use gateway_core::server::db::rag as rag_db;
     let c = rag_db::create_collection(
         &state.db,
         &rag_db::NewCollection {
@@ -577,7 +577,7 @@ async fn non_admin_post_is_forbidden() {
 
 #[tokio::test]
 async fn admin_can_add_set_primary_reindex_and_delete_refs() {
-    use gateway::server::db::rag as rag_db;
+    use gateway_core::server::db::rag as rag_db;
     let state = common::state_with_admin_rbac("http://unused.invalid").await;
     let cookie =
         seed_session_with_roles(&state, "boss", "boss@example.com", vec!["admin".into()]).await;
@@ -700,7 +700,7 @@ async fn admin_can_add_set_primary_reindex_and_delete_refs() {
 /// URLs, so editing lives on the row, not the collection.
 #[tokio::test]
 async fn admin_edits_a_source_url_and_ref() {
-    use gateway::server::db::rag as rag_db;
+    use gateway_core::server::db::rag as rag_db;
     let state = common::state_with_admin_rbac("http://unused.invalid").await;
     let cookie =
         seed_session_with_roles(&state, "boss", "boss@example.com", vec!["admin".into()]).await;
@@ -796,7 +796,7 @@ async fn admin_edits_a_source_url_and_ref() {
 
 #[tokio::test]
 async fn admin_creates_aggregate_collection_and_bulk_adds_sources() {
-    use gateway::server::db::rag as rag_db;
+    use gateway_core::server::db::rag as rag_db;
     let state = common::state_with_admin_rbac("http://unused.invalid").await;
     let cookie =
         seed_session_with_roles(&state, "boss", "boss@example.com", vec!["admin".into()]).await;

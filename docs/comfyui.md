@@ -215,8 +215,8 @@ ComfyUI tools register like any other tool: per-role `tools = ["comfyui_text_to_
 | Operator config (`base_url`, `content_dir`, timeouts) | `gateway.toml` `[comfyui]` |
 | Workflow JSON (model paths, samplers, nodes) | `content_dir/<workflow>/workflow.json` |
 | Tool surface (id, params, descriptions) | `content_dir/<workflow>/manifest.toml` |
-| HTTP client + execution loop | `crates/gateway/src/server/comfyui/` |
-| Tool registration | `crates/gateway/src/server/tools/comfyui_workflow.rs` (one tool impl, parameterised by manifest) |
+| HTTP client + execution loop | `crates/gateway-core/src/server/comfyui/` |
+| Tool registration | `crates/gateway-core/src/server/tools/comfyui_workflow.rs` (one tool impl, parameterised by manifest) |
 
 ## Roadmap
 

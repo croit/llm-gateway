@@ -12,20 +12,20 @@ use std::sync::Arc;
 
 use common::Service as _;
 use gateway::rama_server::{RamaState, SessionStore, router::router};
-use gateway::server::db::{self, user_tool_prefs, users};
-use gateway::server::rbac::Resolver;
-use gateway::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
-use gateway::server::tools::ToolRegistry;
-use gateway::server::tools::echo::Echo;
-use gateway::server::tools::fetch_url::FetchUrl;
-use gateway::server::tools::memory::{Recall, Remember};
-use gateway::server::tools::search_web::SearchWeb;
-use gateway::server::tools::time::CurrentTimestamp;
-use gateway::server::upstreams::{
+use gateway_core::server::db::{self, user_tool_prefs, users};
+use gateway_core::server::rbac::Resolver;
+use gateway_core::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
+use gateway_core::server::tools::ToolRegistry;
+use gateway_core::server::tools::echo::Echo;
+use gateway_core::server::tools::fetch_url::FetchUrl;
+use gateway_core::server::tools::memory::{Recall, Remember};
+use gateway_core::server::tools::search_web::SearchWeb;
+use gateway_core::server::tools::time::CurrentTimestamp;
+use gateway_core::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
-use gateway::server::{AppState, Config};
+use gateway_core::server::{AppState, Config};
 use jiff::{SignedDuration, Timestamp};
 use rama::http::{Body, Method, Request, StatusCode};
 use serde_json::json;
@@ -101,7 +101,7 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
     RamaState::new(
         app,
         sessions,
-        gateway::server::usage::UsageHandle::disabled(),
+        gateway_core::server::usage::UsageHandle::disabled(),
     )
 }
 
@@ -267,8 +267,8 @@ async fn cannot_toggle_a_tool_the_roles_dont_grant() {
 
 /// Seed an `admin`-role user with a bearer token for the `/v1` proxy.
 async fn seed_admin_with_bearer(state: &RamaState, user_id: &str) -> String {
-    use gateway::server::auth::token;
-    use gateway::server::db::tokens;
+    use gateway_core::server::auth::token;
+    use gateway_core::server::db::tokens;
     let _ = seed_session_with_roles(state, user_id, &["admin"]).await;
     let (plaintext, hash) = token::mint();
     tokens::insert(
@@ -427,8 +427,8 @@ async fn seed_bearer_with_tools(
     user_id: &str,
     tools_enabled: bool,
 ) -> (String, String) {
-    use gateway::server::auth::token;
-    use gateway::server::db::tokens;
+    use gateway_core::server::auth::token;
+    use gateway_core::server::db::tokens;
     let _ = seed_session_with_roles(state, user_id, &["admin"]).await;
     let (plaintext, hash) = token::mint();
     let id = Uuid::new_v4().to_string();

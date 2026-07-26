@@ -22,10 +22,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use gateway::server::db;
-use gateway::server::db::rag as rag_db;
-use gateway::server::rag::worker::{Indexer, IndexerConfig, search_chunks};
-use gateway::server::upstreams::{
+use gateway_core::server::db;
+use gateway_core::server::db::rag as rag_db;
+use gateway_core::server::rag::worker::{Indexer, IndexerConfig, search_chunks};
+use gateway_core::server::upstreams::{
     UpstreamRegistry,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
@@ -177,7 +177,7 @@ async fn seed_collection(
         )
         .await
         .unwrap();
-        let v = gateway::server::embeddings::embed(
+        let v = gateway_core::server::embeddings::embed(
             &reqwest::Client::new(),
             reg,
             EMBED_MODEL,

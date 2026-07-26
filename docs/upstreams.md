@@ -15,7 +15,7 @@ request.model ──► [walk pools matching kind] ──► [pool whose backend
     - A picker strategy (`round_robin`, `least_inflight`). Default: `least_inflight`.
     - Implicit "what we serve" — the union of all backends' advertised-model sets.
 
-`crates/gateway/src/server/upstreams/` owns the runtime: the topology is loaded from the database (edited in the UI at `/admin/upstreams`), `registry.rs` walks pools per request, and `health.rs` runs the probe loop.
+`crates/gateway-core/src/server/upstreams/` owns the runtime: the topology is loaded from the database (edited in the UI at `/admin/upstreams`), `registry.rs` walks pools per request, and `health.rs` runs the probe loop.
 
 ## Configuring pools & backends
 

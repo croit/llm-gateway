@@ -40,7 +40,7 @@ typst = "0.15.0"
 
 [env]
 RUST_BACKTRACE = "1"
-RUST_LOG = "info,gateway=debug"
+RUST_LOG = "info,gateway=debug,gateway_core=debug,gateway_web=debug"
 # Secrets (API keys, tokens) go in the gitignored `mise.local.toml`, not
 # here. Web-search settings are the exception in the other direction: they
 # live in the DB and are set under "Web search" on /admin/models (the legacy
@@ -112,10 +112,12 @@ outputs = ["ui/node_modules/.package-lock.json"]
 run = "npm --prefix ui ci --no-audit --no-fund"
 
 [tasks.build-css]
-description = "Build the daisyUI/Tailwind CSS bundle into crates/session-core/assets/app.css. The gateway embeds this bundle via include_bytes! through session_core::assets; the @source globs in ui/src/main.css scan the gateway and session-core source files so utility classes used in either survive the Tailwind tree-shake."
+description = "Build the daisyUI/Tailwind CSS bundle into crates/session-core/assets/app.css. The gateway embeds this bundle via include_bytes! through session_core::assets; the @source globs in ui/src/main.css scan the gateway-web / gateway-core / gateway and session-core source files so utility classes used in any of them survive the Tailwind tree-shake."
 depends = ["npm-install"]
 sources = [
     "ui/src/main.css",
+    "crates/gateway-web/src/**/*.rs",
+    "crates/gateway-core/src/**/*.rs",
     "crates/gateway/src/**/*.rs",
     "crates/session-core/src/**/*.rs",
 ]

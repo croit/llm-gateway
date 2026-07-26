@@ -17,9 +17,9 @@ use std::sync::Arc;
 use rama::http::service::web::extract::State;
 use rama::http::{Request, Response, StatusCode, header};
 
-use crate::rama_server::auth::require_bearer;
-use crate::rama_server::state::RamaState;
-use crate::server::chat_attachments;
+use gateway_core::rama_server::auth::require_bearer;
+use gateway_core::rama_server::state::RamaState;
+use gateway_core::server::chat_attachments;
 
 const PREFIX: &str = "/v1/sandbox/files/";
 

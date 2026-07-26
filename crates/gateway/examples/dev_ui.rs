@@ -28,16 +28,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gateway::rama_server::{RamaState, SessionStore, router};
-use gateway::server::config::{FeedbackConfig, GatewayConfig, SkillsConfig};
-use gateway::server::rbac::RoleConfig;
-use gateway::server::rbac::{Resolver, config::RbacConfig, config::RoleMapping};
-use gateway::server::skills::{SkillStore, UserSkillStore};
-use gateway::server::tools::{ToolRegistry, echo, fetch_url, read_skill, search_web, time};
-use gateway::server::upstreams::{
+use gateway_core::server::config::{FeedbackConfig, GatewayConfig, SkillsConfig};
+use gateway_core::server::rbac::RoleConfig;
+use gateway_core::server::rbac::{Resolver, config::RbacConfig, config::RoleMapping};
+use gateway_core::server::skills::{SkillStore, UserSkillStore};
+use gateway_core::server::tools::{ToolRegistry, echo, fetch_url, read_skill, search_web, time};
+use gateway_core::server::upstreams::{
     self,
     config::{BackendConfig, PickerStrategy, PoolKind, UpstreamPoolConfig},
 };
-use gateway::server::{AppState, Config, db};
+use gateway_core::server::{AppState, Config, db};
 use jiff::{Timestamp, ToSpan};
 use rama::net::address::SocketAddress;
 use wiremock::matchers::{method, path};
@@ -283,7 +283,7 @@ async fn main() -> anyhow::Result<()> {
     // live "up" backends. Backends here carry no API key, so the crypto instance
     // is never actually used to seal anything. Fresh in-memory DB every boot, so
     // this always runs (no seed marker like main.rs).
-    let crypto = gateway::server::crypto::Crypto::from_env_or_session(&SESSION_SECRET);
+    let crypto = gateway_core::server::crypto::Crypto::from_env_or_session(&SESSION_SECRET);
     db::upstreams_config::seed_from_config(&pool, &pools, &Default::default(), &crypto).await?;
     // Run the initial probe round so each backend's `/models` set is
     // populated before we start serving requests. Without this, the
@@ -414,17 +414,17 @@ async fn main() -> anyhow::Result<()> {
     // seeding), then build the resolver from the DB snapshot — so `/admin/groups`
     // shows the seeded groups and an edit + `reload_rbac` round-trips through the
     // same DB path production uses. `bootstrap_admin_groups` keeps `dev` admin.
-    gateway::server::db::gateway_groups::seed_from_config(&pool, &dev_rbac, &config.roles)
+    gateway_core::server::db::gateway_groups::seed_from_config(&pool, &dev_rbac, &config.roles)
         .await
         .expect("dev_ui RBAC seed");
-    let group_snapshot = gateway::server::db::gateway_groups::load_snapshot(&pool)
+    let group_snapshot = gateway_core::server::db::gateway_groups::load_snapshot(&pool)
         .await
         .expect("dev_ui load groups");
     let rbac = Arc::new(Resolver::from_snapshot(
         group_snapshot,
         config.gateway.bootstrap_admin_groups.clone(),
     ));
-    if let Ok(grants) = gateway::server::db::skill_grants::all(&pool).await {
+    if let Ok(grants) = gateway_core::server::db::skill_grants::all(&pool).await {
         rbac.set_skill_grant_overlay(grants);
     }
     let user_skill_store = Arc::new(UserSkillStore::new(skills_dir.join(".users")));
@@ -447,12 +447,12 @@ async fn main() -> anyhow::Result<()> {
     // Enabled usage handle (90-day retention) so the /usage page renders real
     // aggregates instead of the "metrics disabled" banner. Spawn before the
     // pool is moved into the session store.
-    let usage = gateway::server::usage::spawn(pool.clone(), 90);
+    let usage = gateway_core::server::usage::spawn(pool.clone(), 90);
     let sessions = SessionStore::new(pool, SESSION_SECRET);
     let state = RamaState::new(app, sessions, usage);
 
     // --- Seed a user + session so the authed UI is reachable ---------
-    use gateway::server::db::users;
+    use gateway_core::server::db::users;
     let now = Timestamp::now();
     users::upsert(
         &state.db,
@@ -526,8 +526,8 @@ async fn main() -> anyhow::Result<()> {
 /// scheduled actions, and two indexed RAG collections. All owned by the
 /// `dev` user. In-memory DB, so this is rebuilt fresh on every launch.
 async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
-    use gateway::server::db::rag;
-    use gateway::server::scheduled::{self, NewAction};
+    use gateway_core::server::db::rag;
+    use gateway_core::server::scheduled::{self, NewAction};
     use session_core::attachments;
     use session_core::db::{self as chatdb, ToolCallStatus, TurnStatus};
 
@@ -720,7 +720,7 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
     // connectors generic example.com URLs + a demo client id, then enable them
     // so both the admin store and the user connect surface render populated.
     // No real endpoints, credentials, or connections — nothing user-specific.
-    use gateway::server::db::mcp_catalog;
+    use gateway_core::server::db::mcp_catalog;
     mcp_catalog::seed_defaults(&state.db).await?;
     sqlx::query("UPDATE mcp_catalog_connectors SET url = ? WHERE key = ?")
         .bind("https://gworkspace-mcp.example.com/mcp")
@@ -756,7 +756,7 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
         .await?;
     mcp_catalog::set_enabled(&state.db, "discord", true).await?;
     {
-        use gateway::server::db::mcp_audit;
+        use gateway_core::server::db::mcp_audit;
         mcp_audit::record(
             &state.db,
             "dev",
@@ -799,8 +799,8 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
     // `hash` is a throwaway string: the page only lists tokens, it doesn't
     // authenticate with them. `created_at` is backdated; `touch`/`revoke`
     // stamp last-used / revoked-at to "now".
-    use gateway::server::db::tokens;
-    use gateway::server::db::users;
+    use gateway_core::server::db::tokens;
+    use gateway_core::server::db::users;
     let tnow = Timestamp::now();
     // (name, created N days ago, then: "used" | "unused" | "revoked")
     let seed_tokens = [
@@ -885,7 +885,7 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
     // week of history across a couple of models, sources, and kinds — with a
     // few 4xx/5xx so the "errors" stat is non-zero. `insert_batch` writes both
     // the raw event and the daily rollup, so any period renders.
-    use gateway::server::db::usage as usage_db;
+    use gateway_core::server::db::usage as usage_db;
     use usage_db::{UsageKind, UsageRecord, UsageSource};
     let mut usage_rows: Vec<UsageRecord> = Vec::new();
     // (hours-ago, source, kind, model, status, prompt, completion)
@@ -1073,7 +1073,7 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
     // Price the two demo chat models BEFORE inserting usage, so the batched
     // writer computes a real `cost` on each seeded row (→ the /usage cost
     // column + the cost limit bar show non-zero spend).
-    use gateway::server::db::model_defaults;
+    use gateway_core::server::db::model_defaults;
     model_defaults::set_pricing(&state.db, "demo-model", Some(0.5), Some(1.5)).await?;
     model_defaults::set_pricing(&state.db, "demo-model-pro", Some(3.0), Some(15.0)).await?;
 
@@ -1081,7 +1081,7 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
 
     // A spread of demo limit rules so /admin/limits shows a populated table and
     // the /usage "Your limits" bars render (global rules apply to `dev`).
-    use gateway::server::db::limits::{self, Dimension, SubjectType, Window};
+    use gateway_core::server::db::limits::{self, Dimension, SubjectType, Window};
     limits::upsert(
         &state.db,
         SubjectType::Global,

@@ -4,8 +4,8 @@
  * theme system on top of Tailwind v4 — no React, no JS-side component
  * library. We use the class names directly in the rama page handlers.
  *
- * Output bundle: `../crates/gateway/assets/app.css`, served via the
- * rama server's `assets::app_css` handler.
+ * Output bundle: `../crates/session-core/assets/app.css`, embedded via
+ * `include_bytes!` and served through `session_core::assets`.
  */
 
 @import "tailwindcss";
@@ -149,15 +149,21 @@
  * transcript bubbles, composer) — its source files have to scan
  * too, otherwise utility classes that only appear there (e.g.
  * `animate-spin` on the spinner icon, the `chat-prose` rules'
- * dependencies) get dropped from the compiled bundle. */
-@source "../../crates/gateway/src/rama_server/**/*.rs";
+ * dependencies) get dropped from the compiled bundle.
+ *
+ * The page HTML lives in `gateway-web`; the routing glue in `gateway` emits
+ * a little markup of its own (error envelopes, redirects), so both scan. If
+ * a crate ever moves again, these globs move with it — a stale glob doesn't
+ * fail the build, it silently tree-shakes the classes away and the pages
+ * render unstyled. */
+@source "../../crates/gateway-web/src/**/*.rs";
+@source "../../crates/gateway/src/**/*.rs";
 /* Tool implementations inject their own HTML over SSE — the in-chat
  * "share your location?" card lives in `server/tools/location.rs`. Scan
  * the tools tree (the only server code that emits HTML), or its utility
  * classes (`btn-xs`, `border-l-warning`, …) silently drop out of the
  * bundle and the injected markup renders unstyled. */
-@source "../../crates/gateway/src/server/tools/**/*.rs";
-@source "../../crates/gateway/assets/app.js";
+@source "../../crates/gateway-core/src/server/tools/**/*.rs";
 @source "../../crates/session-core/src/**/*.rs";
 @source "../../crates/session-core/ui/ts/**/*.ts";
 

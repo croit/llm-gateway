@@ -16,9 +16,9 @@ use rama::http::{Request, Response, StatusCode, header};
 use serde::Serialize;
 use serde_json::json;
 
-use crate::rama_server::state::RamaState;
-use crate::server::comfyui::ReloadReport;
-use crate::server::db::users;
+use gateway_core::rama_server::state::RamaState;
+use gateway_core::server::comfyui::ReloadReport;
+use gateway_core::server::db::users;
 
 /// `POST /api/v0/comfyui/reload` — re-scan `[comfyui] content_dir` and
 /// atomically swap in the new catalog. In-flight tool calls keep their

@@ -13,9 +13,9 @@ use crate::common;
 
 use common::Service as _;
 use gateway::rama_server::RamaState;
-use gateway::server::crypto::Crypto;
-use gateway::server::db::push_subscriptions;
-use gateway::server::push::PushSender;
+use gateway_core::server::crypto::Crypto;
+use gateway_core::server::db::push_subscriptions;
+use gateway_core::server::push::PushSender;
 use rama::http::{Body, Method, Request, StatusCode};
 use std::sync::Arc;
 

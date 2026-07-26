@@ -1,0 +1,35 @@
+[package]
+name = "gateway-web"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The gateway's server-rendered HTML presentation layer: every `/`, `/chat`,
+# `/tokens`, `/admin/*` page plus the datastar SSE patch handlers. A pure sink —
+# nothing below it (`gateway-core`) references it, and only the router in
+# `gateway` mounts it. Keeping it its own compilation unit is what makes a page
+# edit a leaf-crate rebuild. See docs/architecture.md.
+
+[dependencies]
+gateway-core = { path = "../gateway-core" }
+session-core = { path = "../session-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jiff = { workspace = true }
+tracing = { workspace = true }
+
+# Rama HTTP framework — request/response types and the datastar SSE helpers
+# the page handlers return.
+rama = { workspace = true }
+# HTML templating macro for handler-side server-rendered pages.
+plait = { workspace = true }
+# Form-body parsing for the page-level POST handlers.
+serde_urlencoded = { workspace = true }
+# Multipart parsing for the page-level file uploads (skill bundles, chat
+# attachments, RAG document drops).
+multer = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }

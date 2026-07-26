@@ -3,7 +3,7 @@
 
 //! `/auth/login`, `/auth/callback`, `/auth/logout` for the rama server.
 //!
-//! Re-implements the axum version (`crate::server::api::auth`) on top of
+//! Re-implements the axum version (`gateway_core::server::api::auth`) on top of
 //! our hand-rolled session store + a new `pending_logins` DB table. The
 //! tower-sessions key/value bag is replaced by a row keyed on the OIDC
 //! `state` parameter — that value already round-trips through the IdP
@@ -20,9 +20,9 @@ use rama::http::{Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::rama_server::session::{COOKIE_NAME, read_cookie};
-use crate::rama_server::state::RamaState;
-use crate::server::db::users;
+use gateway_core::rama_server::session::{COOKIE_NAME, read_cookie};
+use gateway_core::rama_server::state::RamaState;
+use gateway_core::server::db::users;
 
 /// TTL for the in-flight `pending_logins` row. Generous because some
 /// IdPs (Authentik, Keycloak's account-linking flows) bounce the user
@@ -56,7 +56,9 @@ pub async fn login(
 
     let start = oidc.begin();
     let now = Timestamp::now();
-    let return_to = params.return_to.filter(|rt| is_safe_return_to(rt));
+    let return_to = params
+        .return_to
+        .filter(|rt| gateway_core::rama_server::session::is_safe_return_to(rt));
 
     let res = sqlx::query(
         "INSERT INTO pending_logins
@@ -226,7 +228,7 @@ pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Resp
     // should drop straight into a conversation, not a dashboard. An
     // explicit, same-origin `return_to` still wins.
     let target = return_to
-        .filter(|rt| is_safe_return_to(rt))
+        .filter(|rt| gateway_core::rama_server::session::is_safe_return_to(rt))
         .unwrap_or_else(|| "/chat".into());
     // Flow complete — clear the login-binding cookie.
     let clear_binding =
@@ -275,16 +277,6 @@ fn redirect_to_with_binding(url: &str, state: &str) -> Response {
         .unwrap()
 }
 
-/// True if `p` is a safe *same-origin* redirect target. `starts_with('/')`
-/// is not enough: `//evil.com` and `/\evil.com` are protocol-relative URLs
-/// (browsers normalise `\`→`/`), so a naive check would let a post-login
-/// redirect bounce the user to an attacker's host. Leading ASCII
-/// whitespace is trimmed first, since browsers strip it before resolving.
-pub(crate) fn is_safe_return_to(p: &str) -> bool {
-    let p = p.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    p.starts_with('/') && !p.starts_with("//") && !p.starts_with("/\\")
-}
-
 fn error_html(status: StatusCode, message: &str) -> Response {
     // Same OpenAI-ish JSON envelope as the proxy routes so monitoring
     // tooling parses both paths uniformly. /auth/* errors aren't really
@@ -301,37 +293,4 @@ fn error_html(status: StatusCode, message: &str) -> Response {
         .header(header::CONTENT_TYPE, "application/json")
         .body(body.to_string().into())
         .unwrap()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_safe_return_to;
-
-    #[test]
-    fn accepts_local_paths() {
-        assert!(is_safe_return_to("/"));
-        assert!(is_safe_return_to("/chat/abc"));
-        assert!(is_safe_return_to("/chat/shared-1?x=1"));
-    }
-
-    #[test]
-    fn rejects_protocol_relative_and_absolute_urls() {
-        // The whole point of the guard: these all pass `starts_with('/')`
-        // (or look local) yet resolve off-origin in a browser.
-        assert!(!is_safe_return_to("//evil.com"));
-        assert!(!is_safe_return_to("/\\evil.com"));
-        assert!(!is_safe_return_to("https://evil.com"));
-        assert!(!is_safe_return_to("http://evil.com"));
-        assert!(!is_safe_return_to("evil.com"));
-        assert!(!is_safe_return_to(""));
-    }
-
-    #[test]
-    fn rejects_whitespace_smuggled_protocol_relative() {
-        // Browsers strip leading whitespace before resolving, so we must
-        // trim before checking, else `\t//evil.com` would slip through.
-        assert!(!is_safe_return_to("  //evil.com"));
-        assert!(!is_safe_return_to("\t//evil.com"));
-        assert!(!is_safe_return_to("\n//evil.com"));
-    }
 }

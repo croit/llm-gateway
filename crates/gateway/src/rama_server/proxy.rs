@@ -3,11 +3,11 @@
 
 //! Rama-side handlers for the OpenAI-compatible proxy routes.
 //!
-//! Reuses the `UpstreamRegistry` from `crate::server::upstreams` verbatim
+//! Reuses the `UpstreamRegistry` from `gateway_core::server::upstreams` verbatim
 //! — that module has no axum coupling. Only the request/response edges are
 //! rewritten for rama's body model.
 //!
-//! The header policy mirrors `crate::server::api::proxy`: client
+//! The header policy mirrors `gateway_core::server::api::proxy`: client
 //! `Authorization` is stripped, upstream `api_key_env` is injected,
 //! hop-by-hop headers are filtered both directions.
 
@@ -26,19 +26,19 @@ use std::time::Instant;
 
 use jiff::Timestamp;
 
-use crate::rama_server::auth::require_bearer;
-use crate::rama_server::state::RamaState;
 use crate::rama_server::vad;
-use crate::server::auth::UserCtx;
-use crate::server::db::usage::{self, UnitUsage, UsageKind, UsageRecord, UsageSource};
-use crate::server::speech::{self, SpokenMarkers};
-use crate::server::tools::ToolContext;
-use crate::server::tools::ToolSource;
-use crate::server::tools::runner::ToolCallAcc;
-use crate::server::tools::runner::{self, LoopError};
-use crate::server::upstreams::registry::{Acquired, RouteError};
-use crate::server::upstreams::{AcquireError, PoolKind};
-use crate::server::usage::UsageHandle;
+use gateway_core::rama_server::auth::require_bearer;
+use gateway_core::rama_server::state::RamaState;
+use gateway_core::server::auth::UserCtx;
+use gateway_core::server::db::usage::{self, UnitUsage, UsageKind, UsageRecord, UsageSource};
+use gateway_core::server::speech::{self, SpokenMarkers};
+use gateway_core::server::tools::ToolContext;
+use gateway_core::server::tools::ToolSource;
+use gateway_core::server::tools::runner::ToolCallAcc;
+use gateway_core::server::tools::runner::{self, LoopError};
+use gateway_core::server::upstreams::registry::{Acquired, RouteError};
+use gateway_core::server::upstreams::{AcquireError, PoolKind};
+use gateway_core::server::usage::UsageHandle;
 use session_core::i18n::{Lang, t};
 
 /// Identity + classification for a usage measurement, built once per
@@ -117,7 +117,7 @@ impl RecordParams {
 
 /// Pre-flight rate-limit / quota gate for a bearer (`/v1`) call. Returns the
 /// `429` to send when the caller is over a limit, else `None`. Resolves the
-/// caller's role ids and consults the shared [`crate::server::limits::Enforcer`].
+/// caller's role ids and consults the shared [`gateway_core::server::limits::Enforcer`].
 async fn limit_check(state: &RamaState, user: &UserCtx) -> Option<Response> {
     let role_ids = state.role_ids_for(&user.roles);
     match state.enforcer.check(&user.user_id, &role_ids).await {
@@ -138,7 +138,7 @@ fn fmt_limit_num(n: f64) -> String {
 
 /// A `429 Too Many Requests` with an OpenAI-shaped error envelope and a
 /// `Retry-After` header, naming the breached limit.
-fn limit_exceeded_response(e: &crate::server::limits::LimitExceeded) -> Response {
+fn limit_exceeded_response(e: &gateway_core::server::limits::LimitExceeded) -> Response {
     let scope = e
         .model
         .as_deref()
@@ -191,7 +191,7 @@ fn response_metrics(kind: UsageKind, bytes: &Bytes) -> (TokenUsage, UnitUsage) {
     }
     if kind == UsageKind::Image {
         units.output =
-            crate::server::image_gen::image_output_units_from_value(&value).or(units.output);
+            gateway_core::server::image_gen::image_output_units_from_value(&value).or(units.output);
     }
     (usage::usage_from_value(&value), units)
 }
@@ -215,7 +215,7 @@ fn request_units(kind: UsageKind, body: &Bytes) -> UnitUsage {
 }
 
 fn image_edit_units(fields: &[MultipartField]) -> Option<f64> {
-    crate::server::image_gen::image_units(
+    gateway_core::server::image_gen::image_units(
         fields
             .iter()
             .filter(|field| field.name == "image" || field.name == "image[]")
@@ -283,7 +283,7 @@ fn proxy_tool_ctx(
         // refuse to run here anyway (they require `assistant_turn_id`).
         attachment_reservations: None,
         indexer: state.indexer.clone(),
-        image_gen: Some(crate::server::image_gen::ImageGenerator::new(
+        image_gen: Some(gateway_core::server::image_gen::ImageGenerator::new(
             state.upstreams.clone(),
             state.http.clone(),
             state.usage.clone(),
@@ -295,7 +295,7 @@ fn proxy_tool_ctx(
         sandbox_lease: state
             .sandbox_client
             .clone()
-            .map(crate::server::tools::sandbox::SandboxLease::new),
+            .map(gateway_core::server::tools::sandbox::SandboxLease::new),
         crypto: Some(state.crypto.clone()),
     }
 }
@@ -310,7 +310,7 @@ fn proxy_tool_ctx(
 async fn forward_one_round(
     state: &Arc<RamaState>,
     model: &str,
-    access: &crate::server::upstreams::PoolAccess,
+    access: &gateway_core::server::upstreams::PoolAccess,
     headers: &HeaderMap,
     rec: &RecordParams,
     body_value: Value,
@@ -386,7 +386,7 @@ async fn chat_bytedumb(
     state: &Arc<RamaState>,
     user: &UserCtx,
     model: &str,
-    access: &crate::server::upstreams::PoolAccess,
+    access: &gateway_core::server::upstreams::PoolAccess,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -404,7 +404,8 @@ async fn chat_bytedumb(
     // `apply_defaults` only fills missing top-level fields. Then rewrite the
     // outgoing `model` to the real id (upstreams don't know the alias).
     let body =
-        crate::server::model_defaults::apply_defaults_to_bytes(&state.db, &real_model, body).await;
+        gateway_core::server::model_defaults::apply_defaults_to_bytes(&state.db, &real_model, body)
+            .await;
     let body = rewrite_model_in_bytes(body, &real_model);
     let rec = RecordParams::v1(
         user,
@@ -431,8 +432,8 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     // Source IP for `get_user_location`: proxy header (behind a load
     // balancer) first, else the direct TCP socket peer. Captured before
     // we split the request so the socket extension is still reachable.
-    let client_ip = crate::server::geoip::client_ip(req.headers())
-        .or_else(|| crate::server::geoip::peer_ip(&req));
+    let client_ip = gateway_core::server::geoip::client_ip(req.headers())
+        .or_else(|| gateway_core::server::geoip::peer_ip(&req));
     let (parts, body) = req.into_parts();
     let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
@@ -475,13 +476,13 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
                 &user.user_id,
                 &role_ids,
                 is_admin,
-                crate::server::tools::mcp::manager::AskContext::Api {
+                gateway_core::server::tools::mcp::manager::AskContext::Api {
                     token_id: &user.token_id,
                 },
             )
             .await
     } else {
-        crate::server::tools::mcp::manager::UserMcpLayer::default()
+        gateway_core::server::tools::mcp::manager::UserMcpLayer::default()
     };
     state.union_mcp_tool_ids(&mut allowed_tools, &user_mcp);
 
@@ -490,7 +491,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     // family, the document-canvas tools, and `upload_attachment` can't run
     // here — advertising them just lets the model pick one and hit a
     // "only available inside a chat session" error instead of a completion.
-    allowed_tools.retain(|id| !crate::server::tools::catalog::requires_chat_session(id));
+    allowed_tools.retain(|id| !gateway_core::server::tools::catalog::requires_chat_session(id));
 
     // Byte-dumb proxy: only when the user has no gateway tool grants.
     // There's nothing to inject, so route bytes 1:1 and leave any
@@ -521,7 +522,8 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
 
     // Defaults key on the resolved real id, same as the byte-dumb path.
     let body =
-        crate::server::model_defaults::apply_defaults_to_bytes(&state.db, &real_model, body).await;
+        gateway_core::server::model_defaults::apply_defaults_to_bytes(&state.db, &real_model, body)
+            .await;
 
     // Gateway-tool path: inject definitions, then run either the
     // streaming intercept or the buffered runner.
@@ -582,8 +584,8 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     let comfyui = state
         .comfyui
         .as_ref()
-        .map(|h| crate::server::comfyui::ComfyuiToolSource::new((**h).clone()));
-    let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
+        .map(|h| gateway_core::server::comfyui::ComfyuiToolSource::new((**h).clone()));
+    let tool_source = gateway_core::server::tools::mcp::manager::CompositeToolSource::new(
         state.tools.as_ref(),
         &user_mcp,
     )
@@ -710,7 +712,7 @@ pub async fn transcribe_session(State(state): State<Arc<RamaState>>, req: Reques
     // Load the user once: for the usage-row email AND to resolve their gateway
     // groups so the transcription model is gated to pools they may access, same
     // as the API path.
-    let user_row = crate::server::db::users::find_by_id(&state.db, &session.user_id)
+    let user_row = gateway_core::server::db::users::find_by_id(&state.db, &session.user_id)
         .await
         .ok()
         .flatten();
@@ -752,7 +754,7 @@ async fn handle_transcription(
     mut headers: HeaderMap,
     body: Bytes,
     mut rec: RecordParams,
-    access: crate::server::upstreams::PoolAccess,
+    access: gateway_core::server::upstreams::PoolAccess,
 ) -> Response {
     let fields = match parse_multipart_fields(&headers, body).await {
         Ok(f) => f,
@@ -1396,7 +1398,7 @@ pub async fn speech_session(State(state): State<Arc<RamaState>>, req: Request) -
     let spoken_len = spoken.chars().count();
     // Gate the TTS pool to the session user's groups, same as every other route.
     let access = {
-        let roles = crate::server::db::users::find_by_id(&state.db, &session.user_id)
+        let roles = gateway_core::server::db::users::find_by_id(&state.db, &session.user_id)
             .await
             .ok()
             .flatten()
@@ -1422,7 +1424,7 @@ pub async fn speech_session(State(state): State<Arc<RamaState>>, req: Request) -
     }
 
     let user_email = if state.usage.is_enabled() {
-        crate::server::db::users::find_by_id(&state.db, &session.user_id)
+        gateway_core::server::db::users::find_by_id(&state.db, &session.user_id)
             .await
             .ok()
             .flatten()
@@ -1600,9 +1602,9 @@ fn model_object(id: String) -> Value {
 /// pattern-matches a rejected capability (image / tool / `response_format`),
 /// record it against `model` so the gateway stops sending that content type to
 /// it. `model` is the *resolved* real id — the same key the capability read
-/// path uses (see [`crate::server::capabilities`]) — so a learned flag is found
+/// path uses (see [`gateway_core::server::capabilities`]) — so a learned flag is found
 /// again. Admin-set `Enabled` values are never overwritten (see
-/// [`crate::server::db::model_defaults::mark_unsupported`]). No-op when the
+/// [`gateway_core::server::db::model_defaults::mark_unsupported`]). No-op when the
 /// error doesn't classify.
 fn maybe_learn_capability(state: &RamaState, model: &str, status: u16, body: &[u8]) {
     // Only 400/422 carry capability rejections. Gate on status *before* touching
@@ -1620,7 +1622,8 @@ fn maybe_learn_capability(state: &RamaState, model: &str, status: u16, body: &[u
         .chars()
         .take(16 * 1024)
         .collect::<String>();
-    let Some(cap) = crate::server::upstreams::error_classify::classify_error(status, &body_str)
+    let Some(cap) =
+        gateway_core::server::upstreams::error_classify::classify_error(status, &body_str)
     else {
         return;
     };
@@ -1628,7 +1631,7 @@ fn maybe_learn_capability(state: &RamaState, model: &str, status: u16, body: &[u
     let db = state.db.clone();
     tokio::spawn(async move {
         if let Err(e) =
-            crate::server::db::model_defaults::mark_unsupported(&db, &model_key, cap).await
+            gateway_core::server::db::model_defaults::mark_unsupported(&db, &model_key, cap).await
         {
             tracing::warn!(error = %e, "auto-learning: failed to record capability");
         } else {
@@ -1772,7 +1775,7 @@ async fn forward(
 fn loop_error_chunk() -> Bytes {
     Bytes::from(format!(
         "data: {}\n\n",
-        json!({"error": {"message": crate::loop_guard::LOOP_MESSAGE, "type": "loop_detected"}})
+        json!({"error": {"message": gateway_core::loop_guard::LOOP_MESSAGE, "type": "loop_detected"}})
     ))
 }
 
@@ -1813,7 +1816,7 @@ fn force_usage_in_body(body: Bytes) -> (Bytes, bool) {
 /// Streaming variant of `forward` — used by /v1/chat/completions so SSE
 /// (`stream: true`) responses unfold token-by-token to the client
 /// instead of buffering. Relays each upstream frame 1:1 while tapping the
-/// deltas through a [`crate::loop_guard::LoopGuard`]; the `Acquired` RAII
+/// deltas through a [`gateway_core::loop_guard::LoopGuard`]; the `Acquired` RAII
 /// guard rides along in the relay task so the in-flight slot stays
 /// reserved for the stream's lifetime. Same header policy as `forward`.
 async fn forward_streaming(
@@ -1918,8 +1921,8 @@ async fn forward_streaming(
         let _slot = acquired;
         let mut upstream_stream = upstream.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
-        let mut content_guard = crate::loop_guard::LoopGuard::new();
-        let mut reasoning_guard = crate::loop_guard::LoopGuard::new();
+        let mut content_guard = gateway_core::loop_guard::LoopGuard::new();
+        let mut reasoning_guard = gateway_core::loop_guard::LoopGuard::new();
         let mut looped = false;
         // Token counts ride the trailing `usage` frame, which we forced on via
         // `force_usage_in_body`. We forward at SSE-event granularity (not raw
@@ -1932,23 +1935,23 @@ async fn forward_streaming(
         'frames: while let Some(frame) = upstream_stream.next().await {
             let Ok(frame) = frame else { break };
             buf.extend_from_slice(&frame);
-            while let Some(event) = crate::server::sse::next_event(&mut buf) {
+            while let Some(event) = gateway_core::server::sse::next_event(&mut buf) {
                 let text = String::from_utf8_lossy(&event);
                 let mut is_usage_only = false;
                 for line in text.lines() {
-                    let Some(payload) = crate::server::sse::data_payload(line) else {
+                    let Some(payload) = gateway_core::server::sse::data_payload(line) else {
                         continue;
                     };
                     let Ok(v) = serde_json::from_str::<Value>(payload) else {
                         continue;
                     };
-                    if let Some(t) = crate::server::sse::usage_tokens(&v) {
+                    if let Some(t) = gateway_core::server::sse::usage_tokens(&v) {
                         tokens = t;
                         // OpenAI's trailing usage frame carries empty `choices`;
                         // a usage riding a content chunk keeps its choice.
                         is_usage_only = v.pointer("/choices/0").is_none();
                     }
-                    let delta = crate::server::sse::ChatDelta::new(&v);
+                    let delta = gateway_core::server::sse::ChatDelta::new(&v);
                     if let Some(t) = delta.content()
                         && content_guard.push(t)
                     {
@@ -2035,15 +2038,15 @@ async fn forward_streaming_with_tools(
     client_ip: Option<String>,
     mut request_body: Value,
     allowed_tools: Vec<String>,
-    user_mcp: crate::server::tools::mcp::manager::UserMcpLayer,
+    user_mcp: gateway_core::server::tools::mcp::manager::UserMcpLayer,
 ) -> Response {
     // Use the layer built once by the caller (same ids it advertised) for
     // injection here and for dispatch inside the loop.
     let comfyui = state
         .comfyui
         .as_ref()
-        .map(|h| crate::server::comfyui::ComfyuiToolSource::new((**h).clone()));
-    let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
+        .map(|h| gateway_core::server::comfyui::ComfyuiToolSource::new((**h).clone()));
+    let tool_source = gateway_core::server::tools::mcp::manager::CompositeToolSource::new(
         state.tools.as_ref(),
         &user_mcp,
     )
@@ -2205,8 +2208,8 @@ async fn drive_streaming_tool_loop(
     client_headers: HeaderMap,
     tool_ctx: ToolContext,
     rec: RecordParams,
-    user_mcp: super::super::server::tools::mcp::manager::UserMcpLayer,
-    access: crate::server::upstreams::PoolAccess,
+    user_mcp: gateway_core::server::tools::mcp::manager::UserMcpLayer,
+    access: gateway_core::server::upstreams::PoolAccess,
     tx: &mut mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
     // Free the turn's sandbox lease on every exit of the loop below — the
@@ -2240,8 +2243,8 @@ async fn drive_streaming_tool_loop_inner(
     client_headers: HeaderMap,
     tool_ctx: ToolContext,
     rec: RecordParams,
-    user_mcp: super::super::server::tools::mcp::manager::UserMcpLayer,
-    access: crate::server::upstreams::PoolAccess,
+    user_mcp: gateway_core::server::tools::mcp::manager::UserMcpLayer,
+    access: gateway_core::server::upstreams::PoolAccess,
     tx: &mut mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
 ) -> Result<(), String> {
     use rama::futures::StreamExt;
@@ -2251,8 +2254,8 @@ async fn drive_streaming_tool_loop_inner(
     let comfyui = state
         .comfyui
         .as_ref()
-        .map(|h| crate::server::comfyui::ComfyuiToolSource::new((**h).clone()));
-    let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
+        .map(|h| gateway_core::server::comfyui::ComfyuiToolSource::new((**h).clone()));
+    let tool_source = gateway_core::server::tools::mcp::manager::CompositeToolSource::new(
         state.tools.as_ref(),
         &user_mcp,
     )
@@ -2344,8 +2347,8 @@ async fn drive_streaming_tool_loop_inner(
         // ends the stream cleanly (error chunk + [DONE]) instead of running
         // until the token ceiling. Repetition-based only, so a long but
         // progressing answer is never cut short.
-        let mut content_guard = crate::loop_guard::LoopGuard::new();
-        let mut reasoning_guard = crate::loop_guard::LoopGuard::new();
+        let mut content_guard = gateway_core::loop_guard::LoopGuard::new();
+        let mut reasoning_guard = gateway_core::loop_guard::LoopGuard::new();
         // Token counts ride the trailing `usage` frame when the client opted
         // into `stream_options.include_usage` (we never inject it on /v1).
         let mut round_tokens: (Option<i64>, Option<i64>, Option<i64>) = (None, None, None);
@@ -2358,7 +2361,7 @@ async fn drive_streaming_tool_loop_inner(
             // SSE events are separated by `\n\n`. Parse each complete
             // event out of the buffer; whatever's left is a partial
             // event for the next chunk to extend.
-            while let Some(event_bytes) = crate::server::sse::next_event(&mut byte_buf) {
+            while let Some(event_bytes) = gateway_core::server::sse::next_event(&mut byte_buf) {
                 let event_str = String::from_utf8_lossy(&event_bytes);
 
                 let mut is_done = false;
@@ -2380,7 +2383,7 @@ async fn drive_streaming_tool_loop_inner(
                         continue;
                     };
                     chunk_meta.absorb(&v);
-                    if let Some(t) = crate::server::sse::usage_tokens(&v) {
+                    if let Some(t) = gateway_core::server::sse::usage_tokens(&v) {
                         round_tokens = t;
                         // Hide the trailing usage-only frame (empty `choices`)
                         // from a client that didn't opt into it.
@@ -2388,16 +2391,16 @@ async fn drive_streaming_tool_loop_inner(
                             hide_event = true;
                         }
                     }
-                    let delta = crate::server::sse::ChatDelta::new(&v);
+                    let delta = gateway_core::server::sse::ChatDelta::new(&v);
                     if let Some(t) = delta.content()
                         && content_guard.push(t)
                     {
-                        return Err(crate::loop_guard::LOOP_MESSAGE.to_string());
+                        return Err(gateway_core::loop_guard::LOOP_MESSAGE.to_string());
                     }
                     if let Some(t) = delta.reasoning()
                         && reasoning_guard.push(t)
                     {
-                        return Err(crate::loop_guard::LOOP_MESSAGE.to_string());
+                        return Err(gateway_core::loop_guard::LOOP_MESSAGE.to_string());
                     }
                     if let Some(tcs) = delta.tool_calls() {
                         hide_event = true;
