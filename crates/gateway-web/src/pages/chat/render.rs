@@ -63,8 +63,8 @@ impl CapabilityRow {
     }
 }
 
-/// Skills sort after every built-in category (`Category::order()` tops out at
-/// 6) so the "Skills" group is always last in the menu.
+/// Skills sort after every built-in category (`Category::order()` stays well
+/// under this) so the "Skills" group is always last in the menu.
 pub(super) const SKILL_ORDER: u8 = 250;
 
 /// Shared horizontal padding for every menu row (master, category heading,
@@ -255,6 +255,14 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
           // `gwcanvasopen` window event (also desktop-gated, in the tool).
             "data-init": "$canvasOpen = $hasCanvas && window.innerWidth >= 768",
            "data-on:gwcanvasopen__window": "$canvasOpen = true; $canvasTab = 'document'",
+          // `delete_document` removed the conversation's last document. The
+          // server can empty the slot but not decide the panel's fate: only
+          // the client knows whether this turn also produced assets, so
+          // `hasCanvas` is recomputed here — the panel survives for the
+          // assets tab, and closes when there is nothing left at all.
+          "data-on:gwcanvasdocgone__window":
+              "$hasDocument = false; $hasCanvas = $hasAssets; \
+               if ($hasAssets) { $canvasTab = 'assets' } else { $canvasOpen = false }",
           // Full width ONLY while the canvas is docked; otherwise the chat
           // falls back to the centered reading column (see main.css).
           "data-class": "{'canvas-open': $canvasOpen}"
@@ -2195,6 +2203,52 @@ mod tests {
         assert!(
             body.contains("$effortMenu = false") && body.contains("$exportMenu = false"),
             "popovers must wire click-outside dismissal: {body}"
+        );
+    }
+
+    /// `delete_document` empties `#document-canvas-slot` and fires
+    /// `gwcanvasdocgone`; without a handler on the shell the header toggle and
+    /// the "Document" tab would survive, pointing at a document that is gone.
+    /// The handler also has to recompute `hasCanvas` from `hasAssets` — the
+    /// server can't know whether this turn produced assets.
+    #[test]
+    fn shell_handles_the_last_document_being_deleted() {
+        let body = page_body(None);
+        assert!(
+            body.contains("data-on:gwcanvasdocgone__window"),
+            "shell must listen for the canvas-emptied event: {body}"
+        );
+        assert!(
+            body.contains("$hasDocument = false"),
+            "the handler must clear hasDocument: {body}"
+        );
+        assert!(
+            body.contains("$hasCanvas = $hasAssets"),
+            "hasCanvas must fall back to whether assets exist: {body}"
+        );
+        assert!(
+            body.contains("$canvasOpen = false"),
+            "with nothing left to show the panel must close: {body}"
+        );
+    }
+
+    /// The load path's counterpart to the event above: a conversation whose
+    /// only document was deleted renders with no panel at all, so a reload
+    /// after a delete agrees with what the live patch left on screen.
+    #[test]
+    fn a_page_without_a_canvas_starts_with_the_canvas_signals_off() {
+        let body = page_body(None);
+        // The signal store rides in an attribute, so the quotes are escaped.
+        assert!(
+            body.contains("&quot;hasCanvas&quot;: false")
+                && body.contains("&quot;hasDocument&quot;: false"),
+            "no document and no assets → both signals false on mount: {body}"
+        );
+        // The slot itself is always present, so the first create (or an
+        // undelete) has a morph target.
+        assert!(
+            body.contains("id=\"document-canvas-slot\""),
+            "the morph target must exist even with no document: {body}"
         );
     }
 

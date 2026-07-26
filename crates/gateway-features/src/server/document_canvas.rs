@@ -26,12 +26,21 @@ pub async fn render_canvas_html(
     version: Option<i64>,
     lang: session_core::i18n::Lang,
 ) -> Result<Option<String>, gateway_core::server::db::DbError> {
-    let docs = documents::list_for_session(pool, session_id).await?;
+    // Live documents only — a deleted document is out of the panel and out of
+    // its document picker.
+    let docs = documents::list_for_session(pool, session_id, false).await?;
     if docs.is_empty() {
         return Ok(None);
     }
-    // Default to the most-recently-updated document (list is ordered).
-    let active = active_id.unwrap_or(&docs[0].id);
+    // Default to the most-recently-updated document (list is ordered). An
+    // `active_id` that isn't in the live list falls back to that default:
+    // `get_version` resolves soft-deleted documents on purpose (deletion
+    // hides, it doesn't unresolve), so filtering against `docs` — not the
+    // `None` branch below — is what keeps a deleted document out of the
+    // panel when a stale link or a pre-delete SSE patch still names it.
+    let active = active_id
+        .filter(|id| docs.iter().any(|d| d.id == *id))
+        .unwrap_or(&docs[0].id);
     let Some((doc, ver)) = documents::get_version(pool, session_id, active, version).await? else {
         // Asked for a doc/version that isn't in this session — fall back
         // to the latest document so the panel never renders empty.

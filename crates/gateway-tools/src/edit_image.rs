@@ -216,6 +216,8 @@ mod tests {
             image_gen: None,
             sandbox_lease: None,
             crypto: None,
+            push: None,
+            model: None,
         }
     }
 

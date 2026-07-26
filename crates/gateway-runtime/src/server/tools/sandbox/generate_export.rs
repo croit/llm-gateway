@@ -183,6 +183,16 @@ impl Tool for ExportDocument {
                         args.document_id
                     ))
                 })?;
+            // A soft-deleted document still resolves by id (that is what keeps
+            // it readable and restorable), so exporting one would quietly
+            // produce a file from work the user threw away.
+            if doc.is_deleted() {
+                return Err(ToolError::InvalidArgs(format!(
+                    "document `{}` is deleted — call `undelete_document` first if you \
+                     want to export it",
+                    args.document_id
+                )));
+            }
             let ext = args.format.ext();
             let stem = filename_stem(args.filename.as_deref(), "document");
             let out = format!("{stem}.{ext}");

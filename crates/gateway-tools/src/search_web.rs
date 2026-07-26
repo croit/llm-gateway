@@ -411,6 +411,8 @@ mod tests {
         search_settings::set_searxng_url(&pool, url).await.unwrap();
         ToolContext {
             crypto: Some(Arc::new(Crypto::ephemeral())),
+            push: None,
+            model: None,
             ..ToolContext::for_test(pool)
         }
     }
@@ -473,6 +475,8 @@ mod tests {
             .unwrap();
         let ctx = ToolContext {
             crypto: Some(Arc::new(Crypto::ephemeral())),
+            push: None,
+            model: None,
             ..ToolContext::for_test(pool)
         };
         let msg = format!(
@@ -496,6 +500,8 @@ mod tests {
             .unwrap();
         let ctx = ToolContext {
             crypto: Some(Arc::new(Crypto::ephemeral())),
+            push: None,
+            model: None,
             ..ToolContext::for_test(pool)
         };
         let msg = format!(

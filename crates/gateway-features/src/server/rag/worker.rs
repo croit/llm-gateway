@@ -1017,6 +1017,16 @@ const RRF_K: f64 = 60.0;
 /// rerank across the dense and lexical signals.
 const CANDIDATE_MULTIPLIER: usize = 4;
 const MIN_CANDIDATES: usize = 20;
+/// Extra widening of the candidate pool when a `path_glob` is in play.
+///
+/// The dense side can only filter *after* the kNN search, so a scope covering
+/// a small slice of the corpus would otherwise come back thin — every
+/// candidate discarded is a result the user asked for and didn't get. Widening
+/// costs one larger kNN query and one `IN (…)` lookup, both cheap next to the
+/// embedding call that already happened. It does not eliminate the recall
+/// loss, which is why the tool documents path scoping as narrowing rather than
+/// as a guarantee.
+const PATH_FILTER_CANDIDATE_MULTIPLIER: usize = 5;
 
 /// Fuse several ranked id-lists into one via Reciprocal Rank Fusion.
 /// Each list contributes `1 / (RRF_K + rank)` to an id's score (rank
@@ -1052,12 +1062,21 @@ fn reciprocal_rank_fusion(lists: &[&[i64]], k: usize) -> Vec<(i64, f64)> {
 /// returned `f32` is the RRF score (higher = more relevant), not a
 /// cosine distance. Public so the `rag_search` tool can reach the
 /// indexer directly without rebuilding the index cache.
+/// `path_glob` restricts the search to files whose indexed path matches
+/// (SQLite GLOB syntax). Both sides honour it, but differently: the lexical
+/// side filters in SQL, while the dense side has to generate kNN candidates
+/// first (a vector index carries no metadata) and then ask the store which of
+/// them are in scope. That costs recall on the dense side — the in-scope
+/// matches have to be in the candidate pool at all — so the pool is widened
+/// when a filter is present, and the filtering happens *before* fusion
+/// truncates to `k` rather than after.
 pub async fn search_chunks(
     indexer: &Indexer,
     rref: &rag_db::CollectionRef,
     query_text: &str,
     query_vec: &[f32],
     k: usize,
+    path_glob: Option<&str>,
 ) -> Result<Vec<(rag_db::Chunk, f32)>, WorkerError> {
     if k == 0 {
         return Ok(Vec::new());
@@ -1065,11 +1084,14 @@ pub async fn search_chunks(
 
     // Store + index live in this ref's own folder, cached by ref id.
     let store = indexer.collection_store(rref.id, &rref.data_uuid).await?;
-    let pool = (k * CANDIDATE_MULTIPLIER).max(MIN_CANDIDATES);
+    let mut pool = (k * CANDIDATE_MULTIPLIER).max(MIN_CANDIDATES);
+    if path_glob.is_some() {
+        pool *= PATH_FILTER_CANDIDATE_MULTIPLIER;
+    }
 
     // Dense side. A missing on-disk index (ref never finished its first
     // build) is not an error here — fall back to lexical-only.
-    let dense: Vec<i64> = match indexer.open_index(rref.id, &rref.data_uuid, None) {
+    let mut dense: Vec<i64> = match indexer.open_index(rref.id, &rref.data_uuid, None) {
         Ok(index) => index
             .search(query_vec, pool)?
             .into_iter()
@@ -1078,9 +1100,19 @@ pub async fn search_chunks(
         Err(IndexError::Open { .. }) => Vec::new(),
         Err(other) => return Err(other.into()),
     };
+    if let Some(glob) = path_glob
+        && !dense.is_empty()
+    {
+        let in_scope =
+            rag_db::vector_ids_matching_path(&store, rref.collection_id, &dense, glob).await?;
+        // Retain, not rebuild: the kNN ranking is the input to fusion, so the
+        // surviving candidates must keep their relative order.
+        dense.retain(|vid| in_scope.contains(vid));
+    }
 
     // Lexical side (BM25 over chunk text) — from this ref's store.
-    let lexical = rag_db::lexical_search(&store, rref.collection_id, query_text, pool).await?;
+    let lexical =
+        rag_db::lexical_search(&store, rref.collection_id, query_text, pool, path_glob).await?;
 
     let fused = reciprocal_rank_fusion(&[&dense, &lexical], k);
     if fused.is_empty() {

@@ -81,7 +81,19 @@ dependency doesn't change the trait signature:
   share `/work`), `chat_feedback` (push UI onto the live SSE stream and await a
   browser reply — `get_user_location` asks for a position, `ask_user` asks a
   question; one hub per reply shape, so the two endpoints can't un-park each
-  other's tool).
+  other's tool), `push` (Web Push, for `notify_user`).
+- **The current model** — `model`, when the path resolved one. Carried so a
+  tool that creates work to be *run later* can inherit it instead of guessing a
+  pool id: `schedule_action` gives the action it writes the same model the user
+  is talking to.
+
+Two of these carry a **per-turn budget**, not just a handle, because the
+context's lifetime is exactly one turn and that is the window a limit needs:
+`attachment_reservations` (a mutex, so concurrent uploaders can't pick the same
+filename) and `push` (a latch — `PushNotifier::claim` succeeds once, so a model
+in a tool loop can't turn someone's phone into a notification feed). Neither
+belongs in `server::limits`, which counts tokens and cost per user over time and
+has no notion of a turn.
 
 Every optional field is `None` where that subsystem isn't configured, and tools
 are expected to degrade with a clear message rather than assume. Tools never
@@ -234,6 +246,31 @@ On `POST /v1/chat/completions`:
    client tools coexist in one completion.
 4. Leave `tool_choice` alone when it is `"required"` or names a tool.
 5. Forward upstream.
+
+`requires_chat_session` covers two different reasons a tool needs the chat path,
+and it is worth keeping them apart when deciding whether a new tool belongs
+there:
+
+- **Nowhere to put the output.** `upload_attachment`, `generate_image`,
+  `export_document` — they attach something to a turn that doesn't exist on
+  `/v1`.
+- **Nobody to ask.** `ask_user` needs a human watching the stream, and so do
+  `schedule_action` and `delete_scheduled_action`, which require an `ask_user`
+  confirmation before writing. That confirmation exists because a scheduled
+  action later runs **as the user**, unattended, until removed — persistence is
+  what makes prompt injection there worth a human "yes", where an ordinary tool
+  call isn't. A useful consequence: a scheduled run cannot create further
+  scheduled actions, because the headless worker has a session but no watcher,
+  so the confirmation goes unanswered and the write is refused.
+
+The inverse case is worth stating too, since it is the easy mistake: a tool
+whose *optional* argument needs a session does **not** belong here.
+`render_typst` renders inline `source` anywhere and only needs a session for its
+`document_id` path; marking it chat-only would remove a working capability from
+`/v1` to protect an argument a proxy caller has no use for. Reusable pattern:
+`crate::ask_user::confirm` gives any tool the card + rendezvous, and returns
+`Confirmation::NoAnswer` off the chat path so the caller decides what "no human
+here" means for its own operation.
 
 ## The tool-call loop
 
