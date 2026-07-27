@@ -35,8 +35,9 @@ use serde_json::{Value, json};
 use session_core::db as chat;
 use shared::api::ToolDef;
 
-use gateway_core::server::db::documents::{self, DocumentFormat};
-use gateway_features::server::chat_attachments::{self, AttachmentRef};
+use gateway_core::server::db::documents::DocumentFormat;
+use gateway_features::server::chat_attachments;
+use gateway_features::server::file_refs::{self, FileRef};
 use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture, ToolResult};
 
 pub struct OfferDownload;
@@ -48,30 +49,6 @@ struct OfferArgs {
     /// the chip (and the downloaded file) uses this one.
     #[serde(default)]
     filename: Option<String>,
-}
-
-/// Where the bytes to offer live, and what we know about them.
-#[derive(Debug, PartialEq, Eq)]
-enum Source {
-    /// The id resolved against the session's attachment markers, so mime
-    /// and size are already known — no storage round-trip needed.
-    Listed(AttachmentRef),
-    /// A `<turn_id>/<filename>` id with no marker anywhere in the
-    /// conversation (a typst `data_id`, an intermediate artifact). The
-    /// turn was verified to belong to this session; mime + size come from
-    /// a HEAD before the copy.
-    Unlisted { turn_id: String, filename: String },
-    /// A canvas document (`doc_…`): the mutable, versioned side of the
-    /// conversation's files — a draft, or the data behind a rendered
-    /// document. Handing one over materialises its *current* version as a
-    /// file, so what the user downloads is what the panel shows (including
-    /// their own hand-edits).
-    Document {
-        title: String,
-        format: DocumentFormat,
-        version: i64,
-        content: String,
-    },
 }
 
 impl Tool for OfferDownload {
@@ -156,45 +133,41 @@ impl Tool for OfferDownload {
                 )
             })?;
 
-            let source = locate(&ctx.db, session_id, &args.id).await?;
+            let source = file_refs::resolve(&ctx.db, Some(session_id), &args.id, None).await?;
             // A canvas document has no stored object to copy — its content
             // lives in the DB — so it takes the short path: write the current
             // version out as a file under this turn and chip it.
-            if let Source::Document {
-                title,
-                format,
-                version,
-                content,
-            } = &source
-            {
+            if let FileRef::Document { doc, version } = &source {
                 return offer_document(
                     &ctx,
                     turn_id,
                     s3,
                     reservations,
                     &args,
-                    title,
-                    *format,
-                    *version,
-                    content,
+                    &doc.title,
+                    doc.format,
+                    version.version,
+                    &version.content,
                 )
                 .await;
             }
             let (src_turn, src_file) = match &source {
-                Source::Listed(a) => (a.turn_id.clone(), a.filename.clone()),
-                Source::Unlisted { turn_id, filename } => (turn_id.clone(), filename.clone()),
+                FileRef::Attachment(a) => (a.turn_id.clone(), a.filename.clone()),
+                FileRef::UnlistedAttachment { turn_id, filename } => {
+                    (turn_id.clone(), filename.clone())
+                }
                 // Handled above; keeping the arm exhaustive rather than
                 // unreachable!() so a future variant is a compile error.
-                Source::Document { .. } => unreachable!("document handled above"),
+                FileRef::Document { .. } => unreachable!("document handled above"),
             };
-            // Size + mime for the marker line. Listed ids carry both in the
-            // marker they came from; an unlisted one needs a HEAD (never a
+            // Size + mime for the marker line. A marker-backed id carries both
+            // in the marker it came from; an unlisted one needs a HEAD (never a
             // GET — the object can be tens of megabytes and we only want its
             // metadata).
             let (mime, size) = match &source {
-                Source::Listed(a) => (a.mime.clone(), a.size),
-                Source::Document { .. } => unreachable!("document handled above"),
-                Source::Unlisted { .. } => {
+                FileRef::Attachment(a) => (a.mime.clone(), a.size),
+                FileRef::Document { .. } => unreachable!("document handled above"),
+                FileRef::UnlistedAttachment { .. } => {
                     let meta = chat_attachments::head(s3, &src_turn, &src_file)
                         .await
                         .map_err(|e| {
@@ -320,14 +293,17 @@ async fn offer_document(
             )));
         }
         Some(name) => name.to_string(),
-        None => document_filename(title, format),
+        // Slugged title + the format's extension, so the download lands in
+        // the user's Downloads folder with a name they can recognise a week
+        // later. Shared with the sandbox staging so both agree.
+        None => format!("{}.{}", file_refs::slug(title), format.file_ext()),
     };
     let filename = chat_attachments::reserve_filename(&ctx.db, turn_id, reservations, &desired)
         .await
         .map_err(|e| ToolError::Failed(format!("reserve filename: {e}")))?;
     let bytes = content.as_bytes().to_vec();
     let size = bytes.len() as u64;
-    let mime = document_mime(format);
+    let mime = file_refs::document_mime(format);
     chat_attachments::upload(s3, turn_id, &filename, mime, bytes)
         .await
         .map_err(|e| ToolError::Failed(format!("storing the document as a file: {e}")))?;
@@ -354,103 +330,6 @@ async fn offer_document(
              after another edit, offer it again if the user wants the new state."
         ),
     }))
-}
-
-/// Filename for a handed-over canvas document: a slug of its title plus the
-/// format's conventional extension, so the download lands in the user's
-/// Downloads folder with a name they can recognise a week later.
-fn document_filename(title: &str, format: DocumentFormat) -> String {
-    let mut slug = String::new();
-    let mut prev_dash = false;
-    for c in title.chars() {
-        if c.is_ascii_alphanumeric() {
-            slug.push(c.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash && !slug.is_empty() {
-            slug.push('-');
-            prev_dash = true;
-        }
-    }
-    let stem = slug.trim_matches('-').chars().take(48).collect::<String>();
-    let stem = stem.trim_matches('-');
-    let stem = if stem.is_empty() { "document" } else { stem };
-    format!("{stem}.{}", format.file_ext())
-}
-
-/// Content type for a canvas document's format. Drives both the chip's icon
-/// and what the browser does with the download.
-fn document_mime(format: DocumentFormat) -> &'static str {
-    match format {
-        DocumentFormat::Markdown => "text/markdown",
-        DocumentFormat::Text => "text/plain",
-        DocumentFormat::Html => "text/html",
-        DocumentFormat::Json => "application/json",
-        DocumentFormat::Toml => "application/toml",
-        DocumentFormat::Yaml => "application/yaml",
-        // No registered type; `text/plain` at least makes it readable
-        // everywhere, and the `.typ` extension carries the real meaning.
-        DocumentFormat::Typst => "text/plain",
-    }
-}
-
-/// Resolve a model-supplied id to a source, session-scoped.
-///
-/// Marker-backed ids go through `resolve_attachment`, which also accepts a
-/// bare filename (newest match wins) — the same leniency every other
-/// attachment-taking tool has, because models lose track of turn ids across
-/// rounds. An id with no marker is only accepted in `<turn_id>/<filename>`
-/// form and only when that turn belongs to *this* session.
-async fn locate(
-    db: &gateway_core::server::db::Pool,
-    session_id: &str,
-    given: &str,
-) -> Result<Source, ToolError> {
-    let atts = chat_attachments::list_session_attachments(db, session_id)
-        .await
-        .map_err(|e| ToolError::Failed(format!("listing attachments: {e}")))?;
-    if let Some(found) = chat_attachments::resolve_attachment(&atts, given) {
-        return Ok(Source::Listed(found.clone()));
-    }
-    // A canvas document id carries no slash, so it can't collide with an
-    // attachment id. `get_version` is session-scoped, which is the same
-    // guarantee the attachment paths get.
-    if !given.contains('/')
-        && let Some((doc, ver)) = documents::get_version(db, session_id, given, None)
-            .await
-            .map_err(|e| ToolError::Failed(format!("reading canvas document: {e}")))?
-    {
-        return Ok(Source::Document {
-            title: doc.title,
-            format: doc.format,
-            version: ver.version,
-            content: ver.content,
-        });
-    }
-    let (turn_id, filename) = given.split_once('/').ok_or_else(|| {
-        ToolError::InvalidArgs(format!(
-            "no file or document named `{given}` in this conversation — call \
-             `list_attachments` / `list_documents` to see what exists, or pass a \
-             full `<turn_id>/<filename>` id"
-        ))
-    })?;
-    if filename.is_empty() || filename.contains('/') {
-        return Err(ToolError::InvalidArgs(format!(
-            "`{given}` is not a `<turn_id>/<filename>` id"
-        )));
-    }
-    if !session_core::db::turn_in_session(db, turn_id, session_id)
-        .await
-        .map_err(|e| ToolError::Failed(format!("checking turn ownership: {e}")))?
-    {
-        return Err(ToolError::InvalidArgs(format!(
-            "`{given}` does not belong to this conversation — you can only hand \
-             over files from the current chat (see `list_attachments`)"
-        )));
-    }
-    Ok(Source::Unlisted {
-        turn_id: turn_id.to_string(),
-        filename: filename.to_string(),
-    })
 }
 
 /// Filenames already carrying a marker on `turn_id`'s content — the chips
@@ -582,156 +461,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn locates_a_marker_backed_file_by_bare_filename() {
-        let pool = pool_with_session().await;
-        let marker = session_core::attachments::marker_line(
-            "data.csv",
-            "text/csv",
-            "/chat/attachment/t1/data.csv",
-            10,
-        );
-        insert_turn(&pool, "s1", "t1", 0, "user", &format!("here\n\n{marker}\n")).await;
-
-        // Bare filename resolves, and the marker's own mime/size come along
-        // so the copy needs no storage round-trip to write its chip.
-        let src = locate(&pool, "s1", "data.csv").await.unwrap();
-        assert_eq!(
-            src,
-            Source::Listed(AttachmentRef {
-                id: "t1/data.csv".into(),
-                turn_id: "t1".into(),
-                filename: "data.csv".into(),
-                mime: "text/csv".into(),
-                size: 10,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn locates_an_unlisted_object_in_a_turn_of_this_session() {
-        let pool = pool_with_session().await;
-        // A typst render's hidden `.json` edit base: the turn exists, the
-        // object exists, but no marker was ever spliced for it.
-        insert_turn(&pool, "s1", "t1", 0, "assistant", "rendered").await;
-        let src = locate(&pool, "s1", "t1/presentation.json").await.unwrap();
-        assert_eq!(
-            src,
-            Source::Unlisted {
-                turn_id: "t1".into(),
-                filename: "presentation.json".into(),
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn refuses_a_turn_from_another_conversation() {
-        let pool = pool_with_session().await;
-        insert_turn(&pool, "s2", "t2", 0, "assistant", "someone else's turn").await;
-        let err = locate(&pool, "s1", "t2/secret.pdf").await.unwrap_err();
-        match err {
-            ToolError::InvalidArgs(msg) => {
-                assert!(
-                    msg.contains("does not belong to this conversation"),
-                    "{msg}"
-                );
-            }
-            other => panic!("expected InvalidArgs, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn refuses_an_unknown_bare_filename() {
-        let pool = pool_with_session().await;
-        insert_turn(&pool, "s1", "t1", 0, "assistant", "nothing here").await;
-        let err = locate(&pool, "s1", "nope.json").await.unwrap_err();
-        match err {
-            ToolError::InvalidArgs(msg) => assert!(msg.contains("list_attachments"), "{msg}"),
-            other => panic!("expected InvalidArgs, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn locates_a_canvas_document_by_id() {
-        let pool = pool_with_session().await;
-        let id = documents::new_id();
-        documents::create(
-            &pool,
-            &id,
-            "s1",
-            "u1",
-            "Deck data",
-            DocumentFormat::Json,
-            r#"{"deck":{"slides":[]}}"#,
-            None,
-        )
-        .await
-        .unwrap();
-        // v2 so the test would catch handing over the wrong (initial) version.
-        documents::append_version(
-            &pool,
-            "s1",
-            &id,
-            r#"{"deck":{"slides":[1]}}"#,
-            None,
-            None,
-            documents::VersionAuthor::Assistant,
-        )
-        .await
-        .unwrap();
-
-        match locate(&pool, "s1", &id).await.unwrap() {
-            Source::Document {
-                title,
-                format,
-                version,
-                content,
-            } => {
-                assert_eq!(title, "Deck data");
-                assert_eq!(format, DocumentFormat::Json);
-                assert_eq!(version, 2, "the latest version is what the panel shows");
-                assert!(content.contains("slides"));
-            }
-            other => panic!("expected a document, got {other:?}"),
-        }
-
-        // Another conversation's document is not reachable, and the error names
-        // both inventories rather than leaking which id exists.
-        let err = locate(&pool, "s2", &id).await.unwrap_err();
-        assert!(
-            matches!(&err, ToolError::InvalidArgs(m) if m.contains("list_documents")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn document_filenames_are_slugged_titles_with_the_format_extension() {
-        assert_eq!(
-            document_filename("croit — LLM Gateway", DocumentFormat::Json),
-            "croit-llm-gateway.json"
-        );
-        assert_eq!(
-            document_filename("Migration plan", DocumentFormat::Markdown),
-            "migration-plan.md"
-        );
-        assert_eq!(
-            document_filename("deck.typ", DocumentFormat::Typst),
-            "deck-typ.typ"
-        );
-        // A title with nothing sluggable still yields a usable filename.
-        assert_eq!(
-            document_filename("——", DocumentFormat::Text),
-            "document.txt"
-        );
-    }
-
-    #[test]
-    fn document_mimes_make_text_downloads_readable() {
-        assert_eq!(document_mime(DocumentFormat::Json), "application/json");
-        assert_eq!(document_mime(DocumentFormat::Markdown), "text/markdown");
-        // No registered type for typst; plain text keeps it openable.
-        assert_eq!(document_mime(DocumentFormat::Typst), "text/plain");
-    }
+    // Reference resolution itself — every accepted spelling, session
+    // scoping, deleted documents, ambiguous titles — is covered where it now
+    // lives, in `gateway_features::server::file_refs`. What stays here is
+    // this tool's own behaviour.
 
     #[tokio::test]
     async fn marker_filenames_are_read_back_from_the_turn() {

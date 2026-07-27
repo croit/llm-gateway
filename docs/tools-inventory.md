@@ -51,7 +51,7 @@ message rather than being absent.
 | `dns_lookup` | — | `dns_lookup` | DNS records over DoH. |
 | `whois_lookup` | — | `whois_lookup` | Domain registration via RDAP. |
 | `tls_cert` | — | `tls_cert` | TLS certificate inspection (issuer, validity, days to expiry, SANs). |
-| `fetch_attachment` | — | `fetch_attachment` | Read an attachment. Tiered PDF reading — text layer, rasterised pages, `mode="ocr"` (gateway OCR, images too), `mode="auto"` (text-or-OCR) — with `page_from`/`page_to`; Office files return structured content. |
+| `fetch_attachment` | — | `fetch_attachment` | Read any file of the conversation — an attachment or (by id/title) a canvas document, which comes back as text plus its version. Tiered PDF reading — text layer, rasterised pages, `mode="ocr"` (gateway OCR, images too), `mode="auto"` (text-or-OCR) — with `page_from`/`page_to`; Office files return structured content. |
 | `upload_attachment` | yes | `upload_attachment` | Attach a model-generated file to the reply. |
 | `offer_download` | yes | `upload_attachment` | Hand a file the conversation *already holds* to the user as a download chip on the current reply — an attachment, or a canvas document (its current version is written out as a file, named from the document's title) — including objects with no chip of their own (a typst render's hidden `.json` data base, an intermediate artifact) and files from earlier turns. Takes a reference, never content: the object is copied inside S3, so a large payload never round-trips through the model as prose. Session-scoped twice over — a marker-backed id is proven in-session by the enumeration, an unlisted `<turn_id>/<filename>` by `turn_in_session`. Shares the `upload_attachment` toggle: one switch for "let the assistant hand me files". |
 | `list_attachments` | yes | `list_attachments` | Inventory of the conversation's files, so assets get reused instead of regenerated. |
@@ -170,7 +170,25 @@ between them rather than duplicating either:
 | Mutable | no — one immutable blob per write | yes — every change appends a version |
 | Content | any bytes (images, PDFs, archives) | UTF-8 text, ≤ 512 KB |
 | User can edit | no | yes (the document panel) |
-| Reached by | `fetch_attachment`, `att:` refs, sandbox `attachments`, `offer_download` | `read_document`/`edit_document`, sandbox `documents`, `typst_* document_id`, `export_document`, `offer_download` |
+| Reached by | `fetch_attachment`, `att:` refs, sandbox `attachments`, `offer_download` | `fetch_attachment`, `read_document`/`edit_document`, sandbox `documents` *or* `attachments`, `typst_*` `document_id`/`base`, `export_document`, `offer_download` |
+
+**One reference syntax, every tool.** Naming a file used to depend on which
+tool you were calling: `run_in_sandbox` took ids and filenames in
+`attachments` but documents only in `documents`, `fetch_attachment` couldn't
+read a document at all, and typst image fields wanted an `att:` prefix. Every
+file-taking tool now resolves through `file_refs::resolve`, which accepts all
+of it — an `<turn_id>/<filename>` id, a bare filename (newest match wins), a
+`doc_…` id, an unambiguous document title or its materialised filename, and a
+leading `att:` / `doc:` / `file:` that some models add unprompted. So a
+reference the model got from *any* result works in *any* argument, and a wrong
+one produces the same message (naming both inventories) wherever it is passed.
+
+Session scoping is part of resolution rather than a check each caller
+remembers: a marker-backed attachment is proven in-session by the enumeration,
+an unlisted `<turn>/<file>` by `turn_in_session`, a document by the
+session-scoped `get_version`. Another conversation's real id resolves to the
+same "not found" as a typo, so nothing leaks. A *deleted* document is its own
+error, because the fix is `undelete_document` rather than a different id.
 
 Crossing over: **`import_file`** turns a text attachment into a document;
 **`offer_download`** writes a document's current version back out as a
