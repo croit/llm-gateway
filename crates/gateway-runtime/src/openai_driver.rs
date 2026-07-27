@@ -1799,6 +1799,15 @@ fn message_for_history(turn: &Turn) -> Option<serde_json::Value> {
             if content.is_empty() {
                 return None;
             }
+            // Strip the assistant's own markers too. Replaying them raw
+            // taught the model the `[gw-attachment …]` syntax — and it
+            // duly wrote marker lines of its own instead of calling the
+            // render tool, producing "here's your PDF" replies whose
+            // chips point at a long-deleted turn. The stub gives it the
+            // `fetch_attachment` id and nothing to copy.
+            let content = gateway_features::server::chat_attachments::strip_markers_for_replay(
+                &content, &turn.id,
+            );
             Some(serde_json::json!({
                 "role": "assistant",
                 "content": content,
@@ -2247,6 +2256,36 @@ mod tests {
                 turn(4, TurnRole::User, "t4", "q3"), // the in-progress turn's user prompt
                 turn(5, TurnRole::Assistant, "t5", ""), // in-progress assistant (empty)
             ]
+        }
+
+        /// Replaying an assistant turn's `[gw-attachment …]` markers raw
+        /// showed the model the exact syntax the renderer turns into a
+        /// download chip — and it started emitting marker lines of its own
+        /// instead of calling the render tool, so the reply claimed a fresh
+        /// PDF while its chip pointed at an older (often already deleted)
+        /// turn. Assistant history replays through the same stub as user
+        /// history: filename + `fetch_attachment` id, no marker syntax.
+        #[test]
+        fn assistant_attachment_markers_replay_as_stubs_not_raw() {
+            let marker = session_core::attachments::marker_line(
+                "deck.pdf",
+                "application/pdf",
+                "/chat/attachment/t1/deck.pdf",
+                42,
+            );
+            let mut turns = convo();
+            turns[1] = turn(
+                1,
+                TurnRole::Assistant,
+                "t1",
+                &format!("here is your deck\n\n{marker}"),
+            );
+            let msgs = build_history_messages(&turns, "t5", None, None);
+            let a1 = msgs[1]["content"].as_str().expect("assistant content");
+            assert!(!a1.contains("gw-attachment"), "raw marker replayed: {a1}");
+            assert!(a1.contains("here is your deck"), "{a1}");
+            assert!(a1.contains(r#"id="t1/deck.pdf""#), "{a1}");
+            assert!(a1.contains("fetch_attachment"), "{a1}");
         }
 
         /// Without a compaction row every completed turn replays verbatim and

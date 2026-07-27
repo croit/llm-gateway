@@ -264,6 +264,12 @@ fn append_turn(out: &mut String, t: &TurnWithTools) {
         }
         TurnRole::Assistant => {
             if let Some(content) = t.turn.content.as_deref().filter(|c| !c.is_empty()) {
+                // Same stripping as the live history replay: the summary
+                // rides in the system prompt, so a raw marker in here
+                // would re-teach the model the syntax it must not write.
+                let content = gateway_features::server::chat_attachments::strip_markers_for_replay(
+                    content, &t.turn.id,
+                );
                 out.push_str("Assistant: ");
                 out.push_str(content.trim());
                 out.push('\n');
@@ -445,6 +451,42 @@ mod tests {
         assert!(plan.input_text.contains("q1"));
         assert!(plan.input_text.contains("a2"));
         assert!(!plan.input_text.contains("q3"), "tail must stay verbatim");
+    }
+
+    /// The summary rides in the system prompt. If an assistant turn's
+    /// `[gw-attachment …]` marker went into it raw, the model would read
+    /// the marker syntax as a way to "attach" a file and start writing
+    /// marker lines itself instead of calling the render tool.
+    #[test]
+    fn folded_assistant_markers_never_reach_the_summariser_raw() {
+        let marker = session_core::attachments::marker_line(
+            "deck.pdf",
+            "application/pdf",
+            "/chat/attachment/t1/deck.pdf",
+            42,
+        );
+        let turns = vec![
+            turn(0, TurnRole::User, "build me a deck"),
+            turn(1, TurnRole::Assistant, &format!("here it is\n\n{marker}")),
+            turn(2, TurnRole::User, "q2"),
+            turn(3, TurnRole::Assistant, "a2"),
+            turn(4, TurnRole::User, "q3"),
+            turn(5, TurnRole::Assistant, "a3"),
+        ];
+        let plan = plan_compaction(&turns, None, &cfg()).expect("should plan");
+        assert!(
+            !plan.input_text.contains("gw-attachment"),
+            "raw marker leaked into the summariser input: {}",
+            plan.input_text
+        );
+        // The file is still named — the summary must not lose that a deck
+        // exists, only how to forge a chip for it.
+        assert!(plan.input_text.contains("deck.pdf"), "{}", plan.input_text);
+        assert!(
+            plan.input_text.contains("t1/deck.pdf"),
+            "{}",
+            plan.input_text
+        );
     }
 
     /// Anti-thrash: nothing new has aged past the previous cutoff → no plan.

@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn assistant_segments_fast_path_returns_one_prose_block() {
-        let segs = assistant_segments("plain text with **bold**");
+        let segs = assistant_segments("plain text with **bold**", "t-1");
         assert_eq!(segs.len(), 1);
         assert!(
             matches!(&segs[0], AssistantSegment::Prose(s) if s.contains("<strong>bold</strong>"))
@@ -478,7 +478,7 @@ mod tests {
         let body = format!(
             "Here is the chart you asked for:\n\n{marker}\n\nLet me know if you want adjustments."
         );
-        let segs = assistant_segments(&body);
+        let segs = assistant_segments(&body, "t-1");
         // Three segments: prose, attachment, prose. Each prose chunk
         // gets its own markdown pass so links/bold/etc. still work
         // around the attachment.

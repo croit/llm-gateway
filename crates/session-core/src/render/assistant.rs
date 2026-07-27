@@ -14,8 +14,8 @@ pub(crate) enum AssistantSegment {
     Attachment(crate::attachments::ParsedAttachment),
 }
 
-pub(crate) fn assistant_segments(content: &str) -> Vec<AssistantSegment> {
-    let raw_segs = crate::attachments::split_markers(content);
+pub(crate) fn assistant_segments(content: &str, turn_id: &str) -> Vec<AssistantSegment> {
+    let raw_segs = crate::attachments::split_markers_for_turn(content, turn_id);
     // Fast path: no attachment markers in the assistant content —
     // render the whole thing as one markdown block so the existing
     // streaming/morph behavior is byte-identical to pre-marker code.
@@ -64,7 +64,7 @@ pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: La
     // No markers? `assistant_segments` returns a single rendered-
     // markdown segment and the body stays one block, preserving the
     // pre-existing fast path.
-    let segments = assistant_segments(&content);
+    let segments = assistant_segments(&content, &turn.id);
     // Normalise into body pieces so a run of 2+ generated media collapses
     // into a numbered side-by-side gallery. Prose stays raw-injected HTML.
     let body_pieces: Vec<BodyPiece> = segments

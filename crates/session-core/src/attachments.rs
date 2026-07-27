@@ -183,25 +183,58 @@ pub fn parse_markers(text: &str) -> Vec<ParsedAttachment> {
         .collect()
 }
 
+/// Whether a marker sitting in `turn_id`'s row may be trusted.
+///
+/// Every marker the gateway writes points at the turn that carries
+/// it: uploads land under the user turn, tool output under the
+/// assistant turn (`marker_line(turn_id, …)` everywhere). A marker
+/// whose proxy URL names a *different* turn was therefore not written
+/// by us — it's a model that copied a marker line out of replayed
+/// history and passed it off as a fresh attachment. Those point at
+/// turns that may be long deleted (the proxy answers `no such turn`)
+/// and at bytes this turn never produced, so every consumer drops
+/// them. Non-proxy URLs (legacy presigned links, external URLs) carry
+/// no turn id and are left alone.
+pub fn marker_url_owned_by(url: &str, turn_id: &str) -> bool {
+    proxy_url_turn_id(url).is_none_or(|t| t == turn_id)
+}
+
+/// [`parse_markers`], keeping only the markers `turn_id` actually
+/// owns — see [`marker_url_owned_by`].
+pub fn parse_markers_for_turn(text: &str, turn_id: &str) -> Vec<ParsedAttachment> {
+    parse_markers(text)
+        .into_iter()
+        .filter(|a| marker_url_owned_by(&a.url, turn_id))
+        .collect()
+}
+
 /// Walk the marker regex over `text` and yield segments alternating
 /// between unparsed prose and a parsed attachment. Used by the chat
 /// renderer to splice attachment HTML into the user bubble while
 /// keeping the surrounding text intact.
 pub fn split_markers(text: &str) -> Vec<Segment<'_>> {
-    let mut out: Vec<Segment<'_>> = Vec::new();
+    split_markers_owned(text, None)
+}
+
+/// [`split_markers`] restricted to the markers `turn_id` owns: a
+/// marker whose proxy URL names another turn yields no segment at all
+/// (not even prose) — see [`marker_url_owned_by`]. The renderer uses
+/// this so a model-forged marker line neither draws a chip pointing at
+/// bytes that don't exist nor leaks its raw text into the bubble.
+pub fn split_markers_for_turn<'a>(text: &'a str, turn_id: &str) -> Vec<Segment<'a>> {
+    split_markers_owned(text, Some(turn_id))
+}
+
+fn split_markers_owned<'a>(text: &'a str, owner: Option<&str>) -> Vec<Segment<'a>> {
+    let mut out: Vec<Segment<'a>> = Vec::new();
     let mut cursor = 0;
     for caps in MARKER_RE.captures_iter(text) {
         let whole = caps.get(0).unwrap();
-        if whole.start() > cursor {
-            out.push(Segment::Text(trim_marker_lead(
-                &text[cursor..whole.start()],
-            )));
-        }
         let size = caps
             .get(4)
             .and_then(|m| m.as_str().parse::<u64>().ok())
             .unwrap_or(0);
-        out.push(Segment::Attachment(ParsedAttachment {
+        let att = ParsedAttachment {
             filename: caps
                 .get(1)
                 .map(|m| m.as_str().to_string())
@@ -216,7 +249,20 @@ pub fn split_markers(text: &str) -> Vec<Segment<'_>> {
                 .unwrap_or_default(),
             size,
             link: caps.get(5).map(|m| m.as_str().to_string()),
-        }));
+        };
+        let keep = owner.is_none_or(|t| marker_url_owned_by(&att.url, t));
+        if whole.start() > cursor {
+            let lead = trim_marker_lead(&text[cursor..whole.start()]);
+            // A dropped marker must not leave an empty prose segment
+            // behind — the bubble would render a blank block where the
+            // forged chip used to be.
+            if keep || !lead.is_empty() {
+                out.push(Segment::Text(lead));
+            }
+        }
+        if keep {
+            out.push(Segment::Attachment(att));
+        }
         cursor = whole.end();
         // For text/* attachments the marker is followed by an
         // inlined fenced block carrying the bytes — we don't want
@@ -443,8 +489,14 @@ pub fn strip_markers_for_replay(text: &str, turn_id: &str) -> String {
         out.push_str(&text[cursor..whole.start()]);
         let filename = caps.get(1).map(|m| m.as_str()).unwrap_or("attachment");
         let mime = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let url = caps.get(3).map(|m| m.as_str()).unwrap_or("");
         let size = caps.get(4).map(|m| m.as_str()).unwrap_or("0");
-        out.push_str(&replay_stub(turn_id, filename, mime, size));
+        // A marker this turn doesn't own is a forgery (see
+        // `marker_url_owned_by`) — replay nothing for it, so the model
+        // isn't handed an id that resolves to no bytes.
+        if marker_url_owned_by(url, turn_id) {
+            out.push_str(&replay_stub(turn_id, filename, mime, size));
+        }
         cursor = whole.end();
         let tail = &text[cursor..];
         if let Some(fenced_end) = skip_fence(tail) {
@@ -699,6 +751,69 @@ mod tests {
         assert!(matches!(segs[0], Segment::Text("hello")));
         assert!(matches!(segs[1], Segment::Attachment(_)));
         assert!(matches!(segs[2], Segment::Text("world")));
+    }
+
+    /// A marker line the model copied out of replayed history: it
+    /// names an *older* turn, so this turn never produced those bytes.
+    /// Every consumer must ignore it — otherwise the bubble shows a
+    /// chip whose download answers `no such turn` once that turn has
+    /// been retried away.
+    #[test]
+    fn split_for_turn_drops_markers_owned_by_another_turn() {
+        let mine = marker_line(
+            "mine.pdf",
+            "application/pdf",
+            "/chat/attachment/t-1/mine.pdf",
+            3,
+        );
+        let forged = marker_line(
+            "stolen.pdf",
+            "application/pdf",
+            "/chat/attachment/t-0/stolen.pdf",
+            9,
+        );
+        let input = format!("here you go\n\n{forged}\n\n{mine}\n\ndone");
+        let segs = split_markers_for_turn(&input, "t-1");
+        let files: Vec<&str> = segs
+            .iter()
+            .filter_map(|s| match s {
+                Segment::Attachment(a) => Some(a.filename.as_str()),
+                Segment::Text(_) => None,
+            })
+            .collect();
+        assert_eq!(files, ["mine.pdf"], "forged marker must not render");
+        // …and its raw text must not leak into the prose either.
+        assert!(
+            !segs
+                .iter()
+                .any(|s| matches!(s, Segment::Text(t) if t.contains("gw-attachment"))),
+            "forged marker text leaked into prose: {segs:?}"
+        );
+        // Unfiltered parsing still sees both — the rule is turn-scoped,
+        // not a change to the marker format.
+        assert_eq!(parse_markers(&input).len(), 2);
+        assert_eq!(parse_markers_for_turn(&input, "t-1").len(), 1);
+    }
+
+    #[test]
+    fn non_proxy_marker_urls_are_always_owned() {
+        // Legacy presigned / external URLs carry no turn id; they must
+        // keep rendering wherever they sit.
+        let line = marker_line("x.png", "image/png", "https://e.invalid/x.png", 1);
+        assert_eq!(parse_markers_for_turn(&line, "whatever").len(), 1);
+        assert!(marker_url_owned_by("https://e.invalid/x.png", "t-1"));
+    }
+
+    #[test]
+    fn strip_for_replay_omits_markers_owned_by_another_turn() {
+        // The model must never be handed an id for bytes this turn
+        // doesn't own — that id resolves to nothing.
+        let forged = marker_line("d.pdf", "application/pdf", "/chat/attachment/t-0/d.pdf", 4);
+        let out = strip_markers_for_replay(&format!("text\n{forged}\ntail"), "t-1");
+        assert!(!out.contains("gw-attachment"), "{out}");
+        assert!(!out.contains("t-1/d.pdf"), "{out}");
+        assert!(!out.contains("fetch_attachment"), "{out}");
+        assert!(out.contains("text") && out.contains("tail"), "{out}");
     }
 
     #[test]
