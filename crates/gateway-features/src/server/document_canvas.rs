@@ -56,6 +56,18 @@ pub async fn render_canvas_html(
         .iter()
         .map(|d| (d.id.clone(), d.title.clone()))
         .collect();
+    // Per-version authors for the switcher's labels. Metadata only (no
+    // content), and only when there is a switcher to label — a single-version
+    // document skips the query entirely.
+    let versions: Vec<(i64, bool)> = if doc.current_ver > 1 {
+        documents::list_versions(pool, session_id, &doc.id)
+            .await?
+            .into_iter()
+            .map(|v| (v.version, v.author.is_user()))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let canvas = session_core::render::DocCanvas {
         session_id,
         active_id: &doc.id,
@@ -66,6 +78,7 @@ pub async fn render_canvas_html(
         content: &ver.content,
         all_docs,
         hand_edited: ver.author.is_user(),
+        versions,
     };
     Ok(Some(session_core::render::render_document_canvas(
         &canvas, lang,

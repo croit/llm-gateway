@@ -570,7 +570,19 @@ impl Tool for ReadDocument {
                 "version": ver.version,
                 "latest_version": doc.current_ver,
                 "total_chars": total_chars,
+                "author": ver.author.as_str(),
             });
+            // The user wrote this revision by hand. Saying so at the point the
+            // model is about to quote or edit the text is what keeps the next
+            // edit from reverting a deliberate correction — the request context
+            // warns once per turn, this warns exactly where it matters.
+            if ver.author.is_user() {
+                result["author_note"] = serde_json::json!(
+                    "The USER wrote this revision by hand in the document panel. Keep \
+                     their wording: change only the passage you were asked about, and \
+                     never rewrite the document whole."
+                );
+            }
             // A deleted document stays readable, but the model must know it is
             // in the bin — otherwise it would report on a document the user no
             // longer sees in the canvas, or try to edit it and hit a refusal.
@@ -660,10 +672,12 @@ impl Tool for ListDocuments {
     fn schema(&self) -> ToolDef {
         ToolDef::function(
             self.id(),
-            "List the documents you've created in this conversation (id, title, \
-             format, current version). Use it to find a `document_id` to edit or \
-             read when you've lost track of it. Deleted documents are left out \
-             unless you pass `include_deleted`.",
+            "List the documents in this conversation (id, title, format, current \
+             version). Use it to find a `document_id` to edit or read when \
+             you've lost track of it. A document whose newest revision the USER \
+             wrote by hand is marked `last_edited_by: \"user\"` — re-read that \
+             one before changing it and keep their wording. Deleted documents \
+             are left out unless you pass `include_deleted`.",
             serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -690,6 +704,14 @@ impl Tool for ListDocuments {
             let docs = documents::list_for_session(&ctx.db, &session_id, include_deleted)
                 .await
                 .map_err(|e| ToolError::Failed(format!("listing documents: {e}")))?;
+            // Which documents the user last wrote by hand. One query for the
+            // whole listing (not one per document), and the flag only appears
+            // where it is true, so the common listing is unchanged.
+            let hand_edited: std::collections::HashSet<String> =
+                documents::hand_edited_in_session(&ctx.db, &session_id)
+                    .await
+                    .map(|docs| docs.into_iter().map(|d| d.id).collect())
+                    .unwrap_or_default();
             let items: Vec<Value> = docs
                 .iter()
                 .map(|d| {
@@ -705,6 +727,9 @@ impl Tool for ListDocuments {
                     if let Some(at) = d.deleted_at {
                         item["deleted"] = serde_json::json!(true);
                         item["deleted_at"] = serde_json::json!(at.to_string());
+                    }
+                    if hand_edited.contains(&d.id) {
+                        item["last_edited_by"] = serde_json::json!("user");
                     }
                     item
                 })
@@ -728,7 +753,9 @@ impl Tool for ListDocumentVersions {
         ToolDef::function(
             self.id(),
             "List a document's version history — every revision's number, edit \
-             summary, timestamp, and size (newest first). Use it to find the \
+             summary, timestamp, size, and author (`user` for a revision the \
+             user wrote by hand in the panel, `assistant` for yours), newest \
+             first. Use it to find the \
              version to inspect (`read_document` with `version`) or to roll \
              back to (`restore_document_version`).",
             serde_json::json!({
@@ -766,6 +793,10 @@ impl Tool for ListDocumentVersions {
                         "summary": v.summary,
                         "created_at": v.created_at.to_string(),
                         "chars": v.chars,
+                        // Which revisions are the user's own — the ones to
+                        // restore to when an edit went wrong, and the ones
+                        // whose wording is not yours to redo.
+                        "author": v.author.as_str(),
                     })
                 })
                 .collect();
@@ -1826,6 +1857,94 @@ mod tests {
         assert!(matches!(err, ToolError::InvalidArgs(_)), "{err:?}");
     }
 
+    /// Authorship reaches the model on all three read surfaces. Without it the
+    /// model sees a version history of interchangeable revisions and cannot
+    /// tell which wording it must not redo.
+    #[tokio::test]
+    async fn hand_edits_are_visible_to_the_model_wherever_it_looks() {
+        let pool = seeded_pool().await;
+        let c = ctx(pool.clone(), "s1");
+        let created = CreateDocument
+            .run(
+                c.clone(),
+                serde_json::json!({
+                    "title": "Plan", "format": "markdown", "content": "model wording\n"
+                }),
+            )
+            .await
+            .unwrap();
+        let id = created["document_id"].as_str().unwrap().to_string();
+
+        // Before any hand edit: nothing is flagged, so the common case stays
+        // as quiet as it was.
+        let listed = ListDocuments
+            .run(c.clone(), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(
+            listed["documents"][0].get("last_edited_by").is_none(),
+            "{listed}"
+        );
+        let read = ReadDocument
+            .run(c.clone(), serde_json::json!({"document_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(read["author"], "assistant");
+        assert!(read.get("author_note").is_none(), "{read}");
+
+        // The user corrects it in the panel (what the edit route does).
+        documents::append_version(
+            &pool,
+            "s1",
+            &id,
+            "my wording\n",
+            Some("Edited by you"),
+            None,
+            documents::VersionAuthor::User,
+        )
+        .await
+        .unwrap();
+
+        let listed = ListDocuments
+            .run(c.clone(), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(listed["documents"][0]["last_edited_by"], "user", "{listed}");
+
+        let read = ReadDocument
+            .run(c.clone(), serde_json::json!({"document_id": id}))
+            .await
+            .unwrap();
+        assert_eq!(read["author"], "user");
+        assert!(
+            read["author_note"]
+                .as_str()
+                .unwrap()
+                .contains("Keep their wording"),
+            "{read}"
+        );
+
+        // The history says which revision is whose, so "restore what I wrote"
+        // is answerable.
+        let hist = ListDocumentVersions
+            .run(c.clone(), serde_json::json!({"document_id": id}))
+            .await
+            .unwrap();
+        let versions = hist["versions"].as_array().unwrap();
+        assert_eq!(versions[0]["version"], 2);
+        assert_eq!(versions[0]["author"], "user");
+        assert_eq!(versions[1]["author"], "assistant");
+
+        // Reading the older revision reports *its* author, not the document's
+        // latest one.
+        let read_v1 = ReadDocument
+            .run(c, serde_json::json!({"document_id": id, "version": 1}))
+            .await
+            .unwrap();
+        assert_eq!(read_v1["author"], "assistant");
+        assert!(read_v1.get("author_note").is_none(), "{read_v1}");
+    }
+
     #[tokio::test]
     async fn tool_runtime_version_history_and_rollback() {
         let pool = seeded_pool().await;
@@ -1977,5 +2096,65 @@ mod tests {
             html.contains(&format!("/chat/s1/document/{id}?version=")),
             "version switcher points at the document route: {html}"
         );
+    }
+
+    /// The version switcher marks the revisions the *user* wrote. A history of
+    /// interchangeable `v4 v3 v2 v1` entries hides the one revision anybody
+    /// actually goes back for: their own correction.
+    #[tokio::test]
+    async fn the_version_switcher_marks_the_users_own_revisions() {
+        let pool = seeded_pool().await;
+        let id = documents::new_id();
+        documents::create(
+            &pool,
+            &id,
+            "s1",
+            "u1",
+            "Doc",
+            DocumentFormat::Markdown,
+            "v1\n",
+            None,
+        )
+        .await
+        .unwrap();
+        documents::append_version(
+            &pool,
+            "s1",
+            &id,
+            "v2 mine\n",
+            Some("Edited by you"),
+            None,
+            documents::VersionAuthor::User,
+        )
+        .await
+        .unwrap();
+        documents::append_version(
+            &pool,
+            "s1",
+            &id,
+            "v3\n",
+            Some("model"),
+            None,
+            documents::VersionAuthor::Assistant,
+        )
+        .await
+        .unwrap();
+
+        let html = gateway_features::server::document_canvas::render_canvas_html(
+            &pool,
+            "s1",
+            None,
+            None,
+            session_core::i18n::Lang::En,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // v2 carries the marker; the assistant's revisions stay bare.
+        assert!(html.contains(">v2 · you<"), "{html}");
+        assert!(html.contains(">v3<") && html.contains(">v1<"), "{html}");
+        // v3 is the latest, so the panel is showing an assistant revision —
+        // the header badge belongs to the *displayed* version only.
+        assert!(!html.contains("edited by you"), "{html}");
     }
 }

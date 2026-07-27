@@ -50,6 +50,7 @@ render-tool-input-label = Input
 render-tool-output-label = Output
 render-tool-output-truncated = truncated for display — full { $bytes } bytes still available to the model + persisted in the DB; displaying first { $chars } chars
 
+render-canvas-version-by-you = you
 render-canvas-hand-edited = edited by you
 render-canvas-edit-button = ✎ Edit
 render-canvas-save = Save as new version
