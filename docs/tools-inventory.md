@@ -198,7 +198,10 @@ the whole payload and invite retyping drift.
 
 The user can **hand-edit** a document in the panel (`POST
 /chat/{id}/document/{doc_id}/edit`, owner-only, newest version only). That save
-is a normal new version, marked as authored by the user — and the request
+is a normal new version, marked as authored by the user — the panel's version
+switcher labels those revisions (`v3 · you`) so a history stops reading as
+interchangeable numbers, and `read_document` / `list_document_versions` /
+`list_documents` report the author too — and the request
 context then tells the model which documents were hand-edited and at what
 version, because nothing in the transcript would: its history still holds the
 content *it* wrote, so an unwarned edit reverts the correction. The warning

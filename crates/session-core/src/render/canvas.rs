@@ -28,6 +28,15 @@ pub struct DocCanvas<'a> {
     /// the assistant — shown as a badge so their own correction is
     /// distinguishable from the model's next pass over it.
     pub hand_edited: bool,
+    /// Version numbers this document has, newest first, each flagged when the
+    /// *user* wrote it. Empty for a single-version document (the switcher is
+    /// hidden then anyway).
+    ///
+    /// Why per-version and not just the current one: scrubbing back through a
+    /// history where every entry reads `v4 v3 v2 v1` tells you nothing about
+    /// which one you fixed by hand — and that is exactly the revision you go
+    /// looking for after the model has written over it twice.
+    pub versions: Vec<(i64, bool)>,
 }
 
 /// Render the document-canvas panel as an HTML string. The caller places
@@ -59,7 +68,13 @@ pub fn render_document_canvas(c: &DocCanvas<'_>, lang: Lang) -> String {
     let show_versions = c.max_version > 1;
     let sid = c.session_id;
     let active = c.active_id;
-    let versions: Vec<i64> = (1..=c.max_version).rev().collect();
+    // Newest first. Fall back to a bare descending range when the caller
+    // didn't load the per-version authors (nothing but the label is lost).
+    let versions: Vec<(i64, bool)> = if c.versions.is_empty() {
+        (1..=c.max_version).rev().map(|v| (v, false)).collect()
+    } else {
+        c.versions.clone()
+    };
     let close_title = t(lang, "render-canvas-close-title");
     let close_aria = t(lang, "render-canvas-close-aria");
     let document_aria = t(lang, "render-canvas-document-aria");
@@ -81,6 +96,7 @@ pub fn render_document_canvas(c: &DocCanvas<'_>, lang: Lang) -> String {
         String::new()
     };
     let edit_label = t(lang, "render-canvas-edit-button");
+    let by_you = t(lang, "render-canvas-version-by-you");
 
     html! {
         // `docEditing` is declared here, on the panel root, so every SSE patch
@@ -141,12 +157,10 @@ pub fn render_document_canvas(c: &DocCanvas<'_>, lang: Lang) -> String {
                         "aria-label": (version_aria),
                         "data-on:change": (format!("@get('/chat/{sid}/document/{active}?version=' + evt.target.value)"))
                     ) {
-                        for v in versions.iter() {
-                            if *v == c.version {
-                                option(value: (v.to_string()), selected: "selected") { (format!("v{v}")) }
-                            } else {
-                                option(value: (v.to_string())) { (format!("v{v}")) }
-                            }
+                        for (v, by_user) in versions.iter() {
+                            // `v3 · you` for the revisions the reader wrote —
+                            // the one thing that makes a history scrubbable.
+                            (version_option(*v, *by_user, *v == c.version, &by_you))
                         }
                     }
                 }
@@ -165,6 +179,28 @@ pub fn render_document_canvas(c: &DocCanvas<'_>, lang: Lang) -> String {
     }
     .to_html()
     .to_string()
+}
+
+/// One `<option>` in the version switcher, marked when the user wrote that
+/// revision.
+///
+/// A standalone helper returning a `&str`-built `Html`, for two reasons: the
+/// `selected` attribute is presence-based (plait's `attr: (bool)` would render
+/// `selected="false"`, which browsers honour as selected), and keeping the
+/// `html!` out of the loop body avoids the macro moving the loop's locals into
+/// per-attribute closures.
+fn version_option(version: i64, by_user: bool, selected: bool, by_you: &str) -> Html {
+    let label = if by_user {
+        format!("v{version} · {by_you}")
+    } else {
+        format!("v{version}")
+    };
+    let value = version.to_string();
+    if selected {
+        html! { option(value: (value), selected: "selected") { (label) } }.to_html()
+    } else {
+        html! { option(value: (value)) { (label) } }.to_html()
+    }
 }
 
 /// The hand-edit form: the document's raw source in a textarea, saved as a

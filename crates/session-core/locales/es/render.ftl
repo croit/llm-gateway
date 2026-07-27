@@ -50,6 +50,7 @@ render-tool-input-label = Entrada
 render-tool-output-label = Salida
 render-tool-output-truncated = truncado para su visualización — los { $bytes } bytes completos siguen disponibles para el modelo y almacenados en la base de datos; mostrando los primeros { $chars } caracteres
 
+render-canvas-version-by-you = tú
 render-canvas-hand-edited = editado por ti
 render-canvas-edit-button = ✎ Editar
 render-canvas-save = Guardar como nueva versión
