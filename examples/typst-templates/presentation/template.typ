@@ -46,6 +46,13 @@
 #let PADT = 2.9cm // body top (clears logo)
 #let PADB = 1.7cm // body bottom (clears footer)
 #let CW = SW - 2 * PADX // usable content width
+// Usable content height. Needed explicitly because `height: 100%` inside `pad`
+// resolves against the region BEFORE the bottom padding is taken off, so a
+// full-height box would reach down through the footer. The extra clearance is
+// because PADB alone does NOT clear the footer: the rule sits a hair *inside*
+// the nominal content box, which only shows up when something is pinned to the
+// very bottom of it (a caption under a full-height image was landing on the rule).
+#let CH = SH - PADT - PADB - 0.55cm
 
 // ---- Per-theme palette -----------------------------------------------------
 #let palette(theme) = if theme == "light" {
@@ -146,6 +153,34 @@
 #let badge-row(p, tags) = grid(columns: tags.map(_ => auto), column-gutter: 8pt,
   ..tags.map(t => badge(p, t)))
 
+// ---- Image placement -------------------------------------------------------
+// Cropping a picture to fill its box ("cover") is free for a photo but
+// destructive for a diagram, chart or screenshot: a 4:3 diagram in a 16:9 hole
+// loses a quarter of its width, and what goes missing is usually a label. So we
+// only crop when the picture is already about as wide as the box it has to fill,
+// and letterbox it ("contain") otherwise — nothing is ever cut off silently.
+#let AR-TOL = 0.20 // how far off the box's aspect a picture may be and still be cropped
+
+// natural aspect ratio of an image file (0.0 if unknown); needs a `context`,
+// because `measure` does.
+#let img-ar(path) = {
+  let nat = measure(image(path))
+  if nat.height == 0pt { 0.0 } else { nat.width / nat.height }
+}
+// May `path` be cropped into a box of this aspect without losing anything that
+// matters? A 16:9 photo in a 16:9 hole: yes. A 4:3 diagram: no.
+#let croppable(path, box-ar) = {
+  let ar = img-ar(path)
+  ar == 0.0 or calc.abs(ar - box-ar) <= box-ar * AR-TOL
+}
+// Draw `path` into a full-width, `h`-tall box, cropping only when that costs
+// (almost) nothing. `layout` supplies the box width the aspect test needs.
+#let fitted-image(path, h) = layout(sz => context box(
+  width: 100%, height: h, clip: true,
+  image(path, width: 100%, height: 100%,
+    fit: if croppable(path, sz.width / h) { "cover" } else { "contain" }),
+))
+
 // browser/device frame around a screenshot (neutral window chrome). `h` = media
 // height; the frame adds a slim title bar with three muted dots above the image.
 #let device-frame(img, h: 11cm) = block(radius: 12pt, clip: true, width: 100%,
@@ -154,7 +189,7 @@
     #grid(columns: (auto, auto, auto), column-gutter: 7pt,
       ..((rgb("#5A5A60"),) * 3).map(c => circle(radius: 3.5pt, fill: c, stroke: none)))
   ]
-  #image(img, width: 100%, height: h, fit: "cover")
+  #fitted-image(img, h)
 ]
 
 // full-bleed background image + dark scrim (keeps text legible). Takes a
@@ -558,74 +593,118 @@
   }
 }
 
-// Map an optional per-slide `size` (small|medium|large|full) to a media height.
-// Shared by `l-media` (framed) and `l-image`. `full` is nearly the whole slide.
-#let media-height(s, default-key: "large") = (
-  small: 6cm, medium: 9cm, large: 12cm, full: 14.5cm,
-).at(s.at("size", default: default-key), default: 12cm)
+// `size` (small|medium|large|full) scales the picture as a FRACTION of the space
+// that is actually free — the region `chrome` leaves between logo and footer —
+// not as an absolute height. Fractions cannot overflow; the absolute heights this
+// replaces (large = 12cm, full = 14.5cm) were up to ~1cm over that budget once a
+// title and a caption were added, and typst silently pushed the overflow onto a
+// blank extra slide instead of shrinking the image.
+#let image-scale(s, default-key: "large") = (
+  small: 0.45, medium: 0.68, large: 0.88, full: 1.0,
+).at(s.at("size", default: default-key), default: 0.88)
 
+// A single image on its own clean slide — centred, sized via `size`, NO browser
+// chrome and NO text overlay (unlike full-bleed `l-media`). Optional `title`
+// above and `caption` below sit in the flow, so nothing ever covers the image.
+// Rows are (auto, 1fr, auto) inside a full-height box: title and caption take
+// exactly what they need, the picture gets everything left over and never more,
+// and `fit: "contain"` shows all of it, uncropped. Use this for a
+// diagram/photo/chart that should read large and unobstructed.
+#let l-image(p, n, s) = chrome(p, n, s, {
+  let img = s.at("image", default: "")
+  let title = s.at("title", default: "")
+  let cap = s.at("caption", default: "")
+  let framed = s.at("frame", default: false)
+  let scale = image-scale(s)
+  box(width: 100%, height: CH, grid(
+    columns: (1fr,), rows: (auto, 1fr, auto), row-gutter: 0.45cm,
+    if title == "" { [] } else { align(center, text(size: 26pt, weight: 600, fill: p.fg)[#title]) },
+    align(center + horizon, if img == "" { [] } else if framed {
+      // the frame adds its own title bar, so leave it room on top of the picture
+      layout(sz => align(center, box(width: scale * 100%,
+        device-frame(img, h: calc.max(sz.height * scale - 1.2cm, 1cm)))))
+    } else {
+      box(width: scale * 100%, height: scale * 100%,
+        image(img, width: 100%, height: 100%, fit: "contain"))
+    }),
+    if cap == "" { [] } else { align(center, text(size: 13pt, fill: p.muted)[#cap]) },
+  ))
+})
+
+// Image showcase. Text on a full-slide picture is the EXCEPTION here, not the
+// rule: a picture big enough to fill a slide is usually a diagram, a chart or a
+// screenshot, i.e. it already carries its own labels, and a headline dropped on
+// top of those is unreadable (the `gallery` tiles put their captions in a strip
+// BELOW the image for exactly this reason). So `media` picks the treatment:
+//   • no title and no caption → the picture alone, edge to edge, nothing on it
+//   • title/caption, no `overlay_position` → the clean `image` slide: picture as
+//     large as it fits, title above it, caption below it, never over it
+//   • `overlay_position` set → opt IN to the glass caption panel ON the picture
+//     (bottom-left | bottom-right | center); for photos/artwork with empty space
+//   • `size` other than "full" → the clean sized `image` slide, so "make the
+//     picture smaller" does something on this layout too (it used to be ignored
+//     unless `frame` was set, which is why no amount of asking ever shrank it)
+//   • `frame: true` → screenshot inside the browser/device chrome
+// A picture whose aspect is too far off 16:9 to crop is never full-bleed either:
+// it falls back to the clean slide rather than losing a quarter of itself.
 #let l-media(p, s, n) = {
   let img = s.at("image", default: "")
   let framed = s.at("frame", default: false)
+  let title = s.at("title", default: "")
+  let cap = s.at("caption", default: "")
+  let overlay-at = s.at("overlay_position", default: "")
+  let has-text = title != "" or cap != ""
   let white-logo = (logo: "assets/logo-light.svg", card-inner: anthracite, fg: white, muted: rgb(255, 255, 255, 220))
   if img != "" and framed {
     // framed screenshot, centred on the (theme) background — a clean product slide
     place(top + left, dx: PADX, dy: 1.15cm, logo-img(p))
-    let title = s.at("title", default: "")
     if title != "" { place(top + left, dx: PADX, dy: 2.7cm, text(size: 26pt, weight: 600, fill: p.fg)[#title]) }
     // `size` scales the framed screenshot (default keeps the original 9.4cm).
     let h = (small: 6cm, medium: 8cm, large: 9.4cm, full: 11cm).at(s.at("size", default: "large"), default: 9.4cm)
     place(center + horizon, dy: -0.2cm, box(width: 21cm, device-frame(img, h: h)))
-    let cap = s.at("caption", default: "")
     if cap != "" { place(center + horizon, dy: 5.7cm, text(size: 13pt, fill: p.muted)[#cap]) }
     footer-row(p, n)
+  } else if img != "" and (s.at("size", default: "full") != "full" or (has-text and overlay-at == "")) {
+    // asked to be smaller, or carrying text → the clean image slide, no overlay
+    l-image(p, n, (..s, size: s.at("size", default: "full")))
   } else if img != "" {
-    // full-bleed image + glass caption overlay (logo goes ON TOP of the image)
-    place(top + left, image(img, width: SW, height: SH, fit: "cover"))
-    place(bottom + left, dx: PADX, dy: -1.6cm, box(width: 18cm, block(
-      fill: anthracite.transparentize(15%), stroke: 0.7pt + rgb(255, 255, 255, 60), radius: 18pt, inset: 18pt,
-    )[
-      #text(size: 22pt, weight: 600, fill: white)[#s.at("title", default: "")]
-      #let cap = s.at("caption", default: "")
-      #if cap != "" { v(4pt); text(size: 13pt, fill: rgb(255, 255, 255, 220))[#cap] }
-    ]))
-    place(top + left, dx: PADX, dy: 1.3cm, logo-img(white-logo, h: 0.7cm))
-    footer-row(white-logo, n, on-grad: true)
+    context if not croppable(img, SW / SH) {
+      // too tall/square to fill a 16:9 slide without cutting it up
+      l-image(p, n, (..s, size: "full"))
+    } else {
+      // edge-to-edge picture; logo and footer are the only marks on it
+      place(top + left, image(img, width: SW, height: SH, fit: "cover"))
+      if has-text {
+        // opt-in glass caption panel. Nearly opaque, so it reads as a card
+        // instead of ghosting whatever sits behind it.
+        let (anchor, dx, dy) = if overlay-at == "bottom-right" {
+          (bottom + right, -PADX, -1.6cm)
+        } else if overlay-at == "center" {
+          (center + horizon, 0cm, 0cm)
+        } else {
+          (bottom + left, PADX, -1.6cm)
+        }
+        place(anchor, dx: dx, dy: dy, box(width: 18cm, block(
+          fill: anthracite.transparentize(6%), stroke: 0.7pt + rgb(255, 255, 255, 60), radius: 18pt, inset: 18pt,
+        )[
+          #text(size: 22pt, weight: 600, fill: white)[#title]
+          #if cap != "" { v(4pt); text(size: 13pt, fill: rgb(255, 255, 255, 220))[#cap] }
+        ]))
+      }
+      place(top + left, dx: PADX, dy: 1.3cm, logo-img(white-logo, h: 0.7cm))
+      footer-row(white-logo, n, on-grad: true)
+    }
   } else {
     // no image: a centred statement on the gradient, so the slide reads as intentional
     place(top + left, rect(width: SW, height: SH, fill: grad))
     place(top + left, dx: PADX, dy: 1.3cm, logo-img(white-logo, h: 0.7cm))
     place(center + horizon, box(width: 24cm, align(center, {
-      text(size: 38pt, weight: 600, fill: white)[#s.at("title", default: "")]
-      let cap = s.at("caption", default: "")
+      text(size: 38pt, weight: 600, fill: white)[#title]
       if cap != "" { v(12pt); text(size: 17pt, fill: rgb(255, 255, 255, 230))[#cap] }
     })))
     footer-row(white-logo, n, on-grad: true)
   }
 }
-
-// A single image on its own clean slide — centred, sized via `size`, NO browser
-// chrome and NO text overlay (unlike full-bleed `l-media`). Optional `title`
-// above and `caption` below sit in the flow, so nothing ever covers the image.
-// `fit: "contain"` inside a fixed box guarantees the whole image shows, uncropped
-// and without overflowing the slide. Use this for a diagram/photo/chart that
-// should read large and unobstructed.
-#let l-image(p, n, s) = chrome(p, n, s, align(center + horizon, {
-  let img = s.at("image", default: "")
-  let title = s.at("title", default: "")
-  let cap = s.at("caption", default: "")
-  let framed = s.at("frame", default: false)
-  let h = media-height(s)
-  if title != "" { text(size: 26pt, weight: 600, fill: p.fg)[#title]; v(0.5cm) }
-  if img != "" {
-    if framed {
-      box(width: 100%, device-frame(img, h: h))
-    } else {
-      box(width: 100%, height: h, image(img, width: 100%, height: 100%, fit: "contain"))
-    }
-  }
-  if cap != "" { v(0.35cm); text(size: 13pt, fill: p.muted)[#cap] }
-}))
 
 #let l-team(p, n, s) = chrome(p, n, s, {
   text(size: 30pt, weight: 600, fill: p.fg)[#s.at("title", default: "")]

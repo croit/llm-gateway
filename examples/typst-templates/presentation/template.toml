@@ -49,8 +49,8 @@ LAYOUTS AND THEIR FIELDS (✱ = required):
 • process — horizontal steps. title✱, steps✱[{label✱, detail?}] (2–6)
 • bignumber — one hero metric. value✱, title✱, body?
 • quote — quote✱, attribution✱, attribution_role?, style? ("default" = left, gradient text | "hero" = big white centred quote, the example.com hero look)
-• media — image showcase. image? (omit → gradient + centred statement), frame? (true → centred screenshot inside a browser/device frame instead of full-bleed), size? ("small"|"medium"|"large"|"full", scales the framed screenshot), title✱, caption?
-• image — ONE image alone on a clean slide: centred, NO browser chrome and NO text overlay (unlike full-bleed `media`), so the picture reads large and unobstructed. image✱, size? ("small"|"medium"|"large" (default)|"full" ≈ whole slide), title? (above, in the flow), caption? (below), frame? (wrap in the browser chrome). Use this for a diagram/photo/chart that should dominate the slide without text on top of it.
+• media — image showcase, edge to edge. image? (omit → gradient + centred statement), title?, caption?, overlay_position? ("bottom-left"|"bottom-right"|"center"), size? ("small"|"medium"|"large"|"full"), frame? (true → centred screenshot inside a browser/device frame instead of full-bleed). TEXT IS NOT DRAWN ON THE PICTURE unless you ask for it: title/caption WITHOUT `overlay_position` get the clean `image` treatment (picture as large as it fits, title above it, caption below it) — which is what you want for a diagram, chart, screenshot or re-used slide, because those already carry their own labels and a headline dropped on top of them is unreadable. Set `overlay_position` ONLY for a photo/artwork with empty space in it, to put the glass caption panel ON the picture. Omit title AND caption for a pure edge-to-edge picture with nothing but the logo and footer on it. `size` shrinks the picture (anything other than "full" gives the clean sized slide). A picture too far off 16:9 to crop is never full-bleed — it is shown whole rather than losing a quarter of itself.
+• image — ONE image alone on a clean slide: centred, NO browser chrome and NO text overlay (unlike full-bleed `media`), so the picture reads large and unobstructed. image✱, size? ("small"|"medium"|"large" (default)|"full" = all the free space), title? (above, in the flow), caption? (below), frame? (wrap in the browser chrome). The picture is scaled to the space that is actually free, so it always fits: whole, uncropped, and never spilling onto a second slide. Use this for a diagram/photo/chart that should dominate the slide without text on top of it.
 • gallery — image grid. title✱, items✱[{image?, caption?}], per_row (default 3). Omitted image → gradient tile.
 • timeline — vertical roadmap. title✱, milestones✱[{label✱, date?, detail?}]
 • logos — "trusted by" wall. title✱, logos✱[strings], per_row (default 4)
@@ -78,6 +78,10 @@ image, and do NOT paste base64 — you cannot embed pixels in JSON). So when you
 rebuild an uploaded deck as branded slides, carry each source image over by \
 dropping its `att:` ref into the matching slide's image field. \
 Omitting an image always yields a clean gradient fallback, never a broken slide. \
+Never put slide text ON a picture that carries text of its own (a diagram, a \
+chart, a screenshot, a slide out of another deck): use `image`, or `media` \
+without `overlay_position`, so the headline sits above the picture and the \
+caption below it. \
 BACKGROUNDS: this sample ships NO background art, so cover, section and \
 statement render on the plain themed background by default; closing uses a full \
 brand-gradient background. To use your own, set `bg_image` to an image path \
