@@ -24,7 +24,7 @@
 use markdown::mdast::{List, Node};
 use markdown::{ParseOptions, to_mdast};
 
-use crate::attachments::{Segment, split_markers};
+use crate::attachments::{Segment, split_markers_for_turn};
 use crate::db::{Session, TurnRole, TurnWithTools};
 
 /// Knobs the exporters need that aren't carried by the turns
@@ -54,7 +54,7 @@ pub fn to_markdown(session: &Session, turns: &[TurnWithTools], opts: &ExportOpts
     for tw in turns {
         let turn = &tw.turn;
         let raw = turn_text(turn);
-        let body = clean_to_markdown(raw, opts.base_url);
+        let body = clean_to_markdown(raw, &turn.id, opts.base_url);
         if body.trim().is_empty() {
             continue;
         }
@@ -71,9 +71,9 @@ pub fn to_markdown(session: &Session, turns: &[TurnWithTools], opts: &ExportOpts
 
 /// Walk a turn's stored text, keeping prose Markdown as-is and turning
 /// each attachment marker into a Markdown link with an absolute URL.
-fn clean_to_markdown(raw: &str, base_url: &str) -> String {
+fn clean_to_markdown(raw: &str, turn_id: &str, base_url: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
-    for seg in split_markers(raw) {
+    for seg in split_markers_for_turn(raw, turn_id) {
         match seg {
             Segment::Text(t) => {
                 let t = t.trim();
@@ -125,7 +125,7 @@ pub fn to_typst(session: &Session, turns: &[TurnWithTools], opts: &ExportOpts<'_
     for tw in turns {
         let turn = &tw.turn;
         let raw = turn_text(turn);
-        let body = clean_to_typst(raw, opts.base_url);
+        let body = clean_to_typst(raw, &turn.id, opts.base_url);
         if body.trim().is_empty() {
             continue;
         }
@@ -153,9 +153,9 @@ pub fn to_typst(session: &Session, turns: &[TurnWithTools], opts: &ExportOpts<'_
 
 /// Walk a turn's stored text, mapping prose through [`md_to_typst`] and
 /// each attachment marker into a Typst link line.
-fn clean_to_typst(raw: &str, base_url: &str) -> String {
+fn clean_to_typst(raw: &str, turn_id: &str, base_url: &str) -> String {
     let mut out = String::new();
-    for seg in split_markers(raw) {
+    for seg in split_markers_for_turn(raw, turn_id) {
         match seg {
             Segment::Text(t) => {
                 let t = t.trim();

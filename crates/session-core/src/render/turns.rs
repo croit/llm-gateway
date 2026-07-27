@@ -111,7 +111,7 @@ pub(crate) fn render_msg_time(ts: jiff::Timestamp) -> Html {
 pub fn render_user_turn(turn: &Turn, actions: Option<&str>, lang: Lang) -> Html {
     let content = turn.user_content.clone().unwrap_or_default();
     let dom_id = format!("turn-{}", turn.id);
-    let segments = crate::attachments::split_markers(&content);
+    let segments = crate::attachments::split_markers_for_turn(&content, &turn.id);
     let has_attachments = segments
         .iter()
         .any(|s| matches!(s, crate::attachments::Segment::Attachment(_)));

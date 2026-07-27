@@ -257,7 +257,12 @@ fn marker_id(turn_id: &str, att: &ParsedAttachment) -> String {
 /// `turn_id`, appending to `out` and skipping ids already present (a
 /// preview marker and the file it links to can both appear).
 fn collect_markers(out: &mut Vec<AttachmentRef>, turn_id: &str, text: &str) {
-    for att in parse_markers(text) {
+    // `parse_markers_for_turn`, not `parse_markers`: a marker whose URL
+    // names another turn was forged by the model out of replayed
+    // history. Keying it under the turn that carries it would mint an
+    // id (`<this turn>/<file>`) that no object ever backed — a phantom
+    // asset card, and a `fetch_attachment` id that resolves to nothing.
+    for att in parse_markers_for_turn(text, turn_id) {
         let id = marker_id(turn_id, &att);
         if out.iter().any(|r: &AttachmentRef| r.id == id) {
             continue;
@@ -337,6 +342,54 @@ pub async fn round_attachments(
     session_id: &str,
 ) -> Result<Vec<AttachmentRef>, AttachmentError> {
     Ok(collect_round(&session_turns(db, session_id).await?))
+}
+
+/// Attachments owned by the turns at or after `from_seq`. Pure over
+/// the turn list so the truncation path can be unit-tested without a
+/// pool. Turns before the cutoff survive the delete, so their files
+/// must not be reclaimed with it.
+fn collect_from_seq(turns: &[chat_db::TurnWithTools], from_seq: i64) -> Vec<AttachmentRef> {
+    let mut out = Vec::new();
+    for t in turns.iter().filter(|t| t.turn.seq >= from_seq) {
+        for text in [t.turn.user_content.as_deref(), t.turn.content.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            collect_markers(&mut out, &t.turn.id, text);
+        }
+    }
+    out
+}
+
+/// Every attachment that a `delete_turns_from_seq(session, from_seq)`
+/// is about to orphan. Call it *before* the delete — once the rows are
+/// gone the markers are gone with them, and the bucket objects can
+/// never be found again (the proxy refuses them with `no such turn`,
+/// so nothing else will ever read them either).
+pub async fn attachments_from_seq(
+    db: &chat_db::Pool,
+    session_id: &str,
+    from_seq: i64,
+) -> Result<Vec<AttachmentRef>, AttachmentError> {
+    Ok(collect_from_seq(
+        &session_turns(db, session_id).await?,
+        from_seq,
+    ))
+}
+
+/// Best-effort reclaim of the bucket objects behind `refs`. Every
+/// failure is logged and skipped: the DB rows are already gone by the
+/// time this runs, so a failed DELETE costs storage, never correctness
+/// (and S3 DELETE is idempotent, so a later sweep can retry).
+pub async fn reclaim_all(cfg: &S3Config, refs: &[AttachmentRef]) {
+    for att in refs {
+        if let Err(err) = delete(cfg, &att.turn_id, &att.filename).await {
+            tracing::warn!(
+                error = %err, turn_id = %att.turn_id, filename = %att.filename,
+                "reclaiming attachment of a deleted turn",
+            );
+        }
+    }
 }
 
 /// Both views in one query: every session attachment plus the current
@@ -568,7 +621,7 @@ mod base64_tests {
 // gateway call sites keep working.
 pub use session_core::attachments::{
     ParsedAttachment, dedupe_filename, is_inline_text, is_pdf, parse_markers,
-    strip_markers_for_replay,
+    parse_markers_for_turn, strip_markers_for_replay,
 };
 
 /// Reserve a unique filename for an upload that's about to land in
@@ -721,6 +774,101 @@ fn urlencode_path_segment(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ids are `<turn>/<file>` keyed off the turn that *owns* the file.
+    /// A marker naming another turn (a model that copied a marker line
+    /// out of history) must not be re-keyed under the turn that carries
+    /// it: that mints an id for an object that was never written, so the
+    /// assets panel shows a dead card and `fetch_attachment` on that id
+    /// finds nothing.
+    #[test]
+    fn foreign_markers_do_not_become_phantom_ids_under_the_hosting_turn() {
+        let own = session_core::attachments::marker_line(
+            "own.pdf",
+            "application/pdf",
+            "/chat/attachment/t-2/own.pdf",
+            7,
+        );
+        let forged = session_core::attachments::marker_line(
+            "copied.pdf",
+            "application/pdf",
+            "/chat/attachment/t-1/copied.pdf",
+            9,
+        );
+        let mut out = Vec::new();
+        collect_markers(&mut out, "t-2", &format!("{own}\n{forged}"));
+        let ids: Vec<&str> = out.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["t-2/own.pdf"]);
+    }
+
+    /// Retry/edit reclaims the bucket objects of the turns it drops —
+    /// and only those. A file on a surviving turn stays: it's still
+    /// referenced by a marker the user can see and download.
+    #[test]
+    fn reclaim_scope_stops_at_the_truncation_cutoff() {
+        let marker = |turn: &str, file: &str| {
+            session_core::attachments::marker_line(
+                file,
+                "application/pdf",
+                &format!("/chat/attachment/{turn}/{file}"),
+                7,
+            )
+        };
+        let turns = vec![
+            turn_with(0, "t0", chat_db::TurnRole::User, &marker("t0", "input.pdf")),
+            turn_with(
+                1,
+                "t1",
+                chat_db::TurnRole::Assistant,
+                &marker("t1", "kept.pdf"),
+            ),
+            turn_with(
+                2,
+                "t2",
+                chat_db::TurnRole::Assistant,
+                &marker("t2", "dropped.pdf"),
+            ),
+        ];
+        let ids: Vec<String> = collect_from_seq(&turns, 2)
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, ["t2/dropped.pdf"]);
+        // Deleting the whole conversation (cutoff 0) takes everything.
+        assert_eq!(collect_from_seq(&turns, 0).len(), 3);
+    }
+
+    fn turn_with(
+        seq: i64,
+        id: &str,
+        role: chat_db::TurnRole,
+        text: &str,
+    ) -> chat_db::TurnWithTools {
+        let now: jiff::Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+        let (user_content, content) = match role {
+            chat_db::TurnRole::User => (Some(text.to_string()), None),
+            chat_db::TurnRole::Assistant => (None, Some(text.to_string())),
+        };
+        chat_db::TurnWithTools {
+            turn: chat_db::Turn {
+                id: id.to_string(),
+                session_id: "s1".into(),
+                seq,
+                role,
+                user_content,
+                model: None,
+                content,
+                reasoning: None,
+                reasoning_elapsed_ms: None,
+                reasoning_started_at: None,
+                status: chat_db::TurnStatus::Completed,
+                error_message: None,
+                created_at: now,
+                completed_at: Some(now),
+            },
+            tool_calls: vec![],
+        }
+    }
 
     #[test]
     fn object_key_assembles_prefix_turn_filename() {

@@ -354,10 +354,16 @@ pub async fn chat_session_delete(
     let (session, user) = require_session!(state, req);
     let datastar = is_datastar_request(req.headers());
     let lang = Lang::from_headers(req.headers());
+    // Deleting the conversation deletes its files: seq 0 covers every
+    // turn. Read before the rows go — see `doomed_attachments`.
+    let orphaned = doomed_attachments(&state, &session_id, 0).await;
     let deleted = match chat::delete_session(&state.db, &user.id, &session_id).await {
         Ok(v) => v,
         Err(err) => return internal_error_html(&user.email, &err.to_string()),
     };
+    if deleted {
+        reclaim_attachments(&state, orphaned);
+    }
     if !deleted {
         return sse_response(&[sse_toast(&super::Flash {
             kind: super::FlashKind::Info,
@@ -1348,10 +1354,12 @@ pub async fn chat_retry(
         return sse_error_response(&t(lang, "chat-error-retry-assistant-only"));
     }
     // Drop this reply + everything below, then regenerate from the
-    // preceding user turn.
+    // preceding user turn. The dropped turns' files go with them.
+    let orphaned = doomed_attachments(&state, &id, turn.seq).await;
     if let Err(err) = chat::delete_turns_from_seq(&state.db, &id, turn.seq).await {
         return sse_error_response(&err.to_string());
     }
+    reclaim_attachments(&state, orphaned);
     start_regeneration(
         state,
         user,
@@ -1436,9 +1444,13 @@ pub async fn chat_edit(
     if let Err(err) = chat::update_user_turn_content(&state.db, &id, &turn_id, &new_text).await {
         return sse_error_response(&err.to_string());
     }
+    // Everything below the edited message is regenerated, so its files
+    // are orphaned — the edited turn's own uploads stay (seq + 1).
+    let orphaned = doomed_attachments(&state, &id, turn.seq + 1).await;
     if let Err(err) = chat::delete_turns_from_seq(&state.db, &id, turn.seq + 1).await {
         return sse_error_response(&err.to_string());
     }
+    reclaim_attachments(&state, orphaned);
     start_regeneration(
         state,
         user,
@@ -1538,6 +1550,45 @@ pub async fn chat_attachment_remove(
         }
     };
     sse_response(&[sse_patch(Some(&selector), Some("outer"), &html)])
+}
+
+/// The attachments a pending `delete_turns_from_seq` is about to
+/// orphan. Read *before* the delete — afterwards the markers are gone
+/// and the bucket objects are unreferenced forever. Empty when
+/// attachments aren't configured or the read fails: reclaiming is
+/// housekeeping and must never block the user's retry/edit.
+async fn doomed_attachments(
+    state: &Arc<RamaState>,
+    session_id: &str,
+    from_seq: i64,
+) -> Vec<chat_attachments::AttachmentRef> {
+    if state.config.chat.s3.is_none() {
+        return Vec::new();
+    }
+    match chat_attachments::attachments_from_seq(&state.db, session_id, from_seq).await {
+        Ok(refs) => refs,
+        Err(err) => {
+            tracing::warn!(error = %err, %session_id, "listing attachments of doomed turns");
+            Vec::new()
+        }
+    }
+}
+
+/// Fire-and-forget the bucket DELETEs for turns that are already gone
+/// from the DB. Off the request path: a slow or flaky bucket must not
+/// delay the regeneration the user is waiting on, and a failed DELETE
+/// only leaves an orphan (which a later delete of the same key would
+/// clean up — S3 DELETE is idempotent).
+fn reclaim_attachments(state: &Arc<RamaState>, orphaned: Vec<chat_attachments::AttachmentRef>) {
+    if orphaned.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Some(cfg) = state.config.chat.s3.as_ref() {
+            chat_attachments::reclaim_all(cfg, &orphaned).await;
+        }
+    });
 }
 
 /// Request-derived bits the worker needs that aren't part of the chat
