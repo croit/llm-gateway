@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn assistant_segments_fast_path_returns_one_prose_block() {
-        let segs = assistant_segments("plain text with **bold**", "t-1");
+        let segs = assistant_segments("plain text with **bold**", "t-1", Lang::En);
         assert_eq!(segs.len(), 1);
         assert!(
             matches!(&segs[0], AssistantSegment::Prose(s) if s.contains("<strong>bold</strong>"))
@@ -478,7 +478,7 @@ mod tests {
         let body = format!(
             "Here is the chart you asked for:\n\n{marker}\n\nLet me know if you want adjustments."
         );
-        let segs = assistant_segments(&body, "t-1");
+        let segs = assistant_segments(&body, "t-1", Lang::En);
         // Three segments: prose, attachment, prose. Each prose chunk
         // gets its own markdown pass so links/bold/etc. still work
         // around the attachment.
@@ -670,6 +670,80 @@ mod tests {
         assert!(
             rendered_img.contains("<img"),
             "a valid session image should be rendered inline: {rendered_img}"
+        );
+    }
+
+    #[test]
+    fn file_chips_download_except_pdfs_which_preview() {
+        let json = crate::attachments::ParsedAttachment {
+            filename: "deck-data.json".into(),
+            mime: "application/json".into(),
+            url: "/chat/attachment/turn-A/deck-data.json".into(),
+            size: 4200,
+            link: None,
+        };
+        let rendered = render_attachment(&json, None, Lang::En).to_string();
+        // Without `download`, a browser renders JSON/CSV/markdown in a tab —
+        // which is the select-and-copy chore a handed-over file replaces.
+        assert!(
+            rendered.contains(r#"download="deck-data.json""#),
+            "text-ish chip must download, not open inline: {rendered}"
+        );
+        let pdf = crate::attachments::ParsedAttachment {
+            filename: "letter.pdf".into(),
+            mime: "application/pdf".into(),
+            url: "/chat/attachment/turn-A/letter.pdf".into(),
+            size: 19600,
+            link: None,
+        };
+        let rendered_pdf = render_attachment(&pdf, None, Lang::En).to_string();
+        assert!(
+            !rendered_pdf.contains("download"),
+            "a PDF should still open in the browser viewer: {rendered_pdf}"
+        );
+    }
+
+    #[test]
+    fn code_blocks_carry_a_copy_button_in_assistant_prose() {
+        let labels = CopyLabels::for_lang(Lang::En);
+        let out = render_markdown_with_copy("```json\n{\"a\": 1}\n```", &labels);
+        assert!(
+            out.contains(r#"class="md-code""#) && out.contains("data-md-copy"),
+            "fenced block should be wrapped with a copy button: {out}"
+        );
+        // Labels are resolved server-side (both states) so the browser
+        // handler needs no locale knowledge.
+        assert!(
+            out.contains(r#"data-copy-label="Copy code""#)
+                && out.contains(r#"data-copied-label="Copied""#),
+            "both translated labels should be on the button: {out}"
+        );
+        // The button sits before the <pre>, inside the wrapper — the
+        // handler finds the code by walking up to `.md-code`.
+        let button_at = out.find("data-md-copy").expect("button rendered");
+        let pre_at = out.find("<pre").expect("pre rendered");
+        assert!(button_at < pre_at, "button must precede the block: {out}");
+
+        // One wrapper per block, and prose without code stays untouched.
+        let two = render_markdown_with_copy("```\na\n```\n\ntext\n\n```\nb\n```", &labels);
+        assert_eq!(two.matches("data-md-copy").count(), 2, "{two}");
+        let plain = render_markdown_with_copy("just **prose**", &labels);
+        assert!(!plain.contains("md-code"), "no code, no button: {plain}");
+    }
+
+    #[test]
+    fn assistant_turn_renders_copy_buttons_for_its_code_blocks() {
+        // The wiring, not just the helper: a rendered turn must carry the
+        // button, since that is the surface the user clicks.
+        let tw = conv_turn(
+            0,
+            TurnRole::Assistant,
+            "here is the data\n\n```json\n{\"deck\": {}}\n```",
+        );
+        let html = render_assistant_turn(&tw, None, Lang::En).to_string();
+        assert!(
+            html.contains("data-md-copy"),
+            "assistant bubble should render a code copy button: {html}"
         );
     }
 

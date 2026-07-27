@@ -190,6 +190,11 @@ async fn main() -> anyhow::Result<()> {
             sandbox_client.clone(),
         ))
         .with(gateway_tools::upload_attachment::UploadAttachment)
+        // Hand an existing conversation object to the user as a download —
+        // a file from an earlier turn, or a data object that never got a
+        // chip (a render's `.json` base). Reference-only: the bytes are
+        // copied inside storage instead of being re-emitted by the model.
+        .with(gateway_tools::offer_download::OfferDownload)
         // Inventory of the conversation's files (uploads + tool outputs), so
         // the model reuses existing assets instead of regenerating them.
         // Reads only the session's turn markers — no storage config needed.

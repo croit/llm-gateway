@@ -29,6 +29,11 @@ render-media-label = { $kind ->
    *[other] Média { $n }
 }
 
+# Bouton de copie sur un bloc de code d'une réponse (icône seule, donc
+# ceci est son infobulle / nom accessible).
+render-code-copy = Copier le code
+render-code-copied = Copié
+
 render-thinking-spinner = Réflexion…
 render-thinking-finalized = Réflexion pendant { $secs } s
 render-thinking-in-progress = Réflexion… ({ $secs } s)

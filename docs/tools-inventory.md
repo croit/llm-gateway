@@ -53,6 +53,7 @@ message rather than being absent.
 | `tls_cert` | — | `tls_cert` | TLS certificate inspection (issuer, validity, days to expiry, SANs). |
 | `fetch_attachment` | — | `fetch_attachment` | Read an attachment. Tiered PDF reading — text layer, rasterised pages, `mode="ocr"` (gateway OCR, images too), `mode="auto"` (text-or-OCR) — with `page_from`/`page_to`; Office files return structured content. |
 | `upload_attachment` | yes | `upload_attachment` | Attach a model-generated file to the reply. |
+| `offer_download` | yes | `upload_attachment` | Hand a file the conversation *already holds* to the user as a download chip on the current reply — including objects with no chip of their own (a typst render's hidden `.json` data base, an intermediate artifact) and files from earlier turns. Takes a reference, never content: the object is copied inside S3, so a large payload never round-trips through the model as prose. Session-scoped twice over — a marker-backed id is proven in-session by the enumeration, an unlisted `<turn_id>/<filename>` by `turn_in_session`. Shares the `upload_attachment` toggle: one switch for "let the assistant hand me files". |
 | `list_attachments` | yes | `list_attachments` | Inventory of the conversation's files, so assets get reused instead of regenerated. |
 | `load_image_url` | yes | `load_image_url` | Fetch an image from a URL and keep it as a reusable conversation attachment. |
 | `create_document` | yes | `document` | Open a canvas document. |

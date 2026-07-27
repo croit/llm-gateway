@@ -26,6 +26,7 @@ import './chat/mic.js';
 import './chat/voice.js';
 import './chat/actions.js';
 import './chat/thinking-timer.js';
+import './chat/code-copy.js';
 import './clipboard.js';
 import './canvas.js';
 import './geo.js';

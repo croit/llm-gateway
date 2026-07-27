@@ -36,6 +36,7 @@ pub mod lookup_ip;
 pub mod memory;
 pub mod netcheck;
 pub mod notify_user;
+pub mod offer_download;
 pub mod qr;
 pub mod rag;
 pub mod read_skill;

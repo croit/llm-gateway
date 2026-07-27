@@ -29,6 +29,11 @@ render-media-label = { $kind ->
    *[other] Media { $n }
 }
 
+# Copy-to-clipboard button on a fenced code block in a reply (icon-only,
+# so this is its tooltip / accessible name).
+render-code-copy = Copy code
+render-code-copied = Copied
+
 render-thinking-spinner = Thinking…
 render-thinking-finalized = Thought for { $secs }s
 render-thinking-in-progress = Thinking… ({ $secs }s)

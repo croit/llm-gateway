@@ -29,6 +29,11 @@ render-media-label = { $kind ->
    *[other] Medium { $n }
 }
 
+# Kopier-Schaltfläche an einem Codeblock in einer Antwort (nur Symbol,
+# daher ist dies der Tooltip bzw. der zugängliche Name).
+render-code-copy = Code kopieren
+render-code-copied = Kopiert
+
 render-thinking-spinner = Denkt nach…
 render-thinking-finalized = { $secs }s nachgedacht
 render-thinking-in-progress = Denkt nach… ({ $secs }s)

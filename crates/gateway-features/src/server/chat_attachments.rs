@@ -115,12 +115,29 @@ pub async fn copy_object(
     to_turn: &str,
     filename: &str,
 ) -> Result<(), AttachmentError> {
-    if filename.is_empty() || filename.contains('/') {
-        return Err(AttachmentError::BadFilename(filename.to_string()));
+    copy_object_as(cfg, from_turn, filename, to_turn, filename).await
+}
+
+/// Renaming sibling of [`copy_object`]: copy `from_turn/from_filename`
+/// to `to_turn/to_filename`. `offer_download` needs this — it re-presents
+/// an existing conversation object under the *current* turn (markers are
+/// only honoured under the turn that owns them) and lets the model give
+/// the user a friendlier download name than the internal one.
+pub async fn copy_object_as(
+    cfg: &S3Config,
+    from_turn: &str,
+    from_filename: &str,
+    to_turn: &str,
+    to_filename: &str,
+) -> Result<(), AttachmentError> {
+    for name in [from_filename, to_filename] {
+        if name.is_empty() || name.contains('/') {
+            return Err(AttachmentError::BadFilename(name.to_string()));
+        }
     }
     let bucket = open_bucket(cfg)?;
-    let from = object_key(&cfg.key_prefix, from_turn, filename);
-    let to = object_key(&cfg.key_prefix, to_turn, filename);
+    let from = object_key(&cfg.key_prefix, from_turn, from_filename);
+    let to = object_key(&cfg.key_prefix, to_turn, to_filename);
     let status = bucket.copy_object_internal(&from, &to).await?;
     if !(200..300).contains(&status) {
         return Err(AttachmentError::Client(S3Error::Io(std::io::Error::other(
@@ -128,6 +145,36 @@ pub async fn copy_object(
         ))));
     }
     Ok(())
+}
+
+/// Size + content-type of one stored attachment, without moving its
+/// bytes through the gateway. `offer_download` needs both to write a
+/// marker line for an object it never reads (the marker carries mime +
+/// size), and the object can be tens of megabytes — a GET just to count
+/// them would be wasteful.
+pub async fn head(
+    cfg: &S3Config,
+    turn_id: &str,
+    filename: &str,
+) -> Result<UploadOutcome, AttachmentError> {
+    if filename.is_empty() || filename.contains('/') {
+        return Err(AttachmentError::BadFilename(filename.to_string()));
+    }
+    let bucket = open_bucket(cfg)?;
+    let key = object_key(&cfg.key_prefix, turn_id, filename);
+    let (meta, status) = bucket.head_object(&key).await?;
+    if !(200..300).contains(&status) {
+        return Err(AttachmentError::Client(S3Error::Io(std::io::Error::other(
+            format!("s3 HEAD returned status {status}"),
+        ))));
+    }
+    Ok(UploadOutcome {
+        filename: filename.to_string(),
+        mime: meta
+            .content_type
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
+        bytes: meta.content_length.unwrap_or_default().max(0) as u64,
+    })
 }
 
 /// DELETE the object at `<key_prefix>/<turn_id>/<filename>`. Used when a

@@ -163,6 +163,25 @@ pub async fn turn_session_readable(
     Ok(row.is_some())
 }
 
+/// Whether `turn_id` is a turn of `session_id`. The session-scoping gate
+/// for model-supplied `<turn_id>/<filename>` attachment ids that carry no
+/// marker in the conversation text — a typst render's hidden `.json` edit
+/// base, for instance — and so can't be proven in-session by
+/// `chat_attachments::list_session_attachments`. `false` for an unknown
+/// turn, so a guessed id is refused rather than fetched.
+pub async fn turn_in_session(
+    pool: &Pool,
+    turn_id: &str,
+    session_id: &str,
+) -> Result<bool, DbError> {
+    let row = sqlx::query(r#"SELECT 1 AS ok FROM chat_turns WHERE id = ? AND session_id = ?"#)
+        .bind(turn_id)
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
 /// Most-recent session for a user; None when they've never chatted. Used
 /// by `GET /chat` to decide where to redirect.
 pub async fn latest_session(pool: &Pool, user_id: &str) -> Result<Option<Session>, DbError> {

@@ -28,6 +28,10 @@ render-media-label = { $kind ->
    *[other] 媒体 { $n }
 }
 
+# 回复中代码块上的复制按钮（仅图标，因此这是其提示文本 / 无障碍名称）。
+render-code-copy = 复制代码
+render-code-copied = 已复制
+
 render-thinking-spinner = 思考中…
 render-thinking-finalized = 思考了 { $secs } 秒
 render-thinking-in-progress = 思考中…（{ $secs } 秒）

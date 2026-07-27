@@ -29,6 +29,11 @@ render-media-label = { $kind ->
    *[other] Medio { $n }
 }
 
+# Botón de copiar en un bloque de código de una respuesta (solo icono,
+# por lo que este es su tooltip / nombre accesible).
+render-code-copy = Copiar código
+render-code-copied = Copiado
+
 render-thinking-spinner = Pensando…
 render-thinking-finalized = Pensó durante { $secs } s
 render-thinking-in-progress = Pensando… ({ $secs } s)

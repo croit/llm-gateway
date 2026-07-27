@@ -29,6 +29,11 @@ render-media-label = { $kind ->
    *[other] Медиа { $n }
 }
 
+# Кнопка копирования у блока кода в ответе (только значок, поэтому это
+# подсказка / доступное имя).
+render-code-copy = Копировать код
+render-code-copied = Скопировано
+
 render-thinking-spinner = Думает…
 render-thinking-finalized = Думал { $secs } с
 render-thinking-in-progress = Думает… ({ $secs } с)
