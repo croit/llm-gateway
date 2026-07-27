@@ -2068,10 +2068,15 @@
         overflow: auto;
         padding: 0.75rem;
     }
+    /* A document's source view. `white-space: pre` (not `pre-wrap`) so long
+     * lines scroll horizontally rather than folding: JSON and Typst are read
+     * by their indentation, and a folded line makes a nested value look like
+     * a new key. The scroll container is this `<pre>` itself — the prose rules
+     * give it `overflow-x: auto` — so the panel's own vertical scroll and the
+     * block's horizontal one stay independent. */
     .document-canvas__source {
         margin: 0;
-        white-space: pre-wrap;
-        word-break: break-word;
+        white-space: pre;
         font-size: 0.8125rem;
     }
 
@@ -2575,7 +2580,8 @@
  * in the cascade. */
 @layer utilities {
     .chat-prose,
-    .thinking-prose {
+    .thinking-prose,
+    .document-prose {
         /* Knobs the two classes parameterise. Defaults = chat reply
          * sizes; `.thinking-prose` ratchets these down below. */
         --prose-size: 0.875rem;
