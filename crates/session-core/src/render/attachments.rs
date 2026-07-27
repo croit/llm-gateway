@@ -136,12 +136,24 @@ pub(crate) fn render_attachment(
         "render-attachment-chip-title",
         &i18n::args([("mime", mime.clone().into()), ("size", size.clone().into())]),
     );
+    // A chip is the "here is your file" affordance, so clicking it should
+    // *download*. Without `download`, a text-ish type (json / csv / md /
+    // plain) renders in a browser tab instead — the exact select-and-copy
+    // chore a file hand-over is supposed to replace. PDFs keep the plain
+    // link: the browser's built-in viewer is a genuinely better first stop
+    // for a rendered document, and its own toolbar offers the download.
+    //
+    // Same-origin (the gateway's own attachment proxy), so `download` is
+    // always honoured; it also carries the chip's filename through, which
+    // the proxy itself doesn't set a `Content-Disposition` for.
+    let download_name = (mime != "application/pdf").then(|| filename.clone());
     wrap(
         html! {
             a(
                 href: (url.clone()),
                 target: "_blank",
                 rel: "noopener",
+                download?: (download_name),
                 class: "chat-msg__attachment-chip",
                 title: (chip_title)
             ) {

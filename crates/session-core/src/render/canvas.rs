@@ -36,13 +36,19 @@ pub struct DocCanvas<'a> {
 /// `json` document can't inject markup into the operator's page.
 pub fn render_document_canvas(c: &DocCanvas<'_>, lang: Lang) -> String {
     let is_markdown = c.format.eq_ignore_ascii_case("markdown");
+    let copy_label = CopyLabels::for_lang(lang);
     let body_html = if is_markdown {
-        render_markdown(c.content)
+        render_markdown_with_copy(c.content, &copy_label)
     } else {
-        // Escaped source view. `(text)` escapes; wrap in <pre><code>.
-        html! { pre(class: "document-canvas__source") { code { (c.content) } } }
-            .to_html()
-            .to_string()
+        // Escaped source view. `(text)` escapes; wrap in <pre><code>. A
+        // non-markdown document *is* one big code block, so it gets the
+        // same one-click copy as a fenced block in prose.
+        add_code_copy_buttons(
+            &html! { pre(class: "document-canvas__source") { code { (c.content) } } }
+                .to_html()
+                .to_string(),
+            &copy_label,
+        )
     };
     let version_label = format!("v{}", c.version);
     let show_doc_switcher = c.all_docs.len() > 1;

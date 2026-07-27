@@ -14,7 +14,13 @@ pub(crate) enum AssistantSegment {
     Attachment(crate::attachments::ParsedAttachment),
 }
 
-pub(crate) fn assistant_segments(content: &str, turn_id: &str) -> Vec<AssistantSegment> {
+pub(crate) fn assistant_segments(
+    content: &str,
+    turn_id: &str,
+    lang: Lang,
+) -> Vec<AssistantSegment> {
+    // Copy-button labels for the fenced code blocks in this reply's prose.
+    let copy = CopyLabels::for_lang(lang);
     let raw_segs = crate::attachments::split_markers_for_turn(content, turn_id);
     // Fast path: no attachment markers in the assistant content —
     // render the whole thing as one markdown block so the existing
@@ -23,13 +29,15 @@ pub(crate) fn assistant_segments(content: &str, turn_id: &str) -> Vec<AssistantS
         .iter()
         .any(|s| matches!(s, crate::attachments::Segment::Attachment(_)))
     {
-        return vec![AssistantSegment::Prose(render_markdown(content))];
+        return vec![AssistantSegment::Prose(render_markdown_with_copy(
+            content, &copy,
+        ))];
     }
     raw_segs
         .into_iter()
         .filter_map(|s| match s {
             crate::attachments::Segment::Text(t) if !t.is_empty() => {
-                Some(AssistantSegment::Prose(render_markdown(t)))
+                Some(AssistantSegment::Prose(render_markdown_with_copy(t, &copy)))
             }
             crate::attachments::Segment::Text(_) => None,
             crate::attachments::Segment::Attachment(a) => Some(AssistantSegment::Attachment(a)),
@@ -64,7 +72,7 @@ pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: La
     // No markers? `assistant_segments` returns a single rendered-
     // markdown segment and the body stays one block, preserving the
     // pre-existing fast path.
-    let segments = assistant_segments(&content, &turn.id);
+    let segments = assistant_segments(&content, &turn.id, lang);
     // Normalise into body pieces so a run of 2+ generated media collapses
     // into a numbered side-by-side gallery. Prose stays raw-injected HTML.
     let body_pieces: Vec<BodyPiece> = segments
@@ -175,7 +183,7 @@ pub fn render_thinking_block(
     let shell_id = format!("turn-{turn_id}-thinking");
     let summary_id = format!("turn-{turn_id}-thinking-summary");
     let timer_id = format!("turn-{turn_id}-thinking-timer");
-    let rendered = render_markdown(reasoning);
+    let rendered = render_markdown_with_copy(reasoning, &CopyLabels::for_lang(lang));
     html! {
         // Collapsed by default — reasoning is mostly debugging
         // material, not something the reader needs in the flow.
