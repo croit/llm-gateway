@@ -287,6 +287,27 @@ pub enum ToolError {
 
 pub type ToolResult = Result<Value, ToolError>;
 
+/// A reference that didn't resolve is the model's mistake to fix — a wrong id,
+/// a deleted document, an off-chat call — so it maps to `InvalidArgs` and the
+/// `RefError` text (which names `list_attachments` / `list_documents` /
+/// `undelete_document`) reaches the model verbatim. A genuine read failure is
+/// ours, and stays `Failed`.
+///
+/// Lives here so every file-taking tool converts with `?` instead of writing
+/// its own phrasing — the reason a wrong id used to produce a different
+/// message depending on which tool you called.
+impl From<gateway_features::server::file_refs::RefError> for ToolError {
+    fn from(err: gateway_features::server::file_refs::RefError) -> Self {
+        use gateway_features::server::file_refs::RefError;
+        match &err {
+            RefError::Failed(msg) => ToolError::Failed(msg.clone()),
+            RefError::NotFound(_) | RefError::Deleted(_) | RefError::NoSession => {
+                ToolError::InvalidArgs(err.to_string())
+            }
+        }
+    }
+}
+
 /// `BoxFuture` alias — keeps each tool's `run` signature legible while staying
 /// object-safe. Hand-rolled so we don't pull in `async_trait` for one trait.
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>>;

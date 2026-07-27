@@ -32,6 +32,7 @@ use shared::api::ToolDef;
 
 use gateway_core::server::db::documents::{self, DocumentFormat};
 use gateway_features::server::chat_attachments;
+use gateway_features::server::file_refs::{self, FileRef};
 use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Cap on the imported content — the same one every other document writer
@@ -125,20 +126,33 @@ impl Tool for ImportFile {
                 )
             })?;
 
-            // Session-scoped by the enumeration itself: only this
-            // conversation's turns are read, so a hit proves the file is ours.
-            let atts = chat_attachments::list_session_attachments(&ctx.db, session_id)
-                .await
-                .map_err(|e| ToolError::Failed(format!("listing attachments: {e}")))?;
-            let att = chat_attachments::resolve_attachment(&atts, &args.id)
-                .ok_or_else(|| {
-                    ToolError::InvalidArgs(format!(
-                        "no file named `{}` in this conversation — call \
-                         `list_attachments` to see what exists",
-                        args.id
-                    ))
-                })?
-                .clone();
+            // The shared resolver: any spelling of an attachment reference,
+            // session-scoped. A document id resolves too — and is refused
+            // below, because importing a document into the canvas it already
+            // lives in would fork it into two copies that drift apart.
+            let att = match file_refs::resolve(&ctx.db, Some(session_id), &args.id, None).await? {
+                FileRef::Attachment(a) => a,
+                FileRef::UnlistedAttachment { turn_id, filename } => {
+                    chat_attachments::AttachmentRef {
+                        id: format!("{turn_id}/{filename}"),
+                        turn_id,
+                        filename,
+                        // Unknown until the fetch below; only the extension drives
+                        // the format guess for these (a hidden `.json` data base).
+                        mime: "application/octet-stream".to_string(),
+                        size: 0,
+                    }
+                }
+                FileRef::Document { doc, version } => {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "`{}` is already canvas document `{}` (v{}) — read it with \
+                         `read_document` and change it with `edit_document`. Importing it \
+                         again would fork it into a second copy that drifts from the one \
+                         the user sees.",
+                        args.id, doc.id, version.version
+                    )));
+                }
+            };
 
             let format = match args.format.as_deref() {
                 Some(s) => DocumentFormat::parse(s).ok_or_else(|| {

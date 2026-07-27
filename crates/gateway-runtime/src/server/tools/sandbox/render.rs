@@ -430,9 +430,16 @@ impl Tool for RenderTypst {
                 files: staged_files,
                 staged,
                 available,
-                notes,
+                mut notes,
+                documents: attachment_documents,
             } = stage_attachments(&ctx, &args.attachments).await?;
             let mut files = staged_files;
+            // A canvas document listed among the figures is materialised too —
+            // a deck that `#include`s a canvas-drafted section is a real case,
+            // and silently dropping it would fail the compile with a missing
+            // file the model can't see.
+            let _ =
+                super::stage_documents(&ctx, &attachment_documents, &mut files, &mut notes).await;
             files.push(InputFile {
                 name: "in.typ".into(),
                 content_b64: b64::encode(source.as_bytes()),

@@ -38,6 +38,7 @@ use shared::sandbox::{Artifact, InputFile, Language, RunError, RunRequest, RunRe
 use super::{Tool, ToolContext, ToolError, ToolFuture};
 use gateway_core::server::config::SandboxConfig;
 use gateway_features::server::chat_attachments::{self, AttachmentRef};
+use gateway_features::server::file_refs;
 
 /// Model-facing description of the `run_in_sandbox` tool. Extracted to a
 /// module const so `RunInSandbox::schema` reads as structure (the JSON
@@ -749,6 +750,11 @@ struct Staged {
     available: Vec<Value>,
     /// Human-readable notes (skips, renames) surfaced to the model.
     notes: Vec<String>,
+    /// Canvas documents named in `attachments` rather than `documents`.
+    /// Staging them needs the documents store, not S3, so they are handed
+    /// back for the caller to merge into its `documents` list — one code
+    /// path materialises documents, whichever argument named them.
+    documents: Vec<DocumentArg>,
 }
 
 /// Pure assembler: dedup names against `/work`, enforce the byte budget,
@@ -803,27 +809,41 @@ async fn stage_attachments(
         staged: vec![],
         available: vec![],
         notes: vec![],
+        documents: vec![],
     };
-    let (Some(session_id), Some(s3)) = (ctx.session_id.as_deref(), ctx.s3.as_ref()) else {
-        // No session (proxy/`/v1`) or no attachment storage configured:
-        // nothing to stage. If the model named ids anyway, say why they
-        // were ignored rather than failing the whole run.
+    let Some(session_id) = ctx.session_id.as_deref() else {
+        // No session (proxy/`/v1`): nothing to resolve against. If the model
+        // named ids anyway, say why they were ignored rather than failing the
+        // whole run.
         if explicit.is_empty() {
             return Ok(empty());
         }
         let mut s = empty();
         s.notes.push(
-            "Attachments can't be staged on this path (no chat session / attachment storage). \
-             Ran without them."
-                .into(),
+            "Attachments can't be staged on this path (no chat session). Ran without them.".into(),
         );
         return Ok(s);
+    };
+    // Storage gates *attachments*, not canvas documents — those live in the
+    // DB. A deployment without `[chat.s3]` can still stage a document the
+    // model names here, so resolve first and only skip the S3 half.
+    let s3 = match ctx.s3.as_ref() {
+        Some(s3) => Some(s3),
+        None => {
+            if explicit.is_empty() {
+                return Ok(empty());
+            }
+            None
+        }
     };
 
     let (session_atts, round) =
         chat_attachments::session_and_round_attachments(&ctx.db, session_id)
             .await
             .map_err(|e| ToolError::Failed(format!("listing session attachments: {e}")))?;
+    // Without storage the round's uploads can't be fetched either, so only
+    // explicitly-named references (which may be documents) are worth walking.
+    let round: Vec<_> = if s3.is_some() { round } else { Vec::new() };
 
     // Build the to-stage list: round uploads first, then explicit ids.
     // De-dupe by id so a file named explicitly *and* in the round is
@@ -837,19 +857,30 @@ async fn stage_attachments(
         }
     }
     let mut notes: Vec<String> = Vec::new();
+    let mut doc_args: Vec<DocumentArg> = Vec::new();
     for arg in explicit {
-        // Accept an exact `<turn>/<file>` id OR a bare filename (newest
-        // match wins) — models lose track of turn ids across rounds and
-        // would otherwise regenerate assets they already produced.
-        let Some(resolved) = chat_attachments::resolve_attachment(&session_atts, &arg.id) else {
-            notes.push(format!(
-                "Ignored attachment `{}`: no attachment with that id or filename in \
-                 this conversation (see `available_attachments`).",
-                arg.id,
-            ));
-            continue;
+        // One resolver, every spelling: an exact `<turn>/<file>` id, a bare
+        // filename (newest match wins — models lose track of turn ids across
+        // rounds), an `att:` ref, or a canvas document. A document id landing
+        // in `attachments` used to be an "ignored, no such attachment" note
+        // even though the file was right there; it now stages, so the model
+        // doesn't have to know which of the two arguments an id belongs in.
+        let resolved = match file_refs::resolve(&ctx.db, Some(session_id), &arg.id, None).await {
+            Ok(r) => r,
+            Err(err) => {
+                notes.push(format!("Ignored `{}`: {err}", arg.id));
+                continue;
+            }
         };
-        let id = resolved.id.clone();
+        if resolved.is_document() {
+            doc_args.push(DocumentArg {
+                document_id: resolved.id(),
+                version: None,
+                name: arg.name.clone(),
+            });
+            continue;
+        }
+        let id = resolved.id();
         if id != arg.id {
             notes.push(format!("Resolved `{}` to attachment `{id}`.", arg.id));
         }
@@ -883,6 +914,13 @@ async fn stage_attachments(
         let (turn, filename) = id
             .split_once('/')
             .ok_or_else(|| ToolError::Failed(format!("malformed attachment id `{id}`")))?;
+        let Some(s3) = s3 else {
+            notes.push(format!(
+                "Could not stage attachment `{id}`: chat attachments are not configured \
+                 on this gateway (canvas documents still work)."
+            ));
+            continue;
+        };
         match chat_attachments::fetch(s3, turn, filename).await {
             Ok(f) => items.push(StageItem {
                 name: desired,
@@ -911,6 +949,7 @@ async fn stage_attachments(
         staged,
         available,
         notes,
+        documents: doc_args,
     })
 }
 
@@ -1368,10 +1407,16 @@ mod tests {
         .await
         .unwrap();
         assert!(s.files.is_empty());
+        // The wording is the shared resolver's, so a wrong reference reads the
+        // same here as it does from `fetch_attachment` or `offer_download` —
+        // and it names both inventories, because either store could have held
+        // what the model meant.
         assert!(
-            s.notes
-                .iter()
-                .any(|n| n.contains("no attachment with that id or filename")),
+            s.notes.iter().any(|n| {
+                n.contains("no file or document named")
+                    && n.contains("list_attachments")
+                    && n.contains("list_documents")
+            }),
             "{:?}",
             s.notes
         );
@@ -2022,6 +2067,47 @@ mod tests {
         assert_eq!(staged[0]["version"], 1);
         // Unknown id → a note, not a failed run.
         assert!(notes.iter().any(|n| n.contains("doc_missing")), "{notes:?}");
+    }
+
+    /// A canvas document named in `attachments` is staged, not ignored: the
+    /// model shouldn't have to know which of two arguments an id belongs in,
+    /// and "no attachment with that id" was a lie when the file was right
+    /// there in the other store.
+    #[tokio::test]
+    async fn a_document_id_in_attachments_is_staged_as_a_document() {
+        let (c, id) = ctx_with_canvas_doc("typst", "= From attachments\n").await;
+        let staged = stage_attachments(
+            &c,
+            &[AttachmentArg {
+                id: id.clone(),
+                name: Some("deck.typ".into()),
+            }],
+        )
+        .await
+        .unwrap();
+        // Handed back for the caller's `stage_documents` pass (S3 staging
+        // can't materialise DB content), carrying the rename through.
+        assert_eq!(staged.documents.len(), 1, "{:?}", staged.notes);
+        assert_eq!(staged.documents[0].document_id, id);
+        assert_eq!(staged.documents[0].name.as_deref(), Some("deck.typ"));
+        // And it is NOT reported as an ignored attachment.
+        assert!(
+            !staged.notes.iter().any(|n| n.contains("Ignored")),
+            "{:?}",
+            staged.notes
+        );
+
+        // The same call end-to-end: the document lands in /work under the
+        // requested name.
+        let mut files = staged.files;
+        let mut notes = staged.notes;
+        let materialised = stage_documents(&c, &staged.documents, &mut files, &mut notes).await;
+        assert_eq!(materialised.len(), 1);
+        let deck = files.iter().find(|f| f.name == "deck.typ").unwrap();
+        assert_eq!(
+            b64::decode(&deck.content_b64).unwrap(),
+            b"= From attachments\n"
+        );
     }
 
     #[tokio::test]

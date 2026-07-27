@@ -59,10 +59,12 @@ impl Tool for RunInSandbox {
                     "additionalProperties": false,
                     "required": ["id"],
                     "properties": {
-                        "id": {"type": "string", "description": "Attachment id \
-                               `<turn>/<file>` from an attachment stub, or just the \
-                               filename of a file from earlier in this conversation \
-                               (newest match wins)."},
+                        "id": {"type": "string", "description": "Any file of this \
+                               conversation: an attachment id `<turn>/<file>`, just \
+                               the filename (newest match wins), or a canvas \
+                               `document_id` / document title — a document named here \
+                               is materialised into the working directory exactly as \
+                               if it were listed under `documents`."},
                         "name": {"type": "string", "description": "Optional filename \
                                  to give the file in the working directory."}
                     }
@@ -150,10 +152,16 @@ impl Tool for RunInSandbox {
                 staged,
                 available,
                 mut notes,
+                documents: attachment_documents,
             } = stage_attachments(&ctx, &args.attachments).await?;
             let mut files = staged_files;
+            // A canvas document is materialised the same way whether it was
+            // named in `documents` or in `attachments` (the resolver sorted
+            // that out), so both lists go through one call.
+            let mut wanted_documents = args.documents;
+            wanted_documents.extend(attachment_documents);
             let staged_documents =
-                stage_documents(&ctx, &args.documents, &mut files, &mut notes).await;
+                stage_documents(&ctx, &wanted_documents, &mut files, &mut notes).await;
             files.extend(args.files.into_iter().map(TextFile::into_input));
             let req = RunRequest {
                 language: args.language,

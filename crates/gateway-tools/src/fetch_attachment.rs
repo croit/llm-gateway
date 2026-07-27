@@ -48,6 +48,7 @@ use std::sync::Arc;
 use shared::sandbox::{InputFile, Language, RunRequest};
 
 use gateway_features::server::chat_attachments::{self, BinaryDisposition, PayloadLimits};
+use gateway_features::server::file_refs::{self, FileRef};
 use gateway_features::server::pdf::{self, PdfError};
 use gateway_runtime::server::tools::sandbox::{SandboxClient, b64};
 use gateway_runtime::server::tools::{
@@ -372,10 +373,14 @@ impl Tool for FetchAttachment {
     fn schema(&self) -> ToolDef {
         ToolDef::function(
             self.id(),
-            "Fetch the contents of a chat attachment by its opaque id. \
+            "Read any file in this conversation — an attachment or a canvas \
+             document, by id, filename or title. \
              User messages with attachments show them as `[attached file=… \
              mime=… size=… id=\"<turn_id>/<filename>\"]` stubs — call this \
-             tool with the stub's id when you actually need the bytes. \
+             tool with the stub's id when you actually need the bytes; a \
+             canvas `document_id` returns that document's current text and \
+             version instead (change one with `edit_document`, never by \
+             rewriting it whole). \
              Text-ish files (code, JSON, CSV, markdown, plain text, …) are \
              returned as UTF-8 in `content`. Images are re-attached as a \
              visible `image_url` part you can look at. PDFs are read in \
@@ -406,11 +411,14 @@ impl Tool for FetchAttachment {
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "Opaque attachment id of the form \
-                                        `<turn_id>/<filename>` exactly as it \
-                                        appeared in the replay stub — or just a \
-                                        filename from this conversation (newest \
-                                        match wins; chat sessions only)."
+                        "description": "Any file of this conversation: an attachment \
+                                        id `<turn_id>/<filename>` as it appeared in a \
+                                        replay stub, just a filename (newest match \
+                                        wins), or a canvas `document_id` / document \
+                                        title — a document comes back as its text \
+                                        with its version, so this reads either store. \
+                                        Bare names and document ids need a chat \
+                                        session."
                     },
                     "max_bytes": {
                         "type": "integer",
@@ -467,30 +475,40 @@ impl Tool for FetchAttachment {
             let mut args: FetchArgs = serde_json::from_value(args)
                 .map_err(|e| ToolError::InvalidArgs(format!("expected {{id, max_bytes?}}: {e}")))?;
 
-            // A bare filename (no `/`) resolves against the session's
-            // attachments, newest match first — so the model can re-read a
-            // file it produced earlier without tracking turn ids. Only the
-            // chat path has a session to resolve against.
-            if !args.id.contains('/') {
-                let Some(session_id) = ctx.session_id.as_deref() else {
-                    return Err(ToolError::InvalidArgs(format!(
-                        "`{}` is not a `<turn_id>/<filename>` id — bare filenames resolve \
-                         only inside a chat session",
-                        args.id
-                    )));
-                };
-                let atts = chat_attachments::list_session_attachments(&ctx.db, session_id)
-                    .await
-                    .map_err(|e| ToolError::Failed(format!("listing session attachments: {e}")))?;
-                args.id = chat_attachments::resolve_attachment(&atts, &args.id)
-                    .map(|a| a.id.clone())
-                    .ok_or_else(|| {
-                        ToolError::InvalidArgs(format!(
-                            "no attachment named `{}` in this conversation — call \
-                             `list_attachments` to see what exists",
+            // Anything but a plain `<turn>/<file>` id goes through the shared
+            // resolver: a bare filename (newest match wins — models lose track
+            // of turn ids across rounds), an `att:` ref copied out of deck
+            // data, or a canvas document. Reading a document here means "read
+            // any file of this conversation" is one tool call rather than a
+            // guess about which store the id came from.
+            if !args.id.contains('/') || file_refs::looks_like_document(&args.id) {
+                match file_refs::resolve(&ctx.db, ctx.session_id.as_deref(), &args.id, None).await {
+                    Ok(FileRef::Document { doc, version }) => {
+                        return Ok(json!({
+                            "id": doc.id,
+                            "title": doc.title,
+                            "format": doc.format.as_str(),
+                            "version": version.version,
+                            "kind": "canvas_document",
+                            "content": version.content,
+                            "note": "This is a canvas document — the mutable, versioned side \
+                                     of this conversation's files, and the user can edit it by \
+                                     hand. Change it with `edit_document` (one passage at a \
+                                     time), not by rewriting it whole.",
+                        }));
+                    }
+                    Ok(other) => args.id = other.id(),
+                    // Off the chat path there is no conversation to resolve
+                    // against, which the model can act on (pass a full id).
+                    Err(file_refs::RefError::NoSession) => {
+                        return Err(ToolError::InvalidArgs(format!(
+                            "`{}` is not a `<turn_id>/<filename>` id — bare filenames and \
+                             document ids resolve only inside a chat session",
                             args.id
-                        ))
-                    })?;
+                        )));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
             }
             let (turn_id, filename) = split_id(&args.id)?;
             let s3 = ctx.s3.as_ref().ok_or_else(|| {
@@ -1117,6 +1135,101 @@ mod tests {
             FetchAttachment::new(None).id(),
             FetchAttachment::new(None).schema().function.name
         );
+    }
+
+    /// Reading a canvas document through the same tool as an attachment: the
+    /// model shouldn't have to know which store an id came from, and this path
+    /// needs no storage at all (the content is in the DB).
+    #[tokio::test]
+    async fn a_canvas_document_id_returns_its_text_and_version() {
+        use gateway_core::server::db::documents::{self, DocumentFormat, VersionAuthor};
+
+        let pool = gateway_core::server::db::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"INSERT INTO users (id, email, created_at, updated_at)
+               VALUES ('u1', 'u1@example.com', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO chat_sessions (id, user_id, created_at, updated_at)
+               VALUES ('s1', 'u1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let id = documents::new_id();
+        documents::create(
+            &pool,
+            &id,
+            "s1",
+            "u1",
+            "Migration plan",
+            DocumentFormat::Markdown,
+            "# Plan\n\nfirst draft\n",
+            None,
+        )
+        .await
+        .unwrap();
+        documents::append_version(
+            &pool,
+            "s1",
+            &id,
+            "# Plan\n\nmy wording\n",
+            Some("Edited by you"),
+            None,
+            VersionAuthor::User,
+        )
+        .await
+        .unwrap();
+
+        let mut ctx = ctx_no_s3(pool);
+        ctx.session_id = Some("s1".into());
+        // By id and by title, and with no `[chat.s3]` configured at all.
+        for given in [id.as_str(), "Migration plan"] {
+            let out = FetchAttachment::new(None)
+                .run(ctx.clone(), json!({"id": given}))
+                .await
+                .unwrap();
+            assert_eq!(out["kind"], "canvas_document", "{given}");
+            assert_eq!(out["id"], id.as_str());
+            assert_eq!(out["version"], 2, "the latest is what the user sees");
+            assert_eq!(out["content"], "# Plan\n\nmy wording\n");
+            // Steering, not just data: rewriting a document whole is how a
+            // hand-edit gets reverted.
+            assert!(
+                out["note"].as_str().unwrap().contains("edit_document"),
+                "{out}"
+            );
+        }
+    }
+
+    /// A ToolContext with no storage configured — the document path must not
+    /// need any.
+    fn ctx_no_s3(pool: gateway_core::server::db::Pool) -> ToolContext {
+        ToolContext {
+            user_id: "u1".into(),
+            roles: vec![],
+            db: pool,
+            s3: None,
+            assistant_turn_id: None,
+            session_id: None,
+            client_ip: None,
+            geoip: None,
+            chat_feedback: None,
+            attachment_reservations: None,
+            indexer: None,
+            image_gen: None,
+            ocr: None,
+            sandbox_lease: None,
+            browser_lease: None,
+            crypto: None,
+            push: None,
+            model: None,
+        }
     }
 
     #[tokio::test]

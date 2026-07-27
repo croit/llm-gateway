@@ -36,6 +36,7 @@ use shared::sandbox::{InputFile, Language, RunRequest};
 
 use gateway_core::server::db::documents::{self, DocumentFormat};
 use gateway_features::server::chat_attachments;
+use gateway_features::server::file_refs::{self, FileRef};
 use gateway_features::server::typst::{
     self, DefaultSource, DocxExport, FieldType, PptxExport, Template,
 };
@@ -627,60 +628,54 @@ enum BaseKind {
     /// A canvas document id (`doc_…`) — what renders produce now.
     Canvas { id: String },
     /// A hidden `<turn_id>/<filename>.json` attachment from a render that
-    /// predates the canvas base.
-    Attachment,
+    /// predates the canvas base. Carries the *resolved* id, so a caller that
+    /// needs its filename doesn't have to re-parse what the model passed (it
+    /// may have been a bare name or an `att:` ref).
+    Attachment { id: String },
 }
 
 /// Load the field data behind a `base` given to `_read` / `_edit` / `_pptx`.
 ///
-/// The two id shapes are unambiguous: an attachment id always carries the
-/// `<turn_id>/<filename>` slash, a canvas document id never does. So one
-/// argument serves both, and a conversation started before the canvas base
-/// keeps editing its old hidden `.json` without the model having to know
-/// which era it is in.
+/// One argument, every spelling — the shared resolver takes a canvas document
+/// id (what renders produce now), the hidden `<turn>/<file>.json` of a render
+/// from before the canvas base, a bare filename, or a title. So a conversation
+/// started in either era keeps editing its own base without the model having to
+/// know which one it is in.
 async fn load_base(
     ctx: &ToolContext,
     s3: &gateway_core::server::config::S3Config,
     base: &str,
 ) -> Result<(Value, BaseKind), ToolError> {
-    if !base.contains('/') {
-        let session_id = ctx.session_id.as_deref().ok_or_else(|| {
-            ToolError::Failed("canvas documents are only available inside a chat session".into())
-        })?;
-        let (doc, ver) = documents::get_version(&ctx.db, session_id, base, None)
-            .await
-            .map_err(|e| ToolError::Failed(format!("reading canvas document: {e}")))?
-            .ok_or_else(|| {
+    match file_refs::resolve(&ctx.db, ctx.session_id.as_deref(), base, None).await? {
+        FileRef::Document { doc, version } => {
+            if doc.format != DocumentFormat::Json {
+                return Err(ToolError::InvalidArgs(format!(
+                    "canvas document `{base}` is `{}` — a typst render's data base is \
+                     a JSON document (a deck's slides under the `deck` key)",
+                    doc.format.as_str()
+                )));
+            }
+            let data: Value = serde_json::from_str(&version.content).map_err(|e| {
+                ToolError::InvalidArgs(format!("canvas document `{base}` is not valid JSON: {e}"))
+            })?;
+            Ok((data, BaseKind::Canvas { id: doc.id }))
+        }
+        other => {
+            let id = other.id();
+            let (base_turn, base_file) = split_attachment_id(&id)?;
+            let fetched = chat_attachments::fetch(s3, base_turn, base_file)
+                .await
+                .map_err(|e| ToolError::Failed(format!("could not read base `{base}`: {e}")))?;
+            let data: Value = serde_json::from_slice(&fetched.bytes).map_err(|e| {
                 ToolError::InvalidArgs(format!(
-                    "no canvas document `{base}` in this conversation — call \
-                     `list_documents` to see what exists, or pass the `data_id` \
-                     of an older render"
+                    "base `{base}` is not a JSON data document ({e}); pass the \
+                     `document_id` from the render result (or an older render's \
+                     `data_id`), not the PDF/PNG id"
                 ))
             })?;
-        if doc.format != DocumentFormat::Json {
-            return Err(ToolError::InvalidArgs(format!(
-                "canvas document `{base}` is `{}` — a typst render's data base is \
-                 a JSON document (a deck's slides under the `deck` key)",
-                doc.format.as_str()
-            )));
+            Ok((data, BaseKind::Attachment { id }))
         }
-        let data: Value = serde_json::from_str(&ver.content).map_err(|e| {
-            ToolError::InvalidArgs(format!("canvas document `{base}` is not valid JSON: {e}"))
-        })?;
-        return Ok((data, BaseKind::Canvas { id: doc.id }));
     }
-    let (base_turn, base_file) = split_attachment_id(base)?;
-    let fetched = chat_attachments::fetch(s3, base_turn, base_file)
-        .await
-        .map_err(|e| ToolError::Failed(format!("could not read base `{base}`: {e}")))?;
-    let data: Value = serde_json::from_slice(&fetched.bytes).map_err(|e| {
-        ToolError::InvalidArgs(format!(
-            "base `{base}` is not a JSON data document ({e}); pass the \
-             `document_id` from the render result (or an older render's \
-             `data_id`), not the PDF/PNG id"
-        ))
-    })?;
-    Ok((data, BaseKind::Attachment))
 }
 
 /// Persist a render's field data where [`BaseTarget`] says, and return the
@@ -1722,7 +1717,7 @@ impl Tool for TypstEditTool {
             let inputs = inputs_from_data(&template, &data)?;
             let target = match &base_kind {
                 BaseKind::Canvas { id } => BaseTarget::CanvasDoc { id, append: true },
-                BaseKind::Attachment => BaseTarget::HiddenJson,
+                BaseKind::Attachment { .. } => BaseTarget::HiddenJson,
             };
             render_and_attach(
                 &ctx,
@@ -1924,7 +1919,7 @@ impl Tool for TypstPptxTool {
             // canvas base has no filename to borrow, so fall back to the
             // template's own basename.
             let stem = match &base_kind {
-                BaseKind::Attachment => split_attachment_id(base)?
+                BaseKind::Attachment { id } => split_attachment_id(id)?
                     .1
                     .strip_suffix(".json")
                     .unwrap_or(&template.output_basename),
