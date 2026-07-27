@@ -28,6 +28,7 @@ pub mod fetch_attachment;
 pub mod fetch_url;
 pub mod generate_image;
 pub mod html_text;
+pub mod import_file;
 pub mod json_patch;
 pub mod list_attachments;
 pub mod load_image_url;
