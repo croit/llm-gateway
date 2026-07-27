@@ -137,6 +137,75 @@ async fn compiles_example_presentation_template() {
     );
 }
 
+/// One slide in, one slide out — for every combination of the image layouts.
+///
+/// The `image` layout used to size the picture in absolute centimetres
+/// (`large` = 12cm, `full` = 14.5cm) against a content box only ~14.4cm tall, so
+/// a title and a caption pushed it over budget and typst — which never
+/// paginates a deck for us — quietly spilled the overflow onto extra, chromeless
+/// slides: a 7-slide deck came out as a 10-page PDF with a cropped picture and a
+/// caption stranded on a blank page. Sizes are fractions of the free space now.
+/// Page count is the cheapest way to pin that: any layout that overflows adds a
+/// page, so `pages == slides` is the contract.
+#[tokio::test]
+async fn presentation_image_slides_never_overflow() {
+    if !typst_available() {
+        eprintln!("skipping: typst CLI not on PATH");
+        return;
+    }
+    let templates = gw_typst::discover_templates(&example_dir()).expect("discover");
+    let deck = templates.iter().find(|t| t.id == "presentation").unwrap();
+    // The bundled sample ships no photos, so use its logo SVG as the picture —
+    // what matters here is the geometry, not the pixels.
+    let img = "assets/logo-light.svg";
+    let slides: Vec<String> = [
+        // `image`: every size, with and without title/caption/frame.
+        r#"{"layout":"image","image":"IMG"}"#.to_string(),
+        r#"{"layout":"image","image":"IMG","size":"small","title":"T","caption":"C"}"#.to_string(),
+        r#"{"layout":"image","image":"IMG","size":"medium","title":"T","caption":"C"}"#.to_string(),
+        r#"{"layout":"image","image":"IMG","size":"large","title":"T","caption":"C"}"#.to_string(),
+        r#"{"layout":"image","image":"IMG","size":"full","title":"T","caption":"C"}"#.to_string(),
+        r#"{"layout":"image","image":"IMG","size":"full","frame":true,"title":"T","caption":"C"}"#
+            .to_string(),
+        // `media`: bare (edge-to-edge), with text (→ clean image slide), with an
+        // opt-in overlay at each position, shrunk, and framed.
+        r#"{"layout":"media","image":"IMG"}"#.to_string(),
+        r#"{"layout":"media","image":"IMG","title":"T","caption":"C"}"#.to_string(),
+        r#"{"layout":"media","image":"IMG","title":"T","caption":"C","overlay_position":"bottom-left"}"#.to_string(),
+        r#"{"layout":"media","image":"IMG","title":"T","overlay_position":"bottom-right"}"#
+            .to_string(),
+        r#"{"layout":"media","image":"IMG","title":"T","caption":"C","overlay_position":"center"}"#
+            .to_string(),
+        r#"{"layout":"media","image":"IMG","size":"medium","title":"T","caption":"C"}"#.to_string(),
+        r#"{"layout":"media","image":"IMG","frame":true,"title":"T","caption":"C"}"#.to_string(),
+        // no image at all → the gradient statement fallback, still one slide
+        r#"{"layout":"media","title":"T","caption":"C"}"#.to_string(),
+    ]
+    .iter()
+    .map(|s| s.replace("IMG", img))
+    .collect();
+    let deck_json = format!(
+        r#"{{"deck_title":"Overflow probe","slides":[{}]}}"#,
+        slides.join(",")
+    );
+    let rendered = gw_typst::compile(deck, &[("deck".to_string(), deck_json)], 1, None)
+        .await
+        .expect("image-layout deck compiles");
+    // typst writes one uncompressed `/MediaBox` per page; if that ever changes
+    // this assert fails loudly rather than silently passing.
+    let pages = rendered
+        .pdf
+        .windows(b"/MediaBox".len())
+        .filter(|w| *w == b"/MediaBox")
+        .count();
+    assert_eq!(
+        pages,
+        slides.len(),
+        "{} slides rendered as {pages} pages — an image layout is overflowing onto extra slides",
+        slides.len()
+    );
+}
+
 #[tokio::test]
 async fn compile_surfaces_typst_error_on_bad_input() {
     if !typst_available() {
