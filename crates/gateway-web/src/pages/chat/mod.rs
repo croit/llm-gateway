@@ -47,6 +47,7 @@ use session_core::{RegisterOutcome, TurnUpdate};
 use session_core::db as chat;
 use session_core::export;
 
+use gateway_core::server::db::documents;
 use gateway_core::server::db::users::User;
 use gateway_features::server::chat_attachments;
 use gateway_runtime::rama_server::state::RamaState;
@@ -1216,8 +1217,27 @@ pub async fn chat_tail(
 // replacing `#document-canvas-slot`'s contents. Readable-gated like the tail
 // (owner or a shared viewer); a missing doc/version closes with no change.
 
+/// Path params for the two document routes, as a **named struct**.
+///
+/// Not `Path<(String, String)>`: a tuple is deserialised from the matcher's
+/// param map in *map* order, not path order, so a two-param tuple binds
+/// `(doc_id, id)` or `(id, doc_id)` depending on hash iteration — the same
+/// build can flip between requests. It cost an afternoon here: the canvas
+/// switcher would intermittently look up the session id as a document id and
+/// answer with an empty patch. Named fields deserialise by key, which is why
+/// every other multi-param route in this file (`TurnPath`, `AttachmentPath`)
+/// is a struct too.
+#[derive(serde::Deserialize)]
+pub struct DocumentPath {
+    pub id: String,
+    pub doc_id: String,
+}
+
 pub async fn chat_document_view(
-    Path((session_id, doc_id)): Path<(String, String)>,
+    Path(DocumentPath {
+        id: session_id,
+        doc_id,
+    }): Path<DocumentPath>,
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
@@ -1241,6 +1261,113 @@ pub async fn chat_document_view(
         Ok(Some(h)) => h,
         // No such document/version in this session, or a read error — leave
         // the panel as-is.
+        _ => return empty_sse_response(),
+    };
+    sse_response(&[sse_patch(
+        Some("#document-canvas-slot"),
+        Some("inner"),
+        &html,
+    )])
+}
+
+// ---------------------------------------------------------------------------
+// POST /chat/{id}/document/{doc_id}/edit — the user's own hand edit.
+//
+// The canvas was assistant-only: when the model got a passage wrong, the only
+// recourse was asking it to try again. This saves the panel's textarea as a
+// new version authored by the *user*, which the request context then tells the
+// model about so its next edit builds on the correction instead of reverting
+// it.
+//
+// Owner-only (not `get_session_readable`): a shared conversation is readable
+// by anyone holding the link, and writing to someone else's document is not
+// reading. The UI hides the affordance for them; this is what enforces it.
+
+#[derive(serde::Deserialize)]
+struct DocumentEditForm {
+    content: String,
+}
+
+pub async fn chat_document_edit(
+    Path(DocumentPath {
+        id: session_id,
+        doc_id,
+    }): Path<DocumentPath>,
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    let (_session, user) = require_session!(state, req);
+    match chat::get_session(&state.db, &user.id, &session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return sse_error_response(&t(lang, "chat-error-conversation-not-found")),
+        Err(err) => return sse_error_response(&err.to_string()),
+    };
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return sse_error_response(&msg),
+    };
+    let form: DocumentEditForm = match serde_urlencoded::from_bytes(&body) {
+        Ok(f) => f,
+        Err(err) => return sse_error_response(&format!("malformed form: {err}")),
+    };
+    // Same ceiling the document tools write against, so a hand edit can never
+    // produce a document the model is then unable to save back.
+    if form.content.len() > documents::MAX_CONTENT_BYTES {
+        return sse_error_response(&t(lang, "chat-error-document-too-large"));
+    }
+    // Normalise the textarea's CRLFs: browsers submit `\r\n` per the HTML
+    // spec, and leaving them in would show up as a diff on every line of an
+    // otherwise-untouched document (and confuse the model's anchored
+    // find/replace, which matches on `\n`).
+    let content = form.content.replace("\r\n", "\n");
+
+    let doc = match documents::get(&state.db, &session_id, &doc_id).await {
+        Ok(Some(d)) if !d.is_deleted() => d,
+        // Deleted or unknown: nothing to write. Answering with the panel as-is
+        // keeps a stale tab from looking like it saved.
+        Ok(_) => return sse_error_response(&t(lang, "chat-error-document-not-found")),
+        Err(err) => return sse_error_response(&err.to_string()),
+    };
+    // A no-op save (opened the editor, changed nothing) should not mint a
+    // version — the history is meant to read as a list of actual changes.
+    let unchanged = match documents::get_version(&state.db, &session_id, &doc_id, None).await {
+        Ok(Some((_, ver))) => ver.content == content,
+        Ok(None) => false,
+        Err(err) => return sse_error_response(&err.to_string()),
+    };
+    if !unchanged
+        && let Err(err) = documents::append_version(
+            &state.db,
+            &session_id,
+            &doc_id,
+            &content,
+            Some("Edited by you"),
+            None,
+            documents::VersionAuthor::User,
+        )
+        .await
+    {
+        return sse_error_response(&err.to_string());
+    }
+    tracing::info!(
+        user_id = %user.id, %session_id, document_id = %doc_id,
+        title = %doc.title, unchanged, "canvas document hand-edited",
+    );
+    // Re-render the panel: new version number, the "edited by you" badge, and
+    // `docEditing` back to false (the signal is declared on the panel root, so
+    // replacing it returns to reading mode without any client-side reset).
+    let html = match gateway_features::server::document_canvas::render_canvas_html(
+        &state.db,
+        &session_id,
+        Some(&doc_id),
+        None,
+        lang,
+    )
+    .await
+    {
+        Ok(Some(h)) => h,
         _ => return empty_sse_response(),
     };
     sse_response(&[sse_patch(

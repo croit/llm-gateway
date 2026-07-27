@@ -12,6 +12,7 @@ mod admin_users;
 mod ask_feedback;
 mod chat_actions;
 mod chat_attachment;
+mod chat_document_edit;
 mod chat_fork;
 mod chat_pin;
 mod chat_search;

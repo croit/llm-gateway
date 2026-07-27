@@ -153,6 +153,48 @@ impl Document {
     }
 }
 
+/// Who wrote a version. The canvas is a shared editing surface now, so
+/// "the model changed it" and "the human changed it" are different facts:
+/// the panel labels the user's own revisions, and the request context warns
+/// the model that a document moved under it (its context still holds what
+/// *it* last wrote, so an unwarned edit reverts the human's correction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionAuthor {
+    Assistant,
+    User,
+}
+
+impl VersionAuthor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VersionAuthor::Assistant => "assistant",
+            VersionAuthor::User => "user",
+        }
+    }
+
+    /// Parse a stored value, defaulting to `Assistant` for anything
+    /// unexpected — the column was backfilled with it, and a stray value
+    /// should never fail a listing.
+    fn from_db(s: &str) -> Self {
+        match s {
+            "user" => VersionAuthor::User,
+            _ => VersionAuthor::Assistant,
+        }
+    }
+
+    pub fn is_user(self) -> bool {
+        matches!(self, VersionAuthor::User)
+    }
+}
+
+/// Maximum content size for one document version.
+///
+/// Lives here rather than in the tool layer because both writers have to
+/// agree: a hand edit from the panel and an `edit_document` call land in the
+/// same column, and a limit only one of them enforced would let the panel
+/// save something no tool could ever save back.
+pub const MAX_CONTENT_BYTES: usize = 512 * 1024;
+
 /// One immutable revision of a document's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentVersion {
@@ -161,6 +203,7 @@ pub struct DocumentVersion {
     pub content: String,
     pub summary: Option<String>,
     pub turn_id: Option<String>,
+    pub author: VersionAuthor,
     pub created_at: Timestamp,
 }
 
@@ -195,13 +238,19 @@ fn map_doc(row: &SqliteRow) -> Result<Document, DbError> {
     })
 }
 
+/// The column list every `DocumentVersion`-returning query selects — same
+/// single-source-of-truth reasoning as [`DOC_COLUMNS`].
+const VERSION_COLUMNS: &str = "document_id, version, content, summary, turn_id, author, created_at";
+
 fn map_version(row: &SqliteRow) -> Result<DocumentVersion, DbError> {
+    let author: String = row.try_get("author")?;
     Ok(DocumentVersion {
         document_id: row.try_get("document_id")?,
         version: row.try_get("version")?,
         content: row.try_get("content")?,
         summary: row.try_get("summary")?,
         turn_id: row.try_get("turn_id")?,
+        author: VersionAuthor::from_db(&author),
         created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
     })
 }
@@ -328,10 +377,10 @@ pub async fn get_version(
         return Ok(None);
     };
     let v = version.unwrap_or(doc.current_ver);
-    let row = sqlx::query(
-        r#"SELECT document_id, version, content, summary, turn_id, created_at
-           FROM document_versions WHERE document_id = ? AND version = ?"#,
-    )
+    let row = sqlx::query(&format!(
+        "SELECT {VERSION_COLUMNS} FROM document_versions \
+         WHERE document_id = ? AND version = ?"
+    ))
     .bind(id)
     .bind(v)
     .fetch_optional(pool)
@@ -352,6 +401,7 @@ pub async fn append_version(
     content: &str,
     summary: Option<&str>,
     turn_id: Option<&str>,
+    author: VersionAuthor,
 ) -> Result<Option<Document>, DbError> {
     let Some(doc) = get(pool, session_id, id).await? else {
         return Ok(None);
@@ -362,14 +412,15 @@ pub async fn append_version(
 
     sqlx::query(
         r#"INSERT INTO document_versions
-               (document_id, version, content, summary, turn_id, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)"#,
+               (document_id, version, content, summary, turn_id, author, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(id)
     .bind(next)
     .bind(content)
     .bind(summary)
     .bind(turn_id)
+    .bind(author.as_str())
     .bind(&now_s)
     .execute(pool)
     .await?;
@@ -398,6 +449,9 @@ pub struct VersionMeta {
     pub created_at: Timestamp,
     /// Content length in characters (SQLite `LENGTH()` on TEXT).
     pub chars: i64,
+    /// Who wrote this revision. The history listing shows it so a user can
+    /// tell their own correction from the model's next pass over it.
+    pub author: VersionAuthor,
 }
 
 /// All versions of a document, newest first — metadata only. Scoped to the
@@ -408,7 +462,7 @@ pub async fn list_versions(
     id: &str,
 ) -> Result<Vec<VersionMeta>, DbError> {
     let rows = sqlx::query(
-        r#"SELECT v.version, v.summary, v.created_at, LENGTH(v.content) AS chars
+        r#"SELECT v.version, v.summary, v.created_at, v.author, LENGTH(v.content) AS chars
            FROM document_versions v
            JOIN documents d ON d.id = v.document_id
            WHERE v.document_id = ? AND d.session_id = ?
@@ -420,14 +474,45 @@ pub async fn list_versions(
     .await?;
     rows.iter()
         .map(|row| {
+            let author: String = row.try_get("author")?;
             Ok(VersionMeta {
                 version: row.try_get("version")?,
                 summary: row.try_get("summary")?,
                 created_at: parse_ts(&row.try_get::<String, _>("created_at")?, "created_at")?,
                 chars: row.try_get("chars")?,
+                author: VersionAuthor::from_db(&author),
             })
         })
         .collect()
+}
+
+/// Documents in this session whose **latest** version the user wrote by hand.
+///
+/// The signal the model needs: its context holds the content it last wrote,
+/// so without being told that a human has since corrected the document it
+/// edits from a stale copy and silently reverts them. Returned as
+/// `(document, current_ver)` pairs, newest-updated first; live documents only
+/// (a deleted one is nothing to warn about).
+pub async fn hand_edited_in_session(
+    pool: &Pool,
+    session_id: &str,
+) -> Result<Vec<Document>, DbError> {
+    let rows = sqlx::query(&format!(
+        "SELECT {} FROM documents d
+         JOIN document_versions v
+           ON v.document_id = d.id AND v.version = d.current_ver
+         WHERE d.session_id = ? AND d.deleted_at IS NULL AND v.author = 'user'
+         ORDER BY d.updated_at DESC",
+        DOC_COLUMNS
+            .split(", ")
+            .map(|c| format!("d.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(map_doc).collect()
 }
 
 /// All documents in a session, most recently updated first.
@@ -531,10 +616,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let doc = append_version(&pool, "s1", &id, "v2", Some("edited"), Some("t2"))
-            .await
-            .unwrap()
-            .unwrap();
+        let doc = append_version(
+            &pool,
+            "s1",
+            &id,
+            "v2",
+            Some("edited"),
+            Some("t2"),
+            VersionAuthor::Assistant,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(doc.current_ver, 2);
         // Latest resolves to v2.
         let (_, latest) = get_version(&pool, "s1", &id, None).await.unwrap().unwrap();
@@ -565,9 +658,17 @@ mod tests {
         )
         .await
         .unwrap();
-        append_version(&pool, "s1", &id, "v2 longer", Some("edited"), None)
-            .await
-            .unwrap();
+        append_version(
+            &pool,
+            "s1",
+            &id,
+            "v2 longer",
+            Some("edited"),
+            None,
+            VersionAuthor::Assistant,
+        )
+        .await
+        .unwrap();
 
         let versions = list_versions(&pool, "s1", &id).await.unwrap();
         assert_eq!(versions.len(), 2);
@@ -601,10 +702,18 @@ mod tests {
         // Another session can't see or touch it.
         assert!(get(&pool, "s2", &id).await.unwrap().is_none());
         assert!(
-            append_version(&pool, "s2", &id, "hacked", None, None)
-                .await
-                .unwrap()
-                .is_none()
+            append_version(
+                &pool,
+                "s2",
+                &id,
+                "hacked",
+                None,
+                None,
+                VersionAuthor::Assistant,
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
         assert!(
             list_for_session(&pool, "s2", false)
@@ -613,6 +722,105 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(list_for_session(&pool, "s1", false).await.unwrap().len(), 1);
+    }
+
+    /// Authorship round-trips, and `hand_edited_in_session` reports exactly
+    /// the documents whose *latest* version the user wrote — the signal the
+    /// request context uses to stop the model reverting a human correction.
+    #[tokio::test]
+    async fn hand_edited_tracks_the_latest_versions_author() {
+        let pool = open(Path::new(":memory:")).await.unwrap();
+        seed_session(&pool, "s1").await;
+        let touched = new_id();
+        let untouched = new_id();
+        for id in [&touched, &untouched] {
+            create(
+                &pool,
+                id,
+                "s1",
+                "u1",
+                "Doc",
+                DocumentFormat::Markdown,
+                "written by the model",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        // Nothing hand-edited yet: a fresh document is the assistant's.
+        assert!(
+            hand_edited_in_session(&pool, "s1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let (_, v1) = get_version(&pool, "s1", &touched, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(v1.author, VersionAuthor::Assistant);
+
+        append_version(
+            &pool,
+            "s1",
+            &touched,
+            "corrected by hand",
+            Some("Edited by you"),
+            None,
+            VersionAuthor::User,
+        )
+        .await
+        .unwrap();
+        let listed = hand_edited_in_session(&pool, "s1").await.unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].id, touched);
+        assert_eq!(listed[0].current_ver, 2);
+        // The history keeps who wrote what, so the panel can label it.
+        let versions = list_versions(&pool, "s1", &touched).await.unwrap();
+        assert_eq!(versions[0].author, VersionAuthor::User);
+        assert_eq!(versions[1].author, VersionAuthor::Assistant);
+
+        // The model editing on top means it has seen the correction — the
+        // warning has served its purpose and must stop firing, or it would
+        // repeat every turn for the rest of the conversation.
+        append_version(
+            &pool,
+            "s1",
+            &touched,
+            "model's take on the correction",
+            None,
+            None,
+            VersionAuthor::Assistant,
+        )
+        .await
+        .unwrap();
+        assert!(
+            hand_edited_in_session(&pool, "s1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A hand-edited document in the bin is nothing to warn about.
+        append_version(
+            &pool,
+            "s1",
+            &untouched,
+            "mine now",
+            None,
+            None,
+            VersionAuthor::User,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hand_edited_in_session(&pool, "s1").await.unwrap().len(), 1);
+        soft_delete(&pool, "s1", &untouched).await.unwrap();
+        assert!(
+            hand_edited_in_session(&pool, "s1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A soft-deleted document leaves every listing, stays resolvable by id
@@ -634,9 +842,17 @@ mod tests {
         )
         .await
         .unwrap();
-        append_version(&pool, "s1", &id, "v2", Some("edited"), None)
-            .await
-            .unwrap();
+        append_version(
+            &pool,
+            "s1",
+            &id,
+            "v2",
+            Some("edited"),
+            None,
+            VersionAuthor::Assistant,
+        )
+        .await
+        .unwrap();
 
         assert!(soft_delete(&pool, "s1", &id).await.unwrap());
         // Gone from the default listing, present when asked for explicitly.

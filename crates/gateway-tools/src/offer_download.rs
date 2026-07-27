@@ -668,9 +668,17 @@ mod tests {
         .await
         .unwrap();
         // v2 so the test would catch handing over the wrong (initial) version.
-        documents::append_version(&pool, "s1", &id, r#"{"deck":{"slides":[1]}}"#, None, None)
-            .await
-            .unwrap();
+        documents::append_version(
+            &pool,
+            "s1",
+            &id,
+            r#"{"deck":{"slides":[1]}}"#,
+            None,
+            None,
+            documents::VersionAuthor::Assistant,
+        )
+        .await
+        .unwrap();
 
         match locate(&pool, "s1", &id).await.unwrap() {
             Source::Document {

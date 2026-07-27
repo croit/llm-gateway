@@ -133,6 +133,10 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/chat/{id}/messages", pages::chat_message_send)
         .with_get("/chat/{id}/tail", pages::chat_tail)
         .with_get("/chat/{id}/document/{doc_id}", pages::chat_document_view)
+        .with_post(
+            "/chat/{id}/document/{doc_id}/edit",
+            pages::chat_document_edit,
+        )
         .with_post("/chat/{id}/cancel", pages::chat_cancel)
         .with_post("/chat/{id}/turns/{turn_id}/retry", pages::chat_retry)
         .with_post("/chat/{id}/turns/{turn_id}/edit", pages::chat_edit)

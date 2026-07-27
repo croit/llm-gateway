@@ -26,6 +26,9 @@ chat-error-edit-own-messages-only = Bearbeiten gilt nur für deine eigenen Nachr
 chat-error-pdf-export-unavailable = PDF-Export nicht verfügbar: Die Typst-CLI ist auf dem Gateway nicht installiert
 chat-error-pdf-export-failed = PDF-Export fehlgeschlagen
 
+chat-error-document-not-found = Dokument nicht gefunden.
+chat-error-document-too-large = Dieses Dokument ist zu groß zum Speichern (Grenze 512 KB).
+
 chat-error-auth-required = Authentifizierung erforderlich
 chat-error-no-such-turn = keine solche Nachricht
 chat-error-db-error = Datenbankfehler

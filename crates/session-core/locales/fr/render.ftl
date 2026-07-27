@@ -50,6 +50,11 @@ render-tool-input-label = Entrée
 render-tool-output-label = Sortie
 render-tool-output-truncated = tronqué pour l'affichage — les { $bytes } octets complets restent disponibles pour le modèle et persistés dans la base de données ; affichage des { $chars } premiers caractères
 
+render-canvas-hand-edited = modifié par vous
+render-canvas-edit-button = ✎ Modifier
+render-canvas-save = Enregistrer comme nouvelle version
+render-canvas-cancel = Annuler
+render-canvas-edit-hint = Enregistré comme nouvelle version ; l'assistant est informé de votre modification.
 render-canvas-close-title = Fermer
 render-canvas-close-aria = Fermer le panneau du document
 render-canvas-document-aria = Document

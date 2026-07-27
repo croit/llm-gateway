@@ -178,6 +178,14 @@ downloadable file. Both copy inside the gateway — content never round-trips
 through the model, which is what made "give me that file" cost two passes of
 the whole payload and invite retyping drift.
 
+The user can **hand-edit** a document in the panel (`POST
+/chat/{id}/document/{doc_id}/edit`, owner-only, newest version only). That save
+is a normal new version, marked as authored by the user — and the request
+context then tells the model which documents were hand-edited and at what
+version, because nothing in the transcript would: its history still holds the
+content *it* wrote, so an unwarned edit reverts the correction. The warning
+stops once the model writes on top (it has seen the change by then).
+
 A **typst render** now parks its field data in a canvas document (its
 `document_id` comes back in the result) instead of the hidden
 `<turn>/<basename>.json` it used to write. That data was the one file the model

@@ -40,8 +40,10 @@ use gateway_core::server::db::documents::{self, DocumentFormat, EditKind};
 use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
 /// Largest document we accept (in bytes of content). Generous for a
-/// long-form guide; guards against a single runaway tool call.
-const MAX_DOC_BYTES: usize = 512 * 1024;
+/// long-form guide; guards against a single runaway tool call. Shared with
+/// the panel's hand-edit route — a limit only one writer enforced would let
+/// one of them save what the other can't.
+const MAX_DOC_BYTES: usize = documents::MAX_CONTENT_BYTES;
 
 /// Default slice size `read_document` returns when the caller doesn't ask
 /// for a section or grep — enough to inspect a chunk without dumping a
@@ -485,6 +487,7 @@ impl Tool for EditDocument {
                 &new_content,
                 summary,
                 ctx.assistant_turn_id.as_deref(),
+                documents::VersionAuthor::Assistant,
             )
             .await
             .map_err(|e| ToolError::Failed(format!("saving edit: {e}")))?
@@ -843,6 +846,7 @@ impl Tool for RestoreDocumentVersion {
                 &ver.content,
                 Some(&note),
                 ctx.assistant_turn_id.as_deref(),
+                documents::VersionAuthor::Assistant,
             )
             .await
             .map_err(|e| ToolError::Failed(format!("saving restore: {e}")))?
@@ -951,6 +955,7 @@ impl Tool for EditDocumentSection {
                 &new_content,
                 Some(&note),
                 ctx.assistant_turn_id.as_deref(),
+                documents::VersionAuthor::Assistant,
             )
             .await
             .map_err(|e| ToolError::Failed(format!("saving edit: {e}")))?
@@ -1943,9 +1948,17 @@ mod tests {
         .await
         .unwrap();
         // A second version turns on the version switcher.
-        documents::append_version(&pool, "s1", &id, "v2 body\n", Some("edit"), None)
-            .await
-            .unwrap();
+        documents::append_version(
+            &pool,
+            "s1",
+            &id,
+            "v2 body\n",
+            Some("edit"),
+            None,
+            documents::VersionAuthor::Assistant,
+        )
+        .await
+        .unwrap();
 
         let html = gateway_features::server::document_canvas::render_canvas_html(
             &pool,

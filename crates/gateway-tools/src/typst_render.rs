@@ -768,6 +768,7 @@ async fn persist_base(
                     &content,
                     Some(summary),
                     Some(turn_id),
+                    documents::VersionAuthor::Assistant,
                 )
                 .await
                 .map_err(|e| ToolError::Failed(format!("saving canvas document: {e}")))?

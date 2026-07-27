@@ -24,6 +24,10 @@ pub struct DocCanvas<'a> {
     /// active one), for the document switcher. A single-element list hides
     /// the switcher.
     pub all_docs: Vec<(String, String)>,
+    /// Whether the version on display was written by the user rather than
+    /// the assistant — shown as a badge so their own correction is
+    /// distinguishable from the model's next pass over it.
+    pub hand_edited: bool,
 }
 
 /// Render the document-canvas panel as an HTML string. The caller places
@@ -60,14 +64,52 @@ pub fn render_document_canvas(c: &DocCanvas<'_>, lang: Lang) -> String {
     let close_aria = t(lang, "render-canvas-close-aria");
     let document_aria = t(lang, "render-canvas-document-aria");
     let version_aria = t(lang, "render-canvas-version-aria");
+    let hand_edited_badge = t(lang, "render-canvas-hand-edited");
+    // Only the newest version is editable. Editing while an older one is on
+    // screen would either fork the history or silently save something the
+    // user isn't looking at; restoring first (`v3` → restore → edit) keeps
+    // one linear history, which is the canvas's whole promise.
+    //
+    // *Who* may edit is not decided here: this HTML is broadcast to every live
+    // viewer of a shared conversation (and rendered from tool calls that have
+    // no viewer at all), so the affordance is gated on the page shell's
+    // `$canEditDocs` signal, which only the owner's own render seeds true.
+    let can_edit = c.version == c.max_version;
+    let edit_form = if can_edit {
+        render_canvas_editor(sid, active, c.content, lang)
+    } else {
+        String::new()
+    };
+    let edit_label = t(lang, "render-canvas-edit-button");
 
     html! {
-        div(id: "document-canvas", class: "document-canvas") {
+        // `docEditing` is declared here, on the panel root, so every SSE patch
+        // that replaces the panel (a save, a doc/version switch, a tool edit)
+        // re-declares it as `false` — the panel always comes back in reading
+        // mode rather than stranding a stale textarea over new content.
+        div(
+            id: "document-canvas",
+            class: "document-canvas",
+            "data-signals": "{docEditing: false}"
+        ) {
             div(class: "document-canvas__header") {
                 (icons::pencil(14))
                 span(class: "document-canvas__title") { (c.title) }
                 span(class: "document-canvas__badge") { (c.format.to_string()) }
                 span(class: "document-canvas__badge") { (version_label) }
+                if c.hand_edited {
+                    span(class: "document-canvas__badge document-canvas__badge--you") {
+                        (hand_edited_badge)
+                    }
+                }
+                if can_edit {
+                    button(
+                        type: "button",
+                        class: "document-canvas__edit",
+                        "data-show": "$canEditDocs && !$docEditing",
+                        "data-on:click": "$docEditing = true"
+                    ) { (edit_label) }
+                }
                 // Closes the docked panel (sets the shared datastar signal).
                 button(
                     type: "button",
@@ -109,8 +151,60 @@ pub fn render_document_canvas(c: &DocCanvas<'_>, lang: Lang) -> String {
                     }
                 }
             }
-            div(id: "document-canvas-body", class: "document-canvas__body document-prose") {
+            div(
+                id: "document-canvas-body",
+                class: "document-canvas__body document-prose",
+                "data-show": "!$docEditing"
+            ) {
                 #(body_html)
+            }
+            if can_edit {
+                #(edit_form)
+            }
+        }
+    }
+    .to_html()
+    .to_string()
+}
+
+/// The hand-edit form: the document's raw source in a textarea, saved as a
+/// new version.
+///
+/// Raw source for *every* format, markdown included — the panel renders
+/// markdown to HTML for reading, but a human correcting a document needs the
+/// text they can actually edit, and round-tripping HTML back to markdown
+/// would rewrite passages nobody touched.
+///
+/// `@post(..., {contentType: 'form'})` is the same submit path the message-edit
+/// form uses; the handler answers with an SSE patch that re-renders this panel
+/// (new version, reading mode), so there is no client-side state to reconcile.
+fn render_canvas_editor(session_id: &str, doc_id: &str, content: &str, lang: Lang) -> String {
+    let url = format!("/chat/{session_id}/document/{doc_id}/edit");
+    let save_label = t(lang, "render-canvas-save");
+    let cancel_label = t(lang, "render-canvas-cancel");
+    let hint = t(lang, "render-canvas-edit-hint");
+    let content = content.to_string();
+    html! {
+        form(
+            action: (url.clone()),
+            method: "post",
+            class: "document-canvas__editor",
+            "data-show": "$canEditDocs && $docEditing",
+            "data-on:submit__prevent": (format!("@post('{url}', {{contentType: 'form'}})"))
+        ) {
+            textarea(
+                name: "content",
+                class: "document-canvas__textarea",
+                spellcheck: "false"
+            ) { (content) }
+            div(class: "document-canvas__editor-actions") {
+                span(class: "document-canvas__editor-hint") { (hint) }
+                button(type: "submit", class: "btn btn-sm btn-primary") { (save_label) }
+                button(
+                    type: "button",
+                    class: "btn btn-sm btn-ghost",
+                    "data-on:click": "$docEditing = false"
+                ) { (cancel_label) }
             }
         }
     }

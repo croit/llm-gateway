@@ -26,6 +26,9 @@ chat-error-edit-own-messages-only = 编辑仅适用于你自己的消息。
 chat-error-pdf-export-unavailable = PDF 导出不可用：网关未安装 typst CLI
 chat-error-pdf-export-failed = PDF 导出失败
 
+chat-error-document-not-found = 未找到文档。
+chat-error-document-too-large = 该文档过大，无法保存（上限 512 KB）。
+
 chat-error-auth-required = 需要身份验证
 chat-error-no-such-turn = 没有此消息
 chat-error-db-error = 数据库错误

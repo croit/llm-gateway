@@ -34,10 +34,10 @@ use gateway_core::server::db::documents::{self, DocumentFormat};
 use gateway_features::server::chat_attachments;
 use gateway_runtime::server::tools::{Tool, ToolContext, ToolError, ToolFuture};
 
-/// Cap on the imported content, mirroring `document`'s own `MAX_DOC_BYTES`:
-/// the document tools refuse to *write* more than this, so importing a bigger
+/// Cap on the imported content — the same one every other document writer
+/// uses: the tools refuse to *write* more than this, so importing a bigger
 /// file would create a document no edit could ever save.
-const MAX_IMPORT_BYTES: usize = 512 * 1024;
+const MAX_IMPORT_BYTES: usize = documents::MAX_CONTENT_BYTES;
 
 pub struct ImportFile;
 

@@ -1156,6 +1156,12 @@ async fn build_request_context(
     // every turn (progressive disclosure for per-user MCP).
     let integrations = build_mcp_offer_section(d, user_mcp).await;
 
+    // Documents the user changed by hand since the assistant last wrote them.
+    // Resolved before the early return below: on a conversation with no
+    // identity, IP or skills to report, this can still be the one thing the
+    // model must be told.
+    let hand_edits = build_hand_edited_docs_section(d).await;
+
     if ip.is_none()
         && geo.is_none()
         && timezone.is_none()
@@ -1163,6 +1169,7 @@ async fn build_request_context(
         && email.is_none()
         && skills.is_none()
         && integrations.is_none()
+        && hand_edits.is_none()
     {
         return None;
     }
@@ -1236,7 +1243,60 @@ async fn build_request_context(
     if let Some(integrations) = integrations {
         out.push_str(&integrations);
     }
+    if let Some(hand_edits) = hand_edits {
+        out.push_str(&hand_edits);
+    }
     Some(out)
+}
+
+/// Canvas documents the user has edited by hand since the assistant last wrote
+/// them — the one piece of context that cannot be recovered from the
+/// transcript.
+///
+/// The model's history holds the content *it* wrote. A hand edit changes the
+/// document without producing a message, so an unwarned model edits from its
+/// stale copy and silently reverts the human's correction — the worst failure
+/// mode of a shared editing surface, and the reason hand-editing needed this
+/// section rather than only a version row.
+///
+/// Kept to titles + ids + version numbers (never content): the model re-reads
+/// what it needs with `read_document`, so a large document costs nothing here.
+/// `None` off the chat path (no canvas) and when nothing was hand-edited.
+async fn build_hand_edited_docs_section(d: &OpenAiDriver) -> Option<String> {
+    let session_id = d.tool_ctx.session_id.as_deref()?;
+    let docs = gateway_core::server::db::documents::hand_edited_in_session(&d.state.db, session_id)
+        .await
+        .unwrap_or_default();
+    hand_edited_docs_section(&docs)
+}
+
+/// Pure formatting half of [`build_hand_edited_docs_section`], so the wording
+/// the model actually receives is unit-testable without a driver.
+fn hand_edited_docs_section(
+    docs: &[gateway_core::server::db::documents::Document],
+) -> Option<String> {
+    use std::fmt::Write as _;
+
+    if docs.is_empty() {
+        return None;
+    }
+    let mut rows = String::new();
+    for doc in docs {
+        let _ = writeln!(
+            rows,
+            "- \"{}\" (`{}`, now v{})",
+            doc.title, doc.id, doc.current_ver
+        );
+    }
+    Some(format!(
+        "\nThe user has hand-edited these canvas documents in the panel, so the \
+         copy in your history is stale:\n{rows}\
+         Call `read_document` before changing any of them, and keep their \
+         wording — they corrected it deliberately. Edit the passage you were \
+         asked about and nothing else; never re-send a whole document you \
+         remember writing, and if a render used one of these as its data, \
+         re-render from the document so the output matches what they see.\n"
+    ))
 }
 
 /// The integrations section of the request-context message: the user's
@@ -2349,6 +2409,40 @@ mod tests {
             // Voice directive alone still yields a system message.
             let only_voice = leading_system_message(Some("VOICE"), None, None).unwrap();
             assert!(only_voice["content"].as_str().unwrap().contains("VOICE"));
+        }
+
+        /// A hand-edited document has to reach the model as an explicit
+        /// warning, with the id it needs to re-read — nothing in the
+        /// transcript says a human touched the canvas, so this section is the
+        /// only thing standing between a user's correction and the model's
+        /// next edit silently reverting it.
+        #[test]
+        fn hand_edited_docs_warn_with_ids_and_no_content() {
+            use crate::openai_driver::hand_edited_docs_section;
+            use gateway_core::server::db::documents::{Document, DocumentFormat};
+
+            assert!(
+                hand_edited_docs_section(&[]).is_none(),
+                "nothing hand-edited → no section, so the common case costs no tokens"
+            );
+            let now: jiff::Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+            let doc = Document {
+                id: "doc_abc".into(),
+                session_id: "s1".into(),
+                title: "Migration plan".into(),
+                format: DocumentFormat::Markdown,
+                current_ver: 5,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+            };
+            let section = hand_edited_docs_section(std::slice::from_ref(&doc)).unwrap();
+            assert!(section.contains("Migration plan"), "{section}");
+            assert!(section.contains("doc_abc"), "{section}");
+            assert!(section.contains("v5"), "{section}");
+            // The two instructions that make it actionable.
+            assert!(section.contains("read_document"), "{section}");
+            assert!(section.contains("stale"), "{section}");
         }
 
         /// `history_limit` caps the verbatim tail *after* compaction folding.
