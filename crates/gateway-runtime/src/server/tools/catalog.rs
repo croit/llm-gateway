@@ -43,6 +43,10 @@ const MEMORY_KEY: &str = "memory";
 /// sandbox's `generate_document` / `convert_document` stay in their own
 /// "Code & Sandbox" group.
 const DOCUMENT_IDS: &[&str] = &[
+    // `import_file` only exists to *make* a canvas document (out of a file the
+    // conversation already holds), so it belongs on the canvas switch: with
+    // the canvas off there is nothing it could produce that anything reads.
+    "import_file",
     "create_document",
     "edit_document",
     "read_document",
@@ -611,9 +615,11 @@ pub fn entries(
                     description: "Lets the assistant build up a long document (a guide, spec, or \
                                   config) in a live side panel and edit it one passage at a time \
                                   across turns — instead of rewriting the whole thing each reply. \
-                                  Keeps a full version history the assistant can roll back to, \
-                                  and lets it clear away drafts it no longer needs (deleted \
-                                  documents keep their history and can be brought back)."
+                                  A file you upload can be pulled into the panel the same way, so \
+                                  it becomes editable rather than only readable. Keeps a full \
+                                  version history the assistant can roll back to, and lets it \
+                                  clear away drafts it no longer needs (deleted documents keep \
+                                  their history and can be brought back)."
                         .to_string(),
                     category: Category::Documents,
                 });

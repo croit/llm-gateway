@@ -195,6 +195,11 @@ async fn main() -> anyhow::Result<()> {
         // chip (a render's `.json` base). Reference-only: the bytes are
         // copied inside storage instead of being re-emitted by the model.
         .with(gateway_tools::offer_download::OfferDownload)
+        // The other direction: an uploaded/produced text file becomes an
+        // editable, versioned canvas document, so it can be changed a
+        // passage at a time (and hand-edited by the user) instead of
+        // rewritten wholesale through the model.
+        .with(gateway_tools::import_file::ImportFile)
         // Inventory of the conversation's files (uploads + tool outputs), so
         // the model reuses existing assets instead of regenerating them.
         // Reads only the session's turn markers — no storage config needed.

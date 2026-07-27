@@ -53,9 +53,10 @@ message rather than being absent.
 | `tls_cert` | — | `tls_cert` | TLS certificate inspection (issuer, validity, days to expiry, SANs). |
 | `fetch_attachment` | — | `fetch_attachment` | Read an attachment. Tiered PDF reading — text layer, rasterised pages, `mode="ocr"` (gateway OCR, images too), `mode="auto"` (text-or-OCR) — with `page_from`/`page_to`; Office files return structured content. |
 | `upload_attachment` | yes | `upload_attachment` | Attach a model-generated file to the reply. |
-| `offer_download` | yes | `upload_attachment` | Hand a file the conversation *already holds* to the user as a download chip on the current reply — including objects with no chip of their own (a typst render's hidden `.json` data base, an intermediate artifact) and files from earlier turns. Takes a reference, never content: the object is copied inside S3, so a large payload never round-trips through the model as prose. Session-scoped twice over — a marker-backed id is proven in-session by the enumeration, an unlisted `<turn_id>/<filename>` by `turn_in_session`. Shares the `upload_attachment` toggle: one switch for "let the assistant hand me files". |
+| `offer_download` | yes | `upload_attachment` | Hand a file the conversation *already holds* to the user as a download chip on the current reply — an attachment, or a canvas document (its current version is written out as a file, named from the document's title) — including objects with no chip of their own (a typst render's hidden `.json` data base, an intermediate artifact) and files from earlier turns. Takes a reference, never content: the object is copied inside S3, so a large payload never round-trips through the model as prose. Session-scoped twice over — a marker-backed id is proven in-session by the enumeration, an unlisted `<turn_id>/<filename>` by `turn_in_session`. Shares the `upload_attachment` toggle: one switch for "let the assistant hand me files". |
 | `list_attachments` | yes | `list_attachments` | Inventory of the conversation's files, so assets get reused instead of regenerated. |
 | `load_image_url` | yes | `load_image_url` | Fetch an image from a URL and keep it as a reusable conversation attachment. |
+| `import_file` | yes | `document` | Turn a text attachment (upload or produced artifact) into an editable, versioned canvas document — server-side, so the content never round-trips through the model. The on-ramp that makes an uploaded `.typ`/`.csv`/`.json`/`.md` editable a passage at a time (and hand-editable by the user); `offer_download` is the exit ramp. Text formats only: binary attachments stay attachments, already usable by id (`att:` refs, sandbox staging, `fetch_attachment`). Capped at the same 512 KB the document tools can write. |
 | `create_document` | yes | `document` | Open a canvas document. |
 | `edit_document` | yes | `document` | Replace a canvas document's content. |
 | `edit_document_section` | yes | `document` | Edit one section of a canvas document. |
@@ -157,6 +158,35 @@ wouldn't have a use for there — a `/v1` caller has no canvas to reference. Sam
 reasoning applies to `run_in_sandbox`'s optional canvas-document staging, which
 degrades to a note instead of failing the run. `export_document` is different
 and *is* chat-only: a canvas document is its only possible input.
+
+### The two shapes a conversation's files come in
+
+A conversation holds files in two stores, on purpose, and the tools cross
+between them rather than duplicating either:
+
+| | Attachments | Canvas documents |
+|---|---|---|
+| Address | `<turn_id>/<filename>` | `doc_…` |
+| Mutable | no — one immutable blob per write | yes — every change appends a version |
+| Content | any bytes (images, PDFs, archives) | UTF-8 text, ≤ 512 KB |
+| User can edit | no | yes (the document panel) |
+| Reached by | `fetch_attachment`, `att:` refs, sandbox `attachments`, `offer_download` | `read_document`/`edit_document`, sandbox `documents`, `typst_* document_id`, `export_document`, `offer_download` |
+
+Crossing over: **`import_file`** turns a text attachment into a document;
+**`offer_download`** writes a document's current version back out as a
+downloadable file. Both copy inside the gateway — content never round-trips
+through the model, which is what made "give me that file" cost two passes of
+the whole payload and invite retyping drift.
+
+A **typst render** now parks its field data in a canvas document (its
+`document_id` comes back in the result) instead of the hidden
+`<turn>/<basename>.json` it used to write. That data was the one file the model
+worked on constantly and nobody could see: not in the panel, not downloadable,
+not stageable, editable only through `_edit`. The `_read` / `_edit` / `_pptx`
+tools take either id — a slash means the old attachment shape — so
+conversations from before the change keep editing their existing base, and
+`_edit` writes back to whichever surface it read from. The render deliberately
+does *not* push the panel open for a data document: the deliverable is the PDF.
 
 All three refuse a **soft-deleted** document explicitly. `documents::get`
 resolves deleted rows on purpose (see `delete_document`), so without that check

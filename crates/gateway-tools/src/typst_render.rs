@@ -160,13 +160,16 @@ impl Tool for TypstRenderTool {
                  (the final document — the deliverable) and a PNG preview of \
                  one page you can visually inspect (clicking it opens the \
                  PDF; defaults to the first page, override with \
-                 `preview_page`). The tool result also returns a `data_id` \
-                 referencing the exact field values you supplied. To change \
-                 something afterwards, do NOT resend the whole input and do \
-                 NOT re-render repeatedly to hunt for what to change: call \
-                 `{id}_read` with the `data_id` to see the stored content and \
-                 locate the exact text/field, then `{id}_edit` with that \
-                 `data_id` and either a small JSON Patch or a find/replace.",
+                 `preview_page`). The field values you supplied are saved as a \
+                 canvas JSON document and the result returns its \
+                 `document_id`: it shows up in the user's document panel, they \
+                 can download and hand-edit it, `run_in_sandbox` can stage it, \
+                 and every change keeps a version history. To change something \
+                 afterwards, do NOT resend the whole input and do NOT re-render \
+                 repeatedly to hunt for what to change: call `{id}_read` with \
+                 the `document_id` to see the stored content and locate the \
+                 exact text/field, then `{id}_edit` with that same id and \
+                 either a small JSON Patch or a find/replace.",
                 descr = t.description,
                 base = t.output_basename,
                 id = self.id(),
@@ -256,7 +259,11 @@ impl Tool for TypstRenderTool {
                     ))
                 })?;
                 let inputs = inputs_from_data(&template, &data)?;
-                let mut result = render_and_attach(
+                // The document already holds this data, so nothing to append
+                // unless the @-fixup changes what actually rendered (handled
+                // inside `persist_base`).
+                let _ = ver;
+                return render_and_attach(
                     &ctx,
                     turn_id,
                     s3,
@@ -265,25 +272,12 @@ impl Tool for TypstRenderTool {
                     &data,
                     self.sandbox.as_ref(),
                     preview_page,
+                    BaseTarget::CanvasDoc {
+                        id: &doc_id,
+                        append: false,
+                    },
                 )
-                .await?;
-                // The canvas document is the source of truth, so drop the
-                // hidden edit-base pointer and steer edits back to the document
-                // (editing the stale base would diverge from the panel).
-                if let Value::Object(m) = &mut result {
-                    m.remove("data_id");
-                    m.insert("canvas_document_id".into(), json!(doc_id));
-                    m.insert("canvas_version".into(), json!(ver.version));
-                    m.insert("note".into(), json!(format!(
-                        "Rendered from canvas document `{doc_id}` (v{ver}), shown in the user's \
-                         document panel. To change it, call edit_document on `{doc_id}` with a \
-                         JSON Patch (same vocabulary as {id}_edit), then re-render with the same \
-                         document_id — do NOT use the _read/_edit data_id path for this render.",
-                        ver = ver.version,
-                        id = self.id(),
-                    )));
-                }
-                return Ok(result);
+                .await;
             }
 
             if wants_identity(&template, &arg_map) {
@@ -320,18 +314,51 @@ impl Tool for TypstRenderTool {
                 &data,
                 self.sandbox.as_ref(),
                 preview_page,
+                BaseTarget::NewCanvasDoc,
             )
             .await
         })
     }
 }
 
+/// Where a render keeps its field data between calls — the thing a later
+/// `_read` / `_edit` / `_pptx` resolves.
+///
+/// Renders used to park the data in a hidden `{base}.json` attachment: one
+/// immutable blob per render, invisible in the UI, un-downloadable, and
+/// editable only by the model through `_edit`. Asked for "the deck's data
+/// file", the model had nothing to hand over and pasted the JSON into its
+/// reply instead.
+///
+/// A canvas document is the same data with the properties that were
+/// missing: it shows up in the user's document panel and `list_documents`,
+/// every edit appends a version (so the history is scrubbable and
+/// revertible), `run_in_sandbox` can stage it into `/work`, `offer_download`
+/// can hand it over as a file, and re-rendering with `document_id` picks up
+/// whatever the *latest* version says — including an edit the user made by
+/// hand. So that is what a fresh render creates now.
+enum BaseTarget<'a> {
+    /// Fresh inline-field render: create a canvas JSON document holding this
+    /// render's data.
+    NewCanvasDoc,
+    /// The data already lives in this canvas document. `append` writes a new
+    /// version — set for an `_edit` (the data changed) and for an @-fixup
+    /// (what rendered is no longer what the document says), cleared for a
+    /// plain re-render of an unchanged document.
+    CanvasDoc { id: &'a str, append: bool },
+    /// Pre-canvas behaviour: park the data in a hidden `{base}.json`
+    /// attachment and return its `data_id`. Still reached by an `_edit`
+    /// whose base is one of those older attachments, so conversations from
+    /// before the canvas base keep working.
+    HiddenJson,
+}
+
 /// Render `inputs` through `template` and attach the result to the
 /// current turn: the PDF (deliverable) + a page-1 PNG preview that
-/// clicks through to the PDF. The full input `data` is uploaded
-/// alongside as a hidden `{base}.json` (no chat chip) so a later
-/// `_edit` call can fetch it as the patch base; its id comes back in
-/// the result. Shared by the render and edit tools.
+/// clicks through to the PDF. The field data is persisted per `base_target`
+/// (canvas document, or the legacy hidden `{base}.json`) and the result
+/// names whichever surface a later edit should address. Shared by the
+/// render and edit tools.
 #[allow(clippy::too_many_arguments)]
 async fn render_and_attach(
     ctx: &ToolContext,
@@ -342,6 +369,7 @@ async fn render_and_attach(
     data: &Value,
     sandbox: Option<&Arc<SandboxClient>>,
     preview_page: u32,
+    base_target: BaseTarget<'_>,
 ) -> ToolResult {
     // Resolve any `att:` image refs the model dropped into image fields
     // (uploaded / extracted images): fetch the bytes, stage them under
@@ -421,7 +449,8 @@ async fn render_and_attach(
     // Persist the escaped variant as the edit base when the auto-escape retry
     // fired, so a later `_edit`/`_read` sees exactly what rendered (and doesn't
     // re-crash on the same `@`); otherwise store the model's data untouched.
-    let data_bytes = serialize_data(edit_base_escaped.as_ref().unwrap_or(data));
+    let base_data = edit_base_escaped.as_ref().unwrap_or(data);
+    let data_bytes = serialize_data(base_data);
 
     let pdf_out = chat_attachments::upload(s3, turn_id, &pdf_name, "application/pdf", rendered.pdf)
         .await
@@ -429,13 +458,22 @@ async fn render_and_attach(
     let png_out = chat_attachments::upload(s3, turn_id, &png_name, "image/png", rendered.png)
         .await
         .map_err(|e| ToolError::Failed(format!("upload png: {e}")))?;
-    // The data file backs the `_edit` patch base and lets the model
-    // re-read its own input; it is NOT shown as a chat chip (the user
-    // only wants the PDF + preview), so no marker is spliced for it.
-    let json_out =
-        chat_attachments::upload(s3, turn_id, &json_name, "application/json", data_bytes)
-            .await
-            .map_err(|e| ToolError::Failed(format!("upload data json: {e}")))?;
+    // Park the field data where `base_target` says. The hidden `.json` is
+    // only written on the legacy path — with a canvas document there would
+    // otherwise be two copies of the same data and no way to tell which one
+    // a later edit meant, which is exactly how a panel goes stale.
+    let base_ref = persist_base(
+        ctx,
+        turn_id,
+        s3,
+        template,
+        &base_target,
+        base_data,
+        &json_name,
+        data_bytes,
+        edit_base_escaped.is_some(),
+    )
+    .await?;
 
     // Optional editable-PowerPoint export, when the template opts in
     // (`[pptx]`) and a sandbox is configured. Best-effort: a sandbox
@@ -519,21 +557,25 @@ async fn render_and_attach(
             .map_err(|e| ToolError::Failed(format!("persist markers: {e}")))?;
     }
 
-    let data_id = format!("{turn_id}/{}", json_out.filename);
     let mut result = json!({
         "template": template.id,
         "pdf": { "filename": pdf_out.filename, "size": pdf_out.bytes,
                  "id": format!("{turn_id}/{}", pdf_out.filename) },
         "preview_png": { "filename": png_out.filename, "size": png_out.bytes,
                          "id": format!("{turn_id}/{}", png_out.filename) },
-        "data_id": data_id,
         "rendered": "The PDF and its page-1 preview are now inline in your \
                      reply (the preview links to the PDF) — do NOT repeat the \
                      marker text in your prose. Look at the PNG to verify the \
-                     layout. To change one thing afterwards, call this \
-                     template's `_edit` tool with base=<the data_id above> \
-                     and a JSON Patch — don't resend the whole input.",
+                     layout.",
     });
+    // How to change this document next time, tailored to where its data
+    // actually lives — one surface, named explicitly, so the model doesn't
+    // resend the whole input or edit a copy that nothing renders from.
+    if let Value::Object(m) = &mut result {
+        for (k, v) in base_ref {
+            m.insert(k, v);
+        }
+    }
     if let Some(p) = &pptx_out {
         result["pptx"] = json!({
             "filename": p.filename, "size": p.bytes,
@@ -577,6 +619,214 @@ async fn render_and_attach(
         });
     }
     Ok(result)
+}
+
+/// What a model-supplied `base` turned out to be.
+#[derive(Debug)]
+enum BaseKind {
+    /// A canvas document id (`doc_…`) — what renders produce now.
+    Canvas { id: String },
+    /// A hidden `<turn_id>/<filename>.json` attachment from a render that
+    /// predates the canvas base.
+    Attachment,
+}
+
+/// Load the field data behind a `base` given to `_read` / `_edit` / `_pptx`.
+///
+/// The two id shapes are unambiguous: an attachment id always carries the
+/// `<turn_id>/<filename>` slash, a canvas document id never does. So one
+/// argument serves both, and a conversation started before the canvas base
+/// keeps editing its old hidden `.json` without the model having to know
+/// which era it is in.
+async fn load_base(
+    ctx: &ToolContext,
+    s3: &gateway_core::server::config::S3Config,
+    base: &str,
+) -> Result<(Value, BaseKind), ToolError> {
+    if !base.contains('/') {
+        let session_id = ctx.session_id.as_deref().ok_or_else(|| {
+            ToolError::Failed("canvas documents are only available inside a chat session".into())
+        })?;
+        let (doc, ver) = documents::get_version(&ctx.db, session_id, base, None)
+            .await
+            .map_err(|e| ToolError::Failed(format!("reading canvas document: {e}")))?
+            .ok_or_else(|| {
+                ToolError::InvalidArgs(format!(
+                    "no canvas document `{base}` in this conversation — call \
+                     `list_documents` to see what exists, or pass the `data_id` \
+                     of an older render"
+                ))
+            })?;
+        if doc.format != DocumentFormat::Json {
+            return Err(ToolError::InvalidArgs(format!(
+                "canvas document `{base}` is `{}` — a typst render's data base is \
+                 a JSON document (a deck's slides under the `deck` key)",
+                doc.format.as_str()
+            )));
+        }
+        let data: Value = serde_json::from_str(&ver.content).map_err(|e| {
+            ToolError::InvalidArgs(format!("canvas document `{base}` is not valid JSON: {e}"))
+        })?;
+        return Ok((data, BaseKind::Canvas { id: doc.id }));
+    }
+    let (base_turn, base_file) = split_attachment_id(base)?;
+    let fetched = chat_attachments::fetch(s3, base_turn, base_file)
+        .await
+        .map_err(|e| ToolError::Failed(format!("could not read base `{base}`: {e}")))?;
+    let data: Value = serde_json::from_slice(&fetched.bytes).map_err(|e| {
+        ToolError::InvalidArgs(format!(
+            "base `{base}` is not a JSON data document ({e}); pass the \
+             `document_id` from the render result (or an older render's \
+             `data_id`), not the PDF/PNG id"
+        ))
+    })?;
+    Ok((data, BaseKind::Attachment))
+}
+
+/// Persist a render's field data where [`BaseTarget`] says, and return the
+/// result keys that tell the model how to edit it next.
+///
+/// The canvas paths deliberately do NOT push a live panel update: a render's
+/// deliverable is the PDF + preview, and popping a JSON panel open over the
+/// conversation on every render would be noise. The document is in
+/// `list_documents` and in the panel's document switcher immediately, and the
+/// next page load shows it.
+#[allow(clippy::too_many_arguments)]
+async fn persist_base(
+    ctx: &ToolContext,
+    turn_id: &str,
+    s3: &gateway_core::server::config::S3Config,
+    template: &Template,
+    target: &BaseTarget<'_>,
+    base_data: &Value,
+    json_name: &str,
+    data_bytes: Vec<u8>,
+    escaped: bool,
+) -> Result<Vec<(String, Value)>, ToolError> {
+    // A canvas document is session-scoped, so without a session there is
+    // nowhere to put one — fall back to the hidden attachment rather than
+    // failing a render that otherwise succeeded.
+    let session_id = ctx.session_id.as_deref();
+    let hidden_json = |bytes: Vec<u8>| async move {
+        let out = chat_attachments::upload(s3, turn_id, json_name, "application/json", bytes)
+            .await
+            .map_err(|e| ToolError::Failed(format!("upload data json: {e}")))?;
+        Ok::<_, ToolError>(vec![
+            (
+                "data_id".to_string(),
+                json!(format!("{turn_id}/{}", out.filename)),
+            ),
+            (
+                "edit_with".to_string(),
+                json!(format!(
+                    "To change one thing, call `typst_{}_edit` with \
+                     base=<the data_id above> and a JSON Patch or find/replace — \
+                     don't resend the whole input.",
+                    template.id
+                )),
+            ),
+        ])
+    };
+    match (target, session_id) {
+        (BaseTarget::HiddenJson, _) | (_, None) => hidden_json(data_bytes).await,
+        (BaseTarget::NewCanvasDoc, Some(session_id)) => {
+            let content = String::from_utf8(data_bytes)
+                .map_err(|e| ToolError::Failed(format!("data is not valid UTF-8: {e}")))?;
+            let title = canvas_doc_title(template, base_data);
+            let id = documents::new_id();
+            documents::create(
+                &ctx.db,
+                &id,
+                session_id,
+                &ctx.user_id,
+                &title,
+                DocumentFormat::Json,
+                &content,
+                Some(turn_id),
+            )
+            .await
+            .map_err(|e| ToolError::Failed(format!("creating canvas document: {e}")))?;
+            Ok(canvas_keys(template, &id, 1, &title))
+        }
+        (BaseTarget::CanvasDoc { id, append }, Some(session_id)) => {
+            let (doc, ver) = documents::get_version(&ctx.db, session_id, id, None)
+                .await
+                .map_err(|e| ToolError::Failed(format!("reading canvas document: {e}")))?
+                .ok_or_else(|| ToolError::InvalidArgs(format!("canvas document `{id}` is gone")))?;
+            let version = if *append || escaped {
+                let content = String::from_utf8(data_bytes)
+                    .map_err(|e| ToolError::Failed(format!("data is not valid UTF-8: {e}")))?;
+                let summary = if escaped {
+                    "Rendered with '@' escaped"
+                } else {
+                    "Edited via typst _edit"
+                };
+                documents::append_version(
+                    &ctx.db,
+                    session_id,
+                    id,
+                    &content,
+                    Some(summary),
+                    Some(turn_id),
+                )
+                .await
+                .map_err(|e| ToolError::Failed(format!("saving canvas document: {e}")))?
+                .ok_or_else(|| ToolError::InvalidArgs(format!("canvas document `{id}` is gone")))?
+                .current_ver
+            } else {
+                ver.version
+            };
+            Ok(canvas_keys(template, id, version, &doc.title))
+        }
+    }
+}
+
+/// Result keys for a canvas-backed render: which document holds the data,
+/// which version rendered, and the two ways to change it.
+fn canvas_keys(template: &Template, id: &str, version: i64, title: &str) -> Vec<(String, Value)> {
+    vec![
+        ("document_id".to_string(), json!(id)),
+        ("document_version".to_string(), json!(version)),
+        ("document_title".to_string(), json!(title)),
+        (
+            "edit_with".to_string(),
+            json!(format!(
+                "The field data is canvas document `{id}` (v{version}, in the \
+                 user's document panel — they can read, download and hand-edit \
+                 it). To change something call `typst_{tid}_edit` with \
+                 base=`{id}` (JSON Patch or find/replace, one call: it edits the \
+                 document AND re-renders), or `edit_document` followed by \
+                 `typst_{tid}` with document_id=`{id}`. Either way the document \
+                 stays the single source of truth — never resend the whole input.",
+                tid = template.id,
+            )),
+        ),
+    ]
+}
+
+/// Title for the canvas document a render creates. Prefers a title-ish field
+/// out of the data (a deck's `deck_title`, a letter's `subject`, …) so the
+/// panel's switcher reads like the conversation rather than like the
+/// template registry; falls back to the template's own human title.
+fn canvas_doc_title(template: &Template, data: &Value) -> String {
+    const TITLE_KEYS: &[&str] = &["deck_title", "title", "subject", "heading", "headline"];
+    let mut candidates: Vec<&Value> = vec![data];
+    if let Some(deck) = data.get("deck") {
+        candidates.push(deck);
+    }
+    for scope in candidates {
+        for key in TITLE_KEYS {
+            if let Some(s) = scope.get(*key).and_then(Value::as_str) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    // The panel shows this next to the format badge, so keep it
+                    // to one line's worth of characters.
+                    return session_core::render::truncate_chars(s, 60);
+                }
+            }
+        }
+    }
+    format!("{} data", template.title)
 }
 
 /// Compile `template` with `inputs`, with the one auto-recovery the tool
@@ -1307,8 +1557,10 @@ impl Tool for TypstEditTool {
             format!(
                 "Make a change to a document previously rendered by \
                  `{render_id}` and re-render it — WITHOUT resending the whole \
-                 input. Give `base` (the `data_id` the render returned) and \
-                 EITHER `find`+`replace` OR `patch`. \
+                 input. One call does both: it saves a new version of the \
+                 render's canvas data document and re-renders from it. Give \
+                 `base` (the `document_id` the render returned, or an older \
+                 render's `data_id`) and EITHER `find`+`replace` OR `patch`. \
                  `find`/`replace`: swap an exact run of text for another \
                  wherever it appears — best for fixing wording (a sentence, a \
                  headline, a quote) when you don't know the field path. \
@@ -1330,9 +1582,10 @@ impl Tool for TypstEditTool {
                 "properties": {
                     "base": {
                         "type": "string",
-                        "description": "The `data_id` returned by a previous \
-                                        render/edit of this template, of the \
-                                        form `<turn_id>/<file>.json`."
+                        "description": "The `document_id` returned by a previous \
+                                        render/edit of this template — or an \
+                                        older render's `data_id` \
+                                        (`<turn_id>/<file>.json`)."
                     },
                     "find": {
                         "type": "string",
@@ -1437,19 +1690,10 @@ impl Tool for TypstEditTool {
                 ));
             }
 
-            // Fetch the prior render's data document (the edit base). It
-            // lives at <turn>/<file>.json under whichever turn produced it
-            // — typically an earlier turn in this same conversation.
-            let (base_turn, base_file) = split_attachment_id(base)?;
-            let fetched = chat_attachments::fetch(s3, base_turn, base_file)
-                .await
-                .map_err(|e| ToolError::Failed(format!("could not read base `{base}`: {e}")))?;
-            let mut data: Value = serde_json::from_slice(&fetched.bytes).map_err(|e| {
-                ToolError::InvalidArgs(format!(
-                    "base `{base}` is not a JSON data document ({e}); pass the \
-                     `data_id` from the render result, not the PDF/PNG id"
-                ))
-            })?;
+            // Fetch the prior render's data — a canvas document (what renders
+            // produce now) or, for an older conversation, the hidden
+            // `<turn>/<file>.json` attachment.
+            let (mut data, base_kind) = load_base(&ctx, s3, base).await?;
 
             // Structural patch first (if any), then the text find/replace.
             if let Some(patch) = patch {
@@ -1470,8 +1714,15 @@ impl Tool for TypstEditTool {
             }
 
             // Re-validate + re-stringify the edited data, then render and
-            // attach to the CURRENT turn exactly like a fresh render.
+            // attach to the CURRENT turn exactly like a fresh render. The
+            // edited data goes back where it came from: a new version of the
+            // canvas document (so the panel and its history follow the edit),
+            // or a fresh hidden `.json` on the legacy path.
             let inputs = inputs_from_data(&template, &data)?;
+            let target = match &base_kind {
+                BaseKind::Canvas { id } => BaseTarget::CanvasDoc { id, append: true },
+                BaseKind::Attachment => BaseTarget::HiddenJson,
+            };
             render_and_attach(
                 &ctx,
                 turn_id,
@@ -1481,6 +1732,7 @@ impl Tool for TypstEditTool {
                 &data,
                 self.sandbox.as_ref(),
                 preview_page,
+                target,
             )
             .await
         })
@@ -1519,12 +1771,15 @@ impl Tool for TypstReadTool {
             format!(
                 "Inspect the stored content of a document previously rendered \
                  by `{render_id}` — its field values, and for a deck the full \
-                 slide structure as JSON. Give `base`, the `data_id` that \
-                 render/edit returned. Use this to find the exact slide index, \
+                 slide structure as JSON. Give `base`: the `document_id` the \
+                 render returned (a canvas JSON document), or an older render's \
+                 `data_id`. Use this to find the exact slide index, \
                  JSON-Pointer path, or current wording you want to change \
                  BEFORE calling `{render_id}_edit`, so you never re-render \
-                 repeatedly just to discover where something lives. Read-only: \
-                 it attaches nothing to your reply."
+                 repeatedly just to discover where something lives. Note the \
+                 user can hand-edit the canvas document, so re-read it rather \
+                 than trusting what you remember writing. Read-only: it \
+                 attaches nothing to your reply."
             ),
             json!({
                 "type": "object",
@@ -1533,8 +1788,9 @@ impl Tool for TypstReadTool {
                 "properties": {
                     "base": {
                         "type": "string",
-                        "description": "The `data_id` from a previous render/edit \
-                                        of this template (`<turn_id>/<file>.json`)."
+                        "description": "The `document_id` from a render/edit of \
+                                        this template, or an older render's \
+                                        `data_id` (`<turn_id>/<file>.json`)."
                     }
                 }
             }),
@@ -1550,17 +1806,10 @@ impl Tool for TypstReadTool {
                 .as_object()
                 .and_then(|o| o.get("base"))
                 .and_then(Value::as_str)
-                .ok_or_else(|| ToolError::InvalidArgs("`base` (the data_id) is required".into()))?;
-            let (base_turn, base_file) = split_attachment_id(base)?;
-            let fetched = chat_attachments::fetch(s3, base_turn, base_file)
-                .await
-                .map_err(|e| ToolError::Failed(format!("could not read base `{base}`: {e}")))?;
-            let data: Value = serde_json::from_slice(&fetched.bytes).map_err(|e| {
-                ToolError::InvalidArgs(format!(
-                    "base `{base}` is not a JSON data document ({e}); pass the \
-                     `data_id` from a render/edit result, not the PDF/PNG id"
-                ))
-            })?;
+                .ok_or_else(|| {
+                    ToolError::InvalidArgs("`base` (the document_id or data_id) is required".into())
+                })?;
+            let (data, _kind) = load_base(&ctx, s3, base).await?;
             Ok(json!({
                 "data": data,
                 "note": "These are the stored field values backing the document \
@@ -1616,11 +1865,12 @@ impl Tool for TypstPptxTool {
             format!(
                 "Export a deck previously produced by `{render_id}` to an \
                  EDITABLE PowerPoint (.pptx) — real text, shapes and gradients, \
-                 not images — ready to import into Google Slides. Give `base`, \
-                 the `data_id` that render/edit returned. The `.pptx` is \
-                 attached to your reply. (A render already attaches one \
-                 automatically; use this to regenerate it or when you only \
-                 have the data_id.)"
+                 not images — ready to import into Google Slides. Give `base`: \
+                 the `document_id` the render returned, or an older render's \
+                 `data_id`. The `.pptx` is attached to your reply. (A render \
+                 already attaches one automatically; use this to regenerate it \
+                 after a hand-edit of the document, or when you only have the \
+                 id.)"
             ),
             json!({
                 "type": "object",
@@ -1629,8 +1879,9 @@ impl Tool for TypstPptxTool {
                 "properties": {
                     "base": {
                         "type": "string",
-                        "description": "The `data_id` from a previous render/edit \
-                                        of this template (`<turn_id>/<file>.json`)."
+                        "description": "The `document_id` from a render/edit of \
+                                        this template, or an older render's \
+                                        `data_id` (`<turn_id>/<file>.json`)."
                     }
                 }
             }),
@@ -1657,17 +1908,10 @@ impl Tool for TypstPptxTool {
                 .as_object()
                 .and_then(|o| o.get("base"))
                 .and_then(Value::as_str)
-                .ok_or_else(|| ToolError::InvalidArgs("`base` (the data_id) is required".into()))?;
-            let (base_turn, base_file) = split_attachment_id(base)?;
-            let fetched = chat_attachments::fetch(s3, base_turn, base_file)
-                .await
-                .map_err(|e| ToolError::Failed(format!("could not read base `{base}`: {e}")))?;
-            let data: Value = serde_json::from_slice(&fetched.bytes).map_err(|e| {
-                ToolError::InvalidArgs(format!(
-                    "base `{base}` is not a JSON data document ({e}); pass the \
-                     `data_id` from a render/edit result"
-                ))
-            })?;
+                .ok_or_else(|| {
+                    ToolError::InvalidArgs("`base` (the document_id or data_id) is required".into())
+                })?;
+            let (data, base_kind) = load_base(&ctx, s3, base).await?;
 
             // Re-stage any `att:` image refs the stored deck carries (the
             // edit-base persists refs, not the ephemeral staged paths).
@@ -1675,10 +1919,16 @@ impl Tool for TypstPptxTool {
             let render_data = apply_reps_to_value(&data, &reps)?;
             let bytes =
                 convert_to_pptx(&self.sandbox, &template, cfg, &render_data, &staged).await?;
-            // Share the deck stem so the .pptx sits beside its siblings.
-            let stem = base_file
-                .strip_suffix(".json")
-                .unwrap_or(&template.output_basename);
+            // Share the deck stem so the .pptx sits beside its siblings. A
+            // canvas base has no filename to borrow, so fall back to the
+            // template's own basename.
+            let stem = match &base_kind {
+                BaseKind::Attachment => split_attachment_id(base)?
+                    .1
+                    .strip_suffix(".json")
+                    .unwrap_or(&template.output_basename),
+                BaseKind::Canvas { .. } => &template.output_basename,
+            };
             let name = chat_attachments::reserve_filename(
                 &ctx.db,
                 turn_id,
@@ -2148,6 +2398,288 @@ mod tests {
             pptx: None,
             docx: None,
         }
+    }
+
+    // --- Canvas data base -------------------------------------------------
+
+    async fn base_pool() -> gateway_core::server::db::Pool {
+        let pool = gateway_core::server::db::open(Path::new(":memory:"))
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"INSERT INTO users (id, email, created_at, updated_at)
+               VALUES ('u1', 'u1@example.com', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO chat_sessions (id, user_id, created_at, updated_at)
+               VALUES ('s1', 'u1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
+    fn base_ctx(pool: gateway_core::server::db::Pool) -> ToolContext {
+        ToolContext {
+            user_id: "u1".into(),
+            roles: vec![],
+            db: pool,
+            s3: None,
+            assistant_turn_id: Some("t1".into()),
+            session_id: Some("s1".into()),
+            client_ip: None,
+            geoip: None,
+            chat_feedback: None,
+            attachment_reservations: None,
+            indexer: None,
+            image_gen: None,
+            ocr: None,
+            sandbox_lease: None,
+            browser_lease: None,
+            crypto: None,
+            push: None,
+            model: None,
+        }
+    }
+
+    /// The canvas branches of `persist_base` never touch storage; this stands
+    /// in for the config they take but don't use.
+    fn unused_s3() -> gateway_core::server::config::S3Config {
+        gateway_core::server::config::S3Config {
+            endpoint: "http://127.0.0.1:1".into(),
+            region: "us-east-1".into(),
+            bucket: "b".into(),
+            access_key_env: "TYPST_BASE_TEST_NOT_SET".into(),
+            secret_key_env: "TYPST_BASE_TEST_NOT_SET".into(),
+            key_prefix: "chat-attachments".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_render_parks_its_data_in_a_canvas_document() {
+        let pool = base_pool().await;
+        let ctx = base_ctx(pool.clone());
+        let t = stub_template();
+        let data = json!({"title": "Quarterly numbers", "draft": false});
+
+        let keys = persist_base(
+            &ctx,
+            "t1",
+            &unused_s3(),
+            &t,
+            &BaseTarget::NewCanvasDoc,
+            &data,
+            "stub.json",
+            serialize_data(&data),
+            false,
+        )
+        .await
+        .unwrap();
+        let map: std::collections::HashMap<_, _> = keys.into_iter().collect();
+        // The document — not a hidden attachment — is the edit surface, so
+        // there is nothing for the model to address by data_id.
+        assert!(!map.contains_key("data_id"), "{map:?}");
+        let doc_id = map["document_id"].as_str().unwrap();
+        assert_eq!(map["document_version"], json!(1));
+        // Titled from the data, so the panel's switcher reads like the
+        // conversation rather than like the template registry.
+        assert_eq!(map["document_title"], json!("Quarterly numbers"));
+
+        // And it really is a JSON canvas document holding this render's data.
+        let (doc, ver) = documents::get_version(&pool, "s1", doc_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.format, DocumentFormat::Json);
+        let stored: Value = serde_json::from_str(&ver.content).unwrap();
+        assert_eq!(stored["title"], json!("Quarterly numbers"));
+    }
+
+    #[tokio::test]
+    async fn an_edit_appends_a_version_and_a_plain_rerender_does_not() {
+        let pool = base_pool().await;
+        let ctx = base_ctx(pool.clone());
+        let t = stub_template();
+        let id = documents::new_id();
+        documents::create(
+            &pool,
+            &id,
+            "s1",
+            "u1",
+            "Deck data",
+            DocumentFormat::Json,
+            r#"{"title":"v1"}"#,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Re-render of an unchanged document: same version, no history noise.
+        let data = json!({"title": "v1"});
+        let keys = persist_base(
+            &ctx,
+            "t1",
+            &unused_s3(),
+            &t,
+            &BaseTarget::CanvasDoc {
+                id: &id,
+                append: false,
+            },
+            &data,
+            "stub.json",
+            serialize_data(&data),
+            false,
+        )
+        .await
+        .unwrap();
+        let map: std::collections::HashMap<_, _> = keys.into_iter().collect();
+        assert_eq!(map["document_version"], json!(1));
+
+        // An `_edit` changed the data, so the document follows it.
+        let edited = json!({"title": "v2"});
+        let keys = persist_base(
+            &ctx,
+            "t1",
+            &unused_s3(),
+            &t,
+            &BaseTarget::CanvasDoc {
+                id: &id,
+                append: true,
+            },
+            &edited,
+            "stub.json",
+            serialize_data(&edited),
+            false,
+        )
+        .await
+        .unwrap();
+        let map: std::collections::HashMap<_, _> = keys.into_iter().collect();
+        assert_eq!(map["document_version"], json!(2));
+        let (_, ver) = documents::get_version(&pool, "s1", &id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&ver.content).unwrap()["title"],
+            json!("v2")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_at_fixup_writes_back_what_actually_rendered() {
+        // Without this, the document in the panel says `@` and the PDF says
+        // `\@` — and the next render from the document re-crashes.
+        let pool = base_pool().await;
+        let ctx = base_ctx(pool.clone());
+        let t = stub_template();
+        let id = documents::new_id();
+        documents::create(
+            &pool,
+            &id,
+            "s1",
+            "u1",
+            "Letter data",
+            DocumentFormat::Json,
+            r#"{"title":"mail me at a@b.c"}"#,
+            None,
+        )
+        .await
+        .unwrap();
+        let escaped = json!({"title": "mail me at a\\@b.c"});
+        let keys = persist_base(
+            &ctx,
+            "t1",
+            &unused_s3(),
+            &t,
+            &BaseTarget::CanvasDoc {
+                id: &id,
+                append: false,
+            },
+            &escaped,
+            "stub.json",
+            serialize_data(&escaped),
+            true,
+        )
+        .await
+        .unwrap();
+        let map: std::collections::HashMap<_, _> = keys.into_iter().collect();
+        assert_eq!(map["document_version"], json!(2), "escape must be saved");
+    }
+
+    #[tokio::test]
+    async fn load_base_resolves_a_canvas_id_and_rejects_a_foreign_one() {
+        let pool = base_pool().await;
+        let ctx = base_ctx(pool.clone());
+        let id = documents::new_id();
+        documents::create(
+            &pool,
+            &id,
+            "s1",
+            "u1",
+            "Deck data",
+            DocumentFormat::Json,
+            r#"{"deck":{"slides":[]}}"#,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (data, kind) = load_base(&ctx, &unused_s3(), &id).await.unwrap();
+        assert!(matches!(kind, BaseKind::Canvas { .. }));
+        assert!(data["deck"]["slides"].is_array());
+
+        // An id from no document at all: a clear error naming the way out,
+        // not a storage fetch for a `<turn>/<file>` that never existed.
+        let err = load_base(&ctx, &unused_s3(), "doc_nope").await.unwrap_err();
+        assert!(
+            matches!(&err, ToolError::InvalidArgs(m) if m.contains("list_documents")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_base_refuses_a_non_json_document() {
+        let pool = base_pool().await;
+        let ctx = base_ctx(pool.clone());
+        let id = documents::new_id();
+        documents::create(
+            &pool,
+            &id,
+            "s1",
+            "u1",
+            "Notes",
+            DocumentFormat::Markdown,
+            "# not a field map\n",
+            None,
+        )
+        .await
+        .unwrap();
+        let err = load_base(&ctx, &unused_s3(), &id).await.unwrap_err();
+        assert!(
+            matches!(&err, ToolError::InvalidArgs(m) if m.contains("markdown")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn canvas_doc_title_prefers_the_data_over_the_template() {
+        let t = stub_template();
+        assert_eq!(
+            canvas_doc_title(&t, &json!({"deck": {"deck_title": "Enterprise AI"}})),
+            "Enterprise AI"
+        );
+        assert_eq!(
+            canvas_doc_title(&t, &json!({"subject": "Invoice 42"})),
+            "Invoice 42"
+        );
+        // Blank titles don't win, and with nothing usable the template's own
+        // human title carries the row.
+        assert_eq!(canvas_doc_title(&t, &json!({"title": "   "})), "Stub data");
+        assert_eq!(canvas_doc_title(&t, &json!({})), "Stub data");
     }
 
     #[test]
