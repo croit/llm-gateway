@@ -6,6 +6,7 @@
 #   - mise run lint  → cargo fmt --all --check, clippy --workspace
 #                      --all-targets -D warnings, tsc --noEmit
 #   - mise run test  → cargo test --workspace
+#   - mise run test-js → node --test over the browser TS unit tests
 # It does NOT run the release builds — those are slow and a compile error
 # surfaces in the test step anyway.
 #
@@ -30,4 +31,5 @@ echo "pre-push: running lint + workspace tests (mirrors CI; bypass with --no-ver
 # failure.
 mise run lint
 mise run test
+mise run test-js
 echo "pre-push: all checks passed ✓"
