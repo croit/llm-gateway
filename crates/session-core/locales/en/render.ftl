@@ -50,6 +50,11 @@ render-tool-input-label = Input
 render-tool-output-label = Output
 render-tool-output-truncated = truncated for display — full { $bytes } bytes still available to the model + persisted in the DB; displaying first { $chars } chars
 
+render-canvas-hand-edited = edited by you
+render-canvas-edit-button = ✎ Edit
+render-canvas-save = Save as new version
+render-canvas-cancel = Cancel
+render-canvas-edit-hint = Saved as a new version; the assistant is told you changed it.
 render-canvas-close-title = Close
 render-canvas-close-aria = Close document canvas
 render-canvas-document-aria = Document

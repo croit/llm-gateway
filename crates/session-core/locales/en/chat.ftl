@@ -26,6 +26,9 @@ chat-error-edit-own-messages-only = Edit applies to your own messages.
 chat-error-pdf-export-unavailable = PDF export unavailable: the typst CLI is not installed on the gateway
 chat-error-pdf-export-failed = PDF export failed
 
+chat-error-document-not-found = Document not found.
+chat-error-document-too-large = That document is too large to save (limit 512 KB).
+
 chat-error-auth-required = auth required
 chat-error-no-such-turn = no such turn
 chat-error-db-error = db error

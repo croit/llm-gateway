@@ -26,6 +26,9 @@ chat-error-edit-own-messages-only = Редактирование применя�
 chat-error-pdf-export-unavailable = Экспорт в PDF недоступен: CLI typst не установлен на шлюзе
 chat-error-pdf-export-failed = Не удалось экспортировать в PDF
 
+chat-error-document-not-found = Документ не найден.
+chat-error-document-too-large = Этот документ слишком велик для сохранения (лимит 512 КБ).
+
 chat-error-auth-required = требуется авторизация
 chat-error-no-such-turn = такого сообщения не существует
 chat-error-db-error = ошибка базы данных

@@ -26,6 +26,9 @@ chat-error-edit-own-messages-only = La modification ne s'applique qu'à vos prop
 chat-error-pdf-export-unavailable = Export PDF indisponible : le CLI typst n'est pas installé sur la passerelle
 chat-error-pdf-export-failed = Échec de l'export PDF
 
+chat-error-document-not-found = Document introuvable.
+chat-error-document-too-large = Ce document est trop volumineux pour être enregistré (limite 512 Ko).
+
 chat-error-auth-required = authentification requise
 chat-error-no-such-turn = ce message n'existe pas
 chat-error-db-error = erreur de base de données

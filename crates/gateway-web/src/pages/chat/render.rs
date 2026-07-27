@@ -233,8 +233,15 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
     let has_document = document_canvas_html.is_some();
     let has_assets = !page.assets.is_empty();
     let initial_tab = if has_document { "document" } else { "assets" };
+    // `canEditDocs` gates the canvas panel's hand-edit affordance. It lives on
+    // the shell, not in the panel markup: the panel HTML is re-rendered by
+    // broadcast SSE patches (a tool edit reaches every live viewer of a shared
+    // conversation, and runs with no viewer identity of its own), so baking
+    // "you may edit" into it would offer the button to a read-only viewer. The
+    // POST handler is the actual gate; this only keeps the UI honest.
+    let can_edit_docs = !page.read_only;
     let canvas_signals = format!(
-        "{{\"hasCanvas\": {has_canvas}, \"hasDocument\": {has_document}, \"hasAssets\": {has_assets}, \"assetCount\": {}, \"canvasOpen\": false, \"canvasTab\": \"{initial_tab}\"}}",
+        "{{\"hasCanvas\": {has_canvas}, \"hasDocument\": {has_document}, \"hasAssets\": {has_assets}, \"assetCount\": {}, \"canvasOpen\": false, \"canvasTab\": \"{initial_tab}\", \"canEditDocs\": {can_edit_docs}}}",
         page.assets.len()
     );
 

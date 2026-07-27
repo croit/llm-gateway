@@ -19,6 +19,12 @@ use gateway_core::server::db::documents;
 /// string. `Ok(None)` when the session has no documents. Shared by the
 /// initial page render, the live SSE inject, and the doc/version-switch
 /// route so all three stay byte-identical.
+/// The hand-edit affordance is *always* rendered (when the newest version is
+/// on screen) and hidden client-side unless the page shell set
+/// `$canEditDocs` — the panel HTML is broadcast to every live viewer of a
+/// shared conversation, including from a tool call that has no request behind
+/// it to say who is watching, so viewer identity can't be baked into it. The
+/// POST handler enforces ownership regardless.
 pub async fn render_canvas_html(
     pool: &gateway_core::server::db::Pool,
     session_id: &str,
@@ -59,6 +65,7 @@ pub async fn render_canvas_html(
         max_version: doc.current_ver,
         content: &ver.content,
         all_docs,
+        hand_edited: ver.author.is_user(),
     };
     Ok(Some(session_core::render::render_document_canvas(
         &canvas, lang,

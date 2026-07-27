@@ -1,0 +1,25 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (C) 2026 croit GmbH
+--
+-- Who wrote a canvas-document version: the assistant, or the user by hand.
+--
+-- The canvas was assistant-only, so "who changed this" had one answer and
+-- needed no column. With hand-editing in the panel it has two, and the
+-- difference matters in both directions:
+--
+--   * The user needs to see which revision is theirs when scrubbing history --
+--     otherwise their own correction is indistinguishable from the model's
+--     next rewrite of it.
+--   * The model needs to know a human touched the document since it last
+--     looked. Its context still holds the content *it* wrote, so without this
+--     signal the next edit silently reverts the correction -- the single worst
+--     failure mode of a shared editing surface, and the reason the user asked
+--     for hand-editing in the first place.
+--
+-- `turn_id` cannot stand in for this: it is NULL for a hand edit but also NULL
+-- for anything written off a live chat turn, so absence proves nothing.
+--
+-- Default 'assistant' backfills every existing row correctly -- nothing but
+-- tools could write a version before this migration.
+
+ALTER TABLE document_versions ADD COLUMN author TEXT NOT NULL DEFAULT 'assistant';

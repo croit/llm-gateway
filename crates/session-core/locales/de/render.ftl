@@ -50,6 +50,11 @@ render-tool-input-label = Eingabe
 render-tool-output-label = Ausgabe
 render-tool-output-truncated = für die Anzeige gekürzt — alle { $bytes } Bytes sind weiterhin für das Modell verfügbar und in der Datenbank gespeichert; die ersten { $chars } Zeichen werden angezeigt
 
+render-canvas-hand-edited = von dir bearbeitet
+render-canvas-edit-button = ✎ Bearbeiten
+render-canvas-save = Als neue Version speichern
+render-canvas-cancel = Abbrechen
+render-canvas-edit-hint = Wird als neue Version gespeichert; der Assistent erfährt von deiner Änderung.
 render-canvas-close-title = Schließen
 render-canvas-close-aria = Dokumentenansicht schließen
 render-canvas-document-aria = Dokument

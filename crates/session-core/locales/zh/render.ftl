@@ -48,6 +48,11 @@ render-tool-input-label = 输入
 render-tool-output-label = 输出
 render-tool-output-truncated = 显示已截断 — 完整的 { $bytes } 字节仍可供模型使用并保存在数据库中；此处显示前 { $chars } 个字符
 
+render-canvas-hand-edited = 你已编辑
+render-canvas-edit-button = ✎ 编辑
+render-canvas-save = 另存为新版本
+render-canvas-cancel = 取消
+render-canvas-edit-hint = 将保存为新版本；助手会知道你做了修改。
 render-canvas-close-title = 关闭
 render-canvas-close-aria = 关闭文档面板
 render-canvas-document-aria = 文档
