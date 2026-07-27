@@ -172,6 +172,17 @@ description = "Run tests with stdout/stderr visible."
 depends = ["build-assets"]
 run = "cargo nextest run --workspace --no-capture"
 
+[tasks.test-js]
+description = "Unit-test the browser TypeScript (node --test, Node's own type stripping — no bundler, no jsdom). Tests live next to their module as `*.test.mjs` and stub the DOM surface they need; they pin behaviour that only shows up at runtime, like the conversation's scroll/tail-space geometry."
+sources = [
+    "ui/ts/**/*.ts",
+    "ui/ts/**/*.test.mjs",
+    "crates/session-core/ui/ts/**/*.ts",
+    "crates/session-core/ui/ts/**/*.test.mjs",
+]
+dir = "{{ config_root }}"
+run = "node --test 'ui/ts/**/*.test.mjs' 'crates/session-core/ui/ts/**/*.test.mjs'"
+
 [tasks.lint]
 description = "Clippy + rustfmt + tsc --noEmit."
 depends = ["build-assets", "typecheck"]
@@ -185,8 +196,8 @@ description = "Advisory: flag panic-prone `.unwrap()`/`.expect()` in library/bin
 run = "cargo clippy --workspace -- -W clippy::unwrap_used -W clippy::expect_used"
 
 [tasks.ci]
-description = "Everything CI runs: lint + test + release build of the gateway binary. mise fans out via the DAG."
-depends = ["lint", "test", "build"]
+description = "Everything CI runs: lint + tests (Rust + browser TS) + release build of the gateway binary. mise fans out via the DAG."
+depends = ["lint", "test", "test-js", "build"]
 
 [tasks.e2e]
 description = "Browser + HTTP end-to-end tests (Playwright via node:test). Needs `mise run dev` running in another terminal. Not part of `ci`. Set CHROMIUM_HEADED=1 to watch the browser, GATEWAY_URL=… to target a remote gateway. See e2e/README.md for first-time Chromium setup."
