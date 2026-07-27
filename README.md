@@ -1,5 +1,7 @@
 # LLM Gateway
 
+![Architecture at a glance: internal users reach the gateway through the chat UI, API tokens, or their own software (OIDC-authenticated); the gateway fans out to self-hosted GPUs and cloud providers behind one OpenAI-compatible API, with Atlassian, GitLab, GitHub, Google, scheduled actions, webhooks, skills, RAG, sandbox and RBAC hanging off it.](docs/img/architecture.webp)
+
 **One endpoint for all your LLM backends — that also makes them agentic.** LLM Gateway is an OpenAI-API-compatible reverse proxy: point any OpenAI SDK at it and it routes across your self-hosted and cloud models (health checks, failover, stable aliases), then runs tools **mid-completion** — web search, code sandbox, document rendering, RAG, per-user MCP connectors — so plain clients get tool use with zero agent code of their own. Team-ready with OIDC login, per-user tokens, and RBAC, plus a built-in chat UI for people who don't speak curl. Ships as a single self-hosted binary (Rust, SQLite) — no compose file, no vector DB, no separate frontend.
 
 ![The built-in chat UI answering a question by calling the web-search tool mid-completion — the reasoning step, the tool calls, and the final markdown answer all render inline.](docs/img/chat.png)
