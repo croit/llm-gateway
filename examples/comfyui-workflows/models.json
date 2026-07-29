@@ -1,0 +1,149 @@
+{
+  "_comment": [
+    "Source map: ComfyUI model filename -> where to download it from.",
+    "Used by fetch-missing-models.sh, which reads the *_name inputs out of every",
+    "bundle's workflow.json and looks each referenced file up here. Keys are the",
+    "filename exactly as the workflow.json asks for it; `path` is the path inside",
+    "the Hugging Face repo, which may have a different basename (the file is saved",
+    "under the key, so an upstream rename is fine).",
+    "`dir` is the subdirectory under ComfyUI's models/ the loader expects.",
+    "`gated` means the repo requires accepting a licence: export HF_TOKEN=hf_...",
+    "Verified against upstream 2026-07-29. If a URL 404s, the repo was",
+    "re-organised: search huggingface.co for the filename and fix the entry."
+  ],
+
+  "qwen_image_edit_2511_fp8mixed.safetensors": {
+    "dir": "diffusion_models",
+    "repo": "Comfy-Org/Qwen-Image-Edit_ComfyUI",
+    "path": "split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors"
+  },
+  "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors": {
+    "dir": "loras",
+    "repo": "lightx2v/Qwen-Image-Edit-2511-Lightning",
+    "path": "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
+  },
+  "qwen_2.5_vl_7b_fp8_scaled.safetensors": {
+    "dir": "text_encoders",
+    "repo": "Comfy-Org/Qwen-Image_ComfyUI",
+    "path": "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors"
+  },
+  "qwen_image_vae.safetensors": {
+    "dir": "vae",
+    "repo": "Comfy-Org/Qwen-Image_ComfyUI",
+    "path": "split_files/vae/qwen_image_vae.safetensors"
+  },
+
+  "flux-2-klein-base-9b-fp8.safetensors": {
+    "dir": "diffusion_models",
+    "repo": "black-forest-labs/FLUX.2-klein-base-9b-fp8",
+    "path": "flux-2-klein-base-9b-fp8.safetensors",
+    "gated": true
+  },
+  "flux2_klein_9b_fp8.safetensors": {
+    "dir": "diffusion_models",
+    "repo": "black-forest-labs/FLUX.2-klein-9b-fp8",
+    "path": "flux-2-klein-9b-fp8.safetensors",
+    "gated": true,
+    "note": "upstream basename uses hyphens; saved under the workflow's name"
+  },
+  "qwen_3_8b_fp8mixed.safetensors": {
+    "dir": "text_encoders",
+    "repo": "Comfy-Org/vae-text-encorder-for-flux-klein-9b",
+    "path": "split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors",
+    "note": "repo name is misspelled upstream; Comfy-Org/flux2-klein-9B redirects here"
+  },
+  "flux2-vae.safetensors": {
+    "dir": "vae",
+    "repo": "Comfy-Org/vae-text-encorder-for-flux-klein-9b",
+    "path": "split_files/vae/flux2-vae.safetensors"
+  },
+  "full_encoder_small_decoder.safetensors": {
+    "dir": "vae",
+    "repo": "black-forest-labs/FLUX.2-small-decoder",
+    "path": "full_encoder_small_decoder.safetensors"
+  },
+
+  "wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors": {
+    "dir": "diffusion_models",
+    "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+    "path": "split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
+  },
+  "wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors": {
+    "dir": "diffusion_models",
+    "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+    "path": "split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
+  },
+  "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors": {
+    "dir": "loras",
+    "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+    "path": "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
+  },
+  "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors": {
+    "dir": "loras",
+    "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+    "path": "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
+  },
+  "umt5_xxl_fp8_e4m3fn_scaled.safetensors": {
+    "dir": "text_encoders",
+    "repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+    "path": "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+  },
+  "wan_2.1_vae.safetensors": {
+    "dir": "vae",
+    "repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+    "path": "split_files/vae/wan_2.1_vae.safetensors"
+  },
+
+  "seedvr2_7b_int8_convrot.safetensors": {
+    "dir": "diffusion_models",
+    "repo": "Comfy-Org/SeedVR2",
+    "path": "diffusion_models/seedvr2_7b_int8_convrot.safetensors"
+  },
+  "ema_vae_fp16.safetensors": {
+    "dir": "vae",
+    "repo": "Comfy-Org/SeedVR2",
+    "path": "vae/ema_vae_fp16.safetensors"
+  },
+
+  "ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors": {
+    "dir": "loras",
+    "repo": "Comfy-Org/ltx-2.3",
+    "path": "split_files/loras/ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors"
+  },
+  "gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors": {
+    "dir": "loras",
+    "repo": "Comfy-Org/ltx-2",
+    "path": "split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors"
+  },
+  "gemma_3_12B_it_fp4_mixed.safetensors": {
+    "dir": "text_encoders",
+    "repo": "Comfy-Org/ltx-2",
+    "path": "split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"
+  },
+  "ltx-2.3-spatial-upscaler-x2-1.1.safetensors": {
+    "dir": "latent_upscale_models",
+    "repo": "Lightricks/LTX-2.3",
+    "path": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+  },
+
+  "acestep_v1.5_turbo.safetensors": {
+    "dir": "diffusion_models",
+    "repo": "Comfy-Org/ace_step_1.5_ComfyUI_files",
+    "path": "split_files/diffusion_models/acestep_v1.5_turbo.safetensors"
+  },
+  "ace_1.5_vae.safetensors": {
+    "dir": "vae",
+    "repo": "Comfy-Org/ace_step_1.5_ComfyUI_files",
+    "path": "split_files/vae/ace_1.5_vae.safetensors"
+  },
+  "qwen_0.6b_ace15.safetensors": {
+    "dir": "text_encoders",
+    "repo": "Comfy-Org/ace_step_1.5_ComfyUI_files",
+    "path": "split_files/text_encoders/qwen_0.6b_ace15.safetensors"
+  },
+  "qwen_4b_ace15.safetensors": {
+    "dir": "text_encoders",
+    "repo": "Comfy-Org/ace_step_1.5_ComfyUI_files",
+    "path": "split_files/text_encoders/qwen_4b_ace15.safetensors"
+  }
+}
