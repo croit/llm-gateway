@@ -264,6 +264,42 @@ impl PodmanBackend {
         }
     }
 
+    /// Read artifacts the agent deliberately left on disk.
+    ///
+    /// With host-backed scratch the agent reports metadata with an empty
+    /// `content_b64` (see `SANDBOX_ARTIFACTS_INPLACE`), so a large produced
+    /// file is never base64-encoded inside the sandbox nor squeezed through its
+    /// response JSON — that is what removes the agent's 64 MiB cap. The bytes
+    /// are read here through the same guarded path as the spill file; the hop
+    /// to the gateway keeps its existing base64 encoding.
+    ///
+    /// An artifact whose file cannot be read is dropped rather than delivered
+    /// empty, so the gateway never stores a 0-byte file under a real name.
+    fn hydrate_inplace_artifacts(&self, container: &str, resp: &mut RunResponse) {
+        let Some(root) = &self.cfg.work_root else {
+            return;
+        };
+        let (work, _tmp) = host_dirs(root, container);
+        resp.artifacts.retain_mut(|a| {
+            if !a.content_b64.is_empty() || a.size == 0 {
+                return true;
+            }
+            match read_sandbox_file(&work, &a.name) {
+                Ok(bytes) => {
+                    a.content_b64 = shared::b64::encode(&bytes);
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        container, artifact = %a.name, error = %e,
+                        "dropping artifact: could not read it from the sandbox scratch dir"
+                    );
+                    false
+                }
+            }
+        });
+    }
+
     /// Drop scratch directories whose container is gone — the runner crashing
     /// mid-job would otherwise leave the files (and their disk) behind forever.
     /// Called at startup after [`Self::reap_stale_containers`], so in practice
@@ -447,16 +483,24 @@ impl ContainerBackend for PodmanBackend {
     ) -> Result<RunResponse, BackendError> {
         // The job marshalling lives inside the image: pipe the RunRequest to
         // `sandbox-agent` on stdin, read a RunResponse back on stdout.
-        let child = tokio::process::Command::new(&self.cfg.podman)
-            .arg("exec")
-            .arg("-i")
+        let mut cmd = tokio::process::Command::new(&self.cfg.podman);
+        cmd.arg("exec").arg("-i");
+        if self.cfg.work_root.is_some() {
+            // Host-backed scratch: tell the agent to leave produced files on
+            // disk instead of base64-ing them into its response. We read them
+            // below, which is what lifts its 64 MiB artifact cap.
+            cmd.arg("-e").arg("SANDBOX_ARTIFACTS_INPLACE=1");
+        }
+        let child = cmd
             .arg(id)
             .arg("/usr/local/bin/sandbox-agent")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        drive_agent(child, id, req, timeout, self).await
+        let mut resp = drive_agent(child, id, req, timeout, self).await?;
+        self.hydrate_inplace_artifacts(id, &mut resp);
+        Ok(resp)
     }
 
     async fn image_id(&self) -> Result<String, BackendError> {
@@ -1264,5 +1308,113 @@ mod scratch_mount_tests {
             !joined.contains("--tmpfs"),
             "tmpfs must be replaced: {joined}"
         );
+    }
+}
+
+#[cfg(test)]
+mod inplace_artifact_tests {
+    //! With host-backed scratch the agent hands back artifact metadata only and
+    //! the runner reads the bytes off the bind mount. That is what removes the
+    //! agent's 64 MiB cap, so it has to be exact about which artifacts survive.
+
+    use super::*;
+    use shared::sandbox::Artifact;
+
+    fn scratch(tag: &str) -> (Arc<Config>, PathBuf, String) {
+        let root = std::env::temp_dir().join(format!(
+            "sbx-inplace-{}-{tag}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let name = "sbx-test".to_string();
+        let (work, tmp) = host_dirs(&root, &name);
+        prepare_host_dirs(&root, &work, &tmp).unwrap();
+        let mut c = crate::config::Config::for_test();
+        c.work_root = Some(root.clone());
+        (Arc::new(c), work, name)
+    }
+
+    fn resp_with(artifacts: Vec<Artifact>) -> RunResponse {
+        RunResponse {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            artifacts,
+            duration_ms: 1,
+            timed_out: false,
+            output_truncated: false,
+            container_id: None,
+        }
+    }
+
+    fn art(name: &str, size: u64, content: &str) -> Artifact {
+        Artifact {
+            name: name.into(),
+            size,
+            mime: "application/octet-stream".into(),
+            content_b64: content.into(),
+        }
+    }
+
+    #[test]
+    fn reads_the_bytes_the_agent_left_on_disk() {
+        let (cfg, work, name) = scratch("read");
+        std::fs::write(work.join("out.mp4"), b"foobar").unwrap();
+        let mut r = resp_with(vec![art("out.mp4", 6, "")]);
+
+        PodmanBackend::new(cfg).hydrate_inplace_artifacts(&name, &mut r);
+
+        assert_eq!(r.artifacts.len(), 1);
+        assert_eq!(r.artifacts[0].content_b64, "Zm9vYmFy");
+    }
+
+    #[test]
+    fn leaves_inline_artifacts_untouched() {
+        // The agent still inlines when scratch isn't host-backed, and a mixed
+        // response must not be re-read (or clobbered) here.
+        let (cfg, _work, name) = scratch("inline");
+        let mut r = resp_with(vec![art("small.txt", 3, "Zm9v")]);
+
+        PodmanBackend::new(cfg).hydrate_inplace_artifacts(&name, &mut r);
+
+        assert_eq!(r.artifacts[0].content_b64, "Zm9v");
+    }
+
+    #[test]
+    fn drops_an_artifact_that_is_a_symlink() {
+        // Untrusted code naming a symlink as its output must not get the target
+        // delivered to the user — and must not yield an empty file either.
+        let (cfg, work, name) = scratch("symlink");
+        let secret = work.join("secret");
+        std::fs::write(&secret, b"host-only").unwrap();
+        std::os::unix::fs::symlink(&secret, work.join("out.mp4")).unwrap();
+        let mut r = resp_with(vec![art("out.mp4", 9, "")]);
+
+        PodmanBackend::new(cfg).hydrate_inplace_artifacts(&name, &mut r);
+
+        assert!(r.artifacts.is_empty(), "symlinked artifact must be dropped");
+    }
+
+    #[test]
+    fn drops_an_artifact_whose_file_vanished() {
+        let (cfg, _work, name) = scratch("missing");
+        let mut r = resp_with(vec![art("gone.bin", 10, "")]);
+
+        PodmanBackend::new(cfg).hydrate_inplace_artifacts(&name, &mut r);
+
+        assert!(r.artifacts.is_empty());
+    }
+
+    #[test]
+    fn is_a_no_op_without_host_backed_scratch() {
+        // Plain tmpfs deployments keep the inline protocol untouched.
+        let cfg = Arc::new(crate::config::Config::for_test()); // work_root: None
+        let mut r = resp_with(vec![art("out.mp4", 6, "")]);
+
+        PodmanBackend::new(cfg).hydrate_inplace_artifacts("sbx-x", &mut r);
+
+        assert_eq!(r.artifacts.len(), 1, "must not touch the response");
+        assert_eq!(r.artifacts[0].content_b64, "");
     }
 }
