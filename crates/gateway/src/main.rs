@@ -394,6 +394,7 @@ async fn main() -> anyhow::Result<()> {
                 .with(rt::tools::sandbox::EditPresentation(client.clone()))
                 .with(rt::tools::sandbox::RenderExcalidraw(client.clone()))
                 .with(rt::tools::sandbox::RenderTypst(client.clone()))
+                .with(rt::tools::sandbox::RenderVideo(client.clone()))
                 .with(rt::tools::sandbox::ReadSandboxOutput);
             // Web tools need egress by definition — every call would fail
             // without it, so absent beats always-failing (the rule in

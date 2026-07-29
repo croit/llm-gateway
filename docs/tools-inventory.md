@@ -113,6 +113,7 @@ Gated so the model is never offered a tool whose every call could only answer
 | `browse_page` | `[sandbox] enabled` **and** the runner reports egress | — | `browse_page` |
 | `render_typst` | `[sandbox] enabled` | — | `render_typst` |
 | `render_excalidraw` | `[sandbox] enabled` | — | `render_excalidraw` |
+| `render_video` | `[sandbox] enabled` | — | `render_video` |
 | `read_sandbox_output` | `[sandbox] enabled` | yes | `read_sandbox_output` |
 
 `export_document` is the one sandbox tool that rides the canvas `document`
