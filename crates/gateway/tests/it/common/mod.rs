@@ -131,6 +131,48 @@ pub async fn state_with_pool(upstream_url: &str, kind: PoolKind, model_name: &st
     state_from_registry(db_pool, registry)
 }
 
+/// Env var names the S3 test config points at for its credentials. Real
+/// deployments name their own; the values are irrelevant to a mock endpoint
+/// (it never verifies the signature) but must be non-empty or the config
+/// reports a missing credential.
+pub const TEST_S3_ACCESS_KEY_ENV: &str = "GATEWAY_TEST_S3_ACCESS_KEY";
+pub const TEST_S3_SECRET_KEY_ENV: &str = "GATEWAY_TEST_S3_SECRET_KEY";
+pub const TEST_S3_BUCKET: &str = "test-bucket";
+pub const TEST_S3_PREFIX: &str = "chat-attachments";
+
+/// Build a `RamaState` with `[chat.s3]` pointed at `endpoint` — a wiremock
+/// server standing in for the object store. Path-style addressing means the
+/// object lands at `GET /<bucket>/<key_prefix>/<turn_id>/<filename>`, which
+/// is what the attachment tests assert on.
+pub async fn state_with_s3(endpoint: &str) -> RamaState {
+    use gateway_core::server::config::S3Config;
+    // SAFETY: single-threaded test setup, before any concurrent env reads.
+    unsafe {
+        std::env::set_var(TEST_S3_ACCESS_KEY_ENV, "test-access-key");
+        std::env::set_var(TEST_S3_SECRET_KEY_ENV, "test-secret-key");
+    }
+    let db_pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+    let registry = upstreams::UpstreamRegistry::new(&HashMap::new()).unwrap();
+    let mut config = Config::default();
+    config.chat.s3 = Some(S3Config {
+        endpoint: endpoint.to_string(),
+        region: "us-east-1".into(),
+        bucket: TEST_S3_BUCKET.into(),
+        access_key_env: TEST_S3_ACCESS_KEY_ENV.into(),
+        secret_key_env: TEST_S3_SECRET_KEY_ENV.into(),
+        key_prefix: TEST_S3_PREFIX.into(),
+    });
+    let tools = Arc::new(ToolRegistry::new());
+    let rbac = Arc::new(Resolver::empty());
+    let app = AppState::new(config, db_pool.clone(), registry, tools, rbac);
+    let sessions = SessionStore::new(db_pool, TEST_SECRET);
+    RamaState::new(
+        app,
+        sessions,
+        gateway_core::server::usage::UsageHandle::disabled(),
+    )
+}
+
 /// Build a `RamaState` with a 2-replica chat pool (both replicas probe-seeded
 /// with the *same* id, to exercise `/v1/models` de-dup) plus a transcription
 /// pool whose model id comes purely from config (`models = [...]`, no probe) —
