@@ -21,6 +21,10 @@ tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 async-trait = { workspace = true }
 
+# O_NOFOLLOW: files produced inside a sandbox are read back through a host
+# bind mount, and the sandbox can plant symlinks there.
+libc = { workspace = true }
+
 # Spawning + driving `podman` subprocesses: `process` for the child,
 # `io-util` for piping the job JSON over its stdin/stdout, `time` for
 # the per-run wall-clock timeout.

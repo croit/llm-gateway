@@ -537,6 +537,7 @@ mod tests {
             pids_limit: 256,
             work_size: "512m".into(),
             tmp_size: "512m".into(),
+            work_root: None,
             max_output_bytes: 1_048_576,
             egress_network: if egress {
                 "egress".into()

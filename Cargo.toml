@@ -83,6 +83,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 qrcode = { version = "0.14", default-features = false }
 
 async-trait = "0.1"
+# Only for O_NOFOLLOW when reading files a sandbox produced (see sandbox-runner).
+libc = "0.2"
 
 # Scratch directories. `gateway-core` uses them for typst compile scratch dirs
 # (one per render) and the RAG index staging; the `gateway` integration suite

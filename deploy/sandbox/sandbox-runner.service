@@ -26,6 +26,10 @@
 Description=LLM Gateway code-execution sandbox runner (host service)
 Wants=network-online.target
 After=network-online.target
+# Host-backed scratch (set by `setup-sandbox.sh --work-image SIZE`): refuse to
+# start unless the scratch filesystem is mounted. An unmounted work root is a
+# plain directory on /, i.e. the size cap silently disappears.
+#RequiresMountsFor=/var/lib/sandbox-work
 
 [Service]
 # Host podman bridge gateway IP. 10.88.0.1 is the podman default; setup-sandbox.sh
@@ -47,10 +51,21 @@ Environment=RUST_LOG=info,sandbox_runner=info
 # while idle (tmpfs /work+/tmp), so budget
 # SANDBOX_MEMORY × (SANDBOX_MAX_CONCURRENT + SANDBOX_MAX_LEASES) against host RAM.
 #Environment=SANDBOX_MAX_LEASES=6
+# Host-backed scratch (set by `setup-sandbox.sh --work-image SIZE`): back each
+# sandbox's /work and /tmp with a bind mount from this directory instead of
+# gVisor-internal tmpfs, so the runner can read produced files straight off disk
+# instead of shipping them back through 64 KiB `podman exec` reads (~426 KiB/s
+# measured). Required for video-sized artifacts. Unset = tmpfs as before, and
+# then SANDBOX_WORK_SIZE / SANDBOX_TMP_SIZE are the caps.
+#Environment=SANDBOX_WORK_ROOT=/var/lib/sandbox-work
 # Egress (optional): uncomment / set by `setup-sandbox.sh --egress`.
 #Environment=SANDBOX_EGRESS_NETWORK=sandbox-egress
 #Environment=SANDBOX_EGRESS_PROXY=http://egress-proxy:3128
 ExecStart=/usr/local/bin/sandbox-runner
+# Leave no sandboxes behind on a stop: the runner reaps stale containers and
+# scratch directories at startup, but a service that is stopped and not started
+# again would otherwise keep both pinned indefinitely.
+ExecStopPost=/bin/sh -c 'podman ps -aq --filter label=app=llm-gateway-sandbox | xargs -r podman rm -f >/dev/null 2>&1 || true'
 # Deprioritise the runner for the host OOM-killer: a sandbox memory bomb (which
 # runs with --oom-score-adj=1000) gets reaped first, so the runner survives.
 OOMScoreAdjust=-800

@@ -6,8 +6,10 @@
 //! gVisor-isolated containers; the test-only `FakeBackend` lets the pool
 //! logic be unit-tested without a container runtime present.
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use shared::sandbox::{RunRequest, RunResponse};
@@ -77,6 +79,118 @@ pub trait ContainerBackend: Send + Sync + 'static {
 /// Drives `podman` to run each job under the configured OCI runtime
 /// (`runsc` by default). Every container is locked down: read-only rootfs,
 /// all capabilities dropped, no-new-privileges, tmpfs `/work`, resource
+/// Monotonic part of a container name, so two containers created in the same
+/// nanosecond still differ.
+static CONTAINER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Name for a fresh sandbox container. The runner names containers itself
+/// (rather than using the id podman prints) because the host directories that
+/// back `/work` and `/tmp` have to be created — and passed as bind mounts —
+/// *before* `podman run` returns an id. Deriving the paths from the name keeps
+/// the mapping stateless: `destroy` and `read_spill` recompute it.
+fn new_container_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = CONTAINER_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("sbx-{}-{nanos:x}-{seq:x}", std::process::id())
+}
+
+/// Host directories backing one container's `/work` and `/tmp`.
+fn host_dirs(root: &Path, name: &str) -> (PathBuf, PathBuf) {
+    let base = root.join(name);
+    (base.join("work"), base.join("tmp"))
+}
+
+/// Create the per-container scratch directories. The shared root is kept
+/// `0700` so only the runner can walk it from the host; each container's own
+/// directories are `1777` to mirror the `mode=1777` the tmpfs mounts used, so
+/// whichever uid the image runs as can write there. The container reaches them
+/// through the bind mount, not by traversing the root, so the tight root
+/// permission costs nothing.
+fn prepare_host_dirs(root: &Path, work: &Path, tmp: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(root)?;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    for d in [work, tmp] {
+        std::fs::create_dir_all(d)?;
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o1777))?;
+    }
+    Ok(())
+}
+
+/// Read a file the sandbox produced, out of a host bind mount.
+///
+/// Everything in `dir` was written by untrusted code, so this is deliberately
+/// narrow:
+///
+/// * `name` must be a single path component — no separators, no `..`. The
+///   agent writes its spill file and artifacts flat, so nothing legitimate
+///   needs a subdirectory, and forbidding them removes the whole class of
+///   attacks where an intermediate directory is a symlink (`O_NOFOLLOW` only
+///   protects the final component).
+/// * the open uses `O_NOFOLLOW`, so a symlink planted under a plausible name
+///   (`out.mp4` → `/etc/shadow`) fails instead of being read.
+/// * the opened descriptor must be a regular file — checked via the handle,
+///   not the path, so there is no time-of-check/time-of-use window.
+pub fn read_sandbox_file(dir: &Path, name: &str) -> Result<Vec<u8>, BackendError> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if name.is_empty() || Path::new(name).components().count() != 1 || name.contains('/') {
+        return Err(BackendError::Protocol(format!(
+            "refusing to read {name:?} from a sandbox scratch dir: not a plain file name"
+        )));
+    }
+    let path = dir.join(name);
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|e| {
+            BackendError::Protocol(format!(
+                "opening {} from sandbox scratch: {e}",
+                path.display()
+            ))
+        })?;
+    let md = f.metadata().map_err(|e| {
+        BackendError::Protocol(format!("stat {} from sandbox scratch: {e}", path.display()))
+    })?;
+    if !md.is_file() {
+        return Err(BackendError::Protocol(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    let mut buf = Vec::with_capacity(md.len() as usize);
+    f.read_to_end(&mut buf).map_err(|e| {
+        BackendError::Protocol(format!(
+            "reading {} from sandbox scratch: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(buf)
+}
+
+/// Split a container-side absolute path into (which mount, file name), for
+/// translating an agent-reported path to its host location. Returns `None` for
+/// anything that isn't directly inside `/work` or `/tmp`.
+fn split_mount_path(path: &str) -> Option<(Mount, &str)> {
+    for (prefix, mount) in [("/work/", Mount::Work), ("/tmp/", Mount::Tmp)] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            return Some((mount, rest));
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mount {
+    Work,
+    Tmp,
+}
+
 /// caps, and no network unless [`Network::Egress`] is requested.
 pub struct PodmanBackend {
     cfg: Arc<Config>,
@@ -87,22 +201,158 @@ impl PodmanBackend {
         Self { cfg }
     }
 
+    /// Best-effort removal of one container's scratch directories, keyed by
+    /// the container name `create` handed out. A crafted name must not be able
+    /// to walk out of the root, hence the single-component check.
+    fn remove_host_dirs(&self, name: &str) {
+        let Some(root) = &self.cfg.work_root else {
+            return;
+        };
+        if name.is_empty() || Path::new(name).components().count() != 1 {
+            tracing::warn!(
+                container = name,
+                "refusing to remove sandbox scratch for a suspicious container name"
+            );
+            return;
+        }
+        let dir = root.join(name);
+        match std::fs::remove_dir_all(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => tracing::warn!(
+                dir = %dir.display(), error = %e,
+                "removing sandbox scratch failed; disk may leak"
+            ),
+            _ => {}
+        }
+    }
+
+    /// Remove sandbox containers left over from a previous runner process.
+    ///
+    /// A restart empties the pool, so every container carrying our label is
+    /// unusable afterwards: the new process tracks none of them, and a gateway
+    /// still holding a lease id just falls back to a fresh single-use sandbox.
+    /// Without this they linger until someone notices (and, with host-backed
+    /// scratch, keep their directories pinned too). Assumes one runner per
+    /// host, which the fixed bind address already implies.
+    pub async fn reap_stale_containers(&self) {
+        let out = tokio::process::Command::new(&self.cfg.podman)
+            .args(["ps", "-aq", "--filter", "label=app=llm-gateway-sandbox"])
+            .stdin(Stdio::null())
+            .output()
+            .await;
+        let Ok(out) = out else {
+            tracing::warn!("listing stale sandbox containers failed; skipping reap");
+            return;
+        };
+        if !out.status.success() {
+            tracing::warn!("listing stale sandbox containers failed; skipping reap");
+            return;
+        }
+        let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        tracing::info!(
+            count = ids.len(),
+            "reaping sandbox containers from a previous run"
+        );
+        for id in ids {
+            self.destroy(&id).await;
+        }
+    }
+
+    /// Drop scratch directories whose container is gone — the runner crashing
+    /// mid-job would otherwise leave the files (and their disk) behind forever.
+    /// Called at startup after [`Self::reap_stale_containers`], so in practice
+    /// nothing is live and everything stale goes; normal teardown goes through
+    /// [`Self::remove_host_dirs`].
+    pub async fn prune_orphan_scratch(&self) {
+        let Some(root) = &self.cfg.work_root else {
+            return;
+        };
+        let out = tokio::process::Command::new(&self.cfg.podman)
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                "label=app=llm-gateway-sandbox",
+                "--format",
+                "{{.Names}}",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .await;
+        // Without a reliable list of live containers, removing nothing is the
+        // safe error: a stale directory wastes disk, a wrongly removed one
+        // breaks a running job.
+        let Ok(out) = out else {
+            tracing::warn!("listing sandbox containers failed; skipping scratch prune");
+            return;
+        };
+        if !out.status.success() {
+            tracing::warn!("listing sandbox containers failed; skipping scratch prune");
+            return;
+        }
+        let live: std::collections::HashSet<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        let mut pruned = 0usize;
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("sbx-") && !live.contains(&name) {
+                self.remove_host_dirs(&name);
+                pruned += 1;
+            }
+        }
+        if pruned > 0 {
+            tracing::info!(pruned, "pruned orphaned sandbox scratch directories");
+        }
+    }
+
     /// Hardening + lifecycle flags shared by every `podman run`.
-    fn run_args(&self, network: Network) -> Vec<String> {
+    ///
+    /// `name` is ours (see [`new_container_name`]) so the scratch bind mounts
+    /// can be derived from it later without extra bookkeeping.
+    fn run_args(&self, network: Network, name: &str) -> Vec<String> {
         let c = &self.cfg;
         let mut a: Vec<String> = vec![
             "run".into(),
             "-d".into(),
+            "--name".into(),
+            name.to_string(),
             "--runtime".into(),
             c.runtime.clone(),
             "--read-only".into(),
-            // Writable scratch for the job; rootfs stays read-only. `/work`
-            // is the job's CWD; `/tmp` is exec-mounted because chromium and
-            // LibreOffice drop helper binaries there.
-            "--tmpfs".into(),
-            format!("/work:rw,size={},mode=1777", c.work_size),
-            "--tmpfs".into(),
-            format!("/tmp:rw,exec,size={},mode=1777", c.tmp_size),
+        ];
+        // Writable scratch for the job; rootfs stays read-only. `/work` is the
+        // job's CWD; `/tmp` is exec-mounted because chromium and LibreOffice
+        // drop helper binaries there.
+        //
+        // With `work_root` set these are host bind mounts, so produced files
+        // are readable straight from the host instead of having to be shipped
+        // back through 64 KiB `podman exec` reads (see `Config::work_root`).
+        // Bind mounts carry no `size=`, so the backing filesystem is the quota.
+        if let Some(root) = &c.work_root {
+            let (work, tmp) = host_dirs(root, name);
+            a.push("-v".into());
+            a.push(format!("{}:/work:rw", work.display()));
+            a.push("-v".into());
+            a.push(format!("{}:/tmp:rw,exec", tmp.display()));
+        } else {
+            a.push("--tmpfs".into());
+            a.push(format!("/work:rw,size={},mode=1777", c.work_size));
+            a.push("--tmpfs".into());
+            a.push(format!("/tmp:rw,exec,size={},mode=1777", c.tmp_size));
+        }
+        a.extend::<Vec<String>>(vec![
             "--cap-drop=ALL".into(),
             "--security-opt".into(),
             "no-new-privileges".into(),
@@ -126,7 +376,7 @@ impl PodmanBackend {
             "1000".into(),
             "--label".into(),
             "app=llm-gateway-sandbox".into(),
-        ];
+        ]);
         match network {
             Network::None => {
                 a.push("--network".into());
@@ -154,24 +404,39 @@ impl PodmanBackend {
 #[async_trait::async_trait]
 impl ContainerBackend for PodmanBackend {
     async fn create(&self, network: Network) -> Result<String, BackendError> {
-        let args = self.run_args(network);
+        let name = new_container_name();
+        if let Some(root) = &self.cfg.work_root {
+            let (work, tmp) = host_dirs(root, &name);
+            prepare_host_dirs(root, &work, &tmp).map_err(|e| {
+                BackendError::Protocol(format!(
+                    "preparing sandbox scratch under {}: {e}",
+                    root.display()
+                ))
+            })?;
+        }
+        let args = self.run_args(network, &name);
         let out = tokio::process::Command::new(&self.cfg.podman)
             .args(&args)
             .stdin(Stdio::null())
             .output()
             .await?;
         if !out.status.success() {
+            // No container to clean up, but the scratch directories exist.
+            self.remove_host_dirs(&name);
             return Err(BackendError::Command {
                 op: "run",
                 code: out.status.code().map(|c| c.to_string()).unwrap_or_default(),
                 stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
             });
         }
-        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if id.is_empty() {
+        if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+            self.remove_host_dirs(&name);
             return Err(BackendError::Protocol("podman run printed no id".into()));
         }
-        Ok(id)
+        // Hand back the name, not the id podman printed: podman accepts either
+        // wherever a container is named, and the name is what the scratch
+        // directories are derived from.
+        Ok(name)
     }
 
     async fn exec(
@@ -231,6 +496,7 @@ impl ContainerBackend for PodmanBackend {
             Err(e) => tracing::warn!(container = id, error = %e, "podman rm could not run"),
             _ => {}
         }
+        self.remove_host_dirs(id);
     }
 }
 
@@ -247,6 +513,30 @@ impl SpillReader for PodmanBackend {
         path: &str,
         len: u64,
     ) -> Result<Vec<u8>, BackendError> {
+        // Fast path: with a host-backed scratch mount the spill file is an
+        // ordinary file on this host, so one `read` replaces the thousands of
+        // 60 KiB execs below (426 KiB/s measured). See `Config::work_root`.
+        if let Some(root) = &self.cfg.work_root {
+            if let Some((mount, name)) = split_mount_path(path) {
+                let (work, tmp) = host_dirs(root, container);
+                let dir = match mount {
+                    Mount::Work => work,
+                    Mount::Tmp => tmp,
+                };
+                let buf = read_sandbox_file(&dir, name)?;
+                if buf.len() as u64 != len {
+                    return Err(BackendError::Protocol(format!(
+                        "spilled response size mismatch: {} bytes on disk, agent announced {len}",
+                        buf.len()
+                    )));
+                }
+                return Ok(buf);
+            }
+            tracing::debug!(
+                path,
+                "spill path is not inside a scratch mount; falling back to chunked exec reads"
+            );
+        }
         const CHUNK: u64 = 60 * 1024;
         let len = len as usize;
         let mut buf: Vec<u8> = Vec::with_capacity(len);
@@ -412,6 +702,7 @@ mod podman_args_tests {
             pids_limit: 256,
             work_size: "512m".into(),
             tmp_size: "512m".into(),
+            work_root: None,
             max_output_bytes: 131_072,
             egress_network: String::new(),
             egress_proxy: String::new(),
@@ -429,7 +720,7 @@ mod podman_args_tests {
     /// the runner before these were enforced).
     #[test]
     fn run_args_enforce_resource_caps() {
-        let a = PodmanBackend::new(cfg()).run_args(Network::None);
+        let a = PodmanBackend::new(cfg()).run_args(Network::None, "sbx-test");
         assert!(has_pair(&a, "--memory", "1024m"));
         // swap pinned to memory → guest can't escape the cap via swap
         assert!(has_pair(&a, "--memory-swap", "1024m"));
@@ -805,5 +1096,173 @@ mod local_tests {
         // Standard base64 of 500_000 bytes is ceil(500000/3)*4 chars; an exact
         // match proves the payload survived the spill+reassembly uncorrupted.
         assert_eq!(art.content_b64.len(), 500_000usize.div_ceil(3) * 4);
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    //! Host-backed scratch (`Config::work_root`): path handling and the
+    //! symlink defence. Everything in a scratch directory was written by
+    //! untrusted code, so these are the tests that matter most in this file.
+
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "sbx-scratch-test-{}-{tag}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn reads_a_regular_file() {
+        let d = tmpdir("plain");
+        std::fs::write(d.join("out.mp4"), b"video-bytes").unwrap();
+        assert_eq!(read_sandbox_file(&d, "out.mp4").unwrap(), b"video-bytes");
+    }
+
+    #[test]
+    fn refuses_a_symlink_planted_by_the_sandbox() {
+        // The attack this design has to survive: untrusted code puts a symlink
+        // where the runner expects its artifact, aiming to have a host file
+        // read out and handed to the model.
+        let d = tmpdir("symlink");
+        let secret = d.join("secret.txt");
+        std::fs::write(&secret, b"host-only").unwrap();
+        std::os::unix::fs::symlink(&secret, d.join("out.mp4")).unwrap();
+
+        let err = read_sandbox_file(&d, "out.mp4").expect_err("symlink must be refused");
+        assert!(
+            !format!("{err}").contains("host-only"),
+            "error must not leak content"
+        );
+        // And nothing was read: the file behind the link stays untouched.
+        assert_eq!(std::fs::read(&secret).unwrap(), b"host-only");
+    }
+
+    #[test]
+    fn refuses_path_traversal_and_separators() {
+        let d = tmpdir("traversal");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub").join("f"), b"x").unwrap();
+        for name in ["../etc/passwd", "sub/f", "/etc/passwd", "", "."] {
+            assert!(
+                read_sandbox_file(&d, name).is_err(),
+                "{name:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_directory() {
+        let d = tmpdir("dir");
+        std::fs::create_dir_all(d.join("adir")).unwrap();
+        assert!(read_sandbox_file(&d, "adir").is_err());
+    }
+
+    #[test]
+    fn maps_container_paths_to_their_mount() {
+        assert_eq!(
+            split_mount_path("/work/out.mp4"),
+            Some((Mount::Work, "out.mp4"))
+        );
+        assert_eq!(
+            split_mount_path("/tmp/tmpab12"),
+            Some((Mount::Tmp, "tmpab12"))
+        );
+        // Not in a scratch mount → caller must fall back to exec reads.
+        assert_eq!(split_mount_path("/etc/passwd"), None);
+        assert_eq!(split_mount_path("/workspace/x"), None);
+    }
+
+    #[test]
+    fn host_dirs_are_per_container() {
+        let (w1, t1) = host_dirs(Path::new("/srv/scratch"), "sbx-a");
+        let (w2, _) = host_dirs(Path::new("/srv/scratch"), "sbx-b");
+        assert_eq!(w1, PathBuf::from("/srv/scratch/sbx-a/work"));
+        assert_eq!(t1, PathBuf::from("/srv/scratch/sbx-a/tmp"));
+        assert_ne!(w1, w2, "two containers must not share scratch");
+    }
+
+    #[test]
+    fn container_names_are_unique() {
+        let a = new_container_name();
+        let b = new_container_name();
+        assert_ne!(a, b);
+        assert!(a.starts_with("sbx-"));
+        // Single path component, so it can never widen the scratch root.
+        assert_eq!(Path::new(&a).components().count(), 1);
+    }
+
+    #[test]
+    fn prepare_host_dirs_locks_down_the_root_and_opens_the_leaves() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmpdir("modes");
+        let (work, tmp) = host_dirs(&root, "sbx-x");
+        prepare_host_dirs(&root, &work, &tmp).unwrap();
+        // Root walkable by the runner only …
+        let rmode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(rmode, 0o700, "scratch root must not be world-traversable");
+        // … while the container's own dirs stay writable for whatever uid the
+        // image runs as (mirrors the tmpfs `mode=1777` this replaces).
+        for d in [&work, &tmp] {
+            let m = std::fs::metadata(d).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(m, 0o1777, "{} should be sticky+world-writable", d.display());
+        }
+    }
+}
+
+#[cfg(test)]
+mod scratch_mount_tests {
+    //! `run_args` has to switch between the two scratch strategies: internal
+    //! tmpfs (default) and host bind mounts (`work_root` set).
+
+    use super::*;
+
+    fn cfg_with_root(root: Option<&str>) -> Arc<Config> {
+        let mut c = crate::config::Config::for_test();
+        c.work_root = root.map(PathBuf::from);
+        Arc::new(c)
+    }
+
+    #[test]
+    fn defaults_to_internal_tmpfs() {
+        let a = PodmanBackend::new(cfg_with_root(None)).run_args(Network::None, "sbx-1");
+        let joined = a.join(" ");
+        assert!(
+            joined.contains("--tmpfs /work:rw,size=512m,mode=1777"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("-v "),
+            "no bind mounts without work_root: {joined}"
+        );
+        assert!(joined.contains("--name sbx-1"));
+    }
+
+    #[test]
+    fn bind_mounts_scratch_when_work_root_is_set() {
+        let a = PodmanBackend::new(cfg_with_root(Some("/srv/scratch")))
+            .run_args(Network::None, "sbx-2");
+        let joined = a.join(" ");
+        // Per-container paths, derived from the name, so two sandboxes can
+        // never see each other's files.
+        assert!(
+            joined.contains("/srv/scratch/sbx-2/work:/work:rw"),
+            "{joined}"
+        );
+        // `/tmp` keeps exec: chromium and LibreOffice drop helper binaries there.
+        assert!(
+            joined.contains("/srv/scratch/sbx-2/tmp:/tmp:rw,exec"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("--tmpfs"),
+            "tmpfs must be replaced: {joined}"
+        );
     }
 }

@@ -98,6 +98,32 @@ pub struct Config {
     #[arg(long, env = "SANDBOX_TMP_SIZE", default_value = "512m")]
     pub tmp_size: String,
 
+    /// Host directory backing each sandbox's `/work` and `/tmp` with bind
+    /// mounts instead of runtime-internal tmpfs. Unset keeps the tmpfs
+    /// behaviour (and its `size=` caps).
+    ///
+    /// Why it exists: gVisor implements a `--tmpfs` mount inside its own
+    /// Sentry, so the host cannot see the files a job produced — not even via
+    /// `podman cp`. Everything therefore had to come back through
+    /// `podman exec` stdout, which gVisor caps at 64 KiB per call. Measured on
+    /// llm01: 141 ms per exec, i.e. **426 KiB/s**, so a 100 MiB artifact cost
+    /// 244 s of pure transport. With a bind mount the runner opens the file
+    /// directly and that cost disappears (measured 4.6 GiB/s).
+    ///
+    /// SECURITY: a bind mount is a writable host path the sandbox controls, so
+    /// it can plant symlinks (`out.mp4` → `/etc/shadow`) hoping the runner
+    /// reads them back. Reads therefore go through
+    /// [`crate::backend::read_sandbox_file`], which opens with `O_NOFOLLOW`,
+    /// insists on a regular file, and rejects anything outside the
+    /// container's own subdirectory.
+    ///
+    /// QUOTA: unlike `--tmpfs size=`, a bind mount has no size cap of its
+    /// own. Point this at a filesystem whose *size is* the cap — a dedicated
+    /// volume or a loopback image — never at the root filesystem, or a
+    /// runaway job fills `/`.
+    #[arg(long, env = "SANDBOX_WORK_ROOT")]
+    pub work_root: Option<std::path::PathBuf>,
+
     /// Truncate combined stdout/stderr to this many bytes in the response.
     /// Kept context-safe by default (128 KiB ≈ 30–40k tokens): stdout is fed
     /// straight back to the model, and ~1 MiB of text alone can overflow a
@@ -155,6 +181,36 @@ impl Config {
     }
 }
 
+impl Config {
+    /// Fully-populated config for tests, so a new field doesn't have to be
+    /// added to every fixture in the crate.
+    #[cfg(test)]
+    pub fn for_test() -> Config {
+        Config {
+            bind: "127.0.0.1:9000".into(),
+            image: "img".into(),
+            runtime: "runsc".into(),
+            podman: "podman".into(),
+            pool_size: 3,
+            max_concurrent: 6,
+            image_check_secs: 60,
+            default_timeout_secs: 60,
+            max_timeout_secs: 300,
+            memory: "1024m".into(),
+            cpus: "2".into(),
+            pids_limit: 256,
+            work_size: "512m".into(),
+            tmp_size: "512m".into(),
+            work_root: None,
+            max_output_bytes: 131_072,
+            egress_network: String::new(),
+            egress_proxy: String::new(),
+            lease_ttl_secs: 600,
+            max_leases: 6,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +231,7 @@ mod tests {
             pids_limit: 256,
             work_size: "512m".into(),
             tmp_size: "512m".into(),
+            work_root: None,
             max_output_bytes: 1_048_576,
             egress_network: String::new(),
             egress_proxy: String::new(),
