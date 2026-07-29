@@ -1110,6 +1110,7 @@ mod generate_export;
 mod read;
 mod render;
 mod run;
+mod video;
 
 pub use browse::*;
 pub use capture::*;
@@ -1118,6 +1119,7 @@ pub use generate_export::*;
 pub use read::*;
 pub use render::*;
 pub use run::*;
+pub use video::*;
 
 #[cfg(test)]
 mod tests {

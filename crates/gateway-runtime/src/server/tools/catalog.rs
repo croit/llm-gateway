@@ -313,7 +313,8 @@ pub fn category_for(tool_id: &str) -> Category {
         | "browse_page"
         | "read_sandbox_output"
         | "render_excalidraw"
-        | "render_typst" => Category::Code,
+        | "render_typst"
+        | "render_video" => Category::Code,
         _ if tool_id.starts_with(TYPST_PREFIX) => Category::Templates,
         _ if tool_id.starts_with(COMFYUI_PREFIX) => Category::ComfyMedia,
         _ if DOCUMENT_IDS.contains(&tool_id) => Category::Documents,
@@ -544,6 +545,13 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Lets the assistant write a Typst document — ggplot-style charts, diagrams, or \
              slide decks, and embed images it made earlier — and hand you the finished \
              PDF, PNG, or SVG.",
+        ),
+        "render_video" => (
+            "Video editing",
+            "Lets the assistant cut clips together with transitions, add animated text and \
+             a logo, and lay music underneath — for promo and ad videos. The timeline is a \
+             JSON document you can edit by hand and re-render, so a revision keeps the same \
+             look.",
         ),
         _ => return None,
     };

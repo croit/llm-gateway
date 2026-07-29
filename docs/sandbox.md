@@ -167,6 +167,47 @@ hosts and scale independently (each runner uses its own host's local podman) —
 but then the channel MUST be mTLS-protected and the runner MUST NOT be publicly
 reachable (it's arbitrary-code-execution as a service).
 
+### Video assembly (`render_video`)
+
+`render_video` builds a video from a **declarative JSON timeline** — clips with
+transitions, animated text, image overlays, a music bed — rather than from
+ffmpeg the model wrote. Two reasons it works that way:
+
+*Reproducibility.* Ad and promo work means rendering the same look again with
+different words in it. A spec renders the same video every time; a freshly
+generated filtergraph does not.
+
+*Escaping.* `drawtext` needs commas, colons and quotes escaped inside a
+`-filter_complex` that sits inside a shell command, and each generation is a
+fresh chance to get it wrong — at minutes per attempt. The tool does not solve
+that problem, it removes it:
+
+- overlay strings are written to files and referenced with `textfile=`, so text
+  never enters the filtergraph;
+- the filtergraph is written to a file and passed with
+  `-filter_complex_script`, so it never enters the shell;
+- staged inputs are renamed to generated names (`in0.mp4`), so an attachment
+  filename cannot reach a command line;
+- the only caller-supplied values that do reach the graph are numbers and
+  position expressions, and those pass a whitelist that rejects anything able
+  to close an option or open a new filter.
+
+It runs **two** sandbox calls in one leased container: `ffprobe` first (clip
+lengths, and `fc-match` for fonts), then the render. `xfade` needs to know when
+to start a crossfade, which means knowing how long the previous clip is —
+probing first keeps that arithmetic in Rust instead of assembling strings inside
+the sandbox. The media is uploaded once, in pass 1, and pass 2 finds it in
+`/work`.
+
+The timeline belongs in a `format: "json"` canvas document: the model drafts it,
+the user can edit it by hand, and a revision is an edit plus a re-render with the
+same `document_id` — the same iterate-in-canvas loop `render_typst` uses. See
+`docs/tools-inventory.md` for the toggle and the tool's own description for the
+spec.
+
+Anything the spec cannot express is still one `run_in_sandbox` call away — the
+gold image has ffmpeg and ~900 fonts.
+
 ### Files across runs: attachments ARE the persistent store
 
 Within a turn `/work` persists in the leased container (above); *across* turns
