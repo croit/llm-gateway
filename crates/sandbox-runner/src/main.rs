@@ -57,7 +57,13 @@ async fn main() -> anyhow::Result<()> {
         );
         Arc::new(LocalBackend::new().context("initialising local backend")?)
     } else {
-        Arc::new(PodmanBackend::new(cfg.clone()))
+        let podman = PodmanBackend::new(cfg.clone());
+        // A previous process's containers are unusable now (the pool is empty),
+        // and a crash mid-job leaves scratch directories behind. Clear both
+        // before serving; normal teardown removes them in `destroy`.
+        podman.reap_stale_containers().await;
+        podman.prune_orphan_scratch().await;
+        Arc::new(podman)
     };
     let pool = Pool::new(backend, cfg.clone());
 
