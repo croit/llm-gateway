@@ -33,7 +33,15 @@ DEFAULT_TIMEOUT = 60
 # Stdout/stderr are also clamped by the runner; this is a first-line guard
 # so a runaway job can't OOM the agent building a giant string.
 MAX_STREAM = 4 * 1024 * 1024
-MAX_ARTIFACT = 64 * 1024 * 1024
+# Artifacts normally travel back inside the RunResponse as base64, and that is
+# the only reason a cap exists here: the encoded string, the JSON wrapped around
+# it and the runner's copy are all RAM. With host-backed scratch
+# (SANDBOX_WORK_ROOT on the runner) the runner reads produced files off the bind
+# mount itself, so it sets SANDBOX_ARTIFACTS_INPLACE=1 and this agent reports
+# metadata only — no read, no base64, and no cap worth having, because the
+# gateway's own max_artifact_bytes is then the limit that decides.
+INPLACE_ARTIFACTS = os.environ.get("SANDBOX_ARTIFACTS_INPLACE") == "1"
+MAX_ARTIFACT = int(os.environ.get("SANDBOX_MAX_ARTIFACT_BYTES", 64 * 1024 * 1024))
 # `podman exec` stdout under gVisor (runsc) is hard-capped at 64 KiB — bytes
 # past that are silently dropped, which would truncate a RunResponse carrying a
 # sizeable artifact mid-JSON. So a response larger than this spills to a temp
@@ -263,16 +271,21 @@ def main():
         if baseline.get(entry) == (st.st_size, st.st_mtime_ns):
             continue  # pre-existing and untouched by this call — not its output
         size = st.st_size
-        if size == 0 or size > MAX_ARTIFACT:
+        # An empty file is never interesting; the size cap only applies when we
+        # are the ones carrying the bytes.
+        if size == 0 or (not INPLACE_ARTIFACTS and size > MAX_ARTIFACT):
             continue
-        with open(path, "rb") as fh:
-            data = fh.read()
+        if INPLACE_ARTIFACTS:
+            content = ""
+        else:
+            with open(path, "rb") as fh:
+                content = base64.b64encode(fh.read()).decode("ascii")
         artifacts.append(
             {
                 "name": entry,
                 "size": size,
                 "mime": mime_for(entry),
-                "content_b64": base64.b64encode(data).decode("ascii"),
+                "content_b64": content,
             }
         )
 

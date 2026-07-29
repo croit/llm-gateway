@@ -8,6 +8,7 @@
 //! place.
 
 pub mod api;
+pub mod b64;
 pub mod sandbox;
 
 /// Healthcheck response body shape. Tiny, but having it here keeps the
