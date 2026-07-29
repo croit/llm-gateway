@@ -1,0 +1,284 @@
+{
+  "_comment": "Replace the person in a video with the person from a reference photo, using Wan 2.2 Animate. Node 3 is ComfyUI-WanVideoWrapper's UniAnimate DWPose detector, used purely as an IMAGE->IMAGE preprocessor so the rest of the graph can stay on native nodes: it renders a pose skeleton per frame that drives the body motion. It downloads its DWPose torchscript weights from Hugging Face on first use (hr16/yolox-onnx + hr16/DWPose-TorchScript-BatchSize5), so the ComfyUI container needs egress once. WanAnimateToVideo's face_video input is deliberately left unconnected: per-frame face crops need comfyui_controlnet_aux, which isn't installed, so body motion transfers but facial expression does not. Node 20 feeds the same frame count to the video loader and to WanAnimateToVideo so pose length and latent length cannot drift apart.",
+  "1": {
+    "class_type": "VHS_LoadVideo",
+    "inputs": {
+      "video": "{{video}}",
+      "force_rate": 0,
+      "custom_width": 0,
+      "custom_height": 0,
+      "frame_load_cap": [
+        "20",
+        0
+      ],
+      "skip_first_frames": 0,
+      "select_every_nth": 1
+    },
+    "_meta": {
+      "title": "Load Video (motion source)"
+    }
+  },
+  "2": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "{{face_image}}"
+    },
+    "_meta": {
+      "title": "Load Image (person to insert)"
+    }
+  },
+  "3": {
+    "class_type": "WanVideoUniAnimateDWPoseDetector",
+    "inputs": {
+      "pose_images": [
+        "1",
+        0
+      ],
+      "score_threshold": 0.3,
+      "stick_width": 4,
+      "draw_body": true,
+      "body_keypoint_size": 4,
+      "draw_feet": true,
+      "draw_hands": true,
+      "hand_keypoint_size": 4,
+      "colorspace": "RGB",
+      "handle_not_detected": "repeat",
+      "draw_head": true
+    },
+    "_meta": {
+      "title": "DWPose (body motion)"
+    }
+  },
+  "4": {
+    "class_type": "CLIPVisionLoader",
+    "inputs": {
+      "clip_name": "clip_vision_h.safetensors"
+    },
+    "_meta": {
+      "title": "Load CLIP Vision"
+    }
+  },
+  "5": {
+    "class_type": "CLIPVisionEncode",
+    "inputs": {
+      "clip_vision": [
+        "4",
+        0
+      ],
+      "image": [
+        "2",
+        0
+      ],
+      "crop": "center"
+    },
+    "_meta": {
+      "title": "Encode reference identity"
+    }
+  },
+  "6": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "wan2.2_animate_14B_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "_meta": {
+      "title": "Load Wan 2.2 Animate"
+    }
+  },
+  "7": {
+    "class_type": "ModelSamplingSD3",
+    "inputs": {
+      "shift": [
+        "21",
+        0
+      ],
+      "model": [
+        "6",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "ModelSamplingSD3"
+    }
+  },
+  "8": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    },
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "9": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "{{prompt}}",
+      "clip": [
+        "8",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Positive"
+    }
+  },
+  "10": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "{{negative_prompt}}",
+      "clip": [
+        "8",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Negative"
+    }
+  },
+  "11": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "wan_2.1_vae.safetensors"
+    },
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "12": {
+    "class_type": "WanAnimateToVideo",
+    "inputs": {
+      "positive": [
+        "9",
+        0
+      ],
+      "negative": [
+        "10",
+        0
+      ],
+      "vae": [
+        "11",
+        0
+      ],
+      "width": "{{width}}",
+      "height": "{{height}}",
+      "length": [
+        "20",
+        0
+      ],
+      "batch_size": 1,
+      "continue_motion_max_frames": 5,
+      "video_frame_offset": 0,
+      "clip_vision_output": [
+        "5",
+        0
+      ],
+      "reference_image": [
+        "2",
+        0
+      ],
+      "pose_video": [
+        "3",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Wan Animate"
+    }
+  },
+  "13": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "7",
+        0
+      ],
+      "seed": "{{seed}}",
+      "steps": "{{steps}}",
+      "cfg": "{{cfg}}",
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "positive": [
+        "12",
+        0
+      ],
+      "negative": [
+        "12",
+        1
+      ],
+      "latent_image": [
+        "12",
+        2
+      ]
+    },
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "14": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "13",
+        0
+      ],
+      "vae": [
+        "11",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "15": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "fps": "{{fps}}",
+      "bit_depth": 8,
+      "images": [
+        "14",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Create Video"
+    }
+  },
+  "16": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "filename_prefix": "llmgw-swap-face-video",
+      "format": "mp4",
+      "codec": "h264",
+      "video": [
+        "15",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Save Video"
+    }
+  },
+  "20": {
+    "class_type": "PrimitiveInt",
+    "inputs": {
+      "value": "{{frames}}"
+    },
+    "_meta": {
+      "title": "Frames (drives both video load and latent length)"
+    }
+  },
+  "21": {
+    "class_type": "PrimitiveFloat",
+    "inputs": {
+      "value": "{{shift}}"
+    },
+    "_meta": {
+      "title": "Shift"
+    }
+  }
+}

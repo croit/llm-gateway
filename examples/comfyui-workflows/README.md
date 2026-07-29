@@ -28,9 +28,11 @@ The manifest's `id` becomes the tool name `comfyui_<id>`. Anything not declared 
 | [`llmgw-text2image`](llmgw-text2image/) | `comfyui_text_to_image` | image | Text → image (FLUX.2 Klein fp8) |
 | [`llmgw-edit-image`](llmgw-edit-image/) | `comfyui_edit_image` | image | Image + prompt → edited image (Flux.2 Dev fp8 img2img) |
 | [`llmgw-merge-images`](llmgw-merge-images/) | `comfyui_merge_images` | image | Two images + prompt → blended image (Qwen Image Edit 2511 multi-reference) |
+| [`llmgw-swap-face`](llmgw-swap-face/) | `comfyui_swap_face` | image | Photo + face reference + prompt → face replaced or retouched (Qwen Image Edit 2511) |
 | [`llmgw-image2video`](llmgw-image2video/) | `comfyui_image_to_video` | video | Image + motion prompt → short clip (Wan 2.2 14B fp8) |
 | [`llmgw-merge-video-audio`](llmgw-merge-video-audio/) | `comfyui_merge_video_audio` | video | Existing video + audio → MP4 with sound (VideoHelperSuite) |
 | [`llmgw-talking-video`](llmgw-talking-video/) | `comfyui_talking_video` | video | Portrait + audio → talking-head clip with lip sync (LTX-2.3) |
+| [`llmgw-swap-face-video`](llmgw-swap-face-video/) | `comfyui_swap_face_video` | video | Video + person photo → clip re-rendered with that person, body motion copied (Wan 2.2 Animate) |
 | [`llmgw-text2music`](llmgw-text2music/) | `comfyui_text_to_music` | audio | Text → music clip (ACE-Step 1.5XL Turbo) |
 | [`llmgw-upscale-image`](llmgw-upscale-image/) | `comfyui_upscale_image` | image | Image → upscaled image with restored detail (SeedVR2 7B Int8) |
 

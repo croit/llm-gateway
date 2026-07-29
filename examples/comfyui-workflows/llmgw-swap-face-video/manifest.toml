@@ -1,0 +1,144 @@
+id = "swap_face_video"
+title = "Put a Person from a Photo into a Video"
+description = "Take a video of a moving person and a photo of a different person, and re-render the video with the person from the photo performing the same body motion (Wan 2.2 Animate). Pass `video` (the motion source) and `face_image` (the person to insert), plus a prompt describing the resulting scene. Body pose, gesture and timing are copied from the video; the identity, face, clothing and build come from the photo. Facial expression is NOT transferred — the driving video's body motion is, so this suits full-body or half-body clips of one clearly visible person, not close-up talking heads. For lip-synced talking heads use `comfyui_talking_video` instead; for a still photo use `comfyui_swap_face`."
+output_kind = "video"
+output_node_id = "16"
+output_filename_prefix = "llmgw-swap-face-video"
+
+[[params]]
+key = "video"
+node_id = "1"
+input_key = "video"
+required = true
+description = "Video attachment supplying the motion. Pass the attachment id EXACTLY as it appears in the conversation — the long `<turn_id>/<filename>` string from the attachment marker. One clearly visible person, full or half body, works far better than a crowd or a close-up: the body pose is detected per frame and drives the result."
+
+  [params.schema]
+  type = "video_attachment"
+
+[[params]]
+key = "face_image"
+node_id = "2"
+input_key = "image"
+required = true
+description = "Photo of the person to put into the video. A sharp, well-lit, front-facing shot showing head and torso gives the best identity transfer. Pass the attachment id EXACTLY as it appears in the conversation."
+
+  [params.schema]
+  type = "image_attachment"
+
+[[params]]
+key = "prompt"
+node_id = "9"
+input_key = "text"
+required = true
+description = "Describe the resulting scene — who is doing what, where, in what style. E.g. 'a man in a grey suit walking through a modern office, natural daylight, cinematic'. Describe the person from the photo and the action from the video; do not write instructions like 'swap the face', the model is not taking orders here, it is being told what the output should look like."
+
+  [params.schema]
+  type = "string"
+  max_length = 1500
+
+[[params]]
+key = "negative_prompt"
+node_id = "10"
+input_key = "text"
+description = "What to avoid. The default is the standard Wan negative prompt and is usually right; extend it when a specific artefact keeps showing up."
+default = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得很差的手部，画得很差的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+
+  [params.schema]
+  type = "string"
+  max_length = 1500
+
+[[params]]
+key = "frames"
+node_id = "20"
+input_key = "value"
+description = "How many frames of the source video to use — this is both the number of frames read and the length generated, so pose and output can't drift apart. Wan wants 4n+1 (33, 49, 61, 77, 93). At 16 fps, 77 frames ≈ 4.8 seconds. Longer costs proportionally more GPU time; start at 33 for a test run. The produced clip runs a handful of frames longer than requested (33 in → 37 out) because the model emits a motion-continuation tail; treat this as approximate length, not exact."
+default = 77
+
+  [params.schema]
+  type = "integer"
+  min = 17
+  max = 161
+
+[[params]]
+key = "width"
+node_id = "12"
+input_key = "width"
+description = "Output width. 832×480 is Wan's native landscape resolution; use 480×832 for portrait/phone footage. Match the source video's aspect ratio or the person gets stretched."
+default = 832
+
+  [params.schema]
+  type = "integer"
+  min = 256
+  max = 1280
+
+[[params]]
+key = "height"
+node_id = "12"
+input_key = "height"
+description = "Output height. 480 pairs with width 832 for landscape; use 832 with width 480 for portrait."
+default = 480
+
+  [params.schema]
+  type = "integer"
+  min = 256
+  max = 1280
+
+[[params]]
+key = "fps"
+node_id = "15"
+input_key = "fps"
+description = "Frame rate of the produced MP4. 16 fps is Wan's native rate and matches the gateway's other video tools. Raising it does not add motion — it just plays the same frames faster."
+default = 16.0
+
+  [params.schema]
+  type = "number"
+  min = 1.0
+  max = 60.0
+
+[[params]]
+key = "steps"
+node_id = "13"
+input_key = "steps"
+description = "Diffusion steps. 20 is a good balance for Wan Animate; below ~12 the identity smears, above ~30 costs time for little gain."
+default = 20
+
+  [params.schema]
+  type = "integer"
+  min = 4
+  max = 50
+
+[[params]]
+key = "cfg"
+node_id = "13"
+input_key = "cfg"
+description = "Classifier-free guidance. 5 follows the prompt closely; drop towards 3 if motion looks stiff or the image is over-contrasted."
+default = 5.0
+
+  [params.schema]
+  type = "number"
+  min = 1.0
+  max = 15.0
+
+[[params]]
+key = "shift"
+node_id = "21"
+input_key = "value"
+description = "Flow-matching timestep shift. 8 is the Wan 2.2 Animate default; lower values (4–5) give softer motion, higher values sharpen detail but can flicker."
+default = 8.0
+
+  [params.schema]
+  type = "number"
+  min = 1.0
+  max = 12.0
+
+[[params]]
+key = "seed"
+node_id = "13"
+input_key = "seed"
+description = "Random seed. Same inputs + seed = same clip, so hold the seed while tuning the prompt and vary it when the likeness or motion just didn't land. -1 = fresh random."
+default = -1
+
+  [params.schema]
+  type = "integer"
+  min = -1
+  randomize_on_sentinel = true

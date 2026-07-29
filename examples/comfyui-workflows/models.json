@@ -83,6 +83,12 @@
     "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
     "path": "split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
   },
+  "wan2.2_animate_14B_int8_convrot.safetensors": {
+    "dir": "diffusion_models",
+    "repo": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+    "path": "split_files/diffusion_models/wan2.2_animate_14B_int8_convrot.safetensors",
+    "note": "17.15 GiB int8; the bf16 build in the same repo is 32.18 GiB and needs heavy offload on a 24 GB-class card"
+  },
   "umt5_xxl_fp8_e4m3fn_scaled.safetensors": {
     "dir": "text_encoders",
     "repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
@@ -92,6 +98,11 @@
     "dir": "vae",
     "repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
     "path": "split_files/vae/wan_2.1_vae.safetensors"
+  },
+  "clip_vision_h.safetensors": {
+    "dir": "clip_vision",
+    "repo": "Comfy-Org/Wan_2.1_ComfyUI_repackaged",
+    "path": "split_files/clip_vision/clip_vision_h.safetensors"
   },
 
   "seedvr2_7b_int8_convrot.safetensors": {
