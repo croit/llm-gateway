@@ -1225,8 +1225,8 @@ pub async fn chat_tail(
 /// build can flip between requests. It cost an afternoon here: the canvas
 /// switcher would intermittently look up the session id as a document id and
 /// answer with an empty patch. Named fields deserialise by key, which is why
-/// every other multi-param route in this file (`TurnPath`, `AttachmentPath`)
-/// is a struct too.
+/// every other multi-param route in this file (`TurnPath`,
+/// `AttachmentRemovePath`) is a struct too.
 #[derive(serde::Deserialize)]
 pub struct DocumentPath {
     pub id: String,
@@ -1594,8 +1594,8 @@ pub async fn chat_edit(
 }
 
 /// Path for `POST /chat/{id}/turns/{turn_id}/attachment/{filename}/remove`.
-/// `filename` arrives percent-decoded (same as the `chat_attachment`
-/// proxy route).
+/// Only the two ids come from the extractor — `filename` is read off the raw
+/// URI by [`remove_path_filename`], see that function for why.
 #[derive(serde::Deserialize)]
 pub struct AttachmentRemovePath {
     pub id: String,
@@ -1610,16 +1610,18 @@ pub struct AttachmentRemovePath {
 /// anymore. Works on both user uploads (`user_content`) and model-produced
 /// files like generated images (`content`).
 pub async fn chat_attachment_remove(
-    Path(AttachmentRemovePath {
-        id,
-        turn_id,
-        filename,
-    }): Path<AttachmentRemovePath>,
+    Path(AttachmentRemovePath { id, turn_id, .. }): Path<AttachmentRemovePath>,
     State(state): State<Arc<RamaState>>,
     req: Request,
 ) -> Response {
     let (_session, user) = require_session!(state, req);
     let lang = Lang::from_headers(req.headers());
+    // The ids are UUIDs, so the extractor's lowercasing is harmless for them;
+    // the filename is not, and both the marker match and the S3 key need it
+    // verbatim. See [`attachment_path_parts`].
+    let Some(filename) = remove_path_filename(req.uri().path()) else {
+        return sse_error_response(&t(lang, "chat-error-bad-filename"));
+    };
     let turn = match load_owned_turn(&state, &user, &id, &turn_id, lang).await {
         Ok(t) => t,
         Err(resp) => return resp,
@@ -2446,22 +2448,81 @@ fn slugify(title: &str) -> String {
 // ---------------------------------------------------------------------------
 // GET /chat/attachment/{turn_id}/{filename} — bytes for one attachment.
 
-#[derive(serde::Deserialize)]
-pub struct AttachmentPath {
-    pub turn_id: String,
-    pub filename: String,
+/// `<turn_id>/<filename>` for `GET /chat/attachment/{turn_id}/{filename}`,
+/// read off the **raw** request URI.
+///
+/// Not the `Path` extractor: rama's router matches on
+/// `uri.path().to_lowercase()` and the `UriParams` it hands the extractor come
+/// from that lowercased string — and it never percent-decodes them. Either
+/// mangling asks the bucket for a key that was never written (`bericht.md` for
+/// a stored `Bericht.md`, or a literal `%20` where the name has a space), and
+/// the browser shows the download as "file wasn't available on site".
+/// `req.uri()` is untouched. Same reason `proxy::retrieve_model` and
+/// `sandbox_api::download` parse by hand.
+///
+/// `None` when the path isn't `<turn>/<file>` with both segments non-empty
+/// and no extra segment beyond the filename.
+fn attachment_path_parts(path: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix("/chat/attachment/")?;
+    let (turn_id, filename) = rest.split_once('/')?;
+    let turn_id = percent_decode_segment(turn_id);
+    let filename = percent_decode_segment(filename);
+    if turn_id.is_empty() || filename.is_empty() || filename.contains('/') {
+        return None;
+    }
+    Some((turn_id, filename))
+}
+
+/// The `{filename}` segment of
+/// `POST /chat/{id}/turns/{turn_id}/attachment/{filename}/remove`, off the raw
+/// URI for the same reason as [`attachment_path_parts`].
+fn remove_path_filename(path: &str) -> Option<String> {
+    let tail = path.rsplit_once("/attachment/")?.1;
+    let filename = percent_decode_segment(tail.strip_suffix("/remove")?);
+    (!filename.is_empty() && !filename.contains('/')).then_some(filename)
+}
+
+/// Percent-decode one path segment. `+` stays a literal plus (it is not a
+/// space in a path — that's `application/x-www-form-urlencoded`, which is why
+/// this isn't `pages::skills::percent_decode`). Malformed escapes pass
+/// through untouched rather than eating characters.
+fn percent_decode_segment(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Stream one attachment's bytes through the gateway, gated by the
 /// session cookie + a check that the turn belongs to the caller's
 /// user. Bucket never sees a browser request; the LLM never sees a
 /// presigned URL.
-pub async fn chat_attachment(
-    Path(AttachmentPath { turn_id, filename }): Path<AttachmentPath>,
-    State(state): State<Arc<RamaState>>,
-    req: Request,
-) -> Response {
+pub async fn chat_attachment(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let lang = Lang::from_headers(req.headers());
+    let Some((turn_id, filename)) = attachment_path_parts(req.uri().path()) else {
+        return attachment_error(
+            rama::http::StatusCode::BAD_REQUEST,
+            &t(lang, "chat-error-bad-filename"),
+        );
+    };
     // 401 (not redirect) — `<img src>` will just show broken-image
     // if the cookie went bad, and a 401 is honest in operator logs.
     let session = match state.sessions.lookup_from_headers(req.headers()).await {
@@ -2547,4 +2608,77 @@ fn attachment_error(status: rama::http::StatusCode, msg: &str) -> Response {
         )
         .body(msg.to_string().into())
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of parsing by hand: a stored `Bericht.md` must not
+    /// become `bericht.md`, and `%20` must become a space — the object key is
+    /// built from these two strings.
+    #[test]
+    fn attachment_path_keeps_case_and_decodes_escapes() {
+        assert_eq!(
+            attachment_path_parts("/chat/attachment/t-1/Bericht.md"),
+            Some(("t-1".to_string(), "Bericht.md".to_string()))
+        );
+        assert_eq!(
+            attachment_path_parts("/chat/attachment/t-1/Bericht%20Q3.md"),
+            Some(("t-1".to_string(), "Bericht Q3.md".to_string()))
+        );
+        assert_eq!(
+            attachment_path_parts("/chat/attachment/t-1/%C3%9Cbersicht.md"),
+            Some(("t-1".to_string(), "Übersicht.md".to_string()))
+        );
+    }
+
+    /// A `/` smuggled in as `%2F` would punch out of the filename segment and
+    /// let a caller reach another turn's prefix in the bucket.
+    #[test]
+    fn attachment_path_rejects_malformed_and_traversing_paths() {
+        for path in [
+            "/chat/attachment/t-1/",
+            "/chat/attachment//x.png",
+            "/chat/attachment/t-1",
+            "/chat/attachment/t-1/a%2F..%2Fb.png",
+            "/chat/attachment/t-1/sub/x.png",
+            "/elsewhere/t-1/x.png",
+        ] {
+            assert_eq!(attachment_path_parts(path), None, "should reject {path}");
+        }
+    }
+
+    /// The remove control's target carries the same verbatim filename — a
+    /// lowercased one matches no marker and deletes no object.
+    #[test]
+    fn remove_path_filename_keeps_case_and_decodes_escapes() {
+        assert_eq!(
+            remove_path_filename("/chat/s1/turns/t0/attachment/Bericht%20Q3.md/remove"),
+            Some("Bericht Q3.md".to_string())
+        );
+        assert_eq!(
+            remove_path_filename("/chat/s1/turns/t0/attachment/pic.PNG/remove"),
+            Some("pic.PNG".to_string())
+        );
+        assert_eq!(
+            remove_path_filename("/chat/s1/turns/t0/attachment/a%2Fb.png/remove"),
+            None
+        );
+        assert_eq!(
+            remove_path_filename("/chat/s1/turns/t0/attachment/x.png"),
+            None
+        );
+    }
+
+    /// `+` is a literal plus in a path segment (`C++ notes.md`), unlike in a
+    /// form body; a truncated escape is left alone instead of swallowing the
+    /// characters after it.
+    #[test]
+    fn percent_decode_segment_leaves_plus_and_bad_escapes_alone() {
+        assert_eq!(percent_decode_segment("C++ notes.md"), "C++ notes.md");
+        assert_eq!(percent_decode_segment("ends-with-%2"), "ends-with-%2");
+        assert_eq!(percent_decode_segment("bad-%zz-seq"), "bad-%zz-seq");
+        assert_eq!(percent_decode_segment("plain.md"), "plain.md");
+    }
 }
