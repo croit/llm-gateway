@@ -934,6 +934,7 @@ mod tests {
                 duration_ms: 1,
                 timed_out: true,
                 output_truncated: false,
+                artifacts_truncated: false,
                 container_id: None,
             })
         }
@@ -989,6 +990,7 @@ mod tests {
             duration_ms: 0,
             timed_out: false,
             output_truncated: false,
+            artifacts_truncated: false,
             container_id: None,
         };
         clamp_output(&mut resp, 200);

@@ -114,7 +114,18 @@ pub struct RunRequest {
 /// input file is collected as an artifact).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Artifact {
+    /// Delivered name: always a single path component, because it becomes an
+    /// attachment filename (`<turn>/<name>`) and because the runner only ever
+    /// opens a plain name out of a scratch dir. A file produced in a
+    /// subdirectory is flattened — see [`Self::path`].
     pub name: String,
+    /// Where the file actually sits inside `/work`, relative to it, when that
+    /// differs from `name` (`docs/backend.md` delivered as `docs-backend.md`).
+    /// `None` for a file produced at the top level. Reported so the model can
+    /// tell which of its own paths a delivered file came from, and so a later
+    /// call in the same turn can still address the original path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub size: u64,
     /// Best-effort content type, sniffed from the extension by the runner.
     pub mime: String,
@@ -138,6 +149,11 @@ pub struct RunResponse {
     /// True when stdout/stderr were clipped to the runner's output cap.
     #[serde(default)]
     pub output_truncated: bool,
+    /// True when the run produced more files than the agent will collect in
+    /// one response. Surfaced to the model so "I wrote 300 files and got 64"
+    /// is a stated limit rather than a silent one.
+    #[serde(default)]
+    pub artifacts_truncated: bool,
     /// Id of the container this job ran in, echoed back **only** when the
     /// request set `keep_alive: true` and the runner kept the container
     /// alive as a lease. `None` for single-use jobs (and when a keep-alive
@@ -222,10 +238,12 @@ mod tests {
                 mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
                     .into(),
                 content_b64: "AAAA".into(),
+                path: None,
             }],
             duration_ms: 42,
             timed_out: false,
             output_truncated: false,
+            artifacts_truncated: false,
             container_id: Some("kept-alive-1".into()),
         };
         let json = serde_json::to_string(&resp).unwrap();

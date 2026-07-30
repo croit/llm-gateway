@@ -721,6 +721,7 @@ async fn drive_agent(
             duration_ms: timeout.as_millis() as u64,
             timed_out: true,
             output_truncated: false,
+            artifacts_truncated: false,
             container_id: None,
         }),
     }
@@ -938,6 +939,7 @@ pub(crate) mod fake {
                 duration_ms: 1,
                 timed_out: false,
                 output_truncated: false,
+                artifacts_truncated: false,
                 container_id: None,
             })
         }
@@ -1050,6 +1052,176 @@ mod local_tests {
             resp.stderr,
         );
         assert!(art.unwrap().size >= 300_000, "preserved full stream");
+    }
+
+    /// The regression this whole change exists for.
+    ///
+    /// Asked for a documentation set, a model writes `docs/backend.md` — the
+    /// tool told it to write output files to the working directory, and a
+    /// subdirectory is in the working directory. Collection used to be a
+    /// top-level `os.listdir`, so the run came back `exit_code: 0` with an
+    /// EMPTY artifact list: the one result shape a model cannot tell apart
+    /// from its own mistake. In the conversation that prompted this fix it
+    /// then spent six turns insisting the files existed and the interface was
+    /// broken, forging attachment stubs to prove it.
+    #[tokio::test]
+    async fn collects_files_produced_in_subdirectories() {
+        if !python3_available() {
+            eprintln!("skipping local_backend test: python3 not on PATH");
+            return;
+        }
+        let be = LocalBackend::new().unwrap();
+        let id = be.create(Network::None).await.unwrap();
+        let req = RunRequest {
+            language: Language::Python,
+            code: "import os\n\
+                   os.makedirs('docs/deep', exist_ok=True)\n\
+                   open('CLAUDE.md','w').write('root')\n\
+                   open('docs/backend.md','w').write('backend')\n\
+                   open('docs/deep/api.md','w').write('api')\n"
+                .into(),
+            files: vec![],
+            timeout_secs: None,
+            network: false,
+            container_id: None,
+            keep_alive: false,
+        };
+        let resp = be.exec(&id, &req, Duration::from_secs(30)).await.unwrap();
+        be.destroy(&id).await;
+        assert_eq!(resp.exit_code, 0, "stderr={}", resp.stderr);
+
+        let by_name = |n: &str| resp.artifacts.iter().find(|a| a.name == n).cloned();
+        // A top-level file keeps its exact name — introducing recursion must
+        // not rename anything that already worked.
+        let root = by_name("CLAUDE.md").expect("top-level file still collected");
+        assert_eq!(root.path, None, "a top-level file reports no sandbox path");
+
+        // Nested files arrive under a flattened name, and say where they came
+        // from so the model can match them to the paths it wrote.
+        let nested = by_name("docs-backend.md").expect("docs/backend.md collected");
+        assert_eq!(nested.path.as_deref(), Some("docs/backend.md"));
+        assert_eq!(nested.content_b64, shared::b64::encode(b"backend"));
+        let deep = by_name("docs-deep-api.md").expect("docs/deep/api.md collected");
+        assert_eq!(deep.path.as_deref(), Some("docs/deep/api.md"));
+        assert_eq!(deep.content_b64, shared::b64::encode(b"api"));
+    }
+
+    /// A flattened name must never silently overwrite a real top-level file:
+    /// `docs/backend.md` and a literal `docs-backend.md` both want the same
+    /// delivered name, and the top-level one owns it.
+    #[tokio::test]
+    async fn flattened_names_yield_to_a_real_top_level_file() {
+        if !python3_available() {
+            eprintln!("skipping local_backend test: python3 not on PATH");
+            return;
+        }
+        let be = LocalBackend::new().unwrap();
+        let id = be.create(Network::None).await.unwrap();
+        let req = RunRequest {
+            language: Language::Python,
+            code: "import os\n\
+                   os.makedirs('docs', exist_ok=True)\n\
+                   open('docs-backend.md','w').write('flat')\n\
+                   open('docs/backend.md','w').write('nested')\n"
+                .into(),
+            files: vec![],
+            timeout_secs: None,
+            network: false,
+            container_id: None,
+            keep_alive: false,
+        };
+        let resp = be.exec(&id, &req, Duration::from_secs(30)).await.unwrap();
+        be.destroy(&id).await;
+        assert_eq!(resp.exit_code, 0, "stderr={}", resp.stderr);
+
+        let flat = resp
+            .artifacts
+            .iter()
+            .find(|a| a.name == "docs-backend.md")
+            .expect("the real top-level file keeps the name");
+        assert_eq!(flat.path, None);
+        assert_eq!(flat.content_b64, shared::b64::encode(b"flat"));
+        let nested = resp
+            .artifacts
+            .iter()
+            .find(|a| a.path.as_deref() == Some("docs/backend.md"))
+            .expect("the nested file is still delivered");
+        assert_eq!(nested.name, "docs-backend-2.md");
+        assert_eq!(nested.content_b64, shared::b64::encode(b"nested"));
+    }
+
+    /// `HOME` is the working directory, so anything that wants a profile or
+    /// cache dir drops one next to the job's real output. Recursion must not
+    /// turn those into attachments — nor descend into a vendored tree.
+    #[tokio::test]
+    async fn cache_and_vendor_directories_are_not_collected() {
+        if !python3_available() {
+            eprintln!("skipping local_backend test: python3 not on PATH");
+            return;
+        }
+        let be = LocalBackend::new().unwrap();
+        let id = be.create(Network::None).await.unwrap();
+        let req = RunRequest {
+            language: Language::Python,
+            code: "import os\n\
+                   for d in ('.cache/fontconfig', '.config', 'node_modules/left-pad', \
+                   '__pycache__'):\n\
+                   \x20   os.makedirs(d, exist_ok=True)\n\
+                   \x20   open(os.path.join(d, 'junk.txt'), 'w').write('noise')\n\
+                   open('report.md','w').write('the real output')\n"
+                .into(),
+            files: vec![],
+            timeout_secs: None,
+            network: false,
+            container_id: None,
+            keep_alive: false,
+        };
+        let resp = be.exec(&id, &req, Duration::from_secs(30)).await.unwrap();
+        be.destroy(&id).await;
+        assert_eq!(resp.exit_code, 0, "stderr={}", resp.stderr);
+        let names: Vec<&str> = resp.artifacts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["report.md"],
+            "only the job's own output should be delivered"
+        );
+    }
+
+    /// Untrusted code must not be able to hand the user a file from outside
+    /// its own output by planting a symlink under a plausible name. Held at
+    /// the agent, so it also holds for the base64 path where the runner's
+    /// `O_NOFOLLOW` read never runs.
+    #[tokio::test]
+    async fn symlinked_output_is_never_collected() {
+        if !python3_available() {
+            eprintln!("skipping local_backend test: python3 not on PATH");
+            return;
+        }
+        let be = LocalBackend::new().unwrap();
+        let id = be.create(Network::None).await.unwrap();
+        let req = RunRequest {
+            language: Language::Python,
+            code: "import os\n\
+                   os.makedirs('out', exist_ok=True)\n\
+                   os.symlink('/etc/hosts', 'out/hosts.txt')\n\
+                   os.symlink('/etc', 'escape')\n\
+                   open('out/real.txt','w').write('mine')\n"
+                .into(),
+            files: vec![],
+            timeout_secs: None,
+            network: false,
+            container_id: None,
+            keep_alive: false,
+        };
+        let resp = be.exec(&id, &req, Duration::from_secs(30)).await.unwrap();
+        be.destroy(&id).await;
+        assert_eq!(resp.exit_code, 0, "stderr={}", resp.stderr);
+        let names: Vec<&str> = resp.artifacts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["out-real.txt"],
+            "symlinks (file and directory) must be skipped, not followed: {names:?}"
+        );
     }
 
     #[tokio::test]
@@ -1344,6 +1516,7 @@ mod inplace_artifact_tests {
             duration_ms: 1,
             timed_out: false,
             output_truncated: false,
+            artifacts_truncated: false,
             container_id: None,
         }
     }
@@ -1351,6 +1524,7 @@ mod inplace_artifact_tests {
     fn art(name: &str, size: u64, content: &str) -> Artifact {
         Artifact {
             name: name.into(),
+            path: None,
             size,
             mime: "application/octet-stream".into(),
             content_b64: content.into(),
