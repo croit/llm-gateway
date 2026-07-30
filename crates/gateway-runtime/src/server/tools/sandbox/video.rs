@@ -58,8 +58,11 @@ pub(crate) struct VideoSpec {
     pub(crate) clips: Vec<Clip>,
     #[serde(default)]
     pub(crate) overlays: Vec<Overlay>,
-    #[serde(default)]
-    pub(crate) audio: Option<AudioTrack>,
+    /// Audio to lay under the video: one music bed, or several tracks (a bed
+    /// plus a narration line per scene) each with its own `start`. Accepts a
+    /// single object as well as a list.
+    #[serde(default, deserialize_with = "one_or_many_tracks")]
+    pub(crate) audio: Vec<AudioTrack>,
     /// Fade the finished video to black over this many seconds.
     #[serde(default)]
     pub(crate) fade_out: Option<f64>,
@@ -286,12 +289,46 @@ pub(crate) struct AudioTrack {
     #[serde(default = "d_volume")]
     pub(crate) volume: f64,
     /// Normalise perceived loudness to broadcast-ish levels (EBU R128).
+    ///
+    /// Right for a music bed, usually wrong for one line of narration among
+    /// several: R128 normalises each track to the same *perceived* loudness, so
+    /// a quiet line and a loud one end up equally loud and the delivery
+    /// flattens out. Turn it off on the voice tracks and keep the levels the
+    /// synthesis produced.
     #[serde(default = "d_true")]
     pub(crate) loudnorm: bool,
+    /// Seconds into the finished video where this track starts. Omitted (or 0)
+    /// starts it at the top, which is what a music bed wants; a narration line
+    /// belongs at the cut it speaks over.
+    #[serde(default)]
+    pub(crate) start: Option<f64>,
     #[serde(default)]
     pub(crate) fade_in: Option<f64>,
     #[serde(default)]
     pub(crate) fade_out: Option<f64>,
+}
+
+/// Accept either one audio track or a list of them.
+///
+/// The field began as a single optional music bed, and every spec written
+/// against that shape has to keep working — a stored canvas document is a
+/// *saved* spec, so changing the accepted JSON would break documents already
+/// on disk, not just future calls.
+fn one_or_many_tracks<'de, D>(d: D) -> Result<Vec<AudioTrack>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(Box<AudioTrack>),
+        Many(Vec<AudioTrack>),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(d)? {
+        None => Vec::new(),
+        Some(OneOrMany::One(t)) => vec![*t],
+        Some(OneOrMany::Many(v)) => v,
+    })
 }
 
 fn d_volume() -> f64 {
@@ -307,6 +344,9 @@ fn d_true() -> bool {
 /// Upper bounds that keep one call from monopolising the sandbox. Generous
 /// enough for an ad; a feature film is not the use case.
 const MAX_CLIPS: usize = 40;
+/// Enough for a music bed plus a narration line per scene; well below the point
+/// where `amix` starts costing real time.
+const MAX_AUDIO_TRACKS: usize = 24;
 const MAX_OVERLAYS: usize = 40;
 const MAX_DIM: u32 = 3840;
 const MIN_DIM: u32 = 64;
@@ -581,21 +621,31 @@ impl VideoSpec {
                 }
             }
         }
-        if let Some(a) = &self.audio {
+        if self.audio.len() > MAX_AUDIO_TRACKS {
+            return Err(ToolError::InvalidArgs(format!(
+                "at most {MAX_AUDIO_TRACKS} audio tracks (got {})",
+                self.audio.len()
+            )));
+        }
+        for (i, a) in self.audio.iter().enumerate() {
             if a.source.trim().is_empty() {
-                return Err(ToolError::InvalidArgs(
-                    "audio.source must not be empty".into(),
-                ));
+                return Err(ToolError::InvalidArgs(format!(
+                    "audio[{i}].source must not be empty"
+                )));
             }
             if !(0.0..=4.0).contains(&a.volume) {
                 return Err(ToolError::InvalidArgs(format!(
-                    "audio.volume must be 0–4 (got {})",
+                    "audio[{i}].volume must be 0–4 (got {})",
                     a.volume
                 )));
             }
-            for (f, v) in [("audio.fade_in", a.fade_in), ("audio.fade_out", a.fade_out)] {
+            for (f, v) in [
+                (format!("audio[{i}].start"), a.start),
+                (format!("audio[{i}].fade_in"), a.fade_in),
+                (format!("audio[{i}].fade_out"), a.fade_out),
+            ] {
                 if let Some(v) = v {
-                    check_time(f, v)?;
+                    check_time(&f, v)?;
                 }
             }
         }
@@ -614,7 +664,7 @@ impl VideoSpec {
                 v.push(source.as_str());
             }
         }
-        if let Some(a) = &self.audio {
+        for a in &self.audio {
             v.push(a.source.as_str());
         }
         v
@@ -1027,21 +1077,23 @@ pub(crate) fn build_render_plan(
     }
 
     // --- pass 2d: closing fade + audio ------------------------------------
+    // Finished length: the running sum after the xfade chain, where each
+    // crossfade eats its own duration. Both the closing video fade and every
+    // audio fade-out are positioned against it.
+    let total: f64 = {
+        let mut t = clip_len[0];
+        for (c, d) in spec.clips.iter().zip(clip_len.iter().copied()).skip(1) {
+            let overlap = c
+                .transition
+                .as_ref()
+                .filter(|t| t.kind.xfade_name().is_some())
+                .map(|t| t.duration)
+                .unwrap_or(0.0);
+            t += d - overlap;
+        }
+        t
+    };
     if let Some(f) = spec.fade_out {
-        // Total length: the running sum after the xfade chain.
-        let total: f64 = {
-            let mut t = clip_len[0];
-            for (c, d) in spec.clips.iter().zip(clip_len.iter().copied()).skip(1) {
-                let overlap = c
-                    .transition
-                    .as_ref()
-                    .filter(|t| t.kind.xfade_name().is_some())
-                    .map(|t| t.duration)
-                    .unwrap_or(0.0);
-                t += d - overlap;
-            }
-            t
-        };
         let st = num((total - f).max(0.0));
         let next = "vfade".to_string();
         let _ = writeln!(
@@ -1054,21 +1106,71 @@ pub(crate) fn build_render_plan(
     let _ = writeln!(graph, "[{label}]null[vout]");
 
     let mut audio_map = String::new();
-    if let Some(a) = &spec.audio {
-        let src = name_of(&a.source)?;
-        let idx = img_input_index;
-        extra_inputs.push(src);
-        let mut chain = format!("[{idx}:a]volume={v}", v = num(a.volume));
-        if a.loudnorm {
-            chain.push_str(",loudnorm=I=-16:TP=-1.5:LRA=11");
+    if !spec.audio.is_empty() {
+        // One chain per track, then a single mix. Each chain ends in `apad`,
+        // which pairs with `-shortest` on the command line to give the one
+        // behaviour that is right in both directions: audio longer than the
+        // video is cut off at the last frame, audio shorter than it is padded
+        // with silence. Without the pad, `-shortest` would truncate the *video*
+        // to the length of a short music bed or a narration line.
+        let mut labels: Vec<String> = Vec::with_capacity(spec.audio.len());
+        for (i, a) in spec.audio.iter().enumerate() {
+            let src = name_of(&a.source)?;
+            let idx = img_input_index + i;
+            extra_inputs.push(src.clone());
+            let mut chain = format!("[{idx}:a]volume={v}", v = num(a.volume));
+            if a.loudnorm {
+                chain.push_str(",loudnorm=I=-16:TP=-1.5:LRA=11");
+            }
+            // Fades are relative to the track, so they go on before the delay
+            // shifts it into place on the timeline.
+            if let Some(f) = a.fade_in {
+                let _ = write!(chain, ",afade=t=in:st=0:d={}", num(f));
+            }
+            // `afade=t=out` needs an explicit start: ffmpeg defaults `st` to 0,
+            // which fades the track out over its first seconds instead of its
+            // last — a music bed that vanishes a second in. So aim it at
+            // whichever end comes first, the track's own or the video's, in
+            // track-local time (the delay below shifts the whole chain).
+            if let Some(f) = a.fade_out {
+                let start = a.start.unwrap_or(0.0);
+                let audible = probed
+                    .durations
+                    .get(&src)
+                    .copied()
+                    .map_or(total - start, |len| len.min(total - start));
+                let _ = write!(
+                    chain,
+                    ",afade=t=out:st={st}:d={d}",
+                    st = num((audible - f).max(0.0)),
+                    d = num(f)
+                );
+            }
+            // `all=1` delays every channel; without it `adelay` shifts only the
+            // first, which turns a stereo line into a smeared half-echo.
+            if let Some(start) = a.start.filter(|s| *s > 0.0) {
+                let _ = write!(
+                    chain,
+                    ",adelay={ms}:all=1",
+                    ms = num((start * 1000.0).round())
+                );
+            }
+            let label = format!("a{i}");
+            let _ = writeln!(graph, ";{chain}[{label}]");
+            labels.push(label);
         }
-        if let Some(f) = a.fade_in {
-            let _ = write!(chain, ",afade=t=in:st=0:d={}", num(f));
+        if labels.len() == 1 {
+            let _ = writeln!(graph, ";[{}]apad[aout]", labels[0]);
+        } else {
+            // `normalize=0`: amix otherwise divides every input by the number of
+            // inputs, so adding a narration line would quietly halve the music.
+            let inputs: String = labels.iter().map(|l| format!("[{l}]")).collect();
+            let _ = writeln!(
+                graph,
+                ";{inputs}amix=inputs={n}:normalize=0:dropout_transition=0,apad[aout]",
+                n = labels.len()
+            );
         }
-        if let Some(f) = a.fade_out {
-            let _ = write!(chain, ",afade=t=out:d={}", num(f));
-        }
-        let _ = writeln!(graph, ";{chain}[aout]");
         audio_map = " -map \"[aout]\" -c:a aac -b:a 192k -shortest".into();
     }
 
@@ -1133,12 +1235,24 @@ mod tests {
                 source: "music.mp3".into(),
                 safe_name: "aud3.mp3".into(),
             },
+            SafeInput {
+                source: "line1.mp3".into(),
+                safe_name: "aud4.mp3".into(),
+            },
+            SafeInput {
+                source: "line2.mp3".into(),
+                safe_name: "aud5.mp3".into(),
+            },
         ]
     }
 
     fn probed() -> Probed {
         Probed {
-            durations: HashMap::from([("in0.mp4".to_string(), 4.0), ("in1.mp4".to_string(), 6.0)]),
+            durations: HashMap::from([
+                ("in0.mp4".to_string(), 4.0),
+                ("in1.mp4".to_string(), 6.0),
+                ("aud3.mp3".to_string(), 2.0),
+            ]),
             fonts: HashMap::from([(
                 "Inter:style=Bold".to_string(),
                 "/usr/share/fonts/inter/Inter-Bold.otf".to_string(),
@@ -1362,11 +1476,80 @@ mod tests {
         let f = filter_of(&p);
         assert!(f.contains("volume=0.3"), "{f}");
         assert!(f.contains("loudnorm=I=-16:TP=-1.5:LRA=11"), "{f}");
+        // The fade-out is aimed at an end rather than left at ffmpeg's default
+        // st=0 (which fades a track out over its first seconds). The bed is
+        // 2 s and the video 4 s, so the earlier end wins: 2 - 1 = 1.
         assert!(
-            f.contains("afade=t=in:st=0:d=0.5") && f.contains("afade=t=out:d=1"),
+            f.contains("afade=t=in:st=0:d=0.5") && f.contains("afade=t=out:st=1:d=1"),
             "{f}"
         );
         assert!(p.script.contains("-map \"[aout]\"") && p.script.contains("-shortest"));
+    }
+
+    #[test]
+    fn a_single_track_is_padded_so_it_cannot_shorten_the_video() {
+        // Regression: `-shortest` alone cuts the *video* down to a music bed
+        // that is shorter than the footage. `apad` makes the audio the longer
+        // stream, so the cut lands on the video's own last frame instead.
+        let f = filter_of(&plan(serde_json::json!({
+            "clips": [{"source": "a.mp4"}],
+            "audio": {"source": "music.mp3"},
+        })));
+        assert!(f.contains("apad[aout]"), "{f}");
+    }
+
+    #[test]
+    fn narration_tracks_are_delayed_and_mixed_without_level_loss() {
+        let p = plan(serde_json::json!({
+            "clips": [{"source": "a.mp4"}],
+            "audio": [
+                {"source": "music.mp3", "volume": 0.25, "fade_out": 1.0},
+                {"source": "line1.mp3", "loudnorm": false},
+                {"source": "line2.mp3", "loudnorm": false, "start": 2.5, "fade_out": 0.3},
+            ],
+        }));
+        let f = filter_of(&p);
+        // Each track gets its own chain…
+        assert!(f.contains("[1:a]volume=0.25"), "{f}");
+        assert!(f.contains("[2:a]volume=1"), "{f}");
+        assert!(f.contains("[3:a]volume=1"), "{f}");
+        // …the offset one is delayed on every channel, in milliseconds…
+        assert!(f.contains("adelay=2500:all=1"), "{f}");
+        // …its fade-out is measured from the video's end in track-local time
+        // (4 s total - 2.5 s start = 1.5 s audible, minus the 0.3 s fade)…
+        assert!(f.contains("afade=t=out:st=1.2:d=0.3"), "{f}");
+        // …the one at the top is not delayed at all…
+        assert!(!f.contains("adelay=0"), "{f}");
+        // …loudnorm applies only where it was asked for…
+        assert_eq!(f.matches("loudnorm").count(), 1, "{f}");
+        // …and the mix keeps every track at its own level.
+        assert!(
+            f.contains("[a0][a1][a2]amix=inputs=3:normalize=0:dropout_transition=0,apad[aout]"),
+            "{f}"
+        );
+        // All three audio files are fed to ffmpeg, under their staged names.
+        for name in ["aud3.mp3", "aud4.mp3", "aud5.mp3"] {
+            assert!(p.script.contains(&format!("-i \"{name}\"")), "{}", p.script);
+        }
+    }
+
+    #[test]
+    fn a_single_audio_object_still_parses_as_before() {
+        // Specs saved in canvas documents were written against the original
+        // single-object shape; they must keep loading unchanged.
+        let one: VideoSpec = serde_json::from_value(serde_json::json!({
+            "clips": [{"source": "a.mp4"}],
+            "audio": {"source": "music.mp3", "volume": 0.5},
+        }))
+        .expect("single object parses");
+        assert_eq!(one.audio.len(), 1);
+        assert_eq!(one.audio[0].volume, 0.5);
+        assert_eq!(one.audio[0].start, None);
+
+        let none: VideoSpec =
+            serde_json::from_value(serde_json::json!({"clips": [{"source": "a.mp4"}]}))
+                .expect("absent parses");
+        assert!(none.audio.is_empty());
     }
 
     #[test]
@@ -1428,7 +1611,14 @@ mod tests {
                     "clips": [{"source": "a.mp4"}],
                     "audio": {"source": "m.mp3", "volume": 9.0},
                 }),
-                "audio.volume",
+                "audio[0].volume",
+            ),
+            (
+                serde_json::json!({
+                    "clips": [{"source": "a.mp4"}],
+                    "audio": [{"source": "m.mp3"}, {"source": "v.mp3", "start": -1.0}],
+                }),
+                "audio[1].start",
             ),
         ];
         for (j, needle) in cases {
@@ -1569,9 +1759,12 @@ impl Tool for RenderVideo {
              {\"kind\": \"slide_left\", \"duration\": 0.4},\n     \"animate_out\": {\"kind\": \
              \"fade\", \"duration\": 0.4},\n     \"box_color\": \"#00000080\", \"box_padding\": \
              12},\n    {\"type\": \"image\", \"source\": \"logo.png\", \"width\": 200, \"x\": \
-             \"w-tw-40\", \"y\": \"40\",\n     \"start\": 1, \"end\": 5}\n  ],\n  \"audio\": \
-             {\"source\": \"music.mp3\", \"volume\": 0.3, \"loudnorm\": true,\n            \
-             \"fade_in\": 0.5, \"fade_out\": 1.0},\n  \"fade_out\": 0.5\n}\n\n\
+             \"w-tw-40\", \"y\": \"40\",\n     \"start\": 1, \"end\": 5}\n  ],\n  \"audio\": [\n    \
+             {\"source\": \"music.mp3\", \"volume\": 0.25, \"loudnorm\": true,\n     \
+             \"fade_in\": 0.5, \"fade_out\": 1.0},\n    \
+             {\"source\": \"line1.mp3\", \"loudnorm\": false},\n    \
+             {\"source\": \"line2.mp3\", \"loudnorm\": false, \"start\": 4.0}\n  ],\n  \
+             \"fade_out\": 0.5\n}\n\n\
              transition.kind: fade, dissolve, wipe_left/right/up/down, slide_left/right, \
              smooth_left/right, circle_open/close, or cut (no crossfade).\n\
              animate kind: fade, slide_left/right/up/down, scale, none.\n\
@@ -1580,7 +1773,14 @@ impl Tool for RenderVideo {
              only; no function calls.\n\
              Clips are scaled and letterboxed onto the output size, so mixing portrait and \
              landscape footage is safe. Time values are seconds. Fonts must exist in the \
-             sandbox: `Inter:style=Bold` and `DejaVu Sans:style=Bold` are good bets.\n\n\
+             sandbox: `Inter:style=Bold` and `DejaVu Sans:style=Bold` are good bets.\n\
+             `audio` takes one track or several, mixed together. `start` places a track on \
+             the timeline, which is how narration lines line up with the cuts they speak \
+             over: synthesize each line with `comfyui_text_to_speech`, then give it the \
+             start time of its scene. Leave `loudnorm` on for a music bed and OFF for \
+             speech (it would level every line to the same loudness and flatten the \
+             delivery). Audio never changes the video length — it is padded or cut to \
+             fit.\n\n\
              The finished MP4 is attached to your reply. For a single still image use \
              `comfyui_*` image tools; for lip-synced talking heads use \
              `comfyui_talking_video`; for anything this spec cannot express, \
@@ -1950,6 +2150,14 @@ mod e2e_dump {
                 {"type": "image", "source": "logo.png", "width": 90,
                  "x": "w-100", "y": "30", "start": 0.5},
             ],
+            // A music bed plus two narration lines, the second offset onto the
+            // scene it belongs to — the mix `amix`/`adelay`/`apad` has to get
+            // right, and which no unit test can prove is valid ffmpeg.
+            "audio": [
+                {"source": "music.mp3", "volume": 0.25, "fade_in": 0.3, "fade_out": 0.8},
+                {"source": "line1.mp3", "loudnorm": false},
+                {"source": "line2.mp3", "loudnorm": false, "start": 2.5},
+            ],
             "fade_out": 0.5,
         }))
         .unwrap();
@@ -1967,6 +2175,18 @@ mod e2e_dump {
             SafeInput {
                 source: "logo.png".into(),
                 safe_name: "in2.png".into(),
+            },
+            SafeInput {
+                source: "music.mp3".into(),
+                safe_name: "in3.mp3".into(),
+            },
+            SafeInput {
+                source: "line1.mp3".into(),
+                safe_name: "in4.mp3".into(),
+            },
+            SafeInput {
+                source: "line2.mp3".into(),
+                safe_name: "in5.mp3".into(),
             },
         ];
         let mut probed = Probed::default();
