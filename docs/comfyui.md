@@ -208,6 +208,36 @@ ComfyUI tools register like any other tool: per-role `tools = ["comfyui_text_to_
 | Workflow timeout | `ToolError::Failed("ComfyUI workflow did not finish within {timeout_secs}s")` |
 | Param validation failure | `ToolError::InvalidArgs` with field-level message |
 
+## Custom nodes we ship ourselves
+
+Most workflows need only ComfyUI core plus the usual video node packs. One does
+not: speech synthesis (`comfyui_text_to_speech`, `comfyui_clone_voice`) runs on
+[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) through a node that lives in
+this repo, at [`examples/comfyui-nodes/`](../examples/comfyui-nodes/).
+
+Two decisions worth knowing about, because both look like accidents otherwise:
+
+**The node is ours, not a third-party pack.** Several packs wrap Qwen3-TTS; the
+ones we looked at are either unlicensed or bundle a dozen engines we don't use.
+A custom node runs with ComfyUI's full privileges, so the surface is worth
+keeping small and ours.
+
+**Its model work happens in a subprocess.** `qwen-tts` pins
+`transformers==4.57.3`; the ComfyUI image ships a newer major version its video
+nodes need, and `transformers` carries no Qwen3-TTS model to fall back on.
+Installing the pin into ComfyUI would break the other nodes, so it lives in an
+isolated venv that only holds the pinned packages — torch, torchaudio,
+onnxruntime and soundfile are inherited from the image by appending ComfyUI's own
+`sys.path` in the worker (passed in, not hardcoded: those four live in three
+different directories in that image).
+
+The consequence that matters operationally is VRAM. The worker starts on the
+first synthesis, keeps the checkpoint resident while someone iterates on a
+script, and exits after an idle timeout — measured on llm01: +5.06 GB while
+working, back to the byte it started at 30 s after the last call. Nothing is
+pinned between jobs, which is why this is a ComfyUI node rather than a resident
+TTS service.
+
 ## What lives where
 
 | Concern | Lives in |
@@ -215,6 +245,8 @@ ComfyUI tools register like any other tool: per-role `tools = ["comfyui_text_to_
 | Operator config (`base_url`, `content_dir`, timeouts) | `gateway.toml` `[comfyui]` |
 | Workflow JSON (model paths, samplers, nodes) | `content_dir/<workflow>/workflow.json` |
 | Tool surface (id, params, descriptions) | `content_dir/<workflow>/manifest.toml` |
+| Example catalog + the custom node (the operator's copy source) | `examples/comfyui-workflows/`, `examples/comfyui-nodes/` |
+| Catalog drift guard (manifest ↔ graph agreement) | `crates/gateway-features/tests/comfyui_catalog.rs` |
 | HTTP client + execution loop | `crates/gateway-features/src/server/comfyui/` |
 | Tool registration | `crates/gateway-runtime/src/server/tools/comfyui_workflow.rs` (one tool impl, parameterised by manifest) |
 

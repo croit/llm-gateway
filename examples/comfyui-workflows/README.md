@@ -35,6 +35,8 @@ The manifest's `id` becomes the tool name `comfyui_<id>`. Anything not declared 
 | [`llmgw-swap-face-video`](llmgw-swap-face-video/) | `comfyui_swap_face_video` | video | Video + person photo → clip re-rendered with that person, body motion copied (Wan 2.2 Animate) |
 | [`llmgw-text2music`](llmgw-text2music/) | `comfyui_text_to_music` | audio | Text → music clip (ACE-Step 1.5XL Turbo) |
 | [`llmgw-upscale-image`](llmgw-upscale-image/) | `comfyui_upscale_image` | image | Image → upscaled image with restored detail (SeedVR2 7B Int8) |
+| [`llmgw-text-to-speech`](llmgw-text-to-speech/) | `comfyui_text_to_speech` | audio | Text + a described voice → spoken audio (Qwen3-TTS 1.7B) |
+| [`llmgw-clone-voice`](llmgw-clone-voice/) | `comfyui_clone_voice` | audio | Text + a reference recording → the same words in that voice (Qwen3-TTS 1.7B) |
 
 ## Model weights
 
@@ -50,6 +52,8 @@ CATALOG=/etc/gateway/comfyui-workflows MODELS=... ./fetch-missing-models.sh # de
 ```
 
 Point `CATALOG` at your live content dir to audit what's actually deployed rather than this example copy. A filename alone doesn't say where to download it from, so [`models.json`](models.json) maps each one to its Hugging Face repo and target subdirectory; anything a workflow references that isn't in the map is reported by name, so the gap is visible instead of silent. Entries marked `gated` need `HF_TOKEN` after accepting the licence on Hugging Face (currently the FLUX.2 klein 9B weights).
+
+The two speech bundles are the exception to all of this: their weights are not files a workflow pins but Hugging Face repos the custom node downloads on first use (into `<models>/Qwen3-TTS/.hf`), so `fetch-missing-models.sh` neither sees nor needs them. What they *do* need is the node itself — see [`../comfyui-nodes/`](../comfyui-nodes/).
 
 Present files are skipped, interrupted transfers resume, and downloads run `JOBS=4` at a time — Hugging Face throttles per connection, so parallelism helps a lot. The run finishes by listing what ComfyUI's `/object_info` reports; note that an `ok` there only means the file is on disk, **not** that the weights load, so validate a bundle by submitting it once.
 

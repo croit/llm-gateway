@@ -1,0 +1,73 @@
+id = "clone_voice"
+title = "Speak in a Recorded Voice"
+description = "Say new words in the voice from an audio recording (Qwen3-TTS voice cloning). Pass a recording of the person in `reference_audio` — a few clear seconds is enough — plus the `text` to speak. Use this when the narration has to sound like a specific person (a colleague who recorded a sample, a house voice you keep reusing) rather than an invented one; for an invented voice use `comfyui_text_to_speech`, which needs no recording. ONLY use a recording of someone who agreed to be cloned."
+output_kind = "audio"
+output_node_id = "3"
+output_filename_prefix = "llmgw-clone-voice"
+
+[[params]]
+key = "reference_audio"
+node_id = "1"
+input_key = "audio"
+required = true
+description = "Audio attachment of the voice to copy. Pass the attachment id EXACTLY as it appears in the conversation — the long `<turn_id>/<filename>` string from the attachment marker. Three to ten seconds of clean, single-speaker speech works best; background music, two people talking over each other or heavy phone compression all degrade the likeness. The clip's language does not have to match the language you synthesize in."
+
+  [params.schema]
+  type = "audio_attachment"
+
+[[params]]
+key = "text"
+node_id = "2"
+input_key = "text"
+required = true
+description = "What this voice should say. Same guidance as `comfyui_text_to_speech`: write it as spoken prose, let punctuation set the rhythm, and keep it to a line or two per call if you need to place the result on a video timeline."
+
+  [params.schema]
+  type = "string"
+  max_length = 3000
+
+[[params]]
+key = "reference_text"
+node_id = "2"
+input_key = "reference_text"
+description = "What is actually said in `reference_audio`, transcribed word for word. Optional but worth supplying: with the transcript the model matches the speaker's rhythm and intonation, without it it copies timbre only (it falls back to a bare speaker embedding). If you don't have it, transcribe the clip first — the gateway can do that — rather than guessing, because a wrong transcript is worse than none."
+default = ""
+
+  [params.schema]
+  type = "string"
+  max_length = 1000
+
+[[params]]
+key = "language"
+node_id = "2"
+input_key = "language"
+description = "Language to speak in — independent of the recording's language, so a German reference can read English copy. `Auto` detects it from `text`."
+default = "Auto"
+
+  [params.schema]
+  type = "string"
+  enum_values = [
+    "Auto",
+    "German",
+    "English",
+    "Chinese",
+    "French",
+    "Italian",
+    "Japanese",
+    "Korean",
+    "Portuguese",
+    "Russian",
+    "Spanish",
+  ]
+
+[[params]]
+key = "seed"
+node_id = "2"
+input_key = "seed"
+description = "Random seed. Keep it unchanged across the lines of one script so the delivery stays consistent; change it to re-roll a take that came out flat."
+default = 7
+
+  [params.schema]
+  type = "integer"
+  min = 0
+  max = 4294967295

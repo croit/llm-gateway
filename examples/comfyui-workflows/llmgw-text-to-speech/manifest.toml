@@ -1,0 +1,95 @@
+id = "text_to_speech"
+title = "Text to Speech"
+description = "Speak a piece of text out loud in a voice you describe (Qwen3-TTS, ten languages incl. German). Use this for video narration, voice-overs and audio clips: write the line in `text`, describe the speaker in `voice` ('deutscher Werbesprecher, männlich, 40, warme tiefe Stimme, ruhig'), and the tool returns an audio file. Hold `seed` FIXED across every line of the same script — the seed plus the description is what makes it the same speaker each time. Returns audio you can pass to `render_video` as a narration track, or to `comfyui_talking_video` for a lip-synced presenter."
+output_kind = "audio"
+output_node_id = "2"
+output_filename_prefix = "llmgw-text-to-speech"
+
+[[params]]
+key = "text"
+node_id = "1"
+input_key = "text"
+required = true
+description = "What should be said, as plain prose. Punctuation drives the rhythm — commas and full stops become real pauses, so write it the way it should be spoken rather than as a bullet list. Numbers, currencies and abbreviations are read out as written ('9,99 €' → 'neun Euro neunundneunzig'), so spell out anything you want pronounced a particular way. One or two sentences per call gives the most control over timing; a whole paragraph works but you lose the ability to place individual lines on a timeline."
+
+  [params.schema]
+  type = "string"
+  max_length = 3000
+
+[[params]]
+key = "voice"
+node_id = "1"
+input_key = "instruct"
+required = true
+description = "Describe the speaker in prose, in any language: age, gender, timbre, accent, pace, mood. E.g. 'deutsche Sprecherin, etwa 30, freundlich und energisch, klare Aussprache, leicht lächelnd' or 'documentary narrator, male, deep and slow, factual, no advertising enthusiasm'. In mode `design` (the default) this description IS the voice — none of the nine built-in speakers is a native German speaker, so for German this is the better route. In mode `preset` the same field becomes stage direction for the chosen `speaker` instead ('ruhig, mit klarer Betonung')."
+
+  [params.schema]
+  type = "string"
+  max_length = 1000
+
+[[params]]
+key = "mode"
+node_id = "1"
+input_key = "mode"
+description = "`design` invents a voice from your `voice` description — the default, and the right choice for German. `preset` uses one of the nine built-in timbres named in `speaker` and treats `voice` as direction for it; the presets are native Chinese, English, Japanese or Korean speakers, so they carry a foreign accent in other languages."
+default = "design"
+
+  [params.schema]
+  type = "string"
+  enum_values = ["design", "preset"]
+
+[[params]]
+key = "speaker"
+node_id = "1"
+input_key = "speaker"
+description = "Which built-in timbre to use — only consulted when `mode` is `preset`. Ryan (dynamic male, EN), Aiden (bright American male, EN), Vivian (bright young female, ZH), Serena (warm young female, ZH), Uncle_Fu (low mellow male, ZH), Dylan (Beijing male, ZH), Eric (Chengdu male, ZH), Ono_Anna (playful female, JA), Sohee (warm female, KO)."
+default = "Ryan"
+
+  [params.schema]
+  type = "string"
+  enum_values = [
+    "Ryan",
+    "Aiden",
+    "Vivian",
+    "Serena",
+    "Uncle_Fu",
+    "Dylan",
+    "Eric",
+    "Ono_Anna",
+    "Sohee",
+  ]
+
+[[params]]
+key = "language"
+node_id = "1"
+input_key = "language"
+description = "Language to speak in. `Auto` detects it from the text and is usually right; set it explicitly when the text mixes languages or carries English product names inside a German sentence and you want German pronunciation rules to win."
+default = "Auto"
+
+  [params.schema]
+  type = "string"
+  enum_values = [
+    "Auto",
+    "German",
+    "English",
+    "Chinese",
+    "French",
+    "Italian",
+    "Japanese",
+    "Korean",
+    "Portuguese",
+    "Russian",
+    "Spanish",
+  ]
+
+[[params]]
+key = "seed"
+node_id = "1"
+input_key = "seed"
+description = "Random seed — and the thing that makes a speaker reproducible. The same `voice` description with the same seed produces the same voice, so KEEP IT UNCHANGED for every line of one narration, or the narrator quietly turns into a different person between sentences. Change it only to re-roll a voice you didn't like."
+default = 7
+
+  [params.schema]
+  type = "integer"
+  min = 0
+  max = 4294967295
