@@ -1,0 +1,33 @@
+{
+  "1": {
+    "class_type": "LoadAudio",
+    "_meta": { "title": "Reference recording" },
+    "inputs": {
+      "audio": "{{reference_audio}}"
+    }
+  },
+  "2": {
+    "class_type": "LlmgwQwen3TTS",
+    "_meta": { "title": "Qwen3-TTS (clone)" },
+    "inputs": {
+      "text": "{{text}}",
+      "mode": "clone",
+      "language": "{{language}}",
+      "instruct": "",
+      "speaker": "Ryan",
+      "size": "1.7B",
+      "seed": "{{seed}}",
+      "reference_audio": ["1", 0],
+      "reference_text": "{{reference_text}}"
+    }
+  },
+  "3": {
+    "class_type": "SaveAudioMP3",
+    "_meta": { "title": "Save speech" },
+    "inputs": {
+      "filename_prefix": "llmgw-clone-voice",
+      "quality": "320k",
+      "audio": ["2", 0]
+    }
+  }
+}

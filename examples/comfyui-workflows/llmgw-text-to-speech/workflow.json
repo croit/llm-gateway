@@ -1,0 +1,24 @@
+{
+  "1": {
+    "class_type": "LlmgwQwen3TTS",
+    "_meta": { "title": "Qwen3-TTS" },
+    "inputs": {
+      "text": "{{text}}",
+      "mode": "{{mode}}",
+      "language": "{{language}}",
+      "instruct": "{{voice}}",
+      "speaker": "{{speaker}}",
+      "size": "1.7B",
+      "seed": "{{seed}}"
+    }
+  },
+  "2": {
+    "class_type": "SaveAudioMP3",
+    "_meta": { "title": "Save speech" },
+    "inputs": {
+      "filename_prefix": "llmgw-text-to-speech",
+      "quality": "320k",
+      "audio": ["1", 0]
+    }
+  }
+}
