@@ -53,7 +53,8 @@ Migration `0042_upstream_config_db.sql` created:
 | `pool_models` | Pool-level fallback model IDs |
 | `backend_models` | Backend-level static model IDs |
 | `backend_aliases` | Client-facing alias → real model mapping |
-| `pool_voices` | Language → voice map for speech pools |
+| `pool_voices` | Language → voice map for speech pools (which voice to *use*) |
+| `pool_offer_voices` | Voices a speech pool offers users to *choose* between (migration `0057`) |
 | `fallback_models` | Per-kind unknown-model fallback |
 
 Plus 9 new columns on `model_defaults` for capabilities + fallback refs.

@@ -568,6 +568,7 @@ mod tests {
     fn image_pool(base_url: &str) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             compliance: Default::default(),
             enforce_limits: true,
@@ -587,6 +588,7 @@ mod tests {
         backend.supports_edit = true;
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             compliance: Compliance { gdpr, nda: true },
             enforce_limits: true,

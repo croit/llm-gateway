@@ -739,6 +739,9 @@ fn render_pool_form(
     let voices = existing
         .map(|p| super::pools::voice_lines(&p.voices))
         .unwrap_or_default();
+    let offer_voices = existing
+        .map(|p| p.offer_voices.join("\n"))
+        .unwrap_or_default();
     let assigned: Vec<String> = existing.map(|p| p.backends.clone()).unwrap_or_default();
     let sort_order_str = sort_order.to_string();
     let is_speech = kind == "speech";
@@ -775,6 +778,7 @@ fn render_pool_form(
     // only for speech pools; edit forms have no signal (server decides).
     let kind_select = pool_kind_select(&kind_opts, is_add);
     let voices_field = render_pool_voices_field(lang, &voices, is_add, is_speech);
+    let offer_voices_field = render_pool_offer_voices_field(lang, &offer_voices, is_add, is_speech);
     let save_key = if is_edit {
         "pools-save-pool"
     } else {
@@ -833,6 +837,7 @@ fn render_pool_form(
                 span(class: "text-xs text-base-content/50") { (t(lang, "pools-field-allowed-groups-hint")) }
             }
             (voices_field)
+            (offer_voices_field)
             fieldset(class: "flex flex-col gap-1") {
                 span(class: "text-xs opacity-70") { (t(lang, "pools-field-backends")) }
                 if backend_boxes.is_empty() {
@@ -914,6 +919,48 @@ fn render_pool_voices_field(lang: Lang, voices: &str, is_add: bool, is_speech: b
                     name: "voices", class: "textarea textarea-bordered textarea-sm font-mono w-full",
                     rows: "2", placeholder: "de=de-voice\nen=en-voice"
                 ) { (voices) }
+            }
+        }
+        .to_html()
+    }
+}
+
+/// The selectable-voices textarea — the menu the per-user voice picker shows.
+/// Same speech-only visibility rule as [`render_pool_voices_field`]; kept a
+/// separate field because the two answer different questions (which voice for a
+/// language vs. which voices a user may choose between).
+fn render_pool_offer_voices_field(
+    lang: Lang,
+    offer_voices: &str,
+    is_add: bool,
+    is_speech: bool,
+) -> Html {
+    if !is_add && !is_speech {
+        return html! {}.to_html();
+    }
+    let offer_voices = offer_voices.to_string();
+    let label = t(lang, "pools-field-offer-voices");
+    if is_add {
+        html! {
+            label(class: "flex flex-col gap-1", "data-show": "$addPoolKind === 'speech'") {
+                span(class: "text-xs opacity-70") { (label) }
+                textarea(
+                    name: "offer_voices",
+                    class: "textarea textarea-bordered textarea-sm font-mono w-full",
+                    rows: "2", placeholder: "alloy\nmarin\ncedar"
+                ) { (offer_voices) }
+            }
+        }
+        .to_html()
+    } else {
+        html! {
+            label(class: "flex flex-col gap-1") {
+                span(class: "text-xs opacity-70") { (label) }
+                textarea(
+                    name: "offer_voices",
+                    class: "textarea textarea-bordered textarea-sm font-mono w-full",
+                    rows: "2", placeholder: "alloy\nmarin\ncedar"
+                ) { (offer_voices) }
             }
         }
         .to_html()
@@ -1385,6 +1432,7 @@ mod tests {
             backends: vec!["gpu-01".into()],
             models: vec!["qwen-32b".into()],
             voices: vec![],
+            offer_voices: vec![],
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
         }

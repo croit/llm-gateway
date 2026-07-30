@@ -58,6 +58,7 @@ async fn seed_admin(state: &gateway::rama_server::RamaState, user_id: &str) -> S
             created_at: now,
             updated_at: now,
             timezone: None,
+            speech_voice: None,
         },
     )
     .await

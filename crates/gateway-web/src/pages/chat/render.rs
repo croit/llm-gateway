@@ -165,6 +165,14 @@ pub(super) struct ChatPage<'a> {
     /// *and* the user has a transcription model (the full loop needs both).
     /// Shows the composer's voice toggle + push-to-talk control.
     pub voice_available: bool,
+    /// Voices the caller's speech pools advertise, for the header's voice
+    /// picker. Fewer than two means there is nothing to choose and the picker
+    /// is left out entirely.
+    pub speech_voices: &'a [String],
+    /// The voice this user picked, or `None` for the operator's
+    /// language→voice default. Seeds the picker's selected option, so a reload
+    /// shows what is actually in force rather than the first option.
+    pub speech_voice: Option<&'a str>,
     /// UI language for this render's own chrome (header pickers, composer
     /// toolbar, popovers) — threaded down into `session_core::render` too.
     pub lang: Lang,
@@ -217,6 +225,28 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
     let compliance_signals = compliance_signals(page.models);
     let voice_models: Vec<String> = page.transcription_models.to_vec();
     let has_voice = !voice_models.is_empty();
+    // Spoken-reply voice picker. Only worth showing when replies can actually
+    // be spoken *and* the operator declared more than one voice — with a single
+    // voice on offer there is nothing to choose. The first option is
+    // "no preference" (empty value), which keeps the pool's language→voice map
+    // in charge; the rest are the declared ids. `speech_voice` seeds the
+    // selection so a reload reflects what is in force, not the first option.
+    let show_tts_voice = page.voice_available && page.speech_voices.len() >= 2;
+    let tts_voice_option_html: Vec<Html> = if show_tts_voice {
+        let mut opts = vec![crate::pages::select_option(
+            "",
+            &t(lang, "chat-render-tts-voice-default"),
+            page.speech_voice.is_none(),
+        )];
+        opts.extend(
+            page.speech_voices
+                .iter()
+                .map(|v| crate::pages::select_option(v, v, page.speech_voice == Some(v.as_str()))),
+        );
+        opts
+    } else {
+        Vec::new()
+    };
     let session_id = page.active.id.clone();
     let turns_owned: Vec<TurnWithTools> = page.turns.to_vec();
     let in_flight_tail_url = page
@@ -356,6 +386,23 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
                             for m in voice_models.iter() {
                                 option(value: (m.clone())) { (m.clone()) }
                             }
+                        }
+                    }
+                }
+                // The spoken-reply counterpart to the mic picker above: which
+                // voice the assistant answers *in*. `app.ts` persists a change
+                // to `POST /api/v0/me/speech_voice`; the speech path reads the
+                // stored value, so no client state rides along per request.
+                if show_tts_voice {
+                    div(class: "flex items-center gap-1.5 text-sm") {
+                        (icons::waveform(14))
+                        select(
+                            id: "tts-voice",
+                            "data-tts-voice": "1",
+                            "aria-label": (t(lang, "chat-render-tts-voice-aria")),
+                            class: "select select-bordered select-sm chat-model-select"
+                        ) {
+                            for o in tts_voice_option_html.iter() { (o.clone()) }
                         }
                     }
                 }
@@ -1553,9 +1600,71 @@ mod tests {
             assets: &[],
             compacted_up_to_seq: None,
             voice_available: false,
+            speech_voices: &[],
+            speech_voice: None,
             lang: Lang::En,
         })
         .to_string()
+    }
+
+    /// The header with the spoken-reply voice picker in play: voice mode on,
+    /// `voices` declared by the operator, `picked` stored on the user row.
+    fn page_body_with_voices(voices: &[&str], picked: Option<&str>) -> String {
+        let s = session();
+        let owned: Vec<String> = voices.iter().map(|v| (*v).to_string()).collect();
+        render_chat_page(ChatPage {
+            active: &s,
+            turns: &[],
+            in_flight_turn_id: None,
+            models: &[],
+            transcription_models: &["whisper-1".to_string()],
+            error_msg: None,
+            read_only: false,
+            shared: false,
+            effort: gateway_core::server::reasoning::Effort::Standard,
+            capabilities: &[],
+            document_canvas_html: None,
+            assets: &[],
+            compacted_up_to_seq: None,
+            voice_available: true,
+            speech_voices: &owned,
+            speech_voice: picked,
+            lang: Lang::En,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn voice_picker_preselects_the_stored_voice_on_load() {
+        // The initial render — not a change event — has to carry the selection,
+        // or a reload silently shows the first option while a different voice
+        // is actually in force.
+        let html = page_body_with_voices(&["alloy", "nova", "onyx"], Some("onyx"));
+        assert!(html.contains("data-tts-voice"), "picker missing: {html}");
+        assert!(
+            html.contains(r#"<option value="onyx" selected"#),
+            "stored voice not preselected: {html}"
+        );
+        // Exactly one option may be selected, and it must not be the default
+        // entry when the user has a pick.
+        assert_eq!(html.matches(r#"selected="selected""#).count(), 1, "{html}");
+    }
+
+    #[test]
+    fn voice_picker_defaults_to_the_no_preference_entry() {
+        let html = page_body_with_voices(&["alloy", "nova"], None);
+        assert!(
+            html.contains(r#"<option value="" selected"#),
+            "no-preference entry not preselected: {html}"
+        );
+    }
+
+    #[test]
+    fn voice_picker_is_absent_when_there_is_nothing_to_choose() {
+        // One declared voice is not a choice, and no speech pool at all is
+        // certainly not one — neither may render a picker.
+        assert!(!page_body_with_voices(&["alloy"], None).contains("data-tts-voice"));
+        assert!(!page_body(None).contains("data-tts-voice"));
     }
 
     /// An assistant turn that recorded `model` (what the load path reads back to
@@ -1608,6 +1717,8 @@ mod tests {
             assets: &[],
             compacted_up_to_seq: None,
             voice_available: false,
+            speech_voices: &[],
+            speech_voice: None,
             lang: Lang::En,
         })
         .to_string()

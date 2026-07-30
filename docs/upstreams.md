@@ -30,6 +30,8 @@ A **backend** belongs to one pool and carries a name, base URL, an API key (ente
 
 A **speech** pool also takes an optional voice map — one voice id per spoken language (lowercase ISO-639-1), plus a default used when no language matches; voice mode resolves the voice from the language the STT detected. Unlike other kinds, a speech pool has **no unknown-model fallback** — a mistyped model or voice just surfaces the backend's own error. The chat UI's voice mode appears only when both a speech pool and a transcription model exist (see [`ui.md`](ui.md)).
 
+Beside the map, a speech pool takes a list of **selectable voices** (`offer_voices`; one id per line in the admin form, order preserved). That is a different question from the map's: the map answers "which voice for German" and holds exactly one voice per language, while the list is the menu the chat header's per-user voice picker shows — three German voices are expressible in the list and not in the map. Leave it empty and the picker falls back to offering whatever the map resolves to, which in a single-voice deployment is one entry and hides the picker. A user's stored pick wins over the map on every synthesis, but only while it is still on the list (or in the map): drop a voice from the config and everyone who had picked it silently returns to the default rather than sending the provider an id it doesn't know.
+
 An **ocr** pool is used internally for document parsing and is not exposed through
 the public chat model list. Its backend is an internal document-aware OCR
 sidecar, not the raw vLLM OpenAI endpoint. The sidecar may use the official

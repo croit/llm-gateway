@@ -72,6 +72,7 @@ async fn make_admin(state: &gateway::rama_server::RamaState, user_id: &str) {
             created_at: now,
             updated_at: now,
             timezone: None,
+            speech_voice: None,
         },
     )
     .await

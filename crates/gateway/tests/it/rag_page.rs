@@ -44,6 +44,7 @@ async fn seed_session_with_roles(
             created_at: now,
             updated_at: now,
             timezone: None,
+            speech_voice: None,
         },
     )
     .await
@@ -266,6 +267,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
         "embed".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -292,6 +294,7 @@ async fn create_form_renders_select_when_embedding_pool_is_configured() {
         "chat".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),

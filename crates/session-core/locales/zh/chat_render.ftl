@@ -20,6 +20,8 @@ chat-render-canvas-close-title = 关闭画布
 chat-render-model-placeholder = 模型（例如 gpt-4o-mini）
 chat-render-model-aria = 聊天模型
 chat-render-voice-model-aria = 语音模型
+chat-render-tts-voice-aria = 朗读语音
+chat-render-tts-voice-default = 默认语音
 
 chat-render-model-non-gdpr = { $id }（不符合 GDPR）
 chat-render-model-confidential = { $id }（保密限制）

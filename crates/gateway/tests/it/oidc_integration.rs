@@ -161,6 +161,7 @@ async fn state_with_oidc(idp_uri: &str, roles_claim: Option<&str>) -> RamaState 
         compliance: Default::default(),
         enforce_limits: true,
         voices: Default::default(),
+        offer_voices: Vec::new(),
         allowed_groups: Vec::new(),
         kind: PoolKind::Chat,
         strategy: upstreams::config::PickerStrategy::RoundRobin,

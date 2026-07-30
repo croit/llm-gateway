@@ -149,6 +149,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 timezone: None,
+                speech_voice: None,
             },
         )
         .await

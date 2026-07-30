@@ -56,6 +56,16 @@ pub struct UpstreamPoolConfig {
     /// ids. Empty ⇒ always send the backend/default voice.
     #[serde(default)]
     pub voices: HashMap<String, String>,
+    /// Voices this pool offers users to *choose* from, in menu order. Only
+    /// meaningful for `kind = "speech"` pools.
+    ///
+    /// Separate from [`Self::voices`] because that is a language → voice map
+    /// and holds one voice per language: it answers "which voice for German",
+    /// not "which German voices may a user pick". Empty (the default) means no
+    /// menu, and the per-user picker falls back to whatever `voices` resolves
+    /// to — one entry in a single-voice deployment, which hides the picker.
+    #[serde(default)]
+    pub offer_voices: Vec<String>,
     /// Gateway-group names allowed to see + route to this pool. Empty (default)
     /// = unrestricted. Managed in `/admin/upstreams` (DB), not the config file;
     /// this field exists so the DB→registry bridge can carry it. See

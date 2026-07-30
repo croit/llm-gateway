@@ -16,6 +16,7 @@ pools-field-fallback-offline-placeholder = servido cuando todos los backends est
 pools-field-models = Modelos servidos (lista de permitidos, separados por comas)
 pools-field-models-hint = Si se define, solo se sirven estos ids de un backend con sondeo /models; el resto se muestra tachado. En blanco = servir todo lo que informa el backend.
 pools-field-voices = Voces (lang=voice por línea)
+pools-field-offer-voices = Voces seleccionables (una por línea, elige el usuario)
 pools-field-backends = Backends
 pools-no-backends = Aún no hay backends definidos. Añada uno primero en la página de Backends.
 pools-field-gdpr = Conforme al GDPR

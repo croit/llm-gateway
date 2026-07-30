@@ -23,6 +23,8 @@ chat-render-canvas-close-title = Canvas schließen
 chat-render-model-placeholder = Modell (z. B. gpt-4o-mini)
 chat-render-model-aria = Chat-Modell
 chat-render-voice-model-aria = Sprachmodell
+chat-render-tts-voice-aria = Stimme der Sprachausgabe
+chat-render-tts-voice-default = Standardstimme
 
 chat-render-model-non-gdpr = { $id } (nicht DSGVO-konform)
 chat-render-model-confidential = { $id } (vertraulichkeitsbeschränkt)

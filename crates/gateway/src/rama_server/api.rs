@@ -440,6 +440,63 @@ pub async fn set_timezone(State(state): State<Arc<RamaState>>, req: Request) -> 
     json_ok(&json!({ "ok": true, "timezone": parsed.timezone }))
 }
 
+/// POST /api/v0/me/speech_voice — store (or clear) the voice the caller wants
+/// spoken replies in. Posted by the chat header's voice picker.
+/// Body: `{ "voice": "onyx" }`, or `{ "voice": null }` to go back to the
+/// operator's language→voice default.
+///
+/// The id is checked against the voices the caller's own speech pools
+/// advertise. The speech path re-checks on every call (an operator can retire a
+/// voice after it was picked), so this validation is not what makes the feature
+/// safe — it's what gives the picker an honest 400 instead of storing a value
+/// that would silently fall back forever.
+pub async fn set_speech_voice(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let session = match require_session(&state, &req).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return invalid_request(&msg),
+    };
+    #[derive(serde::Deserialize)]
+    struct Body {
+        #[serde(default)]
+        voice: Option<String>,
+    }
+    let parsed: Body = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(err) => return invalid_request(&format!("expected {{\"voice\":\"…\"}}: {err}")),
+    };
+    // An empty string is the picker's "no preference" option, same as null.
+    let voice = parsed
+        .voice
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if let Some(v) = &voice {
+        let roles = users::find_by_id(&state.db, &session.user_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.roles)
+            .unwrap_or_default();
+        let allowed = state
+            .upstreams
+            .speech_voices_for(&state.pool_access_for(&roles));
+        if !allowed.contains(v) {
+            return invalid_request(&format!(
+                "`{v}` is not one of this deployment's speech voices"
+            ));
+        }
+    }
+    if let Err(err) = users::set_speech_voice(&state.db, &session.user_id, voice.as_deref()).await {
+        tracing::warn!(error = %err, "users set_speech_voice");
+        return internal_error("could not save the speech voice");
+    }
+    json_ok(&json!({ "ok": true, "voice": voice }))
+}
+
 /// POST /api/v0/me/location — store the caller's browser-reported
 /// position on their user row. Posted from `geo.ts` once
 /// `navigator.geolocation.getCurrentPosition` resolves (the `/tools`

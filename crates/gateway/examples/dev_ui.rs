@@ -171,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
         "chat".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -197,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
         "voice".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -228,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
         "speech".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -256,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
         "image".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -467,6 +471,7 @@ async fn main() -> anyhow::Result<()> {
             created_at: now,
             updated_at: now,
             timezone: None,
+            speech_voice: None,
         },
     )
     .await?;
@@ -484,6 +489,7 @@ async fn main() -> anyhow::Result<()> {
             created_at: now,
             updated_at: now,
             timezone: None,
+            speech_voice: None,
         },
     )
     .await?;
@@ -877,6 +883,7 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
                 created_at: unow,
                 updated_at: unow,
                 timezone: None,
+                speech_voice: None,
             },
         )
         .await?;

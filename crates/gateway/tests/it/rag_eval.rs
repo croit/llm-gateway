@@ -86,6 +86,7 @@ fn registry_pointed_at(upstream_url: &str) -> Arc<UpstreamRegistry> {
         "embed".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),

@@ -56,6 +56,7 @@ async fn state_with_streaming_chat(upstream_uri: &str) -> RamaState {
         "pool".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
