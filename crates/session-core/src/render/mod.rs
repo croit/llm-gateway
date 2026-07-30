@@ -802,4 +802,73 @@ mod tests {
         assert_eq!(html_unescape("&quot;hello&quot;"), "\"hello\"");
         assert_eq!(html_unescape("don&#39;t"), "don't");
     }
+
+    /// A model that cannot get a file to the user invents its own URL scheme
+    /// for one. The markdown crate then drops the destination it can't emit
+    /// but keeps the anchor, leaving a link that looks clickable and does
+    /// nothing — the user clicks, nothing happens, and there is no way for
+    /// them to learn the link was never real. Degrade it to plain text.
+    #[test]
+    fn invented_url_schemes_never_render_as_a_link() {
+        for src in [
+            "[Download croit-cowork-context.zip](attachment:4be8a013-2dd4/bundle.zip)",
+            "[the bundle](sandbox_file:/work/out/bundle.zip)",
+            "[grab it](file:///work/bundle.zip)",
+        ] {
+            let html = render_markdown(src);
+            assert!(
+                !html.contains("<a"),
+                "must not render an anchor for {src}: {html}"
+            );
+        }
+        // The label survives, so the sentence still reads.
+        assert!(
+            render_markdown("[Download the bundle](attachment:x/y.zip)")
+                .contains("Download the bundle")
+        );
+    }
+
+    #[test]
+    fn real_links_still_render() {
+        // The rule keys on a non-web *scheme*, so nothing legitimate is caught:
+        // web links, relative paths, and anchors all keep their href.
+        for src in [
+            "[docs](https://example.com/a)",
+            "[mail](mailto:a@example.com)",
+            "[chip](/chat/attachment/t-1/report.pdf)",
+            "[here](#section)",
+            "[sibling](report.md)",
+        ] {
+            assert!(
+                render_markdown(src).contains("<a href="),
+                "must stay a link: {src}"
+            );
+        }
+    }
+
+    /// End-to-end at the bubble: an assistant turn that typed an attachment
+    /// stub instead of calling a tool renders as prose with nothing that
+    /// resembles a delivered file.
+    #[test]
+    fn a_typed_attachment_stub_renders_as_nothing() {
+        let stub = "[attached file=\"bundle.zip\" mime=\"application/zip\" size=40709 \
+                    id=\"4be8a013-2dd4-41f5-9ea7-9a210b2f4ab1/bundle.zip\"] \
+                    (call the fetch_attachment tool with this id to read its contents)";
+        let segs = assistant_segments(
+            &format!("Here is the bundle.\n\n{stub}\n\nUnzip it into your project root."),
+            "t-1",
+            Lang::En,
+        );
+        let prose: String = segs
+            .iter()
+            .map(|s| match s {
+                AssistantSegment::Prose(html) => html.clone(),
+                AssistantSegment::Attachment(a) => panic!("forged stub became a chip: {a:?}"),
+            })
+            .collect();
+        assert!(!prose.contains("attached file="), "{prose}");
+        assert!(!prose.contains("4be8a013"), "{prose}");
+        assert!(prose.contains("Here is the bundle."), "{prose}");
+        assert!(prose.contains("Unzip it"), "{prose}");
+    }
 }

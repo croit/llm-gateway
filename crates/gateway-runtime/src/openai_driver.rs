@@ -87,6 +87,34 @@ fn configure_final_tool_round(body: &mut serde_json::Value) {
     }
 }
 
+/// Tell the model, in words, that the round it is about to take is its last.
+///
+/// `configure_final_tool_round` withholds the tools, which guarantees *some*
+/// text comes back — but a model that doesn't know why its tools vanished
+/// writes the text it was going to write anyway: the preamble for the tool call
+/// it intended to make next ("All files written. Let me bundle them into a zip
+/// for one download."). The turn then ends on a promise, the user cannot tell a
+/// finished turn from a hung one, and asking "did that complete?" gets an answer
+/// built from what the model *meant* to do rather than what it did.
+///
+/// So the mechanical signal gets a stated one alongside it. Appended to the
+/// request only — never to the persisted `messages` — so it applies to this
+/// round and leaves no trace in the conversation.
+fn announce_final_round(body: &mut serde_json::Value) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    messages.push(serde_json::json!({
+        "role": "system",
+        "content": "This is your FINAL round for this turn: your tool budget is spent and no \
+                    further tool call can run, so nothing you say you are about to do will \
+                    happen. Answer now, from what you already have. State plainly what you did \
+                    and did not manage to finish; do not write a preamble for work you cannot \
+                    do, and do not claim any file was produced, attached or made downloadable \
+                    unless a tool result in this turn actually says so.",
+    }));
+}
+
 /// Ensure every tool call in one round has a non-empty id that is unique
 /// *within the turn*. Some OpenAI-compatible backends (qwen / vLLM are the
 /// usual offenders) emit `tool_call_id`s that are empty or recycled per
@@ -681,6 +709,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             runner::inject_tools(&mut request_body, &tool_source, &allowed_tools)
                 .map_err(upstream_err)?;
             configure_final_tool_round(&mut request_body);
+            announce_final_round(&mut request_body);
             tracing::info!(
                 max_rounds,
                 "tool-round budget reached; requesting final answer with tool choice none"
@@ -1865,6 +1894,19 @@ fn message_for_history(turn: &Turn) -> Option<serde_json::Value> {
             // render tool, producing "here's your PDF" replies whose
             // chips point at a long-deleted turn. The stub gives it the
             // `fetch_attachment` id and nothing to copy.
+            // Contradict any stub the model wrote *itself* rather than getting
+            // from a tool. Replaying it verbatim is what let a model that had
+            // typed "[attached file=…]" read its own past turn as proof it had
+            // delivered the file, so every "I can't download it" was answered
+            // with another forgery instead of an upload. The renderer drops
+            // these for the user (`strip_replay_stubs`); here the model is
+            // told, in the one place it will see it, that nothing was attached.
+            //
+            // Order matters and is load-bearing: this runs on the *stored* text,
+            // BEFORE `strip_markers_for_replay` synthesises the real stubs.
+            // Reversed, it would shred the genuine ones it had just created —
+            // a stub is only a forgery if it was already in the row.
+            let content = session_core::attachments::contradict_replay_stubs(&content);
             let content = gateway_features::server::chat_attachments::strip_markers_for_replay(
                 &content, &turn.id,
             );
@@ -1991,12 +2033,13 @@ fn reasoning_overrides_from_row(
 #[cfg(test)]
 mod tests {
     use super::{
-        THINK_TAGS, ToolCallAcc, ToolCallStatus, configure_final_tool_round,
-        ensure_unique_tool_call_ids, inject_ocr_blocks, ocr_activity_result, ocr_context_block,
-        render_active_skills, render_skill_listing, take_safe_content,
+        THINK_TAGS, ToolCallAcc, ToolCallStatus, announce_final_round, configure_final_tool_round,
+        ensure_unique_tool_call_ids, inject_ocr_blocks, message_for_history, ocr_activity_result,
+        ocr_context_block, render_active_skills, render_skill_listing, take_safe_content,
     };
     use gateway_features::server::ocr::{OcrError, OcrOutcome};
     use gateway_features::server::skills::{Skill, SkillRegistry};
+    use session_core::db::{Turn, TurnRole, TurnStatus};
     use std::path::PathBuf;
 
     fn outcome(markdown: &str) -> OcrOutcome {
@@ -2147,6 +2190,73 @@ mod tests {
         let mut body = serde_json::json!({"messages": []});
         configure_final_tool_round(&mut body);
         assert_eq!(body["tool_choice"], serde_json::json!("none"));
+    }
+
+    /// Withholding the tools guarantees text comes back, but not that the text
+    /// is an *answer*: a model that doesn't know why its tools vanished writes
+    /// the preamble for the call it meant to make next ("Let me bundle those
+    /// into a zip"), and the turn ends on a promise nothing will keep. So the
+    /// mechanical signal gets a stated one next to it.
+    #[test]
+    fn the_final_round_tells_the_model_it_is_the_final_round() {
+        let mut body = serde_json::json!({
+            "messages": [{"role": "user", "content": "make me the docs"}]
+        });
+        announce_final_round(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "appended, not replaced");
+        assert_eq!(messages[0]["content"], "make me the docs");
+        let note = messages[1]["content"].as_str().unwrap();
+        assert_eq!(messages[1]["role"], "system");
+        assert!(note.contains("FINAL round"), "{note}");
+        // The two failure modes it exists to head off.
+        assert!(note.contains("do not write a preamble"), "{note}");
+        assert!(note.contains("do not claim any file"), "{note}");
+    }
+
+    #[test]
+    fn announcing_a_final_round_on_a_bodyless_request_is_a_no_op() {
+        // Defensive: a request shape without `messages` must not panic.
+        let mut body = serde_json::json!({"model": "m"});
+        announce_final_round(&mut body);
+        assert!(body.get("messages").is_none());
+    }
+
+    /// A turn in which the model *typed* an attachment stub instead of calling
+    /// a tool must not be replayed as if a file had been delivered — that is
+    /// what let it read its own forgery back as proof and answer every "I can't
+    /// download it" with another one.
+    #[test]
+    fn a_typed_attachment_stub_is_contradicted_in_replayed_history() {
+        let turn = Turn {
+            id: "t-1".into(),
+            session_id: "s-1".into(),
+            seq: 1,
+            role: TurnRole::Assistant,
+            user_content: None,
+            model: None,
+            content: Some(
+                "Above is the bundle:\n\n[attached file=\"bundle.zip\" \
+                 mime=\"application/zip\" size=40709 id=\"4be8a013-2dd4/bundle.zip\"] \
+                 (call the fetch_attachment tool with this id to read its contents)\n\n\
+                 Unzip it into your project root."
+                    .into(),
+            ),
+            reasoning: None,
+            reasoning_elapsed_ms: None,
+            reasoning_started_at: None,
+            status: TurnStatus::Completed,
+            error_message: None,
+            created_at: jiff::Timestamp::UNIX_EPOCH,
+            completed_at: None,
+        };
+        let msg = message_for_history(&turn).expect("a completed assistant turn replays");
+        let content = msg["content"].as_str().unwrap();
+        assert!(!content.contains("4be8a013"), "{content}");
+        assert!(content.contains("no file was attached here"), "{content}");
+        // The surrounding prose is still the model's own turn.
+        assert!(content.contains("Above is the bundle:"), "{content}");
+        assert!(content.contains("Unzip it"), "{content}");
     }
 
     #[test]

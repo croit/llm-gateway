@@ -27,6 +27,9 @@ pub fn render_markdown(text: &str) -> String {
     // Images in assistant prose are never real gateway attachments. Actual
     // images use gw-attachment markers and are rendered separately.
     let text = SYNTHETIC_IMAGE_RE.replace_all(text, "$1");
+    // Links whose target uses a scheme the browser can't follow become their
+    // own label — see `degrade_dead_scheme_links`.
+    let text = degrade_dead_scheme_links(&text);
     let mut options = markdown::Options::gfm();
     options.parse.constructs.label_start_image = false;
     let html = markdown::to_html_with_options(&text, &options)
@@ -141,6 +144,58 @@ static FENCED_CODE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::
 static SYNTHETIC_IMAGE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"!\[([^\]]*)\]\((?:[^)]*/)?generated-image[^)]*\)").unwrap()
 });
+
+/// A markdown link whose destination carries *some* URL scheme. Which schemes
+/// are fine is decided in [`degrade_dead_scheme_links`] — the pattern only
+/// finds candidates, because `regex` has no look-around to express "not one of
+/// these" inline.
+///
+/// `[^)\s]*` keeps a match inside a single link target, and a destination that
+/// is relative (`report.md`), rooted (`/chat/attachment/…`) or an anchor
+/// (`#section`) cannot match at all: a scheme has to be there.
+///
+/// The scheme charset admits `_`, which RFC 3986 does not. That is deliberate:
+/// what we are matching is not necessarily a *real* scheme but whatever a model
+/// typed in that position — `sandbox_file:/work/out.zip` is a real observed
+/// case, and the markdown crate does treat it as a destination (it renders
+/// `href=""`). No renderable scheme contains an underscore, so widening here
+/// cannot swallow a working link.
+static SCHEME_LINK_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\[([^\]]*)\]\(([A-Za-z][A-Za-z0-9+.\-_]*):[^)\s]*\)").unwrap()
+});
+
+/// Schemes the markdown crate will actually emit an `href` for. Anything else
+/// it drops.
+const RENDERABLE_SCHEMES: &[&str] = &["http", "https", "mailto", "irc", "ircs", "xmpp"];
+
+/// Replace links the browser could never follow with their own label text —
+/// the same call `label_start_image = false` makes for a hallucinated image.
+///
+/// Left alone these produce the worst outcome available: the markdown crate
+/// drops a destination whose scheme it doesn't support but keeps the anchor, so
+/// the page shows a styled, underlined "Download report.zip" that does
+/// *nothing at all* when clicked — no navigation, no error, not even a 404. A
+/// user told to click it, who clicks and sees nothing happen, has no way to
+/// find out the link was never real; they reasonably report that the download
+/// is broken, which is not what is wrong.
+///
+/// Every observed instance is a model inventing a file-handle scheme of its own
+/// (`attachment:<turn>/<file>`, `sandbox_file:/work/out.zip`) after a real
+/// upload path failed. A file reaches the user as a chip, via `offer_download`
+/// or `upload_attachment`; prose is not a delivery mechanism, so prose that
+/// imitates one is better off reading as the plain text it is.
+fn degrade_dead_scheme_links(text: &str) -> std::borrow::Cow<'_, str> {
+    SCHEME_LINK_RE.replace_all(text, |caps: &regex::Captures<'_>| {
+        if RENDERABLE_SCHEMES
+            .iter()
+            .any(|s| caps[2].eq_ignore_ascii_case(s))
+        {
+            caps[0].to_string()
+        } else {
+            caps[1].to_string()
+        }
+    })
+}
 
 pub(crate) fn highlight_fenced_code_blocks(html: &str) -> String {
     FENCED_CODE_RE

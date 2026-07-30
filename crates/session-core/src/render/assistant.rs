@@ -21,6 +21,14 @@ pub(crate) fn assistant_segments(
 ) -> Vec<AssistantSegment> {
     // Copy-button labels for the fenced code blocks in this reply's prose.
     let copy = CopyLabels::for_lang(lang);
+    // Drop any `[attached file=… id=…]` line the model typed itself. That is
+    // the *replay stub* the driver synthesises for the model's own context, so
+    // it is never legitimately part of stored content — but rendered as prose it
+    // is indistinguishable from an attachment chip that failed to draw, which
+    // sends users looking for a download that was never uploaded. Same reasoning
+    // as `split_markers_for_turn` refusing forged markers, one format later.
+    let content = crate::attachments::strip_replay_stubs(content);
+    let content = content.as_ref();
     let raw_segs = crate::attachments::split_markers_for_turn(content, turn_id);
     // Fast path: no attachment markers in the assistant content —
     // render the whole thing as one markdown block so the existing
