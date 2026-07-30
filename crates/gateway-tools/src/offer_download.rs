@@ -64,9 +64,12 @@ impl Tool for OfferDownload {
              reply, as a download chip. Pass its `id` — a `<turn_id>/<filename>` \
              id from `list_attachments`, a canvas `document_id` (from \
              `list_documents`, `create_document`, `import_file`, or a typst \
-             render — the current version is written out as a file), a sandbox \
-             artifact ref, or just a filename from this conversation (newest \
-             match wins). Reach for this whenever the user \
+             render — the current version is written out as a file), the `id` a \
+             `run_in_sandbox` result reported for a produced artifact, or just a \
+             filename from this conversation (newest match wins). A raw path \
+             inside the sandbox's working directory (`docs/backend.md`) is NOT a \
+             reference — only what a run returned in `artifacts` is. Reach for \
+             this whenever the user \
              asks to *get*, *have*, *export* or *download* something that \
              exists as a file — including files from earlier turns and internal \
              data objects that were never shown as a chip. It is also the right \
@@ -85,8 +88,10 @@ impl Tool for OfferDownload {
                         "type": "string",
                         "description": "What to hand over: a `<turn_id>/<filename>` \
                                         attachment id (from `list_attachments`, a \
-                                        replay stub, …), a canvas `document_id`, or \
-                                        a bare filename from this conversation."
+                                        replay stub, a `run_in_sandbox` artifact, …), \
+                                        a canvas `document_id`, or a bare filename \
+                                        from this conversation. Not a sandbox \
+                                        working-directory path."
                     },
                     "filename": {
                         "type": "string",

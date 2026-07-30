@@ -40,6 +40,29 @@ use crate::server::chat_attachments::{self, AttachmentRef};
 /// and turns a class of "invalid reference" errors into working calls.
 const PREFIXES: &[&str] = &["att:", "attachment:", "doc:", "document:", "file:"];
 
+/// Appended to a `NotFound` whose reference contains a `/`.
+///
+/// An attachment id (`<turn_id>/<filename>`) and a sandbox working-directory
+/// path (`docs/backend.md`) are the same shape, so a model that has just
+/// written the latter in `/work` passes exactly that — and the bare "no file
+/// named that in this conversation" reads as *your file is gone* rather than
+/// *you named the wrong store*. A model that believes its output vanished stops
+/// trying to deliver it properly and starts inventing ways to hand it over.
+///
+/// Appended rather than substituted on a guessed classification. The two shapes
+/// cannot be told apart reliably — turn ids are not required to look any
+/// particular way, so a "first segment isn't a UUID → it's a path" rule
+/// mislabels a real cross-session id — and a lookup can't disambiguate either
+/// without leaking whether another conversation holds that id. Saying both
+/// possibilities costs a sentence and is never wrong.
+const SANDBOX_PATH_HINT: &str = "If that is a path inside the sandbox's working \
+     directory, note that `/work` is a different store: nothing outside a \
+     `run_in_sandbox` call can read it. A file the sandbox produced becomes \
+     referenceable only once a run returned it in `artifacts`, under the flattened \
+     `name`/`id` shown there (a file written to `docs/backend.md` is delivered as \
+     `docs-backend.md`). If it never appeared in an `artifacts` list, it was never \
+     delivered — write it again and use the `id` the result gives you.";
+
 /// A resolved reference: which store holds the bytes, and everything the
 /// caller needs to name, size, or read them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,12 +103,18 @@ pub enum RefError {
 impl std::fmt::Display for RefError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RefError::NotFound(given) => write!(
-                f,
-                "no file or document named `{given}` in this conversation — call \
-                 `list_attachments` / `list_documents` to see what exists, or pass a \
-                 full `<turn_id>/<filename>` id"
-            ),
+            RefError::NotFound(given) => {
+                write!(
+                    f,
+                    "no file or document named `{given}` in this conversation — call \
+                     `list_attachments` / `list_documents` to see what exists, or pass a \
+                     full `<turn_id>/<filename>` id"
+                )?;
+                if given.contains('/') {
+                    write!(f, ". {SANDBOX_PATH_HINT}")?;
+                }
+                Ok(())
+            }
             RefError::Deleted(given) => write!(
                 f,
                 "canvas document `{given}` is deleted — call `undelete_document` first \
@@ -517,5 +546,40 @@ mod tests {
             resolve(&pool, None, "doc_abc", None).await,
             Err(RefError::NoSession)
         ));
+    }
+
+    /// An attachment id and a sandbox working-directory path are the same
+    /// shape — `<something>/<filename>` — so a model that has just written
+    /// `docs/backend.md` in `/work` passes exactly that here. The bare "no file
+    /// named that in this conversation" reads as *your file is gone* rather
+    /// than *you named the wrong store*, and a model that believes its output
+    /// vanished starts inventing ways to hand it over.
+    #[tokio::test]
+    async fn a_slashed_reference_also_explains_the_sandbox_store() {
+        let pool = pool().await;
+        let msg = resolve(&pool, Some("s1"), "croit-app-reference/CLAUDE.md", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        // The generic wording stays, so this reads the same everywhere it is
+        // surfaced…
+        assert!(msg.contains("no file or document named"), "{msg}");
+        assert!(msg.contains("list_attachments"), "{msg}");
+        // …and the other possibility is spelled out rather than guessed at.
+        assert!(msg.contains("working directory"), "{msg}");
+        assert!(msg.contains("artifacts"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn a_bare_filename_gets_no_sandbox_hint() {
+        // Nothing about `report.pdf` suggests a path, so the extra sentence
+        // would only be noise — and noise is how the useful half gets skipped.
+        let pool = pool().await;
+        let msg = resolve(&pool, Some("s1"), "report.pdf", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("no file or document named"), "{msg}");
+        assert!(!msg.contains("working directory"), "{msg}");
     }
 }

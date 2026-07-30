@@ -216,6 +216,16 @@ through the conversation's attachment store, not a shared volume:
 
 - every artifact a run produces is uploaded as a chat attachment (S3) and
   stays addressable for the rest of the conversation;
+- **subdirectories count.** The in-sandbox agent walks `/work` recursively, so
+  a job that writes `docs/backend.md` gets it delivered — under a *flattened*
+  name (`docs-backend.md`), because an attachment name is a single path
+  component (the S3 key is `<turn>/<name>`, and the runner's host-side read
+  deliberately only opens a plain name with `O_NOFOLLOW`). The artifact entry
+  carries `sandbox_path` so the model can match the delivered file to the path
+  it wrote. Collection skips symlinks, dot-directories, `node_modules` /
+  `__pycache__` / `site-packages` / `venv` (`HOME` is `/work`, so tool profile
+  and cache dirs land there), stops at depth 8, and caps out at 64 files with
+  `artifacts_truncated: true` rather than truncating silently;
 - a later run pulls any of them back into `/work` by listing it in
   `attachments` — by exact `<turn>/<file>` id **or just its filename**
   (newest match wins), so the model doesn't have to track turn ids;
@@ -273,6 +283,13 @@ Mechanics:
   so when the cap is reached a keep-alive request still runs its job
   single-use and simply returns no `container_id` (the turn gracefully loses
   persistence rather than the runner over-committing host RAM).
+- **A lost lease is reported, not swallowed.** Graceful degradation still means
+  `/work` empties out mid-turn, so when a call lands in a different container
+  than the previous one did, the tool result carries a `workdir_reset` note (and
+  the gateway logs a warning). Without it the model writes a file, gets
+  `exit_code: 0`, then can't find the file on the next call — and has no way to
+  tell its own mistake from the filesystem moving under it. An explicit
+  `fresh: true` is the caller's own request and is never flagged.
 
 ### Egress and the capability probe
 

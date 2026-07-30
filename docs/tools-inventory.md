@@ -191,6 +191,16 @@ session-scoped `get_version`. Another conversation's real id resolves to the
 same "not found" as a typo, so nothing leaks. A *deleted* document is its own
 error, because the fix is `undelete_document` rather than a different id.
 
+What is **not** a reference: a path inside the sandbox's working directory.
+`docs/backend.md` is the same *shape* as an attachment id, so a model that just
+wrote it in `/work` passes exactly that — and the generic "no file named that in
+this conversation" reads as *your file is gone* rather than *you named the wrong
+store*. A non-UUID first segment is therefore detected and answered with the
+real explanation (`file_refs::looks_like_sandbox_path`): `/work` is unreachable
+from outside a `run_in_sandbox` call, and a produced file becomes referenceable
+only once that call returned it in `artifacts`, under the flattened name shown
+there.
+
 Crossing over: **`import_file`** turns a text attachment into a document;
 **`offer_download`** writes a document's current version back out as a
 downloadable file. Both copy inside the gateway — content never round-trips

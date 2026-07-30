@@ -21,6 +21,8 @@
 import base64
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -54,6 +56,21 @@ SPILL_THRESHOLD = 60 * 1024
 # and the model reads the rest on demand. Kept modest so moderately-large output
 # is addressable via a ref rather than inlined.
 PRESERVE_THRESHOLD = 32 * 1024
+# Directories the produced-file walk never descends into. `HOME` is set to the
+# working directory (see the `subprocess.run` below) so anything wanting a
+# profile or cache dir — LibreOffice, matplotlib, fontconfig, chromium, pip —
+# drops one right next to the job's real output. A recursive walk without this
+# would deliver hundreds of cache files as if the job had produced them. Every
+# dot-directory is skipped for the same reason; this list is the few noisy names
+# that don't start with one.
+SKIP_DIRS = frozenset({"node_modules", "__pycache__", "site-packages", "venv"})
+# Walk depth and file-count ceilings. A job that unpacks a source tree or a
+# wheel would otherwise fan out into thousands of chat attachments; `.venv` and
+# friends are already excluded above, so these bite only on genuinely huge
+# output. Exceeding the count sets `artifacts_truncated` so the limit is stated
+# rather than silent.
+MAX_WALK_DEPTH = 8
+MAX_ARTIFACTS = 64
 
 MIME = {
     "pdf": "application/pdf",
@@ -89,8 +106,55 @@ def safe_name(name):
     return name and name not in (".", "..") and "/" not in name and "\\" not in name
 
 
+def walk_files(workdir):
+    """Every regular file under `workdir`, as `(relpath, abspath, stat)`.
+
+    Recursive, and that recursion is the point. The tool tells the model to
+    "write output files to the working directory to return them", so a model
+    asked for a documentation set writes `docs/backend.md` — and a top-level
+    `os.listdir` collected none of it. The run reported `exit_code: 0` with an
+    empty `artifacts` list, which reads as "worked, produced nothing": the one
+    shape a model cannot distinguish from its own mistake. It then either
+    retries the same way or starts claiming files it never delivered.
+
+    Symlinks are skipped rather than followed, at both the file and directory
+    level (`os.walk(followlinks=False)` plus an `S_ISREG` check on `lstat`).
+    Code in the sandbox is untrusted, so a link planted under a plausible
+    output name must not smuggle a file out of the container's rootfs — and
+    the runner's host-side read stays what it always was, a single-component
+    `O_NOFOLLOW` open (see `read_sandbox_file`).
+
+    Ordering is top-down and sorted, so top-level names are always seen before
+    the subdirectory names that flatten onto them, which is what lets
+    `flat_name` keep every pre-existing top-level name byte-identical."""
+    for dirpath, dirnames, filenames in os.walk(workdir, followlinks=False):
+        rel_dir = os.path.relpath(dirpath, workdir)
+        at_root = rel_dir == "."
+        depth = 0 if at_root else rel_dir.count(os.sep) + 1
+        # Prune in place — os.walk reads `dirnames` back to decide where to go.
+        dirnames[:] = (
+            []
+            if depth + 1 > MAX_WALK_DEPTH
+            else [
+                d
+                for d in sorted(dirnames)
+                if not d.startswith(".") and d not in SKIP_DIRS
+            ]
+        )
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue  # symlink, fifo, socket, device — never an output
+            yield (name if at_root else os.path.join(rel_dir, name)), path, st
+
+
 def snapshot(workdir):
-    """Map each regular file in `workdir` to an (size, mtime_ns) identity.
+    """Map each regular file under `workdir` to a `(size, mtime_ns)` identity,
+    keyed by path relative to `workdir`.
 
     Taken just before the job runs so artifact collection can return only the
     files THIS call created or changed. A sandbox container may be kept alive
@@ -100,16 +164,66 @@ def snapshot(workdir):
     re-delivered on every subsequent call. On a fresh container the snapshot is
     just the staged inputs, so behaviour is identical to the old single-use
     model."""
-    snap = {}
-    for entry in os.listdir(workdir):
-        path = os.path.join(workdir, entry)
-        try:
-            st = os.stat(path)
-        except OSError:
-            continue
-        if os.path.isfile(path):
-            snap[entry] = (st.st_size, st.st_mtime_ns)
-    return snap
+    return {rel: (st.st_size, st.st_mtime_ns) for rel, _path, st in walk_files(workdir)}
+
+
+def flat_name(rel, used):
+    """The single-component name a produced file is delivered under.
+
+    An artifact name becomes an attachment filename — the gateway stores it as
+    the object key `<turn_id>/<name>` and the runner opens it back out of the
+    scratch dir by plain name — so it cannot contain a separator. A file
+    produced at `docs/backend.md` is therefore delivered as `docs-backend.md`.
+
+    A top-level file keeps its name unchanged, and top-level names are
+    registered first (see `walk_files` ordering), so introducing recursion
+    cannot rename anything that already worked: a flattened `docs/backend.md`
+    yields to an existing `docs-backend.md` and takes `docs-backend-2.md`."""
+    base = rel.replace(os.sep, "-").replace("/", "-")
+    if base not in used:
+        used.add(base)
+        return base
+    stem, dot, ext = base.rpartition(".")
+    if not dot:
+        stem, ext = base, ""
+    n = 2
+    while True:
+        candidate = f"{stem}-{n}.{ext}" if ext else f"{stem}-{n}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+        n += 1
+
+
+def link_flat(src, name):
+    """Give the runner a top-level plain name for a file produced in a
+    subdirectory, without moving the file.
+
+    With host-backed scratch the runner reads produced bytes off the bind mount
+    by single-component name, deliberately: an intermediate directory could be
+    a symlink, and `O_NOFOLLOW` only protects the final component. So instead
+    of teaching that read to walk subpaths, we hand it something it already
+    accepts — a hard link at the root pointing at the same inode. The original
+    stays exactly where the job put it, so a later call in the same turn still
+    finds its own `docs/backend.md`.
+
+    The job process has already exited by the time this runs, so `src` cannot
+    be swapped between the `S_ISREG` check in `walk_files` and the link.
+    Returns False if neither the link nor a copy fallback works, in which case
+    the caller drops the file rather than reporting a name that won't read."""
+    dst = os.path.join(WORK, name)
+    try:
+        if os.path.lexists(dst):
+            os.remove(dst)
+        os.link(src, dst)
+        return True
+    except OSError:
+        pass
+    try:
+        shutil.copyfile(src, dst)
+        return True
+    except OSError:
+        return False
 
 
 def emit(resp):
@@ -255,39 +369,51 @@ def main():
             with open(fpath, "wb") as fh:
                 fh.write(full_bytes)
 
-    # Collect produced files: anything in /work that isn't an input and that
+    # Collect produced files: anything under /work that isn't an input and that
     # THIS call created or modified (i.e. changed vs the pre-run snapshot).
     # The snapshot diff is what keeps a reused container from re-delivering
     # earlier calls' outputs; on a fresh container everything is new, so this
     # is the same set as before.
+    #
+    # Materialized before the loop because the INPLACE branch creates hard links
+    # at the root as it goes, and those must not be picked up as output of this
+    # same call.
+    produced = list(walk_files(WORK))
     artifacts = []
-    for entry in sorted(os.listdir(WORK)):
-        if entry in inputs:
+    artifacts_truncated = False
+    # Seeded with the input names so a flattened subdirectory file can never
+    # shadow a file the caller staged.
+    used_names = set(inputs)
+    for rel, path, st in produced:
+        if rel in inputs:
             continue
-        path = os.path.join(WORK, entry)
-        if not os.path.isfile(path):
-            continue
-        st = os.stat(path)
-        if baseline.get(entry) == (st.st_size, st.st_mtime_ns):
+        if baseline.get(rel) == (st.st_size, st.st_mtime_ns):
             continue  # pre-existing and untouched by this call — not its output
         size = st.st_size
         # An empty file is never interesting; the size cap only applies when we
         # are the ones carrying the bytes.
         if size == 0 or (not INPLACE_ARTIFACTS and size > MAX_ARTIFACT):
             continue
+        if len(artifacts) >= MAX_ARTIFACTS:
+            artifacts_truncated = True
+            break
+        name = flat_name(rel, used_names)
         if INPLACE_ARTIFACTS:
             content = ""
+            if name != rel and not link_flat(path, name):
+                continue
         else:
             with open(path, "rb") as fh:
                 content = base64.b64encode(fh.read()).decode("ascii")
-        artifacts.append(
-            {
-                "name": entry,
-                "size": size,
-                "mime": mime_for(entry),
-                "content_b64": content,
-            }
-        )
+        entry = {
+            "name": name,
+            "size": size,
+            "mime": mime_for(rel),
+            "content_b64": content,
+        }
+        if name != rel:
+            entry["path"] = rel
+        artifacts.append(entry)
 
     emit(
         {
@@ -298,6 +424,7 @@ def main():
             "duration_ms": duration_ms,
             "timed_out": timed_out,
             "output_truncated": truncated,
+            "artifacts_truncated": artifacts_truncated,
         }
     )
 

@@ -28,8 +28,15 @@ impl Tool for RunInSandbox {
             },
             "code": {
                 "type": "string",
-                "description": "The program to run. Write output files to the \
-                                current working directory to return them."
+                "description": "The program to run. Any file you write under the \
+                                working directory is returned to the user \
+                                automatically, subdirectories included — a file \
+                                written to `docs/backend.md` comes back as an \
+                                attachment named `docs-backend.md` (the delivered \
+                                name is flattened; its `sandbox_path` says where it \
+                                sat). Check the `artifacts` list in the result: if a \
+                                file you wrote is not in it, it was NOT delivered, \
+                                and you must not tell the user it was."
             },
             "files": {
                 "type": "array",
@@ -180,8 +187,24 @@ impl Tool for RunInSandbox {
             // the result is shaped the same.
             let mut out = match &ctx.sandbox_lease {
                 Some(lease) => {
-                    let resp = lease.run(req, args.fresh).await?;
-                    self.0.shape_response(&ctx, resp).await?
+                    let run = lease.run_tracked(req, args.fresh).await?;
+                    let reset = run.workdir_reset;
+                    let mut out = self.0.shape_response(&ctx, run.resp).await?;
+                    if reset && let Some(obj) = out.as_object_mut() {
+                        obj.insert(
+                            "workdir_reset".into(),
+                            json!(
+                                "The working directory did NOT carry over from your previous \
+                                 run_in_sandbox call in this turn — this job started in a fresh, \
+                                 empty /work (the runner could not keep the earlier container). \
+                                 Files earlier calls wrote are gone. Recreate what you need in \
+                                 ONE call rather than assuming it is still there, and note that \
+                                 files already returned in an earlier call's `artifacts` are \
+                                 saved to the conversation and can be re-staged by `id`."
+                            ),
+                        );
+                    }
+                    out
                 }
                 None => self.0.execute(&ctx, req).await?,
             };

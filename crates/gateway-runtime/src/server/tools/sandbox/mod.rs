@@ -91,7 +91,10 @@ const RUN_IN_SANDBOX_DESC: &str = "Run Python or shell in a secure, isolated san
      working directory, and scratch state survive between calls, so \
      you can iterate — run something, read the output, adjust, and \
      run again — instead of cramming everything into one call. Set \
-     `fresh: true` to start over in a clean container. \
+     `fresh: true` to start over in a clean container. Persistence is \
+     best-effort: if a result carries `workdir_reset`, the directory \
+     started empty and earlier calls' files are gone — rebuild what you \
+     need rather than assuming it is still there. \
      Files a user uploaded this turn are ALREADY waiting \
      in the working directory under their original names — just open \
      them. To also work on a file from earlier in the conversation — \
@@ -106,8 +109,14 @@ const RUN_IN_SANDBOX_DESC: &str = "Run Python or shell in a secure, isolated san
      preinstalled, and NOTHING can be installed — never try \
      pip/apt/npm install (there is normally no network, and the \
      sandbox is discarded at the end of the turn). If a library is \
-     missing, solve the task with the preinstalled ones. Write files \
-     to the current working directory to return them to the user. \
+     missing, solve the task with the preinstalled ones. \
+     Any file you write under the working directory is returned to the \
+     user automatically, SUBDIRECTORIES INCLUDED: a file written to \
+     `docs/backend.md` comes back as `docs-backend.md` (delivered names \
+     are flattened; each artifact's `sandbox_path` says where it sat). \
+     The `artifacts` list in the result is the record of what was \
+     actually delivered — if a file you wrote is missing from it, the \
+     user did NOT get it, and you must not say otherwise. \
      When stdout/stderr is large you get a small preview plus a \
      `full_output_ref` — call read_sandbox_output with that ref to \
      grep/page the rest instead of pulling it all into context. Best \
@@ -355,6 +364,18 @@ impl SandboxClient {
             "duration_ms": resp.duration_ms,
             "artifacts": artifacts,
         });
+        // Never let a bounded collection read as a complete one: the model has
+        // to know some of what it wrote was left behind, or it will report the
+        // whole set as delivered.
+        if resp.artifacts_truncated {
+            out["artifacts_truncated"] = json!(true);
+            out["artifacts_note"] = json!(
+                "This run produced more files than one call delivers, so the list above is \
+                 INCOMPLETE. Bundle the rest yourself (e.g. zip the directory) and run again, \
+                 and do not tell the user that files you cannot see in `artifacts` were \
+                 delivered."
+            );
+        }
         if any_attached {
             out["note"] = json!(
                 "Produced files are now attached inline in your message — do NOT \
@@ -400,9 +421,20 @@ impl SandboxClient {
                     "note": "no attachment storage configured ([chat.s3]); file was produced but not retained",
                 })),
             };
-            out.push(
-                entry.unwrap_or_else(|e| json!({"name": a.name, "status": "error", "note": e})),
-            );
+            let mut entry =
+                entry.unwrap_or_else(|e| json!({"name": a.name, "status": "error", "note": e}));
+            // A file produced in a subdirectory is delivered under a flattened
+            // name; say which of the model's own paths it came from, so "I wrote
+            // docs/backend.md" and "docs-backend.md is attached" are visibly the
+            // same file and it doesn't redo work it already finished. Stamped
+            // here rather than inside each delivery branch so it is present on
+            // every outcome — attached, available, not_stored, dropped, error —
+            // since a *failed* delivery is exactly when knowing which file it
+            // was matters most.
+            if let (Some(path), Some(obj)) = (&a.path, entry.as_object_mut()) {
+                obj.insert("sandbox_path".into(), json!(path));
+            }
+            out.push(entry);
         }
         out
     }
@@ -499,6 +531,16 @@ pub struct SandboxLease {
     state: tokio::sync::Mutex<LeaseState>,
 }
 
+/// One [`SandboxLease::run_tracked`] result: the runner's response plus
+/// whether the turn's `/work` survived into this call.
+pub struct LeaseRun {
+    pub resp: RunResponse,
+    /// The job ran in a *different* container than the previous call in this
+    /// turn, so `/work` started empty and anything earlier calls wrote is gone.
+    /// Never set for a caller-requested `fresh: true`.
+    pub workdir_reset: bool,
+}
+
 #[derive(Default)]
 struct LeaseState {
     /// The live container's id, once established.
@@ -524,11 +566,32 @@ impl SandboxLease {
     /// the caller shapes it via [`SandboxClient::shape_response`].
     pub async fn run(
         &self,
-        mut req: RunRequest,
+        req: RunRequest,
         explicit_fresh: bool,
     ) -> Result<RunResponse, ToolError> {
+        self.run_tracked(req, explicit_fresh).await.map(|r| r.resp)
+    }
+
+    /// [`Self::run`], also reporting whether the turn's working directory
+    /// survived the call.
+    ///
+    /// It doesn't always: the runner leases a container only while it has
+    /// capacity, and a `keep_alive` request it cannot lease still runs — as a
+    /// single-use container, echoing no id. The next call then starts from an
+    /// empty `/work`. That fallback is deliberate (a busy runner degrades
+    /// instead of failing), but it used to be *silent*, and silent is the worst
+    /// possible shape for it: the model writes `part1.md`, gets `exit_code: 0`,
+    /// then the next call cannot find the file it just wrote and has no way to
+    /// tell "I made a mistake" from "the filesystem moved under me". Reporting
+    /// it turns a baffling loop into one line the model can act on.
+    pub async fn run_tracked(
+        &self,
+        mut req: RunRequest,
+        explicit_fresh: bool,
+    ) -> Result<LeaseRun, ToolError> {
         let mut st = self.state.lock().await;
         let want_net = req.network;
+        let had = st.container_id.clone();
         // A network-posture change can't be honored by reusing a container
         // (the runner fixes egress at creation), so recreate — same as an
         // explicit `fresh`.
@@ -563,7 +626,26 @@ impl SandboxLease {
         // persistence).
         st.container_id = resp.container_id.clone();
         st.network = want_net;
-        Ok(resp)
+        // Did this call land somewhere other than where the last one did? Only
+        // interesting when we HAD a container and didn't ask to leave it: an
+        // explicit `fresh: true` is the model's own request, so it needs no
+        // warning. A network-posture recreate does — the model asked for
+        // egress, not for its files to be discarded.
+        let workdir_reset = match (&had, &resp.container_id) {
+            (Some(old), new) if !explicit_fresh => new.as_deref() != Some(old.as_str()),
+            _ => false,
+        };
+        if workdir_reset {
+            tracing::warn!(
+                previous = %had.unwrap_or_default(),
+                current = %resp.container_id.clone().unwrap_or_else(|| "<none>".into()),
+                "sandbox lease did not survive: this turn's /work was reset mid-turn"
+            );
+        }
+        Ok(LeaseRun {
+            resp,
+            workdir_reset,
+        })
     }
 
     /// Release the leased container (turn end / reset). Idempotent.
@@ -1698,6 +1780,64 @@ mod tests {
         assert_eq!(arts[0]["name"], "out.png");
     }
 
+    /// A file produced in a subdirectory is delivered under a flattened name.
+    /// The result has to say which path it came from, or "I wrote
+    /// docs/backend.md" and "docs-backend.md is attached" look like two
+    /// different files and the model rewrites work it already finished.
+    #[tokio::test]
+    async fn a_flattened_artifact_reports_the_path_it_came_from() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "exit_code": 0, "stdout": "", "stderr": "",
+                "artifacts": [{
+                    "name": "docs-backend.md", "path": "docs/backend.md",
+                    "size": 3, "mime": "text/markdown", "content_b64": "UE5H",
+                }],
+                "duration_ms": 5, "timed_out": false
+            })))
+            .mount(&server)
+            .await;
+        let tool = RunInSandbox(client(server.uri()));
+        let out = tool
+            .run(ctx().await, json!({"language": "bash", "code": "true"}))
+            .await
+            .unwrap();
+        let arts = out["artifacts"].as_array().unwrap();
+        assert_eq!(arts[0]["name"], "docs-backend.md");
+        assert_eq!(arts[0]["sandbox_path"], "docs/backend.md");
+    }
+
+    /// A bounded collection must never read as a complete one — a model that
+    /// thinks all 300 files came back will tell the user all 300 were
+    /// delivered.
+    #[tokio::test]
+    async fn a_truncated_artifact_list_says_so() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "exit_code": 0, "stdout": "", "stderr": "", "artifacts": [],
+                "duration_ms": 5, "timed_out": false, "artifacts_truncated": true
+            })))
+            .mount(&server)
+            .await;
+        let tool = RunInSandbox(client(server.uri()));
+        let out = tool
+            .run(ctx().await, json!({"language": "bash", "code": "true"}))
+            .await
+            .unwrap();
+        assert_eq!(out["artifacts_truncated"], json!(true));
+        assert!(
+            out["artifacts_note"]
+                .as_str()
+                .unwrap()
+                .contains("INCOMPLETE"),
+            "{out}"
+        );
+    }
+
     #[tokio::test]
     async fn runner_error_envelope_surfaces_to_model() {
         let server = MockServer::start().await;
@@ -2222,6 +2362,66 @@ mod tests {
             .filter(|r| r.url.path() == "/container/c1")
             .count();
         assert_eq!(after, 1, "second release is idempotent");
+    }
+
+    /// A runner with no lease capacity still runs the job — single-use, with no
+    /// `container_id` — so the turn's `/work` quietly resets between calls.
+    /// That fallback is deliberate, but it has to be *reported*: without it the
+    /// model writes a file, gets `exit_code: 0`, then cannot find the file it
+    /// just wrote, and has no way to tell its own mistake from the filesystem
+    /// moving under it.
+    #[tokio::test]
+    async fn a_lease_the_runner_drops_is_reported_as_a_workdir_reset() {
+        let server = MockServer::start().await;
+        // First call leases c1; every later call declines (no container_id).
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exit_code": 0, "stdout": "ok", "stderr": "", "artifacts": [],
+                "duration_ms": 1, "timed_out": false, "output_truncated": false,
+                "container_id": "c1",
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/run"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "exit_code": 0, "stdout": "ok", "stderr": "", "artifacts": [],
+                "duration_ms": 1, "timed_out": false, "output_truncated": false,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(wiremock::matchers::path_regex(r"^/container/.+"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let lease = SandboxLease::new(client(server.uri()));
+
+        // Establishing the lease is not a reset — there was nothing to lose.
+        let first = lease.run_tracked(lease_req(), false).await.unwrap();
+        assert!(!first.workdir_reset, "the first call cannot be a reset");
+        // The runner declines to keep c1 alive: /work is gone.
+        let second = lease.run_tracked(lease_req(), false).await.unwrap();
+        assert!(
+            second.workdir_reset,
+            "a dropped lease must be reported, not swallowed"
+        );
+        // And once there's nothing left to lose, it stops crying wolf.
+        let third = lease.run_tracked(lease_req(), false).await.unwrap();
+        assert!(!third.workdir_reset, "no container held, nothing was lost");
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_requested_fresh_sandbox_is_not_a_reset() {
+        // `fresh: true` is the model's own request, so warning about it would
+        // be noise — and noise is how a real warning gets ignored.
+        let server = lease_server("c1").await;
+        let lease = SandboxLease::new(client(server.uri()));
+        lease.run_tracked(lease_req(), false).await.unwrap();
+        let run = lease.run_tracked(lease_req(), true).await.unwrap();
+        assert!(!run.workdir_reset);
     }
 
     /// A `/run` responder that hands out a fresh incrementing container id
