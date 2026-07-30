@@ -518,6 +518,61 @@ fn replay_stub(turn_id: &str, filename: &str, mime: &str, size: &str) -> String 
     )
 }
 
+/// Matches a [`replay_stub`] line — including one a model wrote itself.
+///
+/// Deliberately looser than the emitted format (any field tail, optional
+/// parenthetical) because what we are detecting is *imitation*, and an
+/// imitation is approximate by nature.
+static REPLAY_STUB_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)[ \t]*\[attached file="[^"\n]*"[^\]\n]*\](?:[ \t]*\(call the fetch_attachment tool[^)\n]*\))?"#,
+    )
+    .expect("replay stub regex compiles")
+});
+
+/// Whether `text` contains something shaped like a replay stub.
+pub fn has_replay_stub(text: &str) -> bool {
+    REPLAY_STUB_RE.is_match(text)
+}
+
+/// Remove replay stubs from *assistant* text before it is rendered.
+///
+/// The stub exists only in the upstream payload — [`strip_markers_for_replay`]
+/// synthesises it per attachment on the way to the model, and it is never
+/// persisted. So a stub sitting in stored assistant content is always something
+/// the model typed after seeing its own history, and it is the second
+/// generation of one specific failure: models used to copy the
+/// `[gw-attachment …]` marker (which `split_markers_for_turn` now refuses on
+/// ownership grounds), and having been given the stub instead, they copy that.
+///
+/// A copied stub renders as literal text that reads, to a user, exactly like an
+/// attachment the interface failed to draw — so they hunt for a download that
+/// was never uploaded, and every "it's not there" is answered with another
+/// forgery. Dropping it is the same call already made for markdown images in
+/// `render::md`: the model has no legitimate way to attach a file through prose,
+/// so prose that looks like an attachment is never worth rendering.
+pub fn strip_replay_stubs(text: &str) -> std::borrow::Cow<'_, str> {
+    REPLAY_STUB_RE.replace_all(text, "")
+}
+
+/// Replace replay stubs in assistant text with a flat contradiction, for the
+/// history replayed *upstream*.
+///
+/// The render-side [`strip_replay_stubs`] protects the user; this protects the
+/// conversation. Left alone, a forged stub is indistinguishable — to the model
+/// reading its own prior turn — from a real one, so it believes it already
+/// delivered the file and keeps insisting the interface is broken. Handing it
+/// back a denial is the only signal in the loop that says otherwise.
+pub fn contradict_replay_stubs(text: &str) -> std::borrow::Cow<'_, str> {
+    REPLAY_STUB_RE.replace_all(
+        text,
+        "[no file was attached here: the text above was typed into the reply and was \
+         NOT produced by a tool, so the user received nothing. Attach a file only by \
+         calling `upload_attachment` or `offer_download`, and never by writing an \
+         `[attached file=…]` line yourself.]",
+    )
+}
+
 /// Files whose bytes get inlined alongside the marker as a fenced
 /// code block. Mirrors the gateway's receive-side logic so callers
 /// in any crate can ask "is this attachment going to be rendered
@@ -802,6 +857,68 @@ mod tests {
         let line = marker_line("x.png", "image/png", "https://e.invalid/x.png", 1);
         assert_eq!(parse_markers_for_turn(&line, "whatever").len(), 1);
         assert!(marker_url_owned_by("https://e.invalid/x.png", "t-1"));
+    }
+
+    /// The exact text a model produced after seeing replay stubs in its own
+    /// history: it wrote one itself, complete with a plausible id, having
+    /// called no tool at all.
+    fn forged_stub() -> String {
+        "[attached file=\"croit-cowork-context.zip\" mime=\"application/zip\" size=40709 \
+         id=\"4be8a013-2dd4-41f5-9ea7-9a210b2f4ab1/croit-cowork-context.zip\"] \
+         (call the fetch_attachment tool with this id to read its contents)"
+            .to_string()
+    }
+
+    #[test]
+    fn a_real_replay_stub_is_recognised_as_the_forgeable_shape() {
+        // Whatever `strip_markers_for_replay` emits is by definition what a
+        // model can copy, so the detector is pinned to the emitter rather than
+        // to a hand-written sample that could drift away from it.
+        let marker = marker_line("d.pdf", "application/pdf", "/chat/attachment/t-1/d.pdf", 4);
+        let replayed = strip_markers_for_replay(&marker, "t-1");
+        assert!(has_replay_stub(&replayed), "{replayed}");
+        assert!(has_replay_stub(&forged_stub()));
+        assert!(!has_replay_stub("here is the file you asked for"));
+    }
+
+    #[test]
+    fn forged_stubs_are_stripped_from_rendered_assistant_text() {
+        // Rendered as prose, a copied stub reads like an attachment the UI
+        // failed to draw — so the user hunts for a download that was never
+        // uploaded. It must leave no trace in the bubble.
+        let text = format!("Above is the bundle:\n\n{}\n\nUnzip it.", forged_stub());
+        let out = strip_replay_stubs(&text);
+        assert!(!out.contains("attached file="), "{out}");
+        assert!(!out.contains("4be8a013"), "{out}");
+        assert!(!out.contains("fetch_attachment"), "{out}");
+        assert!(out.contains("Above is the bundle:"), "{out}");
+        assert!(out.contains("Unzip it."), "{out}");
+    }
+
+    #[test]
+    fn forged_stubs_are_contradicted_in_replayed_history() {
+        // The model must not be able to read its own forgery back as evidence
+        // that it already delivered the file.
+        let forged = forged_stub();
+        let out = contradict_replay_stubs(&forged);
+        assert!(
+            !out.contains("4be8a013"),
+            "the fake id must not survive: {out}"
+        );
+        assert!(out.contains("no file was attached here"), "{out}");
+        assert!(out.contains("upload_attachment"), "{out}");
+    }
+
+    #[test]
+    fn text_without_a_stub_is_returned_untouched() {
+        // Every assistant bubble goes through this on render; the common case
+        // must not allocate or alter a byte.
+        let text = "Just prose, with a [markdown link](https://example.com/a).";
+        assert!(matches!(
+            strip_replay_stubs(text),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(strip_replay_stubs(text), text);
     }
 
     #[test]
