@@ -555,6 +555,15 @@ async fn replace_pool_models(db: &Pool, pool_name: &str, models: &[String]) -> R
     Ok(())
 }
 
+/// Replace a pool's language→voice map.
+///
+/// `ON CONFLICT … DO NOTHING` rather than a bare INSERT: the table is keyed by
+/// `(pool_name, lang_code)`, and a caller handing over two entries for the same
+/// language used to abort the entire pool save with a raw SQLite 1555 — a
+/// constraint error surfaced at the admin form as an internal failure, for input
+/// whose meaning is unambiguous (the first entry is the one resolution would
+/// ever have used). Callers that care about the difference de-duplicate before
+/// getting here; this makes it impossible to fail on.
 async fn replace_pool_voices(
     db: &Pool,
     pool_name: &str,
@@ -567,7 +576,8 @@ async fn replace_pool_voices(
     for v in voices {
         sqlx::query(
             r#"INSERT INTO pool_voices (pool_name, lang_code, voice_id)
-               VALUES (?, ?, ?)"#,
+               VALUES (?, ?, ?)
+               ON CONFLICT(pool_name, lang_code) DO NOTHING"#,
         )
         .bind(pool_name)
         .bind(&v.lang_code)
@@ -578,6 +588,9 @@ async fn replace_pool_voices(
     Ok(())
 }
 
+/// Replace a pool's selectable-voice menu. Same reasoning as
+/// [`replace_pool_voices`]: keyed by `(pool_name, voice_id)`, so a repeated
+/// voice keeps its first position instead of failing the save.
 async fn replace_pool_offer_voices(
     db: &Pool,
     pool_name: &str,
@@ -591,7 +604,8 @@ async fn replace_pool_offer_voices(
     for (i, voice_id) in voices.iter().enumerate() {
         sqlx::query(
             r#"INSERT INTO pool_offer_voices (pool_name, voice_id, sort_order)
-               VALUES (?, ?, ?)"#,
+               VALUES (?, ?, ?)
+               ON CONFLICT(pool_name, voice_id) DO NOTHING"#,
         )
         .bind(pool_name)
         .bind(voice_id)
@@ -1021,6 +1035,33 @@ mod tests {
         // The offer list survives in the operator's order (it is read back by
         // `sort_order`, not alphabetically) — that order is the picker's.
         assert_eq!(p.offer_voices, ["default-voice", "de-voice", "extra"]);
+
+        // Regression: a duplicate in either list must not abort the save with a
+        // raw SQLite 1555. Both tables are keyed by their own second column, and
+        // upsert_pool is the admin form's write path — a constraint error there
+        // surfaces as "could not save the pool" for input whose meaning is
+        // obvious. First entry wins, rest ignored.
+        let mut dup = pool_row.clone();
+        dup.voices = vec![
+            VoiceRow {
+                lang_code: String::new(),
+                voice_id: "alloy".into(),
+            },
+            VoiceRow {
+                lang_code: String::new(),
+                voice_id: "marin".into(),
+            },
+        ];
+        dup.offer_voices = vec!["marin".into(), "marin".into(), "cedar".into()];
+        upsert_pool(&pool, &dup)
+            .await
+            .expect("duplicates tolerated");
+
+        let snap = load_snapshot(&pool).await.unwrap();
+        let p = &snap.pools[0];
+        assert_eq!(p.voices.len(), 1);
+        assert_eq!(p.voices[0].voice_id, "alloy");
+        assert_eq!(p.offer_voices, ["marin", "cedar"]);
     }
 
     #[tokio::test]
