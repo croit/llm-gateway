@@ -205,6 +205,25 @@ same `document_id` — the same iterate-in-canvas loop `render_typst` uses. See
 `docs/tools-inventory.md` for the toggle and the tool's own description for the
 spec.
 
+**Audio: a bed plus placed narration.** `audio` takes one track or a list, each
+with its own `start`, which is what lets a spoken line sit on the cut it
+describes — synthesize the lines with `comfyui_text_to_speech` (or
+`comfyui_clone_voice`), then give each one the start time of its scene. Three
+details are decided here rather than left to the caller, because each has a
+wrong-by-default form in ffmpeg:
+
+- every chain ends in `apad` so `-shortest` cuts *audio* to the video, not the
+  other way round (a 5 s music bed would otherwise truncate a 30 s film);
+- `amix` runs with `normalize=0`, so adding a narration line doesn't silently
+  halve the music;
+- `afade=t=out` gets an explicit `st` computed from the track's own end or the
+  video's, whichever comes first — ffmpeg defaults it to `0`, which fades a
+  track out over its *first* seconds.
+
+`loudnorm` defaults on, which is right for a bed and wrong for speech: EBU R128
+levels every track to the same perceived loudness, so a set of narration lines
+comes out flat. Turn it off per voice track.
+
 Anything the spec cannot express is still one `run_in_sandbox` call away — the
 gold image has ffmpeg and ~900 fonts.
 
