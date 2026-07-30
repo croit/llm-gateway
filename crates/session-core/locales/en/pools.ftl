@@ -19,6 +19,7 @@ pools-field-models-hint = When set, only these ids are served from a probing bac
 pools-field-allowed-groups = Allowed groups
 pools-field-allowed-groups-hint = Comma-separated gateway groups allowed to see + use this pool's models. Blank = everyone. Admins always have access. Manage groups in Admin → Groups.
 pools-field-voices = Voices (lang=voice per line)
+pools-field-offer-voices = Selectable voices (one per line, users pick)
 pools-field-backends = Backends
 pools-no-backends = No backends defined yet. Add one on the Backends page first.
 pools-field-gdpr = GDPR compliant

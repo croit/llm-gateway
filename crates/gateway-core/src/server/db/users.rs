@@ -23,6 +23,12 @@ pub struct User {
     /// Tools that care about wall-clock time fall back to UTC when
     /// this is null.
     pub timezone: Option<String>,
+    /// TTS voice the user picked for spoken replies (a bare upstream voice id
+    /// like `onyx`). `None` — the common case — means the speech pool's
+    /// language → voice map decides. Never trusted on read: the speech path
+    /// re-checks it against the voices the pools currently advertise, so an
+    /// operator who drops a voice from the config retires it everywhere.
+    pub speech_voice: Option<String>,
 }
 
 fn map_row(row: &SqliteRow) -> Result<User, DbError> {
@@ -33,6 +39,7 @@ fn map_row(row: &SqliteRow) -> Result<User, DbError> {
     let created_at: String = row.try_get("created_at")?;
     let updated_at: String = row.try_get("updated_at")?;
     let timezone: Option<String> = row.try_get("timezone")?;
+    let speech_voice: Option<String> = row.try_get("speech_voice")?;
 
     let roles: Vec<String> = serde_json::from_str(&roles_json).map_err(|e| DbError::Decode {
         column: "roles_json",
@@ -59,6 +66,7 @@ fn map_row(row: &SqliteRow) -> Result<User, DbError> {
         created_at,
         updated_at,
         timezone,
+        speech_voice,
     })
 }
 
@@ -117,6 +125,25 @@ pub async fn set_timezone(pool: &Pool, user_id: &str, timezone: &str) -> Result<
     let now = Timestamp::now().to_string();
     sqlx::query("UPDATE users SET timezone = ?, updated_at = ? WHERE id = ?")
         .bind(timezone)
+        .bind(now)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Store (or clear, with `None`) the caller's preferred TTS voice. Bumps
+/// `updated_at`. Called from `POST /api/v0/me/speech_voice`, which validates
+/// the id against the voices the speech pools advertise before it gets here —
+/// this function stores whatever it is given.
+pub async fn set_speech_voice(
+    pool: &Pool,
+    user_id: &str,
+    voice: Option<&str>,
+) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    sqlx::query("UPDATE users SET speech_voice = ?, updated_at = ? WHERE id = ?")
+        .bind(voice)
         .bind(now)
         .bind(user_id)
         .execute(pool)
@@ -236,6 +263,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             timezone: None,
+            speech_voice: None,
         }
     }
 

@@ -381,6 +381,10 @@ pub struct Pool {
     /// Language → voice-id map (speech pools only). See
     /// [`UpstreamPoolConfig::voices`] / [`UpstreamPoolConfig::voice_for_language`].
     pub voices: std::collections::HashMap<String, String>,
+    /// Voices this pool offers users to choose from, in the operator's order
+    /// (speech pools only). See [`UpstreamPoolConfig::offer_voices`] — this is
+    /// the menu, `voices` is the resolution.
+    pub offer_voices: Vec<String>,
     /// Pool-level configured model ids (the `models` TOML list). Retained so
     /// the speech default-model pick can prefer the operator's declared TTS
     /// model over the `/models` probe — a cloud provider like OpenAI reports
@@ -455,6 +459,7 @@ impl Pool {
             compliance: cfg.compliance,
             enforce_limits: cfg.enforce_limits,
             voices: cfg.voices.clone(),
+            offer_voices: cfg.offer_voices.clone(),
             configured_models: cfg.models.clone(),
             fallback_offline: cfg.fallback_offline.clone(),
             allowed_groups: cfg.allowed_groups.clone(),
@@ -878,6 +883,45 @@ impl UpstreamRegistry {
         Some((model, voice))
     }
 
+    /// Every distinct voice advertised by the speech pools `access` permits,
+    /// sorted. Backs the per-user voice picker and, on the speech path, the
+    /// check that a stored preference is still on offer.
+    ///
+    /// The menu is exactly what the operator declared in the pool's
+    /// language→voice map, so a user can neither pick a voice the deployment
+    /// doesn't offer nor keep one after the operator removes it — the stored
+    /// preference falls back to [`Self::speech_target`]'s voice instead of
+    /// reaching the upstream as an unknown id.
+    pub fn speech_voices_for(&self, access: &PoolAccess) -> Vec<String> {
+        let d = self.data();
+        let pools = || {
+            d.pools
+                .values()
+                .filter(|p| p.kind == PoolKind::Speech && access.allows(p))
+        };
+        // The operator's explicit menu comes first and in their order — the
+        // house voice belongs at the top, not wherever the alphabet puts it.
+        let mut voices: Vec<String> = Vec::new();
+        for p in pools() {
+            for v in &p.offer_voices {
+                if !voices.contains(v) {
+                    voices.push(v.clone());
+                }
+            }
+        }
+        // Then whatever the language map resolves to, so a deployment that
+        // never fills the menu still offers its configured voices rather than
+        // nothing at all. Sorted, since a HashMap has no order to honour.
+        let mut resolved: Vec<String> = pools()
+            .flat_map(|p| p.voices.values().cloned())
+            .filter(|v| !voices.contains(v))
+            .collect();
+        resolved.sort();
+        resolved.dedup();
+        voices.extend(resolved);
+        voices
+    }
+
     /// Every advertised model across *all* pools and kinds, de-duplicated by
     /// id (replicas serving the same id collapse to one) and sorted. Backs
     /// the OpenAI-parity `GET /v1/models`, which lists every usable model
@@ -1230,6 +1274,7 @@ mod tests {
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             compliance: Default::default(),
             enforce_limits: true,
@@ -1249,6 +1294,7 @@ mod tests {
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             compliance,
             kind,
@@ -1268,6 +1314,7 @@ mod tests {
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             compliance: Default::default(),
             enforce_limits: true,
@@ -1332,6 +1379,82 @@ mod tests {
         assert_eq!(
             reg.speech_target("fr"),
             Some(("tts-1".to_string(), Some("alloy".to_string())))
+        );
+    }
+
+    #[test]
+    fn speech_voices_are_the_operators_declared_set_deduped() {
+        // Two speech pools, one voice shared between them and one restricted to
+        // a group. The picker must offer each distinct voice once, and only
+        // from pools the caller may route to.
+        let open: UpstreamPoolConfig = toml::from_str(
+            r#"
+            kind = "speech"
+            models = ["tts-1"]
+            [voices]
+            "" = "alloy"
+            de = "onyx"
+            [[backend]]
+            name = "openai"
+            base_url = "https://api.openai.com/v1"
+        "#,
+        )
+        .unwrap();
+        let restricted: UpstreamPoolConfig = toml::from_str(
+            r#"
+            kind = "speech"
+            models = ["tts-1"]
+            allowed_groups = ["studio"]
+            [voices]
+            "" = "onyx"
+            en = "sage"
+            [[backend]]
+            name = "local"
+            base_url = "http://tts.example.com"
+        "#,
+        )
+        .unwrap();
+        let reg = build(vec![("cloud", open), ("studio", restricted)]);
+
+        // A member of no group sees only the unrestricted pool's voices.
+        let plain = PoolAccess::default();
+        assert_eq!(reg.speech_voices_for(&plain), vec!["alloy", "onyx"]);
+        // With access to both, `onyx` still appears exactly once.
+        assert_eq!(
+            reg.speech_voices_for(&PoolAccess::all()),
+            vec!["alloy", "onyx", "sage"]
+        );
+    }
+
+    #[test]
+    fn an_explicit_voice_menu_leads_and_the_language_map_follows() {
+        // The reason `offer_voices` exists: three voices for ONE language,
+        // which the (pool, lang) keyed map cannot hold. The menu keeps the
+        // operator's order — the house voice belongs first, not wherever the
+        // alphabet puts it — and the map's own voices fill in behind it.
+        let cfg: UpstreamPoolConfig = toml::from_str(
+            r#"
+            kind = "speech"
+            models = ["tts-1"]
+            offer_voices = ["marin", "cedar", "alloy"]
+            [voices]
+            "" = "alloy"
+            de = "onyx"
+            [[backend]]
+            name = "openai"
+            base_url = "https://api.openai.com/v1"
+        "#,
+        )
+        .unwrap();
+        let reg = build(vec![("cloud", cfg)]);
+        assert_eq!(
+            reg.speech_voices_for(&PoolAccess::default()),
+            vec!["marin", "cedar", "alloy", "onyx"]
+        );
+        // Resolution is untouched by the menu: `de` still gets its own voice.
+        assert_eq!(
+            reg.speech_target("de"),
+            Some(("tts-1".to_string(), Some("onyx".to_string())))
         );
     }
 
@@ -1987,6 +2110,7 @@ mod tests {
     ) -> UpstreamPoolConfig {
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             compliance: Default::default(),
             enforce_limits: true,
@@ -2387,6 +2511,7 @@ mod tests {
                 backends: vec!["b".into()],
                 models: vec![],
                 voices: vec![],
+                offer_voices: Vec::new(),
                 created_at: Timestamp::now(),
                 updated_at: Timestamp::now(),
             });

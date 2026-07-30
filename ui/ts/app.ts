@@ -110,6 +110,29 @@ window.pushToast = (kind, message) => {
     } catch (_) { /* sessionStorage unavailable / private mode */ }
 })();
 
+// ---- Spoken-reply voice picker ----------------------------------------
+//
+// The chat header's `[data-tts-voice]` <select> persists the caller's TTS
+// voice to their user row; the speech path reads it from there, so nothing
+// has to ride along on each synthesis request. An empty value means "no
+// preference" and hands the choice back to the operator's language→voice map.
+//
+// Delegated on `document` rather than bound to the element: the header is
+// re-rendered by datastar morph patches on every navigation, which would
+// silently drop a directly-bound listener.
+document.addEventListener('change', (evt) => {
+    const target = evt.target as HTMLElement | null;
+    const select = target?.closest<HTMLSelectElement>('[data-tts-voice]');
+    if (!select) return;
+    // Fire-and-forget: a failed POST leaves the pool default in force, which
+    // is a worse voice, not a broken page.
+    fetch('/api/v0/me/speech_voice', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ voice: select.value }),
+    }).catch(() => {});
+});
+
 // ---- Confirm-guarded forms --------------------------------------------
 //
 // A `data-confirm="..."` attribute on a <form> pops a native confirm()

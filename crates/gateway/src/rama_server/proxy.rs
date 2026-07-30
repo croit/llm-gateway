@@ -1402,13 +1402,32 @@ pub async fn speech_session(State(state): State<Arc<RamaState>>, req: Request) -
         return (StatusCode::NO_CONTENT, "").into_response();
     }
 
-    let Some((model, voice)) = state.upstreams.speech_target(&language) else {
+    let Some((model, default_voice)) = state.upstreams.speech_target(&language) else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_speech_backend",
             "no speech (TTS) pool is configured",
         );
     };
+    // One user row, read up front, serves three purposes below: pool access
+    // (RBAC), the picked voice, and the usage record's email. The voice has to
+    // be resolved before the cache key is built, which is why this read now
+    // precedes the cache lookup — a single indexed SELECT, whereas the thing
+    // the cache is actually there to avoid is the upstream round-trip.
+    let me = gateway_core::server::db::users::find_by_id(&state.db, &session.user_id)
+        .await
+        .ok()
+        .flatten();
+    // Gate the TTS pool to the session user's groups, same as every other route.
+    let access = state.pool_access_for(&me.as_ref().map(|u| u.roles.clone()).unwrap_or_default());
+    // The user's pick wins over the pool's language→voice default, but only
+    // while the operator still offers it: a voice dropped from the pool config
+    // must not keep reaching the upstream as an unknown id.
+    let voice = me
+        .as_ref()
+        .and_then(|u| u.speech_voice.clone())
+        .filter(|v| state.upstreams.speech_voices_for(&access).contains(v))
+        .or(default_voice);
     // Cache lookup BEFORE routing, so a hit costs no inflight slot and no TTS
     // spend. Key on the pre-resolution model + voice + spoken text.
     let cache_key = format!("{model}|{}|{spoken}", voice.as_deref().unwrap_or(""));
@@ -1416,16 +1435,6 @@ pub async fn speech_session(State(state): State<Arc<RamaState>>, req: Request) -
         return audio_response(bytes);
     }
     let spoken_len = spoken.chars().count();
-    // Gate the TTS pool to the session user's groups, same as every other route.
-    let access = {
-        let roles = gateway_core::server::db::users::find_by_id(&state.db, &session.user_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|u| u.roles)
-            .unwrap_or_default();
-        state.pool_access_for(&roles)
-    };
     let acquired = match state
         .upstreams
         .route_access(&model, PoolKind::Speech, &access)
@@ -1444,12 +1453,7 @@ pub async fn speech_session(State(state): State<Arc<RamaState>>, req: Request) -
     }
 
     let user_email = if state.usage.is_enabled() {
-        gateway_core::server::db::users::find_by_id(&state.db, &session.user_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|u| u.email)
-            .unwrap_or_default()
+        me.map(|u| u.email).unwrap_or_default()
     } else {
         String::new()
     };

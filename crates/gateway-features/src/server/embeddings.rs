@@ -153,6 +153,7 @@ mod tests {
             "embed".to_string(),
             UpstreamPoolConfig {
                 voices: Default::default(),
+                offer_voices: Vec::new(),
                 allowed_groups: Vec::new(),
                 compliance: Default::default(),
                 enforce_limits: true,

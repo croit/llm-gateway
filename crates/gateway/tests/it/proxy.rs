@@ -832,6 +832,7 @@ async fn state_with_backend_api_key(
         "pool".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -889,6 +890,7 @@ async fn state_with_alias_pool(upstream_url: &str) -> gateway::rama_server::Rama
         "pool".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),

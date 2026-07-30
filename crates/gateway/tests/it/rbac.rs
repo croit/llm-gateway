@@ -64,6 +64,7 @@ fn backend(name: &str, base_url: &str, supports_edit: bool) -> BackendConfig {
 fn pool(kind: PoolKind, be: BackendConfig, allowed_groups: Vec<String>) -> UpstreamPoolConfig {
     UpstreamPoolConfig {
         voices: Default::default(),
+        offer_voices: Vec::new(),
         allowed_groups,
         fallback_offline: None,
         compliance: Default::default(),
@@ -260,6 +261,7 @@ async fn seed_principal(state: &RamaState, id: &str, roles: &[&str]) -> Principa
             created_at: now,
             updated_at: now,
             timezone: None,
+            speech_voice: None,
         },
     )
     .await

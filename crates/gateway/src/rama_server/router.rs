@@ -272,6 +272,7 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/api/v0/push/subscribe", api::push_subscribe)
         .with_post("/api/v0/push/unsubscribe", api::push_unsubscribe)
         .with_post("/api/v0/me/timezone", api::set_timezone)
+        .with_post("/api/v0/me/speech_voice", api::set_speech_voice)
         .with_post("/api/v0/me/location", api::set_location)
         .with_delete("/api/v0/me/location", api::clear_location)
         .with_post(

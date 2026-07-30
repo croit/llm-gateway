@@ -44,6 +44,7 @@ async fn seed_admin(state: &RamaState, user_id: &str) -> String {
             created_at: now,
             updated_at: now,
             timezone: None,
+            speech_voice: None,
         },
     )
     .await

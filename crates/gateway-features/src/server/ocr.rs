@@ -730,6 +730,7 @@ mod tests {
                 enforce_limits: true,
                 allowed_groups: Vec::new(),
                 voices: HashMap::new(),
+                offer_voices: Vec::new(),
             },
         );
         UpstreamRegistry::new(&pools).expect("test registry should build")

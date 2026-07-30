@@ -16,6 +16,7 @@ pools-field-fallback-offline-placeholder = 当所有后端都离线时提供服�
 pools-field-models = 提供的模型（白名单，逗号分隔）
 pools-field-models-hint = 设置后，对于启用 /models 探测的后端仅提供这些 id，其余以划线显示。留空 = 提供后端报告的所有模型。
 pools-field-voices = 语音（每行 lang=voice）
+pools-field-offer-voices = 可选语音（每行一个，供用户选择）
 pools-field-backends = 后端
 pools-no-backends = 尚未定义任何后端。请先在“后端”页面添加一个。
 pools-field-gdpr = 符合 GDPR

@@ -18,6 +18,7 @@ pools-field-models-hint = Wenn gesetzt, werden von einem Backend mit /models-Pro
 pools-field-allowed-groups = Erlaubte Gruppen
 pools-field-allowed-groups-hint = Kommagetrennte Gateway-Gruppen, die die Modelle dieses Pools sehen + nutzen dürfen. Leer = alle. Admins haben immer Zugriff. Gruppen unter Admin → Gruppen verwalten.
 pools-field-voices = Stimmen (lang=voice pro Zeile)
+pools-field-offer-voices = Auswählbare Stimmen (eine pro Zeile, Nutzer wählen)
 pools-field-backends = Backends
 pools-no-backends = Noch keine Backends definiert. Fügen Sie zuerst eines auf der Seite „Backends“ hinzu.
 pools-field-gdpr = GDPR-konform

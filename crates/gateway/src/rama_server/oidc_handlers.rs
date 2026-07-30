@@ -203,6 +203,9 @@ pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Resp
             // conflict, so an existing user's previously-saved value
             // survives a re-login.
             timezone: None,
+            // Same for the picked TTS voice: chosen in the chat header, not by
+            // the identity provider, and outside `upsert`'s column list.
+            speech_voice: None,
         },
     )
     .await

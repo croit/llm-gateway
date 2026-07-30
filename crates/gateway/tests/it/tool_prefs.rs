@@ -46,6 +46,7 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
         "pool".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -120,6 +121,7 @@ async fn seed_session_with_roles(state: &RamaState, user_id: &str, roles: &[&str
             created_at: now,
             updated_at: now,
             timezone: None,
+            speech_voice: None,
         },
     )
     .await

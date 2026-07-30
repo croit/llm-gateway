@@ -352,6 +352,7 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 timezone: Some("Europe/Berlin".to_string()),
+                speech_voice: None,
             },
         )
         .await

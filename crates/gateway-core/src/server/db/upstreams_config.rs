@@ -73,6 +73,11 @@ pub struct PoolRow {
     pub backends: Vec<String>,
     pub models: Vec<String>,
     pub voices: Vec<VoiceRow>,
+    /// Voices this pool offers users to pick from, in menu order. Distinct from
+    /// [`Self::voices`], which maps a language to the voice to *use*: that table
+    /// holds one voice per language and so cannot express "three German voices
+    /// to choose between". Empty = no menu; see `migrations/0057`.
+    pub offer_voices: Vec<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -239,6 +244,7 @@ async fn load_all_pools(db: &Pool) -> Result<Vec<PoolRow>, DbError> {
             backends: Vec::new(),
             models: Vec::new(),
             voices: Vec::new(),
+            offer_voices: Vec::new(),
             created_at,
             updated_at,
         });
@@ -286,6 +292,21 @@ async fn load_all_pools(db: &Pool) -> Result<Vec<PoolRow>, DbError> {
         };
         if let Some(p) = pools.iter_mut().find(|p| p.name == pool_name) {
             p.voices.push(voice);
+        }
+    }
+
+    // Load the offerable-voice menus.
+    let ov_rows = sqlx::query(
+        r#"SELECT pool_name, voice_id FROM pool_offer_voices
+           ORDER BY pool_name, sort_order, voice_id"#,
+    )
+    .fetch_all(db)
+    .await?;
+    for row in &ov_rows {
+        let pool_name: String = row.try_get("pool_name")?;
+        let voice_id: String = row.try_get("voice_id")?;
+        if let Some(p) = pools.iter_mut().find(|p| p.name == pool_name) {
+            p.offer_voices.push(voice_id);
         }
     }
 
@@ -449,6 +470,7 @@ pub async fn upsert_pool(db: &Pool, row: &PoolRow) -> Result<(), DbError> {
     replace_pool_backends(db, &row.name, &row.backends).await?;
     replace_pool_models(db, &row.name, &row.models).await?;
     replace_pool_voices(db, &row.name, &row.voices).await?;
+    replace_pool_offer_voices(db, &row.name, &row.offer_voices).await?;
     Ok(())
 }
 
@@ -550,6 +572,30 @@ async fn replace_pool_voices(
         .bind(pool_name)
         .bind(&v.lang_code)
         .bind(&v.voice_id)
+        .execute(db)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn replace_pool_offer_voices(
+    db: &Pool,
+    pool_name: &str,
+    voices: &[String],
+) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM pool_offer_voices WHERE pool_name = ?")
+        .bind(pool_name)
+        .execute(db)
+        .await?;
+    // Position carries the menu order, so the operator's first line stays first.
+    for (i, voice_id) in voices.iter().enumerate() {
+        sqlx::query(
+            r#"INSERT INTO pool_offer_voices (pool_name, voice_id, sort_order)
+               VALUES (?, ?, ?)"#,
+        )
+        .bind(pool_name)
+        .bind(voice_id)
+        .bind(i as i64)
         .execute(db)
         .await?;
     }
@@ -694,6 +740,7 @@ fn config_to_pool_row(name: &str, cfg: &UpstreamPoolConfig, sort_order: i64) -> 
         backends: cfg.backend.iter().map(|b| b.name.clone()).collect(),
         models: cfg.models.clone(),
         voices,
+        offer_voices: cfg.offer_voices.clone(),
         created_at: Timestamp::now(),
         updated_at: Timestamp::now(),
     }
@@ -878,6 +925,7 @@ mod tests {
             backends: vec!["b1".into()],
             models: vec!["pool-fallback-model".into()],
             voices: vec![],
+            offer_voices: Vec::new(),
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
         };
@@ -943,6 +991,9 @@ mod tests {
                     voice_id: "default-voice".into(),
                 },
             ],
+            // The menu is its own list and keeps the operator's order — three
+            // German voices are expressible here and not in `voices` above.
+            offer_voices: vec!["default-voice".into(), "de-voice".into(), "extra".into()],
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
         };
@@ -967,6 +1018,9 @@ mod tests {
                 .voice_id,
             "default-voice"
         );
+        // The offer list survives in the operator's order (it is read back by
+        // `sort_order`, not alphabetically) — that order is the picker's.
+        assert_eq!(p.offer_voices, ["default-voice", "de-voice", "extra"]);
     }
 
     #[tokio::test]
@@ -1030,6 +1084,7 @@ mod tests {
                     lang_code: "en".into(),
                     voice_id: "v".into(),
                 }],
+                offer_voices: Vec::new(),
                 created_at: Timestamp::now(),
                 updated_at: Timestamp::now(),
             },

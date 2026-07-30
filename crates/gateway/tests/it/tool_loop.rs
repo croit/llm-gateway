@@ -44,6 +44,7 @@ async fn state_with_tools(upstream_uri: &str) -> RamaState {
         "pool".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -121,6 +122,7 @@ async fn seed_engineer_with_bearer(state: &RamaState) -> String {
             created_at: now,
             updated_at: now,
             timezone: None,
+            speech_voice: None,
         },
     )
     .await

@@ -25,6 +25,8 @@ chat-render-canvas-close-title = Закрыть холст
 chat-render-model-placeholder = модель (напр., gpt-4o-mini)
 chat-render-model-aria = Модель чата
 chat-render-voice-model-aria = Голосовая модель
+chat-render-tts-voice-aria = Голос ответов
+chat-render-tts-voice-default = Голос по умолчанию
 
 chat-render-model-non-gdpr = { $id } (не соответствует GDPR)
 chat-render-model-confidential = { $id } (ограничение конфиденциальности)

@@ -67,6 +67,7 @@ pub fn snapshot_to_configs(
                 },
                 enforce_limits: pool.enforce_limits,
                 voices,
+                offer_voices: pool.offer_voices.clone(),
                 allowed_groups: pool.allowed_groups.clone(),
                 backend: backend_configs,
             },
@@ -221,6 +222,7 @@ mod tests {
                 lang_code: "de".into(),
                 voice_id: "de-v".into(),
             }],
+            offer_voices: Vec::new(),
             created_at: ts(),
             updated_at: ts(),
         });
@@ -284,6 +286,7 @@ mod tests {
             backends: vec!["b".into()],
             models: vec![],
             voices: vec![],
+            offer_voices: Vec::new(),
             created_at: ts(),
             updated_at: ts(),
         });
@@ -329,6 +332,7 @@ mod tests {
             backends: vec!["b".into()],
             models: vec![],
             voices: vec![],
+            offer_voices: Vec::new(),
             created_at: ts(),
             updated_at: ts(),
         });

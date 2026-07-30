@@ -71,6 +71,15 @@ pub(super) fn voice_lines(voices: &[VoiceRow]) -> String {
         .join("\n")
 }
 
+/// Parse a plain one-value-per-line textarea, trimming and dropping blanks.
+fn parse_lines(v: &str) -> Vec<String> {
+    v.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Parse the voices textarea: one `lang=voice` per line; a line with no `=` is
 /// the empty-key default voice.
 fn parse_voices(v: &str) -> Vec<VoiceRow> {
@@ -170,6 +179,10 @@ pub async fn pools_save(State(state): State<Arc<RamaState>>, req: Request) -> Re
         backends: fields_all(&pairs, "backends"),
         models: parse_csv(field(&pairs, "models")),
         voices: parse_voices(field(&pairs, "voices")),
+        // The voices users may pick between (one per line). Deliberately a
+        // separate field from `voices` above: that one maps a language to the
+        // voice to use and holds a single voice per language.
+        offer_voices: parse_lines(field(&pairs, "offer_voices")),
         created_at: jiff::Timestamp::now(),
         updated_at: jiff::Timestamp::now(),
     };

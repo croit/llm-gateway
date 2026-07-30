@@ -1,0 +1,23 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
+-- Copyright (C) 2026 croit GmbH
+--
+-- The voice the user picked for spoken replies.
+--
+-- Until now the TTS voice was operator config only: a speech pool declares a
+-- language -> voice map (`pool_voices`) and every user of that deployment got
+-- the same voice for a given language. That is the right *default* but a poor
+-- final answer -- which voice is pleasant to listen to for hours is a personal
+-- preference, not a deployment-wide fact, and a shared gateway has one
+-- `pool_voices` row for everybody.
+--
+-- NULL means "no preference": the pool's language -> voice map decides, exactly
+-- as before this column existed. So the column is additive in behaviour as well
+-- as in schema -- nothing changes for a user who never opens the picker.
+--
+-- The value is NOT trusted on read. It is a plain upstream voice id (`onyx`,
+-- `nova`, ...) that reaches a third-party TTS API, so both the write endpoint
+-- and the speech path re-check it against the voices the speech pools actually
+-- advertise. An operator who removes a voice from the pool config therefore
+-- retires it for every user who had picked it, without a data migration.
+
+ALTER TABLE users ADD COLUMN speech_voice TEXT;

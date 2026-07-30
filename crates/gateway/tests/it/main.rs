@@ -40,6 +40,7 @@ mod scheduled;
 mod session_routes;
 mod sidebar_nav;
 mod skills_user_page;
+mod speech_voice;
 mod tool_loop;
 mod tool_prefs;
 mod tools_inventory;

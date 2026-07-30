@@ -116,6 +116,7 @@ pub async fn state_with_pool(upstream_url: &str, kind: PoolKind, model_name: &st
         "pool".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -123,6 +124,41 @@ pub async fn state_with_pool(upstream_url: &str, kind: PoolKind, model_name: &st
             kind,
             strategy: PickerStrategy::RoundRobin,
             models: Vec::new(),
+            backend: vec![mock_backend("mock", upstream_url)],
+        },
+    );
+    let registry = upstreams::UpstreamRegistry::new(&pools).unwrap();
+    seed_pool_models(&registry, "pool", 0, &[model_name]);
+    state_from_registry(db_pool, registry)
+}
+
+/// Like [`state_with_pool`] for a `speech` pool, with both voice surfaces the
+/// operator controls: `voices` is the language→voice map that *resolves* a
+/// default (`("", "alloy")` being the catch-all entry), `offer` is the menu the
+/// per-user picker shows. Backs the voice-picker tests.
+pub async fn state_with_speech_voices(
+    upstream_url: &str,
+    model_name: &str,
+    voices: &[(&str, &str)],
+    offer: &[&str],
+) -> RamaState {
+    let db_pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool".to_string(),
+        UpstreamPoolConfig {
+            voices: voices
+                .iter()
+                .map(|(lang, voice)| ((*lang).to_string(), (*voice).to_string()))
+                .collect(),
+            offer_voices: offer.iter().map(|v| (*v).to_string()).collect(),
+            allowed_groups: Vec::new(),
+            fallback_offline: None,
+            compliance: Default::default(),
+            enforce_limits: true,
+            kind: PoolKind::Speech,
+            strategy: PickerStrategy::RoundRobin,
+            models: vec![],
             backend: vec![mock_backend("mock", upstream_url)],
         },
     );
@@ -188,6 +224,7 @@ pub async fn state_with_chat_and_config_transcription(
         "chat".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -205,6 +242,7 @@ pub async fn state_with_chat_and_config_transcription(
         "voice".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -235,6 +273,7 @@ pub async fn state_with_chat_and_embed(chat_model: &str, embed_model: &str) -> R
         "chat".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -249,6 +288,7 @@ pub async fn state_with_chat_and_embed(chat_model: &str, embed_model: &str) -> R
         "embed".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -287,6 +327,7 @@ pub async fn state_with_admin_rbac_and_comfyui(upstream_url: &str) -> RamaState 
         "pool".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -370,6 +411,7 @@ async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool
         "pool".to_string(),
         UpstreamPoolConfig {
             voices: Default::default(),
+            offer_voices: Vec::new(),
             allowed_groups: Vec::new(),
             fallback_offline: None,
             compliance: Default::default(),
@@ -485,6 +527,7 @@ pub async fn seed_session(state: &RamaState, user_id: &str, email: &str) -> Stri
             created_at: now,
             updated_at: now,
             timezone: None,
+            speech_voice: None,
         },
     )
     .await
@@ -511,6 +554,7 @@ pub async fn seed_user_with_token(state: &RamaState, user_id: &str) -> String {
             created_at: now,
             updated_at: now,
             timezone: None,
+            speech_voice: None,
         },
     )
     .await

@@ -195,6 +195,9 @@ async fn render_chat_response(
     let access = state.pool_access_for(&user.roles);
     let models = list_chat_models(&state, &access).await;
     let transcription_models = list_transcription_models(&state, &access).await;
+    // Voices this user may pick from — the operator's declared set, filtered to
+    // the speech pools their groups allow.
+    let speech_voices = state.upstreams.speech_voices_for(&access);
     // Effort + capability menu are owner-only (a read-only viewer has no
     // composer to attach them to): a default + empty set keeps the render
     // cheap for that path.
@@ -261,6 +264,8 @@ async fn render_chat_response(
         voice_available: !read_only
             && state.upstreams.has_speech()
             && !transcription_models.is_empty(),
+        speech_voices: &speech_voices,
+        speech_voice: user.speech_voice.as_deref(),
         lang,
     });
     let chat_sidebar = SidebarChat {

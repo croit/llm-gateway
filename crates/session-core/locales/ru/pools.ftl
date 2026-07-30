@@ -16,6 +16,7 @@ pools-field-fallback-offline-placeholder = используется, когда 
 pools-field-models = Обслуживаемые модели (белый список, через запятую)
 pools-field-models-hint = Если задано, от бэкенда с зондированием /models обслуживаются только эти id — остальные показаны зачёркнутыми. Пусто = обслуживать всё, что сообщает бэкенд.
 pools-field-voices = Голоса (lang=voice по одному в строке)
+pools-field-offer-voices = Доступные голоса (по одному в строке, выбирает пользователь)
 pools-field-backends = Бэкенды
 pools-no-backends = Бэкенды ещё не заданы. Сначала добавьте один на странице «Бэкенды».
 pools-field-gdpr = Соответствует GDPR
