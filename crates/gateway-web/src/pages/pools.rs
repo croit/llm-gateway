@@ -72,35 +72,46 @@ pub(super) fn voice_lines(voices: &[VoiceRow]) -> String {
 }
 
 /// Parse a plain one-value-per-line textarea, trimming and dropping blanks.
+/// Parse a plain one-value-per-line textarea, trimming, dropping blanks, and
+/// keeping the first of any repeat. The offer table is keyed by `voice_id`, so a
+/// duplicated line would otherwise abort the whole save on a UNIQUE violation.
 fn parse_lines(v: &str) -> Vec<String> {
-    v.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    for line in v.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !out.iter().any(|s| s == line) {
+            out.push(line.to_string());
+        }
+    }
+    out
 }
 
 /// Parse the voices textarea: one `lang=voice` per line; a line with no `=` is
 /// the empty-key default voice.
+///
+/// Repeated language codes keep the **first** entry. This map answers "which
+/// voice for this language" and is keyed by language in the schema, so a second
+/// entry for the same code was never reachable at resolution time — but it *was*
+/// enough to abort the save with a UNIQUE violation, which is what listing
+/// several bare voices here does (an easy mistake, since the selectable-voices
+/// box right below takes exactly that shape).
 fn parse_voices(v: &str) -> Vec<VoiceRow> {
-    v.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            match line.split_once('=') {
-                Some((lang, voice)) => Some(VoiceRow {
-                    lang_code: lang.trim().to_string(),
-                    voice_id: voice.trim().to_string(),
-                }),
-                None => Some(VoiceRow {
-                    lang_code: String::new(),
-                    voice_id: line.to_string(),
-                }),
-            }
-        })
-        .collect()
+    let mut out: Vec<VoiceRow> = Vec::new();
+    for line in v.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let row = match line.split_once('=') {
+            Some((lang, voice)) => VoiceRow {
+                lang_code: lang.trim().to_string(),
+                voice_id: voice.trim().to_string(),
+            },
+            None => VoiceRow {
+                lang_code: String::new(),
+                voice_id: line.to_string(),
+            },
+        };
+        if !out.iter().any(|r| r.lang_code == row.lang_code) {
+            out.push(row);
+        }
+    }
+    out
 }
 
 /// Re-read the pool list and build the `datastar-patch-elements` event that
@@ -336,6 +347,34 @@ mod tests {
         assert_eq!(
             voice_lines(&parsed),
             "de=de-voice\ndefault-voice\nen=en-voice"
+        );
+    }
+
+    /// Regression: several bare voices in the language-map box used to reach the
+    /// DB as several rows with an empty `lang_code` and abort the whole pool save
+    /// with `UNIQUE constraint failed: pool_voices.pool_name, pool_voices.lang_code`.
+    /// It is an easy mistake to make — the selectable-voices box below takes
+    /// exactly this shape — so the first entry per language wins and the rest are
+    /// dropped rather than failing the form.
+    #[test]
+    fn repeated_language_codes_keep_the_first_instead_of_failing_the_save() {
+        let parsed = parse_voices("alloy\nmarin\ncedar");
+        assert_eq!(parsed.len(), 1, "{parsed:?}");
+        assert_eq!(parsed[0].voice_id, "alloy");
+
+        // Same for an explicit language repeated.
+        let parsed = parse_voices("de=onyx\nde=marin\nen=nova");
+        assert_eq!(parsed.len(), 2, "{parsed:?}");
+        assert_eq!(parsed[0].voice_id, "onyx");
+        assert_eq!(parsed[1].lang_code, "en");
+    }
+
+    #[test]
+    fn selectable_voices_are_deduped_in_order() {
+        // Keyed by voice id in the DB, so a repeat would fail the save too.
+        assert_eq!(
+            parse_lines("  marin\ncedar\n\nmarin\n alloy "),
+            ["marin", "cedar", "alloy"]
         );
     }
 }
