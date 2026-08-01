@@ -18,9 +18,16 @@
 //     on the stop button does both the optimistic UI flip and the
 //     server round-trip.
 //
-// The server flips `$chatStreaming` back to `false` at end-of-stream
-// via a `datastar-patch-signals` SSE event — no JS callback needed
-// for the lifecycle transition.
+// The server owns both ends of the lifecycle via `datastar-patch-signals`
+// SSE events — no JS callback needed for either transition:
+//   * `chatStreaming: true` rides on the opening frame of a turn's stream,
+//     so "a turn started" and "Stop is showing" are the same event. The
+//     client-side flips above are only an optimistic head start.
+//   * `chatStreaming: false` arrives at end-of-stream.
+// Retry/edit (`render::action_submit`) go through the same pair — they spawn
+// a real worker too. They used to set neither, so a regenerated turn streamed
+// behind a composer that still read "ready": no Stop button, and the
+// Enter-guard below let a second message fire into a busy worker.
 //
 // History reconstruction used to live here (`collectHistory()` walked
 // `#conversation` and JSON-encoded the prior turns into a hidden

@@ -175,8 +175,18 @@ pub(crate) fn action_url(base: &str, turn: &Turn, action: &str) -> String {
 
 /// Datastar submit directive for a retry/edit form: copy the current
 /// model dropdown into the form's hidden `model` input, confirm the
-/// destructive drop, then `@post` (whose SSE response streams the
-/// regenerated reply back in).
+/// destructive drop, arm the Stop control, then `@post` (whose SSE
+/// response streams the regenerated reply back in).
+///
+/// `$chatStreaming = true` matters as much here as on the composer's own
+/// submit: retry/edit spawn a *real* worker, so without it the whole
+/// regenerated turn ran with the composer sitting in its "ready" state —
+/// no Stop button (nothing to interrupt a runaway retry with), and the
+/// Enter-to-submit guard in `composer.ts` (which reads the
+/// `.chat-composer--streaming` class) let the user fire a second message
+/// that the server could only reject as "already streaming". The server
+/// re-asserts the same signal in its response (see the regeneration
+/// handler), so a stale client still ends up armed.
 ///
 /// `confirm` is JSON-encoded (not hand-escaped) before splicing into the
 /// JS string literal: JSON string syntax is a strict subset of JS string
@@ -187,7 +197,7 @@ pub(crate) fn action_submit(url: &str, confirm: &str) -> String {
     let confirm_js = serde_json::to_string(confirm).expect("String always serialises");
     format!(
         "window.chatActions.fillModel(el) && confirm({confirm_js}) && \
-         @post('{url}', {{contentType: 'form'}})"
+         ($chatStreaming = true, @post('{url}', {{contentType: 'form'}}))"
     )
 }
 
