@@ -71,17 +71,59 @@ pub fn empty_sse_response() -> Response {
 /// as a 400 + plain text, but datastar 1.0 ignores non-SSE bodies
 /// on `@post` responses — the user saw no toast and no console
 /// message, just silence.
+///
+/// Deliberately does **not** touch `$chatStreaming`. Most handlers that
+/// reach for this (tail, canvas, attachment removal, …) can fire while a
+/// turn is streaming, and clearing the signal there disarmed the Stop
+/// control mid-turn: the composer flipped back to "ready" while tool
+/// calls kept landing, so the turn looked finished when it wasn't. Only
+/// the handlers that own the submit→turn handoff may move the signal —
+/// see [`sse_submit_error_response`] and [`sse_turn_busy_response`].
 pub fn sse_error_response(message: &str) -> Response {
     use crate::chrome::{Flash, FlashKind, sse_response, sse_toast};
-    // Reset `chatStreaming` so the composer's data-class binding
-    // re-shows the send button. Without this, a validation-failed
-    // submit leaves `$chatStreaming=true` (the submit directive
-    // flipped it before @post fired, and only the streaming loop's
-    // `Finalized` event resets it). Cascade then hides .send +
-    // shows .stop — the next click looks the same to the user but
-    // posts to /cancel instead.
+    sse_response(&[sse_toast(&Flash {
+        kind: FlashKind::Error,
+        message: message.to_string(),
+    })])
+}
+
+/// Error response for a submit that never became a turn — the composer's
+/// `POST …/messages` and the retry/edit regeneration posts.
+///
+/// Adds the `chatStreaming: false` reset [`sse_error_response`] leaves
+/// alone: those three directives optimistically set `$chatStreaming =
+/// true` before the `@post` fires, and only the streaming loop's
+/// `Finalized` event clears it. Without the reset a rejected submit
+/// leaves the composer showing Stop forever — and the next click posts to
+/// `/cancel` instead of sending.
+///
+/// Use this **only** where no worker was left running. If a turn is in
+/// fact live, use [`sse_turn_busy_response`].
+pub fn sse_submit_error_response(message: &str) -> Response {
+    use crate::chrome::{Flash, FlashKind, sse_response, sse_toast};
     sse_response(&[
         sse_signals(r#"{"chatStreaming":false}"#),
+        sse_toast(&Flash {
+            kind: FlashKind::Error,
+            message: message.to_string(),
+        }),
+    ])
+}
+
+/// Rejection for a submit that arrived while this user's turn is still
+/// streaming (`RegisterOutcome::Busy`).
+///
+/// Sets `chatStreaming: **true**`. The previous behaviour funnelled this
+/// through the blanket reset, so asking "are you still working?" during a
+/// long turn *disarmed* the Stop button — the one moment it is most
+/// needed — and left the composer claiming the turn was done. A turn
+/// really is in flight here, so the honest signal is the armed one; it
+/// also re-arms a client whose signal had drifted false for any other
+/// reason.
+pub fn sse_turn_busy_response(message: &str) -> Response {
+    use crate::chrome::{Flash, FlashKind, sse_response, sse_toast};
+    sse_response(&[
+        sse_signals(r#"{"chatStreaming":true}"#),
         sse_toast(&Flash {
             kind: FlashKind::Error,
             message: message.to_string(),
@@ -283,4 +325,56 @@ pub fn spawn_session_stream_response(
 /// session list sidebar.
 pub fn no_op_sidebar_emitter() -> SidebarEmitter {
     Box::new(|tx| Box::pin(async move { Ok(tx) }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rama::http::body::util::BodyExt;
+
+    async fn body_of(resp: Response) -> String {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_plain_error_leaves_the_streaming_signal_alone() {
+        // Most callers are handlers that can fire *while* a turn streams (tail,
+        // canvas, attachment removal). Clearing the signal there flipped the
+        // composer back to "ready" mid-turn, so a still-running turn looked
+        // finished while its tool calls kept climbing.
+        let body = body_of(sse_error_response("nope")).await;
+        assert!(
+            !body.contains("chatStreaming"),
+            "a plain chat error must not touch the streaming signal:\n{body}"
+        );
+        assert!(
+            body.contains("event: datastar-patch-elements"),
+            "the user still needs the toast:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_submit_disarms_the_stop_control() {
+        // The submit directives optimistically arm the signal before the @post,
+        // so a submit that never became a turn has to hand it back.
+        let body = body_of(sse_submit_error_response("empty")).await;
+        assert!(
+            body.contains(r#"{"chatStreaming":false}"#),
+            "a rejected submit must release the Stop state:\n{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_busy_rejection_arms_the_stop_control() {
+        let body = body_of(sse_turn_busy_response("already streaming")).await;
+        assert!(
+            body.contains(r#"{"chatStreaming":true}"#),
+            "a turn is live, so Stop must stay armed:\n{body}"
+        );
+        assert!(
+            !body.contains(r#"{"chatStreaming":false}"#),
+            "must not also disarm it:\n{body}"
+        );
+    }
 }

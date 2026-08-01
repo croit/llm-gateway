@@ -148,10 +148,25 @@ async fn message_send_emits_initial_bubbles_and_finalizes_signal() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
 
-    // First element-patch event is the initial `mode append` of the
-    // user bubble + the assistant skeleton onto `#conversation`.
-    let first_event_end = body.find("\n\n").unwrap();
-    let first_event = &body[..first_event_end];
+    // The stream opens by arming the composer's Stop control. The submit
+    // directive also sets it client-side, but the server asserting it is what
+    // makes "a turn started" and "Stop is showing" the same event — the client
+    // signal drifts (composer re-renders re-seed it, other handlers cleared
+    // it) and a turn streaming behind a "ready" composer looks finished.
+    let armed = body
+        .find(r#"data: signals {"chatStreaming":true}"#)
+        .unwrap_or_else(|| panic!("expected the stream to arm chatStreaming:\n{body}"));
+
+    // Then the initial `mode append` of the user bubble + the assistant
+    // skeleton onto `#conversation`.
+    let first_patch = body.find("data: selector #conversation").unwrap();
+    assert!(
+        armed < first_patch,
+        "the arming signal must lead the first patch:\n{body}"
+    );
+    let first_event_end = body[first_patch..].find("\n\n").unwrap() + first_patch;
+    let event_start = body[..first_patch].rfind("event: ").unwrap();
+    let first_event = &body[event_start..first_event_end];
     assert!(first_event.contains("data: selector #conversation"));
     assert!(first_event.contains("data: mode append"));
     assert!(first_event.contains(r#"class="chat-msg--user""#));
@@ -263,6 +278,64 @@ async fn chat_turn_records_a_usage_row_with_source_chat() {
     );
     assert_eq!(agg.by_source[0].key, "chat", "source is the chat UI");
     assert_eq!(agg.by_model[0].key, "model-a");
+}
+
+/// A submit that lands while this user's turn is still streaming is rejected —
+/// and the rejection must leave the Stop control **armed**.
+///
+/// The bug: the rejection went through the blanket `chatStreaming:false` reset
+/// every other chat error used, so asking "are you still working?" during a
+/// long turn disarmed Stop at the one moment it matters and left the composer
+/// claiming the turn had finished. A turn genuinely is in flight here, so the
+/// honest signal is the armed one.
+#[tokio::test]
+async fn a_submit_during_a_live_turn_leaves_stop_armed() {
+    use session_core::workers::RegisterOutcome;
+
+    let upstream = MockServer::start().await;
+    let (state, cookie, session_id) = setup(&upstream.uri()).await;
+    let app = router(state.clone());
+
+    // Stand in for a live worker on this session — the registry is what the
+    // handler consults, so no upstream traffic is needed.
+    let RegisterOutcome::Registered { worker: _worker } =
+        state.chats.register("alice", "busy-turn", &session_id)
+    else {
+        panic!("registry was not empty");
+    };
+
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "are you still working?")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{session_id}/messages"))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+
+    assert!(
+        !body.contains(r#""chatStreaming":false"#),
+        "rejecting a mid-turn submit must not disarm Stop:\n{body}"
+    );
+    assert!(
+        body.contains(r#"data: signals {"chatStreaming":true}"#),
+        "rejecting a mid-turn submit must (re-)arm Stop:\n{body}"
+    );
+    // The user still gets told why nothing was sent.
+    assert!(
+        body.contains("event: datastar-patch-elements"),
+        "expected an error toast:\n{body}"
+    );
+    // And no second turn was created.
+    let turns = chat::list_turns(&state.db, &session_id).await.unwrap();
+    assert!(
+        turns.is_empty(),
+        "a rejected submit must persist nothing: {turns:?}"
+    );
 }
 
 #[tokio::test]

@@ -35,7 +35,8 @@ use super::{
 };
 use session_core::chat::{
     SidebarEmitter, SseTx, cancel_turn as chat_cancel_turn, empty_sse_response,
-    spawn_session_stream_response, sse_error_response,
+    spawn_session_stream_response, sse_error_response, sse_submit_error_response,
+    sse_turn_busy_response,
 };
 use session_core::chrome::{
     NavSections, Theme, is_datastar_request, read_body_to_bytes, see_other, sse_patch,
@@ -969,9 +970,9 @@ pub async fn chat_message_send(
     let active = match chat::get_session(&state.db, &user.id, &session_id).await {
         Ok(Some(s)) => s,
         Ok(None) => {
-            return sse_error_response(&t(lang, "chat-error-conversation-not-found"));
+            return sse_submit_error_response(&t(lang, "chat-error-conversation-not-found"));
         }
-        Err(err) => return sse_error_response(&err.to_string()),
+        Err(err) => return sse_submit_error_response(&err.to_string()),
     };
 
     // Rate-limit / quota gate — before reserving a worker or touching the DB,
@@ -979,7 +980,7 @@ pub async fn chat_message_send(
     {
         let role_ids = state.role_ids_for(&user.roles);
         if state.enforcer.check(&user.id, &role_ids).await.is_err() {
-            return sse_error_response(&t(lang, "chat-error-rate-limited"));
+            return sse_submit_error_response(&t(lang, "chat-error-rate-limited"));
         }
     }
 
@@ -1002,7 +1003,7 @@ pub async fn chat_message_send(
     let (_, body) = req.into_parts();
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
-        Err(msg) => return sse_error_response(&msg),
+        Err(msg) => return sse_submit_error_response(&msg),
     };
     // Pre-generate both turn ids:
     //   * `assistant_turn_id` keys the worker-registry slot below
@@ -1015,10 +1016,10 @@ pub async fn chat_message_send(
     let user_turn_id = uuid::Uuid::new_v4().to_string();
     let submit = match parse_chat_submit(&content_type, body, &user_turn_id, &state).await {
         Ok(s) => s,
-        Err(msg) => return sse_error_response(&msg),
+        Err(msg) => return sse_submit_error_response(&msg),
     };
     if submit.user_text.is_empty() && submit.attachments.is_empty() {
-        return sse_error_response(&t(lang, "chat-error-message-empty"));
+        return sse_submit_error_response(&t(lang, "chat-error-message-empty"));
     }
 
     // Build the final user_text: typed text + per-attachment marker
@@ -1045,7 +1046,7 @@ pub async fn chat_message_send(
     let worker = match outcome {
         RegisterOutcome::Registered { worker } => worker,
         RegisterOutcome::Busy { .. } => {
-            return sse_error_response(&t(lang, "chat-error-still-streaming"));
+            return sse_turn_busy_response(&t(lang, "chat-error-still-streaming"));
         }
     };
 
@@ -1056,7 +1057,7 @@ pub async fn chat_message_send(
             Ok(t) => t,
             Err(err) => {
                 state.chats.clear(&user.id, &worker);
-                return sse_error_response(&err.to_string());
+                return sse_submit_error_response(&err.to_string());
             }
         };
     // Auto-title on the first user turn. Two-stage so the sidebar
@@ -1089,7 +1090,7 @@ pub async fn chat_message_send(
         Ok(t) => t,
         Err(err) => {
             state.chats.clear(&user.id, &worker);
-            return sse_error_response(&err.to_string());
+            return sse_submit_error_response(&err.to_string());
         }
     };
     let _ = chat::touch_session(&state.db, &active.id).await;
@@ -1154,7 +1155,11 @@ pub async fn chat_message_send(
             lang
         )
     );
-    let initial_patch = sse_patch(Some("#conversation"), Some("append"), &initial_html);
+    let initial_patch = armed_initial_patch(sse_patch(
+        Some("#conversation"),
+        Some("append"),
+        &initial_html,
+    ));
 
     spawn_session_stream_response(
         state.db.clone(),
@@ -1441,17 +1446,20 @@ async fn load_owned_turn(
     match chat::get_session(&state.db, &user.id, session_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
-            return Err(sse_error_response(&t(
+            return Err(sse_submit_error_response(&t(
                 lang,
                 "chat-error-conversation-not-found",
             )));
         }
-        Err(err) => return Err(sse_error_response(&err.to_string())),
+        Err(err) => return Err(sse_submit_error_response(&err.to_string())),
     }
     match chat::get_turn(&state.db, session_id, turn_id).await {
         Ok(Some(t)) => Ok(t),
-        Ok(None) => Err(sse_error_response(&t(lang, "chat-error-message-not-found"))),
-        Err(err) => Err(sse_error_response(&err.to_string())),
+        Ok(None) => Err(sse_submit_error_response(&t(
+            lang,
+            "chat-error-message-not-found",
+        ))),
+        Err(err) => Err(sse_submit_error_response(&err.to_string())),
     }
 }
 
@@ -1471,11 +1479,11 @@ pub async fn chat_retry(
     let (_, body) = req.into_parts();
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
-        Err(msg) => return sse_error_response(&msg),
+        Err(msg) => return sse_submit_error_response(&msg),
     };
     let form: RetryForm = match serde_urlencoded::from_bytes(&body) {
         Ok(f) => f,
-        Err(err) => return sse_error_response(&format!("malformed form: {err}")),
+        Err(err) => return sse_submit_error_response(&format!("malformed form: {err}")),
     };
 
     let turn = match load_owned_turn(&state, &user, &id, &turn_id, lang).await {
@@ -1483,13 +1491,13 @@ pub async fn chat_retry(
         Err(resp) => return resp,
     };
     if turn.role != chat::TurnRole::Assistant {
-        return sse_error_response(&t(lang, "chat-error-retry-assistant-only"));
+        return sse_submit_error_response(&t(lang, "chat-error-retry-assistant-only"));
     }
     // Drop this reply + everything below, then regenerate from the
     // preceding user turn. The dropped turns' files go with them.
     let orphaned = doomed_attachments(&state, &id, turn.seq).await;
     if let Err(err) = chat::delete_turns_from_seq(&state.db, &id, turn.seq).await {
-        return sse_error_response(&err.to_string());
+        return sse_submit_error_response(&err.to_string());
     }
     reclaim_attachments(&state, orphaned);
     start_regeneration(
@@ -1533,7 +1541,7 @@ pub async fn chat_edit(
     let (_, body) = req.into_parts();
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
-        Err(msg) => return sse_error_response(&msg),
+        Err(msg) => return sse_submit_error_response(&msg),
     };
 
     // Verify ownership + role BEFORE parsing multipart — parsing uploads
@@ -1544,7 +1552,7 @@ pub async fn chat_edit(
         Err(resp) => return resp,
     };
     if turn.role != chat::TurnRole::User {
-        return sse_error_response(&t(lang, "chat-error-edit-own-messages-only"));
+        return sse_submit_error_response(&t(lang, "chat-error-edit-own-messages-only"));
     }
 
     // The edited message text + any newly attached files. Multipart carries
@@ -1553,7 +1561,7 @@ pub async fn chat_edit(
     let (model, new_text) = if content_type.starts_with("multipart/form-data") {
         let submit = match parse_chat_submit(&content_type, body, &turn_id, &state).await {
             Ok(s) => s,
-            Err(msg) => return sse_error_response(&msg),
+            Err(msg) => return sse_submit_error_response(&msg),
         };
         // `submit.user_text` already carries the existing content (incl. any
         // prior attachment markers the textarea preserved); append markers
@@ -1564,23 +1572,23 @@ pub async fn chat_edit(
     } else {
         let form: EditForm = match serde_urlencoded::from_bytes(&body) {
             Ok(f) => f,
-            Err(err) => return sse_error_response(&format!("malformed form: {err}")),
+            Err(err) => return sse_submit_error_response(&format!("malformed form: {err}")),
         };
         (form.model, form.message.trim().to_string())
     };
     if new_text.is_empty() {
-        return sse_error_response(&t(lang, "chat-error-message-must-not-be-empty"));
+        return sse_submit_error_response(&t(lang, "chat-error-message-must-not-be-empty"));
     }
 
     // Rewrite the message, drop everything below it, regenerate.
     if let Err(err) = chat::update_user_turn_content(&state.db, &id, &turn_id, &new_text).await {
-        return sse_error_response(&err.to_string());
+        return sse_submit_error_response(&err.to_string());
     }
     // Everything below the edited message is regenerated, so its files
     // are orphaned — the edited turn's own uploads stay (seq + 1).
     let orphaned = doomed_attachments(&state, &id, turn.seq + 1).await;
     if let Err(err) = chat::delete_turns_from_seq(&state.db, &id, turn.seq + 1).await {
-        return sse_error_response(&err.to_string());
+        return sse_submit_error_response(&err.to_string());
     }
     reclaim_attachments(&state, orphaned);
     start_regeneration(
@@ -1936,7 +1944,7 @@ async fn start_regeneration(
     {
         RegisterOutcome::Registered { worker } => worker,
         RegisterOutcome::Busy { .. } => {
-            return sse_error_response(&t(lang, "chat-error-still-streaming"));
+            return sse_turn_busy_response(&t(lang, "chat-error-still-streaming"));
         }
     };
     let assistant_turn = match chat::create_assistant_turn_in_progress(
@@ -1950,7 +1958,7 @@ async fn start_regeneration(
         Ok(t) => t,
         Err(err) => {
             state.chats.clear(&user.id, &worker);
-            return sse_error_response(&err.to_string());
+            return sse_submit_error_response(&err.to_string());
         }
     };
     let _ = chat::touch_session(&state.db, &session_id).await;
@@ -1978,7 +1986,8 @@ async fn start_regeneration(
     for turn in &turns {
         inner.push_str(&session_core::render::render_turn(turn, Some("/chat"), lang).to_string());
     }
-    let initial_patch = sse_patch(Some("#conversation"), Some("inner"), &inner);
+    let initial_patch =
+        armed_initial_patch(sse_patch(Some("#conversation"), Some("inner"), &inner));
 
     spawn_session_stream_response(
         state.db.clone(),
@@ -1990,6 +1999,22 @@ async fn start_regeneration(
         Some("/chat".to_string()),
         lang,
     )
+}
+
+/// Prepend `chatStreaming: true` to a stream's opening patch, so the very
+/// first frame of a turn arms the Stop control server-side.
+///
+/// Both start-a-turn paths set the signal client-side too (the composer's
+/// submit directive and `action_submit`'s retry/edit one), but the client is
+/// not a trustworthy source of truth for it: the signal also gets re-seeded by
+/// every composer re-render, and any handler that cleared it would otherwise
+/// leave the page claiming an idle composer while a worker streams. Asserting
+/// it here means "a turn started" and "Stop is showing" are the same event.
+/// The matching `chatStreaming: false` arrives with `TurnUpdate::Finalized`.
+fn armed_initial_patch(patch: rama::bytes::Bytes) -> rama::bytes::Bytes {
+    let mut frame = sse_signals(r#"{"chatStreaming":true}"#).to_vec();
+    frame.extend_from_slice(&patch);
+    frame.into()
 }
 
 // ---------------------------------------------------------------------------

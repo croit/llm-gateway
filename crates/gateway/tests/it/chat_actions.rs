@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use common::Service as _;
 use gateway::rama_server::router::router;
+use rama::http::body::util::BodyExt;
 use rama::http::{Body, Method, Request, StatusCode};
 use session_core::db::{self as chat, TurnRole, TurnStatus};
 
@@ -172,6 +173,51 @@ async fn edit_on_an_assistant_turn_is_rejected() {
         .unwrap();
     assert_eq!(a1.role, TurnRole::Assistant);
     assert!(a1.user_content.is_none());
+}
+
+/// Regeneration spawns a real worker, so its stream must arm the composer's
+/// Stop control — the same as a plain submit does.
+///
+/// The bug: retry/edit set no `chatStreaming` signal at all (client-side or
+/// server-side), so the whole regenerated turn ran with the composer sitting
+/// in its "ready" state. Tool calls kept appearing while the page claimed the
+/// turn was finished, there was no way to stop a runaway retry, and the
+/// Enter-guard let the user fire a second message the server could only reject.
+#[tokio::test]
+async fn retry_and_edit_streams_arm_the_stop_control() {
+    for (action, form) in [
+        ("turns/a1/retry", "model=model-a"),
+        ("turns/u0/edit", "model=model-a&message=reworded"),
+    ] {
+        let state = Arc::new(common::state_with_chat_pool("http://unused.invalid").await);
+        let cookie = common::seed_session(&state, "alice", "alice@example.com").await;
+        let session_id = seed_conversation(&state, "alice").await;
+        let app = router(state.clone());
+
+        let resp = app
+            .serve(post_form(
+                &format!("/chat/{session_id}/{action}"),
+                &cookie,
+                form,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains(r#"data: signals {"chatStreaming":true}"#),
+            "{action} must arm the Stop control, body was:\n{body}"
+        );
+        // And the arming must lead — not trail the conversation repaint, or the
+        // composer reads "ready" for however long the turn takes to finish.
+        let armed = body.find(r#"signals {"chatStreaming":true}"#).unwrap();
+        let repaint = body.find("selector #conversation").unwrap();
+        assert!(
+            armed < repaint,
+            "{action} must arm before repainting the conversation:\n{body}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -76,6 +76,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retry_and_edit_directives_arm_the_stop_control() {
+        // Retry/edit spawn a real worker, exactly like a composer submit, so
+        // their directives must arm `$chatStreaming` the same way. Without it
+        // the regenerated turn streamed behind a "ready" composer: no Stop
+        // button, and `composer.ts`'s Enter-guard (which reads the
+        // `.chat-composer--streaming` class) happily let a second message fire.
+        let directive = action_submit("/chat/s1/turns/a1/retry", "Regenerate?");
+        assert!(
+            directive.contains("$chatStreaming = true"),
+            "a regeneration submit must arm the streaming signal: {directive}"
+        );
+        // The `@post` has to stay inside the confirm's short-circuit — arming
+        // before the confirm would strand Stop on a cancelled dialog.
+        let confirm_at = directive.find("confirm(").expect("confirm guard");
+        assert!(
+            confirm_at < directive.find("$chatStreaming").unwrap(),
+            "the confirm must gate the arming: {directive}"
+        );
+    }
+
     fn conv_turn(seq: i64, role: TurnRole, text: &str) -> TurnWithTools {
         let now = jiff::Timestamp::now();
         let (user_content, content) = match role {
