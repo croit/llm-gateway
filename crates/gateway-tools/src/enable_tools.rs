@@ -343,8 +343,9 @@ fn target_for_key(key: &str) -> EnableTarget {
         "upload_attachment" => (
             "Attach a file to your reply",
             "hand the user a file to download — one you generate (PDF/PNG/text) via \
-             `upload_attachment`, or any file/data object already in this conversation \
-             (an earlier turn's file, a render's data) via `offer_download`",
+             `upload_attachment`, any file/data object already in this conversation \
+             (an earlier turn's file, a render's data) via `offer_download`, or a whole \
+             set of them bundled into one .zip via `zip_attachments`",
         ),
         "list_attachments" => (
             "List conversation files",

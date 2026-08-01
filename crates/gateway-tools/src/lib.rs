@@ -47,3 +47,4 @@ pub mod text_edit;
 pub mod typst_render;
 pub mod upload_attachment;
 pub mod wikipedia;
+pub mod zip_attachments;

@@ -72,12 +72,13 @@ const SCHEDULE_IDS: &[&str] = &[
 ];
 const SCHEDULE_KEY: &str = "schedule";
 
-/// Attaching a file to a reply is one capability with two halves — compose
-/// new content (`upload_attachment`) or hand over something the
-/// conversation already holds (`offer_download`) — so they share a toggle.
-/// A user who turned "attach files to replies" on means both; leaving the
-/// key as the older id keeps existing `user_tool_prefs` rows meaningful.
-const ATTACH_IDS: &[&str] = &["upload_attachment", "offer_download"];
+/// Attaching a file to a reply is one capability with three shapes — compose
+/// new content (`upload_attachment`), hand over something the conversation
+/// already holds (`offer_download`), or bundle several of those into one zip
+/// (`zip_attachments`) — so they share a toggle. A user who turned "attach
+/// files to replies" on means all of them; leaving the key as the oldest id
+/// keeps existing `user_tool_prefs` rows meaningful.
+const ATTACH_IDS: &[&str] = &["upload_attachment", "offer_download", "zip_attachments"];
 const ATTACH_KEY: &str = "upload_attachment";
 
 /// Tools that exist for smoke tests / internal plumbing and shouldn't
@@ -259,8 +260,10 @@ pub fn requires_chat_session(tool_id: &str) -> bool {
         || DOCUMENT_IDS.contains(&tool_id)
         || tool_id == "upload_attachment"
         // Takes a file *from* the conversation and attaches it *to* the
-        // current reply — both halves need a live chat turn.
+        // current reply — both halves need a live chat turn. Same for the
+        // multi-file variant.
         || tool_id == "offer_download"
+        || tool_id == "zip_attachments"
         || tool_id == "list_attachments"
         || tool_id == "generate_image"
         || tool_id == "edit_image"
@@ -301,8 +304,8 @@ pub fn category_for(tool_id: &str) -> Category {
     match tool_id {
         "search_web" | "fetch_url" | "lookup_ip" | "dns_lookup" | "whois_lookup" | "tls_cert"
         | "wikipedia" => Category::Web,
-        "fetch_attachment" | "upload_attachment" | "offer_download" | "list_attachments"
-        | "read_skill" => Category::Documents,
+        "fetch_attachment" | "upload_attachment" | "offer_download" | "zip_attachments"
+        | "list_attachments" | "read_skill" => Category::Documents,
         "generate_image" | "edit_image" | "generate_qr_code" | "load_image_url" => Category::Media,
         "rag_search" | "rag_grep" | "rag_list_collections" => Category::Knowledge,
         "run_in_sandbox"
@@ -382,8 +385,8 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Lets the assistant attach a file to its answer so you can download it — one it \
              generated (a document, image, or data export) as well as anything the \
              conversation already holds, including files from earlier turns and the data \
-             behind a rendered document. Without this it can only paste content into the \
-             reply as text.",
+             behind a rendered document. Several files at once arrive as a single .zip. \
+             Without this it can only paste content into the reply as text.",
         ),
         "list_attachments" => (
             "List conversation files",

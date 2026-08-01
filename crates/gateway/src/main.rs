@@ -195,6 +195,10 @@ async fn main() -> anyhow::Result<()> {
         // chip (a render's `.json` base). Reference-only: the bytes are
         // copied inside storage instead of being re-emitted by the model.
         .with(gateway_tools::offer_download::OfferDownload)
+        // Same, for a *set* of files: one zip chip instead of one chip per
+        // file, which past about four stops being a delivery and starts being
+        // a scavenger hunt (and on a phone buries the reply).
+        .with(gateway_tools::zip_attachments::ZipAttachments)
         // The other direction: an uploaded/produced text file becomes an
         // editable, versioned canvas document, so it can be changed a
         // passage at a time (and hand-edited by the user) instead of
