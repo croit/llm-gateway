@@ -29,6 +29,11 @@ echo "pre-push: running lint + workspace tests (mirrors CI; bypass with --no-ver
 # Separate invocations: `mise run lint test` would pass "test" as an argument
 # to the lint task, not run it as a second task. set -e aborts on the first
 # failure.
+# Secrets first, and over the full history rather than just the staged diff:
+# push is the last moment before something becomes public, and it's the one
+# gate that also covers commits made with `--no-verify` or on a clone where
+# `mise run setup-hooks` was never run. ~1.3 s, so it costs nothing here.
+mise run secrets
 mise run lint
 mise run test
 mise run test-js

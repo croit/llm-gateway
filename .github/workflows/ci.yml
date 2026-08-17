@@ -47,6 +47,37 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
+  # Secret scanning, kept as its own job so it reports in ~30 s instead of
+  # waiting on the multi-minute Rust build, and so its failure is unambiguous.
+  # This is the backstop for the local pre-commit/pre-push hooks: it also
+  # covers commits pushed with `--no-verify` or from a clone where
+  # `mise run setup-hooks` was never run — the exact path by which an internal
+  # bearer token once reached this public repo's history.
+  #
+  # Deliberately not gitleaks/gitleaks-action: that action requires a paid
+  # licence key for organisation-owned repos. The binary from mise.toml has no
+  # such restriction, and sharing `mise run secrets` with the hooks means the
+  # gate can't drift from what developers run locally.
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is load-bearing — `mise run secrets` scans commit
+      # history, and the default shallow checkout would hand it a single
+      # commit and pass vacuously.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # install_args limits this to gitleaks; pulling the full toolset (Rust,
+      # Node, typst) would cost minutes for a 1.3 s scan.
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: gitleaks
+
+      - name: mise run secrets
+        run: mise run secrets
+
   ci:
     name: lint + test + build
     runs-on: ubuntu-latest
@@ -107,7 +138,10 @@ jobs:
 
   container:
     name: container image
-    needs: ci
+    # Gated on `secrets` as well as `ci`: a red secret scan must not be able to
+    # publish an image to GHCR, or the leak ends up baked into a pulled artifact
+    # where rewriting git history no longer reaches it.
+    needs: [secrets, ci]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -177,7 +211,10 @@ jobs:
   # Containerfiles are arch-aware (TARGETARCH) if multi-arch is added later.
   sandbox-image:
     name: sandbox gold image
-    needs: ci
+    # Gated on `secrets` as well as `ci`: a red secret scan must not be able to
+    # publish an image to GHCR, or the leak ends up baked into a pulled artifact
+    # where rewriting git history no longer reaches it.
+    needs: [secrets, ci]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -230,7 +267,10 @@ jobs:
 
   sandbox-runner-image:
     name: sandbox runner image
-    needs: ci
+    # Gated on `secrets` as well as `ci`: a red secret scan must not be able to
+    # publish an image to GHCR, or the leak ends up baked into a pulled artifact
+    # where rewriting git history no longer reaches it.
+    needs: [secrets, ci]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:

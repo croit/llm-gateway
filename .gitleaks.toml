@@ -1,0 +1,68 @@
+# gitleaks — secret scanning that runs before anything leaves this machine.
+#
+# Why this exists: a croit-internal ERP bearer token was once committed in
+# `.codex/config.toml` and pushed to this public repo. GitHub's own secret
+# scanning did not catch it, and could not have: its free tier only matches
+# ~200 *provider* patterns (AWS, Stripe, OpenAI …), and an internal token has
+# no registered format. The generic "HTTP Bearer Token" pattern that would
+# have matched lives behind GitHub Secret Protection (paid). So the detection
+# has to happen here, in the repo:
+#
+#   - `mise run secrets-staged` — pre-commit hook, staged diff only (fast)
+#   - `mise run secrets`        — full history, run by CI's `secrets` job
+#
+# Both share this config, so hook and CI can't disagree about what's a leak.
+
+[extend]
+# Start from gitleaks' bundled ruleset (provider patterns + generic-api-key +
+# private keys + entropy heuristics) and add/subtract below.
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Custom rules
+# ---------------------------------------------------------------------------
+# The bundled `generic-api-key` rule does NOT catch an `Authorization` header
+# value — verified against the token that actually leaked from this repo. Its
+# value pattern is `[\w.=-]{10,150}`, which stops at the space in
+# `Authorization = "Bearer <token>"`; all it captures is the 6-char literal
+# "Bearer", below the rule's minimum length, so nothing is reported. The
+# scheme prefix effectively hides the secret. These two rules close that gap —
+# the same thing GitHub covers with its (paid-tier) "HTTP Bearer Token" and
+# "HTTP Basic Authentication" non-provider patterns.
+
+[[rules]]
+id = "http-bearer-token"
+description = "HTTP Authorization header carrying a bearer token"
+# Matches `Authorization: Bearer …`, `Authorization = "Bearer …"`,
+# `"authorization": "bearer …"` — TOML, JSON, YAML and Rust string literals
+# alike. The comma in the separator class covers the API-call form
+# `headers.insert("Authorization", "Bearer …")` / `.header("Authorization",
+# "Bearer …")`, which is how a hardcoded token is most likely to appear in
+# Rust or TS here. Placeholders (`Bearer {token}`, `Bearer <your-key>`,
+# `Bearer $VAR`) are excluded for free: `{`, `<` and `$` are outside the
+# value charset.
+regex = '''(?i)authorization["']?\s*[:=,]\s*["']?bearer\s+([\w.~+/-]{20,})'''
+secretGroup = 1
+entropy = 3.0
+keywords = ["authorization"]
+
+[[rules]]
+id = "http-basic-auth"
+description = "HTTP Authorization header carrying base64 basic-auth credentials"
+regex = '''(?i)authorization["']?\s*[:=]\s*["']?basic\s+([A-Za-z0-9+/]{16,}={0,2})'''
+secretGroup = 1
+entropy = 3.0
+keywords = ["authorization"]
+
+# Test fixtures that are cryptographic key material by nature but are not
+# credentials to anything. Allowlisted by the *literal value* rather than by
+# file path, so any genuine secret that later appears in these same files is
+# still reported.
+[[allowlists]]
+description = "RFC 8291 §5 Web Push example key material (test fixtures, grants access to nothing)"
+# The 16-byte `auth` secret from the RFC's worked example. Present in the push
+# unit tests and in `push_routes.rs`, where subscribe-time validation rejects
+# anything that isn't well-formed P-256 + auth material — so the tests need
+# values that are structurally valid.
+regexTarget = "line"
+regexes = ['''BTBZMqHH6r4Tts7J_aSIgg''']

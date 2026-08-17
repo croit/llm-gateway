@@ -37,6 +37,12 @@ node = "24"
 # is mise's problem. `mise run fetch-typst-cli` then copies the
 # installed binary into target/release/typst for the runtime image.
 typst = "0.15.0"
+# gitleaks backs the `secrets` / `secrets-staged` tasks: the pre-commit hook
+# and CI's `secrets` job. In the committed toolset (not mise.local.toml) so
+# `mise install` provisions it for every clone and for CI — a scanner only
+# some developers have is not a gate. Deliberately NOT the official
+# gitleaks-action, which requires a paid licence key for organisations.
+gitleaks = "8.30"
 
 [env]
 RUST_BACKTRACE = "1"
@@ -195,6 +201,18 @@ run = [
 description = "Advisory: flag panic-prone `.unwrap()`/`.expect()` in library/binary code (warnings only — NOT part of `ci`). The main `lint` gate runs clippy with `-D warnings`, so promoting these workspace-wide would turn every one of the ~2000 existing (mostly test/mutex/infallible) sites into a hard error. This task instead surfaces them as warnings so new panic sites in request-handling paths are visible in review without a mass rewrite. Excludes test targets (`--all-targets` is intentionally omitted)."
 run = "cargo clippy --workspace -- -W clippy::unwrap_used -W clippy::expect_used"
 
+[tasks.secrets]
+description = "Scan the whole git history for committed secrets (gitleaks). Run by CI's `secrets` job and by the pre-push hook."
+# Scans commit patches, not the working tree, so target/ and other build
+# output never enter the picture. ~1.3 s over this repo's history.
+# Rules + allowlist come from .gitleaks.toml, which gitleaks picks up from
+# the target path automatically.
+run = "gitleaks git . --redact --no-banner"
+
+[tasks.secrets-staged]
+description = "Scan only the staged diff for secrets (gitleaks). Run by the pre-commit hook; use before committing anything credential-shaped."
+run = "gitleaks git . --staged --redact --no-banner"
+
 [tasks.ci]
 description = "Everything CI runs: lint + tests (Rust + browser TS) + release build of the gateway binary. mise fans out via the DAG."
 depends = ["lint", "test", "test-js", "build"]
@@ -216,7 +234,7 @@ description = "Apply rustfmt across the workspace."
 run = "cargo fmt --all"
 
 [tasks.setup-hooks]
-description = "Enable the version-controlled git hooks (pre-push CI gate in .githooks/)."
+description = "Enable the version-controlled git hooks in .githooks/ (pre-commit secret scan, pre-push CI gate, commit-msg trailer check)."
 run = "git config core.hooksPath .githooks"
 
 [tasks.check]

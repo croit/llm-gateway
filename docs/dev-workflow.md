@@ -33,11 +33,23 @@ The gateway binary `include_bytes!`s its static assets (`app.css`, `datastar.js`
 | Bundle the TypeScript page glue — live rebuild | `mise run watch-js` |
 | TypeScript type-check only (`tsc --noEmit`) | `mise run typecheck` |
 | Everything CI runs (lint + test + release build) | `mise run ci` |
-| Enable the version-controlled git hooks (pre-push CI gate) | `mise run setup-hooks` |
+| Scan the whole git history for committed secrets | `mise run secrets` |
+| Scan only the staged diff for secrets | `mise run secrets-staged` |
+| Enable the version-controlled git hooks | `mise run setup-hooks` |
 
 **Debug vs release.** `mise run build` (release) takes ~12 s cold-incremental and ~70 s from clean — only use it when you actually want optimised output (deploys, perf measurement). For day-to-day iteration (running locally, screenshotting pages, smoke-testing changes) use `mise run dev` or `mise run dev-build`; those produce a debug binary in ~2 s incremental (vs ~11 s for a release build). Runtime perf is identical for any UX you'd interact with; only synthetic benchmarks notice the difference.
 
-`mise run setup-hooks` points `core.hooksPath` at `.githooks/`, which installs a pre-push gate that runs CI before a push lands.
+`mise run setup-hooks` points `core.hooksPath` at `.githooks/`. Run it once per clone — it installs three hooks:
+
+- **pre-commit** — gitleaks over the staged diff (~100 ms), so a credential can't reach local history in the first place.
+- **pre-push** — the secret scan again over the *full* history, then lint + tests. Push is the last moment before something becomes public.
+- **commit-msg** — rejects `Co-authored-by:` / `Claude-*:` attribution trailers.
+
+**On secret scanning.** An internal bearer token was once committed to this public repo and pushed. GitHub's own secret scanning cannot catch that class: its free tier matches only ~200 *provider* formats, and the generic "HTTP Bearer Token" pattern that would have matched sits behind the paid Secret Protection tier. Worse, gitleaks' *default* rules miss it too — `generic-api-key` captures the value after `=` with `[\w.=-]+`, which stops at the space in `Authorization = "Bearer <token>"` and only sees the 6-char literal `Bearer`. `.gitleaks.toml` therefore adds explicit `http-bearer-token` and `http-basic-auth` rules. If you touch that config, re-check both directions: real tokens in `Authorization` headers must be caught, and placeholders (`Bearer {token}`, `Bearer $VAR`) must not be.
+
+CI runs the same scan in a dedicated `secret scan` job with `fetch-depth: 0`, which is the backstop for pushes made with `--no-verify` or from a clone where `setup-hooks` was never run.
+
+Credentials belong in `mise.local.toml`, `gateway.toml` or the DB (sealed under `GATEWAY_ENCRYPTION_KEY`) — all gitignored or outside the tree. Tool configs that carry tokens (`.codex/`, editor/agent configs) should live in `$HOME`, not in the repo.
 
 Anything not covered: add a task to `mise.toml` rather than typing the raw command into a script. Discoverability matters.
 

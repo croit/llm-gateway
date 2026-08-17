@@ -46,3 +46,8 @@ __pycache__/
 *.pyc
 
 gateway.toml
+
+# Local agent/tool configs — hold personal MCP endpoints and API tokens.
+# A token from .codex/config.toml once leaked into the public history; keep
+# these untracked so it cannot happen again.
+.codex/

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# pre-commit hook: refuse to commit secrets.
+#
+# Why at commit and not only at push: a credential that reaches a commit is
+# already in local history, and getting it back out means a rewrite. Catching
+# it here costs one `git reset`. The scan is staged-diff-only and takes tens of
+# milliseconds, so WIP commits stay cheap — unlike the CI gate, which is
+# deliberately left at pre-push (see .githooks/pre-push).
+#
+# The rules and the fixture allowlist live in .gitleaks.toml, shared with
+# `mise run secrets` (full history, CI's `secrets` job), so the hook and CI
+# can't drift apart about what counts as a leak.
+#
+# Genuine override (false positive that the allowlist doesn't cover yet):
+# `git commit --no-verify` — then please add it to .gitleaks.toml so the next
+# person isn't blocked by the same string. CI scans the full history and will
+# flag it again anyway.
+set -euo pipefail
+
+# Git hooks inherit a minimal PATH; make the usual mise install locations and
+# Homebrew reachable so `mise` and the toolchains it shims resolve.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+if ! command -v mise >/dev/null 2>&1; then
+  echo "pre-commit: mise not on PATH — install mise, or bypass with 'git commit --no-verify'" >&2
+  exit 1
+fi
+
+if ! mise run secrets-staged; then
+  cat >&2 <<'EOF'
+
+pre-commit: gitleaks found a secret in the staged changes — commit refused.
+
+  * Real credential? Unstage it (`git restore --staged <file>`), move it to an
+    untracked location (mise.local.toml, ~/.config/…, gateway.toml) and rotate
+    it if it ever left this machine.
+  * False positive? Add a scoped entry to .gitleaks.toml (allowlist the literal
+    value, not the whole file), or bypass once with `git commit --no-verify`.
+
+EOF
+  exit 1
+fi
