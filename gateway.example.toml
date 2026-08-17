@@ -12,6 +12,14 @@ path = "gateway.sqlite"
 public_url = "http://localhost:8080"
 token_ttl_days = 90
 session_key_env = "GATEWAY_SESSION_KEY"
+# How long a browser login lasts. `session_ttl_days` is a *sliding* idle
+# timeout — every request pushes it forward, so it's how long you may stay
+# away before signing in again. `session_absolute_max_days` is the hard cap
+# from the moment of login, which no amount of activity extends; it also
+# forces a periodic trip through the IdP, the only point where group claims
+# are re-read. Defaults: 30 and 90.
+session_ttl_days = 30
+session_absolute_max_days = 90
 # Let admins impersonate other users from /admin/users (debugging aid; every
 # impersonation is audited and shows a persistent banner). Default false
 # (opt-in) — it's a privileged capability, so it's off unless you enable it

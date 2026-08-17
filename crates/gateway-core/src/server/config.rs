@@ -710,6 +710,20 @@ pub struct GatewayConfig {
     /// `openssl rand -hex 32` and put it in `$GATEWAY_SESSION_KEY` rather than
     /// in this file — the file is for the *name* of the env var.
     pub session_key_env: String,
+    /// Browser-session idle timeout in days. Default 30. This is a *sliding*
+    /// window: every request renews it (see `rama_server::session`), so it's
+    /// how long you can stay away before having to sign in again, not how
+    /// long a login lasts. Lower it for stricter deployments; the cookie
+    /// itself always carries a long `Max-Age` so a browser or laptop restart
+    /// alone never logs anyone out.
+    #[serde(default = "default_session_ttl_days")]
+    pub session_ttl_days: i64,
+    /// Absolute cap on a session's lifetime in days, counted from login.
+    /// Default 90. Unlike `session_ttl_days` this one does *not* slide: it
+    /// forces everyone back through the identity provider periodically,
+    /// which is also the only point where OIDC group claims are re-read.
+    #[serde(default = "default_session_absolute_max_days")]
+    pub session_absolute_max_days: i64,
     /// Whether admins may impersonate other users from `/admin/users`.
     /// Default `false` (opt-in) — impersonation is a powerful, privileged
     /// capability, so it's off unless explicitly enabled. Set
@@ -738,10 +752,22 @@ impl Default for GatewayConfig {
             public_url: "http://localhost:8080".into(),
             token_ttl_days: 90,
             session_key_env: "GATEWAY_SESSION_KEY".into(),
+            session_ttl_days: default_session_ttl_days(),
+            session_absolute_max_days: default_session_absolute_max_days(),
             allow_impersonation: false,
             bootstrap_admin_groups: Vec::new(),
         }
     }
+}
+
+/// Mirrors `session::DEFAULT_TTL` — 30 days of inactivity.
+fn default_session_ttl_days() -> i64 {
+    30
+}
+
+/// Mirrors `session::DEFAULT_ABSOLUTE_MAX` — 90 days since login.
+fn default_session_absolute_max_days() -> i64 {
+    90
 }
 
 #[derive(Debug, Clone, Deserialize)]

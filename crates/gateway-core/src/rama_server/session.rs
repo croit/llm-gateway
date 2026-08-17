@@ -11,8 +11,15 @@
 //!   the gateway secret key. Tampering with the id invalidates the HMAC;
 //!   the gateway treats the request as anonymous.
 //!
+//! Expiry is a *sliding idle timeout*: a session dies `ttl` after it was
+//! last used, not after it was created. [`SessionStore::lookup`] pushes
+//! `expires_at` forward once a session is past its half-life, so anyone
+//! who visits at least once per `ttl` never has to log in again. The DB
+//! row is the authority — the cookie itself carries a much longer
+//! `Max-Age` (see [`COOKIE_MAX_AGE`]) purely so it survives a browser or
+//! laptop restart.
+//!
 //! What we deliberately don't do (and what tower-sessions did):
-//! - Sliding expiration. Sessions have a fixed TTL set at creation.
 //! - Multiple stores / driver abstraction. SQLite is the only backend.
 //! - Cookie payloads with arbitrary user-supplied keys. Just `user_id`.
 //!
@@ -35,8 +42,37 @@ type HmacSha256 = Hmac<Sha256>;
 /// Name of the cookie carrying the session payload.
 pub const COOKIE_NAME: &str = "id";
 
-/// Default session lifetime — seven days.
-pub const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+/// Default *idle* session lifetime — 30 days since last use. Overridable
+/// per deployment via `gateway.session_ttl_days`. Because `lookup`
+/// renews (see [`SessionStore::lookup`]) this is the maximum time you
+/// can stay away before the gateway asks you to sign in again, not a
+/// countdown from login.
+pub const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 30);
+
+/// How long the browser is asked to keep the cookie. Deliberately far
+/// longer than the session TTL: the DB row decides when a session is
+/// dead, and a cookie that outlives it just resolves to "anonymous".
+/// Without an explicit `Max-Age` the cookie would be a *browser-session*
+/// cookie — dropped on browser quit / laptop restart, which forced a
+/// fresh login even though the server-side session was still valid.
+///
+/// 400 days is the ceiling Chrome and Firefox clamp cookie lifetimes to
+/// (RFC 6265bis §5.5), so anything larger buys nothing.
+pub const COOKIE_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 400);
+
+/// Absolute session lifetime — 90 days from *creation*, no matter how
+/// actively the session is used. OWASP's session-management guidance
+/// pairs an idle timeout with an absolute one so a leaked cookie can't be
+/// kept alive indefinitely by using it; it also forces a periodic trip
+/// through the IdP, which is the only moment group/role claims are
+/// re-read. Overridable via `gateway.session_absolute_max_days`.
+pub const DEFAULT_ABSOLUTE_MAX: Duration = Duration::from_secs(60 * 60 * 24 * 90);
+
+/// Lifetime of an *impersonation* session — 8 hours, fixed, never renewed
+/// (see [`SessionStore::lookup`]). Ordinary logins want to last; acting as
+/// somebody else is a short debugging errand, and the long sliding window
+/// that's right for a personal login would be wrong here.
+pub const IMPERSONATION_TTL: Duration = Duration::from_secs(60 * 60 * 8);
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -54,6 +90,12 @@ pub enum SessionError {
 pub struct SessionStore {
     db: Pool,
     secret: [u8; 32],
+    /// Idle timeout applied to new sessions and to every renewal. See
+    /// [`DEFAULT_TTL`]; set from config at boot via [`SessionStore::with_ttl`].
+    ttl: Duration,
+    /// Hard ceiling on a session's total lifetime, measured from
+    /// `created_at`. See [`DEFAULT_ABSOLUTE_MAX`].
+    absolute_max: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,16 +119,52 @@ impl SessionStore {
     /// `secret` is the raw HMAC key — 32 bytes, sourced from
     /// `$GATEWAY_SESSION_KEY` (hex-decoded) at boot.
     pub fn new(db: Pool, secret: [u8; 32]) -> Self {
-        Self { db, secret }
+        Self {
+            db,
+            secret,
+            ttl: DEFAULT_TTL,
+            absolute_max: DEFAULT_ABSOLUTE_MAX,
+        }
     }
 
-    /// Mints a fresh session for `user_id` with the default TTL,
-    /// persists it, and returns it. Caller serialises the id into a
-    /// cookie via [`Self::sign`].
+    /// Overrides the idle timeout new sessions get (and that renewals
+    /// extend by). Called once at boot with `gateway.session_ttl_days`.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// Overrides the absolute lifetime cap. Called once at boot with
+    /// `gateway.session_absolute_max_days`.
+    pub fn with_absolute_max(mut self, absolute_max: Duration) -> Self {
+        self.absolute_max = absolute_max;
+        self
+    }
+
+    /// The configured idle timeout — what `create` stamps and what
+    /// `lookup` renews to.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    fn ttl_span(&self) -> SignedDuration {
+        SignedDuration::from_secs(secs(self.ttl))
+    }
+
+    fn absolute_max_span(&self) -> SignedDuration {
+        SignedDuration::from_secs(secs(self.absolute_max))
+    }
+
+    /// Mints a fresh session for `user_id` with the configured idle
+    /// timeout, persists it, and returns it. Caller serialises the id
+    /// into a cookie via [`Self::cookie`].
     pub async fn create(&self, user_id: &str) -> Result<Session, SessionError> {
-        self.create_with_ttl(user_id, DEFAULT_TTL).await
+        self.create_with_ttl(user_id, self.ttl).await
     }
 
+    /// Like [`Self::create`] but with an explicit initial lifetime. Note
+    /// that this only sets the *first* expiry: once the session is used,
+    /// renewal extends it by the store's configured TTL, not by `ttl`.
     pub async fn create_with_ttl(
         &self,
         user_id: &str,
@@ -105,7 +183,7 @@ impl SessionStore {
         target_user_id: &str,
         impersonator_id: &str,
     ) -> Result<Session, SessionError> {
-        self.insert(target_user_id, Some(impersonator_id), DEFAULT_TTL)
+        self.insert(target_user_id, Some(impersonator_id), IMPERSONATION_TTL)
             .await
     }
 
@@ -143,6 +221,12 @@ impl SessionStore {
     /// Looks up a session by id, returning it iff present **and** not
     /// expired. Expired rows are left for a future GC pass; we just hide
     /// them at read time so a clock-skew gap doesn't grant access.
+    ///
+    /// Doubles as the renewal point: a session that's past its half-life
+    /// gets `expires_at` pushed to `now + ttl` (see [`Self::renew`]), so
+    /// the TTL behaves as an idle timeout instead of a hard countdown
+    /// from login. Only writing past the half-life keeps this to at most
+    /// one UPDATE per session per `ttl/2` rather than one per request.
     pub async fn lookup(&self, id: &str) -> Result<Option<Session>, SessionError> {
         // (user_id, created_at, expires_at, timezone, impersonator_id)
         type Row = (String, String, String, Option<String>, Option<String>);
@@ -153,13 +237,38 @@ impl SessionStore {
         .bind(id)
         .fetch_optional(&self.db)
         .await?;
-        let Some((user_id, _created, expires_at, timezone, impersonator_id)) = row else {
+        let Some((user_id, created_at, expires_at, timezone, impersonator_id)) = row else {
             return Ok(None);
         };
         let expires_at: Timestamp = expires_at.parse().map_err(|_| SessionError::Malformed)?;
-        if expires_at < Timestamp::now() {
+        let created_at: Timestamp = created_at.parse().map_err(|_| SessionError::Malformed)?;
+        let now = Timestamp::now();
+        if expires_at < now {
             return Ok(None);
         }
+        // Absolute timeout, enforced here rather than trusted from
+        // `expires_at`: it also covers rows written before the cap existed
+        // and a config where `ttl` exceeds `absolute_max`.
+        if created_at + self.absolute_max_span() < now {
+            return Ok(None);
+        }
+        // Sliding expiration. A renewal failure must not fail the request
+        // — the session is valid either way, it just expires earlier.
+        let expires_at = if impersonator_id.is_some() {
+            // Impersonation sessions never slide: they're a debugging aid
+            // with someone else's identity, so they end at a fixed
+            // deadline (see IMPERSONATION_TTL) rather than living as long
+            // as an admin keeps clicking.
+            expires_at
+        } else {
+            match self.renew(id, created_at, expires_at, now).await {
+                Ok(fresh) => fresh,
+                Err(err) => {
+                    tracing::warn!(error = %err, "session renewal");
+                    expires_at
+                }
+            }
+        };
         Ok(Some(Session {
             id: id.to_string(),
             user_id,
@@ -167,6 +276,40 @@ impl SessionStore {
             timezone,
             impersonator_id,
         }))
+    }
+
+    /// Pushes `expires_at` to `now + ttl` when less than half the TTL is
+    /// left, returning the (possibly unchanged) expiry. Half-life is the
+    /// throttle: renewing on every request would mean a write per page
+    /// view, renewing never would mean a hard logout `ttl` after login.
+    ///
+    /// Never past `created_at + absolute_max` — the absolute timeout wins
+    /// over the sliding one, so no session can be kept alive forever just
+    /// by using it.
+    async fn renew(
+        &self,
+        id: &str,
+        created_at: Timestamp,
+        expires_at: Timestamp,
+        now: Timestamp,
+    ) -> Result<Timestamp, SessionError> {
+        // Half-life as a point in time — jiff's `Timestamp - Timestamp`
+        // is a calendar `Span`, so comparing instants is both simpler and
+        // free of unit conversions.
+        if now < expires_at - SignedDuration::from_secs(secs(self.ttl) / 2) {
+            return Ok(expires_at);
+        }
+        let renewed = (now + self.ttl_span()).min(created_at + self.absolute_max_span());
+        if renewed <= expires_at {
+            // Already at the absolute ceiling; nothing to write.
+            return Ok(expires_at);
+        }
+        sqlx::query("UPDATE sessions SET expires_at = ? WHERE id = ?")
+            .bind(renewed.to_string())
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(renewed)
     }
 
     /// Updates the per-session timezone. Called by
@@ -206,6 +349,22 @@ impl SessionStore {
         format!("{id}.{}", base64url_nopad(&tag))
     }
 
+    /// Full `Set-Cookie` value for `id` — signed payload plus the
+    /// attributes every call site must agree on. `secure` comes from
+    /// [`secure_cookies`].
+    ///
+    /// `Max-Age` is what makes a login survive a browser quit or a
+    /// reboot; see [`COOKIE_MAX_AGE`] for why it's much longer than the
+    /// session TTL.
+    pub fn cookie(&self, id: &str, secure: bool) -> String {
+        format!(
+            "{COOKIE_NAME}={signed}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}",
+            signed = self.sign(id),
+            max_age = COOKIE_MAX_AGE.as_secs(),
+            secure = if secure { "; Secure" } else { "" },
+        )
+    }
+
     /// Inverse of `sign` — checks the HMAC and returns the id. Constant
     /// time via `Hmac::verify_slice`.
     pub fn verify<'a>(&self, signed: &'a str) -> Result<&'a str, SessionError> {
@@ -235,6 +394,33 @@ impl SessionStore {
         };
         self.lookup(id).await
     }
+}
+
+/// `Set-Cookie` value that deletes the session cookie. Attributes other
+/// than `Max-Age` must match [`SessionStore::cookie`] or the browser
+/// treats it as a different cookie and keeps the old one.
+pub fn clear_cookie(secure: bool) -> String {
+    format!(
+        "{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}",
+        secure = if secure { "; Secure" } else { "" },
+    )
+}
+
+/// Whether to mark cookies `Secure`, derived from the gateway's own
+/// public URL (`gateway.public_url`) rather than the request: behind a
+/// TLS-terminating proxy the inbound request is plain HTTP, so the
+/// scheme on the wire would say `false` for every production deployment.
+/// A plain-HTTP deployment (local dev) must not get `Secure` or the
+/// browser drops the cookie outright.
+pub fn secure_cookies(public_url: &str) -> bool {
+    public_url.trim_start().starts_with("https://")
+}
+
+/// Whole seconds of a `Duration` as `i64` — the unit jiff's
+/// `SignedDuration` takes. Saturates rather than wrapping; a TTL past
+/// year 292-billion is not a case worth a `Result`.
+fn secs(d: Duration) -> i64 {
+    i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
 }
 
 /// Random 32-byte session id, hex-encoded. The HMAC binding means we
@@ -515,6 +701,186 @@ mod tests {
         h.insert(COOKIE, format!("id={signed}").parse().unwrap());
         let fetched = store.lookup_from_headers(&h).await.unwrap().unwrap();
         assert_eq!(fetched.user_id, "bob");
+    }
+
+    /// Seed a user so the sessions FK is satisfiable.
+    async fn seed_user(store: &SessionStore, id: &str) {
+        let now = Timestamp::now();
+        crate::server::db::users::upsert(
+            &store.db,
+            &crate::server::db::users::User {
+                id: id.into(),
+                email: format!("{id}@x"),
+                name: None,
+                roles: vec![],
+                created_at: now,
+                updated_at: now,
+                timezone: None,
+                speech_voice: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn set_row_times(store: &SessionStore, id: &str, created: Timestamp, expires: Timestamp) {
+        sqlx::query("UPDATE sessions SET created_at = ?, expires_at = ? WHERE id = ?")
+            .bind(created.to_string())
+            .bind(expires.to_string())
+            .bind(id)
+            .execute(&store.db)
+            .await
+            .unwrap();
+    }
+
+    /// The whole point of the sliding window: someone who comes back after
+    /// a fortnight keeps their login instead of being bounced to the IdP.
+    #[tokio::test]
+    async fn lookup_renews_a_session_past_its_half_life() {
+        let store = store().await;
+        seed_user(&store, "alice").await;
+        let session = store.create("alice").await.unwrap();
+
+        // Pretend the session was created 20 days ago: 10 days left of a
+        // 30-day TTL, i.e. past the half-life.
+        let now = Timestamp::now();
+        let created = now - SignedDuration::from_hours(24 * 20);
+        let stale_expiry = created + SignedDuration::from_hours(24 * 30);
+        set_row_times(&store, &session.id, created, stale_expiry).await;
+
+        let fetched = store.lookup(&session.id).await.unwrap().unwrap();
+        assert!(
+            fetched.expires_at > stale_expiry,
+            "expiry should have been pushed forward: {} !> {stale_expiry}",
+            fetched.expires_at,
+        );
+        // And it's persisted, not just returned.
+        let stored: String = sqlx::query_scalar("SELECT expires_at FROM sessions WHERE id = ?")
+            .bind(&session.id)
+            .fetch_one(&store.db)
+            .await
+            .unwrap();
+        assert_eq!(stored.parse::<Timestamp>().unwrap(), fetched.expires_at);
+    }
+
+    /// Renewal is throttled to the second half of the window so an active
+    /// session doesn't cost a write per request.
+    #[tokio::test]
+    async fn lookup_leaves_a_fresh_session_untouched() {
+        let store = store().await;
+        seed_user(&store, "bob").await;
+        let session = store.create("bob").await.unwrap();
+
+        let fetched = store.lookup(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            fetched.expires_at, session.expires_at,
+            "a just-created session must not be rewritten",
+        );
+    }
+
+    /// The absolute cap outranks the sliding renewal — a session can't be
+    /// kept alive forever just by being used.
+    #[tokio::test]
+    async fn absolute_max_caps_renewal_and_then_expires_the_session() {
+        let store = store()
+            .await
+            .with_absolute_max(Duration::from_secs(60 * 60 * 24 * 90));
+        seed_user(&store, "carol").await;
+        let session = store.create("carol").await.unwrap();
+
+        // 80 days in, still inside the 90-day cap but past the half-life:
+        // renewal happens, clamped to created_at + 90 days.
+        let now = Timestamp::now();
+        let created = now - SignedDuration::from_hours(24 * 80);
+        set_row_times(
+            &store,
+            &session.id,
+            created,
+            created + SignedDuration::from_hours(24 * 85),
+        )
+        .await;
+        let fetched = store.lookup(&session.id).await.unwrap().unwrap();
+        let cap = created + SignedDuration::from_hours(24 * 90);
+        assert_eq!(fetched.expires_at, cap, "renewal must clamp to the cap");
+
+        // 100 days in: the row still says "not expired", but the absolute
+        // cap has passed, so the session is gone regardless.
+        set_row_times(
+            &store,
+            &session.id,
+            now - SignedDuration::from_hours(24 * 100),
+            now + SignedDuration::from_hours(24 * 30),
+        )
+        .await;
+        assert!(store.lookup(&session.id).await.unwrap().is_none());
+    }
+
+    /// Acting as someone else is deliberately short-lived: a fixed
+    /// deadline, and no sliding renewal to push it out.
+    #[tokio::test]
+    async fn impersonation_sessions_are_short_lived_and_never_renewed() {
+        let store = store().await;
+        seed_user(&store, "root").await;
+        seed_user(&store, "victim").await;
+
+        let imp = store.create_impersonation("victim", "root").await.unwrap();
+        let now = Timestamp::now();
+        assert!(
+            imp.expires_at < now + SignedDuration::from_hours(9),
+            "impersonation should expire in hours, not days: {}",
+            imp.expires_at,
+        );
+
+        // Well past the half-life of an 8-hour window — an ordinary
+        // session would be renewed here.
+        let created = now - SignedDuration::from_hours(7);
+        let expiry = created + SignedDuration::from_hours(8);
+        set_row_times(&store, &imp.id, created, expiry).await;
+        let fetched = store.lookup(&imp.id).await.unwrap().unwrap();
+        assert_eq!(fetched.expires_at, expiry, "must not slide");
+    }
+
+    #[tokio::test]
+    async fn cookie_carries_the_attributes_that_survive_a_restart() {
+        let store = store().await;
+        let cookie = store.cookie("sess-1", true);
+        // Max-Age is what makes the cookie outlive a browser/laptop restart.
+        assert!(
+            cookie.contains(&format!("Max-Age={}", COOKIE_MAX_AGE.as_secs())),
+            "{cookie}"
+        );
+        assert!(cookie.starts_with("id=sess-1."), "{cookie}");
+        for attr in ["Path=/", "HttpOnly", "SameSite=Lax", "Secure"] {
+            assert!(cookie.contains(attr), "missing {attr} in {cookie}");
+        }
+        // Plain-HTTP deployments must not get `Secure` — the browser would
+        // drop the cookie and nobody could log in at all.
+        assert!(!store.cookie("sess-1", false).contains("Secure"));
+    }
+
+    /// A cleared cookie only replaces the live one if every attribute
+    /// besides Max-Age matches.
+    #[test]
+    fn clear_cookie_mirrors_the_set_cookie_attributes() {
+        let cleared = clear_cookie(true);
+        for attr in [
+            "id=",
+            "Path=/",
+            "HttpOnly",
+            "SameSite=Lax",
+            "Max-Age=0",
+            "Secure",
+        ] {
+            assert!(cleared.contains(attr), "missing {attr} in {cleared}");
+        }
+        assert!(!clear_cookie(false).contains("Secure"));
+    }
+
+    #[test]
+    fn secure_cookies_follows_the_public_url_scheme() {
+        assert!(secure_cookies("https://llm.example.com"));
+        assert!(!secure_cookies("http://localhost:8080"));
+        assert!(!secure_cookies(""));
     }
 
     #[test]

@@ -41,7 +41,7 @@ use session_core::chrome::{
 use session_core::i18n::{Lang, t};
 use session_core::icons;
 
-use gateway_core::rama_server::session::COOKIE_NAME;
+use gateway_core::rama_server::session::secure_cookies;
 use gateway_core::server::db::{audit, users};
 use gateway_runtime::rama_server::state::RamaState;
 
@@ -229,11 +229,9 @@ pub async fn impersonate_stop(State(state): State<Arc<RamaState>>, req: Request)
 /// 303 to `location`, setting the signed session cookie for `session_id`.
 /// Mirrors the cookie attributes the OIDC callback uses.
 fn redirect_with_session_cookie(state: &RamaState, session_id: &str, location: &str) -> Response {
-    let cookie = format!(
-        "{name}={signed}; Path=/; HttpOnly; SameSite=Lax",
-        name = COOKIE_NAME,
-        signed = state.sessions.sign(session_id),
-    );
+    let cookie = state
+        .sessions
+        .cookie(session_id, secure_cookies(&state.config.gateway.public_url));
     Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, location)

@@ -20,7 +20,7 @@ use rama::http::{Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::json;
 
-use gateway_core::rama_server::session::{COOKIE_NAME, read_cookie};
+use gateway_core::rama_server::session::{clear_cookie, read_cookie, secure_cookies};
 use gateway_core::server::db::users;
 use gateway_runtime::rama_server::state::RamaState;
 
@@ -222,10 +222,9 @@ pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Resp
             return error_html(StatusCode::INTERNAL_SERVER_ERROR, "could not mint session");
         }
     };
-    let cookie = format!(
-        "{name}={signed}; Path=/; HttpOnly; SameSite=Lax",
-        name = COOKIE_NAME,
-        signed = state.sessions.sign(&session.id),
+    let cookie = state.sessions.cookie(
+        &session.id,
+        secure_cookies(&state.config.gateway.public_url),
     );
     // Default landing is the chat surface — a freshly signed-in user
     // should drop straight into a conversation, not a dashboard. An
@@ -253,7 +252,7 @@ pub async fn logout(State(state): State<Arc<RamaState>>, req: Request) -> Respon
     }
     // Tell the browser to clear the cookie regardless — handles the case
     // where the cookie is stale-but-valid-HMAC against a deleted row.
-    let expire = format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+    let expire = clear_cookie(secure_cookies(&state.config.gateway.public_url));
     Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, "/")

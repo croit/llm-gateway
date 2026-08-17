@@ -294,6 +294,28 @@ async fn full_oidc_dance_completes_and_stamps_the_session() {
         .get(rama::http::header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    // The session cookie must be *persistent*: without Max-Age the browser
+    // drops it on quit, which is what forced a re-login after every laptop
+    // restart. `public_url` is http:// here, so no `Secure` — a Secure
+    // cookie over plain HTTP would be dropped outright.
+    let session_cookie = resp
+        .headers()
+        .get_all(rama::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with("id="))
+        .map(str::to_string)
+        .expect("callback must set the session cookie");
+    for attr in ["Path=/", "HttpOnly", "SameSite=Lax", "Max-Age="] {
+        assert!(
+            session_cookie.contains(attr),
+            "session cookie missing {attr}: {session_cookie}"
+        );
+    }
+    assert!(
+        !session_cookie.contains("Secure"),
+        "http:// deployment must not mark the cookie Secure: {session_cookie}"
+    );
     let body = String::from_utf8_lossy(&common::read_body(resp).await).into_owned();
     assert_eq!(
         status,

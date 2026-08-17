@@ -496,7 +496,21 @@ async fn main() -> anyhow::Result<()> {
     // Session store reuses the HMAC key derived up top. `crypto` (also built
     // up top) is the same at-rest key used for per-user MCP OAuth tokens,
     // connector client secrets, and backend API keys.
-    let sessions = SessionStore::new(db.clone(), session_secret);
+    // Sliding idle timeout + absolute cap from config (30 / 90 days by
+    // default) — see `rama_server::session` for why the cookie's own
+    // Max-Age is longer than either.
+    let days = |d: i64| std::time::Duration::from_secs(d.clamp(1, 400) as u64 * 24 * 60 * 60);
+    let sessions = SessionStore::new(db.clone(), session_secret)
+        .with_ttl(days(config.gateway.session_ttl_days))
+        .with_absolute_max(days(config.gateway.session_absolute_max_days));
+    // Logged because "why was I logged out?" is otherwise unanswerable from
+    // the outside: these three values are the whole answer.
+    tracing::info!(
+        idle_timeout_days = config.gateway.session_ttl_days,
+        absolute_max_days = config.gateway.session_absolute_max_days,
+        secure_cookies = gateway::rama_server::session::secure_cookies(&config.gateway.public_url),
+        "session policy",
+    );
 
     // Seed the built-in MCP connector catalog (all disabled) so an admin only
     // has to flip a switch. Idempotent — existing rows (incl. admin edits +
@@ -703,9 +717,15 @@ fn state_session_key() -> String {
 
 fn load_session_secret(raw: &str) -> anyhow::Result<[u8; 32]> {
     if raw.is_empty() {
-        tracing::warn!(
-            "GATEWAY_SESSION_KEY unset — using an ephemeral random key; \
-             all existing sessions will be invalidated on restart"
+        // Loud, actionable, and at error level: an ephemeral key means every
+        // restart silently invalidates every open session — the "logged out
+        // again after a few hours" symptom. The fix is configuration, not
+        // code, so say exactly what to set.
+        tracing::error!(
+            "GATEWAY_SESSION_KEY unset — using an ephemeral random key: EVERY RESTART \
+             LOGS OUT EVERY USER, and secrets sealed at rest become unreadable. \
+             Set it persistently (e.g. in /etc/gateway/gateway.env): \
+             GATEWAY_SESSION_KEY=$(openssl rand -hex 32)"
         );
         use rand::TryRngCore;
         let mut buf = [0u8; 32];
