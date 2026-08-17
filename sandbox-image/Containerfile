@@ -94,12 +94,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # color font for emoji fallback).
 # NB: RUN uses /bin/sh (dash) — POSIX only, no bashisms. The local target
 # name is passed explicitly (arg 3) instead of URL-decoding the source name.
+# Files come straight off raw.githubusercontent.com: the github.com/<repo>/raw/
+# redirect endpoint started answering 404 for every path in this repo, and it
+# is a UI convenience route anyway — the raw host is the stable one.
 RUN set -eux; \
     gf() { mkdir -p "/usr/share/fonts/truetype/$1"; \
            curl -fsSL --retry 6 --retry-all-errors --retry-delay 3 \
                 --connect-timeout 15 --max-time 180 \
                 -o "/usr/share/fonts/truetype/$1/$3" \
-                "https://github.com/google/fonts/raw/main/ofl/$1/$2"; }; \
+                "https://raw.githubusercontent.com/google/fonts/main/ofl/$1/$2"; }; \
     gf notoemoji "NotoEmoji%5Bwght%5D.ttf" "NotoEmoji.ttf"; \
     gf oswald "Oswald%5Bwght%5D.ttf" "Oswald.ttf"; \
     gf raleway "Raleway%5Bwght%5D.ttf" "Raleway.ttf"; \
