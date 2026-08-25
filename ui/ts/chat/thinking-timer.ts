@@ -11,14 +11,17 @@
 //   <thinking-timer data-elapsed-ms="…" data-label-template="Thinking… ({secs}s)">…</thinking-timer>
 // and this element counts up locally, independent of upstream chunk cadence.
 //
-// Morph-safety: Datastar re-renders and morphs `#turn-<id>` on every stream
-// tick (reasoning text keeps growing). We render the live label into a shadow
-// root, which idiomorph never reconciles, so the ticking text survives each
-// morph untouched. The host keeps a stable id, so morph reuses the same node
-// and `connectedCallback` fires once — the interval is never restarted and the
-// count never jumps. The host's light-DOM text is a server-rendered static
-// fallback (correct at render instant); the shadow root hides it once the
-// element upgrades, so it only shows pre-upgrade or with JS disabled.
+// Morph-safety: the turn stream patches `#turn-<id>` and its
+// descendants (whole-shell outer patches fire only on phase changes,
+// the open prose block inner-patches its wrapper). We render the live
+// label into a shadow root, which idiomorph never reconciles, so the
+// ticking text survives each morph untouched. The host keeps a
+// stable id, so morph reuses the same node and `connectedCallback`
+// fires once — the interval is never restarted and the count never
+// jumps. The host's light-DOM text is a server-rendered static
+// fallback (correct at render instant); the shadow root hides it once
+// the element upgrades, so it only shows pre-upgrade or with JS
+// disabled.
 //
 // `data-elapsed-ms` is the elapsed-so-far the server measured — non-zero when
 // a page is (re)loaded mid-reasoning, so the count resumes at the right offset

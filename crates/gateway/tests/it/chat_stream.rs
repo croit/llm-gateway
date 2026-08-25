@@ -728,3 +728,393 @@ async fn message_send_rejects_empty_message() {
     let turns = chat::list_turns(&state.db, &session_id).await.unwrap();
     assert!(turns.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Delta-protocol tests. The original design re-rendered the entire
+// assistant bubble (envelope + full accumulated content + live
+// reasoning trace) into every `datastar-patch-elements` event, per
+// upstream chunk — quadratic wire cost, measured at 225 MB for one
+// long reply on mobile. These pin the replacement properties: sealed
+// blocks travel once, live reasoning never rides the main stream,
+// and the on-demand /thinking sub-stream carries it instead.
+
+/// A raw TCP "upstream" the test scripts at runtime: each `send(...)`
+/// writes one SSE line chunk to every open connection; `None` writes
+/// the terminating chunk. Used where wiremock's write-everything-at-
+/// once model can't reproduce mid-stream states. The watch receiver
+/// reports how many connections are open so tests can wait for the
+/// worker to dial in before pushing the first chunk.
+async fn scripted_sse_upstream() -> (
+    String,
+    tokio::sync::mpsc::Sender<Option<String>>,
+    tokio::sync::watch::Receiver<usize>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (conn_tx, conn_rx) = tokio::sync::watch::channel(0usize);
+
+    tokio::spawn(async move {
+        let _ = ready_tx.send(());
+        let mut writers: Vec<tokio::net::tcp::OwnedWriteHalf> = Vec::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    if let Ok((sock, _)) = accepted {
+                        let (mut rd, mut wr) = sock.into_split();
+                        // Drain the request half so client POSTs never
+                        // stall on unread bodies.
+                        tokio::spawn(async move {
+                            let mut sink = [0u8; 4096];
+                            loop {
+                                match rd.read(&mut sink).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
+                            }
+                        });
+                        let _ = wr.write_all(
+                            b"HTTP/1.1 200 OK\r\n\
+                              Content-Type: text/event-stream\r\n\
+                              Transfer-Encoding: chunked\r\n\
+                              Connection: close\r\n\r\n",
+                        ).await;
+                        let _ = wr.flush().await;
+                        writers.push(wr);
+                        let _ = conn_tx.send(writers.len());
+                    }
+                }
+                line = rx.recv() => {
+                    match line {
+                        Some(Some(line)) => {
+                            let frame = format!("{:x}\r\n{line}\r\n", line.len());
+                            for w in writers.iter_mut() {
+                                let _ = w.write_all(frame.as_bytes()).await;
+                                let _ = w.flush().await;
+                            }
+                        }
+                        Some(None) | None => {
+                            for w in writers.iter_mut() {
+                                let _ = w.write_all(b"0\r\n\r\n").await;
+                                let _ = w.flush().await;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (format!("http://{addr}"), tx, conn_rx, ready_rx)
+}
+
+/// Block until the scripted upstream has at least one connection.
+async fn await_upstream_connection(mut conns: tokio::sync::watch::Receiver<usize>) {
+    loop {
+        if *conns.borrow() >= 1 {
+            return;
+        }
+        if conns.changed().await.is_err() {
+            panic!("scripted upstream hung up before any connection");
+        }
+    }
+}
+
+/// Incrementally read an SSE response body, buffering bytes. Returns
+/// (buffered_so_far, body) — timeout-bounded so assertions can run
+/// against "everything sent within N ms".
+async fn drain_sse_for(
+    mut body: rama::http::Body,
+    window: std::time::Duration,
+) -> (String, rama::http::Body, bool) {
+    use rama::http::body::util::BodyExt;
+    let mut out = String::new();
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return (out, body, false);
+        }
+        match tokio::time::timeout(remaining, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    out.push_str(&String::from_utf8_lossy(data));
+                }
+            }
+            Ok(None) => return (out, body, true),
+            _ => return (out, body, true),
+        }
+    }
+}
+
+/// Poll until the assistant turn's reasoning matches `want_prefix`,
+/// returning the turn id. Bounded at 5s so a broken stream fails
+/// instead of hanging.
+async fn await_reasoning(state: &Arc<RamaState>, session_id: &str, want_prefix: &str) -> String {
+    for _ in 0..100 {
+        if let Ok(turns) = chat::list_turns(&state.db, session_id).await
+            && let Some(t) = turns
+                .iter()
+                .find(|t| t.turn.role == chat::TurnRole::Assistant)
+            && t.turn
+                .reasoning
+                .as_deref()
+                .is_some_and(|r| r.starts_with(want_prefix))
+        {
+            return t.turn.id.clone();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("reasoning starting with {want_prefix:?} never landed in the DB");
+}
+
+#[tokio::test]
+async fn live_reasoning_never_rides_the_main_stream() {
+    let (base, script, conns, ready) = scripted_sse_upstream().await;
+    let _ = ready.await;
+    let (state, cookie, session_id) = setup(&base).await;
+    // Pre-title the session so the auto-title generator's own upstream
+    // call can't consume the scripted stream before the worker does.
+    chat::set_session_title(&state.db, &session_id, "titled")
+        .await
+        .unwrap();
+    let app = router(state.clone());
+
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "hi")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{session_id}/messages"))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    let sse_body = resp.into_body();
+    await_upstream_connection(conns.clone()).await;
+
+    // Reasoning phase: one chunk lands, the shell (with the live
+    // timer) flushes — and the reasoning TEXT itself must not be on
+    // the wire. That text is only available through the on-demand
+    // /thinking sub-stream the user opts into by expanding the
+    // trace.
+    script
+        .send(Some(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"the hidden plan unfolds\"}}]}\n\n"
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let (seen, sse_body, _) = drain_sse_for(sse_body, std::time::Duration::from_millis(700)).await;
+    assert!(
+        seen.contains("<thinking-timer"),
+        "the shell with the live timer must flush during reasoning:\n{seen}"
+    );
+    assert!(
+        !seen.contains("the hidden plan unfolds"),
+        "live reasoning must not ship on the main stream:\n{seen}"
+    );
+    assert!(
+        seen.contains("data-on:toggle"),
+        "the collapsed trace must carry the opt-in sub-stream trigger:\n{seen}"
+    );
+
+    // Content + finish: the reasoning is final now, so the settled
+    // render carries it — exactly once.
+    script
+        .send(Some(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"The visible answer.\"}}]}\n\n".into(),
+        ))
+        .await
+        .unwrap();
+    script.send(Some("data: [DONE]\n\n".into())).await.unwrap();
+    script.send(None).await.unwrap();
+    let (rest, _, _) = drain_sse_for(sse_body, std::time::Duration::from_secs(5)).await;
+    let full = format!("{seen}{rest}");
+    assert_eq!(
+        full.matches("the hidden plan unfolds").count(),
+        1,
+        "finalized reasoning ships exactly once (never per-tick):\n{full}"
+    );
+    assert!(
+        full.contains("The visible answer."),
+        "the answer itself must stream:\n{full}"
+    );
+    assert!(
+        full.contains(r#"data: signals {"chatStreaming":false}"#),
+        "the stream must close with the idle signal:\n{full}"
+    );
+}
+
+#[tokio::test]
+async fn thinking_substream_streams_the_live_trace_and_closes() {
+    let (base, script, conns, ready) = scripted_sse_upstream().await;
+    let _ = ready.await;
+    let (state, cookie, session_id) = setup(&base).await;
+    chat::set_session_title(&state.db, &session_id, "titled")
+        .await
+        .unwrap();
+    let app = router(state.clone());
+
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "hi")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{session_id}/messages"))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    let _main_body = resp.into_body();
+    await_upstream_connection(conns.clone()).await;
+
+    script
+        .send(Some(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"trace part one\"}}]}\n\n"
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let turn_id = await_reasoning(&state, &session_id, "trace part one").await;
+
+    // Opt-in: expanding the trace opens the sub-stream, which ships
+    // only the thinking-body interior.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/chat/{session_id}/turns/{turn_id}/thinking"))
+        .header("cookie", format!("id={cookie}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let selector = format!("data: selector #turn-{turn_id}-thinking-body");
+    let thinking_body_stream = resp.into_body();
+    let (first, thinking_body_stream, _) =
+        drain_sse_for(thinking_body_stream, std::time::Duration::from_millis(700)).await;
+    assert!(
+        first.contains(&selector),
+        "sub-stream patches the thinking body interior:\n{first}"
+    );
+    assert!(
+        first.contains("trace part one"),
+        "the live snapshot arrives immediately:\n{first}"
+    );
+
+    // Live updates flow while the trace grows.
+    script
+        .send(Some(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" and part two\"}}]}\n\n"
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let (more, thinking_body_stream, _) =
+        drain_sse_for(thinking_body_stream, std::time::Duration::from_millis(700)).await;
+    assert!(
+        more.contains("and part two"),
+        "growing reasoning streams while the trace is open:\n{more}"
+    );
+
+    // Finalize closes the sub-stream after one last patch.
+    script
+        .send(Some(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n".into(),
+        ))
+        .await
+        .unwrap();
+    script.send(Some("data: [DONE]\n\n".into())).await.unwrap();
+    script.send(None).await.unwrap();
+    // The sub-stream closes cleanly at finalize — with no redundant
+    // re-patch when the last emit already carried the final trace.
+    let (_, _, ended) =
+        drain_sse_for(thinking_body_stream, std::time::Duration::from_secs(5)).await;
+    assert!(ended, "the sub-stream must end when the turn finalizes");
+
+    // Anonymous access is redirected like every other authed route.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/chat/{session_id}/turns/{turn_id}/thinking"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn main_stream_wire_stays_linear_in_content_size() {
+    // 60 paragraphs x ~200 chars streamed one paragraph per delta.
+    // The pre-delta protocol re-rendered the whole bubble per delta
+    // (≈60 x avg-half-content ≈ 30x the content itself); the delta
+    // protocol must stay within a small constant factor.
+    let upstream = MockServer::start().await;
+    let paragraphs: Vec<String> = (0..60)
+        .map(|i| {
+            format!(
+                "paragraph {i:02} {} — and some more words to pad it out nicely\n\n",
+                "lorem ipsum dolor sit amet".repeat(6)
+            )
+        })
+        .collect();
+    let content_len: usize = paragraphs.iter().map(|p| p.len()).sum::<usize>();
+    let sse_body = paragraphs
+        .iter()
+        .map(|p| {
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"delta":{"content":p}}]})
+            )
+        })
+        .collect::<String>()
+        + "data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&upstream)
+        .await;
+
+    let (state, cookie, session_id) = setup(&upstream.uri()).await;
+    let app = router(state.clone());
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "write lots")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{session_id}/messages"))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    let body = String::from_utf8(common::read_body(resp).await.to_vec()).unwrap();
+
+    // Sanity: the full answer landed in the DB.
+    let turns = chat::list_turns(&state.db, &session_id).await.unwrap();
+    let asst = turns
+        .iter()
+        .find(|t| t.turn.role == chat::TurnRole::Assistant)
+        .unwrap();
+    assert_eq!(asst.turn.status, chat::TurnStatus::Completed);
+    assert_eq!(
+        asst.turn.content.as_deref().map(str::len),
+        Some(content_len),
+        "the whole answer must be persisted"
+    );
+
+    let wire: usize = body
+        .lines()
+        .filter(|l| l.starts_with("data: elements "))
+        .map(|l| l.len())
+        .sum();
+    assert!(
+        wire < content_len * 8,
+        "element-patch bytes must stay linear in content size: {wire} bytes of patches for {content_len} bytes of content"
+    );
+    // Shell patches are phase-gated, not per-delta: with no reasoning
+    // and no tool calls the whole turn needs a handful at most.
+    let shell_patches = body.matches("data: selector #turn-").count();
+    assert!(
+        shell_patches <= 6,
+        "full-shell patches must be phase-gated, found {shell_patches}:\n{body}"
+    );
+}

@@ -56,74 +56,69 @@ pub(crate) fn assistant_segments(
 pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: Lang) -> Html {
     let turn = tw.turn.clone();
     let tools = tw.tool_calls.clone();
-    let dom_id = format!("turn-{}", turn.id);
     let reasoning = turn.reasoning.clone().unwrap_or_default();
     let content = turn.content.clone().unwrap_or_default();
-    let elapsed_ms = turn.reasoning_elapsed_ms;
-    // The reasoning phase is over — and its timer must stop — the moment the
-    // driver freezes `reasoning_elapsed_ms` (on the first content delta, or at
-    // finalize for a reasoning-only turn), NOT when the whole turn ends. Tying
-    // this to turn status would let the live timer keep climbing through the
-    // entire answer/tool-call stream and only snap back at completion.
-    let reasoning_done = elapsed_ms.is_some();
-    let in_progress = turn.status == TurnStatus::InProgress;
-    let errored = turn.status == TurnStatus::Errored;
-    let error_msg = turn.error_message.clone().unwrap_or_default();
-    let show_spinner = in_progress && content.is_empty();
-    let thinking_id = format!("turn-{}-thinking", turn.id);
-    let tools_id = format!("turn-{}-tools", turn.id);
-    let text_id = format!("turn-{}-text", turn.id);
-    // Walk the same marker regex over the assistant's content as we
-    // do over user content: any `[gw-attachment …]` line the model
-    // produced via the `upload_attachment` tool becomes an inline
-    // image/chip exactly where it sits chronologically in the prose.
-    // No markers? `assistant_segments` returns a single rendered-
-    // markdown segment and the body stays one block, preserving the
-    // pre-existing fast path.
-    let segments = assistant_segments(&content, &turn.id, lang);
-    // Normalise into body pieces so a run of 2+ generated media collapses
-    // into a numbered side-by-side gallery. Prose stays raw-injected HTML.
-    let body_pieces: Vec<BodyPiece> = segments
-        .into_iter()
-        .map(|seg| match seg {
-            AssistantSegment::Prose(html) => BodyPiece::Block(html! { #(html) }.to_html()),
-            AssistantSegment::Attachment(att) => match media_kind(&att) {
-                Some(_) => BodyPiece::Media(att),
-                None => BodyPiece::File(att),
-            },
-        })
-        .collect();
     // Attachments the model produced (generated images, uploaded files)
     // are removable on the same owner gate as the retry affordance.
     let remove_prefix =
         actions.map(|base| format!("{base}/{}/turns/{}/attachment", turn.session_id, turn.id));
-    let body_items = render_body(&body_pieces, remove_prefix.as_deref(), lang);
+    let body_items = render_body(
+        &body_pieces(&content, &turn.id, lang),
+        remove_prefix.as_deref(),
+        lang,
+    );
     let has_reasoning = !reasoning.is_empty();
 
+    let thinking: Html = if has_reasoning {
+        render_thinking_block(&turn, None, lang)
+    } else {
+        let slot_id = format!("turn-{}-thinking", turn.id);
+        html! { div(id: (slot_id), class: "thinking-block-slot") {} }.to_html()
+    };
+    assemble_assistant_turn(
+        &turn,
+        thinking,
+        &tools,
+        html! {
+            for item in body_items.iter() { (item.clone()) }
+        }
+        .to_html(),
+        actions,
+        lang,
+    )
+}
+
+/// The turn bubble skeleton shared by the settled render and the
+/// streaming shell: thinking block, tool rows, prose container,
+/// spinner / error / timestamp / retry affordances. Callers decide
+/// what goes inside thinking and prose.
+pub(crate) fn assemble_assistant_turn(
+    turn: &Turn,
+    thinking: Html,
+    tools: &[crate::db::ToolCall],
+    text_children: Html,
+    actions: Option<&str>,
+    lang: Lang,
+) -> Html {
+    let dom_id = format!("turn-{}", turn.id);
+    let in_progress = turn.status == TurnStatus::InProgress;
+    let errored = turn.status == TurnStatus::Errored;
+    let error_msg = turn.error_message.clone().unwrap_or_default();
+    let show_spinner = in_progress && turn.content.as_deref().unwrap_or_default().is_empty();
     html! {
         div(id: (dom_id), class: "chat-msg--assistant") {
-            // Reasoning block. Conditionally rendered: when reasoning
-            // exists we emit the `<details>` shell; otherwise a tiny
-            // empty placeholder (so subsequent inner-patches of the
-            // bubble can morph it in without touching siblings).
-            if has_reasoning {
-                (render_thinking_block(&turn.id, &reasoning, elapsed_ms, turn.reasoning_started_at, reasoning_done, lang))
-            } else {
-                div(id: (thinking_id.clone()), class: "thinking-block-slot") {}
-            }
+            (thinking)
             // Tool calls. Each row has its own stable id (`tc-<id>`)
             // so datastar's morph preserves user open/close state
             // across re-renders.
-            div(id: (tools_id), class: "tool-calls flex flex-col") {
-                (render_tool_call_list(&tools, &turn.id, lang))
+            div(id: (format!("turn-{}-tools", turn.id)), class: "tool-calls flex flex-col") {
+                (render_tool_call_list(tools, &turn.id, lang))
             }
             // Main response text. Each prose segment is its own
             // markdown-rendered block, with attachment chips/images
             // spliced inline at the model's write-position.
-            div(id: (text_id), class: "chat-prose") {
-                for item in body_items.iter() {
-                    (item.clone())
-                }
+            div(id: (format!("turn-{}-text", turn.id)), class: "chat-prose") {
+                (text_children)
             }
             // "Thinking…" spinner. Visible only when the turn is
             // in-progress AND no content has landed yet — CSS
@@ -146,11 +141,27 @@ pub fn render_assistant_turn(tw: &TurnWithTools, actions: Option<&str>, lang: La
             // this reply + everything below and regenerates from the
             // preceding user message with the currently-selected model.
             if actions.is_some() && !in_progress {
-                (render_retry_action(&turn, actions.unwrap_or(""), lang))
+                (render_retry_action(turn, actions.unwrap_or(""), lang))
             }
         }
     }
     .to_html()
+}
+
+fn body_pieces(content: &str, turn_id: &str, lang: Lang) -> Vec<BodyPiece> {
+    // Drop any `[attached file=… id=…]` line the model typed itself: that is
+    // the *replay stub* the driver synthesises for the model's own context.
+    let segments = assistant_segments(content, turn_id, lang);
+    segments
+        .into_iter()
+        .map(|seg| match seg {
+            AssistantSegment::Prose(html) => BodyPiece::Block(html! { #(html) }.to_html()),
+            AssistantSegment::Attachment(att) => match media_kind(&att) {
+                Some(_) => BodyPiece::Media(att),
+                None => BodyPiece::File(att),
+            },
+        })
+        .collect()
 }
 
 /// Hover "Retry" affordance under a settled assistant bubble.
@@ -175,23 +186,47 @@ pub(crate) fn render_retry_action(turn: &Turn, base: &str, lang: Lang) -> Html {
     .to_html()
 }
 
-/// `<details>` shell for a reasoning block. `finalized=true` switches
-/// the summary from "Thinking… (Xs)" to "Thought for Xs". Carries
+/// `<details>` shell for a reasoning block.
+///
+/// `live_stream_url` gates the thinking trace on the wire. While the
+/// turn is in progress it is `Some(url)` and the body renders empty —
+/// expanding the `<details>` fires the `@get` which opens the
+/// on-demand sub-stream that ships the trace (live or frozen
+/// complete), so a collapsed trace costs zero bytes no matter how
+/// long the reasoning grows. `None` (settled turns) renders the
+/// reasoning markdown inline — the one place the trace travels on
+/// the main stream.
+///
+/// `finalized` (derived from the turn) switches the summary from
+/// "Thinking… (Xs)" to "Thought for Xs". Carries
 /// `data-preserve-attr="open"` so datastar's morph leaves the user's
 /// collapse state alone on each re-render.
-pub fn render_thinking_block(
-    turn_id: &str,
-    reasoning: &str,
-    elapsed_ms: Option<i64>,
-    reasoning_started_at: Option<jiff::Timestamp>,
-    finalized: bool,
-    lang: Lang,
-) -> Html {
+pub fn render_thinking_block(turn: &Turn, live_stream_url: Option<&str>, lang: Lang) -> Html {
+    let turn_id = &turn.id;
+    let reasoning = turn.reasoning.clone().unwrap_or_default();
+    let elapsed_ms = turn.reasoning_elapsed_ms;
+    let reasoning_started_at = turn.reasoning_started_at;
+    let finalized = elapsed_ms.is_some();
     let body_id = format!("turn-{turn_id}-thinking-body");
     let shell_id = format!("turn-{turn_id}-thinking");
     let summary_id = format!("turn-{turn_id}-thinking-summary");
     let timer_id = format!("turn-{turn_id}-thinking-timer");
-    let rendered = render_markdown_with_copy(reasoning, &CopyLabels::for_lang(lang));
+    let body: plait::Html = match live_stream_url {
+        Some(_) => html! {
+            // Deliberately empty: the live trace streams through the
+            // `/thinking` sub-channel this toggle opens. A shell
+            // re-patch can momentarily wipe a body the sub-stream
+            // filled — the next sub-stream tick (≤ its coalesce
+            // interval) restores it.
+            div(id: (body_id), class: "thinking-prose") {}
+        }
+        .to_html(),
+        None => {
+            let rendered = render_thinking_body(&reasoning, lang);
+            html! { div(id: (body_id), class: "thinking-prose") { #(rendered) } }.to_html()
+        }
+    };
+    let toggle = live_stream_url.map(|url| format!("el.open && @get('{url}')"));
     html! {
         // Collapsed by default — reasoning is mostly debugging
         // material, not something the reader needs in the flow.
@@ -202,7 +237,8 @@ pub fn render_thinking_block(
         details(
             id: (shell_id),
             class: "thinking-block",
-            "data-preserve-attr": "open"
+            "data-preserve-attr": "open",
+            "data-on:toggle": (toggle.clone()),
         ) {
             summary(id: (summary_id), class: "thinking-block__summary") {
                 if finalized {
@@ -232,12 +268,17 @@ pub fn render_thinking_block(
                     }
                 }
             }
-            div(id: (body_id), class: "thinking-prose") {
-                #(rendered)
-            }
+            (body)
         }
     }
     .to_html()
+}
+
+/// Rendered markdown for the inside of a `thinking-body` element —
+/// shared by the settled render and the on-demand thinking
+/// sub-stream.
+pub fn render_thinking_body(reasoning: &str, lang: Lang) -> String {
+    render_markdown_with_copy(reasoning, &CopyLabels::for_lang(lang))
 }
 
 /// One-decimal, locale-stable seconds string (e.g. "12.3"). We format the

@@ -35,8 +35,8 @@ use super::{
 };
 use session_core::chat::{
     SidebarEmitter, SseTx, cancel_turn as chat_cancel_turn, empty_sse_response,
-    spawn_session_stream_response, sse_error_response, sse_submit_error_response,
-    sse_turn_busy_response,
+    spawn_session_stream_response, spawn_thinking_stream_response, sse_error_response,
+    sse_submit_error_response, sse_turn_busy_response,
 };
 use session_core::chrome::{
     NavSections, Theme, is_datastar_request, read_body_to_bytes, see_other, sse_patch,
@@ -1218,6 +1218,51 @@ pub async fn chat_tail(
         Some("/chat".to_string()),
         lang,
     )
+}
+
+// ---------------------------------------------------------------------------
+// GET /chat/{id}/turns/{turn_id}/thinking — the on-demand live reasoning
+// sub-stream. The main turn stream never carries a still-growing thinking
+// body (a collapsed trace costs zero bytes); expanding the `<details>`
+// fires the `data-on:toggle` → `@get` that lands here. Readable-gated like
+// the tail so a shared-chat viewer can also expand the trace.
+
+pub async fn chat_turn_thinking(
+    Path(TurnPath { id, turn_id }): Path<TurnPath>,
+    State(state): State<Arc<RamaState>>,
+    req: Request,
+) -> Response {
+    let (_session, user) = require_session!(state, req);
+    let lang = Lang::from_headers(req.headers());
+
+    match chat::get_session_readable(&state.db, &user.id, &id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return empty_sse_response(),
+        Err(err) => return sse_error_response(&err.to_string()),
+    }
+    // Subscribe live only while the caller's worker is still filling
+    // THIS turn; anything else (already finalized, wrong session, a
+    // trace opened milliseconds after completion) gets a one-shot
+    // snapshot of the body and a clean close.
+    if let Some(worker) = state.chats.get(&user.id)
+        && worker.session_id == id
+        && worker.turn_id == turn_id
+    {
+        let broadcast_rx = worker.broadcast.subscribe();
+        return spawn_thinking_stream_response(state.db.clone(), id, turn_id, broadcast_rx, lang);
+    }
+    match chat::get_turn(&state.db, &id, &turn_id).await {
+        Ok(Some(turn)) => {
+            let selector = format!("#turn-{turn_id}-thinking-body");
+            let html = session_core::render::render_thinking_body(
+                turn.reasoning.as_deref().unwrap_or_default(),
+                lang,
+            );
+            sse_response(&[sse_patch(Some(&selector), Some("inner"), &html)])
+        }
+        Ok(None) => empty_sse_response(),
+        Err(err) => sse_error_response(&err.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------

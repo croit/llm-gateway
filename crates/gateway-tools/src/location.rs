@@ -161,10 +161,11 @@ async fn request_browser_location(fb: &ChatFeedback, turn_id: &str) -> Option<Br
     // Append the prompt as an inline card at the end of the live
     // conversation — right under the in-progress assistant bubble, where
     // the user is already looking — rather than a floating corner toast.
-    // The stream's Tick re-render only ever patches `#turn-<id>` (mode
-    // outer), so a sibling appended to `#conversation` survives every
-    // tick; the explicit teardown below (and the client's own removal on
-    // click) is what clears it.
+    // The stream's patches target `#turn-<id>` and its descendants (and
+    // whole-shell patches only fire on phase changes), so a sibling
+    // appended to `#conversation` survives every tick; the explicit
+    // teardown below (and the client's own removal on click) is what
+    // clears it.
     //
     // A trailing one-shot scroll brings the card into view (distinct from
     // the suppressed token-by-token autoscroll; `center` keeps it clear of

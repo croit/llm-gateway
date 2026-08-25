@@ -2607,6 +2607,15 @@
         & > :first-child { margin-top: 0; }
         & > :last-child { margin-bottom: 0; }
 
+        /* Streaming deltas append sealed markdown blocks inside
+         * `.tu` wrappers (stable ids so only the open block is
+         * re-patched). `display: contents` keeps the wrappers out of
+         * layout entirely, and the two rules below let the
+         * first/last-child margin zeroing see through them. */
+        & > .tu { display: contents; }
+        & > .tu:first-child > :first-child { margin-top: 0; }
+        & > .tu:last-child > :last-child { margin-bottom: 0; }
+
         & p, & ul, & ol { margin: var(--prose-block-margin) 0; }
         & ul { list-style: disc; padding-inline-start: var(--prose-list-indent); }
         & ol { list-style: decimal; padding-inline-start: var(--prose-list-indent); }

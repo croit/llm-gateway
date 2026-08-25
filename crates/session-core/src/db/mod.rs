@@ -693,6 +693,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_turn_with_tools_scopes_to_session_and_bundles_calls() {
+        let pool = pool().await;
+        let s = create_session(&pool, "u1").await.unwrap();
+        create_user_turn(&pool, &s.id, "u-hi", "hi").await.unwrap();
+        let asst = create_assistant_turn_in_progress(&pool, &s.id, "asst-x", "m")
+            .await
+            .unwrap();
+        insert_running_tool_call(&pool, &asst.id, "tc1", "echo", "{}")
+            .await
+            .unwrap();
+        complete_tool_call(&pool, &asst.id, "tc1", "\"ok\"", ToolCallStatus::Completed)
+            .await
+            .unwrap();
+
+        let got = get_turn_with_tools(&pool, &s.id, &asst.id)
+            .await
+            .unwrap()
+            .expect("turn exists");
+        assert_eq!(got.turn.id, "asst-x");
+        assert_eq!(got.tool_calls.len(), 1);
+        assert_eq!(got.tool_calls[0].status, ToolCallStatus::Completed);
+
+        // Wrong session scope → None, even though the turn id exists.
+        let other = create_session(&pool, "u1").await.unwrap();
+        assert!(
+            get_turn_with_tools(&pool, &other.id, &asst.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn delete_session_cascades_to_turns_and_tool_calls() {
         let pool = pool().await;
         let s = create_session(&pool, "u1").await.unwrap();

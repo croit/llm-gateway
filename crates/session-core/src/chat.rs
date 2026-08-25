@@ -31,6 +31,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use rama::http::{Body, Response, StatusCode, header};
 use tokio::sync::broadcast;
@@ -38,8 +39,15 @@ use tokio::sync::broadcast;
 use crate::chrome::{sse_patch, sse_signals};
 use crate::db::{self, Pool};
 use crate::i18n::Lang;
-use crate::render;
+use crate::render::{TurnStream, render_thinking_body};
 use crate::workers::{SessionWorkers, TurnUpdate};
+
+/// Minimum spacing between two turn patches on one subscriber's
+/// wire. Upstream chunks arrive far faster than a human perceives;
+/// coalescing them caps the event rate (and the per-event envelope
+/// overhead) without visibly changing liveness — the trailing flush
+/// guarantees the final state always lands.
+const PATCH_COALESCE: Duration = Duration::from_millis(120);
 
 /// Sender end of the per-request SSE channel. Handlers fill it from
 /// the background task spawned by `spawn_session_stream_response`.
@@ -148,36 +156,77 @@ pub fn cancel_turn(workers: &SessionWorkers, user_id: &str, session_id: &str) ->
     true
 }
 
-/// Pull the assistant turn out of the DB, render it, and forward as
-/// a `mode outer` patch keyed to `#turn-<uuid>`. Used both for the
-/// in-flight tail and for the "fresh subscriber catches up" path
-/// inside `spawn_session_stream_response`.
-pub async fn emit_current_state(
-    pool: &Pool,
-    session_id: &str,
-    assistant_turn_id: &str,
-    tx: &mut SseTx,
-    actions: Option<&str>,
-    lang: Lang,
-) -> Result<(), ()> {
-    use rama::futures::sink::SinkExt;
+/// Sender-side state of one SSE subscriber's turn stream.
+struct TurnFeed {
+    pool: Pool,
+    session_id: String,
+    assistant_turn_id: String,
+    stream: TurnStream,
+    dirty: bool,
+    last_emit: Option<tokio::time::Instant>,
+}
 
-    let turns = match db::list_turns(pool, session_id).await {
-        Ok(t) => t,
-        Err(err) => {
-            tracing::warn!(error = %err, "chat stream: list_turns failed");
-            return Ok(());
+impl TurnFeed {
+    fn new(
+        pool: Pool,
+        session_id: String,
+        assistant_turn_id: String,
+        actions: Option<String>,
+        lang: Lang,
+    ) -> Self {
+        let stream = TurnStream::new(&assistant_turn_id, actions.as_deref(), lang);
+        Self {
+            pool,
+            session_id,
+            assistant_turn_id,
+            stream,
+            dirty: false,
+            last_emit: None,
         }
-    };
-    let Some(turn_with_tools) = turns.into_iter().find(|t| t.turn.id == assistant_turn_id) else {
-        // Turn vanished (session deleted from another tab). Clean
-        // close from the streamer's POV.
-        return Err(());
-    };
-    let selector = format!("#turn-{assistant_turn_id}");
-    let html = render::render_assistant_turn(&turn_with_tools, actions, lang).to_string();
-    let patch = sse_patch(Some(&selector), Some("outer"), &html);
-    tx.send(Ok(patch)).await.map_err(|_| ())
+    }
+
+    /// Mark pending turn state; flush immediately when the coalesce
+    /// window has elapsed, otherwise the deadline branch of the loop
+    /// picks it up.
+    fn tick(&mut self) {
+        self.dirty = true;
+    }
+
+    fn due(&self) -> bool {
+        self.dirty
+            && self
+                .last_emit
+                .is_none_or(|last| last.elapsed() >= PATCH_COALESCE)
+    }
+
+    /// Read the turn, emit whatever changed, and record the emission.
+    /// `Ok(false)` signals the turn vanished — the caller closes the
+    /// stream.
+    async fn flush(&mut self, tx: &mut SseTx) -> Result<bool, ()> {
+        use rama::futures::sink::SinkExt;
+        let turns =
+            match db::get_turn_with_tools(&self.pool, &self.session_id, &self.assistant_turn_id)
+                .await
+            {
+                Ok(t) => t,
+                Err(err) => {
+                    tracing::warn!(error = %err, "chat stream: reading turn failed");
+                    return Ok(true);
+                }
+            };
+        let Some(tw) = turns else {
+            return Ok(false);
+        };
+        for patch in self.stream.diff(&tw) {
+            let event = sse_patch(Some(&patch.selector), Some(patch.mode), &patch.html);
+            if tx.send(Ok(event)).await.is_err() {
+                return Err(());
+            }
+        }
+        self.dirty = false;
+        self.last_emit = Some(tokio::time::Instant::now());
+        Ok(true)
+    }
 }
 
 /// Open a per-request SSE response wired to the worker's broadcast.
@@ -185,12 +234,14 @@ pub async fn emit_current_state(
 ///   1. Optionally emits `initial_patch` (the messages-POST path
 ///      uses this to splice the empty bubble skeleton on first
 ///      response; tail subscribers pass None).
-///   2. Emits the current DB state once immediately so a mid-stream
-///      subscriber catches up without waiting for the next delta.
-///   3. Loops on the broadcast: `Tick` → re-emit; `SidebarChanged`
-///      → call the per-binary `on_sidebar_changed`; `Finalized` →
-///      one last re-emit + a `chatStreaming=false` signal patch +
-///      close.
+///   2. Paints the turn's current state once immediately so a
+///      mid-stream subscriber catches up without waiting for the
+///      next delta.
+///   3. Loops on the broadcast: `Tick` → mark pending and flush at
+///      most every [`PATCH_COALESCE`]; `SidebarChanged` → flush +
+///      call the per-binary `on_sidebar_changed`; `Finalized` → one
+///      authoritative full render + a `chatStreaming=false` signal
+///      patch + close.
 ///   4. `Lagged` (slow subscriber dropped some Ticks) → catch up by
 ///      re-reading the DB; its state subsumes anything missed.
 #[allow(clippy::too_many_arguments)]
@@ -209,102 +260,87 @@ pub fn spawn_session_stream_response(
 
     tokio::spawn(async move {
         use rama::futures::sink::SinkExt;
-        let actions = actions.as_deref();
 
         if let Some(p) = initial_patch
             && tx.send(Ok(p)).await.is_err()
         {
             return;
         }
-        // Render the empty skeleton (or the just-finalized turn for
-        // a fresh tail subscriber) before waiting on the broadcast.
-        let _ = emit_current_state(
-            &pool,
-            &session_id,
-            &assistant_turn_id,
-            &mut tx,
-            actions,
-            lang,
-        )
-        .await;
+
+        let mut feed = TurnFeed::new(pool, session_id, assistant_turn_id, actions, lang);
+        match feed.flush(&mut tx).await {
+            Ok(true) => {}
+            _ => return,
+        }
 
         loop {
-            match broadcast_rx.recv().await {
-                Ok(TurnUpdate::Tick) => {
-                    if emit_current_state(
-                        &pool,
-                        &session_id,
-                        &assistant_turn_id,
-                        &mut tx,
-                        actions,
-                        lang,
-                    )
-                    .await
-                    .is_err()
+            let deadline = match feed.last_emit {
+                Some(last) if feed.dirty => last + PATCH_COALESCE,
+                _ => tokio::time::Instant::now() + PATCH_COALESCE,
+            };
+            tokio::select! {
+                update = broadcast_rx.recv() => {
+                    match update {
+                        Ok(TurnUpdate::Tick) => {
+                            if feed.due() {
+                                if feed.flush(&mut tx).await.is_err() {
+                                    return;
+                                }
+                            } else {
+                                feed.tick();
+                            }
+                        }
+                        Ok(TurnUpdate::SidebarChanged) => {
+                            if matches!(feed.flush(&mut tx).await, Ok(false) | Err(())) {
+                                return;
+                            }
+                            match (on_sidebar_changed)(tx).await {
+                                Ok(t) => tx = t,
+                                Err(_) => return,
+                            }
+                        }
+                        // Forward pre-framed bytes straight through — transient UI
+                        // (e.g. a tool's location prompt) that the DB-driven
+                        // re-render must not own.
+                        Ok(TurnUpdate::Inject(bytes)) => {
+                            if tx.send(Ok(bytes.as_ref().clone())).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(TurnUpdate::InfoMessage(msg)) => {
+                            let html = format!(
+                                r#"<div class="alert alert-info my-2 text-sm" role="alert">{msg}</div>"#
+                            );
+                            let sse = crate::chrome::sse_patch(None, None, &html);
+                            if tx.send(Ok(sse)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(TurnUpdate::Finalized) => {
+                            // The worker settles the row before broadcasting,
+                            // so this flush renders the authoritative final
+                            // bubble (thinking trace included, retry control,
+                            // settled labels). Any pending in-progress diff is
+                            // subsumed by it.
+                            feed.dirty = false;
+                            if matches!(feed.flush(&mut tx).await, Ok(false) | Err(())) {
+                                return;
+                            }
+                            let _ = tx.send(Ok(sse_signals(r#"{"chatStreaming":false}"#))).await;
+                            return;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            feed.dirty = true;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    if feed.due()
+                        && matches!(feed.flush(&mut tx).await, Ok(false) | Err(()))
                     {
                         return;
                     }
-                }
-                Ok(TurnUpdate::SidebarChanged) => {
-                    if emit_current_state(
-                        &pool,
-                        &session_id,
-                        &assistant_turn_id,
-                        &mut tx,
-                        actions,
-                        lang,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
-                    }
-                    match (on_sidebar_changed)(tx).await {
-                        Ok(t) => tx = t,
-                        Err(_) => return,
-                    }
-                }
-                // Forward pre-framed bytes straight through — transient UI
-                // (e.g. a tool's location prompt) that the DB-driven
-                // re-render must not own.
-                Ok(TurnUpdate::Inject(bytes)) => {
-                    if tx.send(Ok(bytes.as_ref().clone())).await.is_err() {
-                        return;
-                    }
-                }
-                Ok(TurnUpdate::InfoMessage(msg)) => {
-                    let html = format!(
-                        r#"<div class="alert alert-info my-2 text-sm" role="alert">{msg}</div>"#
-                    );
-                    let sse = crate::chrome::sse_patch(None, None, &html);
-                    if tx.send(Ok(sse)).await.is_err() {
-                        return;
-                    }
-                }
-                Ok(TurnUpdate::Finalized) => {
-                    let _ = emit_current_state(
-                        &pool,
-                        &session_id,
-                        &assistant_turn_id,
-                        &mut tx,
-                        actions,
-                        lang,
-                    )
-                    .await;
-                    let _ = tx.send(Ok(sse_signals(r#"{"chatStreaming":false}"#))).await;
-                    return;
-                }
-                Err(broadcast::error::RecvError::Closed) => return,
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let _ = emit_current_state(
-                        &pool,
-                        &session_id,
-                        &assistant_turn_id,
-                        &mut tx,
-                        actions,
-                        lang,
-                    )
-                    .await;
                 }
             }
         }
@@ -317,6 +353,131 @@ pub fn spawn_session_stream_response(
         .header("x-accel-buffering", "no")
         .body(Body::from_stream(rx))
         .unwrap()
+}
+
+/// The on-demand thinking sub-stream opened by expanding a live
+/// trace's `<details>` (`data-on:toggle` → `@get …/thinking`). Ships
+/// only the `#turn-<id>-thinking-body` interior: an immediate
+/// snapshot, then a coalesced patch per reasoning change until the
+/// turn finalizes (or the turn is already settled, in which case one
+/// final patch closes the stream). Collapsed traces cost nothing —
+/// the main stream never carries the live body.
+pub fn spawn_thinking_stream_response(
+    pool: Pool,
+    session_id: String,
+    turn_id: String,
+    mut broadcast_rx: broadcast::Receiver<TurnUpdate>,
+    lang: Lang,
+) -> Response {
+    let (mut tx, rx) =
+        rama::futures::channel::mpsc::unbounded::<Result<rama::bytes::Bytes, std::io::Error>>();
+
+    tokio::spawn(async move {
+        let selector = format!("#turn-{turn_id}-thinking-body");
+        let mut last_html = String::new();
+        let mut dirty = false;
+
+        // Immediate snapshot — the opener wants the trace now, not at
+        // the next upstream chunk. Also covers a race where the turn
+        // finalizes before we subscribed (the broadcast then reads
+        // Closed and the loop returns after this one patch).
+        if !emit_thinking(
+            &pool,
+            &session_id,
+            &turn_id,
+            &selector,
+            &mut last_html,
+            &mut tx,
+            lang,
+        )
+        .await
+        {
+            return;
+        }
+        let mut last_emit = Some(tokio::time::Instant::now());
+
+        loop {
+            let deadline = match last_emit {
+                Some(last) if dirty => last + PATCH_COALESCE,
+                _ => tokio::time::Instant::now() + PATCH_COALESCE,
+            };
+            tokio::select! {
+                update = broadcast_rx.recv() => {
+                    match update {
+                        Ok(TurnUpdate::Tick) | Ok(TurnUpdate::SidebarChanged) => {
+                            dirty = true;
+                            if last_emit.is_none_or(|l| l.elapsed() >= PATCH_COALESCE) {
+                                if !emit_thinking(&pool, &session_id, &turn_id, &selector, &mut last_html, &mut tx, lang).await {
+                                    return;
+                                }
+                                last_emit = Some(tokio::time::Instant::now());
+                                dirty = false;
+                            }
+                        }
+                        Ok(TurnUpdate::Finalized) => {
+                            let _ = emit_thinking(&pool, &session_id, &turn_id, &selector, &mut last_html, &mut tx, lang).await;
+                            return;
+                        }
+                        // Transient UI the thinking body doesn't own.
+                        Ok(TurnUpdate::Inject(_)) | Ok(TurnUpdate::InfoMessage(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => return,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            dirty = true;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    if dirty {
+                        if !emit_thinking(&pool, &session_id, &turn_id, &selector, &mut last_html, &mut tx, lang).await {
+                            return;
+                        }
+                        last_emit = Some(tokio::time::Instant::now());
+                        dirty = false;
+                    }
+                }
+            }
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(rx))
+        .unwrap()
+}
+
+/// Read the turn and, when its rendered reasoning changed, patch the
+/// thinking body onto the wire. Returns false when the stream must
+/// close (turn vanished or subscriber gone).
+async fn emit_thinking(
+    pool: &Pool,
+    session_id: &str,
+    turn_id: &str,
+    selector: &str,
+    last_html: &mut String,
+    tx: &mut SseTx,
+    lang: Lang,
+) -> bool {
+    use rama::futures::sink::SinkExt;
+    let turn = match db::get_turn(pool, session_id, turn_id).await {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::warn!(error = %err, "thinking stream: reading turn failed");
+            return true;
+        }
+    };
+    let Some(turn) = turn else {
+        return false;
+    };
+    let html = render_thinking_body(turn.reasoning.as_deref().unwrap_or_default(), lang);
+    if html == *last_html {
+        return true;
+    }
+    let event = sse_patch(Some(selector), Some("inner"), &html);
+    *last_html = html;
+    tx.send(Ok(event)).await.is_ok()
 }
 
 /// Convenience constructor for the common "no sidebar repaint

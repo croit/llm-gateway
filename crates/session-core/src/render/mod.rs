@@ -13,7 +13,11 @@
 //! the initial server render and on every SSE patch the worker
 //! drives, so the morphdom-style diff datastar runs across patches
 //! preserves per-element interactive state (collapsed `<details>`,
-//! scroll position) automatically.
+//! scroll position) automatically. One exception: `stream.rs`'s
+//! delta renderers add `.tu` wrappers around in-flight markdown
+//! blocks (each sealed block travels exactly once); the settled
+//! render drops the wrappers, so the finalize patch is the
+//! authoritative shape.
 //!
 //! Per-turn DOM ids carry the turn UUID so two concurrent stream
 //! attaches (multiple tabs, retry-on-recover) can't cross-write.
@@ -29,6 +33,7 @@ mod attachments;
 mod canvas;
 mod composer;
 mod md;
+mod stream;
 mod tool_calls;
 mod turns;
 
@@ -37,6 +42,7 @@ pub use attachments::*;
 pub use canvas::*;
 pub use composer::*;
 pub use md::*;
+pub use stream::*;
 pub use tool_calls::*;
 pub use turns::*;
 

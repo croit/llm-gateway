@@ -407,6 +407,36 @@ pub async fn get_turn(
     row.as_ref().map(map_turn).transpose()
 }
 
+/// Fetch one turn by id together with its tool calls, scoped to its
+/// session. This is the per-tick read for the streaming SSE loop: the
+/// loop only ever mutates one assistant turn, so re-reading the whole
+/// conversation (`list_turns`) per delta was pure overhead — and grew
+/// with conversation length on every tick.
+pub async fn get_turn_with_tools(
+    pool: &Pool,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<Option<TurnWithTools>, DbError> {
+    let Some(turn) = get_turn(pool, session_id, turn_id).await? else {
+        return Ok(None);
+    };
+    let tool_rows = sqlx::query(
+        r#"SELECT id, turn_id, seq, name, arguments_json, output_json,
+                  status, created_at, completed_at
+           FROM chat_tool_calls
+           WHERE turn_id = ?
+           ORDER BY seq ASC"#,
+    )
+    .bind(turn_id)
+    .fetch_all(pool)
+    .await?;
+    let tool_calls: Vec<ToolCall> = tool_rows
+        .iter()
+        .map(map_tool_call)
+        .collect::<Result<_, _>>()?;
+    Ok(Some(TurnWithTools { turn, tool_calls }))
+}
+
 /// Replace a user turn's text (the "edit" action). Scoped to the
 /// session + `role = 'user'` so it can never rewrite an assistant turn.
 /// Returns whether a row was updated.

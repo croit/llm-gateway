@@ -27,6 +27,7 @@ The whole stack:
 | `POST /chat/sessions` | Creates a fresh conversation, nav-patches `<main>` to its URL. | session | **SSE** |
 | `POST /chat/{id}/messages` | Submits a user message. Persists user + assistant turn rows to SQLite, spawns the streaming worker, and SSE-tails the worker's broadcast. | session | **SSE** |
 | `GET /chat/{id}/tail` | Reconnect endpoint. Subscribes to the user's in-flight worker (if any belongs to this session) and emits the same patches the original POST got. Used after backgrounding / network blips / second tab attach. | session | **SSE** |
+| `GET /chat/{id}/turns/{turn_id}/thinking` | On-demand reasoning sub-stream. Expanding a live trace's `<details>` fires its `data-on:toggle` → `@get` against this endpoint, which ships only the `#turn-<id>-thinking-body` interior (snapshot, then coalesced patches) until the turn finalizes. A collapsed trace costs zero bytes — the main stream never carries a still-streaming trace. | session | **SSE** |
 | `POST /chat/{id}/cancel` | Flips the worker's cancel flag. Worker observes between upstream chunks and exits to finalize. | session | **SSE** |
 | `POST /chat/{id}/delete` | Removes the conversation (cascades turns + tool_calls) and nav-patches to the next session. | session | **SSE** |
 | `POST /theme/toggle` | Flips the theme cookie and 303s back. | anonymous | 303 redirect |
@@ -133,7 +134,7 @@ crates/gateway-web/src/pages/
 │   ├── mod.rs   handlers (chat_index / chat_session_view /
 │   │             chat_session_create / chat_message_send / chat_tail /
 │   │             chat_cancel / chat_session_delete) + the shared
-│   │             SSE-streaming task that re-reads DB on each tick
+│   │             SSE-streaming task emitting coalesced deltas per tick
 │   ├── worker.rs  run_chat_turn — the per-user streaming loop that
 │   │             walks the upstream SSE, appends to chat_turns /
 │   │             chat_tool_calls in SQLite, and broadcasts a Tick
@@ -250,6 +251,47 @@ let _ = tx.send(Ok(sse_signals(r#"{"chatStreaming":false}"#))).await;
 
 The form's `data-class` binding reactively un-toggles `chat-composer--streaming` and the send button reappears. No `<script>` payload, no manual `classList.remove`.
 
+### Chat streaming: the delta protocol
+
+The chat turn stream is the one surface where naive full re-renders are
+unacceptable on the wire: a long reply streams hundreds of upstream
+chunks, and re-sending the accumulated bubble per chunk is quadratic
+(a single reply was measured at 225 MB over mobile). The stream
+(`session_core::chat::spawn_session_stream_response` +
+`session_core::render::stream`) therefore emits **deltas**, with the
+DB still the single source of truth:
+
+- **Sealed markdown blocks travel once.** Content is split at safe
+  block boundaries (blank lines outside fenced code, respecting
+  indented continuations; attachment markers seal hard). A sealed
+  block is rendered exactly once and appended to
+  `#turn-<id>-text` inside a stable `.tu` wrapper
+  (`tu-<turn>-<n>`, laid out via `display: contents` so CSS is
+  unchanged). Only the trailing *open* block re-renders, patched
+  `mode inner` into its wrapper.
+- **Shells are phase-gated.** A `mode outer` patch of the whole
+  `#turn-<id>` fires only when the turn's phase signature changes
+  (reasoning appears, first content lands, error), never per delta.
+- **Thinking is opt-in.** While a turn is in progress the reasoning
+  body on the main stream is an empty div — the `<details>` carries
+  `data-on:toggle="el.open && @get('…/turns/{id}/thinking')"` so
+  expanding the trace opens the on-demand sub-stream that carries
+  it. The completed trace travels the main stream exactly once, in
+  the settled render.
+- **Ticks are coalesced** to ≥120 ms apart per subscriber, with a
+  trailing flush — and each flush reads just the one turn
+  (`db::get_turn_with_tools`), not the whole conversation.
+- **Finalize is authoritative.** The settled render replaces the
+  whole bubble once (`render_assistant_turn`), which repairs any
+  transient splitter artefact (e.g. mid-stream list spacing) and
+  adds the Retry control. Fresh / lagged / reconnected subscribers
+  get one full snapshot, then deltas.
+
+When adding to the streaming path, keep those invariants: never let
+a growing body ride a repeating patch, and never special-case a
+settled shape in the streaming renderer — send the phase change and
+let `render_assistant_turn` own the final paint.
+
 ### Server-side helpers (`pages/mod.rs`)
 
 All in `crates/gateway-web/src/pages/mod.rs`. Re-use these in new handlers — don't open-code SSE framing.
@@ -297,7 +339,7 @@ Anything you want to swap or remove via SSE needs an id you can put in the `sele
 
 Chat-side specifically: every assistant turn gets a server-side UUID (the `chat_turns.id` primary key) that shows up in the DOM as `id="turn-<uuid>"` for the bubble, plus matching `…-thinking` / `…-tools` / `…-text` slot ids. Per-turn ids mean two concurrent stream attaches (multiple tabs, a retry after a network blip) can't cross-write each other's DOM.
 
-Long-lived interactive subtrees (`<details>` blocks for the thinking spoiler and tool calls) carry `data-preserve-attr="open"` so datastar's morph leaves the user's collapse state alone when the bubble re-renders on each tick.
+Long-lived interactive subtrees (`<details>` blocks for the thinking spoiler and tool calls) carry `data-preserve-attr="open"` so datastar's morph leaves the user's collapse state alone when the bubble re-renders.
 
 ### Empty-state without server branching
 
@@ -395,11 +437,13 @@ The worker doesn't care if anyone's listening — it runs to completion either w
 
 **The streaming flow**:
 
-1. **`POST /chat/{id}/messages`** validates the form, persists the user turn + an assistant turn in `in_progress`, calls `ChatWorkers::register` (refuses with a toast if busy), spawns `run_chat_turn`, and SSE-tails the broadcast. Initial event is `mode append` of both fresh bubbles onto `#conversation`. Each `Tick` triggers a re-read of the assistant turn from the DB plus an `mode outer` patch on `#turn-<uuid>` with the current render. `Finalized` emits one last patch plus a `datastar-patch-signals` flipping `$chatStreaming` to false.
+1. **`POST /chat/{id}/messages`** validates the form, persists the user turn + an assistant turn in `in_progress`, calls `ChatWorkers::register` (refuses with a toast if busy), spawns `run_chat_turn`, and SSE-tails the broadcast. Initial event is `mode append` of both fresh bubbles onto `#conversation`. Ticks are coalesced to ≥120 ms and each flush re-reads the assistant turn from the DB and emits the [delta protocol](#chat-streaming-the-delta-protocol) patches (sealed-block appends, open-block inner patches, phase-gated shells). `Finalized` emits one authoritative full render plus a `datastar-patch-signals` flipping `$chatStreaming` to false.
 
-2. **`GET /chat/{id}/tail`** is the reconnect path. Looks up the user's active worker; if it belongs to this session, subscribes to the same broadcast and runs the same re-read-and-patch loop without the initial bubble-append (the bubbles are already on the page from the original `GET /chat/{id}` render). If there's no live worker the response sends `chatStreaming=false` and closes — defensive against a stale tab that's optimistically set the flag.
+2. **`GET /chat/{id}/tail`** is the reconnect path. Looks up the user's active worker; if it belongs to this session, subscribes to the same broadcast and runs the same delta loop without the initial bubble-append (the bubbles are already on the page from the original `GET /chat/{id}` render; the first flush is a full snapshot that re-baselines the subscriber's delta state). If there's no live worker the response sends `chatStreaming=false` and closes — defensive against a stale tab that's optimistically set the flag.
 
-3. **`POST /chat/{id}/cancel`** flips the cancel flag. The worker observes between upstream chunks and exits cleanly into finalize.
+3. **`GET /chat/{id}/turns/{turn_id}/thinking`** is the opt-in reasoning sub-stream (see [the delta protocol](#chat-streaming-the-delta-protocol)): snapshot first, then coalesced `#turn-<id>-thinking-body` inner patches until finalize.
+
+4. **`POST /chat/{id}/cancel`** flips the cancel flag. The worker observes between upstream chunks and exits cleanly into finalize.
 
 `GET /chat/{id}` always reads from the DB. If there's an in-flight assistant turn, the conversation `<section>` emits `data-init="window.chatScroll.init(el); @get('/chat/{id}/tail')"` so the page auto-subscribes to the live worker on mount. Datastar re-fires `data-init` on every nav-patch, so a user backgrounding their phone and unlocking it half a minute later still picks up the live stream.
 
