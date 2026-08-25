@@ -238,7 +238,7 @@ pub fn render_thinking_block(turn: &Turn, live_stream_url: Option<&str>, lang: L
             id: (shell_id),
             class: "thinking-block",
             "data-preserve-attr": "open",
-            "data-on:toggle": (toggle.clone()),
+            "data-on:toggle"?: (toggle.clone()),
         ) {
             summary(id: (summary_id), class: "thinking-block__summary") {
                 if finalized {

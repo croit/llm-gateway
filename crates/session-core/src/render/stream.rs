@@ -15,18 +15,23 @@
 //!   boundaries (blank lines outside fenced code, respecting indented
 //!   continuations). A block is rendered exactly once and appended to
 //!   `#turn-<id>-text` in a stable wrapper (`tu-<turn>-<n>`).
-//! - **The open trailing block** — the only element re-rendered per
-//!   tick, patched `mode inner` into its wrapper.
+//! - **The open trailing block** — the only unit re-rendered per
+//!   tick. Its patch fragment is the wrapper itself, so it must
+//!   REPLACE the wrapper (`mode outer` on `#tu-<turn>-<n>`);
+//!   `mode inner` would nest the wrapper inside itself and
+//!   duplicate content on every subsequent tick.
 //! - **Tool calls** — the `#turn-<id>-tools` container is inner-
-//!   patched only when its rendered HTML actually changed.
+//!   patched only when its rendered HTML actually changed (the
+//!   fragment there is the container's children, without the
+//!   wrapper).
 //! - **The shell** — the whole turn is outer-patched only when its
 //!   *phase signature* changes (reasoning appears, first content
-//!   lands, reasoning freezes, error), not per delta.
-//! - **Thinking gate** — while reasoning is still arriving, streamed
-//!   shells carry an *empty* `thinking-body`; the live trace ships
-//!   only through the on-demand `/thinking` sub-stream the client
-//!   opens by expanding the `<details>`. Once reasoning freezes (the
-//!   first content delta), the final trace is included in the shell.
+//!   lands, error), not per delta.
+//! - **Thinking gate** — while the turn is in progress, streamed
+//!   shells carry an *empty* `thinking-body`; the trace ships only
+//!   through the on-demand `/thinking` sub-stream the client opens
+//!   by expanding the `<details>`. The completed trace travels the
+//!   main stream exactly once, in the settled render.
 //!
 //! Safety net: any settled (non-in-progress) row, and any unexpected
 //! content shrink, falls back to one authoritative full render, so a
@@ -139,9 +144,13 @@ impl TurnStream {
         } else {
             for (i, html) in units.iter().enumerate().take(self.sent_units.len()) {
                 if &self.sent_units[i] != html {
+                    // The fragment is the wrapper itself, so this must
+                    // REPLACE the wrapper (outer) — inner would nest
+                    // `#tu-…-<i>` inside itself and duplicate content
+                    // on every subsequent tick.
                     events.push(StreamPatch {
                         selector: format!("#tu-{}-{i}", self.turn_id),
-                        mode: "inner",
+                        mode: "outer",
                         html: html.clone(),
                     });
                 }
@@ -483,13 +492,13 @@ mod tests {
     }
 
     #[test]
-    fn growing_the_open_block_inner_patches_only_its_wrapper() {
+    fn growing_the_open_block_replaces_only_its_wrapper() {
         let mut s = stream();
         s.diff(&turn_with("Hel", None));
         let events = s.diff(&turn_with("Hello", None));
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0].selector, "#tu-t1-0");
-        assert_eq!(events[0].mode, "inner");
+        assert_eq!(events[0].mode, "outer");
         assert!(events[0].html.contains("Hello"));
     }
 
@@ -593,6 +602,39 @@ mod tests {
         let events = s.diff(&tw);
         assert_eq!(events.len(), 1);
         assert!(events[0].html.contains("deep thought"));
+    }
+
+    #[test]
+    fn settled_thinking_block_has_no_toggle_attribute() {
+        // `data-on:toggle=""` makes datastar throw ValueRequired on
+        // every mutation observation of the details element — the
+        // console error that broke patch application at finalize.
+        let mut tw = turn_with("answer", Some("reasoning text"));
+        tw.turn.reasoning_elapsed_ms = Some(900);
+        tw.turn.status = TurnStatus::Completed;
+        tw.turn.completed_at = Some(jiff::Timestamp::now());
+        let html = render_assistant_turn(&tw, Some("/chat"), Lang::En).to_string();
+        assert!(
+            !html.contains("data-on:toggle"),
+            "the settled trace must carry no toggle directive (empty value breaks datastar):\n{html}"
+        );
+    }
+
+    #[test]
+    fn changed_units_patch_the_wrapper_outer_not_inner() {
+        // Regression (word salad): inner-patching `#tu-<turn>-<n>` with
+        // the full wrapper div nested the wrapper inside itself
+        // (`#tu-0 > #tu-0 > …`), duplicating content on every tick and
+        // driving idiomorph into `moveBefore` hierarchy errors. The
+        // fragment for a changed unit is the wrapper itself, so the
+        // patch must replace it (outer), not fill it (inner).
+        let mut s = stream();
+        s.diff(&turn_with("Hel", None));
+        let events = s.diff(&turn_with("Hello", None));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].selector, "#tu-t1-0");
+        assert_eq!(events[0].mode, "outer", "{events:?}");
+        assert!(events[0].html.contains(r#"id="tu-t1-0""#));
     }
 
     #[test]

@@ -267,8 +267,10 @@ DB still the single source of truth:
   block is rendered exactly once and appended to
   `#turn-<id>-text` inside a stable `.tu` wrapper
   (`tu-<turn>-<n>`, laid out via `display: contents` so CSS is
-  unchanged). Only the trailing *open* block re-renders, patched
-  `mode inner` into its wrapper.
+  unchanged). Only the trailing *open* block re-renders — and its
+  patch fragment is the wrapper itself, so it replaces the wrapper
+  (`mode outer`); `mode inner` would nest `#tu-…-<n>` inside
+  itself and duplicate content on every tick.
 - **Shells are phase-gated.** A `mode outer` patch of the whole
   `#turn-<id>` fires only when the turn's phase signature changes
   (reasoning appears, first content lands, error), never per delta.
@@ -437,7 +439,7 @@ The worker doesn't care if anyone's listening — it runs to completion either w
 
 **The streaming flow**:
 
-1. **`POST /chat/{id}/messages`** validates the form, persists the user turn + an assistant turn in `in_progress`, calls `ChatWorkers::register` (refuses with a toast if busy), spawns `run_chat_turn`, and SSE-tails the broadcast. Initial event is `mode append` of both fresh bubbles onto `#conversation`. Ticks are coalesced to ≥120 ms and each flush re-reads the assistant turn from the DB and emits the [delta protocol](#chat-streaming-the-delta-protocol) patches (sealed-block appends, open-block inner patches, phase-gated shells). `Finalized` emits one authoritative full render plus a `datastar-patch-signals` flipping `$chatStreaming` to false.
+1. **`POST /chat/{id}/messages`** validates the form, persists the user turn + an assistant turn in `in_progress`, calls `ChatWorkers::register` (refuses with a toast if busy), spawns `run_chat_turn`, and SSE-tails the broadcast. Initial event is `mode append` of both fresh bubbles onto `#conversation`. Ticks are coalesced to ≥120 ms and each flush re-reads the assistant turn from the DB and emits the [delta protocol](#chat-streaming-the-delta-protocol) patches (sealed-block appends, open-block wrapper replaces, phase-gated shells). `Finalized` emits one authoritative full render plus a `datastar-patch-signals` flipping `$chatStreaming` to false.
 
 2. **`GET /chat/{id}/tail`** is the reconnect path. Looks up the user's active worker; if it belongs to this session, subscribes to the same broadcast and runs the same delta loop without the initial bubble-append (the bubbles are already on the page from the original `GET /chat/{id}` render; the first flush is a full snapshot that re-baselines the subscriber's delta state). If there's no live worker the response sends `chatStreaming=false` and closes — defensive against a stale tab that's optimistically set the flag.
 
