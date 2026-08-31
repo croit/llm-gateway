@@ -14,13 +14,13 @@ Dropbox, plain WebDAV. Once phase 3 lands it collapses into an operator-facing
 | `FileProvider` trait, capability model, provider registry, config-field descriptors | `gateway-features/src/server/rag/source/mod.rs` |
 | WebDAV provider (Nextcloud / ownCloud / OpenCloud / generic), PROPFIND parsing, extension detection | `…/source/webdav.rs` |
 | Provider-agnostic concurrent tree walker with subtree pruning, cycle and size bounds | `…/source/tree.rs` |
-| `source_kind` / `source_config_json` / sealed `source_secrets`, per-ref `dir_versions_json` + `delta_cursor` | migration `0058_rag_remote_sources.sql`, `db/rag.rs` |
+| `source_kind` / `source_config_json` / sealed `source_secrets`, per-ref `dir_versions_json` + `delta_cursor` | migration `0058_fileshare_rag.sql`, `db/rag.rs` |
 | Worker branch: enumerate → fetch → chunk → embed, sharing the whole indexing path with git | `…/rag/worker.rs` (`gather_remote`, `index_items`, `read_item`) |
 | Admin surface: source picker + credential form rendered from each provider's declared fields, secret sealing, **Test connection** | `gateway-web/src/pages/rag_source.rs`, `pages/rag.rs`, `POST /rag/test-source` |
 | JSON API: `source_kind` + `source_config` on create and PATCH, `GET /api/v0/rag/providers` for field discovery | `gateway/src/rama_server/rag_api.rs` |
 | **Extraction ladder**: text → PDF text layer → OCR → office, with page-accurate provenance | `…/rag/extract.rs`, `…/rag/chunk.rs`, migration-free store DDL change (`loc_kind`/`loc_from`/`loc_to`) |
 | Office reading shared with `fetch_attachment` — one python extractor, two consumers | `gateway-runtime/…/sandbox/office.rs` |
-| **Document profiles**: operator-defined extraction schema, seeded `invoice` + `project_document` | migration `0059_rag_document_profiles.sql`, `db/rag_documents.rs` |
+| **Document profiles**: operator-defined extraction schema, seeded `invoice` + `project_document` | migration `0058_fileshare_rag.sql`, `db/rag_documents.rs` |
 | **Extraction pass**: one LLM call per document → normalised fields + summary, cached by content hash | `…/rag/profile.rs`, `rag_extractions` |
 | **Structured query layer**: filter / sort / aggregate over extracted fields, with `total_matches` and ambiguity reporting | `db/rag_documents.rs` |
 | **Contextual chunk headers** — document identity prepended to each chunk *before embedding* | `…/rag/worker.rs` |
@@ -435,7 +435,7 @@ A **profile** is an operator-defined extraction schema attached to a collection.
 turns each document into a row of normalised fields plus a short summary, both
 written at index time by a cheap chat model.
 
-Central DB, migration `0058_rag_document_profiles.sql`:
+Central DB, migration `0058_fileshare_rag.sql`:
 
 ```sql
 CREATE TABLE rag_document_profiles (
@@ -513,7 +513,7 @@ comparable column without a single language-specific rule in the codebase — wh
 matters, because this corpus is German and English and the product must not care.
 
 **Extraction caching**, mirroring `ocr_derivatives` exactly (migration
-`0059_rag_extractions.sql`, central DB): key `(doc_sha256, profile_id,
+`0058_fileshare_rag.sql`, central DB): key `(doc_sha256, profile_id,
 profile_version, model)`, value the extracted JSON. A failed row is kept for the
 operator but reads as a miss, so a transient backend failure retries instead of
 poisoning the document forever. Consequence worth stating: a full corpus rebuild

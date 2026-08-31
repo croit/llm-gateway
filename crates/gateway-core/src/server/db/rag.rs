@@ -100,7 +100,7 @@ impl SearchMode {
 /// The config is an opaque string map on purpose: its schema belongs to the
 /// provider (`ProviderFactory::config_fields`), not to this table, so
 /// registering a new provider never needs a migration. See
-/// `migrations/0058_rag_remote_sources.sql`.
+/// `migrations/0058_fileshare_rag.sql`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSpec {
     /// `git` (the original behaviour) or a registered remote provider such
@@ -723,7 +723,7 @@ pub struct CollectionRef {
     pub force_full_rebuild: bool,
     /// Which extractors were available when this ref was last built. `None`
     /// for a ref built before the column existed. See
-    /// `migrations/0064_rag_extractor_fingerprint.sql`.
+    /// `migrations/0058_fileshare_rag.sql`.
     pub extractor_fingerprint: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
