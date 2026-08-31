@@ -54,8 +54,13 @@ pub async fn run_session_turn(pool: Pool, driver: Box<dyn SessionDriver>, ctx: S
     // is that drivers don't surface cancel as an error); the cancel
     // flag tells us which it was.
     let (status, error_message) = match result {
-        Ok(()) if cancel.load(Ordering::SeqCst) => (TurnStatus::Cancelled, None),
-        Ok(()) => (TurnStatus::Completed, None),
+        Ok(_) if cancel.load(Ordering::SeqCst) => (TurnStatus::Cancelled, None),
+        // A finished turn may still carry a notice — see `TurnOutcome`. It goes
+        // in the same column an error would, and the renderer tells them apart
+        // by the row's status, so a turn that produced a real answer stays
+        // `Completed` (replayable, webhook-ok, compactable) while still saying
+        // out loud how it ended.
+        Ok(outcome) => (TurnStatus::Completed, outcome.notice),
         Err(err) => {
             // The top-level `Display` often hides the real cause (e.g.
             // `DbError::Query`'s source sqlx error). Walk the full

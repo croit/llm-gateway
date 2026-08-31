@@ -1118,3 +1118,210 @@ async fn main_stream_wire_stays_linear_in_content_size() {
         "full-shell patches must be phase-gated, found {shell_patches}:\n{body}"
     );
 }
+
+#[tokio::test]
+async fn a_reply_cut_off_at_the_token_ceiling_is_marked_and_stays_replayable() {
+    // Regression for "the turn looks finished but isn't": the driver used to
+    // ignore `finish_reason` entirely, so an upstream that stopped at
+    // `max_tokens` mid-sentence produced a turn with a timestamp, no spinner
+    // and nothing else — indistinguishable from a real answer.
+    //
+    // The turn must say it was cut off. It must ALSO stay `Completed`: the
+    // partial text is real output, and a non-completed assistant turn is
+    // skipped by `message_for_history`, so erroring it would delete the answer
+    // from the model's own context — the notice tells the user to ask it to
+    // continue, and it has to have something to continue from.
+    let upstream = MockServer::start().await;
+    let truncated = "data: {\"choices\":[{\"delta\":{\"content\":\"Here is the plan: first I will\"}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+         data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(truncated, "text/event-stream"))
+        .mount(&upstream)
+        .await;
+
+    let (state, cookie, session_id) = setup(&upstream.uri()).await;
+    let app = router(state.clone());
+
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "write me a report")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{session_id}/messages"))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Draining the SSE tail blocks until the worker finalizes the turn.
+    let _ = resp.into_body().collect().await.unwrap().to_bytes();
+
+    let turns = chat::list_turns(&state.db, &session_id).await.unwrap();
+    let asst = turns
+        .iter()
+        .find(|t| t.turn.role == chat::TurnRole::Assistant)
+        .expect("assistant turn");
+    let notice = asst.turn.error_message.as_deref().unwrap_or_default();
+    assert!(
+        notice.contains("maximum output length"),
+        "the turn must carry a notice saying the reply was cut off at the \
+         ceiling, got: {notice:?}"
+    );
+    assert!(
+        notice.contains("max_tokens"),
+        "…and name the knob an operator raises, got: {notice:?}"
+    );
+    assert_eq!(
+        asst.turn.status,
+        chat::TurnStatus::Completed,
+        "a truncated turn produced usable output: erroring it would drop the \
+         partial answer from the replayed history, break `continue`, 502 the \
+         webhook path and fail the scheduled-run path"
+    );
+    // Everything the model did manage to say stays on screen.
+    assert_eq!(
+        asst.turn.content.as_deref(),
+        Some("Here is the plan: first I will"),
+        "the partial reply must be kept, not discarded"
+    );
+
+    // …and the model can actually see it on the next turn. This is the half
+    // the status choice exists for.
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "continue")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{session_id}/messages"))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    let _ = resp.into_body().collect().await.unwrap().to_bytes();
+
+    let sent = upstream
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    let last = sent
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+        .rfind(|b| b["stream"] == serde_json::json!(true))
+        .expect("the second streamed turn");
+    let replayed = last["messages"].to_string();
+    assert!(
+        replayed.contains("Here is the plan: first I will"),
+        "the truncated reply must be replayed to the model, or \"continue\" \
+         starts from nothing: {replayed}"
+    );
+}
+
+#[tokio::test]
+async fn a_normal_stop_still_completes() {
+    // The guard above must never fire on a healthy turn: `finish_reason: stop`
+    // is the overwhelmingly common case and a false positive turns a good
+    // answer into an error alert.
+    let upstream = MockServer::start().await;
+    let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"all done\"}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+         data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&upstream)
+        .await;
+
+    let (state, cookie, session_id) = setup(&upstream.uri()).await;
+    let app = router(state.clone());
+
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "hi")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{session_id}/messages"))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    let _ = resp.into_body().collect().await.unwrap().to_bytes();
+
+    let turns = chat::list_turns(&state.db, &session_id).await.unwrap();
+    let asst = turns
+        .iter()
+        .find(|t| t.turn.role == chat::TurnRole::Assistant)
+        .expect("assistant turn");
+    assert_eq!(asst.turn.status, chat::TurnStatus::Completed);
+    assert_eq!(asst.turn.content.as_deref(), Some("all done"));
+}
+
+#[tokio::test]
+async fn the_turn_discipline_rule_actually_reaches_the_upstream_request() {
+    // Wiring guard for the "turn ends on a promise" fix. The unit test proves
+    // `leading_system_message` composes the rule; this proves it survives the
+    // whole path and lands on the wire as the FIRST message of the request the
+    // backend receives — a single leading `system` turn (several would be
+    // rejected outright by the Qwen3 vLLM chat template).
+    //
+    // Deliberately checked against a bare conversation: no name, no IP, no
+    // skills, no compaction. That case used to send no system message at all,
+    // which is exactly the case this rule has to cover.
+    let upstream = MockServer::start().await;
+    let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+         data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+        .mount(&upstream)
+        .await;
+
+    let (state, cookie, session_id) = setup(&upstream.uri()).await;
+    let app = router(state.clone());
+
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "make me a report")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{session_id}/messages"))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    let _ = resp.into_body().collect().await.unwrap().to_bytes();
+
+    // The title-generation pass hits the same mock, so pick the streaming
+    // request — the turn itself — rather than whichever landed first.
+    let sent = upstream
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    let body = sent
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+        .find(|b| b["stream"] == serde_json::json!(true))
+        .expect("the streamed turn request");
+    let messages = body["messages"].as_array().expect("messages array");
+
+    assert_eq!(
+        messages[0]["role"], "system",
+        "the rule must lead the request: {messages:#?}"
+    );
+    let system = messages[0]["content"].as_str().unwrap();
+    assert!(
+        system.contains("no background execution"),
+        "the upstream must be told nothing of the model's runs on after the \
+         message ends; got: {system}"
+    );
+    assert!(
+        system.contains("never end a message on an announcement"),
+        "…and that an announcement is only allowed when the call follows it in \
+         the same turn; got: {system}"
+    );
+    assert_eq!(
+        messages.iter().filter(|m| m["role"] == "system").count(),
+        1,
+        "exactly ONE leading system turn — backends reject more: {messages:#?}"
+    );
+    // The user's own message still travels, unmodified, right after it.
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["content"], "make me a report");
+}

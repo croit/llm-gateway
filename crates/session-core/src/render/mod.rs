@@ -203,6 +203,81 @@ mod tests {
         );
     }
 
+    /// A turn that is still running must SAY so, for as long as it runs —
+    /// including after it has written text and paused to call a tool.
+    ///
+    /// The bug: the spinner stopped at the first content delta and the
+    /// timestamp was printed regardless of status, so a mid-turn pause left a
+    /// bubble that was pixel-for-pixel a finished reply. Users read "done",
+    /// stopped watching, and only discovered the turn was alive by prodding it
+    /// ("are you still thinking?"). Running tool rows do render, but *above*
+    /// the prose — off-screen for anyone sitting at the bottom of a long reply.
+    #[test]
+    fn an_in_progress_turn_with_content_still_shows_it_is_working() {
+        let tw = reasoning_turn(
+            Some("Here is the plan: first I will fetch the invoices."),
+            Some(3000),
+            TurnStatus::InProgress,
+        );
+        let html = render_assistant_turn(&tw, Some("/chat"), Lang::En).to_string();
+        assert!(
+            html.contains("Still working…"),
+            "a live turn that has written text must keep a live indicator              under the text: {html}"
+        );
+        assert!(
+            !html.contains("chat-msg__time"),
+            "a live turn must not wear the timestamp every settled message              carries: {html}"
+        );
+    }
+
+    /// …and the settled render is the mirror image: timestamp back, no
+    /// spinner. Otherwise the fix above just moves the ambiguity.
+    #[test]
+    fn a_settled_turn_drops_the_working_indicator_and_gets_its_timestamp() {
+        let tw = reasoning_turn(Some("all done"), Some(3000), TurnStatus::Completed);
+        let html = render_assistant_turn(&tw, Some("/chat"), Lang::En).to_string();
+        assert!(html.contains("chat-msg__time"), "{html}");
+        assert!(!html.contains("Still working…"), "{html}");
+        assert!(!html.contains("Thinking…"), "{html}");
+    }
+
+    /// A turn can finish successfully and still have something to say about
+    /// how it ended — a reply cut off at the model's token ceiling completes,
+    /// carrying a notice (see `driver::TurnOutcome`). The banner is gated on
+    /// the message being present, not on the row being errored, or the notice
+    /// would be written to the DB and shown to nobody.
+    #[test]
+    fn a_completed_turn_with_a_notice_still_shows_it() {
+        let mut tw = reasoning_turn(
+            Some("Here is the plan: first I will"),
+            Some(10),
+            TurnStatus::Completed,
+        );
+        tw.turn.error_message = Some("The model reached its maximum output length".into());
+        let html = render_assistant_turn(&tw, Some("/chat"), Lang::En).to_string();
+        assert!(
+            html.contains("The model reached its maximum output length"),
+            "a notice on a completed turn must be shown: {html}"
+        );
+        assert!(
+            html.contains("alert-warning") && !html.contains("alert-error"),
+            "…styled as a warning, not an error — the answer above it is real: {html}"
+        );
+        // Still a settled turn in every other respect.
+        assert!(html.contains("chat-msg__time"), "{html}");
+        assert!(!html.contains("Still working…"), "{html}");
+    }
+
+    /// A genuinely failed turn keeps the error styling.
+    #[test]
+    fn an_errored_turn_still_shows_an_error_banner() {
+        let mut tw = reasoning_turn(None, Some(10), TurnStatus::Errored);
+        tw.turn.error_message = Some("upstream 502".into());
+        let html = render_assistant_turn(&tw, Some("/chat"), Lang::En).to_string();
+        assert!(html.contains("alert-error"), "{html}");
+        assert!(html.contains("upstream 502"), "{html}");
+    }
+
     #[test]
     fn compaction_divider_marks_boundary_when_compacted() {
         let turns = vec![

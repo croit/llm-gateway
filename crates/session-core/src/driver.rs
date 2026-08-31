@@ -10,8 +10,8 @@
 //! `SessionContext` (who/where, plus the cancel flag and broadcast
 //! channel) and the user's prompt; the driver streams output, calls
 //! the persistence callbacks back in `SessionContext`, and returns
-//! `Ok(())` on natural finish/cancel or `Err(TurnError)` on upstream
-//! failure. The cancel flag must be polled between chunks (the
+//! `Ok(TurnOutcome)` on natural finish/cancel or `Err(TurnError)` on
+//! upstream failure. The cancel flag must be polled between chunks (the
 //! contract mirrors what the existing chat worker already does).
 //!
 //! What's deliberately NOT in this trait:
@@ -105,12 +105,35 @@ pub struct SessionContext {
 /// - On every persisted delta (content, reasoning, tool call insert,
 ///   tool call complete), emit one `TurnUpdate::Tick` on
 ///   `ctx.broadcast`.
-/// - Returning `Ok(())` is "natural finish OR cancel"; the harness
-///   re-reads the cancel flag to decide between `Completed` and
-///   `Cancelled`.
+/// - Returning `Ok(TurnOutcome)` is "natural finish OR cancel"; the
+///   harness re-reads the cancel flag to decide between `Completed`
+///   and `Cancelled`.
 /// - Returning `Err(TurnError)` flips the turn to `errored` and
 ///   stamps the message on the row.
 #[async_trait::async_trait]
 pub trait SessionDriver: Send + Sync + 'static {
-    async fn run_turn(&self, ctx: SessionContext) -> Result<(), TurnError>;
+    async fn run_turn(&self, ctx: SessionContext) -> Result<TurnOutcome, TurnError>;
+}
+
+/// How a turn that did NOT fail ended.
+///
+/// Exists for the one case in between "it worked" and "it failed": the turn
+/// produced a real, usable answer *and* something about how it ended has to be
+/// said out loud — today, that the model was cut off at its output-token
+/// ceiling mid-sentence.
+///
+/// Such a turn must not be `Errored`. That status is load-bearing well beyond
+/// the error alert: `message_for_history` refuses to replay a non-completed
+/// assistant turn, so erroring one deletes the partial answer from the model's
+/// own context — and an answer the user can still read, that the model can no
+/// longer see, is worse than either a clean failure or a plain success (asking
+/// it to "continue" makes it start over). Webhook runs turn into 502s with no
+/// output, scheduled runs record as failed, and compaction skips the turn.
+///
+/// So the turn completes, and the notice rides alongside it.
+#[derive(Debug, Default, Clone)]
+pub struct TurnOutcome {
+    /// Shown under the reply and stored on the row. `None` for an ordinary
+    /// finish, which is what [`TurnOutcome::default`] gives you.
+    pub notice: Option<String>,
 }

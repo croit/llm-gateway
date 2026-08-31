@@ -35,6 +35,7 @@ render-code-copy = Копировать код
 render-code-copied = Скопировано
 
 render-thinking-spinner = Думает…
+render-still-working-spinner = Ещё работает…
 render-thinking-finalized = Думал { $secs } с
 render-thinking-in-progress = Думает… ({ $secs } с)
 
