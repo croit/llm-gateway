@@ -33,6 +33,7 @@ render-code-copy = 复制代码
 render-code-copied = 已复制
 
 render-thinking-spinner = 思考中…
+render-still-working-spinner = 仍在处理…
 render-thinking-finalized = 思考了 { $secs } 秒
 render-thinking-in-progress = 思考中…（{ $secs } 秒）
 

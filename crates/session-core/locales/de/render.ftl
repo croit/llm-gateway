@@ -35,6 +35,7 @@ render-code-copy = Code kopieren
 render-code-copied = Kopiert
 
 render-thinking-spinner = Denkt nach…
+render-still-working-spinner = Arbeitet noch…
 render-thinking-finalized = { $secs }s nachgedacht
 render-thinking-in-progress = Denkt nach… ({ $secs }s)
 

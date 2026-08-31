@@ -23,7 +23,7 @@ use std::sync::atomic::Ordering;
 use async_trait::async_trait;
 use rama::futures::StreamExt;
 use session_core::db::{self as chat, ToolCallStatus, Turn, TurnRole, TurnStatus};
-use session_core::driver::{SessionContext, SessionDriver, TurnError};
+use session_core::driver::{SessionContext, SessionDriver, TurnError, TurnOutcome};
 use session_core::workers::TurnUpdate;
 
 use crate::rama_server::state::RamaState;
@@ -44,6 +44,35 @@ const THINK_TAGS: [&str; 2] = ["<think>", "</think>"];
 /// many tool rounds) is never cut — only a truly silent one. Generous enough
 /// to cover queueing + slow time-to-first-token on a loaded backend.
 const UPSTREAM_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Shown under the partial reply when the upstream stopped at its output-token
+/// ceiling: the text already streamed stays on screen, and this says why it
+/// stops where it does.
+///
+/// Rides on a *completed* turn as a `TurnOutcome::notice` rather than erroring
+/// it, so the partial answer is still replayed to the model and "ask it to
+/// continue" actually can. Worth naming the knob — the ceiling is `max_tokens`
+/// in the model's `/admin/models` defaults, so an operator reading this over
+/// the user's shoulder knows exactly what to raise.
+///
+/// English-only, like `loop_guard::LOOP_MESSAGE`: it is written into the turn
+/// row at generation time, where the reader's locale isn't known (the row is
+/// rendered later, possibly by a second viewer of a shared chat, in whatever
+/// language they use). Localising it means storing a key instead of a string,
+/// for every gateway-authored notice at once — worth doing, but not here.
+const TRUNCATED_MESSAGE: &str = "The model reached its maximum output length and stopped mid-reply, so the answer above is \
+     incomplete. Ask it to continue, or have an operator raise this model's `max_tokens`.";
+
+/// Whether a `finish_reason` means "cut off at the token ceiling" rather than
+/// "done". OpenAI and vLLM say `length`; Anthropic-shaped and some
+/// OpenAI-compatible backends say `max_tokens`. Anything else — `stop`,
+/// `tool_calls`, a vendor extension, or nothing at all (plenty of backends
+/// never send one) — is treated as a normal finish: this must never
+/// false-positive, since it turns a good turn into an errored one.
+fn truncated_output(finish_reason: Option<&str>) -> bool {
+    finish_reason
+        .is_some_and(|r| r.eq_ignore_ascii_case("length") || r.eq_ignore_ascii_case("max_tokens"))
+}
 
 /// Pull the safe-to-emit prefix out of `buf`, removing any complete
 /// `<think>`/`</think>` tags and holding back a trailing run that could be the
@@ -100,6 +129,10 @@ fn configure_final_tool_round(body: &mut serde_json::Value) {
 /// So the mechanical signal gets a stated one alongside it. Appended to the
 /// request only — never to the persisted `messages` — so it applies to this
 /// round and leaves no trace in the conversation.
+///
+/// This is the *budget-spent* case only. The same failure with rounds still on
+/// the clock — the model simply stops calling tools after announcing its plan —
+/// is addressed by [`TURN_DISCIPLINE`], which rides in every round.
 fn announce_final_round(body: &mut serde_json::Value) {
     let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;
@@ -272,11 +305,11 @@ pub fn build_tool_context(state: &Arc<RamaState>, facts: TurnFacts) -> ToolConte
 
 #[async_trait]
 impl SessionDriver for OpenAiDriver {
-    async fn run_turn(&self, ctx: SessionContext) -> Result<(), TurnError> {
+    async fn run_turn(&self, ctx: SessionContext) -> Result<TurnOutcome, TurnError> {
         let result = run_one_turn(self, ctx.clone()).await;
         // Free the turn's sandbox container (if any) here, the single choke
         // point that covers every way `run_one_turn` exits — success, error,
-        // and the several early `Ok(())` cancel returns inside it. The
+        // and the several early cancel returns inside it. The
         // `SandboxLease` `Drop` guard + the runner's TTL sweeper are the
         // backstops; this is the prompt, normal path.
         if let Some(lease) = &self.tool_ctx.sandbox_lease {
@@ -459,7 +492,7 @@ async fn classify_and_dispatch_tool_calls(
     Ok((assistant_tool_calls, call_refs, refused))
 }
 
-async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnError> {
+async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutcome, TurnError> {
     // Build the upstream message list from DB. We include every
     // completed turn before the in-progress one. Tool calls aren't
     // included in the prior-history payload — the old client-side
@@ -571,24 +604,28 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
     enrich_current_message_with_ocr(d, &ctx, &mut messages).await;
 
     // Prepend a SINGLE leading system message combining:
+    //   - the standing turn-discipline rule (`TURN_DISCIPLINE`) — the turn ends
+    //     the moment a round comes back without tool calls, so a model that
+    //     announces work and stops leaves the user waiting on nothing; and
     //   - the auto-provided request context (caller's real connection IP, a
     //     coarse IP-based location, timezone) — lets the model answer "what's my
     //     IP / where am I" directly instead of flailing through tools, and
     //     reflects the *true* source IP (correct behind a load balancer); and
     //   - the compaction summary standing in for the folded-out oldest turns.
-    // These must be merged into one message, not inserted as two separate
-    // `system` turns: some backends (e.g. the Qwen3 vLLM chat template) reject a
-    // request with more than one leading system message ("System message must be
-    // at the beginning"). See `leading_system_message`.
+    // These must be merged into one message, not inserted as separate `system`
+    // turns: some backends (e.g. the Qwen3 vLLM chat template) reject a request
+    // with more than one leading system message ("System message must be at the
+    // beginning"). See `leading_system_message`.
     let request_context = build_request_context(d, &user_mcp).await;
     let voice_directive = d.voice_mode.then_some(VOICE_DIRECTIVE);
-    if let Some(system) = leading_system_message(
-        voice_directive,
-        request_context,
-        compaction.as_ref().map(|c| c.summary.as_str()),
-    ) {
-        messages.insert(0, system);
-    }
+    messages.insert(
+        0,
+        leading_system_message(
+            voice_directive,
+            request_context,
+            compaction.as_ref().map(|c| c.summary.as_str()),
+        ),
+    );
 
     // Monotonic zero point of the reasoning phase, set on the first
     // reasoning chunk. Used to compute the single authoritative
@@ -636,7 +673,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
 
     for round in 0..max_rounds {
         if ctx.cancel.load(Ordering::SeqCst) {
-            return Ok(());
+            return Ok(TurnOutcome::default());
         }
 
         // On the final allowed round, withhold tools so the model is forced
@@ -810,6 +847,10 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         let mut content_tag_buf = String::new();
         // Token counts from the trailing `usage` frame (we set include_usage).
         let mut round_tokens: (Option<i64>, Option<i64>, Option<i64>) = (None, None, None);
+        // Why the upstream stopped generating this round. Read from whichever
+        // frame carries it (backends put it on the last delta frame, sometimes
+        // on a choice-less one), so it is captured before the delta guard.
+        let mut finish_reason: Option<String> = None;
         let mut upstream_stream = upstream.bytes_stream();
 
         'chunks: loop {
@@ -840,7 +881,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                 };
             if ctx.cancel.load(Ordering::SeqCst) {
                 drop(acquired);
-                return Ok(());
+                return Ok(TurnOutcome::default());
             }
             let Ok(chunk) = chunk else { break 'chunks };
             byte_buf.extend_from_slice(&chunk);
@@ -860,6 +901,16 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
                     // skips choice-less frames.
                     if let Some(t) = gateway_core::server::sse::usage_tokens(&v) {
                         round_tokens = t;
+                    }
+                    // Grab the terminal reason before the delta guard below
+                    // drops the frame: backends put it on the last delta frame
+                    // of the round, which usually carries an empty `delta` and
+                    // nothing else worth reading.
+                    if let Some(reason) = v
+                        .pointer("/choices/0/finish_reason")
+                        .and_then(|r| r.as_str())
+                    {
+                        finish_reason = Some(reason.to_string());
                     }
                     let delta = match v.pointer("/choices/0/delta") {
                         Some(d) => d,
@@ -1035,12 +1086,39 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         }
 
         if ctx.cancel.load(Ordering::SeqCst) {
-            return Ok(());
+            return Ok(TurnOutcome::default());
+        }
+
+        // The model was cut off mid-generation at its output-token ceiling.
+        // Everything below treats "no more tool calls" as "the model is done",
+        // so without this check a truncation finalizes as an unremarkable turn:
+        // the user gets a reply that stops mid-sentence, wearing a timestamp
+        // and nothing else, and cannot tell it from a finished one. Any tool
+        // call accumulated in the same round is unusable anyway — its argument
+        // JSON was cut off with the rest.
+        //
+        // It ends the turn but does NOT error it: the partial answer is real
+        // output the user can read, and `Errored` would delete it from the
+        // model's own replayed history (`message_for_history` skips any
+        // non-completed assistant turn) — so "ask it to continue", which is
+        // exactly what the notice suggests, would have the model continuing
+        // from a blank. See `TurnOutcome`.
+        if truncated_output(finish_reason.as_deref()) {
+            tracing::warn!(
+                model = %ctx.model,
+                backend = %backend_name,
+                round,
+                completion_tokens = ?round_tokens.1,
+                "upstream stopped at the output-token limit; finalizing the turn as truncated"
+            );
+            return Ok(TurnOutcome {
+                notice: Some(TRUNCATED_MESSAGE.to_string()),
+            });
         }
 
         // End of round. If no tool calls, we're done.
         if tool_acc.is_empty() {
-            return Ok(());
+            return Ok(TurnOutcome::default());
         }
 
         // Tool calls fired. Insert each as 'running' and broadcast,
@@ -1074,7 +1152,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
         )
         .await?;
         if call_refs.is_empty() && refused.is_empty() {
-            return Ok(());
+            return Ok(TurnOutcome::default());
         }
 
         let results = runner::execute_tool_calls(&tool_source, &d.tool_ctx, &call_refs).await;
@@ -1142,7 +1220,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<(), TurnE
             }));
         }
     }
-    Ok(())
+    Ok(TurnOutcome::default())
 }
 
 /// Build the auto-provided request-context system message: the signed-in
@@ -1811,6 +1889,40 @@ fn build_history_messages(
         .collect()
 }
 
+/// The one behavioural rule every turn carries: work happens *inside* the turn
+/// or not at all.
+///
+/// The round loop ends the turn the moment a round comes back without tool
+/// calls ("End of round. If no tool calls, we're done."). A model that writes
+/// its plan and stops — "I'll start the data retrieval now, hang tight!" —
+/// therefore ends the turn having done nothing, and the reply reads exactly
+/// like a finished one: no spinner, a timestamp, a settled bubble. The user
+/// waits on background work that does not exist, eventually asks "are you
+/// still thinking?", and *that* turn does the work while the model explains it
+/// was "processing in the background". It was not; there is no such thing here.
+///
+/// [`announce_final_round`] says this already, but only when the tool budget is
+/// spent — the reported failures happen with most of the budget still unused
+/// (a handful of calls into a 32-round Deep turn). So it is stated standing, in
+/// the single leading system message, for every round of every turn (chat and
+/// scheduled alike; the `/v1` passthrough builds its own request and never sees
+/// it).
+///
+/// Deliberately about the *shape* of a message, not about vocabulary: a
+/// preamble is legitimate when the call follows it, so the rule keys on
+/// "announcement with nothing after it", which holds in any language.
+const TURN_DISCIPLINE: &str = "How a turn works here: everything you do happens before your \
+message ends. There is no background execution and nothing of yours continues afterwards — the \
+moment you emit no further tool call, the turn is over and the user is left holding whatever text \
+you wrote. Work you announced but did not do simply never happens, and the user only finds out by \
+asking you later.\n\
+So never end a message on an announcement. If you write that you are about to fetch, build, \
+compile, gather or write something, the tool call that does it must follow in the same turn. If \
+you cannot finish — too much data, a tool that failed, something only the user can give you — say \
+that plainly instead, and state what you did manage to do. A phrase like \"starting now\", \"hang \
+tight\" or \"I'll do that next\" (in any language) is fine only when the very next thing you emit \
+is the call that does it.";
+
 /// Voice-conversation brevity/format directive. Injected only for voice-mode
 /// turns (see [`OpenAiDriver::voice_mode`]) so the reply is short spoken prose
 /// the TTS can read. Instructs the model to answer in the user's spoken
@@ -1832,9 +1944,13 @@ blocks, no tables, no emoji, and never read out URLs.\n\
 - If a complete answer would genuinely be long or need code or a table, give a one-sentence \
 spoken summary, say the details are on screen, and offer to go deeper only if they ask.";
 
-/// Compose the single leading `system` message from the optional voice
-/// directive, request context, and compaction summary. Returns `None` when all
-/// are absent (so no empty system message is sent).
+/// Compose the single leading `system` message: [`TURN_DISCIPLINE`] plus the
+/// optional voice directive, request context, and compaction summary.
+///
+/// The turn-discipline rule is unconditional, so this always returns a message
+/// — the other three are what vary. It leads because it governs how the turn
+/// may *end*, which the parts after it (formatting, context, summary) all
+/// assume.
 ///
 /// All must live in ONE system message: some backends (notably the Qwen3 vLLM
 /// chat template) reject a request carrying more than one leading system turn
@@ -1844,8 +1960,8 @@ fn leading_system_message(
     voice_directive: Option<&str>,
     request_context: Option<String>,
     summary: Option<&str>,
-) -> Option<serde_json::Value> {
-    let mut parts: Vec<String> = Vec::new();
+) -> serde_json::Value {
+    let mut parts: Vec<String> = vec![TURN_DISCIPLINE.to_string()];
     if let Some(directive) = voice_directive {
         parts.push(directive.to_string());
     }
@@ -1859,13 +1975,10 @@ fn leading_system_message(
              seamlessly):\n\n{summary}"
         ));
     }
-    if parts.is_empty() {
-        return None;
-    }
-    Some(serde_json::json!({
+    serde_json::json!({
         "role": "system",
         "content": parts.join("\n\n---\n\n"),
-    }))
+    })
 }
 
 fn message_for_history(turn: &Turn) -> Option<serde_json::Value> {
@@ -2036,6 +2149,7 @@ mod tests {
         THINK_TAGS, ToolCallAcc, ToolCallStatus, announce_final_round, configure_final_tool_round,
         ensure_unique_tool_call_ids, inject_ocr_blocks, message_for_history, ocr_activity_result,
         ocr_context_block, render_active_skills, render_skill_listing, take_safe_content,
+        truncated_output,
     };
     use gateway_features::server::ocr::{OcrError, OcrOutcome};
     use gateway_features::server::skills::{Skill, SkillRegistry};
@@ -2214,6 +2328,24 @@ mod tests {
         assert!(note.contains("do not claim any file"), "{note}");
     }
 
+    /// The truncation guard keys on the two spellings backends actually use,
+    /// and on nothing else — a false positive turns a healthy turn into an
+    /// error alert, and plenty of backends send no `finish_reason` at all.
+    #[test]
+    fn only_a_token_ceiling_counts_as_truncated_output() {
+        assert!(truncated_output(Some("length")));
+        assert!(truncated_output(Some("max_tokens")));
+        assert!(truncated_output(Some("LENGTH")), "case-insensitive");
+        assert!(!truncated_output(Some("stop")));
+        assert!(!truncated_output(Some("tool_calls")));
+        assert!(!truncated_output(Some("content_filter")));
+        assert!(!truncated_output(Some("")));
+        assert!(
+            !truncated_output(None),
+            "absent must read as a normal finish"
+        );
+    }
+
     #[test]
     fn announcing_a_final_round_on_a_bodyless_request_is_a_no_op() {
         // Defensive: a request shape without `messages` must not panic.
@@ -2257,6 +2389,45 @@ mod tests {
         // The surrounding prose is still the model's own turn.
         assert!(content.contains("Above is the bundle:"), "{content}");
         assert!(content.contains("Unzip it"), "{content}");
+    }
+
+    /// The invariant the truncation guard's status choice rests on: history
+    /// replay drops any assistant turn that is not `Completed`, however much
+    /// content it holds. That is why a reply cut off at the token ceiling
+    /// finishes as a completed turn carrying a notice rather than an errored
+    /// one — erroring it would leave the user reading an answer the model can
+    /// no longer see, and "continue" would restart from nothing.
+    #[test]
+    fn only_a_completed_assistant_turn_is_replayed_to_the_model() {
+        let mut turn = Turn {
+            id: "a1".into(),
+            session_id: "s1".into(),
+            seq: 1,
+            role: TurnRole::Assistant,
+            user_content: None,
+            model: None,
+            content: Some("Here is the plan: first I will".into()),
+            reasoning: None,
+            reasoning_elapsed_ms: None,
+            reasoning_started_at: None,
+            status: TurnStatus::Completed,
+            error_message: Some("cut off at the ceiling".into()),
+            created_at: jiff::Timestamp::UNIX_EPOCH,
+            completed_at: None,
+        };
+        // Completed + a notice: replayed, notice not leaked into the model's
+        // own words (it is the gateway talking, not the assistant).
+        let msg = message_for_history(&turn).expect("a completed turn replays");
+        let content = msg["content"].as_str().unwrap();
+        assert_eq!(content, "Here is the plan: first I will");
+
+        // Errored: dropped entirely, content and all.
+        turn.status = TurnStatus::Errored;
+        assert!(
+            message_for_history(&turn).is_none(),
+            "a non-completed assistant turn is not replayed — which is exactly \
+             what a truncated turn must not be"
+        );
     }
 
     #[test]
@@ -2500,25 +2671,58 @@ mod tests {
         /// system message (backends reject multiple leading system turns).
         #[test]
         fn system_message_merges_context_and_summary() {
-            let m = leading_system_message(None, Some("CONTEXT".into()), Some("SUMMARY"))
-                .expect("some");
+            let m = leading_system_message(None, Some("CONTEXT".into()), Some("SUMMARY"));
             assert_eq!(m["role"], "system");
             let content = m["content"].as_str().unwrap();
             assert!(content.contains("CONTEXT"));
             assert!(content.contains("SUMMARY"));
         }
 
-        /// Each part is optional; absent all three → no system message at all.
+        /// The three context parts are each optional and merge in when present.
         #[test]
         fn system_message_optional_parts() {
-            assert!(leading_system_message(None, None, None).is_none());
-            let only_ctx = leading_system_message(None, Some("C".into()), None).unwrap();
+            let only_ctx = leading_system_message(None, Some("C".into()), None);
             assert!(only_ctx["content"].as_str().unwrap().contains('C'));
-            let only_sum = leading_system_message(None, None, Some("S")).unwrap();
+            let only_sum = leading_system_message(None, None, Some("S"));
             assert!(only_sum["content"].as_str().unwrap().contains('S'));
-            // Voice directive alone still yields a system message.
-            let only_voice = leading_system_message(Some("VOICE"), None, None).unwrap();
+            let only_voice = leading_system_message(Some("VOICE"), None, None);
             assert!(only_voice["content"].as_str().unwrap().contains("VOICE"));
+        }
+
+        /// EVERY turn carries the rule that work happens inside the turn or not
+        /// at all — including the bare case with no identity, no skills, no
+        /// compaction, which used to produce no system message whatsoever.
+        ///
+        /// The bug: the loop ends a turn as soon as a round returns no tool
+        /// calls, so a model that writes "I'm starting the data retrieval now,
+        /// hang tight!" and stops ends a turn having done nothing — and the
+        /// bubble reads as finished. `announce_final_round` said as much, but
+        /// only once the tool budget was spent; the real failures happen with
+        /// most of the budget still unused.
+        #[test]
+        fn every_turn_carries_the_no_background_work_rule() {
+            let bare = leading_system_message(None, None, None);
+            assert_eq!(bare["role"], "system");
+            let content = bare["content"].as_str().expect("string content");
+            assert!(
+                content.contains("no background execution"),
+                "the model must be told nothing of its own runs on after the \
+                 message ends: {content}"
+            );
+            assert!(
+                content.contains("never end a message on an announcement"),
+                "…and that announcing work is only allowed when the call \
+                 follows it in the same turn: {content}"
+            );
+            // It leads: the parts after it assume the turn can't be continued
+            // later, and a rule buried under a page of context is a rule the
+            // model weighs against everything above it.
+            let with_all = leading_system_message(Some("VOICE"), Some("CONTEXT".into()), Some("S"));
+            let all = with_all["content"].as_str().unwrap();
+            assert!(
+                all.starts_with("How a turn works here:"),
+                "turn discipline must lead the system message: {all}"
+            );
         }
 
         /// A hand-edited document has to reach the model as an explicit

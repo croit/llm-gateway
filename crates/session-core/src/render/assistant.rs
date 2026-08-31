@@ -103,8 +103,42 @@ pub(crate) fn assemble_assistant_turn(
     let dom_id = format!("turn-{}", turn.id);
     let in_progress = turn.status == TurnStatus::InProgress;
     let errored = turn.status == TurnStatus::Errored;
-    let error_msg = turn.error_message.clone().unwrap_or_default();
-    let show_spinner = in_progress && turn.content.as_deref().unwrap_or_default().is_empty();
+    // `error_message` is the row's terminal notice, not strictly a failure: a
+    // turn that produced a real answer can still carry one (a reply cut off at
+    // the model's token ceiling completes, with the notice saying so — see
+    // `driver::TurnOutcome`). The row's status is what tells the two apart, so
+    // the banner is gated on the message being there and only *styled* by the
+    // status. Gating it on `errored` instead is how a notice on a completed
+    // turn would be written to the DB and then never shown to anyone.
+    let notice = turn.error_message.clone().unwrap_or_default();
+    let show_notice = !notice.is_empty();
+    let notice_class = if errored {
+        "alert alert-error mt-2"
+    } else {
+        "alert alert-warning mt-2"
+    };
+    // Live-activity footer. It runs for the WHOLE of an in-progress turn, not
+    // just the silent head of it.
+    //
+    // It used to stop at the first content delta, on the theory that streaming
+    // text is its own progress indicator. It isn't: a turn keeps going after
+    // the model pauses to call a tool, and in that gap the bubble held finished
+    // text, a timestamp and nothing else — indistinguishable from a settled
+    // reply. The running tool rows *are* rendered, but above the prose, i.e.
+    // off-screen for anyone pinned to the bottom of a long reply, which is
+    // everyone watching one stream in. That left the composer's Stop button as
+    // the only thing on screen saying "still live", which is not where anyone
+    // looks to see whether an answer is finished.
+    //
+    // The label distinguishes the two phases: nothing written yet is
+    // "Thinking…", anything after that is "still working" — a spinner labelled
+    // "Thinking…" under a finished paragraph reads like a stuck element.
+    let has_content = !turn.content.as_deref().unwrap_or_default().is_empty();
+    let activity_label = if has_content {
+        "render-still-working-spinner"
+    } else {
+        "render-thinking-spinner"
+    };
     html! {
         div(id: (dom_id), class: "chat-msg--assistant") {
             (thinking)
@@ -120,23 +154,28 @@ pub(crate) fn assemble_assistant_turn(
             div(id: (format!("turn-{}-text", turn.id)), class: "chat-prose") {
                 (text_children)
             }
-            // "Thinking…" spinner. Visible only when the turn is
-            // in-progress AND no content has landed yet — CSS
-            // handles the toggle so we don't need to render
-            // conditionally on each tick.
-            if show_spinner {
+            // Live-activity footer, under the text where the reader's eye
+            // already is. Present for as long as the turn is in progress; the
+            // settled render drops it.
+            if in_progress {
                 div(class: "thinking flex items-center gap-2 text-base-content/60 text-sm") {
                     (icons::spinner(16))
-                    span { (t(lang, "render-thinking-spinner")) }
+                    span { (t(lang, activity_label)) }
                 }
             }
-            if errored {
-                div(class: "alert alert-error mt-2") {
+            if show_notice {
+                div(class: (notice_class)) {
                     (icons::alert(16))
-                    span { (error_msg) }
+                    span { (notice) }
                 }
             }
-            (render_msg_time(turn.created_at))
+            // Timestamp only once the turn has settled. A time under a live
+            // bubble is the other half of "this looks finished" — it is the
+            // mark every completed message carries, so printing it mid-stream
+            // makes a running turn indistinguishable from a done one.
+            if !in_progress {
+                (render_msg_time(turn.created_at))
+            }
             // Retry — only on a settled turn (never mid-stream). Drops
             // this reply + everything below and regenerates from the
             // preceding user message with the currently-selected model.
