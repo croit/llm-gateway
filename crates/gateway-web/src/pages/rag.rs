@@ -2164,6 +2164,7 @@ fn render_edit_form(
         Some(rag_source::ConsentState {
             collection_id: c.id,
             connected: rag_source::has_refresh_token(&c.source, crypto),
+            account: c.connected_account.as_deref(),
         }),
     );
     let source_signals = rag_source::source_signals(&c.source.kind);
@@ -2555,6 +2556,9 @@ mod tests {
             profile_id: None,
             extraction_model: None,
             sync_hook_set: false,
+            connected_account: None,
+            connected_by: None,
+            connected_at: None,
             embedding_model: "embed".into(),
             include_globs: vec!["**/*".into()],
             exclude_globs: vec![],

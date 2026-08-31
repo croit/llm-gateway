@@ -267,6 +267,38 @@ pub async fn rag_oauth_callback(
         return internal_error_html(&user.email, &t(lang, "rag-oauth-store-failed"));
     }
 
+    // Record whose access this corpus is now read through. Asking the
+    // provider rather than trusting the session: the person who clicked
+    // Connect and the Google account they picked on the consent screen are
+    // not necessarily the same, and it is the latter that decides what the
+    // index can see.
+    let account = match state.provider_registry().build(
+        &collection.source.kind,
+        &gateway_features::server::rag::source::ProviderConfig::new(
+            collection.source.config.clone(),
+            secrets.clone(),
+        ),
+        state.http.clone(),
+    ) {
+        Ok(provider) => provider.probe().await.ok().and_then(|r| r.account),
+        Err(err) => {
+            // Not fatal: the token is stored and the corpus will index. We
+            // just cannot name the account yet.
+            tracing::warn!(error = %err, "rag oauth: naming the connected account");
+            None
+        }
+    };
+    if let Err(err) = rag_db::set_connected_account(
+        &state.db,
+        pending.collection_id,
+        account.as_deref(),
+        &user.email,
+    )
+    .await
+    {
+        tracing::warn!(error = %err, "rag oauth: recording the connected account");
+    }
+
     // The corpus could not be read before this moment, so whatever is indexed
     // was built without the source. Queue a build rather than leave a
     // connected collection sitting idle until someone notices.
@@ -283,6 +315,7 @@ pub async fn rag_oauth_callback(
         kind = %pending.source_kind,
         started_by = %pending.admin_user_id,
         completed_by = %user.email,
+        account = ?account,
         "rag oauth: source connected"
     );
     see_other("/rag")

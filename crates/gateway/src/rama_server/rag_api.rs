@@ -92,6 +92,10 @@ struct CreateRequest {
     name: String,
     #[serde(default)]
     description: Option<String>,
+    /// Only meaningful for `source_kind: "git"`, and only required there —
+    /// a Drive or WebDAV collection has no git URL, and demanding one made
+    /// every non-git caller send `"git_url": ""` to get past the parser.
+    #[serde(default)]
     git_url: String,
     #[serde(default = "default_ref")]
     git_ref: String,
@@ -584,17 +588,27 @@ pub async fn update_collection(
         sets.push("exclude_globs_json = ?");
         bindings.push(UpdateBinding::Str(s));
     }
+    // Validated as a *pair*, against whatever the other half will be after
+    // this edit. Checking each field alone let either one be moved past the
+    // other: the chunker clamps the overlap so nothing breaks, but the stored
+    // numbers then disagree with the ones actually used, and the web form —
+    // which does check the pair — refuses to save the collection at all,
+    // leaving it uneditable in the UI.
+    let effective_size = body.chunk_size.unwrap_or(before.chunk_size);
+    let effective_overlap = body.chunk_overlap.unwrap_or(before.chunk_overlap);
+    if body.chunk_size.is_some() && (effective_size <= 0 || effective_size > 8000) {
+        return invalid_request("`chunk_size` must be in (0, 8000]");
+    }
+    if (body.chunk_size.is_some() || body.chunk_overlap.is_some())
+        && (effective_overlap < 0 || effective_overlap >= effective_size)
+    {
+        return invalid_request("`chunk_overlap` must satisfy 0 <= overlap < chunk_size");
+    }
     if let Some(cs) = body.chunk_size {
-        if cs <= 0 || cs > 8000 {
-            return invalid_request("`chunk_size` must be in (0, 8000]");
-        }
         sets.push("chunk_size = ?");
         bindings.push(UpdateBinding::Int(cs));
     }
     if let Some(co) = body.chunk_overlap {
-        if co < 0 {
-            return invalid_request("`chunk_overlap` must be >= 0");
-        }
         sets.push("chunk_overlap = ?");
         bindings.push(UpdateBinding::Int(co));
     }

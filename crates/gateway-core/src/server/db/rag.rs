@@ -155,6 +155,13 @@ pub struct Collection {
     /// Whether this collection has a sync-trigger hook. The token itself is
     /// never read back — only whether one is set.
     pub sync_hook_set: bool,
+    /// For an OAuth source: the account the corpus is read as, who granted
+    /// that access, and when. Everyone who can search the collection sees
+    /// what this account can see, so it is recorded rather than left to a
+    /// "Test connection" toast. `None` for a source with typed credentials.
+    pub connected_account: Option<String>,
+    pub connected_by: Option<String>,
+    pub connected_at: Option<String>,
     pub embedding_model: String,
     pub include_globs: Vec<String>,
     pub exclude_globs: Vec<String>,
@@ -262,6 +269,9 @@ fn map_collection_row(row: &SqliteRow) -> Result<Collection, DbError> {
         sync_hook_set: row
             .try_get::<Option<String>, _>("sync_token_hash")?
             .is_some(),
+        connected_account: row.try_get("connected_account")?,
+        connected_by: row.try_get("connected_by")?,
+        connected_at: row.try_get("connected_at")?,
         profile_id: row.try_get("profile_id")?,
         extraction_model: row.try_get("extraction_model")?,
         embedding_model: row.try_get("embedding_model")?,
@@ -290,6 +300,7 @@ const COLLECTION_COLUMNS: &str = "id, data_uuid, name, description, git_url, git
      source_kind, source_config_json, source_secrets_ct, source_secrets_nonce, \
      profile_id, extraction_model, sync_token_hash, embedding_model, include_globs_json, exclude_globs_json, chunk_size, chunk_overlap, \
      search_mode, status, allowed_groups, last_indexed_at, last_indexed_commit, last_error, \
+     connected_account, connected_by, connected_at, \
      created_at, updated_at";
 
 pub async fn create_collection(pool: &Pool, new: &NewCollection) -> Result<Collection, DbError> {
@@ -485,6 +496,31 @@ impl SourceSpec {
             .and_then(|plain| serde_json::from_str::<BTreeMap<String, String>>(&plain).ok())
             .unwrap_or_default()
     }
+}
+
+/// Record which account an OAuth source was connected as.
+///
+/// Written by the consent callback alongside the refresh token, so the two
+/// cannot disagree about whose access the corpus is indexed with.
+pub async fn set_connected_account(
+    pool: &Pool,
+    id: i64,
+    account: Option<&str>,
+    by: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE rag_collections
+         SET connected_account = ?, connected_by = ?, connected_at = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(account)
+    .bind(by)
+    .bind(Timestamp::now().to_string())
+    .bind(Timestamp::now().to_string())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Replace a collection's sealed source secrets.
@@ -2576,6 +2612,37 @@ mod tests {
         let rref = add_ref(&pool, c.id, "main", None, true).await.unwrap();
         assert!(!rref.is_searchable());
         assert!(rref.needs_full_rebuild());
+    }
+
+    /// Whose access a shared corpus is read through must be recorded, not
+    /// inferred.
+    ///
+    /// With `allowed_groups` as the only access control, "everyone who can
+    /// search this collection sees what that account sees" is the fact with
+    /// the security consequence — and it used to live in a doc comment and a
+    /// transient "Test connection" toast.
+    #[tokio::test]
+    async fn the_connected_account_is_recorded_and_read_back() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        assert_eq!(c.connected_account, None, "nothing connected yet");
+
+        set_connected_account(&pool, c.id, Some("svc@example.com"), "alice@example.com")
+            .await
+            .unwrap();
+        let after = find_collection_by_id(&pool, c.id).await.unwrap().unwrap();
+        assert_eq!(after.connected_account.as_deref(), Some("svc@example.com"));
+        assert_eq!(after.connected_by.as_deref(), Some("alice@example.com"));
+        assert!(after.connected_at.is_some());
+
+        // A provider that cannot name the account still records who granted
+        // it — a partial answer beats none.
+        set_connected_account(&pool, c.id, None, "bob@example.com")
+            .await
+            .unwrap();
+        let after = find_collection_by_id(&pool, c.id).await.unwrap().unwrap();
+        assert_eq!(after.connected_account, None);
+        assert_eq!(after.connected_by.as_deref(), Some("bob@example.com"));
     }
 
     #[tokio::test]

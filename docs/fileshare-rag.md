@@ -196,8 +196,15 @@ connecting would deadlock against each other.
 
 The consent is per *collection*, not per user — a corpus is shared and the
 background worker has no session to borrow. **Everyone who can search the
-collection sees what the connected account can see**, which is why the form
-says so next to the button.
+collection sees what the connected account can see.** With `allowed_groups`
+as the only access control, that is the fact with a security consequence, so
+it is recorded rather than inferred: the callback asks the provider who it
+just authenticated as and stores `connected_account` / `connected_by` /
+`connected_at` on the collection, and the form shows the account beside the
+Connect button. Asking the provider rather than trusting the session is
+deliberate — the person who clicked Connect and the Google account they
+picked on the consent screen need not be the same, and it is the latter that
+decides what the index can see.
 
 **Google-native documents have no bytes.** A Doc, Sheet or Slide cannot be
 downloaded; it must be *exported*, and the target format decides how much
@@ -599,6 +606,16 @@ credential back. A provider that *does* rotate on every redemption —
 Microsoft Graph — would need a write-back path from the provider to the
 sealed source secrets, which does not exist yet. That is the thing to build
 before adding OneDrive, not after.
+
+**No refresh-token write-back.** Repeated here because it is the next thing
+to build, not a footnote: Google's refresh tokens are long-lived and do not
+rotate, so the Drive provider refreshes in memory and never writes a
+credential back. Microsoft Graph rotates on every redemption and would
+re-auth-fail after the first restart. The shape to copy already exists —
+`McpConnectionManager::refresh` (`gateway-runtime/.../mcp/manager.rs`)
+reseals and stores — but a provider built by `ProviderFactory::build` has no
+channel back to the sealed source secrets. Settle that before starting
+OneDrive, not after.
 
 **Shared-drive coverage is untested.** The listing passes
 `supportsAllDrives` and `includeItemsFromAllDrives`, so a shared drive's

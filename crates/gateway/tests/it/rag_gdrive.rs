@@ -364,7 +364,6 @@ async fn the_api_can_create_a_drive_collection_before_consent() {
     let body = r#"{
         "name": "drive-api",
         "embedding_model": "embed",
-        "git_url": "",
         "source_kind": "gdrive",
         "source_config": {
             "client_id": "cid.apps.googleusercontent.com",
@@ -524,4 +523,46 @@ async fn the_providers_endpoint_says_which_sources_need_consent() {
         webdav["auth"]["kind"], "fields",
         "a typed-credential source is not confused for a consent one"
     );
+}
+
+/// A non-git source must not have to send a git URL.
+///
+/// `git_url` was a required JSON field even though it is only validated for
+/// `source_kind: "git"`, so every Drive or WebDAV caller had to send
+/// `"git_url": ""` to get past the parser.
+#[tokio::test]
+async fn a_remote_collection_needs_no_git_url() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_user(&state, "alice", vec!["admin".into()]).await;
+    let app = common::app(state);
+
+    let body = r#"{
+        "name": "no-git-url",
+        "embedding_model": "embed",
+        "source_kind": "gdrive",
+        "source_config": { "client_id": "cid", "client_secret": "sec" }
+    }"#;
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/api/v0/rag/collections",
+            &cookie,
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // A git collection still has to name a repository.
+    let body = r#"{ "name": "needs-url", "embedding_model": "embed" }"#;
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/api/v0/rag/collections",
+            &cookie,
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

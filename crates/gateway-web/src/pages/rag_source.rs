@@ -129,7 +129,7 @@ pub fn provider_fields(
     lang: Lang,
     registry: &ProviderRegistry,
     existing: Option<&rag_db::SourceSpec>,
-    consent: Option<ConsentState>,
+    consent: Option<ConsentState<'_>>,
 ) -> Html {
     let blocks: Vec<(String, Vec<FieldView>, Html)> = registry
         .factories()
@@ -169,10 +169,12 @@ pub fn provider_fields(
 /// `None` on the create form: there is no collection to hang a consent on
 /// yet, which is itself the thing the operator needs told.
 #[derive(Debug, Clone, Copy)]
-pub struct ConsentState {
+pub struct ConsentState<'a> {
     pub collection_id: i64,
     /// Whether a refresh token is already stored for this source.
     pub connected: bool,
+    /// The account the corpus is read as, when one is recorded.
+    pub account: Option<&'a str>,
 }
 
 /// The connect / reconnect control for a provider that needs browser consent.
@@ -182,7 +184,7 @@ pub struct ConsentState {
 fn consent_block(
     lang: Lang,
     factory: &dyn source::ProviderFactory,
-    consent: Option<ConsentState>,
+    consent: Option<ConsentState<'_>>,
 ) -> Html {
     if !matches!(factory.auth(), source::AuthKind::OAuth2 { .. }) {
         return html! {}.to_html();
@@ -215,13 +217,24 @@ fn consent_block(
     } else {
         t(lang, "rag-source-consent-connect")
     };
+    // Naming the account is the point: everyone who can search this
+    // collection reads through it, so leaving it to a "Test connection"
+    // toast made the one fact with a security consequence the hardest to
+    // find.
+    let account = state.account.unwrap_or_default().to_string();
+    let has_account = !account.is_empty();
     html! {
-        div(class: "md:col-span-2 flex flex-wrap items-center gap-3") {
-            span(class: (badge_class)) { (badge) }
-            // A plain link, not a form post: the browser has to leave for the
-            // provider's consent screen, and this page is otherwise driven by
-            // datastar over SSE, which cannot navigate away.
-            a(href: (href), class: "btn btn-sm btn-primary") { (action) }
+        div(class: "md:col-span-2 flex flex-col gap-1") {
+            div(class: "flex flex-wrap items-center gap-3") {
+                span(class: (badge_class)) { (badge) }
+                // A plain link, not a form post: the browser has to leave for
+                // the provider's consent screen, and this page is otherwise
+                // driven by datastar over SSE, which cannot navigate away.
+                a(href: (href), class: "btn btn-sm btn-primary") { (action) }
+                if has_account {
+                    span(class: "text-xs font-mono opacity-80") { (account) }
+                }
+            }
             span(class: "text-xs opacity-70") { (t(lang, "rag-source-consent-help")) }
         }
     }
