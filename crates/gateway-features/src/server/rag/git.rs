@@ -310,15 +310,28 @@ mod tests {
         assert!(ssh_to_https("./relative:thing").is_none());
     }
 
+    /// A `git` invocation with the inherited git context scrubbed, matching
+    /// what [`run`] does. Without this these fixtures build their "repo"
+    /// inside whichever repository invoked a hook (see
+    /// [`INHERITED_GIT_VARS`]), so the suite passes from a shell and fails
+    /// from `pre-push`.
+    fn git_cmd(cwd: &std::path::Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new("git");
+        cmd.current_dir(cwd);
+        for var in INHERITED_GIT_VARS {
+            cmd.env_remove(var);
+        }
+        cmd
+    }
+
     /// Build a tiny git repo to use as a clone source. Returns the path.
     /// Skips itself if `git` isn't on PATH (CI without git → test ignored
     /// rather than failed).
     async fn fixture_repo() -> Option<tempfile::TempDir> {
         let dir = tempdir().unwrap();
         let path = dir.path();
-        let init = std::process::Command::new("git")
+        let init = git_cmd(path)
             .args(["init", "-q", "-b", "main", "."])
-            .current_dir(path)
             .output();
         let Ok(init) = init else { return None };
         if !init.status.success() {
@@ -331,23 +344,14 @@ mod tests {
             ["config", "commit.gpgsign", "false"],
         ];
         for args in cfgs {
-            let s = std::process::Command::new("git")
-                .args(args)
-                .current_dir(path)
-                .status()
-                .unwrap();
+            let s = git_cmd(path).args(args).status().unwrap();
             assert!(s.success(), "git {args:?} failed");
         }
         fs::write(path.join("README.md"), b"hello\n").unwrap();
-        let add = std::process::Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(path)
-            .status()
-            .unwrap();
+        let add = git_cmd(path).args(["add", "README.md"]).status().unwrap();
         assert!(add.success());
-        let commit = std::process::Command::new("git")
+        let commit = git_cmd(path)
             .args(["commit", "-q", "-m", "init"])
-            .current_dir(path)
             .status()
             .unwrap();
         assert!(commit.success());
@@ -371,13 +375,9 @@ mod tests {
         // Add a second commit upstream, then re-pull — sha should change
         // and the new file should show up.
         fs::write(src.path().join("more.txt"), b"more\n").unwrap();
-        let _ = std::process::Command::new("git")
-            .args(["add", "more.txt"])
-            .current_dir(src.path())
-            .status();
-        let _ = std::process::Command::new("git")
+        let _ = git_cmd(src.path()).args(["add", "more.txt"]).status();
+        let _ = git_cmd(src.path())
             .args(["commit", "-q", "-m", "second"])
-            .current_dir(src.path())
             .status();
         let sha2 = clone_or_update(&url, "main", None, &target).await.unwrap();
         assert_ne!(sha, sha2);
