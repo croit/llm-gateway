@@ -189,6 +189,7 @@ async fn indexer_clones_chunks_embeds_then_search_returns_right_chunk() {
             data_dir: data_dir.path().to_path_buf(),
             ..IndexerConfig::default()
         },
+        None,
     );
 
     let collection = rag_db::create_collection(
@@ -199,6 +200,9 @@ async fn indexer_clones_chunks_embeds_then_search_returns_right_chunk() {
             git_url: repo.path().to_string_lossy().to_string(),
             git_ref: "main".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: "embed-test".into(),
             include_globs: vec!["*.txt".into()],
             exclude_globs: Vec::new(),
@@ -290,6 +294,7 @@ async fn reindex_after_edit_drops_old_chunks_and_picks_up_new_content() {
             data_dir: data_dir.path().to_path_buf(),
             ..IndexerConfig::default()
         },
+        None,
     );
 
     let collection = rag_db::create_collection(
@@ -300,6 +305,9 @@ async fn reindex_after_edit_drops_old_chunks_and_picks_up_new_content() {
             git_url: repo.path().to_string_lossy().to_string(),
             git_ref: "main".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: "embed-test".into(),
             include_globs: vec!["*.txt".into()],
             exclude_globs: Vec::new(),
@@ -437,6 +445,7 @@ async fn aggregate_folds_every_source_when_clones_run_in_parallel() {
             clone_concurrency: 3,
             ..IndexerConfig::default()
         },
+        None,
     );
 
     // Aggregate collection carries no single repo URL — each source brings its
@@ -449,6 +458,9 @@ async fn aggregate_folds_every_source_when_clones_run_in_parallel() {
             git_url: String::new(),
             git_ref: "main".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: "embed-test".into(),
             include_globs: vec!["*.txt".into()],
             exclude_globs: Vec::new(),

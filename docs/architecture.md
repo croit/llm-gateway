@@ -4,6 +4,10 @@
 
 The gateway is a single Rust binary built on **rama 0.3**, which is a proxy-native HTTP framework. The same process serves the OpenAI-compatible API (`/v1/*`), the OIDC browser flow (`/auth/*`), the session-authed JSON admin API (`/api/v0/*`), and a server-rendered HTML UI (`/`, `/login`, `/tokens`, `/chat`). HTML templates use the **plait** macro inline in handlers; client-side reactivity is **datastar** (self-hosted, ~34 KB JS) — chat replies stream over SSE and token CRUD uses the same SSE-patch pattern for surgical updates; styling is **daisyUI v5 + Tailwind v4** with a shadcn-flavoured neutral palette.
 
+> Indexing an external file share (Nextcloud / WebDAV / …) into RAG is its
+> own subsystem with its own extension point — see
+> [`fileshare-rag.md`](fileshare-rag.md).
+
 ## Diagram
 
 ```

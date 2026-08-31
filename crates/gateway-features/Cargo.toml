@@ -52,6 +52,13 @@ pdfium-render = { workspace = true }
 image = { workspace = true }
 # Rama wire types the subsystems hand back (bodies, header maps).
 rama = { workspace = true }
+# Object-safe async traits. Needed for `Arc<dyn FileProvider>`: the RAG
+# indexer dispatches over pluggable remote file sources (WebDAV today,
+# OneDrive/Dropbox later) and tests swap in an in-memory fake, exactly as
+# `sandbox-runner` does for `dyn ContainerBackend`.
+async-trait = { workspace = true }
+# PROPFIND multistatus parsing for the WebDAV source provider.
+quick-xml = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }

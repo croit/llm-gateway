@@ -247,6 +247,246 @@ async fn full_create_get_list_update_reindex_delete_round_trip() {
 }
 
 #[tokio::test]
+async fn providers_endpoint_describes_each_source_and_its_fields() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "alice").await;
+    let app = common::app(state);
+
+    let resp = app
+        .serve(req_with_cookie(
+            Method::GET,
+            "/api/v0/rag/providers",
+            &cookie,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let parsed: Value = serde_json::from_slice(&common::read_body(resp).await).unwrap();
+    let kinds: Vec<&str> = parsed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"git"));
+    assert!(kinds.contains(&"webdav"));
+
+    // A client with no compiled-in knowledge of the provider can build a
+    // form from this: which fields exist, which are required, which are
+    // secret. That is what makes the API extensible rather than just the UI.
+    let dav = parsed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["kind"] == "webdav")
+        .expect("webdav is described");
+    let fields = dav["fields"].as_array().unwrap();
+    let password = fields
+        .iter()
+        .find(|f| f["key"] == "password")
+        .expect("the credential field is described");
+    assert_eq!(password["secret"], true);
+    assert_eq!(password["required"], true);
+    let base_url = fields.iter().find(|f| f["key"] == "base_url").unwrap();
+    assert_eq!(base_url["secret"], false);
+}
+
+#[tokio::test]
+async fn creating_a_remote_source_seals_its_secret_and_needs_no_git_url() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "alice").await;
+    let db = state.db.clone();
+    let app = common::app(state);
+
+    let body = r#"{
+        "name": "docs",
+        "git_url": "",
+        "embedding_model": "embed-1",
+        "source_kind": "webdav",
+        "source_config": {
+            "base_url": "https://cloud.example.com",
+            "username": "svc",
+            "password": "app-pw",
+            "root": "Finance"
+        }
+    }"#;
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/api/v0/rag/collections",
+            &cookie,
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created: Value = serde_json::from_slice(&common::read_body(resp).await).unwrap();
+    assert_eq!(created["source_kind"], "webdav");
+    assert_eq!(created["source_config"]["root"], "Finance");
+    assert_eq!(created["source_secrets_set"], true);
+    assert!(
+        created["source_config"].get("password").is_none(),
+        "a secret must never come back in the config map: {created}"
+    );
+    assert!(
+        !serde_json::to_string(&created).unwrap().contains("app-pw"),
+        "the plaintext credential must never be serialised to a client"
+    );
+
+    // And it really is sealed on disk, not merely hidden from the view.
+    let id = created["id"].as_i64().unwrap();
+    let stored = gateway_core::server::db::rag::find_collection_by_id(&db, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.source.secrets.is_some());
+    assert!(!stored.source.config.contains_key("password"));
+}
+
+#[tokio::test]
+async fn creating_a_remote_source_with_a_bad_setting_is_a_400_not_a_broken_collection() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "alice").await;
+    let app = common::app(state);
+
+    // No password: the provider declares it required.
+    let body = r#"{
+        "name": "docs",
+        "git_url": "",
+        "embedding_model": "embed-1",
+        "source_kind": "webdav",
+        "source_config": {"base_url": "https://cloud.example.com", "username": "svc"}
+    }"#;
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/api/v0/rag/collections",
+            &cookie,
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let parsed: Value = serde_json::from_slice(&common::read_body(resp).await).unwrap();
+    let msg = parsed.to_string().to_lowercase();
+    assert!(
+        msg.contains("password"),
+        "the caller is told which field: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_source_kind_lists_the_known_ones() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "alice").await;
+    let app = common::app(state);
+
+    let body = r#"{
+        "name": "docs",
+        "git_url": "",
+        "embedding_model": "embed-1",
+        "source_kind": "dropbox",
+        "source_config": {}
+    }"#;
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/api/v0/rag/collections",
+            &cookie,
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let parsed: Value = serde_json::from_slice(&common::read_body(resp).await).unwrap();
+    let msg = parsed.to_string();
+    assert!(msg.contains("git") && msg.contains("webdav"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_source_config_without_its_kind_is_rejected() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "alice").await;
+    let app = common::app(state);
+
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/api/v0/rag/collections",
+            &cookie,
+            Some(create_body()),
+        ))
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&common::read_body(resp).await).unwrap();
+    let id = created["id"].as_i64().unwrap();
+
+    // A settings map means nothing without the kind whose schema defines it,
+    // so accepting one alone would silently apply it to the wrong provider.
+    let resp = app
+        .serve(req_with_cookie(
+            Method::PATCH,
+            &format!("/api/v0/rag/collections/{id}"),
+            &cookie,
+            Some(r#"{"source_config": {"base_url": "https://cloud.example.com"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn patching_a_git_collection_onto_a_remote_source_replaces_it() {
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let cookie = seed_admin(&state, "alice").await;
+    let db = state.db.clone();
+    let app = common::app(state);
+
+    let resp = app
+        .serve(req_with_cookie(
+            Method::POST,
+            "/api/v0/rag/collections",
+            &cookie,
+            Some(create_body()),
+        ))
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&common::read_body(resp).await).unwrap();
+    let id = created["id"].as_i64().unwrap();
+    assert_eq!(created["source_kind"], "git");
+
+    let patch = r#"{
+        "source_kind": "webdav",
+        "source_config": {
+            "base_url": "https://cloud.example.com",
+            "username": "svc",
+            "password": "app-pw"
+        }
+    }"#;
+    let resp = app
+        .serve(req_with_cookie(
+            Method::PATCH,
+            &format!("/api/v0/rag/collections/{id}"),
+            &cookie,
+            Some(patch),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let updated: Value = serde_json::from_slice(&common::read_body(resp).await).unwrap();
+    assert_eq!(updated["source_kind"], "webdav");
+    assert_eq!(updated["source_secrets_set"], true);
+
+    let stored = gateway_core::server::db::rag::find_collection_by_id(&db, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.source.kind, "webdav");
+    assert!(stored.source.secrets.is_some());
+}
+
+#[tokio::test]
 async fn create_rejects_duplicate_name_with_a_helpful_400() {
     let state = common::state_with_admin_rbac("http://unused.invalid").await;
     let cookie = seed_admin(&state, "alice").await;

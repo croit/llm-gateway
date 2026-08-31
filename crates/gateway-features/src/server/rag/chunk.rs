@@ -94,9 +94,103 @@ pub fn chunk_text(text: &str, chunk_size: usize, chunk_overlap: usize) -> Vec<Ch
     out
 }
 
+/// One chunk plus where it sits, in whatever unit its document is measured
+/// in — lines for source text, pages for anything that went through
+/// extraction. The unit itself is the caller's to record; this type only
+/// carries the numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedChunk {
+    pub chunk_index: usize,
+    /// Inclusive, 1-based.
+    pub from: usize,
+    pub to: usize,
+    pub content: String,
+}
+
+/// Chunk flowing text, positioned by line. The existing behaviour for source
+/// files, in the shape the indexer now stores.
+pub fn chunk_lines(text: &str, chunk_size: usize, chunk_overlap: usize) -> Vec<LocatedChunk> {
+    chunk_text(text, chunk_size, chunk_overlap)
+        .into_iter()
+        .map(|c| LocatedChunk {
+            chunk_index: c.chunk_index,
+            from: c.start_line,
+            to: c.end_line,
+            content: c.content,
+        })
+        .collect()
+}
+
+/// Chunk a paginated document one page at a time.
+///
+/// Chunking per page rather than over the concatenated text is deliberate:
+/// a chunk that straddles a page boundary cannot be cited precisely, and an
+/// imprecise citation is worse than a coarse one — the user opens page 4,
+/// does not find the sentence, and stops trusting the answer. The cost is
+/// that a short page produces a short chunk, which retrieval handles fine.
+///
+/// Empty pages are skipped but still consume their page number, so page
+/// numbering matches the original document even when a scan produced
+/// nothing for a blank page.
+pub fn chunk_pages(pages: &[String], chunk_size: usize, chunk_overlap: usize) -> Vec<LocatedChunk> {
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    for (i, page) in pages.iter().enumerate() {
+        let page_no = i + 1;
+        for piece in chunk_text(page, chunk_size, chunk_overlap) {
+            out.push(LocatedChunk {
+                chunk_index: index,
+                from: page_no,
+                to: page_no,
+                content: piece.content,
+            });
+            index += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_chunks_carry_their_page_number() {
+        let pages = vec!["alpha".to_string(), "beta".to_string()];
+        let out = chunk_pages(&pages, 100, 10);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].from, 1);
+        assert_eq!(out[0].to, 1);
+        assert_eq!(out[1].from, 2);
+        assert_eq!(out[1].content, "beta");
+    }
+
+    #[test]
+    fn a_chunk_never_straddles_a_page_boundary() {
+        // Two pages that would merge into one window if concatenated.
+        let pages = vec!["aaaa".to_string(), "bbbb".to_string()];
+        let out = chunk_pages(&pages, 1000, 0);
+        assert_eq!(out.len(), 2, "each page is chunked on its own");
+        assert_eq!(out[0].content, "aaaa");
+        assert_eq!(out[1].content, "bbbb");
+    }
+
+    #[test]
+    fn chunk_indices_are_continuous_across_pages() {
+        let pages = vec!["abcdef".to_string(), "ghijkl".to_string()];
+        let out = chunk_pages(&pages, 3, 0);
+        let indices: Vec<usize> = out.iter().map(|c| c.chunk_index).collect();
+        assert_eq!(indices, (0..out.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn an_empty_page_does_not_shift_later_page_numbers() {
+        // A blank page in a scan must not make page 3 report as page 2.
+        let pages = vec!["one".to_string(), String::new(), "three".to_string()];
+        let out = chunk_pages(&pages, 100, 0);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].from, 3, "the blank page still consumed its number");
+    }
 
     #[test]
     fn empty_text_emits_no_chunks() {

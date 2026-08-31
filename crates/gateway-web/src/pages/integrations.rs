@@ -265,7 +265,7 @@ pub async fn integrations_connect(
         &connector.scopes,
         &oauth_state,
         &pkce.challenge,
-        &resource,
+        Some(resource.as_str()),
     ) {
         Ok(u) => u,
         Err(err) => {
@@ -425,7 +425,7 @@ pub async fn integrations_callback(
         &pending.redirect_uri,
         &client_id,
         client_secret.as_deref(),
-        &resource,
+        Some(resource.as_str()),
     )
     .await
     {

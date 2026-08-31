@@ -42,6 +42,10 @@ pub enum UsageSource {
     Scheduled,
     /// An inbound-webhook fire (headless; triggered by `/hooks/{secret}`).
     Webhook,
+    /// The RAG indexer reading documents (OCR of scans while building a
+    /// collection). Has no end user: the cost belongs to the corpus, not to
+    /// whoever happened to trigger the re-index.
+    Indexer,
 }
 
 impl UsageSource {
@@ -51,6 +55,7 @@ impl UsageSource {
             UsageSource::Chat => "chat",
             UsageSource::Scheduled => "scheduled",
             UsageSource::Webhook => "webhook",
+            UsageSource::Indexer => "indexer",
         }
     }
 }

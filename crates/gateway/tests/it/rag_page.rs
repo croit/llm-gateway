@@ -173,6 +173,9 @@ async fn admin_reindex_flips_status_back_to_pending() {
             git_url: "https://example.invalid".into(),
             git_ref: "main".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: "embed-1".into(),
             include_globs: vec![],
             exclude_globs: vec![],
@@ -218,6 +221,9 @@ async fn admin_delete_removes_row() {
             git_url: "u".into(),
             git_ref: "main".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: "m".into(),
             include_globs: vec![],
             exclude_globs: vec![],
@@ -400,6 +406,9 @@ async fn admin_edit_form_then_update_round_trip() {
             git_url: "https://example.invalid/old.git".into(),
             git_ref: "main".into(),
             pat: Some("ghp_oldtoken".into()),
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: "embed-1".into(),
             include_globs: vec!["*.rs".into()],
             exclude_globs: vec![],
@@ -484,6 +493,9 @@ async fn update_with_empty_pat_keeps_existing_pat() {
             git_url: "https://example.invalid/repo.git".into(),
             git_ref: "main".into(),
             pat: Some("ghp_keepme".into()),
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: "embed-1".into(),
             include_globs: vec![],
             exclude_globs: vec![],
@@ -534,6 +546,9 @@ async fn cancel_edit_returns_display_row_without_saving() {
             git_url: "https://example.invalid".into(),
             git_ref: "main".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: "embed-1".into(),
             include_globs: vec![],
             exclude_globs: vec![],
@@ -593,6 +608,9 @@ async fn admin_can_add_set_primary_reindex_and_delete_refs() {
             git_url: "https://example.invalid".into(),
             git_ref: "main".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: "embed-1".into(),
             include_globs: vec![],
             exclude_globs: vec![],
@@ -717,6 +735,9 @@ async fn admin_edits_a_source_url_and_ref() {
             git_url: String::new(),
             git_ref: "master".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: "embed-1".into(),
             include_globs: vec![],
             exclude_globs: vec![],
@@ -916,4 +937,65 @@ async fn admin_creates_aggregate_collection_and_bulk_adds_sources() {
             .as_deref(),
         Some("updated desc")
     );
+}
+
+/// The sync hook, over HTTP, with a real minted token.
+///
+/// Regression: the handler took its token through rama's `Path` extractor,
+/// which lowercases every segment, while `rotate_sync_token` mints from a
+/// mixed-case alphabet — so a token containing any capital (very nearly all
+/// of them) hashed to nothing and the hook 404'd forever. Every existing test
+/// called `find_by_sync_token` directly and so never crossed the router,
+/// which is exactly where the casing was lost.
+#[tokio::test]
+async fn the_sync_hook_accepts_a_real_mixed_case_token_over_http() {
+    use gateway_core::server::db::rag as rag_db;
+
+    let state = common::state_with_admin_rbac("http://unused.invalid").await;
+    let c = rag_db::create_collection(
+        &state.db,
+        &rag_db::NewCollection {
+            name: "hooked".into(),
+            description: None,
+            git_url: "https://example.invalid/r.git".into(),
+            git_ref: "main".into(),
+            pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
+            embedding_model: "embed".into(),
+            include_globs: vec![],
+            exclude_globs: vec![],
+            chunk_size: 800,
+            chunk_overlap: 100,
+            search_mode: rag_db::SearchMode::Versioned,
+        },
+    )
+    .await
+    .unwrap();
+    let token = rag_db::rotate_sync_token(&state.db, c.id).await.unwrap();
+    assert!(
+        token.chars().any(|ch| ch.is_ascii_uppercase()),
+        "the alphabet is mixed-case, so this test is only meaningful if the \
+         minted token actually has a capital in it: {token}"
+    );
+    let app = common::app(state);
+
+    let resp = app
+        .serve(common::req(Method::POST, &format!("/hooks/rag/{token}")))
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the token resolved to its collection; a 404 here means the router \
+         mangled it on the way in"
+    );
+
+    // And a token that was never minted still gets the same flat answer.
+    let resp = app
+        .serve(common::req(Method::POST, "/hooks/rag/NotARealToken"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

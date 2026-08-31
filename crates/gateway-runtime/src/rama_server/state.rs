@@ -117,6 +117,19 @@ impl RamaState {
         self
     }
 
+    /// Share an already-built OCR service instead of the one [`Self::new`]
+    /// constructs.
+    ///
+    /// The concurrency gate inside `OcrService` only bounds anything if every
+    /// caller holds the *same* instance. The RAG indexer needs one before
+    /// `RamaState` exists, so without this the gateway would run two
+    /// independent gates and quietly allow twice the intended number of
+    /// concurrent OCR calls against one GPU.
+    pub fn with_ocr(mut self, ocr: gateway_features::server::ocr::OcrService) -> Self {
+        self.ocr = ocr;
+        self
+    }
+
     /// Install the Web Push sender on the wrapped [`AppState`]. Production
     /// installs it on the `AppState` before `RamaState::new`; this mirror lets
     /// callers (and tests) opt into push after the fact.

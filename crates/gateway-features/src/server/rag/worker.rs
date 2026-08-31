@@ -24,7 +24,7 @@
 //! task that wakes on an interval or an explicit kick, scans the DB, and
 //! runs the pending work for that pass.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,16 +32,23 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::server::embeddings::{self, EmbedError};
-use crate::server::rag::chunk::{self, Chunk as ChunkPiece};
+use crate::server::rag::chunk;
+use crate::server::rag::extract;
 use crate::server::rag::git::{self, GitError};
 use crate::server::rag::index::{CollectionIndex, IndexError};
+use crate::server::rag::profile;
+use crate::server::rag::rerank;
+use crate::server::rag::sha256_hex;
+use crate::server::rag::source;
+use crate::server::rag::sync;
 use crate::server::rag::walk::{self, Filter};
+use gateway_core::server::crypto::Crypto;
 use gateway_core::server::db::Pool;
 use gateway_core::server::db::rag as rag_db;
+use gateway_core::server::db::rag_documents as docs_db;
 use gateway_core::server::upstreams::UpstreamRegistry;
 
 /// Instruction prefix prepended to *query* embeddings (see
@@ -56,6 +63,18 @@ const QUERY_INSTRUCTION: &str = "Instruct: Given a code-search question, retriev
 /// hardware.
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
+    /// Cross-encoder model for reranking search results. `None` uses the
+    /// first model the `rerank` pool advertises; with no such pool the step
+    /// is skipped entirely.
+    pub rerank_model: Option<String>,
+    /// How many fused candidates the reranker is given. Larger means the
+    /// cross-encoder has more chance to surface something fusion ranked low,
+    /// at one model call's cost.
+    pub rerank_candidates: usize,
+    /// How much of a document the profile-extraction pass sees, head + tail.
+    /// `0` means the module default. Invoice totals live at the bottom, so
+    /// the budget is spent on both ends rather than only the first pages.
+    pub extraction_max_input_chars: usize,
     /// Where the gateway puts its RAG state (one usearch file per
     /// collection + the per-collection clone cache).
     pub data_dir: PathBuf,
@@ -81,6 +100,9 @@ impl Default for IndexerConfig {
             embed_batch_size: 32,
             poll_interval: Duration::from_secs(30),
             clone_concurrency: 4,
+            rerank_model: None,
+            rerank_candidates: 50,
+            extraction_max_input_chars: 24_000,
         }
     }
 }
@@ -97,6 +119,8 @@ pub enum WorkerError {
     Index(#[from] IndexError),
     #[error("filesystem: {0}")]
     Io(#[from] std::io::Error),
+    #[error("source: {0}")]
+    Source(#[from] source::ProviderError),
     #[error("collection {id} not found")]
     NotFound { id: i64 },
 }
@@ -106,7 +130,10 @@ pub enum WorkerError {
 /// happen while cloning, everything else while indexing.
 fn failure_phase(err: &WorkerError) -> &'static str {
     match err {
-        WorkerError::Git(_) => "cloning",
+        // Reaching the source is the same phase for both source kinds: a
+        // clone that fails and a directory listing that fails are the same
+        // thing to an operator reading the timeline.
+        WorkerError::Git(_) | WorkerError::Source(_) => "cloning",
         _ => "indexing",
     }
 }
@@ -126,6 +153,12 @@ fn friendly_error(
 ) -> String {
     let url = rref.effective_git_url(collection);
     match err {
+        // Passed through verbatim. A provider error is written for operators
+        // where it is raised, by the only code that knows which credential,
+        // path or endpoint is at fault. Re-wording it here would blur that —
+        // and would drag provider-specific knowledge into the worker, which
+        // is precisely what the source abstraction exists to prevent.
+        WorkerError::Source(err) => err.to_string(),
         WorkerError::Git(GitError::NonZero { stderr, .. }) => {
             let lower = stderr.to_lowercase();
             // Order matters: "remote branch X not found" also contains the
@@ -204,6 +237,55 @@ fn friendly_error(
     }
 }
 
+/// One file a build will index, and where its bytes come from.
+///
+/// The two variants exist because a git clone has already materialised the
+/// tree on disk — re-fetching those files would be pure waste — while a
+/// remote source hands over bytes on demand. Everything downstream of
+/// [`Indexer::read_item`] is identical for both.
+#[derive(Debug, Clone)]
+pub enum BuildItem {
+    Disk {
+        rel_path: String,
+        abs_path: std::path::PathBuf,
+    },
+    Remote(source::RemoteEntry),
+}
+
+impl BuildItem {
+    pub fn rel_path(&self) -> &str {
+        match self {
+            BuildItem::Disk { rel_path, .. } => rel_path,
+            BuildItem::Remote(entry) => &entry.rel_path,
+        }
+    }
+}
+
+/// What indexing one item produced.
+///
+/// `Skipped` and `Failed` are deliberately distinct: the first is permanent
+/// (nothing here can read a `.zip`) and the second is transient (the server
+/// was down). Only the second must stop a pass from being recorded as
+/// authoritative.
+enum ItemOutcome {
+    Indexed(usize),
+    /// Nothing indexable came out, and *why* — grouped by the caller into
+    /// `skip_summary`. The reason is the whole value here: a corpus of scans
+    /// with OCR switched off is indistinguishable from an empty collection
+    /// without it.
+    Skipped(String),
+    Failed,
+}
+
+/// Outcome of reading one item. `Unsupported` is separate from `Failed`
+/// because they mean different things to an operator: the first is "turn on
+/// the OCR backend / the sandbox", the second is "something is broken".
+enum ItemRead {
+    Ok(extract::ExtractedDoc),
+    Unsupported(String),
+    Failed(String),
+}
+
 /// Result of a `build_ref` run. `Swapped` carries the stats the log records;
 /// `Superseded` means a re-queue/delete won the race and the build was thrown
 /// away with the live index untouched.
@@ -212,6 +294,23 @@ enum BuildOutcome {
         files: usize,
         chunks: usize,
         commit: String,
+        /// The store folder that is now live.
+        ///
+        /// A full rebuild writes a fresh one and the old folder is reaped; an
+        /// incremental pass updates the existing folder in place and reports
+        /// it unchanged. Without this the caller cannot tell the two apart,
+        /// and would delete the very store the incremental pass just wrote.
+        live_uuid: String,
+        /// Whether every file this pass set out to read was actually read.
+        ///
+        /// A *transient* failure — a fetch that 503'd, an OCR backend that
+        /// was down — means the corpus this pass saw is not the corpus that
+        /// exists. Recording directory versions from it would let the next
+        /// sync prune straight past a document that was never indexed, and
+        /// nothing would revisit it until something else in that folder
+        /// changed. `is_complete()` only covers directories that failed to
+        /// *list*; this covers files that failed to *read*.
+        all_items_read: bool,
     },
     Superseded,
 }
@@ -250,6 +349,18 @@ struct IndexerInner {
     /// but independent collections proceed concurrently. Same size as
     /// `clone_sem` so embedding load stays bounded.
     job_sem: Arc<Semaphore>,
+    /// Every remote file provider this binary knows about. Registering a
+    /// provider here is the whole extension point — the build path below
+    /// asks for capabilities, never for a product name.
+    providers: source::ProviderRegistry,
+    /// At-rest key for opening a collection's sealed provider secrets.
+    /// `None` in tests that only exercise git collections; a remote source
+    /// then fails with a message saying so rather than a decrypt panic.
+    crypto: Option<Arc<Crypto>>,
+    /// Bytes → text. Degrades rather than fails: with no OCR backend and no
+    /// sandbox it still reads every text file, and says why it skipped the
+    /// rest.
+    extractor: extract::DocumentExtractor,
 }
 
 impl Indexer {
@@ -258,6 +369,7 @@ impl Indexer {
         upstreams: Arc<UpstreamRegistry>,
         http: reqwest::Client,
         mut config: IndexerConfig,
+        crypto: Option<Arc<Crypto>>,
     ) -> Self {
         // Resolve `data_dir` to an absolute path so every downstream
         // error message names the real on-disk path. Without this, a
@@ -301,6 +413,9 @@ impl Indexer {
                 kick: tokio::sync::Notify::new(),
                 clone_sem: Arc::new(Semaphore::new(permits)),
                 job_sem: Arc::new(Semaphore::new(permits)),
+                providers: source::ProviderRegistry::with_builtins(),
+                crypto,
+                extractor: extract::DocumentExtractor::new(None, None),
             }),
         }
     }
@@ -311,6 +426,55 @@ impl Indexer {
 
     pub fn db(&self) -> &Pool {
         &self.inner.db
+    }
+
+    /// Wire in the document readers: an OCR backend for scans and images,
+    /// and an office extractor for docx/pptx/xlsx.
+    ///
+    /// Separate from `new` because both live above this crate's concerns —
+    /// the office extractor is implemented in `gateway-runtime`, which sits
+    /// on top of this one — and because every existing caller (tests
+    /// included) wants the degraded, text-only ladder.
+    pub fn with_document_readers(
+        mut self,
+        ocr: Option<crate::server::ocr::OcrService>,
+        office: Option<Arc<dyn extract::OfficeExtractor>>,
+    ) -> Self {
+        let extractor = extract::DocumentExtractor::new(ocr, office);
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.extractor = extractor,
+            // Only reachable if a clone was taken before wiring, which the
+            // boot path does not do. Loud rather than silently text-only.
+            None => tracing::error!(
+                "rag: document readers configured after the indexer was shared; \
+                 scans and office files will not be read"
+            ),
+        }
+        self
+    }
+
+    /// Queue a **full** rebuild of a ref, discarding incremental state.
+    ///
+    /// Use whenever a change on *our* side invalidates what is indexed — the
+    /// extraction profile, chunking, globs, or the embedding model. A plain
+    /// re-index would take the incremental path, find nothing changed at the
+    /// source, and leave the corpus exactly as it was.
+    pub async fn request_full_rebuild(
+        &self,
+        ref_id: i64,
+    ) -> Result<(), gateway_core::server::db::DbError> {
+        rag_db::request_full_rebuild(&self.inner.db, ref_id).await?;
+        self.inner.kick.notify_one();
+        Ok(())
+    }
+
+    /// Every remote source provider this binary knows about.
+    ///
+    /// The admin UI renders its source picker and credential form from this,
+    /// so registering a provider is the only step needed to make it
+    /// configurable — no page code changes.
+    pub fn providers(&self) -> &source::ProviderRegistry {
+        &self.inner.providers
     }
 
     /// Embed a single text through the configured embedding model. The
@@ -604,9 +768,14 @@ impl Indexer {
                 files,
                 chunks,
                 commit,
+                live_uuid,
+                ..
             }) => {
-                self.evict_ref_caches(ref_id);
-                if old_uuid != build_uuid {
+                // Reap the previous folder only when the build actually moved
+                // to a new one. An incremental pass reports the same folder,
+                // and discarding it would delete the live store.
+                if old_uuid != live_uuid {
+                    self.evict_ref_caches(ref_id);
                     self.discard_dir(&old_uuid);
                 }
                 let dur = started.elapsed().as_millis() as i64;
@@ -686,13 +855,15 @@ impl Indexer {
 
         rag_db::set_ref_status(&self.inner.db, ref_id, rag_db::CollectionStatus::Cloning).await?;
         // Timeline entry so the admin sees the build started even while it's
-        // still cloning (the status badge also flips to "cloning").
+        // still fetching (the status badge also flips to "cloning").
         self.log_event(rag_db::NewLogEntry {
             ref_id,
             collection_id: collection.id,
             level: rag_db::LogLevel::Info,
             phase: "cloning".into(),
-            message: if collection.search_mode == rag_db::SearchMode::Aggregate {
+            message: if !collection.source.is_git() {
+                format!("Listing files from the {} source…", collection.source.kind)
+            } else if collection.search_mode == rag_db::SearchMode::Aggregate {
                 "Cloning sources…".to_string()
             } else {
                 format!(
@@ -713,6 +884,61 @@ impl Indexer {
             &collection.exclude_globs,
             self.inner.config.max_file_bytes,
         );
+
+        // A non-git source delegates enumeration to its provider entirely:
+        // the walker returns the same (files, marker) pair a clone does, so
+        // everything below this point is shared. `git` keeps its own path
+        // because a clone materialises the tree on disk, which is cheaper to
+        // read than re-fetching each file.
+        if !collection.source.is_git() {
+            // A ref that has already built once updates its live store in
+            // place: re-fetching and re-embedding an unchanged corpus every
+            // night is the difference between a feature an operator runs and
+            // one they turn off. The first build still goes through the
+            // fresh-folder path, so there is nothing to be half-way through.
+            // A ref whose extractor set has changed since it was built must
+            // go the long way round: the files it skipped for want of OCR or
+            // the sandbox are readable now, and an incremental diff would
+            // find them unchanged at the source and never look again.
+            let extractors_changed = rref.extractor_fingerprint.as_deref()
+                != Some(self.inner.extractor.fingerprint().as_str());
+            if !rref.needs_full_rebuild() && !extractors_changed {
+                return self.build_ref_incremental(collection, rref, &filter).await;
+            }
+            if extractors_changed {
+                tracing::info!(
+                    ref_id,
+                    was = ?rref.extractor_fingerprint,
+                    now = %self.inner.extractor.fingerprint(),
+                    "rag: document extractors changed, rebuilding rather than diffing"
+                );
+            }
+            let (items, head, snapshot, provider) = self
+                .gather_remote(collection, rref, &filter, &Default::default())
+                .await?;
+            if self.superseded(ref_id).await? {
+                return Ok(BuildOutcome::Superseded);
+            }
+            let outcome = self
+                .index_items(collection, rref, build_uuid, items, head, Some(provider))
+                .await?;
+            // Remember directory versions only after the build is live AND
+            // the walk saw the whole tree. Storing them from a partial walk
+            // would let a later sync prune a subtree whose files were never
+            // indexed — the corpus would quietly lose documents and look
+            // healthy doing it.
+            let read_everything = matches!(
+                outcome,
+                BuildOutcome::Swapped {
+                    all_items_read: true,
+                    ..
+                }
+            );
+            if read_everything && snapshot.is_complete() {
+                rag_db::set_ref_sync_state(&self.inner.db, ref_id, &snapshot.dir_versions).await?;
+            }
+            return Ok(outcome);
+        }
 
         // Gather the files to index plus a commit marker. Two shapes:
         //   * Versioned ref → clone its one repo; index it as-is.
@@ -800,7 +1026,695 @@ impl Indexer {
             (walk::walk(&clone_dir, &filter)?, sha)
         };
 
+        let items: Vec<BuildItem> = walked
+            .into_iter()
+            .map(|w| BuildItem::Disk {
+                rel_path: w.rel_path,
+                abs_path: w.abs_path,
+            })
+            .collect();
+        self.index_items(collection, rref, build_uuid, items, head, None)
+            .await
+    }
+
+    /// Enumerate a non-git source through its provider.
+    ///
+    /// Returns the files to index, a marker that changes iff the remote
+    /// changed, the snapshot (so the caller can decide whether it may be
+    /// trusted), and the live provider handle the fetch step needs.
+    async fn gather_remote(
+        &self,
+        collection: &rag_db::Collection,
+        rref: &rag_db::CollectionRef,
+        filter: &Filter,
+        prior: &source::tree::DirVersions,
+    ) -> Result<
+        (
+            Vec<BuildItem>,
+            String,
+            source::tree::TreeSnapshot,
+            Arc<dyn source::FileProvider>,
+        ),
+        WorkerError,
+    > {
+        let provider = self.build_provider(collection)?;
+        let opts = source::tree::WalkOptions {
+            max_file_bytes: self.inner.config.max_file_bytes,
+            concurrency: self.inner.config.clone_concurrency.max(1),
+            ..Default::default()
+        };
+        // A full rebuild passes an empty `prior` — it writes into a fresh
+        // folder, so a pruned subtree would contribute no files and its
+        // documents would vanish. An incremental pass passes the stored
+        // versions and carries pruned subtrees over untouched, which is what
+        // makes an unchanged corpus cost one request per branch.
+        let snapshot = source::tree::walk(Arc::clone(&provider), prior, filter, &opts).await?;
+
+        for failed in &snapshot.failed {
+            self.log_event(rag_db::NewLogEntry {
+                ref_id: rref.id,
+                collection_id: collection.id,
+                level: rag_db::LogLevel::Warn,
+                phase: "cloning".into(),
+                message: format!(
+                    "Could not list `{}`: {} — its files are not in this build.",
+                    if failed.rel_path.is_empty() {
+                        "/"
+                    } else {
+                        failed.rel_path.as_str()
+                    },
+                    failed.message
+                ),
+                commit_sha: None,
+                files: None,
+                chunks: None,
+                duration_ms: None,
+            })
+            .await;
+        }
+        // Nothing listed at all is a broken source, not an empty one. Raised
+        // as a failure so the ref goes `error` with the reason instead of
+        // going `ready` with zero documents.
+        if snapshot.files.is_empty() && !snapshot.failed.is_empty() {
+            return Err(WorkerError::Source(source::ProviderError::Config(format!(
+                "no directory could be listed ({} failed); first error: {}",
+                snapshot.failed.len(),
+                snapshot.failed[0].message
+            ))));
+        }
+        if snapshot.oversized > 0 || snapshot.filtered_out > 0 {
+            self.log_event(rag_db::NewLogEntry {
+                ref_id: rref.id,
+                collection_id: collection.id,
+                level: rag_db::LogLevel::Info,
+                phase: "indexing".into(),
+                message: format!(
+                    "Listed {} file(s); skipped {} over the size limit and {} not matching the \
+                     include/exclude globs.",
+                    snapshot.files.len(),
+                    snapshot.oversized,
+                    snapshot.filtered_out
+                ),
+                commit_sha: None,
+                files: Some(snapshot.files.len() as i64),
+                chunks: None,
+                duration_ms: None,
+            })
+            .await;
+        }
+
+        let marker = snapshot.marker();
+        let items = snapshot
+            .files
+            .iter()
+            .cloned()
+            .map(BuildItem::Remote)
+            .collect();
+        Ok((items, marker, snapshot, provider))
+    }
+
+    /// Fetch one item's bytes and run them through the extraction ladder.
+    ///
+    /// The ladder (`extract::DocumentExtractor`) is what turns a PDF, a scan
+    /// or an office file into text; before it existed, everything that was
+    /// not UTF-8 was dropped here without a log line. Which rung applies is
+    /// decided by type, not by source, so a git repo full of PDFs reads
+    /// exactly as a WebDAV folder full of them does.
+    async fn read_item(
+        &self,
+        item: &BuildItem,
+        provider: Option<&Arc<dyn source::FileProvider>>,
+    ) -> ItemRead {
+        let (bytes, mime) = match item {
+            BuildItem::Disk { abs_path, .. } => match std::fs::read(abs_path) {
+                Ok(b) => (b, None),
+                Err(e) => return ItemRead::Failed(e.to_string()),
+            },
+            BuildItem::Remote(entry) => {
+                let Some(provider) = provider else {
+                    return ItemRead::Failed("no provider for a remote item".into());
+                };
+                match provider
+                    .fetch(entry, self.inner.config.max_file_bytes)
+                    .await
+                {
+                    Ok(b) => (b, entry.mime.clone()),
+                    Err(e) => return ItemRead::Failed(e.to_string()),
+                }
+            }
+        };
+        match self
+            .inner
+            .extractor
+            .extract(item.rel_path(), mime.as_deref(), bytes)
+            .await
+        {
+            extract::Extracted::Ok(doc) if doc.is_empty() => {
+                // A document that extracted to nothing (a blank scan, an
+                // empty file) is not an error, but indexing zero chunks for
+                // it and saying nothing would look like a silent drop.
+                ItemRead::Unsupported("extracted no text".into())
+            }
+            extract::Extracted::Ok(doc) => ItemRead::Ok(doc),
+            extract::Extracted::Unsupported { reason } => ItemRead::Unsupported(reason),
+            extract::Extracted::Failed(err) => ItemRead::Failed(err),
+        }
+    }
+
+    /// The collection's extraction profile, if it has one.
+    ///
+    /// A configured-but-missing profile is a config error worth naming: the
+    /// alternative is a corpus indexed without fields and an operator
+    /// wondering why the query tool finds nothing.
+    async fn resolve_profile(
+        &self,
+        collection: &rag_db::Collection,
+        rref: &rag_db::CollectionRef,
+    ) -> Result<Option<docs_db::Profile>, WorkerError> {
+        let Some(id) = collection.profile_id else {
+            return Ok(None);
+        };
+        if let Some(p) = docs_db::find_profile(&self.inner.db, id).await? {
+            return Ok(Some(p));
+        }
+        self.log_event(rag_db::NewLogEntry {
+            ref_id: rref.id,
+            collection_id: collection.id,
+            level: rag_db::LogLevel::Warn,
+            phase: "indexing".into(),
+            message: format!(
+                "Extraction profile {id} no longer exists; indexing without document \
+                 fields. Pick a profile on the collection to restore structured queries."
+            ),
+            commit_sha: None,
+            files: None,
+            chunks: None,
+            duration_ms: None,
+        })
+        .await;
+        Ok(None)
+    }
+
+    /// Read, extract, chunk, embed and store one item. Returns the number of
+    /// chunks written, or `None` when the item produced nothing indexable.
+    ///
+    /// Shared by the full rebuild and the incremental pass so the two cannot
+    /// drift — the failure that would produce is a corpus whose incrementally
+    /// updated documents are subtly unlike its rebuilt ones.
+    #[allow(clippy::too_many_arguments)]
+    async fn index_one_item(
+        &self,
+        collection: &rag_db::Collection,
+        store: &Pool,
+        index: &CollectionIndex,
+        profile: Option<&docs_db::Profile>,
+        item: &BuildItem,
+        provider: Option<&Arc<dyn source::FileProvider>>,
+        next_vector_id: &mut i64,
+        replaces: Option<i64>,
+    ) -> Result<ItemOutcome, WorkerError> {
+        let doc = match self.read_item(item, provider).await {
+            ItemRead::Ok(doc) => doc,
+            ItemRead::Unsupported(reason) => return Ok(ItemOutcome::Skipped(reason)),
+            // A fetch that 503'd or an OCR backend that was down is a
+            // *transient* nothing, not a permanent one. Reported separately
+            // so the caller can decline to record this pass as authoritative
+            // — otherwise the file's directory version would be stored and
+            // the next sync would prune right past it.
+            ItemRead::Failed(err) => {
+                tracing::debug!(path = %item.rel_path(), error = %err, "rag: item read failed");
+                return Ok(ItemOutcome::Failed);
+            }
+        };
+        // Only now that the replacement content is in hand is it safe to drop
+        // what is being replaced. Dropping first and then failing the read
+        // would leave the file row with zero chunks and nothing to notice it.
+        if let Some(old) = replaces {
+            // The whole row, not just its chunks. A file that moved *and*
+            // changed arrives here with a new `rel_path`, so the `upsert_file`
+            // below finds no conflict and inserts a second row — leaving the
+            // old one behind with zero chunks but an intact `rag_documents`
+            // join, which `rag_query_documents` and `rag_list_documents`
+            // happily keep reporting at the path the file no longer has. The
+            // two rows also share a `remote_id`, so the next `sync::plan`
+            // collides on identity and can re-upsert the file every pass.
+            //
+            // Dropping the row cascades its document away; both are rebuilt
+            // from the content just read.
+            self.drop_file(store, index, old).await?;
+        }
+        let paginated = doc.extractor != extract::Extractor::Text;
+        let size = collection.chunk_size as usize;
+        let overlap = collection.chunk_overlap as usize;
+        let text = doc.pages.join("\n");
+        let pieces = if paginated {
+            chunk::chunk_pages(&doc.pages, size, overlap)
+        } else {
+            chunk::chunk_lines(&text, size, overlap)
+        };
+        if pieces.is_empty() {
+            return Ok(ItemOutcome::Skipped("produced no text".to_string()));
+        }
+        let hash = sha256_hex(&text);
+        let (web_url, remote_id, source_version) = match (item, provider) {
+            (BuildItem::Remote(entry), Some(p)) => (
+                p.web_url(entry),
+                Some(entry.id.clone()),
+                Some(entry.version.clone()),
+            ),
+            _ => (None, None, None),
+        };
+        let file_id = rag_db::upsert_file(
+            store,
+            collection.id,
+            item.rel_path(),
+            &hash,
+            &rag_db::FileOrigin {
+                web_url: web_url.as_deref(),
+                remote_id: remote_id.as_deref(),
+                source_version: source_version.as_deref(),
+            },
+        )
+        .await?;
+
+        let extraction = match profile {
+            None => None,
+            Some(p) => match profile::extract(
+                &self.inner.http,
+                &self.inner.upstreams,
+                &self.inner.db,
+                p,
+                collection.extraction_model.as_deref(),
+                &hash,
+                &text,
+                self.inner.config.extraction_max_input_chars,
+            )
+            .await
+            {
+                Ok(e) => {
+                    let values = profile::to_field_values(p, &e.fields);
+                    docs_db::upsert_document(
+                        store,
+                        file_id,
+                        &docs_db::DocumentMeta {
+                            title: e.fields.get("title").map(String::as_str),
+                            summary: e.summary.as_deref(),
+                            extractor: doc.extractor.as_str(),
+                            pages_total: doc.pages_total.map(|n| n as i64),
+                            pages_processed: doc.pages_processed.map(|n| n as i64),
+                        },
+                        &values,
+                    )
+                    .await?;
+                    Some(e)
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        path = %item.rel_path(), error = %err,
+                        "rag: profile extraction failed"
+                    );
+                    None
+                }
+            },
+        };
+        let context_header = extraction
+            .as_ref()
+            .map(|e| e.context_header(item.rel_path()));
+
+        let mut written = 0usize;
+        for batch in pieces.chunks(self.inner.config.embed_batch_size) {
+            let inputs: Vec<String> = batch
+                .iter()
+                .map(|p| match context_header.as_deref() {
+                    Some(header) => format!("{header}\n{}", p.content),
+                    None => p.content.clone(),
+                })
+                .collect();
+            let vectors = embeddings::embed(
+                &self.inner.http,
+                &self.inner.upstreams,
+                &collection.embedding_model,
+                &inputs,
+            )
+            .await?;
+            if vectors.is_empty() {
+                continue;
+            }
+            if vectors[0].len() != index.dimensions() {
+                return Err(WorkerError::Index(IndexError::BadVectorLen {
+                    expected: index.dimensions(),
+                    got: vectors[0].len(),
+                }));
+            }
+            let mut new_chunks: Vec<rag_db::NewChunk> = Vec::with_capacity(batch.len());
+            let mut to_index: Vec<(i64, &[f32])> = Vec::with_capacity(batch.len());
+            for (piece, vec) in batch.iter().zip(vectors.iter()) {
+                let vid = *next_vector_id;
+                *next_vector_id += 1;
+                let loc = if paginated {
+                    rag_db::ChunkLoc::pages(piece.from as i64, piece.to as i64)
+                } else {
+                    rag_db::ChunkLoc::lines(piece.from as i64, piece.to as i64)
+                };
+                new_chunks.push(rag_db::NewChunk {
+                    file_id,
+                    chunk_index: piece.chunk_index as i64,
+                    loc,
+                    content: piece.content.clone(),
+                    vector_id: vid,
+                });
+                to_index.push((vid, vec.as_slice()));
+            }
+            rag_db::insert_chunks(store, collection.id, &new_chunks).await?;
+            for (vid, vec) in to_index {
+                index.add(vid, vec)?;
+            }
+            written += new_chunks.len();
+        }
+        Ok(ItemOutcome::Indexed(written))
+    }
+
+    /// Update a ref's live store in place, doing only the work the source's
+    /// changes require.
+    ///
+    /// This forfeits the fresh-folder-and-swap safety of a full rebuild, so
+    /// three things replace it:
+    ///
+    ///   * **Per-file transactionality.** One file's delete-then-insert is
+    ///     one SQLite transaction, bracketed by its vector removals and adds.
+    ///     A crash leaves at most one file inconsistent.
+    ///   * **The diff is the resume cursor.** Directory versions are stored
+    ///     only after a fully successful pass, so an interrupted run costs
+    ///     one extra walk and nothing else: the next diff sees the files it
+    ///     already indexed as unchanged and skips them.
+    ///   * **Deletions need an authoritative walk.** A folder that errored is
+    ///     indistinguishable from a folder that was emptied, so a partial
+    ///     walk deletes nothing (see `sync::plan`).
+    async fn build_ref_incremental(
+        &self,
+        collection: &rag_db::Collection,
+        rref: &rag_db::CollectionRef,
+        filter: &Filter,
+    ) -> Result<BuildOutcome, WorkerError> {
+        let ref_id = rref.id;
+        rag_db::set_ref_status(&self.inner.db, ref_id, rag_db::CollectionStatus::Cloning).await?;
+
+        let (items, head, snapshot, provider) = self
+            .gather_remote(collection, rref, filter, &rref.dir_versions)
+            .await?;
+        if self.superseded(ref_id).await? {
+            return Ok(BuildOutcome::Superseded);
+        }
+
+        let store = self.collection_store(ref_id, &rref.data_uuid).await?;
+        let existing = rag_db::list_files_for_collection(&store, collection.id).await?;
+        let indexed: Vec<sync::IndexedState> = existing
+            .iter()
+            .map(|f| sync::IndexedState {
+                file_id: f.id,
+                path: f.path.clone(),
+                remote_id: f.remote_id.clone(),
+                source_version: f.source_version.clone(),
+            })
+            .collect();
+
+        let entries: Vec<source::RemoteEntry> = items
+            .iter()
+            .filter_map(|i| match i {
+                BuildItem::Remote(e) => Some(e.clone()),
+                BuildItem::Disk { .. } => None,
+            })
+            .collect();
+        let mut plan = sync::plan(
+            &entries,
+            &indexed,
+            provider.capabilities().stable_ids,
+            snapshot.is_complete(),
+        );
+        // A pruned subtree contributed no entries, so its files look absent.
+        // They are not: nothing beneath that directory changed. Dropping this
+        // would make the first cheap re-sync delete most of the corpus.
+        let keep = sync::keep_pruned(&indexed, &snapshot.pruned);
+        plan.deletions.retain(|id| !keep.contains(id));
+
         rag_db::set_ref_status(&self.inner.db, ref_id, rag_db::CollectionStatus::Indexing).await?;
+        self.log_event(rag_db::NewLogEntry {
+            ref_id,
+            collection_id: collection.id,
+            level: rag_db::LogLevel::Info,
+            phase: "indexing".into(),
+            message: format!("Incremental sync: {}.", plan.summary()),
+            commit_sha: None,
+            files: Some(plan.upserts.len() as i64),
+            chunks: None,
+            duration_ms: None,
+        })
+        .await;
+
+        let index = self.open_index(ref_id, &rref.data_uuid, None)?;
+        // Deletions first, so a file moving onto a path this pass is about to
+        // free does not collide with the row still holding it.
+        let mut removed_vectors = 0usize;
+        for file_id in &plan.deletions {
+            removed_vectors += self.drop_file(&store, &index, *file_id).await?;
+        }
+        // Then every move at once: applied one by one, two files swapping
+        // paths would violate `UNIQUE (collection_id, path)` in either order
+        // and fail the whole pass.
+        rag_db::rename_files(&store, &plan.renames).await?;
+
+        let mut indexed_files = 0usize;
+        let mut added_chunks = 0usize;
+        let mut item_failures = 0usize;
+        // Grouped by reason, exactly as the full rebuild does — this is the
+        // pass that runs nightly, so it is the one whose silence would last.
+        let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+        if !plan.upserts.is_empty() {
+            let mut next_vector_id = rag_db::max_vector_id(&store, collection.id)
+                .await?
+                .unwrap_or(0)
+                + 1;
+            let profile = self.resolve_profile(collection, rref).await?;
+            for upsert in &plan.upserts {
+                if self.superseded(ref_id).await? {
+                    // Persist what was indexed so far before bailing: the
+                    // store rows are already committed, and an index file
+                    // that does not match them would answer with vectors
+                    // whose chunks are gone.
+                    index.save()?;
+                    return Ok(BuildOutcome::Superseded);
+                }
+                let item = BuildItem::Remote(upsert.entry.clone());
+                let outcome = match self
+                    .index_one_item(
+                        collection,
+                        &store,
+                        &index,
+                        profile.as_ref(),
+                        &item,
+                        Some(&provider),
+                        &mut next_vector_id,
+                        upsert.replaces,
+                    )
+                    .await
+                {
+                    Ok(o) => o,
+                    Err(err) => {
+                        index.save()?;
+                        return Err(err);
+                    }
+                };
+                match outcome {
+                    ItemOutcome::Indexed(n) => {
+                        indexed_files += 1;
+                        added_chunks += n;
+                    }
+                    ItemOutcome::Skipped(reason) => {
+                        *skipped.entry(reason).or_default() += 1;
+                    }
+                    ItemOutcome::Failed => {
+                        item_failures += 1;
+                        *skipped.entry("extraction failed".to_string()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        index.save()?;
+
+        // Only now, with every change applied, are the directory versions
+        // safe to store: recording them earlier would let the next pass prune
+        // a subtree whose files this pass never got to.
+        let outcome = rag_db::swap_ref_index(
+            &self.inner.db,
+            ref_id,
+            &rref.data_uuid,
+            &head,
+            &self.inner.extractor.fingerprint(),
+        )
+        .await?;
+        if outcome != 1 {
+            // A re-queue flipped the ref away from `indexing` while we
+            // worked. The store is still consistent — every change was
+            // applied per file — so the next pass simply diffs from here.
+            return Ok(BuildOutcome::Superseded);
+        }
+        // Directory versions are only safe to record when this pass actually
+        // read everything it set out to. `is_complete()` covers directories
+        // that failed to *list*; `item_failures` covers files that failed to
+        // *fetch or extract*. Recording either would let the next sync prune
+        // past a document that was never indexed — and nothing would retry it
+        // until something else in that folder changed.
+        if snapshot.is_complete() && item_failures == 0 {
+            let merged = sync::merged_dir_versions(&rref.dir_versions, &snapshot.dir_versions);
+            rag_db::set_ref_sync_state(&self.inner.db, ref_id, &merged).await?;
+        } else if item_failures > 0 {
+            self.log_event(rag_db::NewLogEntry {
+                ref_id,
+                collection_id: collection.id,
+                level: rag_db::LogLevel::Warn,
+                phase: "ready".into(),
+                message: format!(
+                    "{item_failures} document(s) could not be read this pass; the next sync \
+                     will re-walk and retry them rather than assume they are up to date."
+                ),
+                commit_sha: None,
+                files: None,
+                chunks: None,
+                duration_ms: None,
+            })
+            .await;
+        }
+        let skipped_total: usize = skipped.values().sum();
+        if skipped_total > 0 {
+            self.log_event(rag_db::NewLogEntry {
+                ref_id,
+                collection_id: collection.id,
+                level: rag_db::LogLevel::Warn,
+                phase: "ready".into(),
+                message: format!(
+                    "{skipped_total} document(s) changed at the source but could not be read. {}",
+                    skip_summary(&skipped)
+                ),
+                commit_sha: None,
+                files: None,
+                chunks: None,
+                duration_ms: None,
+            })
+            .await;
+        }
+        self.log_event(rag_db::NewLogEntry {
+            ref_id,
+            collection_id: collection.id,
+            level: rag_db::LogLevel::Info,
+            phase: "ready".into(),
+            message: format!(
+                "Synced {indexed_files} document(s), {added_chunks} chunk(s) added, \
+                 {removed_vectors} vector(s) removed; {} unchanged.",
+                plan.unchanged
+            ),
+            commit_sha: Some(head.clone()),
+            files: Some(indexed_files as i64),
+            chunks: Some(added_chunks as i64),
+            duration_ms: None,
+        })
+        .await;
+
+        Ok(BuildOutcome::Swapped {
+            files: indexed_files,
+            chunks: added_chunks,
+            commit: head,
+            live_uuid: rref.data_uuid.clone(),
+            all_items_read: item_failures == 0,
+        })
+    }
+
+    /// Remove one file's chunks and their vectors. Returns how many vectors
+    /// went.
+    async fn drop_chunks(
+        &self,
+        store: &Pool,
+        index: &CollectionIndex,
+        file_id: i64,
+    ) -> Result<usize, WorkerError> {
+        let ids = rag_db::vector_ids_for_file(store, file_id).await?;
+        for id in &ids {
+            // A vector the index does not have is not an error: the store is
+            // the record of truth and the index is derived from it.
+            let _ = index.remove(*id)?;
+        }
+        rag_db::delete_chunks_for_file(store, file_id).await?;
+        Ok(ids.len())
+    }
+
+    /// Remove a file entirely — chunks, vectors, and the row itself. The
+    /// extracted document row goes with it via `ON DELETE CASCADE`.
+    async fn drop_file(
+        &self,
+        store: &Pool,
+        index: &CollectionIndex,
+        file_id: i64,
+    ) -> Result<usize, WorkerError> {
+        let removed = self.drop_chunks(store, index, file_id).await?;
+        rag_db::delete_file(store, file_id).await?;
+        Ok(removed)
+    }
+
+    /// Instantiate the collection's provider, opening its sealed secrets.
+    fn build_provider(
+        &self,
+        collection: &rag_db::Collection,
+    ) -> Result<Arc<dyn source::FileProvider>, WorkerError> {
+        let secrets = match collection.source.secrets.as_ref() {
+            None => std::collections::BTreeMap::new(),
+            Some(sealed) => {
+                let crypto = self.inner.crypto.as_ref().ok_or_else(|| {
+                    source::ProviderError::Config(
+                        "this collection has stored credentials but the gateway has no at-rest \
+                         encryption key configured, so they cannot be opened"
+                            .into(),
+                    )
+                })?;
+                let plain = crypto
+                    .open_str(&sealed.nonce, &sealed.ciphertext)
+                    .map_err(|e| {
+                        source::ProviderError::Config(format!(
+                            "stored credentials could not be decrypted ({e}) — re-enter them; \
+                             this usually means the at-rest key changed"
+                        ))
+                    })?;
+                serde_json::from_str(&plain).map_err(|e| {
+                    source::ProviderError::Config(format!("stored credentials are corrupt: {e}"))
+                })?
+            }
+        };
+        let cfg = source::ProviderConfig::new(collection.source.config.clone(), secrets);
+        Ok(self
+            .inner
+            .providers
+            .build(&collection.source.kind, &cfg, self.inner.http.clone())?)
+    }
+
+    /// Chunk, embed and index `items` into a fresh store, then swap the ref
+    /// onto it.
+    ///
+    /// Shared by every source: once enumeration has produced a list of items
+    /// and a marker, nothing below here cares where they came from. That is
+    /// what keeps adding a provider from touching the indexing path.
+    async fn index_items(
+        &self,
+        collection: &rag_db::Collection,
+        rref: &rag_db::CollectionRef,
+        build_uuid: &str,
+        items: Vec<BuildItem>,
+        head: String,
+        provider: Option<Arc<dyn source::FileProvider>>,
+    ) -> Result<BuildOutcome, WorkerError> {
+        let ref_id = rref.id;
+        rag_db::set_ref_status(&self.inner.db, ref_id, rag_db::CollectionStatus::Indexing).await?;
+
+        let profile = self.resolve_profile(collection, rref).await?;
+        let mut extracted_docs = 0usize;
+        let mut extraction_failures = 0usize;
 
         // Fresh, uncached store + index for this build.
         let store = gateway_core::server::db::open_collection_store(
@@ -814,25 +1728,136 @@ impl Indexer {
         let mut dimensions: Option<usize> = None;
         let mut index: Option<CollectionIndex> = None;
 
-        for file in &walked {
-            let content = match std::fs::read(&file.abs_path) {
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(s) => s,
-                    Err(_) => continue, // binary — skip
-                },
-                Err(_) => continue,
+        let mut unreadable = 0usize;
+        let mut item_failures = 0usize;
+        let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+        let mut partial: Vec<String> = Vec::new();
+        for file in &items {
+            let doc = match self.read_item(file, provider.as_ref()).await {
+                ItemRead::Ok(doc) => doc,
+                // Nothing configured here can read this type. Counted and
+                // grouped by reason rather than dropped in silence, so a
+                // corpus of scans with OCR switched off says exactly that
+                // instead of looking like an empty collection.
+                ItemRead::Unsupported(reason) => {
+                    unreadable += 1;
+                    *skipped.entry(reason).or_default() += 1;
+                    continue;
+                }
+                ItemRead::Failed(err) => {
+                    tracing::debug!(path = %file.rel_path(), error = %err, "rag: item unreadable");
+                    unreadable += 1;
+                    // Transient: the corpus this pass saw is not the corpus
+                    // that exists, so its directory versions must not be
+                    // recorded as authoritative.
+                    item_failures += 1;
+                    *skipped.entry("extraction failed".to_string()).or_default() += 1;
+                    continue;
+                }
             };
-            let pieces: Vec<ChunkPiece> = chunk::chunk_text(
-                &content,
-                collection.chunk_size as usize,
-                collection.chunk_overlap as usize,
-            );
+            // A document read only in part must be visible as such: an
+            // answer sourced from 8 of 40 pages is not an answer about the
+            // document.
+            if !doc.complete() {
+                partial.push(format!("{} ({})", file.rel_path(), doc.coverage_note()));
+            }
+            // Plain text keeps line positions; anything that went through
+            // extraction is positioned by page, because lines do not survive
+            // a PDF and a page is what a person can open the original to.
+            let paginated = doc.extractor != extract::Extractor::Text;
+            let size = collection.chunk_size as usize;
+            let overlap = collection.chunk_overlap as usize;
+            let text = doc.pages.join("\n");
+            let pieces = if paginated {
+                chunk::chunk_pages(&doc.pages, size, overlap)
+            } else {
+                chunk::chunk_lines(&text, size, overlap)
+            };
             if pieces.is_empty() {
                 continue;
             }
-            let hash = sha256_hex(&content);
-            let file_id = rag_db::upsert_file(&store, collection.id, &file.rel_path, &hash).await?;
+            let hash = sha256_hex(&text);
+            // The provider's own link to this file, so an answer can be
+            // checked against the original instead of taken on trust.
+            let (web_url, remote_id, source_version) = match (file, provider.as_ref()) {
+                (BuildItem::Remote(entry), Some(p)) => (
+                    p.web_url(entry),
+                    Some(entry.id.clone()),
+                    Some(entry.version.clone()),
+                ),
+                _ => (None, None, None),
+            };
+            let file_id = rag_db::upsert_file(
+                &store,
+                collection.id,
+                file.rel_path(),
+                &hash,
+                &rag_db::FileOrigin {
+                    web_url: web_url.as_deref(),
+                    remote_id: remote_id.as_deref(),
+                    source_version: source_version.as_deref(),
+                },
+            )
+            .await?;
             indexed_files += 1;
+
+            // The profile pass: fields + a summary, cached by content hash so
+            // a rebuild re-embeds without re-running the model.
+            let extraction = match profile.as_ref() {
+                None => None,
+                Some(p) => {
+                    match profile::extract(
+                        &self.inner.http,
+                        &self.inner.upstreams,
+                        &self.inner.db,
+                        p,
+                        collection.extraction_model.as_deref(),
+                        &hash,
+                        &text,
+                        self.inner.config.extraction_max_input_chars,
+                    )
+                    .await
+                    {
+                        Ok(e) => {
+                            extracted_docs += 1;
+                            let values = profile::to_field_values(p, &e.fields);
+                            let title = e.fields.get("title").map(String::as_str);
+                            docs_db::upsert_document(
+                                &store,
+                                file_id,
+                                &docs_db::DocumentMeta {
+                                    title,
+                                    summary: e.summary.as_deref(),
+                                    extractor: doc.extractor.as_str(),
+                                    pages_total: doc.pages_total.map(|n| n as i64),
+                                    pages_processed: doc.pages_processed.map(|n| n as i64),
+                                },
+                                &values,
+                            )
+                            .await?;
+                            Some(e)
+                        }
+                        // One document's extraction failing must not fail the
+                        // build: the text is still worth indexing, it just
+                        // will not answer structured queries.
+                        Err(err) => {
+                            extraction_failures += 1;
+                            tracing::debug!(
+                                path = %file.rel_path(), error = %err,
+                                "rag: profile extraction failed"
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+            // Prepended to each chunk *before embedding*, never to the stored
+            // text. A bare paragraph from page 2 of an invoice is
+            // embedding-identical to the same paragraph in 400 others; this
+            // header is what separates them in vector space.
+            let context_header = extraction
+                .as_ref()
+                .map(|e| e.context_header(file.rel_path()));
 
             for batch in pieces.chunks(self.inner.config.embed_batch_size) {
                 // Abort early if a re-queue / delete superseded this build,
@@ -840,7 +1865,13 @@ impl Indexer {
                 if self.superseded(ref_id).await? {
                     return Ok(BuildOutcome::Superseded);
                 }
-                let inputs: Vec<String> = batch.iter().map(|p| p.content.clone()).collect();
+                let inputs: Vec<String> = batch
+                    .iter()
+                    .map(|p| match context_header.as_deref() {
+                        Some(header) => format!("{header}\n{}", p.content),
+                        None => p.content.clone(),
+                    })
+                    .collect();
                 let vectors = embeddings::embed(
                     &self.inner.http,
                     &self.inner.upstreams,
@@ -865,23 +1896,27 @@ impl Indexer {
                 let idx = index.as_ref().expect("index opened above");
 
                 let mut new_chunks: Vec<rag_db::NewChunk> = Vec::with_capacity(batch.len());
-                let mut to_index: Vec<(i64, Vec<f32>)> = Vec::with_capacity(batch.len());
+                let mut to_index: Vec<(i64, &[f32])> = Vec::with_capacity(batch.len());
                 for (piece, vec) in batch.iter().zip(vectors.iter()) {
                     let vid = next_vector_id;
                     next_vector_id += 1;
+                    let loc = if paginated {
+                        rag_db::ChunkLoc::pages(piece.from as i64, piece.to as i64)
+                    } else {
+                        rag_db::ChunkLoc::lines(piece.from as i64, piece.to as i64)
+                    };
                     new_chunks.push(rag_db::NewChunk {
                         file_id,
                         chunk_index: piece.chunk_index as i64,
-                        start_line: piece.start_line as i64,
-                        end_line: piece.end_line as i64,
+                        loc,
                         content: piece.content.clone(),
                         vector_id: vid,
                     });
-                    to_index.push((vid, vec.clone()));
+                    to_index.push((vid, vec.as_slice()));
                 }
                 rag_db::insert_chunks(&store, collection.id, &new_chunks).await?;
                 for (vid, vec) in to_index {
-                    idx.add(vid, &vec)?;
+                    idx.add(vid, vec)?;
                 }
             }
         }
@@ -895,7 +1930,15 @@ impl Indexer {
         // Atomic swap, guarded by `status='indexing'`: if a re-queue flipped
         // the ref to `pending` while we built, this affects 0 rows and we
         // report "superseded" so the caller discards the build.
-        let swapped = rag_db::swap_ref_index(&self.inner.db, ref_id, build_uuid, &head).await? == 1;
+        let swapped = rag_db::swap_ref_index(
+            &self.inner.db,
+            ref_id,
+            build_uuid,
+            &head,
+            &self.inner.extractor.fingerprint(),
+        )
+        .await?
+            == 1;
         if !swapped {
             // Lost the race: a re-queue flipped the ref away from `indexing`
             // while we built. Discard quietly; the live index is untouched.
@@ -909,20 +1952,29 @@ impl Indexer {
         if chunks == 0 {
             tracing::warn!(
                 ref_id,
-                files = walked.len(),
+                files = items.len(),
                 "ref indexed 0 chunks — include globs likely match nothing"
             );
-            let warning = "Indexed 0 files — nothing matched the collection's include globs. \
-                 Check the include patterns (e.g. add *.pm, *.js, *.adoc for non-Rust repos).";
+            let warning = if unreadable > 0 {
+                format!(
+                    "Indexed 0 files: {unreadable} file(s) were found but none could be read. \
+                     {}",
+                    skip_summary(&skipped)
+                )
+            } else {
+                "Indexed 0 files — nothing matched the collection's include globs. Check the \
+                 include patterns (e.g. add *.pm, *.js, *.adoc for non-Rust repos)."
+                    .to_string()
+            };
             // Keep the advisory on `last_error` (shown as the ref's headline)
             // AND on the timeline.
-            let _ = rag_db::set_ref_warning(&self.inner.db, ref_id, warning).await;
+            let _ = rag_db::set_ref_warning(&self.inner.db, ref_id, &warning).await;
             self.log_event(rag_db::NewLogEntry {
                 ref_id,
                 collection_id: collection.id,
                 level: rag_db::LogLevel::Warn,
                 phase: "ready".into(),
-                message: warning.to_string(),
+                message: warning.clone(),
                 commit_sha: Some(head.clone()),
                 files: Some(0),
                 chunks: Some(0),
@@ -930,10 +1982,84 @@ impl Indexer {
             })
             .await;
         }
+        if profile.is_some() && (extracted_docs > 0 || extraction_failures > 0) {
+            let level = if extraction_failures > 0 {
+                rag_db::LogLevel::Warn
+            } else {
+                rag_db::LogLevel::Info
+            };
+            self.log_event(rag_db::NewLogEntry {
+                ref_id,
+                collection_id: collection.id,
+                level,
+                phase: "ready".into(),
+                message: format!(
+                    "Extracted document fields from {extracted_docs} document(s); \
+                     {extraction_failures} failed."
+                ),
+                commit_sha: None,
+                files: Some(extracted_docs as i64),
+                chunks: None,
+                duration_ms: None,
+            })
+            .await;
+        }
+
+        // A build that indexed *something* can still have quietly dropped
+        // half the corpus. Report it: "ready" next to 3000 unreadable scans
+        // is the most expensive kind of silence in this system.
+        if chunks > 0 && unreadable > 0 {
+            self.log_event(rag_db::NewLogEntry {
+                ref_id,
+                collection_id: collection.id,
+                level: rag_db::LogLevel::Warn,
+                phase: "ready".into(),
+                message: format!(
+                    "Skipped {unreadable} of {} file(s). {}",
+                    items.len(),
+                    skip_summary(&skipped)
+                ),
+                commit_sha: None,
+                files: Some(indexed_files as i64),
+                chunks: None,
+                duration_ms: None,
+            })
+            .await;
+        }
+        if !partial.is_empty() {
+            // Naming a few is more actionable than a count alone, and the
+            // full list would flood the timeline on a big corpus.
+            let shown: Vec<&str> = partial.iter().take(5).map(String::as_str).collect();
+            let more = partial.len().saturating_sub(shown.len());
+            let suffix = if more > 0 {
+                format!(" (and {more} more)")
+            } else {
+                String::new()
+            };
+            self.log_event(rag_db::NewLogEntry {
+                ref_id,
+                collection_id: collection.id,
+                level: rag_db::LogLevel::Warn,
+                phase: "ready".into(),
+                message: format!(
+                    "{} document(s) were only read in part: {}{suffix}",
+                    partial.len(),
+                    shown.join(", ")
+                ),
+                commit_sha: None,
+                files: None,
+                chunks: None,
+                duration_ms: None,
+            })
+            .await;
+        }
+
         Ok(BuildOutcome::Swapped {
             files: indexed_files,
             chunks,
             commit: head,
+            live_uuid: build_uuid.to_string(),
+            all_items_read: item_failures == 0,
         })
     }
 }
@@ -996,16 +2122,23 @@ async fn drain_once(indexer: &Indexer) -> Result<(), WorkerError> {
     Ok(())
 }
 
-fn sha256_hex(s: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(s.as_bytes());
-    let bytes = h.finalize();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(out, "{b:02x}");
+/// Group per-file skip reasons into one operator-readable sentence.
+///
+/// Grouped rather than listed: a corpus of 3000 scans with OCR off produces
+/// one reason, not 3000 log lines, and the reason is the thing to act on.
+fn skip_summary(skipped: &BTreeMap<String, usize>) -> String {
+    if skipped.is_empty() {
+        return String::new();
     }
-    out
+    let mut parts: Vec<(usize, &String)> = skipped.iter().map(|(r, n)| (*n, r)).collect();
+    // Commonest reason first — that is the one worth fixing.
+    parts.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    let listed: Vec<String> = parts
+        .iter()
+        .take(3)
+        .map(|(n, reason)| format!("{n} × {reason}"))
+        .collect();
+    format!("Reasons: {}.", listed.join("; "))
 }
 
 /// Reciprocal-rank-fusion constant. The standard k=60 from Cormack et
@@ -1088,6 +2221,18 @@ pub async fn search_chunks(
     if path_glob.is_some() {
         pool *= PATH_FILTER_CANDIDATE_MULTIPLIER;
     }
+    // A reranker can only promote what fusion handed it, so widen the net
+    // when one is configured. The extra cost is one larger kNN query and a
+    // few more rows — trivial next to the model call that follows.
+    // Resolved once: the answer cannot change mid-search, and each call
+    // allocates a model list and runs a pool health check.
+    let rerank_model = rerank::model(
+        &indexer.inner.upstreams,
+        indexer.inner.config.rerank_model.as_deref(),
+    );
+    if rerank_model.is_some() {
+        pool = pool.max(indexer.inner.config.rerank_candidates);
+    }
 
     // Dense side. A missing on-disk index (ref never finished its first
     // build) is not an error here — fall back to lexical-only.
@@ -1114,7 +2259,12 @@ pub async fn search_chunks(
     let lexical =
         rag_db::lexical_search(&store, rref.collection_id, query_text, pool, path_glob).await?;
 
-    let fused = reciprocal_rank_fusion(&[&dense, &lexical], k);
+    // Fuse to the *candidate pool*, not to `k`: the reranker below can only
+    // promote what it is handed, so truncating here would make the widened
+    // pool pointless and leave the cross-encoder re-sorting the same `k`
+    // items retrieval already chose. Without a reranker `pool` is the
+    // ordinary candidate count and the final `truncate(k)` does the work.
+    let fused = reciprocal_rank_fusion(&[&dense, &lexical], pool);
     if fused.is_empty() {
         return Ok(Vec::new());
     }
@@ -1125,10 +2275,51 @@ pub async fn search_chunks(
         chunks.into_iter().map(|c| (c.vector_id, c)).collect();
     // Re-join in fused order, carrying the RRF score; drop any vector id
     // whose chunk row didn't come back (index/db drift; rare).
-    Ok(fused
+    let mut hits: Vec<(rag_db::Chunk, f32)> = fused
         .into_iter()
         .filter_map(|(vid, score)| by_vid.remove(&vid).map(|c| (c, score as f32)))
-        .collect())
+        .collect();
+
+    // Second opinion. Fusion scored the query and each passage separately;
+    // a cross-encoder sees the pair. On a corpus of near-identical documents
+    // that is often the only thing that can tell the right one from four
+    // that look just like it.
+    if let Some(model) = rerank_model {
+        let documents: Vec<String> = hits.iter().map(|(c, _)| c.content.clone()).collect();
+        match rerank::rerank(
+            &indexer.inner.http,
+            &indexer.inner.upstreams,
+            &model,
+            query_text,
+            &documents,
+        )
+        .await
+        {
+            Ok(order) if !order.is_empty() => {
+                let mut taken: Vec<Option<(rag_db::Chunk, f32)>> =
+                    hits.into_iter().map(Some).collect();
+                hits = order
+                    .into_iter()
+                    .filter_map(|(idx, score)| {
+                        taken
+                            .get_mut(idx)
+                            .and_then(Option::take)
+                            .map(|(c, _)| (c, score))
+                    })
+                    .collect();
+            }
+            Ok(_) => {}
+            // Degraded ordering beats no answer: a reranker that is down
+            // must not take search down with it.
+            Err(err) => tracing::warn!(
+                error = %err,
+                "rag: reranking failed; returning the fused ranking"
+            ),
+        }
+    }
+
+    hits.truncate(k);
+    Ok(hits)
 }
 
 #[cfg(test)]
@@ -1170,6 +2361,7 @@ mod tests {
                 data_dir: dir.path().to_path_buf(),
                 ..IndexerConfig::default()
             },
+            None,
         );
         let a = indexer.open_index(1, "uuid-1", Some(4)).unwrap();
         let b = indexer.open_index(1, "uuid-1", Some(4)).unwrap();
@@ -1208,6 +2400,9 @@ mod tests {
             git_url: git_url.into(),
             git_ref: git_ref.into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: "embed-model".into(),
             include_globs,
             exclude_globs: vec![],
@@ -1230,6 +2425,7 @@ mod tests {
                 data_dir: dir.path().to_path_buf(),
                 ..IndexerConfig::default()
             },
+            None,
         );
         (indexer, db, collection, rref, dir)
     }
@@ -1307,6 +2503,10 @@ mod tests {
             git_url: git_url.into(),
             git_ref: "main".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
+            sync_hook_set: false,
             embedding_model: "embed-model".into(),
             include_globs: vec!["**/*".into()],
             exclude_globs: vec![],
@@ -1336,6 +2536,10 @@ mod tests {
             last_indexed_at: None,
             last_indexed_commit: None,
             last_error: None,
+            dir_versions: Default::default(),
+            delta_cursor: None,
+            force_full_rebuild: false,
+            extractor_fingerprint: None,
             created_at: now,
             updated_at: now,
         }
@@ -1431,6 +2635,7 @@ mod tests {
                 clone_concurrency: 2,
                 ..IndexerConfig::default()
             },
+            None,
         );
 
         let mut ref_ids = Vec::new();
@@ -1441,6 +2646,9 @@ mod tests {
                 git_url: url.clone(),
                 git_ref: "main".into(),
                 pat: None,
+                source: Default::default(),
+                profile_id: None,
+                extraction_model: None,
                 embedding_model: "embed-model".into(),
                 include_globs: vec!["*.nomatch".into()],
                 exclude_globs: vec![],

@@ -40,6 +40,7 @@ pub mod notify_user;
 pub mod offer_download;
 pub mod qr;
 pub mod rag;
+pub mod rag_documents;
 pub mod read_skill;
 pub mod schedule;
 pub mod search_web;

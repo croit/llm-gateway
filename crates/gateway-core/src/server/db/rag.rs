@@ -13,11 +13,14 @@
 //!   * Glob arrays travel through the DB as JSON-encoded text — keeps the
 //!     schema simple and lets callers thread `Vec<String>` end-to-end.
 
+use std::collections::BTreeMap;
+
 use jiff::Timestamp;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use super::{DbError, Pool};
+use crate::server::crypto::{Crypto, Sealed};
 
 /// Lifecycle of a collection from the indexer's point of view. The chat
 /// surface only ever searches `Ready` collections; everything else is in
@@ -92,6 +95,39 @@ impl SearchMode {
     }
 }
 
+/// Which provider reaches a collection's files, and how it is configured.
+///
+/// The config is an opaque string map on purpose: its schema belongs to the
+/// provider (`ProviderFactory::config_fields`), not to this table, so
+/// registering a new provider never needs a migration. See
+/// `migrations/0058_rag_remote_sources.sql`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSpec {
+    /// `git` (the original behaviour) or a registered remote provider such
+    /// as `webdav`.
+    pub kind: String,
+    pub config: BTreeMap<String, String>,
+    /// Sealed with the at-rest key. This layer never sees the plaintext —
+    /// callers open it with `Crypto`, as `backends.api_key_ct` works.
+    pub secrets: Option<Sealed>,
+}
+
+impl Default for SourceSpec {
+    fn default() -> Self {
+        Self {
+            kind: "git".to_string(),
+            config: BTreeMap::new(),
+            secrets: None,
+        }
+    }
+}
+
+impl SourceSpec {
+    pub fn is_git(&self) -> bool {
+        self.kind == "git"
+    }
+}
+
 /// One configured codebase. Fields mirror the migration; see `0013_rag.sql`
 /// for the why-each-column commentary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +143,18 @@ pub struct Collection {
     pub git_url: String,
     pub git_ref: String,
     pub pat: Option<String>,
+    /// Which provider reaches this collection's files, and how.
+    pub source: SourceSpec,
+    /// Extraction profile applied to each document, or `None` for no
+    /// extraction. `None` is the right default: a code collection has no
+    /// fields worth pulling out, and the pass costs one LLM call per file.
+    pub profile_id: Option<i64>,
+    /// Chat model for the extraction pass. `None` uses the first model the
+    /// chat pool advertises.
+    pub extraction_model: Option<String>,
+    /// Whether this collection has a sync-trigger hook. The token itself is
+    /// never read back — only whether one is set.
+    pub sync_hook_set: bool,
     pub embedding_model: String,
     pub include_globs: Vec<String>,
     pub exclude_globs: Vec<String>,
@@ -137,6 +185,9 @@ pub struct NewCollection {
     pub git_url: String,
     pub git_ref: String,
     pub pat: Option<String>,
+    pub source: SourceSpec,
+    pub profile_id: Option<i64>,
+    pub extraction_model: Option<String>,
     pub embedding_model: String,
     pub include_globs: Vec<String>,
     pub exclude_globs: Vec<String>,
@@ -178,6 +229,41 @@ fn map_collection_row(row: &SqliteRow) -> Result<Collection, DbError> {
         git_url: row.try_get("git_url")?,
         git_ref: row.try_get("git_ref")?,
         pat: row.try_get("pat")?,
+        source: SourceSpec {
+            kind: row.try_get("source_kind")?,
+            config: {
+                let json: String = row.try_get("source_config_json")?;
+                serde_json::from_str(&json).map_err(|e| DbError::Decode {
+                    column: "source_config_json",
+                    source: anyhow::Error::from(e),
+                })?
+            },
+            secrets: {
+                let ct: Option<Vec<u8>> = row.try_get("source_secrets_ct")?;
+                let nonce: Option<Vec<u8>> = row.try_get("source_secrets_nonce")?;
+                // Half a sealed value is not a sealed value. A row with only
+                // one column set is corruption, and reading it as "no
+                // secrets" would hand the provider an empty password and
+                // produce a 401 that looks like a wrong credential.
+                match (ct, nonce) {
+                    (Some(ciphertext), Some(nonce)) => Some(Sealed { nonce, ciphertext }),
+                    (None, None) => None,
+                    _ => {
+                        return Err(DbError::Decode {
+                            column: "source_secrets_ct",
+                            source: anyhow::anyhow!(
+                                "ciphertext and nonce must both be present or both absent"
+                            ),
+                        });
+                    }
+                }
+            },
+        },
+        sync_hook_set: row
+            .try_get::<Option<String>, _>("sync_token_hash")?
+            .is_some(),
+        profile_id: row.try_get("profile_id")?,
+        extraction_model: row.try_get("extraction_model")?,
         embedding_model: row.try_get("embedding_model")?,
         include_globs: decode_globs(&include_globs_json, "include_globs_json")?,
         exclude_globs: decode_globs(&exclude_globs_json, "exclude_globs_json")?,
@@ -201,7 +287,8 @@ fn map_collection_row(row: &SqliteRow) -> Result<Collection, DbError> {
 }
 
 const COLLECTION_COLUMNS: &str = "id, data_uuid, name, description, git_url, git_ref, pat, \
-     embedding_model, include_globs_json, exclude_globs_json, chunk_size, chunk_overlap, \
+     source_kind, source_config_json, source_secrets_ct, source_secrets_nonce, \
+     profile_id, extraction_model, sync_token_hash, embedding_model, include_globs_json, exclude_globs_json, chunk_size, chunk_overlap, \
      search_mode, status, allowed_groups, last_indexed_at, last_indexed_commit, last_error, \
      created_at, updated_at";
 
@@ -219,12 +306,19 @@ pub async fn create_collection(pool: &Pool, new: &NewCollection) -> Result<Colle
     // Allocate the store-folder id up front so a freshly created
     // collection already knows where its per-collection data will live.
     let data_uuid = uuid::Uuid::new_v4().to_string();
+    let source_config_json =
+        serde_json::to_string(&new.source.config).map_err(|e| DbError::Decode {
+            column: "source_config_json",
+            source: e.into(),
+        })?;
     let id: i64 = sqlx::query_scalar(
         r#"INSERT INTO rag_collections
-           (data_uuid, name, description, git_url, git_ref, pat, embedding_model,
+           (data_uuid, name, description, git_url, git_ref, pat,
+            source_kind, source_config_json, source_secrets_ct, source_secrets_nonce,
+            profile_id, extraction_model, embedding_model,
             include_globs_json, exclude_globs_json, chunk_size, chunk_overlap,
             search_mode, status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
            RETURNING id"#,
     )
     .bind(&data_uuid)
@@ -233,6 +327,12 @@ pub async fn create_collection(pool: &Pool, new: &NewCollection) -> Result<Colle
     .bind(&new.git_url)
     .bind(&new.git_ref)
     .bind(&new.pat)
+    .bind(&new.source.kind)
+    .bind(&source_config_json)
+    .bind(new.source.secrets.as_ref().map(|s| s.ciphertext.clone()))
+    .bind(new.source.secrets.as_ref().map(|s| s.nonce.clone()))
+    .bind(new.profile_id)
+    .bind(&new.extraction_model)
     .bind(&new.embedding_model)
     .bind(&include_json)
     .bind(&exclude_json)
@@ -369,6 +469,50 @@ pub async fn delete_collection(pool: &Pool, id: i64) -> Result<bool, DbError> {
     Ok(affected > 0)
 }
 
+impl SourceSpec {
+    /// The stored secrets as plaintext; empty when there are none, or when
+    /// the blob will not open.
+    ///
+    /// Treating an unopenable blob as empty is deliberate: a rotated at-rest
+    /// key must not wedge the admin form or the consent flow, and re-entering
+    /// the credential (or reconnecting) is exactly the recovery. Callers that
+    /// need to tell "no secrets" from "cannot decrypt" — the indexer, which
+    /// must fail loudly rather than index nothing — open the blob themselves.
+    pub fn open_secrets(&self, crypto: &Crypto) -> BTreeMap<String, String> {
+        self.secrets
+            .as_ref()
+            .and_then(|s| crypto.open_str(&s.nonce, &s.ciphertext).ok())
+            .and_then(|plain| serde_json::from_str::<BTreeMap<String, String>>(&plain).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// Replace a collection's sealed source secrets.
+///
+/// Used by the OAuth consent callback, which is the one writer that adds a
+/// credential nobody typed. Takes the whole sealed blob rather than one key
+/// because the blob is a single AEAD ciphertext: there is no way to update a
+/// field inside it without opening and resealing the lot, and the caller has
+/// already done exactly that.
+pub async fn set_source_secrets(
+    pool: &Pool,
+    id: i64,
+    sealed: Option<&Sealed>,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE rag_collections
+         SET source_secrets_ct = ?, source_secrets_nonce = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(sealed.map(|s| s.ciphertext.clone()))
+    .bind(sealed.map(|s| s.nonce.clone()))
+    .bind(Timestamp::now().to_string())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Backfill the store-folder id for a pre-migration row that has none.
 /// Called by the indexer the first time it touches such a collection.
 pub async fn assign_data_uuid(pool: &Pool, id: i64, data_uuid: &str) -> Result<(), DbError> {
@@ -378,6 +522,122 @@ pub async fn assign_data_uuid(pool: &Pool, id: i64, data_uuid: &str) -> Result<(
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Re-queue a ref for a **full** rebuild, discarding the incremental state.
+///
+/// An incremental pass only re-indexes what the *source* changed. That is
+/// exactly wrong when what changed is on our side — the extraction profile,
+/// the chunk size, the include globs, the embedding model. The diff would
+/// find every file unchanged and the corpus would keep answering with the
+/// old shape, or worse (a new embedding model against vectors produced by
+/// the old one) answer confidently from an incomparable vector space.
+///
+/// Clearing `dir_versions` and setting `force_full_rebuild` sends the next
+/// build down the fresh-folder path, which rebuilds everything and swaps
+/// atomically — the live store keeps serving until it does.
+///
+/// `last_indexed_commit` is deliberately left alone: it is what
+/// `is_searchable` reads, and clearing it would take the corpus offline for
+/// the whole rebuild it is still perfectly able to answer from.
+/// Does moving a collection from `before` to `after` invalidate what is
+/// already indexed?
+///
+/// Derived by comparing the two rows rather than re-listed by each writer.
+/// Every surface that can edit a collection — the web form, `PATCH
+/// /api/v0/rag/collections/{id}`, anything added later — has to re-queue on
+/// exactly the same conditions, and a hand-copied predicate drifts: the API
+/// handler could already swap `embedding_model` without re-queueing, leaving
+/// the corpus answering confidently out of an incomparable vector space.
+///
+/// Only the fields that change how documents are *reached*, *read*, or
+/// *embedded* count. Credentials are deliberately excluded: rotating a
+/// password reaches the same files, and forcing a full rebuild of a large
+/// corpus on a routine rotation would be its own bug.
+pub fn index_shape_changed(before: &Collection, after: &Collection) -> bool {
+    before.source.kind != after.source.kind
+        || before.source.config != after.source.config
+        || before.git_url != after.git_url
+        || before.git_ref != after.git_ref
+        || before.profile_id != after.profile_id
+        || before.extraction_model != after.extraction_model
+        || before.embedding_model != after.embedding_model
+        || before.chunk_size != after.chunk_size
+        || before.chunk_overlap != after.chunk_overlap
+        || before.include_globs != after.include_globs
+        || before.exclude_globs != after.exclude_globs
+}
+
+pub async fn request_full_rebuild(pool: &Pool, ref_id: i64) -> Result<(), DbError> {
+    let now = Timestamp::now().to_string();
+    sqlx::query(
+        r#"UPDATE rag_collection_refs
+           SET status = 'pending', last_error = NULL,
+               dir_versions_json = '{}', delta_cursor = NULL,
+               force_full_rebuild = 1, updated_at = ?
+           WHERE id = ?"#,
+    )
+    .bind(&now)
+    .bind(ref_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Hash a sync token for storage and lookup.
+///
+/// The token itself is never stored, for the same reason a webhook secret
+/// is not: a leaked database must not hand out working trigger URLs.
+pub fn hash_sync_token(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Give a collection a fresh sync token, returning the plaintext.
+///
+/// Shown to the operator once, at the moment they create it — after that
+/// only the hash exists, and rotating is the only way to get a new one.
+pub async fn rotate_sync_token(pool: &Pool, id: i64) -> Result<String, DbError> {
+    use rand::Rng as _;
+    let token: String = {
+        const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        let mut rng = rand::rng();
+        (0..40)
+            .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
+            .collect()
+    };
+    sqlx::query("UPDATE rag_collections SET sync_token_hash = ?, updated_at = ? WHERE id = ?")
+        .bind(hash_sync_token(&token))
+        .bind(Timestamp::now().to_string())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(token)
+}
+
+/// Remove a collection's sync token, disabling its hook.
+pub async fn clear_sync_token(pool: &Pool, id: i64) -> Result<(), DbError> {
+    sqlx::query("UPDATE rag_collections SET sync_token_hash = NULL, updated_at = ? WHERE id = ?")
+        .bind(Timestamp::now().to_string())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The collection a sync token belongs to, or `None`.
+///
+/// Looked up by hash so an attacker with database read access still cannot
+/// mint a working URL.
+pub async fn find_by_sync_token(pool: &Pool, token: &str) -> Result<Option<Collection>, DbError> {
+    let q = format!("SELECT {COLLECTION_COLUMNS} FROM rag_collections WHERE sync_token_hash = ?");
+    let row = sqlx::query(&q)
+        .bind(hash_sync_token(token))
+        .fetch_optional(pool)
+        .await?;
+    row.as_ref().map(map_collection_row).transpose()
 }
 
 // ---- collection refs (branches / tags / commits) -------------------------
@@ -405,6 +665,30 @@ pub struct CollectionRef {
     pub last_indexed_at: Option<Timestamp>,
     pub last_indexed_commit: Option<String>,
     pub last_error: Option<String>,
+    /// Directory versions from the last completed walk, for subtree pruning
+    /// on the next one. A cache: losing it costs one full walk, never
+    /// correctness. Always empty for git sources and for providers that do
+    /// not report `subtree_pruning`.
+    pub dir_versions: BTreeMap<String, String>,
+    /// Provider-native change-feed cursor, for providers with a delta API.
+    /// Cursor for a provider-native change feed.
+    ///
+    /// **Not yet written by anything.** The column, [`super::super::rag`]'s
+    /// `DeltaPage` and `FileProvider::delta` are the seam for a cursor-based
+    /// provider (Microsoft Graph, Dropbox); the worker has no consumer for
+    /// one, so every provider currently re-walks. Wiring it up is a branch in
+    /// `gather_remote`, a cursor threaded back out of `build_ref_incremental`,
+    /// and teaching `sync::plan` a shape with no `TreeSnapshot` and no
+    /// `is_complete()` — a delta page hands you removals directly. Said here
+    /// so the next implementer finds out now rather than after writing the
+    /// provider method.
+    pub delta_cursor: Option<String>,
+    /// Set by `request_full_rebuild`; cleared by a successful swap.
+    pub force_full_rebuild: bool,
+    /// Which extractors were available when this ref was last built. `None`
+    /// for a ref built before the column existed. See
+    /// `migrations/0064_rag_extractor_fingerprint.sql`.
+    pub extractor_fingerprint: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -415,6 +699,16 @@ impl CollectionRef {
     /// on that store even while a later re-index rebuilds in a fresh folder.
     pub fn is_searchable(&self) -> bool {
         self.last_indexed_commit.is_some()
+    }
+
+    /// Whether the next build must go down the fresh-folder path rather than
+    /// updating the live store in place.
+    ///
+    /// Separate from [`Self::is_searchable`] on purpose: asking for a rebuild
+    /// must not make the corpus unsearchable while it runs. The rebuild is
+    /// atomic — the live store answers until the swap.
+    pub fn needs_full_rebuild(&self) -> bool {
+        self.force_full_rebuild || !self.is_searchable()
     }
 
     /// The URL the indexer should clone for this source: its own `git_url`
@@ -448,7 +742,9 @@ pub fn repo_basename(url: &str) -> String {
 }
 
 const REF_COLUMNS: &str = "id, collection_id, git_ref, git_url, is_primary, data_uuid, status, \
-     last_indexed_at, last_indexed_commit, last_error, created_at, updated_at";
+     last_indexed_at, last_indexed_commit, last_error, dir_versions_json, delta_cursor, \
+     force_full_rebuild, extractor_fingerprint, \
+     created_at, updated_at";
 
 fn map_ref_row(row: &SqliteRow) -> Result<CollectionRef, DbError> {
     let last_indexed_at: Option<String> = row.try_get("last_indexed_at")?;
@@ -470,6 +766,15 @@ fn map_ref_row(row: &SqliteRow) -> Result<CollectionRef, DbError> {
         last_indexed_at,
         last_indexed_commit: row.try_get("last_indexed_commit")?,
         last_error: row.try_get("last_error")?,
+        dir_versions: {
+            let json: String = row.try_get("dir_versions_json")?;
+            // A cache, so a decode failure degrades to "walk everything"
+            // rather than failing the build.
+            serde_json::from_str(&json).unwrap_or_default()
+        },
+        delta_cursor: row.try_get("delta_cursor")?,
+        force_full_rebuild: row.try_get::<i64, _>("force_full_rebuild")? != 0,
+        extractor_fingerprint: row.try_get("extractor_fingerprint")?,
         created_at: parse_ts(&created_at_s, "created_at")?,
         updated_at: parse_ts(&updated_at_s, "updated_at")?,
     })
@@ -705,23 +1010,55 @@ pub async fn swap_ref_index(
     ref_id: i64,
     new_data_uuid: &str,
     commit_sha: &str,
+    extractor_fingerprint: &str,
 ) -> Result<u64, DbError> {
     let now = Timestamp::now().to_string();
     let affected = sqlx::query(
         r#"UPDATE rag_collection_refs
            SET data_uuid = ?, last_indexed_commit = ?, last_indexed_at = ?,
-               status = 'ready', last_error = NULL, updated_at = ?
+               status = 'ready', last_error = NULL, force_full_rebuild = 0,
+               extractor_fingerprint = ?, updated_at = ?
            WHERE id = ? AND status = 'indexing'"#,
     )
     .bind(new_data_uuid)
     .bind(commit_sha)
     .bind(&now)
+    .bind(extractor_fingerprint)
     .bind(&now)
     .bind(ref_id)
     .execute(pool)
     .await?
     .rows_affected();
     Ok(affected)
+}
+
+/// Indexer-only: record what the last walk learned about the remote tree,
+/// so the next one can skip unchanged subtrees.
+///
+/// Called only after a walk that saw the whole tree
+/// (`TreeSnapshot::is_complete`). Storing versions from a partial walk would
+/// let the next sync prune a subtree whose contents we never actually read.
+pub async fn set_ref_sync_state(
+    pool: &Pool,
+    ref_id: i64,
+    dir_versions: &BTreeMap<String, String>,
+) -> Result<(), DbError> {
+    let json = serde_json::to_string(dir_versions).map_err(|e| DbError::Decode {
+        column: "dir_versions_json",
+        source: e.into(),
+    })?;
+    let now = Timestamp::now().to_string();
+    sqlx::query(
+        r#"UPDATE rag_collection_refs
+           SET dir_versions_json = ?, updated_at = ?
+           WHERE id = ?"#,
+    )
+    .bind(&json)
+    .bind(&now)
+    .bind(ref_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Indexer-only: a failed run. Status → `error` (message stored), but only
@@ -982,11 +1319,22 @@ pub struct IndexedFile {
     pub path: String,
     pub content_hash: String,
     pub indexed_at: Timestamp,
+    /// Deep link into the source's own UI, so an answer can be checked
+    /// against the original. `None` for sources with no per-file URL.
+    pub web_url: Option<String>,
+    /// Provider-native stable id, where the source has one.
+    pub remote_id: Option<String>,
+    /// The source's change token when this file was indexed. Compared for
+    /// equality on the next sync; never parsed.
+    pub source_version: Option<String>,
 }
 
 fn map_file_row(row: &SqliteRow) -> Result<IndexedFile, DbError> {
     let indexed_at_s: String = row.try_get("indexed_at")?;
     Ok(IndexedFile {
+        web_url: row.try_get("web_url")?,
+        remote_id: row.try_get("remote_id")?,
+        source_version: row.try_get("source_version")?,
         id: row.try_get("id")?,
         collection_id: row.try_get("collection_id")?,
         path: row.try_get("path")?,
@@ -1000,7 +1348,8 @@ pub async fn list_files_for_collection(
     collection_id: i64,
 ) -> Result<Vec<IndexedFile>, DbError> {
     let rows = sqlx::query(
-        r#"SELECT id, collection_id, path, content_hash, indexed_at
+        r#"SELECT id, collection_id, path, content_hash, indexed_at, web_url,
+                  remote_id, source_version
            FROM rag_files WHERE collection_id = ?"#,
     )
     .bind(collection_id)
@@ -1012,28 +1361,123 @@ pub async fn list_files_for_collection(
 /// Upsert a file row. Returns the file's id. Used by the indexer after
 /// it has decided this file needs (re-)embedding — paired with a
 /// [`delete_chunks_for_file`] so the old chunks/vectors are reaped first.
+/// Where a file came from, for the row `upsert_file` writes.
+///
+/// Grouped rather than passed as four `Option<&str>` in a row, which is an
+/// invitation to swap two of them silently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileOrigin<'a> {
+    pub web_url: Option<&'a str>,
+    pub remote_id: Option<&'a str>,
+    /// The source's change token. Stored so the next sync can tell this file
+    /// apart from a changed one without re-fetching it.
+    pub source_version: Option<&'a str>,
+}
+
 pub async fn upsert_file(
     pool: &Pool,
     collection_id: i64,
     path: &str,
     content_hash: &str,
+    origin: &FileOrigin<'_>,
 ) -> Result<i64, DbError> {
     let now = Timestamp::now().to_string();
     let id: i64 = sqlx::query_scalar(
-        r#"INSERT INTO rag_files (collection_id, path, content_hash, indexed_at)
-           VALUES (?, ?, ?, ?)
+        r#"INSERT INTO rag_files
+             (collection_id, path, content_hash, indexed_at, web_url, remote_id, source_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (collection_id, path) DO UPDATE
-               SET content_hash = excluded.content_hash,
-                   indexed_at   = excluded.indexed_at
+               SET content_hash   = excluded.content_hash,
+                   indexed_at     = excluded.indexed_at,
+                   web_url        = excluded.web_url,
+                   remote_id      = excluded.remote_id,
+                   source_version = excluded.source_version
            RETURNING id"#,
     )
     .bind(collection_id)
     .bind(path)
     .bind(content_hash)
     .bind(&now)
+    .bind(origin.web_url)
+    .bind(origin.remote_id)
+    .bind(origin.source_version)
     .fetch_one(pool)
     .await?;
     Ok(id)
+}
+
+/// Apply a batch of path moves atomically.
+///
+/// `rag_files` is `UNIQUE (collection_id, path)`, so moves cannot simply be
+/// applied one at a time: two files that swap paths collide whichever order
+/// you pick, and a file moving onto a path another file is about to vacate
+/// collides too. A single failed `UPDATE` propagates and takes the whole
+/// incremental pass with it.
+///
+/// So every row is first parked on a path nothing can collide with, then
+/// placed. The park path is keyed by `file_id` (unique by construction) and
+/// starts with a control character, which no real path from any provider
+/// contains — WebDAV paths come from hrefs and the Drive provider strips
+/// control characters in `sanitize_segment`. Both phases run in one
+/// transaction, so a crash between them cannot leave parked rows behind.
+pub async fn rename_files(pool: &Pool, moves: &[(i64, String)]) -> Result<(), DbError> {
+    if moves.is_empty() {
+        return Ok(());
+    }
+    let now = Timestamp::now().to_string();
+    let mut tx = pool.begin().await?;
+    for (file_id, _) in moves {
+        sqlx::query("UPDATE rag_files SET path = ? WHERE id = ?")
+            .bind(format!("\u{1}parking/{file_id}"))
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for (file_id, new_path) in moves {
+        sqlx::query("UPDATE rag_files SET path = ?, indexed_at = ? WHERE id = ?")
+            .bind(new_path)
+            .bind(&now)
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Move a file to a new path without touching its content.
+///
+/// The cheap half of incremental sync: a reorganised folder of 400 documents
+/// is 400 of these rather than 400 re-extractions.
+pub async fn rename_file(pool: &Pool, file_id: i64, new_path: &str) -> Result<(), DbError> {
+    sqlx::query("UPDATE rag_files SET path = ?, indexed_at = ? WHERE id = ?")
+        .bind(new_path)
+        .bind(Timestamp::now().to_string())
+        .bind(file_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The vector ids belonging to one file, so they can be removed from the
+/// usearch index when the file is replaced or deleted. Without this, a
+/// deleted document's vectors keep answering searches.
+pub async fn vector_ids_for_file(pool: &Pool, file_id: i64) -> Result<Vec<i64>, DbError> {
+    let rows: Vec<i64> = sqlx::query_scalar("SELECT vector_id FROM rag_chunks WHERE file_id = ?")
+        .bind(file_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// Delete a file and everything derived from it. Chunks and extracted
+/// document rows go with it via `ON DELETE CASCADE`.
+pub async fn delete_file(pool: &Pool, file_id: i64) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM rag_files WHERE id = ?")
+        .bind(file_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 // ---- chunk-side metadata --------------------------------------------------
@@ -1048,11 +1492,82 @@ pub struct Chunk {
     pub collection_id: i64,
     pub file_id: i64,
     pub file_path: String,
+    /// The source's own link to this file, when it has one — what turns a
+    /// citation into something the reader can open and verify.
+    pub web_url: Option<String>,
     pub chunk_index: i64,
-    pub start_line: i64,
-    pub end_line: i64,
+    pub loc: ChunkLoc,
     pub content: String,
     pub vector_id: i64,
+}
+
+/// The unit a chunk's position is measured in.
+///
+/// Source files are cited by line. A PDF, a scan or an office document is
+/// cited by page: line numbers do not survive extraction and a page is what
+/// a person can actually open the original to and check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocKind {
+    Line,
+    Page,
+}
+
+impl LocKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LocKind::Line => "line",
+            LocKind::Page => "page",
+        }
+    }
+
+    /// Unknown values read as `Line`, which is what every pre-existing row
+    /// is. Stores are regenerable, so this is a decoding convenience rather
+    /// than a compatibility promise.
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "page" => LocKind::Page,
+            _ => LocKind::Line,
+        }
+    }
+}
+
+/// Where a chunk sits in its document. Inclusive on both ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkLoc {
+    pub kind: LocKind,
+    pub from: i64,
+    pub to: i64,
+}
+
+impl ChunkLoc {
+    pub fn lines(from: i64, to: i64) -> Self {
+        Self {
+            kind: LocKind::Line,
+            from,
+            to,
+        }
+    }
+
+    pub fn pages(from: i64, to: i64) -> Self {
+        Self {
+            kind: LocKind::Page,
+            from,
+            to,
+        }
+    }
+
+    /// Human- and model-readable citation, e.g. `lines 12-30` or `page 4`.
+    /// One string rather than raw numbers, because this is what a model
+    /// quotes back to the user and a bare pair of integers invites it to
+    /// invent the unit.
+    pub fn label(&self) -> String {
+        let unit = self.kind.as_str();
+        if self.from == self.to {
+            format!("{unit} {}", self.from)
+        } else {
+            format!("{unit}s {}-{}", self.from, self.to)
+        }
+    }
 }
 
 /// A chunk awaiting insertion. The indexer fills these out then calls
@@ -1061,8 +1576,7 @@ pub struct Chunk {
 pub struct NewChunk {
     pub file_id: i64,
     pub chunk_index: i64,
-    pub start_line: i64,
-    pub end_line: i64,
+    pub loc: ChunkLoc,
     pub content: String,
     pub vector_id: i64,
 }
@@ -1073,9 +1587,16 @@ fn map_chunk_row(row: &SqliteRow) -> Result<Chunk, DbError> {
         collection_id: row.try_get("collection_id")?,
         file_id: row.try_get("file_id")?,
         file_path: row.try_get("file_path")?,
+        web_url: row.try_get("web_url").ok().flatten(),
         chunk_index: row.try_get("chunk_index")?,
-        start_line: row.try_get("start_line")?,
-        end_line: row.try_get("end_line")?,
+        loc: {
+            let kind: String = row.try_get("loc_kind")?;
+            ChunkLoc {
+                kind: LocKind::from_db(&kind),
+                from: row.try_get("loc_from")?,
+                to: row.try_get("loc_to")?,
+            }
+        },
         content: row.try_get("content")?,
         vector_id: row.try_get("vector_id")?,
     })
@@ -1094,14 +1615,16 @@ pub async fn insert_chunks(
     for c in chunks {
         sqlx::query(
             r#"INSERT INTO rag_chunks
-               (collection_id, file_id, chunk_index, start_line, end_line, content, vector_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+               (collection_id, file_id, chunk_index, loc_kind, loc_from, loc_to,
+                content, vector_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(collection_id)
         .bind(c.file_id)
         .bind(c.chunk_index)
-        .bind(c.start_line)
-        .bind(c.end_line)
+        .bind(c.loc.kind.as_str())
+        .bind(c.loc.from)
+        .bind(c.loc.to)
         .bind(&c.content)
         .bind(c.vector_id)
         .execute(&mut *tx)
@@ -1232,7 +1755,8 @@ pub async fn scan_chunks(
 ) -> Result<Vec<Chunk>, DbError> {
     let sql = format!(
         "SELECT c.id, c.collection_id, c.file_id, f.path AS file_path, \
-                c.chunk_index, c.start_line, c.end_line, c.content, c.vector_id \
+                c.chunk_index, c.loc_kind, c.loc_from, c.loc_to, c.content, c.vector_id, \
+                f.web_url AS web_url \
          FROM rag_chunks c JOIN rag_files f ON f.id = c.file_id \
          WHERE c.collection_id = ? AND c.id > ?{} \
          ORDER BY c.id ASC LIMIT ?",
@@ -1287,7 +1811,8 @@ pub async fn chunks_by_vector_ids(
     let placeholders = vec!["?"; vector_ids.len()].join(",");
     let q = format!(
         "SELECT c.id, c.collection_id, c.file_id, f.path AS file_path, \
-                c.chunk_index, c.start_line, c.end_line, c.content, c.vector_id \
+                c.chunk_index, c.loc_kind, c.loc_from, c.loc_to, c.content, c.vector_id, \
+                f.web_url AS web_url \
          FROM rag_chunks c \
          JOIN rag_files f ON f.id = c.file_id \
          WHERE c.collection_id = ? AND c.vector_id IN ({placeholders})"
@@ -1325,6 +1850,9 @@ mod tests {
             git_url: "https://example.invalid/repo.git".into(),
             git_ref: "main".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: "embed-model".into(),
             include_globs: vec!["*.rs".into()],
             exclude_globs: vec!["target/".into()],
@@ -1403,10 +1931,10 @@ mod tests {
     #[tokio::test]
     async fn upsert_file_returns_stable_id_and_updates_hash() {
         let (store, _dir) = store().await;
-        let id1 = upsert_file(&store, 1, "src/main.rs", "hash-a")
+        let id1 = upsert_file(&store, 1, "src/main.rs", "hash-a", &Default::default())
             .await
             .unwrap();
-        let id2 = upsert_file(&store, 1, "src/main.rs", "hash-b")
+        let id2 = upsert_file(&store, 1, "src/main.rs", "hash-b", &Default::default())
             .await
             .unwrap();
         assert_eq!(id1, id2, "upsert must keep the same row id");
@@ -1418,7 +1946,9 @@ mod tests {
     #[tokio::test]
     async fn chunks_round_trip_with_vector_id_join() {
         let (store, _dir) = store().await;
-        let f = upsert_file(&store, 1, "src/lib.rs", "h").await.unwrap();
+        let f = upsert_file(&store, 1, "src/lib.rs", "h", &Default::default())
+            .await
+            .unwrap();
         insert_chunks(
             &store,
             1,
@@ -1426,16 +1956,14 @@ mod tests {
                 NewChunk {
                     file_id: f,
                     chunk_index: 0,
-                    start_line: 1,
-                    end_line: 10,
+                    loc: ChunkLoc::lines(1, 10),
                     content: "first".into(),
                     vector_id: 10,
                 },
                 NewChunk {
                     file_id: f,
                     chunk_index: 1,
-                    start_line: 11,
-                    end_line: 20,
+                    loc: ChunkLoc::lines(11, 20),
                     content: "second".into(),
                     vector_id: 11,
                 },
@@ -1459,7 +1987,9 @@ mod tests {
         // FTS5 lexical side: an identifier query should match the chunk
         // whose underscored symbol tokenizes to the same terms.
         let (store, _dir) = store().await;
-        let f = upsert_file(&store, 1, "global.yaml.in", "h").await.unwrap();
+        let f = upsert_file(&store, 1, "global.yaml.in", "h", &Default::default())
+            .await
+            .unwrap();
         insert_chunks(
             &store,
             1,
@@ -1467,16 +1997,14 @@ mod tests {
                 NewChunk {
                     file_id: f,
                     chunk_index: 0,
-                    start_line: 1,
-                    end_line: 1,
+                    loc: ChunkLoc::lines(1, 1),
                     content: "name: osd_op_timeout desc: timeout for osd ops".into(),
                     vector_id: 1,
                 },
                 NewChunk {
                     file_id: f,
                     chunk_index: 1,
-                    start_line: 2,
-                    end_line: 2,
+                    loc: ChunkLoc::lines(2, 2),
                     content: "crush choose_total_tries placement retries".into(),
                     vector_id: 2,
                 },
@@ -1567,9 +2095,15 @@ mod tests {
         set_ref_status(&pool, indexed.id, CollectionStatus::Indexing)
             .await
             .unwrap();
-        swap_ref_index(&pool, indexed.id, "u-indexed", "sha")
-            .await
-            .unwrap();
+        swap_ref_index(
+            &pool,
+            indexed.id,
+            "u-indexed",
+            "sha",
+            "ocr=false,office=false",
+        )
+        .await
+        .unwrap();
 
         // Deleting the primary must hand primacy to the searchable survivor,
         // never leave the collection without a primary.
@@ -1597,12 +2131,22 @@ mod tests {
         let r = add_ref(&pool, c.id, "reef", None, true).await.unwrap();
 
         // Swap is a no-op unless the ref is mid-index.
-        assert_eq!(swap_ref_index(&pool, r.id, "u1", "sha1").await.unwrap(), 0);
+        assert_eq!(
+            swap_ref_index(&pool, r.id, "u1", "sha1", "ocr=false,office=false")
+                .await
+                .unwrap(),
+            0
+        );
 
         set_ref_status(&pool, r.id, CollectionStatus::Indexing)
             .await
             .unwrap();
-        assert_eq!(swap_ref_index(&pool, r.id, "u1", "sha1").await.unwrap(), 1);
+        assert_eq!(
+            swap_ref_index(&pool, r.id, "u1", "sha1", "ocr=false,office=false")
+                .await
+                .unwrap(),
+            1
+        );
         let after = find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
         assert_eq!(after.status, CollectionStatus::Ready);
         assert_eq!(after.data_uuid, "u1");
@@ -1611,7 +2155,9 @@ mod tests {
         // A re-queue must not be clobbered by a stale build finishing.
         request_ref_reindex(&pool, r.id).await.unwrap();
         assert_eq!(
-            swap_ref_index(&pool, r.id, "u2", "sha2").await.unwrap(),
+            swap_ref_index(&pool, r.id, "u2", "sha2", "ocr=false,office=false")
+                .await
+                .unwrap(),
             0,
             "swap must not overwrite a re-queued ref"
         );
@@ -1693,7 +2239,7 @@ mod tests {
         set_ref_status(&pool, a.id, CollectionStatus::Indexing)
             .await
             .unwrap();
-        swap_ref_index(&pool, a.id, "uuid-a", "sha-a")
+        swap_ref_index(&pool, a.id, "uuid-a", "sha-a", "ocr=false,office=false")
             .await
             .unwrap();
         let searchable = searchable_refs(&pool, c.id).await.unwrap();
@@ -1735,7 +2281,7 @@ mod tests {
         set_ref_status(&pool, r.id, CollectionStatus::Indexing)
             .await
             .unwrap();
-        swap_ref_index(&pool, r.id, &r.data_uuid, "sha")
+        swap_ref_index(&pool, r.id, &r.data_uuid, "sha", "ocr=false,office=false")
             .await
             .unwrap();
         set_ref_warning(&pool, r.id, "Indexed 0 files — check globs")
@@ -1902,5 +2448,280 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The predicate both collection editors re-queue on.
+    ///
+    /// Pinned here because the cost of a false negative is silent and severe:
+    /// a corpus that keeps answering out of a store built to different
+    /// settings. `PATCH /api/v0/rag/collections/{id}` used to have no check at
+    /// all and could swap the embedding model without re-queueing.
+    /// Two files swapping paths must not violate `UNIQUE (collection_id,
+    /// path)`.
+    ///
+    /// Regression: moves were applied one `UPDATE` at a time, so a swap
+    /// collided whichever order was chosen and the error propagated out of
+    /// the incremental pass, failing the whole sync. Reorganising a folder is
+    /// the ordinary case this has to survive.
+    /// Asking for a rebuild must not make the corpus unsearchable while it
+    /// runs.
+    ///
+    /// Regression: `request_full_rebuild` forced the fresh-folder path by
+    /// NULLing `last_indexed_commit`, which is also what `is_searchable`
+    /// reads — so clicking Re-index made `rag_search` answer "its first index
+    /// hasn't completed" for the whole build, on a corpus that was sitting
+    /// right there. A full rebuild is atomic; the live store serves until the
+    /// swap.
+    #[tokio::test]
+    async fn asking_for_a_rebuild_keeps_the_collection_searchable() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let rref = add_ref(&pool, c.id, "main", None, true).await.unwrap();
+
+        set_ref_status(&pool, rref.id, CollectionStatus::Indexing)
+            .await
+            .unwrap();
+        assert_eq!(
+            swap_ref_index(&pool, rref.id, "uuid-1", "abc123", "ocr=false,office=false")
+                .await
+                .unwrap(),
+            1
+        );
+        let indexed = list_refs(&pool, c.id).await.unwrap().remove(0);
+        assert!(indexed.is_searchable());
+        assert!(
+            !indexed.needs_full_rebuild(),
+            "a ref that just finished updates in place next time"
+        );
+
+        request_full_rebuild(&pool, rref.id).await.unwrap();
+        let queued = list_refs(&pool, c.id).await.unwrap().remove(0);
+        assert!(
+            queued.is_searchable(),
+            "the live store still answers while the rebuild runs"
+        );
+        assert!(
+            queued.needs_full_rebuild(),
+            "...but the next build goes down the fresh-folder path"
+        );
+
+        // And finishing the rebuild clears the request.
+        set_ref_status(&pool, rref.id, CollectionStatus::Indexing)
+            .await
+            .unwrap();
+        swap_ref_index(&pool, rref.id, "uuid-2", "def456", "ocr=false,office=false")
+            .await
+            .unwrap();
+        let done = list_refs(&pool, c.id).await.unwrap().remove(0);
+        assert!(!done.needs_full_rebuild());
+    }
+
+    /// A ref that has never completed still rebuilds from scratch.
+    /// Turning on OCR must invalidate what was indexed without it.
+    ///
+    /// Regression: a file the ladder could not read was recorded as skipped,
+    /// and a skip does not stop a pass recording its directory versions —
+    /// correctly, since the file will not become readable on its own. But it
+    /// does the moment an operator wires up the missing backend. Index 500
+    /// scans with no OCR pool, add one, and every later sync saw those
+    /// directories unchanged and pruned past them; the scans stayed invisible
+    /// until someone forced a full rebuild by hand.
+    #[tokio::test]
+    async fn gaining_an_extractor_invalidates_what_was_indexed_without_it() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let rref = add_ref(&pool, c.id, "main", None, true).await.unwrap();
+
+        set_ref_status(&pool, rref.id, CollectionStatus::Indexing)
+            .await
+            .unwrap();
+        swap_ref_index(&pool, rref.id, "uuid-1", "sha", "ocr=false,office=false")
+            .await
+            .unwrap();
+
+        let built = list_refs(&pool, c.id).await.unwrap().remove(0);
+        assert_eq!(
+            built.extractor_fingerprint.as_deref(),
+            Some("ocr=false,office=false"),
+            "the build records what it could read with"
+        );
+        assert!(
+            !built.needs_full_rebuild(),
+            "nothing changed, so the next pass may diff"
+        );
+
+        // The worker compares this against its live extractor set; a
+        // different answer sends the build down the fresh-folder path.
+        assert_ne!(
+            built.extractor_fingerprint.as_deref(),
+            Some("ocr=true,office=false"),
+            "wiring OCR is a different answer, and must not be diffed against"
+        );
+
+        // A ref built before the column existed has no fingerprint, which
+        // also differs from any live set — so it rebuilds once and settles.
+        sqlx::query("UPDATE rag_collection_refs SET extractor_fingerprint = NULL WHERE id = ?")
+            .bind(rref.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy = list_refs(&pool, c.id).await.unwrap().remove(0);
+        assert_eq!(legacy.extractor_fingerprint, None);
+    }
+
+    #[tokio::test]
+    async fn a_never_indexed_ref_needs_a_full_build() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let rref = add_ref(&pool, c.id, "main", None, true).await.unwrap();
+        assert!(!rref.is_searchable());
+        assert!(rref.needs_full_rebuild());
+    }
+
+    #[tokio::test]
+    async fn files_can_swap_paths_in_one_batch() {
+        let pool = fresh().await;
+        let store = crate::server::db::open_collection_store(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let _ = &pool;
+
+        let origin = FileOrigin {
+            web_url: None,
+            remote_id: None,
+            source_version: None,
+        };
+        let a = upsert_file(&store, 1, "2024/report.pdf", "h1", &origin)
+            .await
+            .unwrap();
+        let b = upsert_file(&store, 1, "2025/report.pdf", "h2", &origin)
+            .await
+            .unwrap();
+
+        rename_files(
+            &store,
+            &[
+                (a, "2025/report.pdf".to_string()),
+                (b, "2024/report.pdf".to_string()),
+            ],
+        )
+        .await
+        .expect("a swap is applied as one batch, not two colliding updates");
+
+        let path_a: String = sqlx::query_scalar("SELECT path FROM rag_files WHERE id = ?")
+            .bind(a)
+            .fetch_one(&store)
+            .await
+            .unwrap();
+        let path_b: String = sqlx::query_scalar("SELECT path FROM rag_files WHERE id = ?")
+            .bind(b)
+            .fetch_one(&store)
+            .await
+            .unwrap();
+        assert_eq!(path_a, "2025/report.pdf");
+        assert_eq!(path_b, "2024/report.pdf");
+    }
+
+    /// And nothing is left parked if the batch is a plain move.
+    #[tokio::test]
+    async fn a_batch_of_moves_leaves_no_parked_rows() {
+        let store = crate::server::db::open_collection_store(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let origin = FileOrigin {
+            web_url: None,
+            remote_id: None,
+            source_version: None,
+        };
+        let a = upsert_file(&store, 1, "old/a.pdf", "h", &origin)
+            .await
+            .unwrap();
+        rename_files(&store, &[(a, "new/a.pdf".to_string())])
+            .await
+            .unwrap();
+        let parked: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM rag_files WHERE path LIKE char(1) || '%'")
+                .fetch_one(&store)
+                .await
+                .unwrap();
+        assert_eq!(parked, 0);
+    }
+
+    #[tokio::test]
+    async fn index_shape_changes_are_recognised_and_credential_rotation_is_not_one() {
+        let pool = fresh().await;
+        let base = create_collection(&pool, &sample_new()).await.unwrap();
+
+        assert!(
+            !index_shape_changed(&base, &base),
+            "an unchanged collection does not force a rebuild"
+        );
+
+        // Every field that changes how documents are reached, read or embedded.
+        let embedding = Collection {
+            embedding_model: "a-different-model".into(),
+            ..base.clone()
+        };
+        assert!(
+            index_shape_changed(&base, &embedding),
+            "a new embedding model makes the stored vectors incomparable"
+        );
+
+        let profile = Collection {
+            profile_id: Some(7),
+            ..base.clone()
+        };
+        assert!(index_shape_changed(&base, &profile));
+
+        let chunking = Collection {
+            chunk_size: base.chunk_size + 1,
+            ..base.clone()
+        };
+        assert!(index_shape_changed(&base, &chunking));
+
+        let globs = Collection {
+            include_globs: vec!["*.md".into()],
+            ..base.clone()
+        };
+        assert!(index_shape_changed(&base, &globs));
+
+        let mut moved = base.clone();
+        moved.source.kind = "webdav".into();
+        assert!(
+            index_shape_changed(&base, &moved),
+            "pointing at a different provider invalidates the corpus"
+        );
+
+        let mut elsewhere = base.clone();
+        elsewhere
+            .source
+            .config
+            .insert("root".into(), "Other/Folder".into());
+        assert!(index_shape_changed(&base, &elsewhere));
+
+        // ...but not a rotated password: it reaches the same files, and
+        // rebuilding a large corpus on a routine rotation would be its own bug.
+        let rotated = Collection {
+            source: SourceSpec {
+                secrets: Some(Sealed {
+                    nonce: vec![1, 2, 3],
+                    ciphertext: vec![4, 5, 6],
+                }),
+                ..base.source.clone()
+            },
+            ..base.clone()
+        };
+        assert!(
+            !index_shape_changed(&base, &rotated),
+            "rotating a credential reaches the same files"
+        );
+
+        // Nor does renaming it or editing its description.
+        let renamed = Collection {
+            name: "renamed".into(),
+            description: Some("new words".into()),
+            ..base.clone()
+        };
+        assert!(!index_shape_changed(&base, &renamed));
     }
 }

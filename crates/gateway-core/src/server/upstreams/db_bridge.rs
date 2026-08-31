@@ -138,6 +138,7 @@ fn parse_kind(s: &str) -> Option<PoolKind> {
         "image" => Some(PoolKind::Image),
         "speech" => Some(PoolKind::Speech),
         "ocr" => Some(PoolKind::Ocr),
+        "rerank" => Some(PoolKind::Rerank),
         _ => None,
     }
 }

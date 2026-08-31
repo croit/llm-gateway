@@ -708,6 +708,9 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
                 git_url: git_url.into(),
                 git_ref: git_ref.into(),
                 pat: None,
+                source: Default::default(),
+                profile_id: None,
+                extraction_model: None,
                 embedding_model: "demo-embed".into(),
                 include_globs: vec!["**/*.md".into(), "**/*.rs".into()],
                 exclude_globs: vec!["target/**".into(), "node_modules/**".into()],
@@ -720,7 +723,14 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
         rag::mark_indexed(&state.db, c.id, commit).await?;
         let r = rag::add_ref(&state.db, c.id, git_ref, None, true).await?;
         rag::set_ref_status(&state.db, r.id, rag::CollectionStatus::Indexing).await?;
-        rag::swap_ref_index(&state.db, r.id, &uuid::Uuid::new_v4().to_string(), commit).await?;
+        rag::swap_ref_index(
+            &state.db,
+            r.id,
+            &uuid::Uuid::new_v4().to_string(),
+            commit,
+            "ocr=false,office=false",
+        )
+        .await?;
     }
 
     // --- MCP connector catalog (for the /admin/connectors + /integrations

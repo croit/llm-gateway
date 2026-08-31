@@ -414,7 +414,11 @@ pub fn build_authorize_url(
     scopes: &[String],
     state: &str,
     pkce_challenge: &str,
-    resource: &str,
+    // RFC 8707 audience binding. `Some` for MCP, where the token must be
+    // bound to the server it will be presented to; `None` for an ordinary
+    // OAuth provider like Google, which does not implement RFC 8707 and has
+    // no audience to name.
+    resource: Option<&str>,
 ) -> Result<String, OauthError> {
     let mut url =
         Url::parse(authorize_url).map_err(|_| OauthError::Url(authorize_url.to_string()))?;
@@ -425,9 +429,11 @@ pub fn build_authorize_url(
             .append_pair("redirect_uri", redirect_uri)
             .append_pair("state", state)
             .append_pair("code_challenge", pkce_challenge)
-            .append_pair("code_challenge_method", "S256")
+            .append_pair("code_challenge_method", "S256");
+        if let Some(resource) = resource {
             // RFC 8707: bind the issued token to the MCP server.
-            .append_pair("resource", resource);
+            q.append_pair("resource", resource);
+        }
         if !scopes.is_empty() {
             q.append_pair("scope", &scopes.join(" "));
         }
@@ -475,7 +481,9 @@ pub async fn exchange_code(
     redirect_uri: &str,
     client_id: &str,
     client_secret: Option<&str>,
-    resource: &str,
+    // See `build_authorize_url`: `Some` for MCP, `None` for a plain OAuth2
+    // provider.
+    resource: Option<&str>,
 ) -> Result<Tokens, OauthError> {
     let mut form = vec![
         ("grant_type", "authorization_code"),
@@ -483,8 +491,10 @@ pub async fn exchange_code(
         ("redirect_uri", redirect_uri),
         ("code_verifier", pkce_verifier),
         ("client_id", client_id),
-        ("resource", resource),
     ];
+    if let Some(resource) = resource {
+        form.push(("resource", resource));
+    }
     if let Some(secret) = client_secret {
         form.push(("client_secret", secret));
     }
@@ -617,7 +627,7 @@ mod tests {
             &["a".into(), "b".into()],
             "state-xyz",
             "challenge-abc",
-            "https://mcp.example/",
+            Some("https://mcp.example/"),
         )
         .unwrap();
         assert!(url.starts_with("https://accounts.example/auth?"));
@@ -640,7 +650,7 @@ mod tests {
             &[],
             "s",
             "ch",
-            "https://mcp/",
+            Some("https://mcp/"),
         )
         .unwrap();
         assert!(!url.contains("scope="));

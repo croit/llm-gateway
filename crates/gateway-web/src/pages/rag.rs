@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use plait::{Html, ToHtml, html};
 use rama::http::service::web::extract::{Path, State};
+use rama::http::service::web::response::IntoResponse;
 use rama::http::{Request, Response};
 use serde::Deserialize;
 
@@ -34,9 +35,14 @@ use session_core::chrome::{
 use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
+use gateway_core::server::crypto::Crypto;
 use gateway_core::server::db::rag as rag_db;
+use gateway_core::server::db::rag_documents as docs_db;
 use gateway_core::server::upstreams::PoolKind;
+use gateway_features::server::rag::source::ProviderRegistry;
 use gateway_runtime::rama_server::state::RamaState;
+
+use super::rag_source;
 
 #[derive(Deserialize)]
 struct CreateForm {
@@ -45,6 +51,11 @@ struct CreateForm {
     git_url: String,
     git_ref: Option<String>,
     pat: Option<String>,
+    /// Extraction profile to apply, or absent/`0` for none.
+    #[serde(default)]
+    profile_id: Option<i64>,
+    #[serde(default)]
+    extraction_model: Option<String>,
     embedding_model: String,
     include_globs: Option<String>,
     exclude_globs: Option<String>,
@@ -97,7 +108,14 @@ pub async fn rag_index(State(state): State<Arc<RamaState>>, req: Request) -> Res
     )
     .await
     .filter(|m| embedding_models.iter().any(|a| a == m));
-    let body = render_body(lang, &rows, &embedding_models, default_embedding.as_deref());
+    let body = render_body(
+        lang,
+        &rows,
+        &embedding_models,
+        default_embedding.as_deref(),
+        providers(&state),
+        &docs_db::list_profiles(&state.db).await.unwrap_or_default(),
+    );
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "rag-page-title");
     {
@@ -131,7 +149,18 @@ pub async fn rag_create(State(state): State<Arc<RamaState>>, req: Request) -> Re
         Ok(f) => f,
         Err(err) => return malformed_form_toast(lang, err),
     };
-    let new = match validate(lang, form) {
+    let source = match rag_source::to_spec(
+        lang,
+        rag_source::parse_form(&form_pairs(&body)),
+        providers(&state),
+        &state.crypto,
+        None,
+        state.http.clone(),
+    ) {
+        Ok(spec) => spec,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let new = match validate(lang, form, source) {
         Ok(n) => n,
         Err(msg) => return toast(FlashKind::Error, msg),
     };
@@ -194,6 +223,259 @@ pub async fn rag_create(State(state): State<Arc<RamaState>>, req: Request) -> Re
             message: toast_msg,
         }),
     ])
+}
+
+/// The provider registry the forms render from.
+///
+/// Falls back to the built-in set when no indexer is wired (RAG is not
+/// configured on this deployment), so the source picker still renders and
+/// the operator sees what *would* be available rather than a form with a
+/// silently missing control.
+fn providers(state: &RamaState) -> &ProviderRegistry {
+    state.provider_registry()
+}
+
+/// Decode a urlencoded body into ordered pairs, for the provider fields
+/// whose names are not known at compile time.
+fn form_pairs(body: &[u8]) -> Vec<(String, String)> {
+    serde_urlencoded::from_bytes::<Vec<(String, String)>>(body).unwrap_or_default()
+}
+
+/// POST /rag/test-source — reach the source described by the submitted
+/// form and report what came back, as a toast.
+///
+/// Exists because the alternative is finding out that a folder path or an
+/// app password is wrong *after* committing to a multi-hour first index, by
+/// reading an error on the timeline. `collection_id` (optional) lets an edit
+/// form be tested without retyping a stored secret.
+pub async fn rag_test_source(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let (_, body) = req.into_parts();
+    let body = match read_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    let pairs = form_pairs(&body);
+    let parsed = rag_source::parse_form(&pairs);
+    if parsed.kind == rag_source::GIT_KIND {
+        return toast(FlashKind::Info, t(lang, "rag-source-test-git"));
+    }
+
+    // An edit form supplies the collection so its stored secret can stand in
+    // for a blank password field — testing must not require retyping it.
+    //
+    // But only against the settings that secret was stored for: see
+    // `stored_secrets_may_stand_in`. Otherwise this probe will present a
+    // stored credential to whatever host the form asked for.
+    let stored = match pairs.iter().find(|(k, _)| k == "collection_id") {
+        Some((_, id)) => match id.parse::<i64>() {
+            Ok(id) => rag_db::find_collection_by_id(&state.db, id)
+                .await
+                .ok()
+                .flatten()
+                .map(|c| c.source),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let registry = providers(&state);
+    let existing = match (stored, registry.get(&parsed.kind)) {
+        (Some(spec), Some(factory)) => {
+            rag_source::stored_secrets_may_stand_in(factory.as_ref(), &parsed.config, &spec)
+                .then_some(spec)
+        }
+        _ => None,
+    };
+
+    let provider = match rag_source::provider_for_probe(
+        lang,
+        parsed,
+        registry,
+        &state.crypto,
+        existing.as_ref(),
+        state.http.clone(),
+    ) {
+        Ok(p) => p,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    match provider.probe().await {
+        Ok(report) => {
+            let mut message = match report.account.as_deref() {
+                Some(account) => t_args(
+                    lang,
+                    "rag-source-test-ok",
+                    &i18n::args([
+                        ("account", account.to_string().into()),
+                        ("entries", (report.root_entries as i64).into()),
+                    ]),
+                ),
+                None => t_args(
+                    lang,
+                    "rag-source-test-ok-plain",
+                    &i18n::args([("entries", (report.root_entries as i64).into())]),
+                ),
+            };
+            // Whether the server's extensions were detected decides whether
+            // this collection gets cheap re-syncs and move-proof identity, so
+            // it belongs in the operator's first look at the connection.
+            if let Some(server) = report.server.as_deref() {
+                message.push(' ');
+                message.push_str(&t_args(
+                    lang,
+                    "rag-source-detected",
+                    &i18n::args([("server", server.to_string().into())]),
+                ));
+            }
+            toast(FlashKind::Success, message)
+        }
+        Err(err) => toast(
+            FlashKind::Error,
+            t_args(
+                lang,
+                "rag-source-test-failed",
+                &i18n::args([("error", err.to_string().into())]),
+            ),
+        ),
+    }
+}
+
+/// The token from `/hooks/rag/{token}`, with its case intact.
+///
+/// See [`rag_sync_hook`]: the `Path` extractor would lowercase it.
+fn sync_hook_token(path: &str) -> Option<String> {
+    let tail = path.rsplit_once("/hooks/rag/")?.1;
+    let token = tail.trim_end_matches('/');
+    (!token.is_empty() && !token.contains('/')).then(|| token.to_string())
+}
+
+/// POST /hooks/rag/{token} — re-sync the collection this token belongs to.
+///
+/// Unauthenticated by design: the token in the URL *is* the credential, the
+/// same shape `/hooks/{secret}` uses for user webhooks. Nextcloud's
+/// webhook_listeners app (or ownCloud's, or a cron line, or anything that can
+/// make an HTTP request) points at this on file events.
+///
+/// The body is ignored. This is a doorbell, not a change feed: what actually
+/// changed is established by the walk that follows, which is cheap on a
+/// source that supports subtree pruning. Accepting a payload here would mean
+/// trusting an unauthenticated caller's description of the corpus.
+pub async fn rag_sync_hook(State(state): State<Arc<RamaState>>, req: Request) -> Response {
+    // Read the token off the raw URI, not through `Path`: rama's extractor
+    // lowercases every segment, and `rotate_sync_token` mints from a
+    // mixed-case alphabet. Through `Path` a token containing any capital —
+    // which is to say very nearly all of them — hashes to something that
+    // matches no row, and the hook 404s forever.
+    let Some(token) = sync_hook_token(req.uri().path()) else {
+        return (
+            rama::http::StatusCode::NOT_FOUND,
+            [(rama::http::header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"unknown sync token"}"#,
+        )
+            .into_response();
+    };
+    // A missing collection and a wrong token get the same answer: anything
+    // else turns this into an oracle for guessing valid tokens.
+    let Ok(Some(collection)) = rag_db::find_by_sync_token(&state.db, &token).await else {
+        return (
+            rama::http::StatusCode::NOT_FOUND,
+            [(rama::http::header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"unknown sync token"}"#,
+        )
+            .into_response();
+    };
+    let Some(indexer) = state.indexer.as_ref() else {
+        return (
+            rama::http::StatusCode::SERVICE_UNAVAILABLE,
+            [(rama::http::header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"the indexer is not running"}"#,
+        )
+            .into_response();
+    };
+    let refs = rag_db::list_refs(&state.db, collection.id)
+        .await
+        .unwrap_or_default();
+    let mut queued = 0usize;
+    for r in &refs {
+        // Already-pending refs are left alone: a burst of file events must
+        // not re-queue a build that is about to run anyway.
+        if r.status == rag_db::CollectionStatus::Pending {
+            continue;
+        }
+        if indexer.request_reindex(r.id).await.is_ok() {
+            queued += 1;
+        }
+    }
+    tracing::info!(
+        collection = %collection.name,
+        queued,
+        "rag: sync hook fired"
+    );
+    (
+        rama::http::StatusCode::ACCEPTED,
+        [(rama::http::header::CONTENT_TYPE, "application/json")],
+        // Serialised, not interpolated: a collection name containing a quote
+        // or a backslash would otherwise emit invalid JSON to the caller.
+        serde_json::json!({ "collection": collection.name, "queued": queued }).to_string(),
+    )
+        .into_response()
+}
+
+/// POST /rag/{id}/sync-token — mint (or rotate) a collection's sync token.
+///
+/// The plaintext is shown once, in the toast: only its hash is stored, so
+/// there is no way to read it back. Rotating invalidates the old URL, which
+/// is the point.
+pub async fn rag_sync_token(
+    State(state): State<Arc<RamaState>>,
+    Path(id): Path<i64>,
+    req: Request,
+) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let token = match rag_db::rotate_sync_token(&state.db, id).await {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::warn!(error = %err, %id, "minting rag sync token");
+            return toast(FlashKind::Error, t(lang, "rag-toast-save-failed"));
+        }
+    };
+    let url = format!(
+        "{}/hooks/rag/{token}",
+        state.config.gateway.public_url.trim_end_matches('/')
+    );
+    row_patch(
+        &state,
+        lang,
+        id,
+        t_args(
+            lang,
+            "rag-toast-sync-token",
+            &i18n::args([("url", url.into())]),
+        ),
+    )
+    .await
+}
+
+/// POST /rag/{id}/sync-token/clear — disable the hook.
+pub async fn rag_sync_token_clear(
+    State(state): State<Arc<RamaState>>,
+    Path(id): Path<i64>,
+    req: Request,
+) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    if let Err(resp) = require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    if let Err(err) = rag_db::clear_sync_token(&state.db, id).await {
+        tracing::warn!(error = %err, %id, "clearing rag sync token");
+        return toast(FlashKind::Error, t(lang, "rag-toast-save-failed"));
+    }
+    row_patch(&state, lang, id, t(lang, "rag-toast-sync-token-cleared")).await
 }
 
 /// Re-patch a collection's `#rag-row-{id}` with its current refs + a toast.
@@ -287,8 +569,19 @@ pub async fn rag_reindex(
             return toast(FlashKind::Error, t(lang, "rag-toast-reindex-queue-failed"));
         }
     };
+    // An explicit Re-index means "rebuild it", not "check for changes" —
+    // the cheap incremental check already runs on the poll and via the sync
+    // hook. Without this there would be no way to force a rebuild of a
+    // remote collection at all, since its diff would find nothing changed.
     for r in &refs {
-        requeue_ref(&state, r.id).await;
+        match state.indexer.as_ref() {
+            Some(indexer) => {
+                let _ = indexer.request_full_rebuild(r.id).await;
+            }
+            None => {
+                let _ = rag_db::request_full_rebuild(&state.db, r.id).await;
+            }
+        }
     }
     row_patch(
         &state,
@@ -869,7 +1162,15 @@ pub async fn rag_edit_form(
     sse_response(&[sse_patch(
         Some(&selector),
         Some("outer"),
-        &render_edit_form(lang, &collection, &models).to_string(),
+        &render_edit_form(
+            lang,
+            &collection,
+            &models,
+            providers(&state),
+            &docs_db::list_profiles(&state.db).await.unwrap_or_default(),
+            &state.crypto,
+        )
+        .to_string(),
     )])
 }
 
@@ -907,6 +1208,10 @@ struct UpdateForm {
     /// knowing the current one.
     #[serde(default)]
     clear_pat: Option<String>,
+    #[serde(default)]
+    profile_id: Option<i64>,
+    #[serde(default)]
+    extraction_model: Option<String>,
     embedding_model: String,
     include_globs: Option<String>,
     exclude_globs: Option<String>,
@@ -958,11 +1263,31 @@ pub async fn rag_update(
         }
     };
 
+    // The source is resolved against the stored spec, so a secret left blank
+    // keeps its stored value rather than being wiped.
+    let source = match rag_source::to_spec(
+        lang,
+        rag_source::parse_form(&form_pairs(&body)),
+        providers(&state),
+        &state.crypto,
+        Some(&existing.source),
+        state.http.clone(),
+    ) {
+        Ok(spec) => spec,
+        Err(msg) => return toast(FlashKind::Error, msg),
+    };
+    // Changing where a collection's documents come from invalidates what is
+    // indexed, so the operator gets told to re-index rather than left with a
+    // corpus that silently belongs to the old source.
+
     let git_url = form.git_url.trim();
     // Aggregate collections carry no single repo URL (each source has its
     // own), so the collection-level Git URL is optional for them — only
-    // versioned collections require it.
-    if git_url.is_empty() && existing.search_mode == rag_db::SearchMode::Versioned {
+    // versioned git collections require it.
+    if git_url.is_empty()
+        && source.is_git()
+        && existing.search_mode == rag_db::SearchMode::Versioned
+    {
         return toast(FlashKind::Error, t(lang, "rag-toast-git-url-required"));
     }
     let embedding_model = form.embedding_model.trim();
@@ -993,7 +1318,18 @@ pub async fn rag_update(
     let exclude_globs = split_globs(form.exclude_globs);
     let include_json = serde_json::to_string(&include_globs).unwrap_or_else(|_| "[]".into());
     let exclude_json = serde_json::to_string(&exclude_globs).unwrap_or_else(|_| "[]".into());
-
+    let source_config_json = serde_json::to_string(&source.config).unwrap_or_else(|_| "{}".into());
+    // `0` is the form's "no extraction" option.
+    let profile_id = form.profile_id.filter(|id| *id > 0);
+    // Blank means "use the pool's default model", which is a real choice — so
+    // an empty field clears the override rather than silently keeping the old
+    // one. It is not a secret; there is nothing to protect by refusing to let
+    // it go back to empty.
+    let extraction_model = form
+        .extraction_model
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let clear_pat = form.clear_pat.is_some();
     let new_pat: Option<String> = form
         .pat
@@ -1016,6 +1352,12 @@ pub async fn rag_update(
                git_url = ?,
                git_ref = ?,
                pat = ?,
+               profile_id = ?,
+               extraction_model = ?,
+               source_kind = ?,
+               source_config_json = ?,
+               source_secrets_ct = ?,
+               source_secrets_nonce = ?,
                embedding_model = ?,
                include_globs_json = ?,
                exclude_globs_json = ?,
@@ -1028,6 +1370,12 @@ pub async fn rag_update(
     .bind(git_url)
     .bind(&git_ref)
     .bind(&pat_to_store)
+    .bind(profile_id)
+    .bind(&extraction_model)
+    .bind(&source.kind)
+    .bind(&source_config_json)
+    .bind(source.secrets.as_ref().map(|s| s.ciphertext.clone()))
+    .bind(source.secrets.as_ref().map(|s| s.nonce.clone()))
     .bind(embedding_model)
     .bind(&include_json)
     .bind(&exclude_json)
@@ -1055,6 +1403,17 @@ pub async fn rag_update(
             return toast(FlashKind::Error, t(lang, "rag-toast-saved-reload-failed"));
         }
     };
+    // Pointing a collection at a different source — or asking for a different
+    // set of extracted fields — invalidates what is indexed, so re-queue
+    // rather than leave a corpus that silently answers with the old shape.
+    // Derived from the saved rows so this surface and the API can't drift.
+    if rag_db::index_shape_changed(&existing, &updated)
+        && let Some(indexer) = state.indexer.as_ref()
+    {
+        for r in rag_db::list_refs(&state.db, id).await.unwrap_or_default() {
+            let _ = indexer.request_full_rebuild(r.id).await;
+        }
+    }
     let refs = rag_db::list_refs(&state.db, id).await.unwrap_or_default();
     let selector = format!("#rag-row-{id}");
     sse_response(&[
@@ -1138,7 +1497,19 @@ fn malformed_form_toast(lang: Lang, err: impl std::fmt::Display) -> Response {
     )
 }
 
-fn validate(lang: Lang, form: CreateForm) -> Result<rag_db::NewCollection, String> {
+fn validate(
+    lang: Lang,
+    form: CreateForm,
+    source: rag_db::SourceSpec,
+) -> Result<rag_db::NewCollection, String> {
+    // `0` is the form's "no extraction" option: a code collection has no
+    // fields worth pulling out, and the pass costs one LLM call per file.
+    let profile_id = form.profile_id.filter(|id| *id > 0);
+    let extraction_model = form
+        .extraction_model
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let name = form.name.trim();
     if name.is_empty() || name.len() > 64 {
         return Err(t(lang, "rag-toast-name-length"));
@@ -1150,8 +1521,9 @@ fn validate(lang: Lang, form: CreateForm) -> Result<rag_db::NewCollection, Strin
     };
     let git_url = form.git_url.trim();
     // Aggregate collections carry no single repo — each source brings its
-    // own URL — so the collection-level Git URL is optional there.
-    if git_url.is_empty() && search_mode == rag_db::SearchMode::Versioned {
+    // own URL — so the collection-level Git URL is optional there. A remote
+    // source has no repo at all: its location lives in the provider config.
+    if git_url.is_empty() && source.is_git() && search_mode == rag_db::SearchMode::Versioned {
         return Err(t(lang, "rag-toast-git-url-required"));
     }
     let embedding_model = form.embedding_model.trim();
@@ -1182,6 +1554,9 @@ fn validate(lang: Lang, form: CreateForm) -> Result<rag_db::NewCollection, Strin
             .pat
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
+        source,
+        profile_id,
+        extraction_model,
         embedding_model: embedding_model.to_string(),
         include_globs: split_globs(form.include_globs),
         exclude_globs: split_globs(form.exclude_globs),
@@ -1222,6 +1597,16 @@ fn render_row(lang: Lang, c: &rag_db::Collection, refs: &[rag_db::CollectionRef]
     let delete_directive = format!("@post('{delete_action}', {{contentType: 'form'}})");
     let edit_directive = format!("@post('{edit_action}', {{contentType: 'form'}})");
     let add_ref_directive = format!("@post('{add_ref_action}', {{contentType: 'form'}})");
+    let sync_token_action = format!("/rag/{}/sync-token", c.id);
+    let sync_clear_action = format!("/rag/{}/sync-token/clear", c.id);
+    let sync_token_directive = format!("@post('{sync_token_action}', {{contentType: 'form'}})");
+    let sync_clear_directive = format!("@post('{sync_clear_action}', {{contentType: 'form'}})");
+    let sync_hook_set = c.sync_hook_set;
+    let sync_token_label = if sync_hook_set {
+        t(lang, "rag-button-sync-token-rotate")
+    } else {
+        t(lang, "rag-button-sync-token")
+    };
     let bulk_action = format!("/rag/{}/refs/bulk", c.id);
     let bulk_directive = format!("@post('{bulk_action}', {{contentType: 'form'}})");
     // Stable form ids so the add-source / bulk handlers can reset the form
@@ -1272,6 +1657,9 @@ fn render_row(lang: Lang, c: &rag_db::Collection, refs: &[rag_db::CollectionRef]
                         if aggregate {
                             span(class: "badge badge-sm badge-secondary") { (t(lang, "rag-badge-aggregate")) }
                         }
+                        if sync_hook_set {
+                            span(class: "badge badge-sm badge-ghost") { (t(lang, "rag-badge-sync-hook")) }
+                        }
                     }
                     if !description.is_empty() {
                         p(class: "text-sm text-base-content/70 mt-0.5") { (description) }
@@ -1299,6 +1687,27 @@ fn render_row(lang: Lang, c: &rag_db::Collection, refs: &[rag_db::CollectionRef]
                         "data-on:submit__prevent": (delete_directive)
                     ) {
                         button(type: "submit", class: "btn btn-sm btn-outline btn-error") { (t(lang, "rag-button-delete-collection")) }
+                    }
+                    // The trigger URL a file host's webhook points at. Minted
+                    // here because the plaintext is shown once and never
+                    // stored — rotating is the only way to get a new one.
+                    form(
+                        action: (sync_token_action.clone()),
+                        method: "post",
+                        class: "m-0",
+                        "data-on:submit__prevent": (sync_token_directive)
+                    ) {
+                        button(type: "submit", class: "btn btn-sm btn-ghost") { (sync_token_label.clone()) }
+                    }
+                    if sync_hook_set {
+                        form(
+                            action: (sync_clear_action.clone()),
+                            method: "post",
+                            class: "m-0",
+                            "data-on:submit__prevent": (sync_clear_directive)
+                        ) {
+                            button(type: "submit", class: "btn btn-sm btn-ghost") { (t(lang, "rag-button-sync-token-clear")) }
+                        }
                     }
                 }
             }
@@ -1574,7 +1983,15 @@ fn render_create_form(
     lang: Lang,
     embedding_models: &[String],
     default_embedding: Option<&str>,
+    registry: &ProviderRegistry,
+    profiles: &[docs_db::Profile],
 ) -> Html {
+    let profile_picker = profile_field(lang, profiles, None);
+    let picker = rag_source::source_picker(lang, registry, rag_source::GIT_KIND);
+    let fields = rag_source::provider_fields(lang, registry, None, None);
+    let signals = rag_source::source_signals(rag_source::GIT_KIND);
+    let git_show = format!("$sourceKind === '{}'", rag_source::GIT_KIND);
+    let remote_show = format!("$sourceKind !== '{}'", rag_source::GIT_KIND);
     html! {
         form(
             id: "rag-create-form",
@@ -1609,38 +2026,48 @@ fn render_create_form(
                             class: "input input-bordered w-full"
                         );
                     }
-                    label(class: "flex flex-col gap-1 w-full") {
-                        // Not `required`: aggregate collections leave this empty
-                        // (each source brings its own URL). The server enforces
-                        // a non-empty URL for versioned collections.
-                        div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-git-url-versioned")) } }
-                        input(
-                            name: "git_url",
-                            type: "text",
-                            placeholder: (t(lang, "rag-placeholder-git-url")),
-                            class: "input input-bordered w-full"
-                        );
-                    }
-                    label(class: "flex flex-col gap-1 w-full") {
-                        div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-branch-tag")) } }
-                        input(
-                            name: "git_ref",
-                            type: "text",
-                            value: "main",
-                            class: "input input-bordered w-full"
-                        );
-                    }
-                    label(class: "flex flex-col gap-1 w-full md:col-span-2") {
-                        div(class: "label") {
-                            span(class: "label-text") { (t(lang, "rag-label-pat-optional")) }
+                    (signals)
+                    (picker)
+                    div(
+                        class: "grid grid-cols-1 md:grid-cols-2 gap-4 md:col-span-2",
+                        "data-show": (git_show.clone()),
+                        style: "display:none"
+                    ) {
+                        label(class: "flex flex-col gap-1 w-full") {
+                            // Not `required`: aggregate collections leave this empty
+                            // (each source brings its own URL). The server enforces
+                            // a non-empty URL for versioned git collections.
+                            div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-git-url-versioned")) } }
+                            input(
+                                name: "git_url",
+                                type: "text",
+                                placeholder: (t(lang, "rag-placeholder-git-url")),
+                                class: "input input-bordered w-full"
+                            );
                         }
-                        input(
-                            name: "pat",
-                            type: "password",
-                            placeholder: (t(lang, "rag-placeholder-pat")),
-                            class: "input input-bordered w-full"
-                        );
+                        label(class: "flex flex-col gap-1 w-full") {
+                            div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-branch-tag")) } }
+                            input(
+                                name: "git_ref",
+                                type: "text",
+                                value: "main",
+                                class: "input input-bordered w-full"
+                            );
+                        }
+                        label(class: "flex flex-col gap-1 w-full md:col-span-2") {
+                            div(class: "label") {
+                                span(class: "label-text") { (t(lang, "rag-label-pat-optional")) }
+                            }
+                            input(
+                                name: "pat",
+                                type: "password",
+                                placeholder: (t(lang, "rag-placeholder-pat")),
+                                class: "input input-bordered w-full"
+                            );
+                        }
                     }
+                    (fields)
+                    (profile_picker)
                     label(class: "flex flex-col gap-1 w-full") {
                         div(class: "label") {
                             span(class: "label-text") { (t(lang, "rag-label-include-globs-full")) }
@@ -1696,6 +2123,17 @@ fn render_create_form(
                     }
                 }
                 div(class: "card-actions justify-end mt-2") {
+                    // Only meaningful for a remote source; hidden for git,
+                    // whose repo is checked when indexing actually runs.
+                    button(
+                        type: "button",
+                        class: "btn btn-ghost",
+                        "data-show": (remote_show.clone()),
+                        style: "display:none",
+                        "data-on:click": "@post('/rag/test-source', {contentType: 'form'})"
+                    ) {
+                        (t(lang, "rag-source-test-button"))
+                    }
                     button(type: "submit", class: "btn btn-primary") { (t(lang, "rag-button-queue-indexing")) }
                 }
             }
@@ -1707,7 +2145,31 @@ fn render_create_form(
 /// The row swapped in by `rag_edit_form`. Same `<li id="rag-row-{id}">`
 /// shell so the SSE outer-replace round-trips cleanly between display
 /// and edit modes. Fields are pre-filled from the stored row.
-fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[String]) -> Html {
+fn render_edit_form(
+    lang: Lang,
+    c: &rag_db::Collection,
+    embedding_models: &[String],
+    registry: &ProviderRegistry,
+    profiles: &[docs_db::Profile],
+    // Needed only to answer "has this source been consented?" — the secrets
+    // are one sealed blob, so which keys it holds is not visible without it.
+    crypto: &Crypto,
+) -> Html {
+    let profile_picker = profile_field(lang, profiles, c.profile_id);
+    let picker = rag_source::source_picker(lang, registry, &c.source.kind);
+    let source_fields = rag_source::provider_fields(
+        lang,
+        registry,
+        Some(&c.source),
+        Some(rag_source::ConsentState {
+            collection_id: c.id,
+            connected: rag_source::has_refresh_token(&c.source, crypto),
+        }),
+    );
+    let source_signals = rag_source::source_signals(&c.source.kind);
+    let git_show = format!("$sourceKind === '{}'", rag_source::GIT_KIND);
+    let remote_show = format!("$sourceKind !== '{}'", rag_source::GIT_KIND);
+    let collection_id = c.id.to_string();
     let dom_id = format!("rag-row-{}", c.id);
     let update_action = format!("/rag/{}/update", c.id);
     let cancel_action = format!("/rag/{}/cancel-edit", c.id);
@@ -1757,61 +2219,74 @@ fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[Stri
                                 class: "input input-bordered w-full"
                             );
                         }
-                        label(class: "flex flex-col gap-1 w-full") {
-                            // Not `required`: aggregate collections leave this
-                            // empty (sources bring their own URLs). The server
-                            // only enforces it for versioned collections.
-                            div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-git-url-versioned")) } }
-                            input(
-                                name: "git_url",
-                                type: "text",
-                                value: (c.git_url.clone()),
-                                class: "input input-bordered w-full"
-                            );
-                        }
-                        label(class: "flex flex-col gap-1 w-full") {
-                            div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-branch-tag")) } }
-                            input(
-                                name: "git_ref",
-                                type: "text",
-                                value: (c.git_ref.clone()),
-                                class: "input input-bordered w-full"
-                            );
-                        }
-                        (embedding_model_field(lang, embedding_models, Some(&c.embedding_model)))
-                        div(class: "flex flex-col gap-1 w-full") {
-                            div(class: "label") {
-                                span(class: "label-text") {
-                                    (t(lang, "rag-label-pat"))
-                                    if pat_present {
-                                        span(class: "ml-2 badge badge-success badge-outline") {
-                                            (t(lang, "rag-badge-pat-set"))
+                        (source_signals)
+                        // Lets "Test connection" fall back to the stored
+                        // secret instead of demanding it be retyped.
+                        input(type: "hidden", name: "collection_id", value: (collection_id));
+                        (picker)
+                        div(
+                            class: "grid grid-cols-1 md:grid-cols-2 gap-4 md:col-span-2",
+                            "data-show": (git_show.clone()),
+                            style: "display:none"
+                        ) {
+                            label(class: "flex flex-col gap-1 w-full") {
+                                // Not `required`: aggregate collections leave this
+                                // empty (sources bring their own URLs). The server
+                                // only enforces it for versioned git collections.
+                                div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-git-url-versioned")) } }
+                                input(
+                                    name: "git_url",
+                                    type: "text",
+                                    value: (c.git_url.clone()),
+                                    class: "input input-bordered w-full"
+                                );
+                            }
+                            label(class: "flex flex-col gap-1 w-full") {
+                                div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-branch-tag")) } }
+                                input(
+                                    name: "git_ref",
+                                    type: "text",
+                                    value: (c.git_ref.clone()),
+                                    class: "input input-bordered w-full"
+                                );
+                            }
+                            div(class: "flex flex-col gap-1 w-full md:col-span-2") {
+                                div(class: "label") {
+                                    span(class: "label-text") {
+                                        (t(lang, "rag-label-pat"))
+                                        if pat_present {
+                                            span(class: "ml-2 badge badge-success badge-outline") {
+                                                (t(lang, "rag-badge-pat-set"))
+                                            }
+                                        } else {
+                                            span(class: "ml-2 badge badge-ghost") { (t(lang, "rag-badge-pat-none")) }
                                         }
-                                    } else {
-                                        span(class: "ml-2 badge badge-ghost") { (t(lang, "rag-badge-pat-none")) }
                                     }
                                 }
-                            }
-                            input(
-                                name: "pat",
-                                type: "password",
-                                placeholder: (pat_placeholder),
-                                class: "input input-bordered w-full"
-                            );
-                            if pat_present {
-                                label(class: "label cursor-pointer justify-start gap-2 mt-1") {
-                                    input(
-                                        type: "checkbox",
-                                        name: "clear_pat",
-                                        value: "1",
-                                        class: "checkbox checkbox-sm"
-                                    );
-                                    span(class: "label-text text-sm") {
-                                        (t(lang, "rag-label-clear-pat"))
+                                input(
+                                    name: "pat",
+                                    type: "password",
+                                    placeholder: (pat_placeholder),
+                                    class: "input input-bordered w-full"
+                                );
+                                if pat_present {
+                                    label(class: "label cursor-pointer justify-start gap-2 mt-1") {
+                                        input(
+                                            type: "checkbox",
+                                            name: "clear_pat",
+                                            value: "1",
+                                            class: "checkbox checkbox-sm"
+                                        );
+                                        span(class: "label-text text-sm") {
+                                            (t(lang, "rag-label-clear-pat"))
+                                        }
                                     }
                                 }
                             }
                         }
+                        (source_fields)
+                        (profile_picker)
+                        (embedding_model_field(lang, embedding_models, Some(&c.embedding_model)))
                         label(class: "flex flex-col gap-1 w-full") {
                             div(class: "label") {
                                 span(class: "label-text") { (t(lang, "rag-label-include-globs")) }
@@ -1878,6 +2353,15 @@ fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[Stri
                         ) {
                             button(type: "submit", class: "btn btn-sm btn-outline") { (t(lang, "rag-button-cancel")) }
                         }
+                        button(
+                            type: "button",
+                            class: "btn btn-sm btn-ghost",
+                            "data-show": (remote_show.clone()),
+                            style: "display:none",
+                            "data-on:click": "@post('/rag/test-source', {contentType: 'form'})"
+                        ) {
+                            (t(lang, "rag-source-test-button"))
+                        }
                         button(type: "submit", class: "btn btn-sm btn-primary") { (t(lang, "rag-button-save-changes")) }
                     }
                 }
@@ -1893,6 +2377,41 @@ fn render_edit_form(lang: Lang, c: &rag_db::Collection, embedding_models: &[Stri
 /// text input so the page stays usable in test scaffolding + before any
 /// upstream has reported its first `/models` probe. `selected` pre-fills
 /// the chosen option in edit forms.
+/// Extraction-profile picker.
+///
+/// "None" is first and is the default: extraction costs one model call per
+/// document, and a code collection has no fields worth pulling out. The
+/// operator opts in for a document corpus.
+fn profile_field(lang: Lang, profiles: &[docs_db::Profile], selected: Option<i64>) -> Html {
+    let options: Vec<(String, String, bool)> = profiles
+        .iter()
+        .map(|p| {
+            (
+                p.id.to_string(),
+                match p.description.as_deref() {
+                    Some(d) => format!("{} — {d}", p.name),
+                    None => p.name.clone(),
+                },
+                selected == Some(p.id),
+            )
+        })
+        .collect();
+    let none_selected = selected.is_none();
+    html! {
+        label(class: "flex flex-col gap-1 w-full md:col-span-2") {
+            div(class: "label") { span(class: "label-text") { (t(lang, "rag-label-profile")) } }
+            select(name: "profile_id", class: "select select-bordered w-full") {
+                (super::select_option("0", &t(lang, "rag-option-profile-none"), none_selected))
+                for (id, label, is_selected) in options.iter() {
+                    (super::select_option(id, label, *is_selected))
+                }
+            }
+            p(class: "text-xs opacity-70") { (t(lang, "rag-profile-help")) }
+        }
+    }
+    .to_html()
+}
+
 fn embedding_model_field(lang: Lang, models: &[String], selected: Option<&str>) -> Html {
     if models.is_empty() {
         let value = selected.unwrap_or("");
@@ -1943,11 +2462,7 @@ fn embedding_model_field(lang: Lang, models: &[String], selected: Option<&str>) 
                     }
                 }
                 for (model, is_selected) in options.iter() {
-                    if *is_selected {
-                        option(value: (model.clone()), selected: "selected") { (model.clone()) }
-                    } else {
-                        option(value: (model.clone())) { (model.clone()) }
-                    }
+                    (super::select_option(model, model, *is_selected))
                 }
             }
         }
@@ -1960,6 +2475,8 @@ fn render_body(
     list: &[(rag_db::Collection, Vec<rag_db::CollectionRef>)],
     embedding_models: &[String],
     default_embedding: Option<&str>,
+    registry: &ProviderRegistry,
+    profiles: &[docs_db::Profile],
 ) -> Html {
     html! {
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
@@ -1971,9 +2488,17 @@ fn render_body(
                 (t(lang, "rag-description-prefix")) " "
                 code(class: "font-mono text-xs") { "rag_search" }
                 " " (t(lang, "rag-description-suffix"))
+                " "
+                a(
+                    href: "/rag/profiles",
+                    class: "link link-primary",
+                    "data-on:click__prevent": "@get('/rag/profiles')"
+                ) {
+                    (t(lang, "rag-profile-link"))
+                }
             }
 
-            (render_create_form(lang, embedding_models, default_embedding))
+            (render_create_form(lang, embedding_models, default_embedding, registry, profiles))
 
             section(class: "card border border-base-300") {
                 div(class: "card-body") {
@@ -2026,6 +2551,10 @@ mod tests {
             git_url: "https://example.invalid/ceph.git".into(),
             git_ref: "main".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
+            sync_hook_set: false,
             embedding_model: "embed".into(),
             include_globs: vec!["**/*".into()],
             exclude_globs: vec![],
@@ -2055,6 +2584,10 @@ mod tests {
             last_indexed_at: None,
             last_indexed_commit: None,
             last_error: err.map(|s| s.into()),
+            dir_versions: Default::default(),
+            delta_cursor: None,
+            force_full_rebuild: false,
+            extractor_fingerprint: None,
             created_at: now,
             updated_at: now,
         }
@@ -2062,6 +2595,162 @@ mod tests {
 
     /// The "Log" control on a ref must call the matching log endpoint, and the
     /// status row must carry the stable `#rag-ref-{id}` id the poller patches.
+    /// A collection whose source is a registered provider rather than git.
+    fn webdav_collection() -> rag_db::Collection {
+        let mut c = collection();
+        c.source = rag_db::SourceSpec {
+            kind: "webdav".into(),
+            config: [
+                (
+                    "base_url".to_string(),
+                    "https://cloud.example.com".to_string(),
+                ),
+                ("username".to_string(), "svc".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            secrets: None,
+        };
+        c
+    }
+
+    #[test]
+    fn create_form_offers_every_registered_source_and_its_fields() {
+        let registry = ProviderRegistry::with_builtins();
+        let html =
+            render_create_form(Lang::En, &["embed".into()], None, &registry, &[]).to_string();
+        assert!(html.contains(r#"name="source_kind""#), "{html}");
+        assert!(
+            html.contains(r#"value="webdav""#),
+            "the picker lists the provider"
+        );
+        assert!(
+            html.contains(r#"name="src_webdav_base_url""#),
+            "the provider's declared fields are rendered: {html}"
+        );
+    }
+
+    #[test]
+    fn create_form_hides_the_git_inputs_behind_the_picker() {
+        let registry = ProviderRegistry::with_builtins();
+        let html =
+            render_create_form(Lang::En, &["embed".into()], None, &registry, &[]).to_string();
+        // The git block is gated on the same signal the picker writes, so
+        // choosing a remote source does not leave a required-looking Git URL
+        // on screen.
+        assert!(
+            html.contains("$sourceKind ===") || html.contains("$sourceKind &#61;&#61;&#61;"),
+            "{html}"
+        );
+        assert!(html.contains(r#"name="git_url""#));
+    }
+
+    #[test]
+    fn create_form_wires_the_test_button_to_its_endpoint() {
+        let registry = ProviderRegistry::with_builtins();
+        let html =
+            render_create_form(Lang::En, &["embed".into()], None, &registry, &[]).to_string();
+        assert!(
+            html.contains("/rag/test-source"),
+            "the Test connection button must post to the route the router registers: {html}"
+        );
+    }
+
+    #[test]
+    fn edit_form_preselects_the_collections_own_source() {
+        let registry = ProviderRegistry::with_builtins();
+        let c = webdav_collection();
+        let html = render_edit_form(
+            Lang::En,
+            &c,
+            &["embed".into()],
+            &registry,
+            &[],
+            &Crypto::from_key([3u8; 32]),
+        )
+        .to_string();
+        assert!(
+            html.contains(r#"value="webdav" selected="selected""#),
+            "the stored kind is the selected option: {html}"
+        );
+        assert!(
+            html.contains("sourceKind:") && html.contains("webdav"),
+            "and the signal is seeded to match, so the right field set shows on load"
+        );
+        assert!(
+            html.contains("https://cloud.example.com"),
+            "stored non-secret settings are prefilled"
+        );
+    }
+
+    #[test]
+    fn edit_form_carries_the_collection_id_for_a_credential_free_test() {
+        let registry = ProviderRegistry::with_builtins();
+        let c = webdav_collection();
+        let html = render_edit_form(
+            Lang::En,
+            &c,
+            &["embed".into()],
+            &registry,
+            &[],
+            &Crypto::from_key([3u8; 32]),
+        )
+        .to_string();
+        assert!(
+            html.contains(r#"name="collection_id""#),
+            "without this, testing an existing source would demand the password be retyped"
+        );
+    }
+
+    #[test]
+    fn a_remote_source_does_not_require_a_git_url() {
+        let form = CreateForm {
+            name: "docs".into(),
+            description: None,
+            git_url: String::new(),
+            git_ref: None,
+            pat: None,
+            profile_id: None,
+            extraction_model: None,
+            embedding_model: "embed".into(),
+            include_globs: None,
+            exclude_globs: None,
+            chunk_size: None,
+            chunk_overlap: None,
+            aggregate: None,
+        };
+        let source = rag_db::SourceSpec {
+            kind: "webdav".into(),
+            config: Default::default(),
+            secrets: None,
+        };
+        let new = validate(Lang::En, form, source).expect("a remote source has no repo URL");
+        assert_eq!(new.source.kind, "webdav");
+    }
+
+    #[test]
+    fn a_git_collection_still_requires_its_url() {
+        let form = CreateForm {
+            name: "code".into(),
+            description: None,
+            git_url: String::new(),
+            git_ref: None,
+            pat: None,
+            profile_id: None,
+            extraction_model: None,
+            embedding_model: "embed".into(),
+            include_globs: None,
+            exclude_globs: None,
+            chunk_size: None,
+            chunk_overlap: None,
+            aggregate: None,
+        };
+        assert!(
+            validate(Lang::En, form, rag_db::SourceSpec::default()).is_err(),
+            "the git path keeps its existing validation"
+        );
+    }
+
     #[test]
     fn render_ref_wires_log_button_to_endpoint() {
         let c = collection();
@@ -2207,7 +2896,16 @@ mod tests {
     fn render_body_arms_status_poll_and_log_container() {
         let c = collection();
         let refs = vec![cref(42, rag_db::CollectionStatus::Cloning, None)];
-        let html = render_body(Lang::En, &[(c, refs)], &["embed".into()], None).to_string();
+        let registry = ProviderRegistry::with_builtins();
+        let html = render_body(
+            Lang::En,
+            &[(c, refs)],
+            &["embed".into()],
+            None,
+            &registry,
+            &[],
+        )
+        .to_string();
         assert!(html.contains("data-on-interval__duration.4s"), "{html}");
         assert!(html.contains("/rag/status"), "{html}");
         assert!(html.contains("rag-reflog-42"), "{html}");
@@ -2216,7 +2914,8 @@ mod tests {
     /// An empty list must NOT arm the poll (nothing to watch → no traffic).
     #[test]
     fn render_body_empty_list_does_not_poll() {
-        let html = render_body(Lang::En, &[], &["embed".into()], None).to_string();
+        let registry = ProviderRegistry::with_builtins();
+        let html = render_body(Lang::En, &[], &["embed".into()], None, &registry, &[]).to_string();
         assert!(!html.contains("/rag/status"), "{html}");
     }
 
@@ -2227,13 +2926,15 @@ mod tests {
     fn create_form_preselects_configured_default_embedding() {
         let models: Vec<String> = vec!["embed-a".into(), "embed-b".into()];
         // Configured + advertised → that option is selected.
-        let with = render_create_form(Lang::En, &models, Some("embed-b")).to_string();
+        let registry = ProviderRegistry::with_builtins();
+        let with =
+            render_create_form(Lang::En, &models, Some("embed-b"), &registry, &[]).to_string();
         assert!(
             with.contains(r#"value="embed-b" selected="selected""#),
             "configured default must be pre-selected: {with}"
         );
         // No default → the disabled placeholder is the selected option.
-        let without = render_create_form(Lang::En, &models, None).to_string();
+        let without = render_create_form(Lang::En, &models, None, &registry, &[]).to_string();
         assert!(
             without.contains(r#"disabled="disabled" selected="selected""#),
             "unset default must keep the choose-a-model placeholder: {without}"

@@ -71,3 +71,24 @@ We don't enforce a line-coverage number — it incentivizes the wrong tests. Ins
 ## Crates dedicated to testing
 
 Pre-approved dev-dependencies are listed in [`docs/dependencies.md`](dependencies.md). Adding anything else requires the same justification step as a runtime dep.
+
+## Live, on-demand tests
+
+Two test binaries are gated behind an env var and excluded from the normal
+run — they need infrastructure a hermetic suite cannot have. Both compile in
+`cargo test` and skip instantly without their gate.
+
+| Binary | Gate | Runner | Needs |
+| --- | --- | --- | --- |
+| `sandbox_e2e_live.rs` | `RUN_SANDBOX_E2E` | manual | a sandbox-runner + real S3 |
+| `nextcloud_e2e_live.rs` | `RUN_NEXTCLOUD_E2E` | `mise run test-nextcloud` | docker or podman |
+
+`mise run test-nextcloud` owns the whole lifecycle: it starts a throwaway
+Nextcloud, waits for it to finish installing (first run also pulls ~600 MB),
+runs the tests single-threaded, and tears the container down on any exit
+including Ctrl-C. `NEXTCLOUD_E2E_KEEP=1` leaves it running to poke at.
+
+What belongs there rather than in the mocked suite: assertions about
+*someone else's* behaviour, which a mock cannot check because the mock is
+built from the same assumption. See
+[`fileshare-rag.md`](fileshare-rag.md#testing) for the current list.

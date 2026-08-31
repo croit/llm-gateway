@@ -336,9 +336,24 @@ for OCR and does not expose an OCR capability to the model. See
 
 ### RAG (codebase search)
 
-Point the gateway at git repositories; it clones, chunks, and embeds them, and exposes them to the chat model through the `rag_search` tool (plus `rag_list_collections`, so the model can discover what's available). It's for "answer from *our* code and docs" without stuffing a whole repo into the context window.
+Point the gateway at a body of documents; it fetches, chunks, and embeds it, and exposes it to the chat model through the `rag_search` tool (plus `rag_list_collections`, so the model can discover what's available). It's for "answer from *our* code and docs" without stuffing everything into the context window.
 
-**Requirements:** an `embedding`-kind upstream pool (chunks and queries are embedded through it), `git` on the host PATH (the indexer shells out to it — the container image ships it), and a `[rag]` block. The block is optional; its main knob is `data_dir` (a second, `clone_concurrency`, is documented in `gateway.example.toml`):
+**Where the documents come from** is a per-collection choice:
+
+- **`git`** — clone a repository and index its working tree. Needs `git` on the host PATH (the container image ships it).
+- **`webdav`** — index a folder tree on a WebDAV server: Nextcloud, ownCloud, OpenCloud, or a plain RFC 4918 server. Give it a server URL, an account, and an **app password** (stored encrypted at rest), plus optionally the folder to index. It indexes exactly what that account can see, so scope the account's shares to what you want indexed. On the ownCloud lineage the gateway detects the `oc:fileid` / propagating-etag extensions automatically and uses them for move-proof file identity; a plain server works too, just without those.
+
+Pick the source on the `/rag` create form — the credential fields come from the provider itself, so the form matches whichever source you choose — and use **Test connection** to check the account and folder before starting an index. `GET /api/v0/rag/providers` returns the same descriptors for scripting.
+
+**What gets read.** Text files and born-digital PDFs are read in-process. Scans and images go to the [OCR backend](docs/ocr.md) if one is configured, and `.docx`/`.pptx`/`.xlsx` go through the sandbox — both optional: without them those files are skipped, *counted, and reported on the collection's timeline* with the reason, rather than silently dropped. Hits are cited by page for documents and by line for source files.
+
+**Questions about sets of documents.** Passage search answers "what does the contract say about SLAs". It cannot answer "when did we last get an invoice from X, and how much" — that is a superlative over a filtered set, and a handful of similar-looking chunks is a coin flip. Attach an **extraction profile** to a collection and each document additionally gets a row of normalised fields (vendor, date, amount, project, …) plus a two-sentence summary, written at index time by a cheap model. The chat model then reaches those through `rag_query_documents` (filter, sort, total), `rag_list_documents` (folder listing with the stored summaries) and `rag_fetch_document`.
+
+Two profiles ship seeded — `invoice` and `project_document` — and you pick one on the `/rag` form (`GET /api/v0/rag/profiles` lists them with their fields). Extraction costs one model call per document, cached by content hash, so a re-index re-embeds but never re-extracts. Leave the profile as **None** for code or plain-text collections.
+
+Normalisation happens in the prompt, not in code: `31.12.2025` and `12/31/2025` both come back as one ISO date, `1.234,56 €` and `$1,234.56` as a decimal plus a currency code. That is what makes one code path serve a German and English corpus.
+
+**Requirements:** an `embedding`-kind upstream pool (chunks and queries are embedded through it), `git` on the host PATH for git collections (the indexer shells out to it — the container image ships it), and a `[rag]` block. The block is optional; its main knob is `data_dir` (a second, `clone_concurrency`, is documented in `gateway.example.toml`):
 
 ```toml
 [rag]
@@ -426,6 +441,7 @@ openai api chat_completions.create -m <model-id> -g user "Hello"
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness probes. |
 | `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled`, `/webhooks`, `/integrations`, `/skills`, `/usage` | session cookie | Web UI (`/integrations` is the per-user MCP connector store; `/skills` is the per-user private-skills manager — upload a `.skill` archive or write `SKILL.md` inline, usable only in your own chats; `/webhooks` manages your inbound triggers; `/usage` shows your own request/token usage; admins get an in-page "All users" toggle). |
 | `/hooks/{secret}` | secret in URL | Fire a webhook: runs the owner's saved prompt with the request body appended as an untrusted block. Accepts GET and POST; sync webhooks return the model output as a JSON envelope, async ones return `202`. |
+| `/hooks/rag/{token}` | token in URL | Re-sync one RAG collection. Point a file host's webhook (Nextcloud's `webhook_listeners`, ownCloud's equivalent, or a cron line) at it so a changed folder is searchable in minutes rather than at the next poll. The body is ignored — this is a doorbell, not a change feed; the walk that follows establishes what actually changed. Returns `202` with the number of refs queued. |
 | `/admin/users`, `/admin/groups`, `/rag`, `/admin/models`, `/admin/upstreams`, `/admin/skills`, `/admin/connectors`, `/admin/comfyui`, `/admin/limits` | admin role | Admin UI (the users page lists registered users and starts impersonation; groups maps OIDC claims onto gateway groups and sets per-group tool/skill grants — pools, RAG collections, and MCP connectors then restrict access by group; upstreams edits the pool/backend topology in the DB and hot-reloads it via "Apply changes" — the old `/admin/backends` and `/admin/pools` now redirect here; connectors curates the MCP catalog — see [`docs/connectors.md`](docs/connectors.md) for provider setup; comfyui shows the loaded ComfyUI workflow catalog with a live reload button — see [`docs/comfyui.md`](docs/comfyui.md) for the manifest format; limits sets per-global/role/user rate limits & quotas). |
 | `POST /impersonate/stop` | session cookie | End an active impersonation and return to your own account. |
 | `/feedback`, `/feedback/extract`, `/feedback/config` | session cookie | Feedback widget: file a GitHub issue, turn a voice transcript into structured fields, and report whether the feature is configured. Enabled by the `[feedback]` config block. |

@@ -56,6 +56,70 @@ fn page_marker(page: usize) -> String {
     format!("--- page {page} ---")
 }
 
+/// Split assembled OCR markdown back into per-page text.
+///
+/// Lives here because this module owns the marker format written by
+/// [`page_marker`] — a reader elsewhere would silently rot the first time
+/// that format changed. Text with no markers (a single image, or a sidecar
+/// doing one multi-image call) comes back as one page.
+pub fn split_pages(markdown: &str) -> Vec<String> {
+    // Positional, and positions *are* page numbers to everything downstream:
+    // `chunk_pages` numbers what it is given from 1, and those numbers become
+    // the citation a person opens the original at.
+    //
+    // `assemble_pages` drops blank pages but keeps the true number in the
+    // marker, so a scan with a blank page 3 arrives as 1,2,4,5,… — read
+    // positionally, every page after the blank is cited one too low. So the
+    // marker's number is honoured and the gaps are filled with empty pages,
+    // which produce no chunks and cost nothing.
+    let mut numbered: Vec<(usize, String)> = Vec::new();
+    let mut current = String::new();
+    let mut current_page: Option<usize> = None;
+    let mut next_implicit = 1usize;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if let Some(page) = parse_page_marker(trimmed) {
+            if let Some(n) = current_page.take() {
+                numbered.push((n, current.trim().to_string()));
+            }
+            current.clear();
+            // A marker we cannot read a number out of still separates pages;
+            // fall back to counting.
+            current_page = Some(page.unwrap_or(next_implicit));
+            next_implicit = current_page.unwrap_or(next_implicit) + 1;
+            continue;
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    match current_page {
+        Some(n) => numbered.push((n, current.trim().to_string())),
+        None => {
+            let whole = markdown.trim();
+            if !whole.is_empty() {
+                numbered.push((1, whole.to_string()));
+            }
+        }
+    }
+
+    let highest = numbered.iter().map(|(n, _)| *n).max().unwrap_or(0);
+    let mut pages = vec![String::new(); highest];
+    for (n, content) in numbered {
+        if n >= 1 && n <= highest {
+            pages[n - 1] = content;
+        }
+    }
+    pages
+}
+
+/// `--- page 4 ---` -> `Some(Some(4))`; a marker whose number will not parse
+/// -> `Some(None)`; anything else -> `None`.
+fn parse_page_marker(trimmed: &str) -> Option<Option<usize>> {
+    let rest = trimmed.strip_prefix("--- page ")?.strip_suffix(" ---")?;
+    Some(rest.trim().parse::<usize>().ok())
+}
+
 #[derive(Debug, Error)]
 pub enum OcrError {
     /// OCR is switched off, or no healthy `ocr` pool serves a model. Callers
@@ -1143,5 +1207,32 @@ mod tests {
             }),
             baseline
         );
+    }
+
+    /// A blank page must not shift the pages after it.
+    ///
+    /// Regression: `assemble_pages` omits blank pages but keeps the true
+    /// number in the marker, and `split_pages` threw the number away and
+    /// returned a positional list — so a 10-page scan with a blank page 3
+    /// cited pages 4-10 as 3-9. The citation is what a person opens the
+    /// original at, so it was wrong for every page after the first gap.
+    #[test]
+    fn a_dropped_blank_page_does_not_shift_the_ones_after_it() {
+        let md = "--- page 1 ---\nfirst\n--- page 2 ---\nsecond\n--- page 4 ---\nfourth";
+        let pages = split_pages(md);
+        assert_eq!(pages.len(), 4, "the gap is kept, not closed up");
+        assert_eq!(pages[0], "first");
+        assert_eq!(pages[1], "second");
+        assert_eq!(pages[2], "", "page 3 was blank and stays blank");
+        assert_eq!(
+            pages[3], "fourth",
+            "page 4's text is at index 3, so it is cited as page 4"
+        );
+    }
+
+    #[test]
+    fn markdown_with_no_markers_is_a_single_page() {
+        assert_eq!(split_pages("just text"), vec!["just text".to_string()]);
+        assert!(split_pages("   ").is_empty());
     }
 }

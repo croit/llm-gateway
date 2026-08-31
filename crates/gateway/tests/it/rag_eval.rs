@@ -144,6 +144,9 @@ async fn seed_collection(
             git_url: "https://example.invalid".into(),
             git_ref: "main".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: EMBED_MODEL.into(),
             include_globs: vec![],
             exclude_globs: vec![],
@@ -161,7 +164,7 @@ async fn seed_collection(
     let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
     let idx = indexer.open_index(r.id, &r.data_uuid, Some(4)).unwrap();
     for (vid, d) in (1i64..).zip(docs.iter()) {
-        let file_id = rag_db::upsert_file(&store, c.id, d.path, "hash")
+        let file_id = rag_db::upsert_file(&store, c.id, d.path, "hash", &Default::default())
             .await
             .unwrap();
         rag_db::insert_chunks(
@@ -170,8 +173,7 @@ async fn seed_collection(
             &[rag_db::NewChunk {
                 file_id,
                 chunk_index: 0,
-                start_line: 1,
-                end_line: 1,
+                loc: rag_db::ChunkLoc::lines(1, 1),
                 content: d.content.into(),
                 vector_id: vid,
             }],
@@ -194,9 +196,15 @@ async fn seed_collection(
     rag_db::set_ref_status(central, r.id, rag_db::CollectionStatus::Indexing)
         .await
         .unwrap();
-    rag_db::swap_ref_index(central, r.id, &r.data_uuid, "deadbeef")
-        .await
-        .unwrap();
+    rag_db::swap_ref_index(
+        central,
+        r.id,
+        &r.data_uuid,
+        "deadbeef",
+        "ocr=false,office=false",
+    )
+    .await
+    .unwrap();
     rag_db::find_ref_by_id(central, r.id)
         .await
         .unwrap()
@@ -216,6 +224,7 @@ async fn hybrid_recovers_exact_identifier_that_dense_only_misses() {
             data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
             ..IndexerConfig::default()
         },
+        None,
     );
 
     // 3 CRUSH distractors (cluster with the query in vector space) + the
@@ -286,6 +295,7 @@ async fn lexical_alone_answers_when_vector_index_is_absent() {
             data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
             ..IndexerConfig::default()
         },
+        None,
     );
     // Seed DB rows + FTS, but DON'T open/populate a usearch index.
     let c = rag_db::create_collection(
@@ -296,6 +306,9 @@ async fn lexical_alone_answers_when_vector_index_is_absent() {
             git_url: "https://example.invalid".into(),
             git_ref: "main".into(),
             pat: None,
+            source: Default::default(),
+            profile_id: None,
+            extraction_model: None,
             embedding_model: EMBED_MODEL.into(),
             include_globs: vec![],
             exclude_globs: vec![],
@@ -310,17 +323,22 @@ async fn lexical_alone_answers_when_vector_index_is_absent() {
         .await
         .unwrap();
     let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
-    let file_id = rag_db::upsert_file(&store, c.id, "src/common/options/global.yaml.in", "h")
-        .await
-        .unwrap();
+    let file_id = rag_db::upsert_file(
+        &store,
+        c.id,
+        "src/common/options/global.yaml.in",
+        "h",
+        &Default::default(),
+    )
+    .await
+    .unwrap();
     rag_db::insert_chunks(
         &store,
         c.id,
         &[rag_db::NewChunk {
             file_id,
             chunk_index: 0,
-            start_line: 1,
-            end_line: 1,
+            loc: rag_db::ChunkLoc::lines(1, 1),
             content: "name: osd_op_timeout desc: timeout for ops handled by osds".into(),
             vector_id: 1,
         }],

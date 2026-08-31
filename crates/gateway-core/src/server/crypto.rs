@@ -59,7 +59,7 @@ impl std::fmt::Debug for Crypto {
 
 /// One encrypted value: a 96-bit nonce and the GCM ciphertext (which includes
 /// the auth tag). Both are stored as SQLite BLOBs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sealed {
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,

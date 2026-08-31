@@ -138,3 +138,89 @@ rag-label-embedding-model = Embedding-Modell
 rag-placeholder-embedding-model-none = keine Embedding-Pools konfiguriert — Modell-ID eingeben
 rag-option-choose-embedding-model = Embedding-Modell wählen…
 rag-suffix-not-advertised = (nicht mehr verfügbar)
+
+# Quellenauswahl + Zugangsdaten der Anbieter (rag_source.rs). Die
+# Feldbeschriftungen der Anbieter stammen vom Anbieter selbst und werden
+# nicht übersetzt.
+rag-label-source-kind = Quelle
+rag-source-git-label = Git-Repository
+rag-source-git-help = Klont ein Repository und indexiert dessen Dateien. Das bisherige Verhalten.
+rag-source-secret-stored = gespeichert
+rag-source-secret-placeholder = leer lassen, um den gespeicherten Wert zu behalten
+rag-source-secret-clear = Gespeicherten Wert löschen
+rag-source-unknown-kind = Unbekannte Quellenart.
+rag-source-test-button = Verbindung testen
+rag-source-test-ok = Verbunden als `{ $account }`. { $entries } Eintrag/Einträge im konfigurierten Ordner.
+rag-source-test-ok-plain = Verbunden. { $entries } Eintrag/Einträge im konfigurierten Ordner.
+rag-source-test-failed = Quelle nicht erreichbar: { $error }
+rag-source-test-git = Wähle eine entfernte Quelle zum Testen. Git-Repositories werden beim Indexieren geprüft.
+rag-source-detected = Erkannt: { $server }
+
+rag-label-profile = Dokumentfelder
+rag-option-profile-none = Keine — nur Text indexieren
+rag-profile-help = Extrahiert Felder (Lieferant, Datum, Betrag, Projekt) aus jedem Dokument, damit sie gefiltert, sortiert und summiert werden können. Kostet einen Modellaufruf pro Dokument; für Code- oder reine Textsammlungen "Keine" lassen.
+
+# Editor für Extraktionsprofile (/rag/profiles, rag_profiles.rs)
+rag-profile-page-title = Extraktionsprofile — LLM Gateway
+rag-profile-heading = Extraktionsprofile
+rag-profile-description = Was aus jedem Dokument einer Sammlung extrahiert wird: die Felder, mit denen "die letzte Rechnung von X" oder "wie viel haben wir ausgegeben" überhaupt beantwortbar werden. Ein Profil wird einer Sammlung auf der RAG-Seite zugewiesen.
+rag-profile-create-heading = Neues Profil
+rag-profile-list-heading = Profile
+rag-profile-empty = Noch keine Profile.
+rag-profile-builtin = mitgeliefert
+rag-profile-version = v{ $version }
+rag-profile-summary = { $count } Feld(er)
+rag-profile-label-name = Name
+rag-profile-label-description = Beschreibung
+rag-profile-label-prompt = Extraktionsanweisungen
+rag-profile-label-fields = Felder (JSON)
+rag-profile-prompt-placeholder = Beschreibe, was das Modell liest und wie Datums- und Betragsangaben zu normalisieren sind.
+rag-profile-fields-help = Ein Objekt pro Feld: key, label, type (text | number | date | enum), description sowie optional filterable / sortable. Ein enum braucht zusätzlich "values". Die Beschreibung sieht das Modell — also präzise formulieren.
+rag-profile-edit-warning = Beim Speichern wird die Profilversion erhöht und der Extraktions-Cache verworfen. Sammlungen, die dieses Profil nutzen, müssen neu indexiert werden.
+rag-profile-button-create = Profil anlegen
+rag-profile-button-save = Speichern
+rag-profile-button-delete = Löschen
+rag-profile-link = Extraktionsprofile bearbeiten
+rag-profile-toast-created = Profil `{ $name }` angelegt.
+rag-profile-toast-saved = `{ $name }` gespeichert.
+rag-profile-toast-saved-reindex = `{ $name }` gespeichert. Zum Anwenden neu indexieren: { $collections }.
+rag-profile-toast-deleted = Profil gelöscht.
+rag-profile-toast-name-exists = ein Profil namens `{ $name }` existiert bereits
+rag-profile-toast-name-length = Der Name muss 1 bis 64 Zeichen lang sein.
+rag-profile-toast-name-charset = Der Name darf nur Buchstaben, Ziffern, `-` und `_` enthalten.
+rag-profile-toast-prompt-required = Extraktionsanweisungen sind erforderlich.
+rag-profile-toast-fields-invalid = Felder sind kein gültiges JSON: { $err }
+rag-profile-toast-fields-empty = Ein Profil braucht mindestens ein Feld.
+rag-profile-toast-field-key-required = Jedes Feld braucht einen key.
+rag-profile-toast-field-duplicate = Doppelter Feld-key `{ $key }`.
+rag-profile-toast-enum-values = Feld `{ $key }` ist ein enum und braucht eine "values"-Liste.
+rag-profile-toast-in-use = Wird noch verwendet von: { $collections }. Weise diesen zuerst ein anderes Profil zu.
+rag-profile-toast-builtin = Mitgelieferte Profile können nicht gelöscht werden. Bearbeite oder kopiere sie stattdessen.
+rag-profile-toast-save-failed = Speichern des Profils fehlgeschlagen.
+
+# Sync-Hook — ein eingehender Auslöser, der eine Sammlung neu synchronisiert.
+rag-toast-sync-token = Sync-URL (wird einmalig angezeigt und nicht gespeichert): { $url }
+rag-toast-sync-token-cleared = Sync-URL deaktiviert.
+rag-button-sync-token = Sync-URL
+rag-button-sync-token-rotate = Neue Sync-URL
+rag-button-sync-token-clear = Sync-URL deaktivieren
+rag-badge-sync-hook = Sync-Hook
+
+# Browser consent for an OAuth source (Google Drive).
+rag-source-consent-save-first = Sammlung zuerst mit Client-ID und Secret speichern, dann verbinden, um Zugriff zu erteilen.
+rag-source-consent-connected = verbunden
+rag-source-consent-not-connected = nicht verbunden
+rag-source-consent-connect = Verbinden
+rag-source-consent-reconnect = Neu verbinden
+rag-source-consent-help = Alle, die diese Sammlung durchsuchen können, sehen die Dateien des verbundenen Kontos.
+rag-oauth-lookup-failed = Die Sammlung konnte nicht gelesen werden.
+rag-oauth-not-oauth = Diese Quellenart wird nicht im Browser verbunden.
+rag-oauth-no-client = Speichern Sie zuerst OAuth-Client-ID und Secret an der Sammlung.
+rag-oauth-bad-authorize-url = Die Autorisierungs-URL des Anbieters konnte nicht gebildet werden.
+rag-oauth-start-failed = Die Autorisierung konnte nicht gestartet werden.
+rag-oauth-callback-missing = In der Antwort des Anbieters fehlten Code oder State.
+rag-oauth-expired = Diese Autorisierung ist abgelaufen oder wurde bereits verwendet. Bitte erneut starten.
+rag-oauth-provider-refused = Der Anbieter hat die Autorisierung abgelehnt: { $error }
+rag-oauth-exchange-failed = Der Tausch des Autorisierungscodes ist fehlgeschlagen: { $error }
+rag-oauth-no-refresh-token = Der Anbieter hat kein Refresh-Token geliefert; unbeaufsichtigtes Indexieren wäre damit nicht möglich. Entziehen Sie dem Gateway im Anbieterkonto den Zugriff und verbinden Sie erneut.
+rag-oauth-store-failed = Die Zugangsdaten konnten nicht gespeichert werden.

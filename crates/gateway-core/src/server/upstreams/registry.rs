@@ -922,19 +922,28 @@ impl UpstreamRegistry {
         voices
     }
 
+    /// Internal capability pools — never listed as chat models.
+    ///
+    /// OCR takes a document and reranking scores (query, passage) pairs;
+    /// neither answers a chat completion, so a client picking a model from
+    /// `/v1/models` must never see them.
+    fn is_internal_kind(kind: PoolKind) -> bool {
+        matches!(kind, PoolKind::Ocr | PoolKind::Rerank)
+    }
+
     /// Every advertised model across *all* pools and kinds, de-duplicated by
     /// id (replicas serving the same id collapse to one) and sorted. Backs
     /// the OpenAI-parity `GET /v1/models`, which lists every usable model
     /// regardless of capability — clients pick by id.
     pub fn all_models(&self) -> Vec<String> {
-        self.collect_models(|p| p.kind != PoolKind::Ocr)
+        self.collect_models(|p| !Self::is_internal_kind(p.kind))
     }
 
     /// Like [`Self::all_models`], but only over pools `access` permits — the
     /// per-user `GET /v1/models`. A model withheld here is also unroutable for
     /// the same caller (see [`Self::route_for`]), so the list can't be bypassed.
     pub fn all_models_for(&self, access: &PoolAccess) -> Vec<String> {
-        self.collect_models(|p| p.kind != PoolKind::Ocr && access.allows(p))
+        self.collect_models(|p| !Self::is_internal_kind(p.kind) && access.allows(p))
     }
 
     /// Like [`Self::models_for_kind`], but only over pools `access` permits —
@@ -949,7 +958,7 @@ impl UpstreamRegistry {
         self.data()
             .pools
             .values()
-            .any(|p| p.kind != PoolKind::Ocr && access.allows(p) && p.knows_model(model))
+            .any(|p| !Self::is_internal_kind(p.kind) && access.allows(p) && p.knows_model(model))
     }
 
     /// Sorted list of `(model_id, merged_compliance)` for every model served

@@ -142,6 +142,10 @@ pub enum PoolKind {
     /// Dedicated document OCR. This is an internal capability pool; it is
     /// not exposed as a normal chat model endpoint.
     Ocr,
+    /// Cross-encoder reranking for retrieval. Like [`PoolKind::Ocr`], an
+    /// internal capability pool: it scores (query, passage) pairs and is
+    /// never a chat model, so it stays out of `/v1/models`.
+    Rerank,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -289,7 +293,7 @@ impl FallbackConfig {
             PoolKind::Image => self.image.as_deref(),
             // Speech has no unknown-model fallback: a mistyped voice/model just
             // surfaces the backend's own error. No sensible cross-substitution.
-            PoolKind::Speech | PoolKind::Ocr => None,
+            PoolKind::Speech | PoolKind::Ocr | PoolKind::Rerank => None,
         }
     }
 }

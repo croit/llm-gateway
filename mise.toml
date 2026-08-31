@@ -57,6 +57,77 @@ RUST_LOG = "info,gateway=debug,gateway_core=debug,gateway_features=debug,gateway
 # update_token_env` names which var to read (default below):
 # IP2LOCATION_TOKEN = "<your-ip2location-lite-token>"   # ← in mise.local.toml
 
+[tasks.test-nextcloud]
+description = "LIVE E2E for the fileshare RAG WebDAV provider against a real Nextcloud in a throwaway container. Never runs in normal CI or `cargo test` — the test binary is gated behind RUN_NEXTCLOUD_E2E and skips without it. Verifies the assumptions the mocked tests cannot: that oc:fileid really survives a move, and that a collection etag really changes and propagates when something beneath it changes (subtree pruning is built on that). Needs docker or podman. First run pulls ~600 MB and waits ~60-90 s for Nextcloud to install itself."
+run = """
+set -eu
+
+CONTAINER="${NEXTCLOUD_E2E_CONTAINER:-gw-nextcloud-e2e}"
+PORT="${NEXTCLOUD_E2E_PORT:-8099}"
+IMAGE="${NEXTCLOUD_E2E_IMAGE:-docker.io/library/nextcloud:31-apache}"
+USER_NAME="admin"
+PASSWORD="admin-password-e2e"
+
+# podman is drop-in here; prefer whichever exists.
+if command -v podman >/dev/null 2>&1; then RUNTIME=podman
+elif command -v docker >/dev/null 2>&1; then RUNTIME=docker
+else
+  echo "need docker or podman to run the live Nextcloud test" >&2
+  exit 1
+fi
+
+# Always tear down, including on failure or Ctrl-C: a stray container
+# holding the port makes the next run fail with something unhelpful.
+cleanup() {
+  if [ "${NEXTCLOUD_E2E_KEEP:-}" = "1" ]; then
+    echo "leaving $CONTAINER running (NEXTCLOUD_E2E_KEEP=1) on http://127.0.0.1:$PORT"
+  else
+    $RUNTIME rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+$RUNTIME rm -f "$CONTAINER" >/dev/null 2>&1 || true
+echo "starting $IMAGE as $CONTAINER on port $PORT ..."
+# SQLite: no second container, and the corpus here is a handful of files.
+$RUNTIME run -d --name "$CONTAINER" \
+  -p "127.0.0.1:$PORT:80" \
+  -e SQLITE_DATABASE=nextcloud \
+  -e NEXTCLOUD_ADMIN_USER="$USER_NAME" \
+  -e NEXTCLOUD_ADMIN_PASSWORD="$PASSWORD" \
+  -e NEXTCLOUD_TRUSTED_DOMAINS="127.0.0.1 localhost" \
+  "$IMAGE" >/dev/null
+
+# Nextcloud installs itself on first boot; until that finishes it answers
+# 503 or redirects to the setup wizard. Poll the DAV endpoint we actually
+# use rather than the front page, so we wait for the thing under test.
+echo -n "waiting for Nextcloud to finish installing"
+DAV="http://127.0.0.1:$PORT/remote.php/dav/files/$USER_NAME/"
+for _ in $(seq 1 120); do
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -u "$USER_NAME:$PASSWORD" \
+    -X PROPFIND -H 'Depth: 0' "$DAV" || true)
+  if [ "$CODE" = "207" ]; then echo " ready."; break; fi
+  echo -n "."
+  sleep 2
+done
+if [ "${CODE:-}" != "207" ]; then
+  echo ""
+  echo "Nextcloud did not become ready (last status: ${CODE:-none}). Container logs:" >&2
+  $RUNTIME logs --tail 40 "$CONTAINER" >&2 || true
+  exit 1
+fi
+
+# --test-threads=1: the tests share one Nextcloud and each manages its own
+# folder, but the server's etag propagation is what we are measuring and
+# concurrent writes elsewhere in the tree would muddy it.
+RUN_NEXTCLOUD_E2E=1 \
+NEXTCLOUD_URL="http://127.0.0.1:$PORT" \
+NEXTCLOUD_USER="$USER_NAME" \
+NEXTCLOUD_PASS="$PASSWORD" \
+  cargo test -p gateway --test nextcloud_e2e_live -- --nocapture --test-threads=1
+"""
+dir = "{{ config_root }}"
+
 [tasks.dev]
 description = "Run the gateway (debug build) against the local config. Pair with `mise run watch-css` / `mise run watch-js` in another terminal for live asset reload."
 depends = ["build-assets"]

@@ -1412,11 +1412,19 @@ pub use comfyui::{comfyui_index as admin_comfyui_index, comfyui_reload as admin_
 
 // Admin RAG-collections CRUD (`/rag`). Same admin gate.
 mod rag;
+// The source-kind picker + provider field sets, rendered from each
+// provider's own declared config fields (see `rag_source`).
+mod rag_oauth;
+mod rag_profiles;
+mod rag_source;
 pub use rag::{
     rag_add_ref, rag_add_sources_bulk, rag_cancel_edit, rag_create, rag_delete, rag_edit_form,
     rag_index, rag_ref_cancel_edit, rag_ref_delete, rag_ref_edit_form, rag_ref_log,
-    rag_ref_reindex, rag_ref_set_primary, rag_ref_update, rag_reindex, rag_status, rag_update,
+    rag_ref_reindex, rag_ref_set_primary, rag_ref_update, rag_reindex, rag_status, rag_sync_hook,
+    rag_sync_token, rag_sync_token_clear, rag_test_source, rag_update,
 };
+pub use rag_oauth::{rag_connect, rag_oauth_callback};
+pub use rag_profiles::{profile_create, profile_delete, profile_update, profiles_index};
 
 // Admin gateway-groups editor (`/admin/groups`) — OIDC→group mappings + per-group
 // tool/skill grants. Same admin gate.

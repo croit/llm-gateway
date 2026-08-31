@@ -13,6 +13,10 @@ publish.workspace = true
 # edit a leaf-crate rebuild. See docs/architecture.md.
 
 [dependencies]
+# Shared HTTP client type: the /rag source form builds a provider from the
+# submitted credentials to validate them, and the "Test connection" button
+# drives a live probe through the gateway's own client pool.
+reqwest = { workspace = true }
 gateway-core = { path = "../gateway-core" }
 gateway-features = { path = "../gateway-features" }
 gateway-runtime = { path = "../gateway-runtime" }

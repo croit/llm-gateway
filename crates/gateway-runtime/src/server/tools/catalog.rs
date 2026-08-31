@@ -308,6 +308,7 @@ pub fn category_for(tool_id: &str) -> Category {
         | "list_attachments" | "read_skill" => Category::Documents,
         "generate_image" | "edit_image" | "generate_qr_code" | "load_image_url" => Category::Media,
         "rag_search" | "rag_grep" | "rag_list_collections" => Category::Knowledge,
+        "rag_query_documents" | "rag_list_documents" | "rag_fetch_document" => Category::Knowledge,
         "run_in_sandbox"
         | "generate_document"
         | "convert_document"
@@ -485,6 +486,24 @@ fn display_meta(tool_id: &str) -> Option<(&'static str, &'static str)> {
             "Lets the assistant search the indexed repositories with a regular expression and \
              get back the matching lines with file and line number — for \"every place that \
              looks like this\", where a meaning-based search can't express the pattern.",
+        ),
+        "rag_query_documents" => (
+            "Query indexed documents",
+            "Lets the assistant filter, sort and total the documents in a knowledge base by \
+             the details pulled out of them — vendor, date, amount, project — so it can \
+             answer \"the most recent invoice from X\" or \"how much did we spend\" with a \
+             real figure, instead of a few passages that merely look relevant.",
+        ),
+        "rag_list_documents" => (
+            "List indexed documents",
+            "Lets the assistant list the documents in a folder of a knowledge base with a \
+             one-paragraph summary of each, so it can cover a whole project folder in one \
+             step rather than opening every file.",
+        ),
+        "rag_fetch_document" => (
+            "Read an indexed document",
+            "Lets the assistant read one indexed document in full when a summary is not \
+             enough and it needs the document's own wording.",
         ),
         "rag_list_collections" => (
             "List knowledge bases",

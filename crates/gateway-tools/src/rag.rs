@@ -612,7 +612,7 @@ async fn grep_scan(
 ) -> Result<GrepScan, ToolError> {
     let started = std::time::Instant::now();
     let mut matches: Vec<Value> = Vec::new();
-    let mut seen: HashSet<(String, i64)> = HashSet::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut chunks_scanned = 0usize;
     let mut after_id = 0i64;
     let mut stopped_because = None;
@@ -640,18 +640,27 @@ async fn grep_scan(
                 if !re.is_match(line) {
                     continue;
                 }
-                let line_no = chunk.start_line + idx as i64;
-                if !seen.insert((chunk.file_path.clone(), line_no)) {
+                // Line offsets are only meaningful inside a line-positioned
+                // chunk. In a page-positioned one, adding the offset to the
+                // page number would produce a confident, wrong citation.
+                let location = match chunk.loc.kind {
+                    rag_db::LocKind::Line => {
+                        format!("line {}", chunk.loc.from + idx as i64)
+                    }
+                    rag_db::LocKind::Page => {
+                        format!("{}, line {}", chunk.loc.label(), idx + 1)
+                    }
+                };
+                if !seen.insert((chunk.file_path.clone(), location.clone())) {
                     continue;
                 }
                 let from = idx.saturating_sub(context_lines);
                 let to = (idx + context_lines + 1).min(lines.len());
                 matches.push(json!({
                     "file_path": chunk.file_path,
-                    "line": line_no,
+                    "location": location,
                     "text": line,
                     "context": lines[from..to].join("\n"),
-                    "context_start_line": chunk.start_line + from as i64,
                 }));
                 if matches.len() >= max_results {
                     stopped_because = Some(StopReason::Results);
@@ -679,7 +688,7 @@ async fn grep_scan(
 /// Shared by `rag_search` and `rag_grep` so the two can't drift: a collection
 /// the caller's groups don't permit must be reported as *not found*, identical
 /// to a nonexistent one, or the error message becomes an existence oracle.
-async fn resolve_collection(
+pub(crate) async fn resolve_collection(
     rbac: &Resolver,
     db: &gateway_core::server::db::Pool,
     roles: &[String],
@@ -726,8 +735,11 @@ fn validate_glob(raw: Option<&str>) -> Result<Option<String>, ToolError> {
 fn hit_json((chunk, score): (rag_db::Chunk, f32)) -> Value {
     json!({
         "file_path": chunk.file_path,
-        "start_line": chunk.start_line,
-        "end_line": chunk.end_line,
+        // One citation string rather than a bare pair of numbers: the unit
+        // differs by document (lines for source, pages for a PDF or a scan),
+        // and handing a model two integers with no unit invites it to invent
+        // one. This is the text it quotes back to the user.
+        "location": chunk.loc.label(),
         "score": score,
         "content": chunk.content,
     })
@@ -917,6 +929,7 @@ mod tests {
                 data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
                 ..IndexerConfig::default()
             },
+            None,
         );
         let c = rag_db::create_collection(
             &pool,
@@ -926,6 +939,9 @@ mod tests {
                 git_url: "https://example.invalid/repo".into(),
                 git_ref: "main".into(),
                 pat: None,
+                source: Default::default(),
+                profile_id: None,
+                extraction_model: None,
                 embedding_model: "embed-test".into(),
                 include_globs: vec![],
                 exclude_globs: vec![],
@@ -952,9 +968,15 @@ mod tests {
         rag_db::set_ref_status(&pool, r.id, rag_db::CollectionStatus::Indexing)
             .await
             .unwrap();
-        rag_db::swap_ref_index(&pool, r.id, &r.data_uuid, "deadbeef")
-            .await
-            .unwrap();
+        rag_db::swap_ref_index(
+            &pool,
+            r.id,
+            &r.data_uuid,
+            "deadbeef",
+            "ocr=false,office=false",
+        )
+        .await
+        .unwrap();
 
         let out = RagListCollections::new(std::sync::Arc::new(
             gateway_core::server::rbac::Resolver::empty(),
@@ -984,6 +1006,7 @@ mod tests {
                 data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
                 ..IndexerConfig::default()
             },
+            None,
         );
         let c = rag_db::create_collection(
             &pool,
@@ -993,6 +1016,9 @@ mod tests {
                 git_url: "https://example.invalid/default.git".into(),
                 git_ref: "master".into(),
                 pat: None,
+                source: Default::default(),
+                profile_id: None,
+                extraction_model: None,
                 embedding_model: "embed-test".into(),
                 include_globs: vec![],
                 exclude_globs: vec![],
@@ -1016,7 +1042,7 @@ mod tests {
                 rag_db::set_ref_status(&pool, r.id, rag_db::CollectionStatus::Indexing)
                     .await
                     .unwrap();
-                rag_db::swap_ref_index(&pool, r.id, &r.data_uuid, "sha")
+                rag_db::swap_ref_index(&pool, r.id, &r.data_uuid, "sha", "ocr=false,office=false")
                     .await
                     .unwrap();
             }
@@ -1072,6 +1098,7 @@ mod tests {
                 data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
                 ..IndexerConfig::default()
             },
+            None,
         );
 
         // Seed the DB + index by hand (avoid the git path here — the
@@ -1084,6 +1111,9 @@ mod tests {
                 git_url: "https://example.invalid".into(),
                 git_ref: "main".into(),
                 pat: None,
+                source: Default::default(),
+                profile_id: None,
+                extraction_model: None,
                 embedding_model: "embed-test".into(),
                 include_globs: vec![],
                 exclude_globs: vec![],
@@ -1099,7 +1129,7 @@ mod tests {
             .await
             .unwrap();
         let store = indexer.collection_store(r.id, &r.data_uuid).await.unwrap();
-        let f = rag_db::upsert_file(&store, c.id, "src/alpha.rs", "hashA")
+        let f = rag_db::upsert_file(&store, c.id, "src/alpha.rs", "hashA", &Default::default())
             .await
             .unwrap();
         rag_db::insert_chunks(
@@ -1108,8 +1138,7 @@ mod tests {
             &[rag_db::NewChunk {
                 file_id: f,
                 chunk_index: 0,
-                start_line: 1,
-                end_line: 5,
+                loc: rag_db::ChunkLoc::lines(1, 5),
                 content: "alpha alpha".into(),
                 vector_id: 1,
             }],
@@ -1133,9 +1162,15 @@ mod tests {
         rag_db::set_ref_status(&pool, r.id, rag_db::CollectionStatus::Indexing)
             .await
             .unwrap();
-        rag_db::swap_ref_index(&pool, r.id, &r.data_uuid, "deadbeef")
-            .await
-            .unwrap();
+        rag_db::swap_ref_index(
+            &pool,
+            r.id,
+            &r.data_uuid,
+            "deadbeef",
+            "ocr=false,office=false",
+        )
+        .await
+        .unwrap();
         let r = rag_db::find_ref_by_id(&pool, r.id).await.unwrap().unwrap();
 
         // Sanity-check the lower layer first so a search-tool failure
@@ -1169,7 +1204,9 @@ mod tests {
         let hits = out["hits"].as_array().unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["file_path"], "src/alpha.rs");
-        assert_eq!(hits[0]["start_line"], 1);
+        // Provenance is one citation string, so the unit travels with the
+        // number and a model cannot quote a page as though it were a line.
+        assert_eq!(hits[0]["location"], "lines 1-5");
         assert_eq!(hits[0]["content"], "alpha alpha");
     }
 
@@ -1186,6 +1223,7 @@ mod tests {
                 data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
                 ..IndexerConfig::default()
             },
+            None,
         );
         let c = rag_db::create_collection(
             &pool,
@@ -1195,6 +1233,9 @@ mod tests {
                 git_url: "https://example.invalid/default.git".into(),
                 git_ref: "master".into(),
                 pat: None,
+                source: Default::default(),
+                profile_id: None,
+                extraction_model: None,
                 embedding_model: "embed-test".into(),
                 include_globs: vec![],
                 exclude_globs: vec![],
@@ -1224,15 +1265,16 @@ mod tests {
             ("qemu-server/PVE/QemuServer.pm", "beta beta", 2i64),
         ];
         for (path, content, vid) in docs {
-            let f = rag_db::upsert_file(&store, c.id, path, "h").await.unwrap();
+            let f = rag_db::upsert_file(&store, c.id, path, "h", &Default::default())
+                .await
+                .unwrap();
             rag_db::insert_chunks(
                 &store,
                 c.id,
                 &[rag_db::NewChunk {
                     file_id: f,
                     chunk_index: 0,
-                    start_line: 1,
-                    end_line: 2,
+                    loc: rag_db::ChunkLoc::lines(1, 2),
                     content: content.into(),
                     vector_id: vid,
                 }],
@@ -1255,9 +1297,15 @@ mod tests {
         rag_db::set_ref_status(&pool, primary.id, rag_db::CollectionStatus::Indexing)
             .await
             .unwrap();
-        rag_db::swap_ref_index(&pool, primary.id, &primary.data_uuid, "sha")
-            .await
-            .unwrap();
+        rag_db::swap_ref_index(
+            &pool,
+            primary.id,
+            &primary.data_uuid,
+            "sha",
+            "ocr=false,office=false",
+        )
+        .await
+        .unwrap();
 
         // ONE query over the unified index — `alpha` ranks the pve-manager
         // chunk first, and the hit path is prefixed with its source repo.
@@ -1289,6 +1337,7 @@ mod tests {
                 data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
                 ..IndexerConfig::default()
             },
+            None,
         );
         let c = rag_db::create_collection(
             &pool,
@@ -1298,6 +1347,9 @@ mod tests {
                 git_url: "https://e.invalid".into(),
                 git_ref: "main".into(),
                 pat: None,
+                source: Default::default(),
+                profile_id: None,
+                extraction_model: None,
                 embedding_model: "embed-test".into(),
                 include_globs: vec![],
                 exclude_globs: vec![],
@@ -1342,6 +1394,7 @@ mod tests {
                 data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
                 ..IndexerConfig::default()
             },
+            None,
         );
         let err = RagSearch::new(std::sync::Arc::new(
             gateway_core::server::rbac::Resolver::empty(),
@@ -1383,6 +1436,7 @@ mod tests {
                 data_dir: tempfile::tempdir().unwrap().path().to_path_buf(),
                 ..IndexerConfig::default()
             },
+            None,
         );
         let c = rag_db::create_collection(
             &pool,
@@ -1392,6 +1446,9 @@ mod tests {
                 git_url: "https://example.invalid".into(),
                 git_ref: "main".into(),
                 pat: None,
+                source: Default::default(),
+                profile_id: None,
+                extraction_model: None,
                 embedding_model: "embed-test".into(),
                 include_globs: vec![],
                 exclude_globs: vec![],
@@ -1409,7 +1466,7 @@ mod tests {
         let idx = indexer.open_index(r.id, &r.data_uuid, Some(4)).unwrap();
         for (i, (path, content)) in files.iter().enumerate() {
             let vid = i as i64 + 1;
-            let f = rag_db::upsert_file(&store, c.id, path, "hash")
+            let f = rag_db::upsert_file(&store, c.id, path, "hash", &Default::default())
                 .await
                 .unwrap();
             rag_db::insert_chunks(
@@ -1418,8 +1475,7 @@ mod tests {
                 &[rag_db::NewChunk {
                     file_id: f,
                     chunk_index: 0,
-                    start_line: 1,
-                    end_line: content.lines().count().max(1) as i64,
+                    loc: rag_db::ChunkLoc::lines(1, content.lines().count().max(1) as i64),
                     content: (*content).into(),
                     vector_id: vid,
                 }],
@@ -1442,9 +1498,15 @@ mod tests {
         rag_db::set_ref_status(&pool, r.id, rag_db::CollectionStatus::Indexing)
             .await
             .unwrap();
-        rag_db::swap_ref_index(&pool, r.id, &r.data_uuid, "deadbeef")
-            .await
-            .unwrap();
+        rag_db::swap_ref_index(
+            &pool,
+            r.id,
+            &r.data_uuid,
+            "deadbeef",
+            "ocr=false,office=false",
+        )
+        .await
+        .unwrap();
         (pool, indexer, upstream)
     }
 
@@ -1551,7 +1613,7 @@ mod tests {
         assert_eq!(matches.len(), 1, "{out:?}");
         assert_eq!(matches[0]["file_path"], "src/osd.rs");
         // Chunk starts at line 1, the match is the second line.
-        assert_eq!(matches[0]["line"], 2, "{out:?}");
+        assert_eq!(matches[0]["location"], "line 2", "{out:?}");
         assert!(
             matches[0]["text"]
                 .as_str()

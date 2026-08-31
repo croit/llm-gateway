@@ -45,8 +45,6 @@ use shared::api::ToolDef;
 
 use std::sync::Arc;
 
-use shared::sandbox::{InputFile, Language, RunRequest};
-
 use gateway_features::server::chat_attachments::{self, BinaryDisposition, PayloadLimits};
 use gateway_features::server::file_refs::{self, FileRef};
 use gateway_features::server::pdf::{self, PdfError};
@@ -126,76 +124,6 @@ fn image_mime(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Verbatim structured extractor run in the sandbox. Dispatches by the
-/// input file's extension (python-pptx / python-docx / openpyxl). Prints one
-/// JSON object of the document's content — titles, text, bullets, tables,
-/// notes, image filenames — with NO modification, so the model can re-author
-/// it into a template (letter / presentation / one-pager) losslessly. Each
-/// embedded image is written to `/work` top-level (NOT a subdir) so the
-/// sandbox agent returns it as an artifact for the gateway to re-attach.
-const EXTRACT_PY: &str = r#"import sys, json, os
-src, imgdir = sys.argv[1], sys.argv[2]
-os.makedirs(imgdir, exist_ok=True)
-ext = os.path.splitext(src)[1].lower()
-def extract_pptx():
-    from pptx import Presentation
-    from pptx.enum.shapes import MSO_SHAPE_TYPE
-    prs = Presentation(src); out=[]
-    def walk(shapes, tshape, acc):
-        for sh in shapes:
-            if sh.shape_type==MSO_SHAPE_TYPE.GROUP: walk(sh.shapes,tshape,acc); continue
-            if sh.shape_type==MSO_SHAPE_TYPE.PICTURE: acc["_p"].append(sh); continue
-            if sh.has_table: acc["tables"].append([[c.text for c in r.cells] for r in sh.table.rows]); continue
-            if sh.has_text_frame:
-                ps=[p.text for p in sh.text_frame.paragraphs if p.text.strip()]
-                if not ps: continue
-                if sh is tshape: acc["title"]=sh.text_frame.text.strip()
-                elif len(ps)>1: acc["bullets"].append(ps)
-                else: acc["text"].append(ps[0])
-    for i,sl in enumerate(prs.slides):
-        acc={"title":"","text":[],"bullets":[],"tables":[],"_p":[]}
-        walk(sl.shapes, sl.shapes.title, acc)
-        imgs=[]
-        for j,sh in enumerate(acc.pop("_p")):
-            im=sh.image; fn="slide%d_img%d.%s"%(i+1,j+1,im.ext); open(os.path.join(imgdir,fn),"wb").write(im.blob); imgs.append(fn)
-        notes=sl.notes_slide.notes_text_frame.text.strip() if sl.has_notes_slide else ""
-        s={"index":i+1}
-        for k in ("title","text","bullets","tables"):
-            if acc[k]: s[k]=acc[k]
-        if imgs: s["images"]=imgs
-        if notes: s["notes"]=notes
-        out.append(s)
-    return {"kind":"presentation","units":"slides","content":out}
-def extract_docx():
-    import docx
-    d=docx.Document(src); blocks=[]
-    for p in d.paragraphs:
-        t=p.text.strip()
-        if t: blocks.append({"style":p.style.name if p.style else "", "text":t})
-    tables=[[[c.text for c in r.cells] for r in t.rows] for t in d.tables]
-    imgs=[]
-    for i,rel in enumerate(d.part.rels.values()):
-        if "image" in rel.reltype:
-            blob=rel.target_part.blob; fn="img%d.%s"%(i+1,(rel.target_part.content_type.split("/")[-1] or "png"))
-            open(os.path.join(imgdir,fn),"wb").write(blob); imgs.append(fn)
-    r={"kind":"document","paragraphs":blocks}
-    if tables: r["tables"]=tables
-    if imgs: r["images"]=imgs
-    return r
-def extract_xlsx():
-    from openpyxl import load_workbook
-    wb=load_workbook(src, data_only=True); sheets=[]
-    for ws in wb.worksheets:
-        rows=[[("" if c is None else str(c)) for c in row] for row in ws.iter_rows(values_only=True)]
-        rows=[r for r in rows if any(x.strip() for x in r)]
-        sheets.append({"name":ws.title,"rows":rows})
-    return {"kind":"spreadsheet","sheets":sheets}
-fn={".pptx":extract_pptx,".docx":extract_docx,".xlsx":extract_xlsx}.get(ext)
-if not fn: print(json.dumps({"error":"unsupported: "+ext})); sys.exit(1)
-res=fn(); res["source"]=os.path.basename(src)
-print(json.dumps(res, ensure_ascii=False))
-"#;
-
 /// Run [`EXTRACT_PY`] over `bytes` in the sandbox and return the parsed
 /// structured content. The document rides in as `upload.<ext>` so the
 /// extractor dispatches on the real format.
@@ -207,34 +135,9 @@ async fn extract_office(
     ext: &str,
     bytes: Vec<u8>,
 ) -> Result<Value, ToolError> {
-    let infile = format!("upload.{ext}");
-    // `EXTRACT_PY` is concatenated (not `format!`-interpolated) so its Python
-    // dict/set braces don't collide with format placeholders. Images go to
-    // `.` (== `/work`, the cwd) so the agent collects them as artifacts.
-    let code =
-        format!("set -e\ncd /work\npython3 - {infile} . <<'PYEOF'\n") + EXTRACT_PY + "PYEOF\n";
-    let req = RunRequest {
-        language: Language::Bash,
-        code,
-        files: vec![InputFile {
-            name: infile,
-            content_b64: b64::encode(&bytes),
-        }],
-        timeout_secs: None,
-        network: false,
-        container_id: None,
-        keep_alive: false,
-    };
-    let resp = sandbox.run_job(req).await?;
-    if resp.exit_code != 0 || resp.timed_out {
-        return Err(ToolError::Failed(format!(
-            "document extraction failed (exit {}): {}",
-            resp.exit_code,
-            resp.stderr.chars().rev().take(400).collect::<String>()
-        )));
-    }
-    let mut document: Value = serde_json::from_str(resp.stdout.trim())
-        .map_err(|e| ToolError::Failed(format!("extractor did not return JSON: {e}")))?;
+    let extracted =
+        gateway_runtime::server::tools::sandbox::run_office_extractor(sandbox, ext, bytes).await?;
+    let mut document = extracted.document;
 
     // Re-attach each embedded image the extractor pulled out. They ride back
     // as sandbox artifacts (top-level `/work` files); store each as a
@@ -245,7 +148,7 @@ async fn extract_office(
     // `file` key matches the filename listed on each slide/paragraph, so the
     // model can map "slide 3 had slide3_img1.png" → the ref to use.
     let mut image_refs = Vec::new();
-    for art in &resp.artifacts {
+    for art in &extracted.artifacts {
         let Some(mime) = image_mime(&art.name) else {
             continue;
         };

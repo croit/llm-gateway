@@ -38,6 +38,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 toml = "0.8"
 multer = "3"
+# WebDAV PROPFIND multistatus parsing for the RAG remote-source providers.
+# Pull-parser only (no serde-xml layer); already in the tree transitively via
+# rust-s3, so making it direct does not grow the dependency graph.
+quick-xml = "0.40"
 # S3 (or S3-compatible) client for chat attachments. The gateway
 # uploads each attached file to a bucket and includes the public
 # object URL in OpenAI's `image_url` content parts (or in a

@@ -404,6 +404,24 @@ impl AppState {
         self
     }
 
+    /// The providers this gateway can index from.
+    ///
+    /// Falls back to the built-in set when no indexer is wired (RAG is not
+    /// configured here), so a source picker still renders and the operator
+    /// sees what *would* be available rather than a form with a silently
+    /// missing control. Lives here rather than in each caller so one process
+    /// has one registry: the web pages and the JSON API previously each held
+    /// their own `LazyLock` fallback.
+    pub fn provider_registry(&self) -> &gateway_features::server::rag::source::ProviderRegistry {
+        use gateway_features::server::rag::source::ProviderRegistry;
+        static FALLBACK: std::sync::LazyLock<ProviderRegistry> =
+            std::sync::LazyLock::new(ProviderRegistry::with_builtins);
+        match self.indexer.as_ref() {
+            Some(indexer) => indexer.providers(),
+            None => &FALLBACK,
+        }
+    }
+
     /// Install the production at-rest encryption key, rebuilding the MCP
     /// connection manager so it seals/opens its tokens under the same key.
     pub fn with_crypto(mut self, crypto: Arc<Crypto>) -> Self {

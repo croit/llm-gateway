@@ -16,6 +16,8 @@ This directory holds the design docs for the LLM gateway. The agent-facing entry
 | [`tools-inventory.md`](tools-inventory.md) | Every tool id with its registration gate, toggle key, and whether it is chat-only (CI-drift-guarded) |
 | [`file-conversions.md`](file-conversions.md) | How uploads are read and documents produced/converted — tools, formats, expectations, limitations, gaps |
 | [`ocr.md`](ocr.md) | Internal document-OCR sidecar contract and Unlimited-OCR deployment requirements |
+| [`fileshare-rag.md`](fileshare-rag.md) | **Fileshare RAG** — indexing a file share (Nextcloud, ownCloud, OpenCloud, WebDAV) into RAG: the provider abstraction, extraction ladder, document profiles, structured queries, incremental sync |
+| [`nextcloud-rag-plan.md`](nextcloud-rag-plan.md) | The design record behind `fileshare-rag.md`: what was decided and why, what is deliberately not built, and the cited external protocol behaviour |
 | [`connectors.md`](connectors.md) | Per-user MCP connector catalog — operator setup for Google/GitHub/Atlassian/GitLab + troubleshooting |
 | [`ui.md`](ui.md) | Server-rendered HTML with plait + daisyUI + datastar (SSE-patch CRUD pattern) |
 | [`testing.md`](testing.md) | Test layers, mocking strategy, coverage targets |

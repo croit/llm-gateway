@@ -89,6 +89,9 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         // Webhooks: per-user prompts fired by an inbound HTTP call. The
         // management pages are session-gated; the public trigger
         // `/hooks/{secret}` authenticates by the secret in the URL.
+        // Unauthenticated by design: the token in the URL is the credential.
+        // Points a file host's webhook at one RAG collection's re-sync.
+        .with_post("/hooks/rag/{token}", pages::rag_sync_hook)
         .with_get("/webhooks", pages::webhooks_index)
         .with_post("/webhooks", pages::webhooks_create)
         .with_get("/webhooks/{id}/edit", pages::webhooks_edit_form)
@@ -225,7 +228,21 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/skills/delete", pages::user_skills_delete)
         .with_get("/rag", pages::rag_index)
         .with_get("/rag/status", pages::rag_status)
+        // Static before {id}: rama matches in registration order, so
+        // `/rag/oauth/callback` must be claimed before `/rag/{id}/...`.
+        .with_get("/rag/oauth/callback", pages::rag_oauth_callback)
+        .with_get("/rag/{id}/connect", pages::rag_connect)
         .with_post("/rag", pages::rag_create)
+        .with_post("/rag/test-source", pages::rag_test_source)
+        .with_post("/rag/{id}/sync-token", pages::rag_sync_token)
+        .with_post("/rag/{id}/sync-token/clear", pages::rag_sync_token_clear)
+        // Static paths before the `{id}` routes: rama matches in
+        // registration order, so `/rag/profiles` must be claimed before
+        // anything that could capture `profiles` as an id.
+        .with_get("/rag/profiles", pages::profiles_index)
+        .with_post("/rag/profiles", pages::profile_create)
+        .with_post("/rag/profiles/{id}/update", pages::profile_update)
+        .with_post("/rag/profiles/{id}/delete", pages::profile_delete)
         .with_post("/rag/{id}/reindex", pages::rag_reindex)
         .with_post("/rag/{id}/delete", pages::rag_delete)
         .with_post("/rag/{id}/edit-form", pages::rag_edit_form)
@@ -284,6 +301,8 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
             api::location_feedback,
         )
         .with_post("/api/v0/me/ask/feedback/{turn_id}", api::ask_feedback)
+        .with_get("/api/v0/rag/providers", rag_api::list_providers)
+        .with_get("/api/v0/rag/profiles", rag_api::list_profiles)
         .with_get("/api/v0/rag/collections", rag_api::list_collections)
         .with_post("/api/v0/rag/collections", rag_api::create_collection)
         .with_get("/api/v0/rag/collections/{id}", rag_api::get_collection)

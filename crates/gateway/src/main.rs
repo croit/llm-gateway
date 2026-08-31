@@ -247,6 +247,19 @@ async fn main() -> anyhow::Result<()> {
         // Regex over the same indexed corpus, for patterns BM25 can't express
         // (`TODO\(.*\)`, `impl .* for Tool`). Same per-collection group ACL.
         .with(gateway_tools::rag::RagGrep::new(rbac.clone()))
+        // Document-level retrieval over the fields the extraction profile
+        // pulled out. This is what answers questions about *sets* of
+        // documents — "the latest invoice from X", "everything about project
+        // Y" — which passage retrieval structurally cannot.
+        .with(gateway_tools::rag_documents::RagQueryDocuments::new(
+            rbac.clone(),
+        ))
+        .with(gateway_tools::rag_documents::RagListDocuments::new(
+            rbac.clone(),
+        ))
+        .with(gateway_tools::rag_documents::RagFetchDocument::new(
+            rbac.clone(),
+        ))
         // Document canvas — build up and incrementally edit long documents
         // across turns. Content lives in the `documents` store, not S3, so
         // these need no extra config; off the chat path they error cleanly.
@@ -645,6 +658,16 @@ async fn main() -> anyhow::Result<()> {
         state = state.with_geoip(geo);
     }
 
+    // Usage metrics: a batched background writer + retention-prune task,
+    // fronted by a fire-and-forget handle on the shared state. When
+    // `[usage] enabled = false` the handle is a no-op and no tasks spawn.
+    let usage = if state.config.usage.enabled {
+        srv::usage::spawn(state.db.clone(), state.config.usage.retention_days)
+    } else {
+        tracing::info!("usage metrics disabled via [usage].enabled = false");
+        srv::usage::UsageHandle::disabled()
+    };
+
     // RAG indexer — always wired in. The DB-backed collection registry
     // starts empty, so deployments that don't use RAG just have a quiet
     // poller running every 30s. Operators add collections via the admin
@@ -660,29 +683,42 @@ async fn main() -> anyhow::Result<()> {
         clone_concurrency: rag_config.clone_concurrency,
         ..feat::rag::worker::IndexerConfig::default()
     };
+    // One OCR service for the whole process. Built here rather than letting
+    // `RamaState` construct its own, because its concurrency gate only bounds
+    // GPU work if the indexer and the chat path share the same instance —
+    // two would allow twice the configured concurrency.
+    let ocr = feat::ocr::OcrService::new(
+        state.config.chat.ocr.clone(),
+        state.upstreams.clone(),
+        state.http.clone(),
+        usage.clone(),
+        state.db.clone(),
+    );
+    // Office documents are read through the sandbox. `gateway-features` sits
+    // below the sandbox client, so the capability is injected here rather
+    // than reached for from inside the indexer.
+    let office: Option<std::sync::Arc<dyn feat::rag::extract::OfficeExtractor>> =
+        sandbox_client.clone().map(|sb| {
+            std::sync::Arc::new(rt::tools::sandbox::SandboxOfficeExtractor::new(sb))
+                as std::sync::Arc<dyn feat::rag::extract::OfficeExtractor>
+        });
     let indexer = feat::rag::worker::Indexer::new(
         state.db.clone(),
         state.upstreams.clone(),
         state.http.clone(),
         indexer_config,
-    );
+        // Opens the sealed credentials of remote (non-git) sources.
+        Some(state.crypto.clone()),
+    )
+    .with_document_readers(Some(ocr.clone()), office);
     // Re-queue any ref left mid-build by a previous crash/restart and reap
     // orphaned build folders before the loop starts handling new work.
     indexer.recover_on_startup().await;
     feat::rag::worker::spawn(indexer.clone());
     state = state.with_indexer(indexer);
 
-    // Usage metrics: a batched background writer + retention-prune task,
-    // fronted by a fire-and-forget handle on the shared state. When
-    // `[usage] enabled = false` the handle is a no-op and no tasks spawn.
-    let usage = if state.config.usage.enabled {
-        srv::usage::spawn(state.db.clone(), state.config.usage.retention_days)
-    } else {
-        tracing::info!("usage metrics disabled via [usage].enabled = false");
-        srv::usage::UsageHandle::disabled()
-    };
-
-    let state = Arc::new(gateway::rama_server::RamaState::new(state, sessions, usage));
+    let state =
+        Arc::new(gateway::rama_server::RamaState::new(state, sessions, usage).with_ocr(ocr));
 
     // Scheduled actions: start the background loop that fires due actions
     // (the `scheduled_actions` table is created by migration 0021).

@@ -139,3 +139,88 @@ rag-suffix-not-advertised = (ya no disponible)
 
 rag-label-allowed-groups = Grupos permitidos
 rag-hint-allowed-groups = Grupos del gateway (separados por comas) autorizados a listar y buscar en esta colecciÃ³n. VacÃ­o = todos los que tengan las herramientas RAG. Los admins siempre tienen acceso.
+
+# Selector de origen + credenciales del proveedor (rag_source.rs). Las
+# etiquetas de los campos provienen del proveedor y no se traducen.
+rag-label-source-kind = Origen
+rag-source-git-label = Repositorio Git
+rag-source-git-help = Clona un repositorio e indexa sus archivos. El comportamiento original.
+rag-source-secret-stored = guardado
+rag-source-secret-placeholder = dejar vacío para conservar el valor guardado
+rag-source-secret-clear = Borrar el valor guardado
+rag-source-unknown-kind = Tipo de origen desconocido.
+rag-source-test-button = Probar conexión
+rag-source-test-ok = Conectado como `{ $account }`. { $entries } elemento(s) en la carpeta configurada.
+rag-source-test-ok-plain = Conectado. { $entries } elemento(s) en la carpeta configurada.
+rag-source-test-failed = No se pudo acceder al origen: { $error }
+rag-source-test-git = Elige un origen remoto para probar. Los repositorios Git se comprueban al indexar.
+rag-source-detected = Detectado: { $server }
+
+rag-label-profile = Campos del documento
+rag-option-profile-none = Ninguno — indexar solo el texto
+rag-profile-help = Extrae campos (proveedor, fecha, importe, proyecto) de cada documento para poder filtrarlos, ordenarlos y sumarlos. Cuesta una llamada al modelo por documento; deja «Ninguno» para colecciones de código o texto plano.
+
+# Editor de perfiles de extracción (/rag/profiles, rag_profiles.rs)
+rag-profile-page-title = Perfiles de extracción — LLM Gateway
+rag-profile-heading = Perfiles de extracción
+rag-profile-description = Lo que se extrae de cada documento de una colección: los campos que hacen que «la última factura de X» o «cuánto gastamos» tengan respuesta. Un perfil se asigna a una colección desde la página RAG.
+rag-profile-create-heading = Nuevo perfil
+rag-profile-list-heading = Perfiles
+rag-profile-empty = Todavía no hay perfiles.
+rag-profile-builtin = incluido
+rag-profile-version = v{ $version }
+rag-profile-summary = { $count } campo(s)
+rag-profile-label-name = Nombre
+rag-profile-label-description = Descripción
+rag-profile-label-prompt = Instrucciones de extracción
+rag-profile-label-fields = Campos (JSON)
+rag-profile-prompt-placeholder = Describe qué está leyendo el modelo y cómo normalizar fechas e importes.
+rag-profile-fields-help = Un objeto por campo: key, label, type (text | number | date | enum), description y, opcionalmente, filterable / sortable. Un enum necesita además «values». La descripción se le muestra al modelo, así que sé preciso.
+rag-profile-edit-warning = Al guardar se incrementa la versión del perfil y se vacía su caché de extracción. Las colecciones que lo usan deben reindexarse para adoptar los nuevos campos.
+rag-profile-button-create = Crear perfil
+rag-profile-button-save = Guardar
+rag-profile-button-delete = Eliminar
+rag-profile-link = Editar perfiles de extracción
+rag-profile-toast-created = Perfil «{ $name }» creado.
+rag-profile-toast-saved = «{ $name }» guardado.
+rag-profile-toast-saved-reindex = «{ $name }» guardado. Reindexa para aplicarlo: { $collections }.
+rag-profile-toast-deleted = Perfil eliminado.
+rag-profile-toast-name-exists = ya existe un perfil llamado «{ $name }»
+rag-profile-toast-name-length = El nombre debe tener entre 1 y 64 caracteres.
+rag-profile-toast-name-charset = El nombre solo puede contener letras, dígitos, `-` y `_`.
+rag-profile-toast-prompt-required = Las instrucciones de extracción son obligatorias.
+rag-profile-toast-fields-invalid = Los campos no son JSON válido: { $err }
+rag-profile-toast-fields-empty = Un perfil necesita al menos un campo.
+rag-profile-toast-field-key-required = Cada campo necesita una clave (key).
+rag-profile-toast-field-duplicate = Clave de campo «{ $key }» duplicada.
+rag-profile-toast-enum-values = El campo «{ $key }» es un enum, así que necesita una lista «values».
+rag-profile-toast-in-use = Todavía lo usan: { $collections }. Asígnales antes otro perfil.
+rag-profile-toast-builtin = Los perfiles incluidos no se pueden eliminar. Edita o copia uno.
+rag-profile-toast-save-failed = No se pudo guardar el perfil.
+
+# Hook de sincronización — un disparador entrante que resincroniza una colección.
+rag-toast-sync-token = URL de sincronización (se muestra una sola vez, no se almacena): { $url }
+rag-toast-sync-token-cleared = URL de sincronización desactivada.
+rag-button-sync-token = URL de sync
+rag-button-sync-token-rotate = Nueva URL de sync
+rag-button-sync-token-clear = Desactivar la URL de sync
+rag-badge-sync-hook = hook de sync
+
+# Browser consent for an OAuth source (Google Drive).
+rag-source-consent-save-first = Guarde primero la colección con su ID de cliente y secreto, luego conéctela para conceder acceso.
+rag-source-consent-connected = conectada
+rag-source-consent-not-connected = no conectada
+rag-source-consent-connect = Conectar
+rag-source-consent-reconnect = Reconectar
+rag-source-consent-help = Todos los que puedan buscar en esta colección verán los archivos que ve la cuenta conectada.
+rag-oauth-lookup-failed = No se pudo leer la colección.
+rag-oauth-not-oauth = Este tipo de fuente no se conecta en el navegador.
+rag-oauth-no-client = Guarde primero el ID de cliente y el secreto de OAuth en la colección.
+rag-oauth-bad-authorize-url = No se pudo construir la URL de autorización del proveedor.
+rag-oauth-start-failed = No se pudo iniciar la autorización.
+rag-oauth-callback-missing = Faltaba el código o el estado en la respuesta del proveedor.
+rag-oauth-expired = Esa autorización caducó o ya se usó. Vuelva a empezar.
+rag-oauth-provider-refused = El proveedor rechazó la autorización: { $error }
+rag-oauth-exchange-failed = Falló el intercambio del código de autorización: { $error }
+rag-oauth-no-refresh-token = El proveedor no devolvió un token de actualización, por lo que la indexación desatendida no sería posible. Revoque el acceso de la pasarela en su cuenta del proveedor y vuelva a conectar.
+rag-oauth-store-failed = No se pudieron guardar las credenciales.

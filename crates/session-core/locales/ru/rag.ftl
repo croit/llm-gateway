@@ -139,3 +139,88 @@ rag-suffix-not-advertised = (больше не предлагается)
 
 rag-label-allowed-groups = Ð Ð°Ð·ÑÐµÑÑÐ½Ð½ÑÐµ Ð³ÑÑÐ¿Ð¿Ñ
 rag-hint-allowed-groups = ÐÑÑÐ¿Ð¿Ñ ÑÐ»ÑÐ·Ð° (ÑÐµÑÐµÐ· Ð·Ð°Ð¿ÑÑÑÑ), ÐºÐ¾ÑÐ¾ÑÑÐ¼ ÑÐ°Ð·ÑÐµÑÐµÐ½Ð¾ Ð¿ÑÐ¾ÑÐ¼Ð°ÑÑÐ¸Ð²Ð°ÑÑ Ð¸ Ð¸ÑÐºÐ°ÑÑ Ð² ÑÑÐ¾Ð¹ ÐºÐ¾Ð»Ð»ÐµÐºÑÐ¸Ð¸. ÐÑÑÑÐ¾ = Ð²ÑÐµ, Ñ ÐºÐ¾Ð³Ð¾ ÐµÑÑÑ RAG-Ð¸Ð½ÑÑÑÑÐ¼ÐµÐ½ÑÑ. ÐÐ´Ð¼Ð¸Ð½Ñ Ð²ÑÐµÐ³Ð´Ð° Ð¸Ð¼ÐµÑÑ Ð´Ð¾ÑÑÑÐ¿.
+
+# Выбор источника + учётные данные провайдера (rag_source.rs). Подписи
+# полей задаёт сам провайдер, они не переводятся.
+rag-label-source-kind = Источник
+rag-source-git-label = Git-репозиторий
+rag-source-git-help = Клонирует репозиторий и индексирует его файлы. Исходное поведение.
+rag-source-secret-stored = сохранено
+rag-source-secret-placeholder = оставьте пустым, чтобы сохранить текущее значение
+rag-source-secret-clear = Удалить сохранённое значение
+rag-source-unknown-kind = Неизвестный тип источника.
+rag-source-test-button = Проверить подключение
+rag-source-test-ok = Подключено как `{ $account }`. Элементов в указанной папке: { $entries }.
+rag-source-test-ok-plain = Подключено. Элементов в указанной папке: { $entries }.
+rag-source-test-failed = Не удалось получить доступ к источнику: { $error }
+rag-source-test-git = Выберите удалённый источник для проверки. Git-репозитории проверяются при индексации.
+rag-source-detected = Обнаружено: { $server }
+
+rag-label-profile = Поля документа
+rag-option-profile-none = Нет — индексировать только текст
+rag-profile-help = Извлекает поля (поставщик, дата, сумма, проект) из каждого документа, чтобы их можно было фильтровать, сортировать и суммировать. Стоит одного вызова модели на документ; для кода и обычного текста оставьте «Нет».
+
+# Редактор профилей извлечения (/rag/profiles, rag_profiles.rs)
+rag-profile-page-title = Профили извлечения — LLM Gateway
+rag-profile-heading = Профили извлечения
+rag-profile-description = Что извлекается из каждого документа коллекции: поля, благодаря которым вопросы «последний счёт от X» или «сколько мы потратили» вообще получают ответ. Профиль назначается коллекции на странице RAG.
+rag-profile-create-heading = Новый профиль
+rag-profile-list-heading = Профили
+rag-profile-empty = Профилей пока нет.
+rag-profile-builtin = встроенный
+rag-profile-version = v{ $version }
+rag-profile-summary = полей: { $count }
+rag-profile-label-name = Название
+rag-profile-label-description = Описание
+rag-profile-label-prompt = Инструкции по извлечению
+rag-profile-label-fields = Поля (JSON)
+rag-profile-prompt-placeholder = Опишите, что читает модель и как нормализовать даты и суммы.
+rag-profile-fields-help = По одному объекту на поле: key, label, type (text | number | date | enum), description и при необходимости filterable / sortable. Для enum нужен также список «values». Описание видит модель — формулируйте точно.
+rag-profile-edit-warning = Сохранение повышает версию профиля и очищает кэш извлечений. Коллекции, использующие профиль, нужно переиндексировать, чтобы применить новые поля.
+rag-profile-button-create = Создать профиль
+rag-profile-button-save = Сохранить
+rag-profile-button-delete = Удалить
+rag-profile-link = Редактировать профили извлечения
+rag-profile-toast-created = Профиль «{ $name }» создан.
+rag-profile-toast-saved = «{ $name }» сохранён.
+rag-profile-toast-saved-reindex = «{ $name }» сохранён. Переиндексируйте, чтобы применить: { $collections }.
+rag-profile-toast-deleted = Профиль удалён.
+rag-profile-toast-name-exists = профиль с именем «{ $name }» уже существует
+rag-profile-toast-name-length = Название должно содержать от 1 до 64 символов.
+rag-profile-toast-name-charset = В названии допустимы только буквы, цифры, `-` и `_`.
+rag-profile-toast-prompt-required = Инструкции по извлечению обязательны.
+rag-profile-toast-fields-invalid = Поля не являются корректным JSON: { $err }
+rag-profile-toast-fields-empty = Профилю нужно хотя бы одно поле.
+rag-profile-toast-field-key-required = У каждого поля должен быть key.
+rag-profile-toast-field-duplicate = Дублирующийся key поля: «{ $key }».
+rag-profile-toast-enum-values = Поле «{ $key }» — enum, ему нужен список «values».
+rag-profile-toast-in-use = Ещё используется: { $collections }. Сначала назначьте им другой профиль.
+rag-profile-toast-builtin = Встроенные профили нельзя удалить. Отредактируйте или скопируйте профиль.
+rag-profile-toast-save-failed = Не удалось сохранить профиль.
+
+# Sync-хук — входящий триггер, запускающий пересинхронизацию коллекции.
+rag-toast-sync-token = URL синхронизации (показывается один раз и не сохраняется): { $url }
+rag-toast-sync-token-cleared = URL синхронизации отключён.
+rag-button-sync-token = URL синхронизации
+rag-button-sync-token-rotate = Новый URL синхронизации
+rag-button-sync-token-clear = Отключить URL синхронизации
+rag-badge-sync-hook = sync-хук
+
+# Browser consent for an OAuth source (Google Drive).
+rag-source-consent-save-first = Сначала сохраните коллекцию с ID клиента и секретом, затем подключите её, чтобы предоставить доступ.
+rag-source-consent-connected = подключено
+rag-source-consent-not-connected = не подключено
+rag-source-consent-connect = Подключить
+rag-source-consent-reconnect = Переподключить
+rag-source-consent-help = Все, кто может искать в этой коллекции, видят файлы, доступные подключённой учётной записи.
+rag-oauth-lookup-failed = Не удалось прочитать коллекцию.
+rag-oauth-not-oauth = Этот тип источника не подключается через браузер.
+rag-oauth-no-client = Сначала сохраните OAuth ID клиента и секрет в коллекции.
+rag-oauth-bad-authorize-url = Не удалось построить URL авторизации провайдера.
+rag-oauth-start-failed = Не удалось начать авторизацию.
+rag-oauth-callback-missing = В ответе провайдера отсутствовал код или state.
+rag-oauth-expired = Эта авторизация истекла или уже использована. Начните заново.
+rag-oauth-provider-refused = Провайдер отклонил авторизацию: { $error }
+rag-oauth-exchange-failed = Не удалось обменять код авторизации: { $error }
+rag-oauth-no-refresh-token = Провайдер не вернул refresh-токен, поэтому автономная индексация невозможна. Отзовите доступ шлюза в учётной записи провайдера и подключитесь снова.
+rag-oauth-store-failed = Не удалось сохранить учётные данные.

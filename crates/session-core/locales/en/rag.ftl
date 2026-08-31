@@ -140,3 +140,89 @@ rag-label-embedding-model = Embedding model
 rag-placeholder-embedding-model-none = no embedding pools configured — type a model id
 rag-option-choose-embedding-model = Choose an embedding model…
 rag-suffix-not-advertised = (no longer advertised)
+
+# Source kind picker + provider credential fields (rag_source.rs). The
+# per-provider field labels come from the provider itself and are not
+# translated: they are written where the provider is defined.
+rag-label-source-kind = Source
+rag-source-git-label = Git repository
+rag-source-git-help = Clones a repository and indexes its files. The original behaviour.
+rag-source-secret-stored = stored
+rag-source-secret-placeholder = leave empty to keep the stored value
+rag-source-secret-clear = Clear the stored value
+rag-source-unknown-kind = Unknown source kind.
+rag-source-test-button = Test connection
+rag-source-test-ok = Connected as `{ $account }`. { $entries } item(s) under the configured folder.
+rag-source-test-ok-plain = Connected. { $entries } item(s) under the configured folder.
+rag-source-test-failed = Could not reach the source: { $error }
+rag-source-test-git = Pick a remote source to test. Git repositories are checked when indexing runs.
+rag-source-detected = Detected: { $server }
+
+rag-label-profile = Document fields
+rag-option-profile-none = None — index text only
+rag-profile-help = Extracts fields (vendor, date, amount, project) from each document so they can be filtered, sorted and totalled. Costs one model call per document; leave as None for code or plain-text collections.
+
+# Extraction-profile editor (/rag/profiles, rag_profiles.rs)
+rag-profile-page-title = Extraction profiles — LLM Gateway
+rag-profile-heading = Extraction profiles
+rag-profile-description = What gets pulled out of every document in a collection: the fields that make "the most recent invoice from X" or "how much did we spend" answerable. Attach a profile to a collection on the RAG page.
+rag-profile-create-heading = New profile
+rag-profile-list-heading = Profiles
+rag-profile-empty = No profiles yet.
+rag-profile-builtin = built-in
+rag-profile-version = v{ $version }
+rag-profile-summary = { $count } field(s)
+rag-profile-label-name = Name
+rag-profile-label-description = Description
+rag-profile-label-prompt = Extraction instructions
+rag-profile-label-fields = Fields (JSON)
+rag-profile-prompt-placeholder = Describe what the model is reading and how to normalise dates and amounts.
+rag-profile-fields-help = One object per field: key, label, type (text | number | date | enum), description, and optional filterable / sortable. An enum also needs "values". The description is shown to the model, so be precise.
+rag-profile-edit-warning = Saving bumps this profile's version, which clears its cached extractions. Collections using it must be re-indexed to pick up the new fields.
+rag-profile-button-create = Create profile
+rag-profile-button-save = Save
+rag-profile-button-delete = Delete
+rag-profile-link = Edit extraction profiles
+rag-profile-toast-created = Created profile `{ $name }`.
+rag-profile-toast-saved = Saved `{ $name }`.
+rag-profile-toast-saved-reindex = Saved `{ $name }`. Re-index to apply it: { $collections }.
+rag-profile-toast-deleted = Profile deleted.
+rag-profile-toast-name-exists = a profile named `{ $name }` already exists
+rag-profile-toast-name-length = Name must be 1..=64 characters.
+rag-profile-toast-name-charset = Name may only contain letters, digits, `-` and `_`.
+rag-profile-toast-prompt-required = Extraction instructions are required.
+rag-profile-toast-fields-invalid = Fields are not valid JSON: { $err }
+rag-profile-toast-fields-empty = A profile needs at least one field.
+rag-profile-toast-field-key-required = Every field needs a key.
+rag-profile-toast-field-duplicate = Duplicate field key `{ $key }`.
+rag-profile-toast-enum-values = Field `{ $key }` is an enum, so it needs a "values" list.
+rag-profile-toast-in-use = Still used by: { $collections }. Point them at another profile first.
+rag-profile-toast-builtin = Built-in profiles cannot be deleted. Edit or copy one instead.
+rag-profile-toast-save-failed = Saving the profile failed.
+
+# Sync hook — an inbound trigger that re-syncs one collection.
+rag-toast-sync-token = Sync URL (shown once, it is not stored): { $url }
+rag-toast-sync-token-cleared = Sync URL disabled.
+rag-button-sync-token = Sync URL
+rag-button-sync-token-rotate = New sync URL
+rag-button-sync-token-clear = Disable sync URL
+rag-badge-sync-hook = sync hook
+
+# Browser consent for an OAuth source (Google Drive).
+rag-source-consent-save-first = Save the collection with its client ID and secret first, then connect it to grant access.
+rag-source-consent-connected = connected
+rag-source-consent-not-connected = not connected
+rag-source-consent-connect = Connect
+rag-source-consent-reconnect = Reconnect
+rag-source-consent-help = Everyone who can search this collection sees the files the connected account can see.
+rag-oauth-lookup-failed = Could not read the collection.
+rag-oauth-not-oauth = This source kind is not connected in the browser.
+rag-oauth-no-client = Save the OAuth client ID and secret on the collection first.
+rag-oauth-bad-authorize-url = Could not build the provider's authorization URL.
+rag-oauth-start-failed = Could not start the authorization.
+rag-oauth-callback-missing = The provider's answer was missing its code or state.
+rag-oauth-expired = That authorization has expired or was already used. Start again.
+rag-oauth-provider-refused = The provider refused the authorization: { $error }
+rag-oauth-exchange-failed = Exchanging the authorization code failed: { $error }
+rag-oauth-no-refresh-token = The provider returned no refresh token, so the gateway could not keep indexing unattended. Remove the gateway's access in your provider account and connect again.
+rag-oauth-store-failed = Could not store the credentials.
