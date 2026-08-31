@@ -251,11 +251,8 @@ pub async fn create_collection(State(state): State<Arc<RamaState>>, req: Request
     if body.embedding_model.trim().is_empty() {
         return invalid_request("`embedding_model` must not be empty");
     }
-    if body.chunk_size <= 0 || body.chunk_size > 8000 {
-        return invalid_request("`chunk_size` must be in (0, 8000]");
-    }
-    if body.chunk_overlap < 0 || body.chunk_overlap >= body.chunk_size {
-        return invalid_request("`chunk_overlap` must satisfy 0 <= overlap < chunk_size");
+    if let Some(msg) = chunk_pair_error(body.chunk_size, body.chunk_overlap) {
+        return invalid_request(msg);
     }
     let new = rag_db::NewCollection {
         name: body.name.trim().to_string(),
@@ -312,13 +309,29 @@ pub async fn create_collection(State(state): State<Arc<RamaState>>, req: Request
 /// refresh token minted by the consent callback is a secret **no caller ever
 /// sends** — rebuilding the blob from the request alone would disconnect the
 /// collection every time someone edited an unrelated field.
+/// The chunking invariant, in one place.
+///
+/// Create and PATCH both enforce it and both spelled out the same two
+/// messages; the web form has its own copy again with i18n keys. Two had
+/// already drifted — the PATCH path only checked the size bound when
+/// `chunk_size` was being set.
+fn chunk_pair_error(size: i64, overlap: i64) -> Option<&'static str> {
+    if size <= 0 || size > 8000 {
+        return Some("`chunk_size` must be in (0, 8000]");
+    }
+    if overlap < 0 || overlap >= size {
+        return Some("`chunk_overlap` must satisfy 0 <= overlap < chunk_size");
+    }
+    None
+}
+
 fn build_source(
     state: &RamaState,
     kind: &str,
     config: &std::collections::BTreeMap<String, String>,
     existing: Option<&rag_db::SourceSpec>,
 ) -> Result<rag_db::SourceSpec, String> {
-    use gateway_features::server::rag::source::{AuthKind, FieldKind, ProviderConfig};
+    use gateway_features::server::rag::source::ProviderConfig;
 
     if kind == "git" {
         return Ok(rag_db::SourceSpec::default());
@@ -333,12 +346,7 @@ fn build_source(
             known.join(", ")
         )
     })?;
-    let secret_keys: Vec<&str> = factory
-        .config_fields()
-        .iter()
-        .filter(|f| f.kind == FieldKind::Secret)
-        .map(|f| f.key)
-        .collect();
+    let secret_keys = factory.secret_keys();
     let mut values = std::collections::BTreeMap::new();
     let mut secrets = existing
         .filter(|s| s.kind == kind)
@@ -363,9 +371,7 @@ fn build_source(
     // has clicked through the provider's consent screen, and that needs a
     // saved collection to hang the flow on. Same rule the web form applies —
     // without it, creating a Drive collection over the API is impossible.
-    let awaiting_consent = matches!(factory.auth(), AuthKind::OAuth2 { .. })
-        && !secrets.contains_key(gateway_features::server::rag::source::REFRESH_TOKEN_KEY);
-    if !awaiting_consent {
+    if !gateway_features::server::rag::source::awaiting_consent(factory.as_ref(), &secrets) {
         factory
             .build(&cfg, state.http.clone())
             .map_err(|e| e.to_string())?;
@@ -594,15 +600,12 @@ pub async fn update_collection(
     // numbers then disagree with the ones actually used, and the web form —
     // which does check the pair — refuses to save the collection at all,
     // leaving it uneditable in the UI.
-    let effective_size = body.chunk_size.unwrap_or(before.chunk_size);
-    let effective_overlap = body.chunk_overlap.unwrap_or(before.chunk_overlap);
-    if body.chunk_size.is_some() && (effective_size <= 0 || effective_size > 8000) {
-        return invalid_request("`chunk_size` must be in (0, 8000]");
-    }
-    if (body.chunk_size.is_some() || body.chunk_overlap.is_some())
-        && (effective_overlap < 0 || effective_overlap >= effective_size)
-    {
-        return invalid_request("`chunk_overlap` must satisfy 0 <= overlap < chunk_size");
+    if body.chunk_size.is_some() || body.chunk_overlap.is_some() {
+        let size = body.chunk_size.unwrap_or(before.chunk_size);
+        let overlap = body.chunk_overlap.unwrap_or(before.chunk_overlap);
+        if let Some(msg) = chunk_pair_error(size, overlap) {
+            return invalid_request(msg);
+        }
     }
     if let Some(cs) = body.chunk_size {
         sets.push("chunk_size = ?");

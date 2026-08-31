@@ -382,9 +382,13 @@ pub fn to_field_values(profile: &Profile, fields: &BTreeMap<String, String>) -> 
             date: None,
         };
         match def.field_type {
-            FieldType::Number => match parse_decimal(raw) {
-                Ok(n) => value.num = Some(n),
-                Err(()) => value.text = Some(raw.clone()),
+            // The *same* parser the query side uses. These are the write and
+            // read halves of one decision: when they disagree, a value is
+            // stored as text and then filtered as a number, and the filter
+            // silently matches nothing. They had already drifted three ways.
+            FieldType::Number => match docs_db::parse_number(raw) {
+                Some(n) => value.num = Some(n),
+                None => value.text = Some(raw.clone()),
             },
             FieldType::Date if is_iso_date(raw) => value.date = Some(raw.clone()),
             _ => value.text = Some(raw.clone()),
@@ -394,65 +398,6 @@ pub fn to_field_values(profile: &Profile, fields: &BTreeMap<String, String>) -> 
     out
 }
 
-/// Parse an amount the model returned, refusing anything ambiguous.
-///
-/// The prompt asks for a plain dot-decimal, but the `Err` arm exists exactly
-/// because a model may not comply — so this must not *guess*. Blindly
-/// stripping commas turns the European `1234,56` into `123456` and
-/// `1.234,56` into `1.23456`, and those land in the numeric column that
-/// `sum_field` and range filters read: a confidently wrong total, which is
-/// worse than no total at all.
-///
-/// So: accept a dot-decimal, and accept commas only where they are
-/// unambiguously thousands separators (`1,234,567.89` — groups of three, and
-/// never after a decimal point). Anything else falls through to the text
-/// column, where it stays visible to a human but out of arithmetic.
-fn parse_decimal(raw: &str) -> Result<f64, ()> {
-    let raw = raw.trim();
-    if let Ok(n) = raw.parse::<f64>() {
-        return Ok(n);
-    }
-    if !raw.contains(',') {
-        return Err(());
-    }
-    // Commas may only precede the decimal point, and each group after the
-    // first must be exactly three digits.
-    let (int_part, frac_part) = match raw.split_once('.') {
-        Some((i, f)) => (i, Some(f)),
-        None => (raw, None),
-    };
-    if frac_part.is_some_and(|f| f.contains(',')) {
-        return Err(());
-    }
-    let groups: Vec<&str> = int_part.split(',').collect();
-    if groups.len() < 2 {
-        return Err(());
-    }
-    let head_ok = !groups[0].is_empty()
-        && groups[0].len() <= 3
-        && groups[0]
-            .strip_prefix('-')
-            .unwrap_or(groups[0])
-            .chars()
-            .all(|c| c.is_ascii_digit());
-    let rest_ok = groups[1..]
-        .iter()
-        .all(|g| g.len() == 3 && g.chars().all(|c| c.is_ascii_digit()));
-    if !head_ok || !rest_ok {
-        return Err(());
-    }
-    int_part
-        .replace(',', "")
-        .parse::<f64>()
-        .map(|whole| match frac_part {
-            Some(f) => format!("{whole}.{f}").parse::<f64>().unwrap_or(whole),
-            None => whole,
-        })
-        .map_err(|_| ())
-}
-
-/// `YYYY-MM-DD`, which is the only date form the prompt asks for and the only
-/// one that sorts correctly as text.
 /// A real calendar date, not just ten bytes shaped like one.
 ///
 /// `value_date` is what range filters and `ORDER BY` read, so `2025-13-45`
@@ -596,11 +541,22 @@ mod tests {
         assert_eq!(by_key("vendor").text.as_deref(), Some("ACME"));
     }
 
+    /// The extraction side parses amounts with the *same* function the query
+    /// side uses. Kept as a test here because this is where the value is
+    /// written: if the two ever diverge again, a number stored as text and
+    /// filtered as a number matches nothing, silently.
     #[test]
     fn plain_and_thousand_separated_numbers_parse() {
-        assert_eq!(parse_decimal("1234.56"), Ok(1234.56));
-        assert_eq!(parse_decimal("1,234,567.89"), Ok(1234567.89));
-        assert_eq!(parse_decimal("-42"), Ok(-42.0));
+        assert_eq!(docs_db::parse_number("1234.56"), Some(1234.56));
+        assert_eq!(docs_db::parse_number("1,234,567.89"), Some(1234567.89));
+        assert_eq!(docs_db::parse_number("-42"), Some(-42.0));
+        assert_eq!(
+            docs_db::parse_number("-123,456"),
+            Some(-123456.0),
+            "a negative thousands-separated amount: the two parsers used to \
+             disagree here, so it was stored as text and then filtered as a \
+             number against a NULL column"
+        );
     }
 
     #[test]
@@ -608,9 +564,9 @@ mod tests {
         // `1234,56` is 1234.56 to a German reader and 123456 if you just
         // strip the comma. Storing the second in the column `sum` reads is a
         // confidently wrong total — far worse than falling back to text.
-        assert!(parse_decimal("1234,56").is_err());
-        assert!(parse_decimal("1.234,56").is_err());
-        assert!(parse_decimal("1,23").is_err());
+        assert!(docs_db::parse_number("1234,56").is_none());
+        assert!(docs_db::parse_number("1.234,56").is_none());
+        assert!(docs_db::parse_number("1,23").is_none());
     }
 
     #[test]

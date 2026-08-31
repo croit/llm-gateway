@@ -1280,7 +1280,7 @@ impl Indexer {
             (BuildItem::Remote(entry), Some(p)) => (
                 p.web_url(entry),
                 Some(entry.id.clone()),
-                Some(entry.version.clone()),
+                entry.version.clone(),
             ),
             _ => (None, None, None),
         };
@@ -1795,7 +1795,7 @@ impl Indexer {
                 &rag_db::FileOrigin {
                     web_url: web_url.as_deref(),
                     remote_id: remote_id.as_deref(),
-                    source_version: source_version.as_deref(),
+                    source_version: source_version.as_ref().and_then(|v| v.as_deref()),
                 },
             )
             .await?;
@@ -2540,7 +2540,6 @@ mod tests {
             last_indexed_commit: None,
             last_error: None,
             dir_versions: Default::default(),
-            delta_cursor: None,
             force_full_rebuild: false,
             extractor_fingerprint: None,
             created_at: now,

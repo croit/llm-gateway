@@ -571,11 +571,35 @@ fn escape_like(raw: &str) -> String {
 /// One bound query parameter, carrying its SQL type.
 ///
 /// The typed columns of `rag_doc_fields` have real affinities; binding
-/// everything as text makes SQLite's conversion rules decide the answer.
+/// everything as text makes SQLite's conversion rules decide the answer —
+/// `value_num >= '1000 EUR'` never converts, and REAL sorts below TEXT
+/// unconditionally, so the filter matches nothing while `<=` matches
+/// everything. That is a wrong total with no error anywhere, which is why
+/// these carry a type.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Bind {
+pub(crate) enum Bind {
     Text(String),
     Num(f64),
+}
+
+/// Bind a slice of [`Bind`] onto a query in order.
+///
+/// A macro rather than a function because `sqlx::query` and
+/// `sqlx::query_scalar` return different types with no shared trait for
+/// `bind`. Four call sites had this loop spelled out; a new `Bind` variant
+/// should be one edit, and a site that missed it would bind the wrong type
+/// silently.
+macro_rules! bind_all {
+    ($q:expr, $binds:expr) => {{
+        let mut q = $q;
+        for b in $binds {
+            q = match b {
+                Bind::Text(t) => q.bind(t),
+                Bind::Num(n) => q.bind(n),
+            };
+        }
+        q
+    }};
 }
 
 /// Parse a number a person or a model might have written.
@@ -633,13 +657,7 @@ pub async fn query_documents(
     let count_sql = format!(
         "SELECT COUNT(*) FROM rag_documents d JOIN rag_files f ON f.id = d.file_id {where_sql}"
     );
-    let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
-    for b in &bindings {
-        count_q = match b {
-            Bind::Text(t) => count_q.bind(t),
-            Bind::Num(n) => count_q.bind(n),
-        };
-    }
+    let count_q = bind_all!(sqlx::query_scalar::<_, i64>(&count_sql), &bindings);
     let total: i64 = count_q.fetch_one(pool).await?;
 
     let order_sql = match &query.order_by {
@@ -673,13 +691,7 @@ pub async fn query_documents(
          FROM rag_documents d JOIN rag_files f ON f.id = d.file_id \
          {where_sql} {order_sql} LIMIT ?"
     );
-    let mut q = sqlx::query(&sql);
-    for b in &bindings {
-        q = match b {
-            Bind::Text(t) => q.bind(t),
-            Bind::Num(n) => q.bind(n),
-        };
-    }
+    let mut q = bind_all!(sqlx::query(&sql), &bindings);
     q = q.bind(query.limit.clamp(1, 200));
     let rows = q.fetch_all(pool).await?;
 
@@ -786,13 +798,7 @@ pub async fn distinct_values(
          ORDER BY df.value_text LIMIT 25",
         and_or_where = if where_sql.is_empty() { "WHERE" } else { "AND" }
     );
-    let mut q = sqlx::query(&sql);
-    for b in &bindings {
-        q = match b {
-            Bind::Text(t) => q.bind(t),
-            Bind::Num(n) => q.bind(n),
-        };
-    }
+    let q = bind_all!(sqlx::query(&sql), &bindings);
     let rows = q
         .bind(key)
         .bind(format!("%{}%", like.to_lowercase()))
@@ -815,18 +821,19 @@ pub async fn sum_field(
                      AND df.key = ?)) \
          FROM rag_documents d JOIN rag_files f ON f.id = d.file_id {where_sql}"
     );
-    let mut q = sqlx::query_scalar::<_, Option<f64>>(&sql).bind(key);
-    for b in &bindings {
-        q = match b {
-            Bind::Text(t) => q.bind(t),
-            Bind::Num(n) => q.bind(n),
-        };
-    }
+    let q = bind_all!(
+        sqlx::query_scalar::<_, Option<f64>>(&sql).bind(key),
+        &bindings
+    );
     Ok(q.fetch_one(pool).await?)
 }
 
 /// Full text of one document, reassembled from its chunks in order.
-pub async fn document_text(pool: &Pool, doc_id: i64) -> Result<String, DbError> {
+pub async fn document_text(
+    pool: &Pool,
+    doc_id: i64,
+    max_chars: usize,
+) -> Result<(String, bool), DbError> {
     let rows = sqlx::query(
         "SELECT c.content FROM rag_chunks c \
          JOIN rag_documents d ON d.file_id = c.file_id \
@@ -836,56 +843,73 @@ pub async fn document_text(pool: &Pool, doc_id: i64) -> Result<String, DbError> 
     .fetch_all(pool)
     .await?;
     let mut out = String::new();
+    let mut chars = 0usize;
     for row in &rows {
+        // `out` only ever grows, so once it holds the caller's budget the
+        // prefix is final and the remaining chunks are work whose result is
+        // thrown away. `rag_fetch_document` caps at 60k, which is ~80 chunks
+        // at the default size — a 2500-chunk document used to reassemble in
+        // full before being cut.
+        if chars >= max_chars {
+            return Ok((out, true));
+        }
         let content: String = row.try_get("content")?;
-        append_without_overlap(&mut out, &content);
+        chars += append_without_overlap(&mut out, &content);
     }
-    Ok(out)
+    Ok((out, chars > max_chars))
 }
 
-/// Longest run of characters, up to [`MAX_OVERLAP_CHARS`], that `next` repeats
-/// from the end of `out`.
+/// How far back the overlap search looks. The chunker's overlap is bounded by
+/// the collection's `chunk_overlap`, which is itself below `chunk_size`.
 const MAX_OVERLAP_CHARS: usize = 2048;
 
 /// Append `next`, dropping the part it repeats from the end of `out`.
+/// Returns how many characters were actually added.
 ///
 /// The chunker overlaps consecutive chunks by `chunk_overlap` so a passage
 /// straddling a boundary is retrievable from either side. That is right for
-/// retrieval and wrong for reassembly: concatenating the chunks verbatim
-/// repeats every boundary, and `rag_fetch_document` presents the result as
-/// "the full extracted text". A model asked to total invoice line items then
-/// counts anything near a boundary twice.
+/// retrieval and wrong for reassembly: concatenating verbatim repeats every
+/// boundary, and `rag_fetch_document` presents the result as "the full
+/// extracted text". A model asked to total invoice line items then counts
+/// anything near a boundary twice.
 ///
 /// The overlap length is not recorded per chunk, so it is measured: the
 /// longest suffix of what we have that is also a prefix of what comes next.
-/// Bounded, because an unbounded search is quadratic in the document.
-fn append_without_overlap(out: &mut String, next: &str) {
+/// Found by scanning candidate *start* positions in the tail rather than
+/// testing every prefix length — testing lengths is quadratic, and on
+/// repetitive content (table padding, OCR gutters) every test runs to full
+/// length.
+fn append_without_overlap(out: &mut String, next: &str) -> usize {
     if out.is_empty() {
         out.push_str(next);
-        return;
+        return next.chars().count();
     }
-    let cap = next
+    let tail_start = out
         .char_indices()
-        .map(|(i, _)| i)
-        .take(MAX_OVERLAP_CHARS + 1)
+        .rev()
+        .take(MAX_OVERLAP_CHARS)
         .last()
-        .unwrap_or(0);
+        .map_or(0, |(i, _)| i);
+    let tail = &out[tail_start..];
+
+    // The longest overlap is the earliest position in the tail from which the
+    // rest of the tail is a prefix of `next`.
     let mut overlap = 0usize;
-    for (i, _) in next[..cap].char_indices().skip(1) {
-        if out.ends_with(&next[..i]) {
-            overlap = i;
+    for (i, _) in tail.char_indices() {
+        if next.starts_with(&tail[i..]) {
+            overlap = tail.len() - i;
+            break;
         }
-    }
-    if out.ends_with(&next[..cap]) {
-        overlap = cap;
     }
     let rest = &next[overlap..];
-    if !rest.is_empty() {
-        if overlap == 0 && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(rest);
+    if rest.is_empty() {
+        return 0;
     }
+    if overlap == 0 && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(rest);
+    rest.chars().count()
 }
 
 #[cfg(test)]
@@ -1132,6 +1156,32 @@ mod tests {
     }
 
     /// The overlap scan must never split a character.
+    /// Reassembly stops at the caller's budget instead of rebuilding a whole
+    /// document to throw most of it away. `rag_fetch_document` caps at 60k,
+    /// which is ~80 chunks at the default size.
+    #[test]
+    fn reassembly_reports_what_it_added_and_the_caller_can_stop() {
+        let mut out = String::new();
+        assert_eq!(append_without_overlap(&mut out, "alpha beta"), 10);
+        // The overlap is not new text, so it does not count toward the budget.
+        assert_eq!(append_without_overlap(&mut out, "beta gamma"), 6);
+        assert_eq!(out, "alpha beta gamma");
+        // A chunk wholly contained in what we have adds nothing.
+        assert_eq!(append_without_overlap(&mut out, "gamma"), 0);
+        assert_eq!(out, "alpha beta gamma");
+    }
+
+    /// The overlap scan must find the *longest* repeat, not the first one it
+    /// stumbles on — a short accidental match would leave the boundary
+    /// duplicated, which is the double-counting this exists to stop.
+    #[test]
+    fn the_longest_overlap_wins() {
+        let mut out = String::new();
+        append_without_overlap(&mut out, "a b a b c");
+        append_without_overlap(&mut out, "a b c d");
+        assert_eq!(out, "a b a b c d");
+    }
+
     #[test]
     fn reassembly_is_safe_across_multibyte_boundaries() {
         let mut out = String::new();

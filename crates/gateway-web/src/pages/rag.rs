@@ -2589,7 +2589,6 @@ mod tests {
             last_indexed_commit: None,
             last_error: err.map(|s| s.into()),
             dir_versions: Default::default(),
-            delta_cursor: None,
             force_full_rebuild: false,
             extractor_fingerprint: None,
             created_at: now,

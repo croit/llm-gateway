@@ -445,43 +445,39 @@ fn to_entries(parent_rel: &str, files: Vec<DriveFile>) -> Vec<RemoteEntry> {
     // those. Counting the bare name would miss the collision that only
     // appears after exporting: a Google Doc called `report` and an uploaded
     // `report.docx` are distinct names that both become `report.docx`.
-    let named: Vec<(DriveFile, Option<ExportTarget>, String)> = files
+    let named: Vec<(DriveFile, Option<ExportTarget>, EntryKind, String)> = files
         .into_iter()
         .filter_map(|f| {
-            let is_dir = f.mime_type == FOLDER_MIME;
+            let kind = if f.mime_type == FOLDER_MIME {
+                EntryKind::Dir
+            } else {
+                EntryKind::File
+            };
             let export = export_target(&f.mime_type);
             // A native type with no document in it is not an unreadable
             // file to report, it is not a file at all.
-            if !is_dir && is_native_google(&f.mime_type) && export.is_none() {
+            if kind == EntryKind::File && is_native_google(&f.mime_type) && export.is_none() {
                 return None;
             }
             let mut display = sanitize_segment(&f.name);
             if let Some(target) = export {
                 display = format!("{display}.{}", target.extension);
             }
-            Some((f, export, display))
+            Some((f, export, kind, display))
         })
         .collect();
 
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for (_, _, display) in &named {
-        *counts.entry(display.as_str()).or_default() += 1;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, _, _, display) in &named {
+        *counts.entry(display.clone()).or_default() += 1;
     }
-    let colliding: std::collections::HashSet<&str> = counts
-        .iter()
-        .filter(|(_, n)| **n > 1)
-        .map(|(name, _)| *name)
-        .collect();
-    let colliding: std::collections::HashSet<String> =
-        colliding.into_iter().map(str::to_string).collect();
 
     named
         .into_iter()
-        .map(|(f, export, display)| {
-            let is_dir = f.mime_type == FOLDER_MIME;
+        .map(|(f, export, kind, display)| {
             // `suffixed` inserts before the extension, so an exported name
             // still reads as `report ~<id>.docx`.
-            let segment = if colliding.contains(&display) {
+            let segment = if counts.get(&display).is_some_and(|n| *n > 1) {
                 suffixed(&display, &f.id)
             } else {
                 display
@@ -502,29 +498,21 @@ fn to_entries(parent_rel: &str, files: Vec<DriveFile>) -> Vec<RemoteEntry> {
                     None => f.id.clone(),
                 },
                 rel_path,
-                kind: if is_dir {
-                    EntryKind::Dir
-                } else {
-                    EntryKind::File
-                },
-                // `version` is always present in practice; falling back to
-                // the id would pin the file as never-changing, so fall back
-                // to the modified time and only then to the id.
-                version: f
-                    .version
-                    .clone()
-                    .or_else(|| f.modified_time.clone())
-                    .unwrap_or_else(|| f.id.clone()),
+                kind,
+                // `version` is always present in practice; the modified time
+                // is the fallback. Neither means "cannot tell" — falling back
+                // to the id would pin the file as never-changing.
+                version: f.version.clone().or_else(|| f.modified_time.clone()),
                 size_bytes: f.size.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0),
                 // The type of the bytes `fetch` returns — the exported type
                 // for a native file, not the `application/vnd.google-apps.*`
                 // that has no bytes. `extract` hands this to the OCR sidecar
                 // as a Content-Type, so a native mime here is a lie that
                 // leaves the provider.
-                mime: match (is_dir, export) {
-                    (true, _) => None,
-                    (false, Some(t)) => Some(t.mime.to_string()),
-                    (false, None) => Some(f.mime_type.clone()),
+                mime: match (kind, export) {
+                    (EntryKind::Dir, _) => None,
+                    (EntryKind::File, Some(t)) => Some(t.mime.to_string()),
+                    (EntryKind::File, None) => Some(f.mime_type.clone()),
                 },
                 modified_at: f
                     .modified_time
@@ -819,7 +807,8 @@ mod tests {
         f.version = None;
         let entries = to_entries("", vec![f]);
         assert_eq!(
-            entries[0].version, "2026-01-01T00:00:00.000Z",
+            entries[0].version.as_deref(),
+            Some("2026-01-01T00:00:00.000Z"),
             "with no version, the modified time still moves when the file does"
         );
     }

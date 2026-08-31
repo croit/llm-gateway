@@ -235,6 +235,18 @@ impl WebdavProvider {
         p
     }
 
+    /// This href as a path relative to our root, or `None` when it is not
+    /// under our prefix at all.
+    ///
+    /// Both the self-entry search and the entry mapping need this answer and
+    /// must agree on it: when they disagreed about an unmatched prefix, the
+    /// first unrelated response was accepted as the root's own entry and its
+    /// etag pinned the collection empty forever.
+    fn rel_of(&self, href: &str, prefix: &str) -> Option<String> {
+        let path = decode_percent(href_path(href));
+        path.strip_prefix(prefix).map(normalize_rel)
+    }
+
     fn note_extensions(&self, saw_fileid: bool) {
         let _ = self.extensions.set(saw_fileid);
     }
@@ -314,11 +326,9 @@ impl WebdavProvider {
         let prefix = self.href_prefix();
         let mut out = Vec::new();
         for r in responses {
-            let path = decode_percent(href_path(&r.href));
-            let Some(rel) = path.strip_prefix(&prefix) else {
+            let Some(rel) = self.rel_of(&r.href, &prefix) else {
                 continue;
             };
-            let rel = normalize_rel(rel);
             if rel == normalize_rel(dir_rel) {
                 continue; // the directory itself
             }
@@ -340,11 +350,10 @@ impl WebdavProvider {
                 // invisible, permanently and silently. `weak_version` says
                 // "we cannot tell", which costs a re-read per sync for the
                 // few files affected instead of losing their updates.
-                version: r
-                    .etag
-                    .clone()
-                    .or_else(|| r.last_modified.clone())
-                    .unwrap_or_else(|| weak_version(r.content_length)),
+                // Neither property means "cannot tell", which the planner
+                // turns into a re-read. Inventing a stable stand-in here
+                // would pin the file as never-changing.
+                version: r.etag.clone().or_else(|| r.last_modified.clone()),
                 size_bytes: r.content_length.unwrap_or(0),
                 mime: r.content_type.clone(),
                 modified_at: r.last_modified.as_deref().and_then(parse_http_date),
@@ -391,11 +400,7 @@ impl FileProvider for WebdavProvider {
         // while reporting `ready`.
         let prefix = self.href_prefix();
         let self_entry = responses.iter().find(|r| {
-            let path = decode_percent(href_path(&r.href));
-            match path.strip_prefix(&prefix) {
-                Some(rest) => normalize_rel(rest) == normalize_rel(&dir.locator),
-                None => false,
-            }
+            self.rel_of(&r.href, &prefix).as_deref() == Some(&normalize_rel(&dir.locator))
         });
         let version = self_entry.and_then(|r| r.etag.clone());
 
@@ -723,23 +728,6 @@ fn encode_path(path: &str) -> String {
 
 /// Trim leading/trailing slashes and collapse the empty case, so `""`,
 /// `"/"` and `"/a/b/"` normalise to `""` and `"a/b"`.
-/// A change token for an entry the server gave no change token for.
-///
-/// Deliberately different on every walk: `sync::plan` compares versions for
-/// equality, so any *stable* stand-in (the filename, say) declares the file
-/// unchanged forever. Re-reading it each sync is the honest cost of a server
-/// that reports neither an etag nor a modification time. The size is folded
-/// in only so the value is informative in a log.
-fn weak_version(content_length: Option<u64>) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    format!(
-        "weak:{}:{}",
-        content_length.unwrap_or(0),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
 fn normalize_rel(s: &str) -> String {
     s.trim_matches('/').to_string()
 }
@@ -1006,17 +994,14 @@ mod tests {
             ("root", ""),
             ("base_url", "https://dav.example.com"),
         ]);
-        let first = p.to_entries("", parse_multistatus(NO_TOKEN_LISTING).unwrap());
-        let second = p.to_entries("", parse_multistatus(NO_TOKEN_LISTING).unwrap());
-        assert_eq!(first.len(), 1);
-        assert_ne!(
-            first[0].version, second[0].version,
-            "with nothing to compare, the honest answer is `changed` — a \
-             stable stand-in would silently drop every future edit"
-        );
-        assert_ne!(
-            first[0].version, first[0].rel_path,
-            "and it is never the filename"
+        let entries = p.to_entries("", parse_multistatus(NO_TOKEN_LISTING).unwrap());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].version, None,
+            "with nothing that moves when the file does, the honest answer is \
+             `unknown` — the planner turns that into a re-read. Any stable \
+             stand-in (the filename, the path, the size) would pin the file \
+             as never-changing and silently drop every later edit."
         );
     }
 
@@ -1090,7 +1075,7 @@ mod tests {
             locator: "a.pdf".into(),
             rel_path: "a.pdf".into(),
             kind: EntryKind::File,
-            version: "v".into(),
+            version: Some("v".into()),
             size_bytes: 1,
             mime: None,
             modified_at: None,

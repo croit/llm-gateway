@@ -569,13 +569,6 @@ pub async fn assign_data_uuid(pool: &Pool, id: i64, data_uuid: &str) -> Result<(
 /// old shape, or worse (a new embedding model against vectors produced by
 /// the old one) answer confidently from an incomparable vector space.
 ///
-/// Clearing `dir_versions` and setting `force_full_rebuild` sends the next
-/// build down the fresh-folder path, which rebuilds everything and swaps
-/// atomically — the live store keeps serving until it does.
-///
-/// `last_indexed_commit` is deliberately left alone: it is what
-/// `is_searchable` reads, and clearing it would take the corpus offline for
-/// the whole rebuild it is still perfectly able to answer from.
 /// Does moving a collection from `before` to `after` invalidate what is
 /// already indexed?
 ///
@@ -604,12 +597,19 @@ pub fn index_shape_changed(before: &Collection, after: &Collection) -> bool {
         || before.exclude_globs != after.exclude_globs
 }
 
+/// Clearing `dir_versions` and setting `force_full_rebuild` sends the next
+/// build down the fresh-folder path, which rebuilds everything and swaps
+/// atomically — the live store keeps serving until it does.
+///
+/// `last_indexed_commit` is deliberately left alone: it is what
+/// `is_searchable` reads, and clearing it would take the corpus offline for
+/// the whole rebuild it is still perfectly able to answer from.
 pub async fn request_full_rebuild(pool: &Pool, ref_id: i64) -> Result<(), DbError> {
     let now = Timestamp::now().to_string();
     sqlx::query(
         r#"UPDATE rag_collection_refs
            SET status = 'pending', last_error = NULL,
-               dir_versions_json = '{}', delta_cursor = NULL,
+               dir_versions_json = '{}',
                force_full_rebuild = 1, updated_at = ?
            WHERE id = ?"#,
     )
@@ -707,18 +707,6 @@ pub struct CollectionRef {
     /// not report `subtree_pruning`.
     pub dir_versions: BTreeMap<String, String>,
     /// Provider-native change-feed cursor, for providers with a delta API.
-    /// Cursor for a provider-native change feed.
-    ///
-    /// **Not yet written by anything.** The column, [`super::super::rag`]'s
-    /// `DeltaPage` and `FileProvider::delta` are the seam for a cursor-based
-    /// provider (Microsoft Graph, Dropbox); the worker has no consumer for
-    /// one, so every provider currently re-walks. Wiring it up is a branch in
-    /// `gather_remote`, a cursor threaded back out of `build_ref_incremental`,
-    /// and teaching `sync::plan` a shape with no `TreeSnapshot` and no
-    /// `is_complete()` — a delta page hands you removals directly. Said here
-    /// so the next implementer finds out now rather than after writing the
-    /// provider method.
-    pub delta_cursor: Option<String>,
     /// Set by `request_full_rebuild`; cleared by a successful swap.
     pub force_full_rebuild: bool,
     /// Which extractors were available when this ref was last built. `None`
@@ -778,7 +766,7 @@ pub fn repo_basename(url: &str) -> String {
 }
 
 const REF_COLUMNS: &str = "id, collection_id, git_ref, git_url, is_primary, data_uuid, status, \
-     last_indexed_at, last_indexed_commit, last_error, dir_versions_json, delta_cursor, \
+     last_indexed_at, last_indexed_commit, last_error, dir_versions_json, \
      force_full_rebuild, extractor_fingerprint, \
      created_at, updated_at";
 
@@ -808,7 +796,6 @@ fn map_ref_row(row: &SqliteRow) -> Result<CollectionRef, DbError> {
             // rather than failing the build.
             serde_json::from_str(&json).unwrap_or_default()
         },
-        delta_cursor: row.try_get("delta_cursor")?,
         force_full_rebuild: row.try_get::<i64, _>("force_full_rebuild")? != 0,
         extractor_fingerprint: row.try_get("extractor_fingerprint")?,
         created_at: parse_ts(&created_at_s, "created_at")?,
@@ -1478,20 +1465,6 @@ pub async fn rename_files(pool: &Pool, moves: &[(i64, String)]) -> Result<(), Db
             .await?;
     }
     tx.commit().await?;
-    Ok(())
-}
-
-/// Move a file to a new path without touching its content.
-///
-/// The cheap half of incremental sync: a reorganised folder of 400 documents
-/// is 400 of these rather than 400 re-extractions.
-pub async fn rename_file(pool: &Pool, file_id: i64, new_path: &str) -> Result<(), DbError> {
-    sqlx::query("UPDATE rag_files SET path = ?, indexed_at = ? WHERE id = ?")
-        .bind(new_path)
-        .bind(Timestamp::now().to_string())
-        .bind(file_id)
-        .execute(pool)
-        .await?;
     Ok(())
 }
 

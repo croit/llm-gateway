@@ -49,11 +49,16 @@ pub const DEFAULT_PROMPT: &str = "Document parsing.";
 /// cache identity alongside the document hash, model, and settings.
 pub const PROMPT_VERSION: &str = "v1";
 
+/// The two halves of the page marker. Shared by the writer and the reader so
+/// this module really does own the format, as `split_pages` claims.
+const PAGE_MARKER_PREFIX: &str = "--- page ";
+const PAGE_MARKER_SUFFIX: &str = " ---";
+
 /// Marker written before each page block when the sidecar returns per-page
 /// results. Keeps page order and page numbers legible to the model, which is
 /// what makes "the answer is on page 7" possible.
 fn page_marker(page: usize) -> String {
-    format!("--- page {page} ---")
+    format!("{PAGE_MARKER_PREFIX}{page}{PAGE_MARKER_SUFFIX}")
 }
 
 /// Split assembled OCR markdown back into per-page text.
@@ -79,15 +84,16 @@ pub fn split_pages(markdown: &str) -> Vec<String> {
 
     for line in markdown.lines() {
         let trimmed = line.trim();
-        if let Some(page) = parse_page_marker(trimmed) {
+        if let Some(rest) = marker_page_number(trimmed) {
             if let Some(n) = current_page.take() {
                 numbered.push((n, current.trim().to_string()));
             }
             current.clear();
             // A marker we cannot read a number out of still separates pages;
             // fall back to counting.
-            current_page = Some(page.unwrap_or(next_implicit));
-            next_implicit = current_page.unwrap_or(next_implicit) + 1;
+            let n = rest.trim().parse::<usize>().unwrap_or(next_implicit);
+            current_page = Some(n);
+            next_implicit = n + 1;
             continue;
         }
         current.push_str(line);
@@ -106,18 +112,21 @@ pub fn split_pages(markdown: &str) -> Vec<String> {
     let highest = numbered.iter().map(|(n, _)| *n).max().unwrap_or(0);
     let mut pages = vec![String::new(); highest];
     for (n, content) in numbered {
-        if n >= 1 && n <= highest {
+        // `highest` is the maximum of these, so the only bound to check is
+        // that a marker did not claim page 0.
+        if n >= 1 {
             pages[n - 1] = content;
         }
     }
     pages
 }
 
-/// `--- page 4 ---` -> `Some(Some(4))`; a marker whose number will not parse
-/// -> `Some(None)`; anything else -> `None`.
-fn parse_page_marker(trimmed: &str) -> Option<Option<usize>> {
-    let rest = trimmed.strip_prefix("--- page ")?.strip_suffix(" ---")?;
-    Some(rest.trim().parse::<usize>().ok())
+/// The page number text out of `--- page 4 ---`, or `None` if this line is
+/// not a marker. The caller decides what an unparseable number means.
+fn marker_page_number(trimmed: &str) -> Option<&str> {
+    trimmed
+        .strip_prefix(PAGE_MARKER_PREFIX)?
+        .strip_suffix(PAGE_MARKER_SUFFIX)
 }
 
 #[derive(Debug, Error)]

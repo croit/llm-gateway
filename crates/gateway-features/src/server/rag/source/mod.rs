@@ -164,8 +164,16 @@ pub struct RemoteEntry {
     /// provenance the model and the user see, and the store's fallback key.
     pub rel_path: String,
     pub kind: EntryKind,
-    /// Opaque change token. Compared for equality only.
-    pub version: String,
+    /// Opaque change token, compared for equality only. `None` when the
+    /// source reports nothing that moves when the file does.
+    ///
+    /// `None` rather than a stand-in value: the planner reads it as "cannot
+    /// tell, re-read", which is the honest answer. A provider that invented a
+    /// stable filler — the filename, the path, the size — would pin the file
+    /// as never-changing and lose every later edit, silently and permanently.
+    /// That is a mistake each provider would otherwise have to avoid on its
+    /// own; `Option` makes it unrepresentable.
+    pub version: Option<String>,
     pub size_bytes: u64,
     pub mime: Option<String>,
     pub modified_at: Option<Timestamp>,
@@ -230,7 +238,9 @@ pub struct DeltaPage {
 /// What a provider can do. The worker reads this instead of matching on a
 /// provider name, which is what keeps `worker.rs` free of provider
 /// knowledge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The default is the pessimistic set: a provider that opts into nothing
+/// still works, just with a full walk and path-keyed identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProviderCapabilities {
     /// A directory's version changes when anything beneath it changes, so an
     /// unchanged directory can be skipped without descending.
@@ -239,18 +249,6 @@ pub struct ProviderCapabilities {
     pub delta: bool,
     /// [`RemoteEntry::id`] survives rename and move.
     pub stable_ids: bool,
-}
-
-/// The pessimistic set: a provider that opts into nothing still works, just
-/// with a full walk and path-keyed identity.
-impl Default for ProviderCapabilities {
-    fn default() -> Self {
-        Self {
-            subtree_pruning: false,
-            delta: false,
-            stable_ids: false,
-        }
-    }
 }
 
 /// What [`FileProvider::probe`] tells the operator after a "Test connection"
@@ -296,6 +294,14 @@ pub trait FileProvider: Send + Sync + 'static {
 
     /// Provider-native change feed. Only called when
     /// [`ProviderCapabilities::delta`] is set.
+    ///
+    /// **No consumer yet**, and deliberately no schema either: the cursor a
+    /// real implementation needs is one `ALTER TABLE` away, and shipping the
+    /// column before the code that writes it made it look wired when it was
+    /// not. Wiring this up is a branch in `gather_remote`, a cursor threaded
+    /// back out of `build_ref_incremental`, and teaching `sync::plan` a shape
+    /// with no `TreeSnapshot` and no `is_complete()` — a delta page hands you
+    /// removals directly.
     async fn delta(&self, _cursor: Option<&str>) -> Result<DeltaPage, ProviderError> {
         Err(ProviderError::Unsupported {
             provider: self.kind(),
@@ -449,6 +455,19 @@ pub enum AuthKind {
 /// to paste something that cannot work.
 pub const REFRESH_TOKEN_KEY: &str = "refresh_token";
 
+/// True when this provider needs a browser consent that has not happened yet.
+///
+/// Asked of the factory rather than by naming a provider, so the next OAuth
+/// source inherits the behaviour instead of adding a second special case.
+/// Lives beside [`AuthKind`] rather than in either write surface because
+/// both of them need it: an OAuth source must be *storable* before anyone
+/// can consent (consent needs the saved client id), so both the admin form
+/// and the JSON API have to skip their dry-run `build()` in this state or
+/// the two deadlock against each other.
+pub fn awaiting_consent(factory: &dyn ProviderFactory, secrets: &BTreeMap<String, String>) -> bool {
+    matches!(factory.auth(), AuthKind::OAuth2 { .. }) && !secrets.contains_key(REFRESH_TOKEN_KEY)
+}
+
 /// Builds providers of one kind and describes their settings.
 pub trait ProviderFactory: Send + Sync + 'static {
     fn kind(&self) -> &'static str;
@@ -464,6 +483,17 @@ pub trait ProviderFactory: Send + Sync + 'static {
     /// How this provider is authorised. Default: typed credentials.
     fn auth(&self) -> AuthKind {
         AuthKind::Fields
+    }
+
+    /// Which config keys hold secrets, and so must be sealed rather than
+    /// stored in the clear. Derived from the declared fields — every caller
+    /// that splits a submitted form needs this same answer.
+    fn secret_keys(&self) -> Vec<&'static str> {
+        self.config_fields()
+            .iter()
+            .filter(|f| f.kind == FieldKind::Secret)
+            .map(|f| f.key)
+            .collect()
     }
 
     fn build(

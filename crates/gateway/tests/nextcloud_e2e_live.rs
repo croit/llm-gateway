@@ -250,7 +250,11 @@ async fn a_real_listing_carries_fileid_etag_size_and_type() {
         "oc:fileid should be numeric, got {:?}",
         file.id
     );
-    assert!(!file.version.is_empty(), "an etag came back");
+    assert!(
+        file.version.as_deref().is_some_and(|v| !v.is_empty()),
+        "a real Nextcloud reports an etag; `None` would mean every sync \
+         re-reads this file forever"
+    );
     assert_eq!(
         file.size_bytes, 17,
         "getcontentlength matched the bytes we wrote"

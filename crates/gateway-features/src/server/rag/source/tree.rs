@@ -102,7 +102,7 @@ impl TreeSnapshot {
         let mut parts: Vec<String> = self
             .files
             .iter()
-            .map(|f| format!("{}:{}", f.id, f.version))
+            .map(|f| format!("{}:{}", f.id, f.version.as_deref().unwrap_or("?")))
             .collect();
         // Pruned subtrees contribute their directory version, so a change
         // deep inside one still moves the marker.
@@ -285,7 +285,7 @@ mod tests {
             locator: path.to_string(),
             rel_path: path.to_string(),
             kind: EntryKind::File,
-            version: version.to_string(),
+            version: Some(version.to_string()),
             size_bytes: size,
             mime: None,
             modified_at: None,
@@ -298,7 +298,7 @@ mod tests {
             locator: path.to_string(),
             rel_path: path.to_string(),
             kind: EntryKind::Dir,
-            version: "d".to_string(),
+            version: Some("d".to_string()),
             size_bytes: 0,
             mime: None,
             modified_at: None,

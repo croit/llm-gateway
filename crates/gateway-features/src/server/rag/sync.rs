@@ -152,10 +152,13 @@ pub fn plan(
                 replaces: None,
             }),
             Some(prior) => {
-                let same_version = prior
-                    .source_version
-                    .as_deref()
-                    .is_some_and(|v| v == entry.version);
+                // Unchanged only when both sides actually have a token and
+                // they match. A missing one on either side means "cannot
+                // tell", which is a re-read, never a silent skip.
+                let same_version = matches!(
+                    (prior.source_version.as_deref(), entry.version.as_deref()),
+                    (Some(a), Some(b)) if a == b
+                );
                 let moved = prior.path != entry.rel_path;
                 match (same_version, moved) {
                     // Unchanged content, new path: the whole point of keying
@@ -252,7 +255,7 @@ mod tests {
             locator: path.into(),
             rel_path: path.into(),
             kind: EntryKind::File,
-            version: version.into(),
+            version: Some(version.into()),
             size_bytes: 10,
             mime: None,
             modified_at: None,

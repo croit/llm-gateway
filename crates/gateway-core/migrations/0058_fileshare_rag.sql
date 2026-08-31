@@ -64,12 +64,6 @@ ALTER TABLE rag_collections ADD COLUMN connected_at TEXT;
 -- biggest saving in a re-sync.
 ALTER TABLE rag_collection_refs ADD COLUMN dir_versions_json TEXT NOT NULL DEFAULT '{}';
 
--- Cursor for a provider-native change feed. **Not yet written by anything.**
--- The column, `DeltaPage` and `FileProvider::delta` are the seam for a
--- cursor-based provider (Microsoft Graph, Dropbox); the worker has no
--- consumer for one, so every provider currently re-walks.
-ALTER TABLE rag_collection_refs ADD COLUMN delta_cursor TEXT;
-
 -- "Rebuild from scratch", kept separate from "has ever finished a build"
 -- (`last_indexed_commit`). Conflating them meant that asking for a rebuild
 -- made the corpus unsearchable for the whole build — on data that was sitting

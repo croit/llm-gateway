@@ -456,12 +456,7 @@ pub fn to_spec(
         .ok_or_else(|| t(lang, "rag-source-unknown-kind"))?;
 
     // Split the submitted values by what the provider says is secret.
-    let secret_keys: Vec<&str> = factory
-        .config_fields()
-        .iter()
-        .filter(|f| f.kind == FieldKind::Secret)
-        .map(|f| f.key)
-        .collect();
+    let secret_keys = factory.secret_keys();
     let mut config = BTreeMap::new();
     let mut secrets = BTreeMap::new();
     for (k, v) in parsed.config {
@@ -496,7 +491,7 @@ pub fn to_spec(
     // someone has clicked through the provider's consent screen, and that
     // cannot happen until the client id and secret are *saved*. Demanding a
     // buildable provider here would deadlock the two against each other.
-    if !awaiting_consent(factory.as_ref(), &merged) {
+    if !source::awaiting_consent(factory.as_ref(), &merged) {
         factory.build(&cfg, http).map_err(|e| e.to_string())?;
     }
 
@@ -513,18 +508,6 @@ pub fn to_spec(
 pub fn has_refresh_token(spec: &rag_db::SourceSpec, crypto: &Crypto) -> bool {
     spec.open_secrets(crypto)
         .contains_key(source::REFRESH_TOKEN_KEY)
-}
-
-/// True when this provider needs a browser consent that has not happened yet.
-///
-/// Asked of the factory rather than by naming a provider, so the next OAuth
-/// source inherits the behaviour instead of adding a second special case.
-pub fn awaiting_consent(
-    factory: &dyn source::ProviderFactory,
-    secrets: &BTreeMap<String, String>,
-) -> bool {
-    matches!(factory.auth(), source::AuthKind::OAuth2 { .. })
-        && !secrets.contains_key(source::REFRESH_TOKEN_KEY)
 }
 
 fn seal_spec(
@@ -569,12 +552,7 @@ pub fn stored_secrets_may_stand_in(
     if stored.kind != factory.kind() {
         return false;
     }
-    let secret_keys: Vec<&str> = factory
-        .config_fields()
-        .iter()
-        .filter(|f| f.kind == FieldKind::Secret)
-        .map(|f| f.key)
-        .collect();
+    let secret_keys = factory.secret_keys();
     let submitted_public: BTreeMap<&str, &str> = submitted
         .iter()
         .filter(|(k, _)| !secret_keys.contains(&k.as_str()))

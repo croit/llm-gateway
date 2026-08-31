@@ -557,7 +557,10 @@ impl Tool for RagFetchDocument {
                 .ok_or_else(|| ToolError::Failed("RAG is not configured on this gateway".into()))?;
             let (_c, store, _profile) = open(&ctx, &self.rbac, indexer, &a.collection).await?;
 
-            let text = docs_db::document_text(&store, a.document_id)
+            let cap = a.max_chars.unwrap_or(DEFAULT_MAX_CHARS).clamp(500, 60_000);
+            // The budget goes down, so reassembly stops at it rather than
+            // rebuilding a whole document to throw most of it away.
+            let (text, truncated) = docs_db::document_text(&store, a.document_id, cap)
                 .await
                 .map_err(|e| ToolError::Failed(format!("reading document: {e}")))?;
             if text.trim().is_empty() {
@@ -566,9 +569,12 @@ impl Tool for RagFetchDocument {
                     a.document_id, a.collection
                 )));
             }
-            let cap = a.max_chars.unwrap_or(DEFAULT_MAX_CHARS).clamp(500, 60_000);
-            let truncated = text.chars().count() > cap;
-            let body: String = text.chars().take(cap).collect();
+            // One partial pass instead of two full decodes plus a
+            // char-at-a-time rebuild.
+            let (body, truncated) = match text.char_indices().nth(cap) {
+                Some((i, _)) => (&text[..i], true),
+                None => (text.as_str(), truncated),
+            };
             let mut out = json!({
                 "document_id": a.document_id,
                 // Named and framed as data: a document that says "ignore your
