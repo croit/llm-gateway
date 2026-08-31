@@ -208,6 +208,25 @@ pub async fn head_commit(repo: &Path) -> Result<String, GitError> {
     Ok(out.trim().to_string())
 }
 
+/// Environment variables that make `git` ignore `current_dir` and operate on
+/// some *other* repository.
+///
+/// Git exports these to hooks and to anything a hook runs, so a gateway (or a
+/// test) started from inside a `git push` inherits them — and every clone
+/// below would then be aimed at the pushing repository instead of the
+/// directory we asked for. Scrubbed rather than trusted: nothing here ever
+/// wants a caller's git context.
+pub(crate) const INHERITED_GIT_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
 async fn run(command: &'static str, cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     let mut cmd = Command::new("git");
     cmd.args(args)
@@ -217,6 +236,9 @@ async fn run(command: &'static str, cwd: &Path, args: &[&str]) -> Result<String,
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for var in INHERITED_GIT_VARS {
+        cmd.env_remove(var);
+    }
     let output = cmd
         .output()
         .await

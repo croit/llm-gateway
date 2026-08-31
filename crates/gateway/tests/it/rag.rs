@@ -117,16 +117,38 @@ fn registry_pointed_at(upstream_url: &str) -> Arc<UpstreamRegistry> {
     registry
 }
 
+/// A `git` invocation that cannot be hijacked by an inherited git context.
+///
+/// `git push` exports `GIT_DIR` (and friends) to its hooks and to everything
+/// they run, and those override `current_dir`. Without scrubbing them these
+/// fixtures build their "repo" inside whatever repository invoked the hook —
+/// so the suite passes from a shell and fails from `pre-push`, which is
+/// exactly when it matters.
+fn git_cmd(cwd: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(cwd);
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// Initialise a small git repo with two text files. Returns `None` if
 /// system `git` isn't on PATH — the indexer is git-shell-dependent, so
 /// without `git` the rest of the test is meaningless.
 fn fixture_repo() -> Option<tempfile::TempDir> {
     let dir = tempdir().unwrap();
     let p = dir.path();
-    let init = std::process::Command::new("git")
-        .args(["init", "-q", "-b", "main", "."])
-        .current_dir(p)
-        .output();
+    let init = git_cmd(p).args(["init", "-q", "-b", "main", "."]).output();
     let Ok(init) = init else { return None };
     if !init.status.success() {
         return None;
@@ -136,14 +158,7 @@ fn fixture_repo() -> Option<tempfile::TempDir> {
         &["config", "user.name", "t"][..],
         &["config", "commit.gpgsign", "false"][..],
     ] {
-        assert!(
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(p)
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(git_cmd(p).args(args).status().unwrap().success());
     }
     std::fs::write(p.join("alpha.txt"), b"alpha alpha alpha alpha\n").unwrap();
     std::fs::write(p.join("beta.txt"), b"beta beta beta beta\n").unwrap();
@@ -152,18 +167,10 @@ fn fixture_repo() -> Option<tempfile::TempDir> {
         b"# project\n\nignored by include glob.\n",
     )
     .unwrap();
+    assert!(git_cmd(p).args(["add", "-A"]).status().unwrap().success());
     assert!(
-        std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(p)
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        std::process::Command::new("git")
+        git_cmd(p)
             .args(["commit", "-q", "-m", "seed"])
-            .current_dir(p)
             .status()
             .unwrap()
             .success()
@@ -337,17 +344,15 @@ async fn reindex_after_edit_drops_old_chunks_and_picks_up_new_content() {
     // Edit alpha.txt upstream + commit.
     std::fs::write(repo.path().join("alpha.txt"), b"gamma gamma gamma\n").unwrap();
     assert!(
-        std::process::Command::new("git")
+        git_cmd(repo.path())
             .args(["add", "-A"])
-            .current_dir(repo.path())
             .status()
             .unwrap()
             .success()
     );
     assert!(
-        std::process::Command::new("git")
+        git_cmd(repo.path())
             .args(["commit", "-q", "-m", "edit"])
-            .current_dir(repo.path())
             .status()
             .unwrap()
             .success()
@@ -391,9 +396,8 @@ fn fixture_repo_with(marker: &str) -> Option<tempfile::TempDir> {
     let dir = tempdir().unwrap();
     let p = dir.path();
     let ok = |args: &[&str]| {
-        std::process::Command::new("git")
+        git_cmd(p)
             .args(args)
-            .current_dir(p)
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
