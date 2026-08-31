@@ -547,10 +547,15 @@ pub(super) fn render_chat_page(page: ChatPage<'_>) -> Html {
             if let Some(html) = document_canvas_html.as_ref() {
                 div(
                     id: "document-canvas-slot",
+                    class: "canvas-slot",
                     "data-show": "$canvasTab === 'document'"
                 ) { #(html.clone()) }
             } else {
-                div(id: "document-canvas-slot", "data-show": "$canvasTab === 'document'") {}
+                div(
+                    id: "document-canvas-slot",
+                    class: "canvas-slot",
+                    "data-show": "$canvasTab === 'document'"
+                ) {}
             }
             div(
                 id: "assets-canvas-slot",

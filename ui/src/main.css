@@ -1868,13 +1868,23 @@
     }
 
     /* Mobile-first: the canvas is a full-screen overlay toggled by the header
-     * button (no splitter, no docked column on small screens). */
+     * button (no splitter, no docked column on small screens).
+     *
+     * A flex COLUMN, not a block: the tab strip is fixed-height and the active
+     * slot below it takes the rest. That is what gives the panel inside a
+     * *bounded* height — without it the slot is auto-height, the panel's own
+     * `height: 100%` resolves against nothing, its scroll body grows to the
+     * full length of the document, and `overflow: hidden` here silently clips
+     * everything past the fold with no way to scroll to it. */
     .canvas-col {
         position: fixed;
         inset: 0;
         z-index: 50;
         overflow: hidden;
         background: var(--color-base-100);
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
     }
     .canvas-splitter {
         display: none !important;
@@ -1910,6 +1920,7 @@
 
     .canvas-tabs {
         display: flex;
+        flex: 0 0 auto;
         align-items: center;
         gap: 0.25rem;
         min-height: 3.25rem;
@@ -1934,10 +1945,22 @@
         color: var(--color-base-content);
         background: var(--color-base-200);
     }
+    /* The tab bodies (`#document-canvas-slot` / `#assets-canvas-slot`) each
+     * take the column's remaining height. `min-height: 0` is load-bearing: a
+     * flex item defaults to `min-height: auto`, which refuses to shrink below
+     * its content and hands the scroll container inside a height equal to the
+     * whole document. Only one is ever visible ($canvasTab), the other is
+     * `display: none` via data-show. */
+    .canvas-slot {
+        display: flex;
+        flex-direction: column;
+        flex: 1 1 auto;
+        min-height: 0;
+    }
     .assets-canvas {
         display: flex;
         flex-direction: column;
-        height: calc(100% - 0.25rem);
+        flex: 1 1 auto;
         min-height: 0;
     }
     .assets-canvas__header {
@@ -2014,7 +2037,8 @@
     .document-canvas {
         display: flex;
         flex-direction: column;
-        height: 100%;
+        flex: 1 1 auto;
+        min-height: 0;
     }
     .document-canvas__header {
         display: flex;
@@ -2065,6 +2089,7 @@
     }
     .document-canvas__body {
         flex: 1 1 auto;
+        min-height: 0;
         overflow: auto;
         padding: 0.75rem;
     }

@@ -248,3 +248,82 @@ pub async fn icon(req: Request) -> Response {
         None => (StatusCode::NOT_FOUND, "unknown icon").into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::APP_CSS;
+
+    /// The declaration block of the first rule whose selector list mentions
+    /// `sel` (the compiled bundle merges identical blocks into one selector
+    /// list, so an exact-selector match would miss them).
+    fn rule_for(sel: &str) -> String {
+        let css = std::str::from_utf8(APP_CSS).expect("bundle is utf-8");
+        let mut from = 0;
+        while let Some(hit) = css[from..].find(sel) {
+            let at = from + hit;
+            // Selector list = back to the previous `}` / `{`.
+            let start = css[..at].rfind(['}', '{']).map_or(0, |i| i + 1);
+            let open = match css[at..].find('{') {
+                Some(i) => at + i,
+                None => break,
+            };
+            let close = match css[open..].find('}') {
+                Some(i) => open + i,
+                None => break,
+            };
+            // Only a real selector-list hit, not a substring of a longer class
+            // (`.document-canvas` inside `.document-canvas__body`).
+            let selectors = &css[start..open];
+            if selectors
+                .split(',')
+                .any(|s| s.trim().trim_end_matches("::-webkit-scrollbar") == sel)
+            {
+                return css[open + 1..close].to_string();
+            }
+            from = open;
+        }
+        panic!("no rule for `{sel}` in the compiled CSS bundle");
+    }
+
+    /// The document canvas scrolls only if EVERY link from the column down to
+    /// the scroll body has a bounded height. The bug this pins: the panel was
+    /// `height: 100%` inside an auto-height slot, so the percentage never
+    /// resolved, `.document-canvas__body` grew to the full length of the
+    /// document, and `.canvas-col`'s `overflow: hidden` clipped everything
+    /// past the fold — a long report simply could not be scrolled.
+    ///
+    /// A flex item defaults to `min-height: auto` (refuses to shrink below its
+    /// content), so each link needs an explicit `min-height: 0` as well.
+    #[test]
+    fn the_canvas_scroll_chain_is_height_bounded() {
+        let col = rule_for(".canvas-col");
+        assert!(
+            col.contains("display:flex") && col.contains("flex-direction:column"),
+            "the canvas column must be a flex column so the tab bodies below \
+             the tab strip get a bounded height; got: {col}"
+        );
+        assert!(col.contains("min-height:0"), "{col}");
+
+        for sel in [".canvas-slot", ".document-canvas", ".document-canvas__body"] {
+            let rule = rule_for(sel);
+            assert!(
+                rule.contains("min-height:0"),
+                "`{sel}` is a flex item in the canvas scroll chain and must \
+                 declare min-height:0, or it refuses to shrink below its \
+                 content and the panel body never becomes scrollable; got: {rule}"
+            );
+            assert!(
+                !rule.contains("height:100%"),
+                "`{sel}` must not size itself off a percentage — its ancestors \
+                 are auto-height until flex resolves them, so `height: 100%` \
+                 silently computes to `auto`; got: {rule}"
+            );
+        }
+
+        let body = rule_for(".document-canvas__body");
+        assert!(
+            body.contains("overflow:auto"),
+            "the panel body is the scroll container; got: {body}"
+        );
+    }
+}
