@@ -74,6 +74,154 @@ fn truncated_output(finish_reason: Option<&str>) -> bool {
         .is_some_and(|r| r.eq_ignore_ascii_case("length") || r.eq_ignore_ascii_case("max_tokens"))
 }
 
+/// Shown when a turn finishes without the model writing a single word, having
+/// run no tools either — nothing happened at all.
+///
+/// English-only for the same reason as `TRUNCATED_MESSAGE`: it is written into
+/// the turn row at generation time, where the reader's locale isn't known.
+const EMPTY_REPLY_MESSAGE: &str = "The model ended this turn without writing a reply. Nothing was \
+     lost — ask again, or rephrase the request.";
+
+/// Shown when the model ran its tools and then ended the turn without writing
+/// anything about them. Distinguished from [`EMPTY_REPLY_MESSAGE`] because the
+/// user's next move differs: the work *did* happen, so asking for the results
+/// is cheap, whereas re-asking from scratch would run it all again.
+const EMPTY_AFTER_TOOLS_MESSAGE: &str = "The model ran its tools (above) but ended the turn without \
+     writing an answer. The tool results are in its context — ask it to report what it found, \
+     rather than repeating the request.";
+
+/// Whether an upstream rejection is "the prompt is bigger than the context
+/// window" rather than any other bad request.
+///
+/// There is no status code or error code for this — every OpenAI-compatible
+/// backend reports it as a plain 400 with prose — so it is matched on the
+/// wording the implementations actually use: vLLM and OpenAI both say
+/// "maximum context length", llama.cpp and TGI phrase it around "context
+/// window"/"context size", and several say "too long"/"too many tokens".
+/// Matched case-insensitively and only on 400/413, since a false positive
+/// replaces a real error message with misleading advice.
+fn context_overflow(status: u16, body: &str) -> bool {
+    if status != 400 && status != 413 {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    [
+        "maximum context length",
+        "context window",
+        "context size",
+        "context_length_exceeded",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle))
+        || (body.contains("too long") && body.contains("token"))
+        || body.contains("too many tokens")
+}
+
+/// Chars per token used to convert the model's context window (tokens) into a
+/// byte budget for tool results. The usual ~4 for English prose; JSON — which
+/// is what tool results overwhelmingly are — packs *worse* than that (braces,
+/// quotes and field names tokenize densely), so 4 is the conservative
+/// direction: it under-estimates the budget rather than over-spending it.
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Share of the model's context window that all of one turn's tool results may
+/// occupy, and the share any single result may take on its own.
+///
+/// The rest of the window has to hold the conversation history, the system
+/// message, the tool schemas and the model's own answer, so tool results get a
+/// minority of it. A single result is capped tighter than the turn as a whole:
+/// one enormous payload must not eat the entire budget and starve the three
+/// calls that follow it in the same round.
+const TOOL_RESULTS_TURN_SHARE: f64 = 0.35;
+const TOOL_RESULT_SINGLE_SHARE: f64 = 0.15;
+
+/// Floors, in bytes, for the two budgets. A model configured with a tiny (or
+/// absurd) context window still gets enough room for a tool result to be worth
+/// reading — a 200-byte slice of a JSON document tells the model nothing, and
+/// silently starving every tool is a worse failure than a slightly-too-large
+/// prompt.
+const TOOL_RESULTS_TURN_FLOOR: usize = 16_384;
+const TOOL_RESULT_SINGLE_FLOOR: usize = 8_192;
+
+/// How much of the prompt this turn's tool results may still take up.
+///
+/// A tool result went upstream at whatever size the tool produced it. One ERP
+/// listing, one crawled page or one big query answer therefore overflowed the
+/// model's context on its own, and the turn died on a raw upstream 400 —
+/// after the tool work had already been done and paid for. Compaction does not
+/// help: it runs *between* turns, on conversation history, and cannot rescue a
+/// prompt that a single round has already blown past the window.
+///
+/// So results are budgeted against the model's real context window, both per
+/// result and cumulatively across the turn (four medium results add up to the
+/// same overflow one large one causes). Truncation is visible to the model —
+/// see [`cap_tool_result`] — because a silently shortened result is one the
+/// model will confidently draw wrong conclusions from.
+#[derive(Debug, Clone, Copy)]
+struct ToolResultBudget {
+    per_result: usize,
+    remaining: usize,
+}
+
+impl ToolResultBudget {
+    /// `window` is the model's context window in tokens, already resolved from
+    /// `model_defaults` (or the configured global default).
+    fn for_window(window: i64) -> Self {
+        let window_bytes = window.max(0) as usize * CHARS_PER_TOKEN;
+        let per_result = ((window_bytes as f64 * TOOL_RESULT_SINGLE_SHARE) as usize)
+            .max(TOOL_RESULT_SINGLE_FLOOR);
+        let remaining =
+            ((window_bytes as f64 * TOOL_RESULTS_TURN_SHARE) as usize).max(TOOL_RESULTS_TURN_FLOOR);
+        Self {
+            per_result,
+            remaining,
+        }
+    }
+
+    /// The cap the next result must fit in: its own share, or whatever is left
+    /// of the turn's allowance, whichever is smaller.
+    fn cap(&self) -> usize {
+        self.per_result.min(self.remaining)
+    }
+
+    fn spend(&mut self, bytes: usize) {
+        self.remaining = self.remaining.saturating_sub(bytes);
+    }
+}
+
+/// Cut `body` down to `cap` bytes if it is over, appending a note that says so.
+///
+/// The note matters as much as the cut. A result silently shortened to a
+/// well-formed-looking prefix is worse than an error: the model reads a partial
+/// list as the whole list and reports it to the user as complete. So the tail
+/// states plainly that this is a slice, how big the real payload was, and what
+/// to do about it — narrow the request and call again, which is the one move
+/// that actually fits the data in the window.
+///
+/// Splits on a char boundary (`floor_char_boundary` is unstable, so walk back
+/// by hand); a payload cut mid-codepoint is invalid UTF-8 that some backends
+/// reject outright.
+fn cap_tool_result(body: String, cap: usize) -> String {
+    if body.len() <= cap {
+        return body;
+    }
+    let original = body.len();
+    let mut end = cap;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = body;
+    out.truncate(end);
+    out.push_str(&format!(
+        "\n\n[truncated by the gateway: this is the first {end} bytes of a {original}-byte \
+         result, which does not fit in this model's context window. The rest was NOT sent to \
+         you — do not treat what you see as the complete answer. If you need the missing part, \
+         call the tool again with a narrower request (filters, a smaller page size, fewer \
+         fields), and tell the user the result was too large to read in full.]"
+    ));
+    out
+}
+
 /// Pull the safe-to-emit prefix out of `buf`, removing any complete
 /// `<think>`/`</think>` tags and holding back a trailing run that could be the
 /// start of one (so a tag split across stream deltas is still removed). The
@@ -671,6 +819,30 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
     let mut seen_tool_call_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
+    // Did the model write any visible prose anywhere in this turn? Tracked
+    // across rounds (not per round): a turn that narrates in round 0 and goes
+    // quiet in round 3 has still answered, while one that only ever emitted
+    // tool calls has not. Drives the empty-reply notice at the end of the
+    // round loop.
+    let mut wrote_any_content = false;
+
+    // How many bytes of tool output this turn may still push into the prompt.
+    // Resolved from the model's own `context_window` (the same `model_defaults`
+    // value compaction uses), falling back to the configured global default
+    // when the model has no row — so an unconfigured model gets a sane budget
+    // rather than an unbounded one. See `ToolResultBudget`.
+    let mut tool_budget = ToolResultBudget::for_window(
+        crate::server::compaction::model_context_window(&d.state, &real_model)
+            .await
+            .unwrap_or(d.state.config.chat.compaction.default_context_window),
+    );
+    tracing::debug!(
+        model = %real_model,
+        per_result = tool_budget.per_result,
+        per_turn = tool_budget.remaining,
+        "tool-result byte budget for this turn"
+    );
+
     for round in 0..max_rounds {
         if ctx.cancel.load(Ordering::SeqCst) {
             return Ok(TurnOutcome::default());
@@ -819,15 +991,24 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
                 started,
                 (None, None, None),
             );
-            return Err(TurnError::Upstream {
-                message: format!(
+            let body = String::from_utf8_lossy(&bytes);
+            // A context overflow is the one upstream 400 a *user* can act on,
+            // and the raw backend JSON ("This model's maximum context length
+            // is 262144 tokens…") tells them nothing they can act on. Say what
+            // happened and what to do instead; keep everything else verbatim.
+            let message = if context_overflow(status.as_u16(), &body) {
+                "This conversation no longer fits in the model's context window, so the model \
+                 refused the request. Start a new chat, or ask for a narrower slice of the \
+                 data (fewer records, a filter, a date range) — the last tool result was \
+                 probably too large to read in one go."
+                    .to_string()
+            } else {
+                format!(
                     "upstream {status}: {}",
-                    String::from_utf8_lossy(&bytes)
-                        .chars()
-                        .take(200)
-                        .collect::<String>()
-                ),
-            });
+                    body.chars().take(200).collect::<String>()
+                )
+            };
+            return Err(TurnError::Upstream { message });
         }
         let status_code = upstream.status().as_u16();
 
@@ -1010,6 +1191,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
                         let emit = take_safe_content(&mut content_tag_buf);
                         if !emit.is_empty() {
                             round_content.push_str(&emit);
+                            wrote_any_content = true;
                             chat::append_content(&d.state.db, &ctx.assistant_turn_id, &emit)
                                 .await
                                 .map_err(persist_err("append_content", &ctx.assistant_turn_id))?;
@@ -1078,6 +1260,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
             }
             if !content_tag_buf.is_empty() {
                 round_content.push_str(&content_tag_buf);
+                wrote_any_content = true;
                 chat::append_content(&d.state.db, &ctx.assistant_turn_id, &content_tag_buf)
                     .await
                     .map_err(persist_err("append_content_flush", &ctx.assistant_turn_id))?;
@@ -1118,6 +1301,33 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
 
         // End of round. If no tool calls, we're done.
         if tool_acc.is_empty() {
+            // ...but "done" having written nothing at all is not a reply, and
+            // on screen it is indistinguishable from one: the bubble settles,
+            // the spinner clears, a timestamp appears, and the user is looking
+            // at an empty (or tool-rows-only) message wondering whether the
+            // answer is still coming. That is the other half of the reported
+            // "did it finish or not?" — the model ran its tools and then ended
+            // the turn without saying anything about them.
+            //
+            // Whether the tools ran or not changes what the user should do, so
+            // the notice says which case this is. A notice, not an error: any
+            // tool work really did happen, and erroring would drop the row from
+            // the model's own replayed history.
+            if !wrote_any_content {
+                tracing::warn!(
+                    model = %ctx.model,
+                    round,
+                    tool_rounds_done = round,
+                    "turn ended with no assistant content; finalizing with an empty-reply notice"
+                );
+                return Ok(TurnOutcome {
+                    notice: Some(if round > 0 {
+                        EMPTY_AFTER_TOOLS_MESSAGE.to_string()
+                    } else {
+                        EMPTY_REPLY_MESSAGE.to_string()
+                    }),
+                });
+            }
             return Ok(TurnOutcome::default());
         }
 
@@ -1195,6 +1405,11 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
             // back). Otherwise fall back to stringified JSON — the
             // pre-existing contract.
             let content = match crate::server::tools::extract_content_parts(&result.body) {
+                // Mixed content parts (an image the model is meant to *see*)
+                // deliberately skip the byte budget: the payload here is image
+                // bytes, which `maybe_replace_image_content` already sizes for
+                // the model, and slicing a base64 image in half produces a
+                // corrupt attachment rather than a shorter one.
                 Some(parts) => {
                     let (replaced, notification) =
                         gateway_core::server::capabilities::maybe_replace_image_content(
@@ -1211,7 +1426,13 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
                     }
                     serde_json::Value::Array(replaced)
                 }
-                None => serde_json::Value::String(output_str),
+                None => {
+                    // The DB/operator copy above keeps the full payload; only
+                    // what goes upstream is budgeted.
+                    let capped = cap_tool_result(output_str, tool_budget.cap());
+                    tool_budget.spend(capped.len());
+                    serde_json::Value::String(capped)
+                }
             };
             messages.push(serde_json::json!({
                 "role": "tool",
@@ -1411,7 +1632,11 @@ fn hand_edited_docs_section(
 /// as `mcp__<key> — <name>: <description>`. Returns `None` when the user has no
 /// connected connectors, or all of them are already enabled (nothing to
 /// advertise). The model turns one on with `enable_tools(["mcp__<key>"])`; its
-/// real tool schemas then appear from the next turn. Connector display copy
+/// real tool schemas appear on the very next round of the *same* turn, since
+/// `user_mcp` lists every connected connector's tools up front and only the
+/// per-round `enabled_keys` filter gates them. Saying "next turn" here (as this
+/// did) reads to the model as an instruction to stop and wait for a nudge,
+/// which is precisely the "looks finished, did nothing" bubble. Connector copy
 /// comes from the admin catalog; only connectors actually present in the live
 /// `UserMcpLayer` are listed, so an advertised key is always connectable.
 async fn build_mcp_offer_section(
@@ -1461,7 +1686,8 @@ async fn build_mcp_offer_section(
     }
     Some(format!(
         "\nIntegrations the user has connected and you can turn on with \
-         `enable_tools([\"<key>\"])` (their tools then appear next turn):\n{rows}"
+         `enable_tools([\"<key>\"])` (their tools are then yours to call immediately, in \
+         this same turn — enable and use them in one go, never enable and stop):\n{rows}"
     ))
 }
 
@@ -2769,5 +2995,124 @@ mod tests {
             assert_eq!(msgs[0]["content"], "a2");
             assert_eq!(msgs[1]["content"], "q3");
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_budget_tests {
+    use super::{ToolResultBudget, cap_tool_result, context_overflow};
+
+    #[test]
+    fn small_results_pass_through_untouched() {
+        let body = r#"{"ok":true}"#.to_string();
+        assert_eq!(cap_tool_result(body.clone(), 8_192), body);
+    }
+
+    /// The reported failure: one tool result larger than the whole context
+    /// window. It must come back inside the cap, and must *say* it was cut —
+    /// a silently shortened list is one the model reports as complete.
+    #[test]
+    fn oversized_results_are_cut_and_labelled() {
+        let huge = "x".repeat(2_000_000);
+        let out = cap_tool_result(huge.clone(), 10_000);
+        assert!(out.len() < huge.len() / 100, "expected a hard cut");
+        assert!(out.contains("truncated by the gateway"), "{out}");
+        assert!(
+            out.contains(&huge.len().to_string()),
+            "the note must state the real payload size: {out}"
+        );
+        assert!(
+            out.contains("do not treat what you see as the complete answer"),
+            "{out}"
+        );
+        assert!(
+            out.contains("narrower request"),
+            "the note must say what to do about it: {out}"
+        );
+    }
+
+    #[test]
+    fn truncation_never_splits_a_codepoint() {
+        // Cap lands mid-emoji: a naive byte slice is invalid UTF-8, which
+        // some backends reject outright.
+        let payload = format!("{}\u{1F600}\u{1F600}", "x".repeat(99));
+        let out = cap_tool_result(payload, 100);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    /// Four medium results add up to the same overflow one large result
+    /// causes, so the budget is cumulative across the turn — exactly the
+    /// shape of the reported ERP failure (4 calls in one round).
+    #[test]
+    fn the_turn_budget_is_cumulative_across_calls() {
+        let mut budget = ToolResultBudget::for_window(262_144);
+        let per_result = budget.per_result;
+        let mut total = 0usize;
+        for _ in 0..12 {
+            let out = cap_tool_result("y".repeat(5_000_000), budget.cap());
+            budget.spend(out.len());
+            total += out.len();
+        }
+        assert!(
+            total < per_result * 12,
+            "a cumulative budget must bite before 12 max-size results: {total}"
+        );
+        // Everything sent still fits the turn share of the window.
+        let window_bytes = 262_144 * super::CHARS_PER_TOKEN;
+        assert!(
+            total <= (window_bytes as f64 * super::TOOL_RESULTS_TURN_SHARE) as usize + 12 * 512,
+            "turn total {total} overruns the budgeted share"
+        );
+    }
+
+    /// A single result may not swallow the whole turn allowance and starve
+    /// the calls that follow it in the same round.
+    #[test]
+    fn one_result_cannot_eat_the_whole_turn_budget() {
+        let budget = ToolResultBudget::for_window(262_144);
+        assert!(
+            budget.per_result < budget.remaining,
+            "per-result cap must be tighter than the turn budget"
+        );
+    }
+
+    /// A tiny or unset window must not starve tools down to a useless slice.
+    #[test]
+    fn tiny_windows_still_get_a_usable_floor() {
+        let budget = ToolResultBudget::for_window(0);
+        assert!(budget.per_result >= super::TOOL_RESULT_SINGLE_FLOOR);
+        assert!(budget.remaining >= super::TOOL_RESULTS_TURN_FLOOR);
+        // And a negative/absurd row can't panic or wrap.
+        let _ = ToolResultBudget::for_window(-1);
+    }
+
+    #[test]
+    fn context_overflow_recognises_the_backends_we_run() {
+        // vLLM / OpenAI — the exact body from the reported failure.
+        assert!(context_overflow(
+            400,
+            r#"{"error":{"message":"This model's maximum context length is 262144 tokens. However, you requested 0 output tokens and your prompt contains at least 262145 input tokens"}}"#
+        ));
+        assert!(context_overflow(400, "context_length_exceeded"));
+        assert!(context_overflow(400, "the input is too long: 5000 tokens"));
+        assert!(context_overflow(413, "Requested context window exceeded"));
+    }
+
+    /// A false positive replaces a real, actionable error with misleading
+    /// advice, so everything else must fall through verbatim.
+    #[test]
+    fn other_bad_requests_are_left_alone() {
+        assert!(!context_overflow(
+            400,
+            r#"{"error":"unknown model 'gpt-9'"}"#
+        ));
+        assert!(!context_overflow(
+            400,
+            "invalid tool schema: missing `name`"
+        ));
+        assert!(!context_overflow(429, "maximum context length"));
+        assert!(!context_overflow(500, "internal error"));
+        // "too long" about something that isn't tokens.
+        assert!(!context_overflow(400, "field `name` is too long"));
     }
 }

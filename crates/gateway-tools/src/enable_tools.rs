@@ -160,8 +160,10 @@ impl Tool for EnableTools {
              Use this whenever the user's request needs a capability that isn't already \
              in your current tools list — call it BEFORE you say you can't do something. \
              Enablement is sticky: once a key is on it stays on for the remaining turns. \
-             The real tool schemas appear in your tools list on the next turn after the \
-             call succeeds.\n\nAvailable keys:\n",
+             The real tool schemas are handed to you immediately — they are in your tools \
+             list on your very next step of THIS turn, so carry straight on and call them \
+             here. Never end your message after enabling; there is no later turn of yours \
+             in which the work would happen.\n\nAvailable keys:\n",
         );
         for t in catalog.iter() {
             description.push_str(&format!("- {} — {} ({})\n", t.key, t.title, t.one_liner));
@@ -273,8 +275,11 @@ impl Tool for EnableTools {
                 "status": "ok",
                 "enabled": enabled,
                 "skipped": skipped,
-                "note": "the enabled tools' real schemas appear in your tools list on the \
-                        next turn",
+                "note": "The enabled tools' real schemas are in your tools list as of right \
+                        now, in this same turn — go ahead and call them. Do not end your \
+                        message here and do not tell the user to nudge you: nothing of \
+                        yours runs after the message ends, so the work would simply never \
+                        happen.",
             }))
         })
     }
@@ -773,6 +778,59 @@ mod tests {
         assert_eq!(
             allowed,
             vec!["enable_tools".to_string(), "fetch_url".into()]
+        );
+    }
+
+    /// The reported "looks finished but did nothing" bubble: the model called
+    /// `enable_tools`, was told by this tool's own result that the schemas
+    /// arrive "on the next turn", and dutifully ended its message asking the
+    /// user for a nudge. The claim was false — `run_one_turn` re-resolves the
+    /// overlay every round, so the schemas are there on the very next round of
+    /// the SAME turn — and the driver's standing turn-discipline rule cannot
+    /// win against a specific, mechanical-sounding instruction to stop.
+    ///
+    /// So neither the result nor the schema may tell the model to wait for a
+    /// later turn, and both must tell it to carry on now.
+    #[tokio::test]
+    async fn the_result_never_tells_the_model_to_wait_for_another_turn() {
+        let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+        seed_session(&pool, "s1").await;
+        let reg = ToolRegistry::new().with(FetchUrl);
+        let et = EnableTools::from_registry(&reg);
+        let out = et
+            .run(
+                ctx(pool.clone(), Some("s1".into())).await,
+                json!({"keys": ["fetch_url"]}),
+            )
+            .await
+            .unwrap();
+        let note = out["note"].as_str().unwrap().to_ascii_lowercase();
+        assert!(
+            !note.contains("next turn"),
+            "the note must not defer the work to a later turn: {note}"
+        );
+        assert!(
+            note.contains("this same turn") || note.contains("right now"),
+            "the note must say the schemas are usable now: {note}"
+        );
+        assert!(
+            note.contains("do not end your message"),
+            "the note must forbid the announce-and-stop: {note}"
+        );
+    }
+
+    #[test]
+    fn the_schema_description_never_defers_to_a_later_turn() {
+        let reg = ToolRegistry::new().with(FetchUrl).with(SearchWeb);
+        let et = EnableTools::from_registry(&reg);
+        let desc = et.schema().function.description.to_ascii_lowercase();
+        assert!(
+            !desc.contains("on the next turn"),
+            "the description must not defer the work to a later turn: {desc}"
+        );
+        assert!(
+            desc.contains("this turn"),
+            "the description must say the schemas are usable in this turn: {desc}"
         );
     }
 }

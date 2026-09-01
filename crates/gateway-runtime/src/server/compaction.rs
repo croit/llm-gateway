@@ -110,7 +110,7 @@ pub async fn maybe_autocompact(state: &RamaState, session_id: &str, model: &str)
 /// global default. Keyed on the resolved real model id (the caller maps any
 /// alias first), matching how reasoning config and cost accounting key on it —
 /// an alias carries no settings of its own.
-async fn model_context_window(state: &RamaState, model: &str) -> Option<i64> {
+pub(crate) async fn model_context_window(state: &RamaState, model: &str) -> Option<i64> {
     model_defaults::get(&state.db, model)
         .await
         .ok()

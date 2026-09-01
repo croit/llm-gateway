@@ -1217,6 +1217,57 @@ async fn a_reply_cut_off_at_the_token_ceiling_is_marked_and_stays_replayable() {
 }
 
 #[tokio::test]
+async fn a_turn_that_writes_nothing_says_so_instead_of_looking_answered() {
+    // The other half of "did it finish or is it still working?": the model
+    // ends the turn having emitted no content at all. The bubble settles, the
+    // spinner clears and a timestamp appears — the exact shape of a finished
+    // reply — except there is no reply in it. The user is left unable to tell
+    // an empty answer from one still on its way.
+    let upstream = MockServer::start().await;
+    // A well-formed stream that simply carries no content delta.
+    let empty = "data: {\"choices\":[{\"delta\":{}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+         data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(empty, "text/event-stream"))
+        .mount(&upstream)
+        .await;
+
+    let (state, cookie, session_id) = setup(&upstream.uri()).await;
+    let app = router(state.clone());
+
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "say something")]);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{session_id}/messages"))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.serve(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = resp.into_body().collect().await.unwrap().to_bytes();
+
+    let turns = chat::list_turns(&state.db, &session_id).await.unwrap();
+    let asst = turns
+        .iter()
+        .find(|t| t.turn.role == chat::TurnRole::Assistant)
+        .expect("assistant turn");
+    let notice = asst.turn.error_message.as_deref().unwrap_or_default();
+    assert!(
+        notice.contains("without writing a reply"),
+        "an empty turn must say it is empty rather than presenting as answered, \
+         got: {notice:?}"
+    );
+    assert_eq!(
+        asst.turn.status,
+        chat::TurnStatus::Completed,
+        "nothing failed — the turn ran to completion, it just said nothing"
+    );
+}
+
+#[tokio::test]
 async fn a_normal_stop_still_completes() {
     // The guard above must never fire on a healthy turn: `finish_reason: stop`
     // is the overwhelmingly common case and a false positive turns a good
