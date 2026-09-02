@@ -34,8 +34,12 @@ fn s3_cfg() -> Arc<S3Config> {
             .unwrap_or_else(|_| "https://s3.example.com".into()),
         region: std::env::var("E2E_S3_REGION").unwrap_or_else(|_| "fra1".into()),
         bucket: std::env::var("E2E_S3_BUCKET").unwrap_or_else(|_| "llm-gateway".into()),
-        access_key_env: "GATEWAY_S3_ACCESS_KEY".into(),
-        secret_key_env: "GATEWAY_S3_SECRET_KEY".into(),
+        access_key: None,
+        secret_key: None,
+        // A live run takes its credentials from the environment it is started
+        // with, which the legacy `*_env` path still supports.
+        access_key_env: Some("GATEWAY_S3_ACCESS_KEY".into()),
+        secret_key_env: Some("GATEWAY_S3_SECRET_KEY".into()),
         // Isolate this test's objects under their own prefix.
         key_prefix: "e2e-sandbox-test".into(),
     })
@@ -50,7 +54,7 @@ fn client() -> Arc<SandboxClient> {
             timeout_secs: 120,
             max_artifact_bytes: 50 * 1024 * 1024,
         }),
-        "http://localhost:8080".into(),
+        gateway_runtime::server::state::RuntimeSettings::new_handle("http://localhost:8080"),
     )
 }
 

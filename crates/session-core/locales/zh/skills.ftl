@@ -12,7 +12,7 @@ skills-intro-part1 = 运营者安装的指导内容,聊天模型会在需要时�
 skills-intro-part2 = 工具按需加载。请在下方上传
 skills-intro-part3 = 归档文件——上传后立即生效,无需重启。
 skills-empty-loaded = 尚未加载任何技能。上传一个 .skill 归档文件即可添加。
-skills-empty-not-configured = 未配置技能。请在网关配置中设置 [skills] dir 并重启以启用。
+skills-empty-not-configured = 未配置技能。请在 /admin/settings 中启用（skills.dir）并重启以加载。
 
 skills-upload-heading = 添加技能
 skills-upload-button = 上传 .skill

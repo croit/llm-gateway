@@ -96,7 +96,7 @@ pub async fn user_skills_upload(State(state): State<Arc<RamaState>>, req: Reques
     let datastar = is_datastar_request(req.headers());
     let (session, user) = require_session!(state, req);
     let impersonating = session.impersonator_id.is_some();
-    let Some(store) = state.user_skills.clone() else {
+    let Some(store) = state.user_skills() else {
         return err_page(
             &state,
             datastar,
@@ -197,7 +197,7 @@ pub async fn user_skills_save(State(state): State<Arc<RamaState>>, req: Request)
     let datastar = is_datastar_request(req.headers());
     let (session, user) = require_session!(state, req);
     let impersonating = session.impersonator_id.is_some();
-    let Some(store) = state.user_skills.clone() else {
+    let Some(store) = state.user_skills() else {
         return err_page(
             &state,
             datastar,
@@ -312,7 +312,7 @@ struct SaveForm {
 pub async fn user_skills_delete(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let (session, user) = require_session!(state, req);
     let _ = session;
-    let Some(store) = state.user_skills.clone() else {
+    let Some(store) = state.user_skills() else {
         return see_other("/skills");
     };
     let (_, body) = req.into_parts();
@@ -340,7 +340,7 @@ pub async fn user_skills_download(State(state): State<Arc<RamaState>>, req: Requ
     let Some(name) = selected_skill_param(&req) else {
         return see_other("/skills");
     };
-    let Some(store) = state.user_skills.clone() else {
+    let Some(store) = state.user_skills() else {
         return see_other("/skills");
     };
     let registry = store.registry_for(&user.id);
@@ -488,11 +488,11 @@ async fn render_page(
     editor_prefill: Option<String>,
     error: Option<&str>,
 ) -> Response {
-    let views = match state.user_skills.as_ref() {
-        Some(store) => skill_views(store, &user.id),
+    let views = match state.user_skills() {
+        Some(store) => skill_views(&store, &user.id),
         None => Vec::new(),
     };
-    let configured = state.user_skills.is_some();
+    let configured = state.user_skills().is_some();
     let selected = views
         .iter()
         .position(|v| Some(v.name.as_str()) == selected_name);

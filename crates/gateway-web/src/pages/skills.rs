@@ -40,7 +40,7 @@ pub async fn skills_download(State(state): State<Arc<RamaState>>, req: Request) 
     let Some(name) = selected_skill_param(&req) else {
         return see_other("/admin/skills");
     };
-    let Some(store) = state.skills.clone() else {
+    let Some(store) = state.skills() else {
         return see_other("/admin/skills");
     };
     let registry = store.current();
@@ -126,7 +126,7 @@ pub async fn skills_upload(State(state): State<Arc<RamaState>>, req: Request) ->
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let Some(store) = state.skills.clone() else {
+    let Some(store) = state.skills() else {
         return render_page(
             &state,
             datastar,
@@ -233,7 +233,7 @@ pub async fn skills_delete(State(state): State<Arc<RamaState>>, req: Request) ->
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let Some(store) = state.skills.clone() else {
+    let Some(store) = state.skills() else {
         return see_other("/admin/skills");
     };
     let (_, body) = req.into_parts();
@@ -324,7 +324,7 @@ pub async fn skills_grants_save(State(state): State<Arc<RamaState>>, req: Reques
         return resp;
     }
     // Skills must be configured to grant them — mirrors the other mutations.
-    if state.skills.is_none() {
+    if state.skills().is_none() {
         return see_other("/admin/skills");
     }
     let (_, body) = req.into_parts();
@@ -341,8 +341,8 @@ pub async fn skills_grants_save(State(state): State<Arc<RamaState>>, req: Reques
     // already granted by config — the config-granted checkboxes render
     // disabled, so they shouldn't post, but we filter defensively so a
     // hand-crafted request can't write a redundant or bogus row.
-    let config_granted: Vec<&str> = state
-        .config
+    let config = state.config();
+    let config_granted: Vec<&str> = config
         .roles
         .iter()
         .filter(|r| r.skills.iter().any(|g| g == "*" || g == &skill))
@@ -351,7 +351,7 @@ pub async fn skills_grants_save(State(state): State<Arc<RamaState>>, req: Reques
     let roles: Vec<String> = submitted
         .into_iter()
         .filter(|role| {
-            state.config.roles.iter().any(|r| &r.id == role)
+            state.config().roles.iter().any(|r| &r.id == role)
                 && !config_granted.iter().any(|c| c == role)
         })
         .collect();
@@ -481,7 +481,7 @@ async fn render_page(
         .iter()
         .position(|v| Some(v.name.as_str()) == selected_name)
         .unwrap_or(0);
-    let dir = state.config.skills.as_ref().map(|c| display_dir(&c.dir));
+    let dir = state.config().skills.as_ref().map(|c| display_dir(&c.dir));
     let push_url = match views.get(selected) {
         Some(v) => format!("/admin/skills?skill={}", v.name),
         None => "/admin/skills".to_string(),
@@ -520,7 +520,7 @@ async fn render_page(
 /// [`gateway_core::server::rbac::Resolver::allowed_skills`] enforces) and
 /// `granted_roles` from the live UI overlay. Also renders its `SKILL.md` body.
 fn skill_views(state: &RamaState) -> Vec<SkillView> {
-    let Some(store) = state.skills.as_ref() else {
+    let Some(store) = state.skills() else {
         return Vec::new();
     };
     let registry = store.current();
@@ -528,7 +528,7 @@ fn skill_views(state: &RamaState) -> Vec<SkillView> {
         .iter()
         .map(|skill| {
             let config_roles = state
-                .config
+                .config()
                 .roles
                 .iter()
                 .filter(|r| r.skills.iter().any(|g| g == "*" || g == &skill.name))
@@ -554,7 +554,7 @@ fn skill_views(state: &RamaState) -> Vec<SkillView> {
 /// Every role id defined in the gateway config, in declaration order — the
 /// universe of checkboxes the grant dialog offers.
 fn all_role_ids(state: &RamaState) -> Vec<String> {
-    state.config.roles.iter().map(|r| r.id.clone()).collect()
+    state.config().roles.iter().map(|r| r.id.clone()).collect()
 }
 
 /// Show the skills directory relative to the gateway's working directory when

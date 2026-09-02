@@ -915,7 +915,7 @@ pub async fn chat_fork(
     // A copy failure leaves a marker pointing at an empty key (a broken
     // thumbnail) but the conversation text — the main value — still lands,
     // so we warn rather than roll the whole fork back.
-    if let Some(cfg) = state.config.chat.s3.as_ref() {
+    if let Some(cfg) = state.config().chat.s3.as_ref() {
         for c in &copies {
             if let Err(err) =
                 chat_attachments::copy_object(cfg, &c.from_turn_id, &c.to_turn_id, &c.filename)
@@ -996,10 +996,8 @@ pub async fn chat_message_send(
     // the request (and before the worker, which has no request in scope).
     let client_ip = gateway_features::server::geoip::client_ip(req.headers())
         .or_else(|| gateway_features::server::geoip::peer_ip(&req));
-    let secure = gateway_features::server::geoip::transport_is_secure(
-        req.headers(),
-        &state.config.gateway.public_url,
-    );
+    let secure =
+        gateway_features::server::geoip::transport_is_secure(req.headers(), &state.public_url());
     let (_, body) = req.into_parts();
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
@@ -1517,10 +1515,8 @@ pub async fn chat_retry(
     let lang = Lang::from_headers(req.headers());
     let client_ip = gateway_features::server::geoip::client_ip(req.headers())
         .or_else(|| gateway_features::server::geoip::peer_ip(&req));
-    let secure = gateway_features::server::geoip::transport_is_secure(
-        req.headers(),
-        &state.config.gateway.public_url,
-    );
+    let secure =
+        gateway_features::server::geoip::transport_is_secure(req.headers(), &state.public_url());
     let (_, body) = req.into_parts();
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
@@ -1569,10 +1565,8 @@ pub async fn chat_edit(
     let lang = Lang::from_headers(req.headers());
     let client_ip = gateway_features::server::geoip::client_ip(req.headers())
         .or_else(|| gateway_features::server::geoip::peer_ip(&req));
-    let secure = gateway_features::server::geoip::transport_is_secure(
-        req.headers(),
-        &state.config.gateway.public_url,
-    );
+    let secure =
+        gateway_features::server::geoip::transport_is_secure(req.headers(), &state.public_url());
     // Snapshot the content-type before consuming the request — the edit
     // form now posts `multipart/form-data` (so it can carry pasted/dropped
     // attachments, exactly like the composer); older cached clients may
@@ -1710,7 +1704,7 @@ pub async fn chat_attachment_remove(
     // Reclaim the bytes. Best-effort: the marker is already gone, so a
     // failed delete only leaves an orphaned object (idempotent DELETE
     // makes a later retry safe) — never fail the user's action over it.
-    if let Some(cfg) = state.config.chat.s3.as_ref()
+    if let Some(cfg) = state.config().chat.s3.as_ref()
         && let Err(err) = chat_attachments::delete(cfg, &turn_id, &filename).await
     {
         tracing::warn!(error = %err, %turn_id, %filename, "attachment S3 delete (marker already removed)");
@@ -1749,7 +1743,7 @@ async fn doomed_attachments(
     session_id: &str,
     from_seq: i64,
 ) -> Vec<chat_attachments::AttachmentRef> {
-    if state.config.chat.s3.is_none() {
+    if state.config().chat.s3.is_none() {
         return Vec::new();
     }
     match chat_attachments::attachments_from_seq(&state.db, session_id, from_seq).await {
@@ -1772,7 +1766,7 @@ fn reclaim_attachments(state: &Arc<RamaState>, orphaned: Vec<chat_attachments::A
     }
     let state = state.clone();
     tokio::spawn(async move {
-        if let Some(cfg) = state.config.chat.s3.as_ref() {
+        if let Some(cfg) = state.config().chat.s3.as_ref() {
             chat_attachments::reclaim_all(cfg, &orphaned).await;
         }
     });
@@ -2292,9 +2286,13 @@ async fn parse_chat_submit(
                 if filename.is_empty() && bytes.is_empty() {
                     continue;
                 }
-                let cfg = state.config.chat.s3.as_ref().ok_or_else(|| {
-                    "chat attachments are not configured (set [chat.s3] \
-                         in gateway.toml)"
+                // Bound, not chained: `config()` hands back an owned snapshot,
+                // and borrowing `[chat.s3]` out of a temporary would drop it at
+                // the end of the statement.
+                let config = state.config();
+                let cfg = config.chat.s3.as_ref().ok_or_else(|| {
+                    "chat attachments are not configured (enable [chat.s3] \
+                         at /admin/settings)"
                         .to_string()
                 })?;
                 // Nameless blobs (some drag/paste sources) get a
@@ -2393,7 +2391,7 @@ pub async fn chat_export_markdown(
         Err(resp) => return resp,
     };
     let opts = export::ExportOpts {
-        base_url: &state.config.gateway.public_url,
+        base_url: &state.public_url(),
     };
     let body = export::to_markdown(&session, &turns, &opts);
     download_response(
@@ -2415,7 +2413,7 @@ pub async fn chat_export_pdf(
         Err(resp) => return resp,
     };
     let opts = export::ExportOpts {
-        base_url: &state.config.gateway.public_url,
+        base_url: &state.public_url(),
     };
     let source = export::to_typst(&session, &turns, &opts);
     match gateway_features::server::typst::compile_source(&source).await {
@@ -2633,7 +2631,8 @@ pub async fn chat_attachment(State(state): State<Arc<RamaState>>, req: Request) 
             );
         }
     }
-    let Some(cfg) = state.config.chat.s3.as_ref() else {
+    let config = state.config();
+    let Some(cfg) = config.chat.s3.as_ref() else {
         return attachment_error(
             rama::http::StatusCode::SERVICE_UNAVAILABLE,
             &t(lang, "chat-error-attachments-not-configured"),

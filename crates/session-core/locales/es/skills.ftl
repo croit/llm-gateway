@@ -12,7 +12,7 @@ skills-intro-part1 = Instrucciones instaladas por el operador que el modelo de c
 skills-intro-part2 = correspondiente. Sube un archivo
 skills-intro-part3 = a continuación — está disponible de inmediato, sin necesidad de reiniciar.
 skills-empty-loaded = Aún no se han cargado skills. Sube un archivo .skill para añadir uno.
-skills-empty-not-configured = Los skills no están configurados. Define [skills] dir en la configuración de la pasarela y reinicia para habilitarlos.
+skills-empty-not-configured = Los skills no están configurados. Actívalos en /admin/settings (skills.dir) y reinicia para cargarlos.
 
 skills-upload-heading = Añadir un skill
 skills-upload-button = Subir .skill

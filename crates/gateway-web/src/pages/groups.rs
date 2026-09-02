@@ -57,10 +57,10 @@ pub async fn groups_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     let observed = gateway_groups::observed_oidc_values(&state.db)
         .await
         .unwrap_or_default();
-    let mut tool_ids: Vec<String> = state.tools.ids().map(|s| s.to_string()).collect();
+    let mut tool_ids: Vec<String> = state.tools().ids().map(|s| s.to_string()).collect();
     tool_ids.sort();
     let skill_names: Vec<String> = state
-        .skills
+        .skills()
         .as_ref()
         .map(|s| s.current().names().map(|n| n.to_string()).collect())
         .unwrap_or_default();

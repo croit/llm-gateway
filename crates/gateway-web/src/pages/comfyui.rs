@@ -61,7 +61,7 @@ pub async fn comfyui_reload(State(state): State<Arc<RamaState>>, req: Request) -
     if let Err(resp) = require_admin_or_403(&state, &req).await {
         return resp;
     }
-    let Some(handle) = state.comfyui.as_ref() else {
+    let Some(handle) = state.comfyui() else {
         return see_other("/admin/comfyui");
     };
     // The rescan is synchronous disk I/O + parsing — run it off the async
@@ -136,7 +136,7 @@ async fn render_page(
     let jobs = gateway_features::server::comfyui::jobs::recent(&state.db, 20)
         .await
         .unwrap_or_default();
-    let body = render_body(lang, state.comfyui.as_deref(), flash, &jobs);
+    let body = render_body(lang, state.comfyui().as_deref(), flash, &jobs);
     let chat = fetch_sidebar_chat(state, &user.id, None).await;
     let title = "ComfyUI — Workflow catalog";
     {
@@ -202,8 +202,8 @@ fn render_body(
                 div(class: "card-body") {
                     h2(class: "card-title text-base") { "Not configured" }
                     p(class: "text-base-content/70") {
-                        "Add a [comfyui] block to gateway.toml and restart the \
-                         gateway to enable the ComfyUI workflow catalog."
+                        "Enable ComfyUI at /admin/settings — set its base URL and workflow \
+                         directory — then restart the gateway to load the workflow catalog."
                     }
                 }
             }

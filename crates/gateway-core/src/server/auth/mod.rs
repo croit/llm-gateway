@@ -9,6 +9,7 @@
 
 pub mod mcp_oauth;
 pub mod oidc;
+pub mod pending;
 pub mod token;
 
 /// User identity resolved from a request's bearer token. Threaded into

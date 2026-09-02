@@ -748,7 +748,7 @@ mod tests {
                 timeout_secs: 5,
                 max_artifact_bytes: 1024,
             }),
-            "https://gw.example".into(),
+            crate::server::state::RuntimeSettings::new_handle("https://gw.example"),
         );
         let lease = crate::server::tools::sandbox::SandboxLease::new(client);
         // Simulate the turn having called run_in_sandbox once (establishes c1).

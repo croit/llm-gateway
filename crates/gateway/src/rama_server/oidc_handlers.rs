@@ -14,27 +14,16 @@
 
 use std::sync::Arc;
 
-use jiff::{SignedDuration, Timestamp};
+use jiff::Timestamp;
 use rama::http::service::web::extract::{Query, State};
 use rama::http::{Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::json;
 
 use gateway_core::rama_server::session::{clear_cookie, read_cookie, secure_cookies};
+use gateway_core::server::auth::pending::{self, BINDING_COOKIE, Purpose, clear_binding_cookie};
 use gateway_core::server::db::users;
 use gateway_runtime::rama_server::state::RamaState;
-
-/// TTL for the in-flight `pending_logins` row. Generous because some
-/// IdPs (Authentik, Keycloak's account-linking flows) bounce the user
-/// through several screens before redirecting back.
-const PENDING_LOGIN_TTL: SignedDuration = SignedDuration::from_mins(15);
-
-/// Cookie that binds an in-flight OIDC login to the browser that started
-/// it. Set at `/auth/login`, and required to match the `state` parameter
-/// at `/auth/callback`. Without it, the `state` row alone doesn't prove
-/// the callback arrived in the same browser, opening login CSRF / session
-/// fixation. Scoped to `Path=/auth` so it only rides the login routes.
-const OIDC_BINDING_COOKIE: &str = "gw_oidc";
 
 #[derive(Deserialize)]
 pub struct LoginParams {
@@ -47,7 +36,11 @@ pub async fn login(
     State(state): State<Arc<RamaState>>,
     Query(params): Query<LoginParams>,
 ) -> Response {
-    let Some(oidc) = state.oidc.as_ref() else {
+    // Unconfigured gateways never get here: `rama_server::first_run` redirects
+    // `/auth/login` to the wizard before routing. `/auth/callback` below is the
+    // one `/auth` route it deliberately lets through, because the wizard's own
+    // test login lands there.
+    let Some(oidc) = state.oidc() else {
         return error_html(
             StatusCode::INTERNAL_SERVER_ERROR,
             "OIDC is not configured on this gateway",
@@ -55,25 +48,12 @@ pub async fn login(
     };
 
     let start = oidc.begin();
-    let now = Timestamp::now();
     let return_to = params
         .return_to
         .filter(|rt| gateway_core::rama_server::session::is_safe_return_to(rt));
 
-    let res = sqlx::query(
-        "INSERT INTO pending_logins
-           (state, pkce_verifier, nonce, return_to, created_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&start.csrf)
-    .bind(&start.pkce_verifier)
-    .bind(&start.nonce)
-    .bind(return_to.as_deref())
-    .bind(now.to_string())
-    .bind((now + PENDING_LOGIN_TTL).to_string())
-    .execute(&state.db)
-    .await;
-    if let Err(err) = res {
+    if let Err(err) = pending::insert(&state.db, &start, return_to.as_deref(), Purpose::Login).await
+    {
         tracing::warn!(error = %err, "persisting pending login");
         return error_html(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -81,9 +61,9 @@ pub async fn login(
         );
     }
 
-    // Bind the flow to this browser (see OIDC_BINDING_COOKIE): the
+    // Bind the flow to this browser (see `pending::BINDING_COOKIE`): the
     // callback must echo `state` back via this cookie or we reject it.
-    redirect_to_with_binding(&start.url, &start.csrf)
+    pending::authorization_redirect(&start)
 }
 
 #[derive(Deserialize, Default)]
@@ -122,7 +102,7 @@ pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Resp
     // callback landed in the same browser — without this a phisher could
     // feed a victim their own `code`+`state` and silently log the victim
     // into the *attacker's* account (login CSRF / session fixation).
-    if read_cookie(req.headers(), OIDC_BINDING_COOKIE).as_deref() != Some(state_param.as_str()) {
+    if read_cookie(req.headers(), BINDING_COOKIE).as_deref() != Some(state_param.as_str()) {
         return error_html(
             StatusCode::BAD_REQUEST,
             "OIDC callback was not initiated by this browser — restart at /auth/login",
@@ -131,9 +111,9 @@ pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Resp
 
     // Pull the in-flight row. Missing → either expired, already consumed,
     // or never started — all "go back to /auth/login" from the user POV.
-    type PendingRow = (String, String, Option<String>, String);
+    type PendingRow = (String, String, Option<String>, String, String);
     let pending: Option<PendingRow> = match sqlx::query_as(
-        "SELECT pkce_verifier, nonce, return_to, expires_at
+        "SELECT pkce_verifier, nonce, return_to, expires_at, purpose
              FROM pending_logins WHERE state = ?",
     )
     .bind(&state_param)
@@ -146,7 +126,7 @@ pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Resp
             return error_html(StatusCode::INTERNAL_SERVER_ERROR, "session lookup failed");
         }
     };
-    let Some((verifier, nonce, return_to, expires_at_raw)) = pending else {
+    let Some((verifier, nonce, return_to, expires_at_raw, purpose)) = pending else {
         return error_html(
             StatusCode::BAD_REQUEST,
             "OIDC callback without an in-flight session — restart at /auth/login",
@@ -171,7 +151,35 @@ pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Resp
         .execute(&state.db)
         .await;
 
-    let Some(oidc) = state.oidc.as_ref() else {
+    // Exhaustive on purpose, so a future third purpose cannot silently fall
+    // into the branch that mints a session. An unparseable value is rejected
+    // rather than guessed at.
+    let Some(purpose) = Purpose::from_stored(&purpose) else {
+        tracing::warn!(%purpose, "pending login row has an unrecognised purpose; rejecting");
+        return error_html(
+            StatusCode::BAD_REQUEST,
+            "This sign-in could not be completed — restart at /auth/login",
+        );
+    };
+    match purpose {
+        // A setup probe finishes in the wizard: it verifies the code against
+        // the *draft* provider being tested (the live one is typically absent
+        // on a fresh install), then hands the claims back. Deliberately no user
+        // upsert and no session — nothing has authorised anyone yet.
+        Purpose::Setup => {
+            return crate::rama_server::pages::setup_probe_callback(
+                &state,
+                req.headers(),
+                &code,
+                &verifier,
+                &nonce,
+            )
+            .await;
+        }
+        Purpose::Login => {}
+    }
+
+    let Some(oidc) = state.oidc() else {
         return error_html(
             StatusCode::INTERNAL_SERVER_ERROR,
             "OIDC is not configured on this gateway",
@@ -222,10 +230,9 @@ pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Resp
             return error_html(StatusCode::INTERNAL_SERVER_ERROR, "could not mint session");
         }
     };
-    let cookie = state.sessions.cookie(
-        &session.id,
-        secure_cookies(&state.config.gateway.public_url),
-    );
+    let cookie = state
+        .sessions
+        .cookie(&session.id, secure_cookies(&state.public_url()));
     // Default landing is the chat surface — a freshly signed-in user
     // should drop straight into a conversation, not a dashboard. An
     // explicit, same-origin `return_to` still wins.
@@ -233,8 +240,7 @@ pub async fn callback(State(state): State<Arc<RamaState>>, req: Request) -> Resp
         .filter(|rt| gateway_core::rama_server::session::is_safe_return_to(rt))
         .unwrap_or_else(|| "/chat".into());
     // Flow complete — clear the login-binding cookie.
-    let clear_binding =
-        format!("{OIDC_BINDING_COOKIE}=; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=0");
+    let clear_binding = clear_binding_cookie();
     Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, target)
@@ -252,29 +258,11 @@ pub async fn logout(State(state): State<Arc<RamaState>>, req: Request) -> Respon
     }
     // Tell the browser to clear the cookie regardless — handles the case
     // where the cookie is stale-but-valid-HMAC against a deleted row.
-    let expire = clear_cookie(secure_cookies(&state.config.gateway.public_url));
+    let expire = clear_cookie(secure_cookies(&state.public_url()));
     Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, "/")
         .header(header::SET_COOKIE, expire)
-        .body("".into())
-        .unwrap()
-}
-
-/// 303 to the IdP while dropping the browser-binding cookie (see
-/// [`OIDC_BINDING_COOKIE`]). `state` is the CSRF/state value the callback
-/// will later require this cookie to match.
-fn redirect_to_with_binding(url: &str, state: &str) -> Response {
-    // Path=/auth confines the cookie to the login + callback routes;
-    // Max-Age=900 matches PENDING_LOGIN_TTL (15 min). HttpOnly keeps it
-    // away from JS; SameSite=Lax is sufficient because the value must
-    // still equal `state` at the callback.
-    let binding =
-        format!("{OIDC_BINDING_COOKIE}={state}; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=900");
-    Response::builder()
-        .status(StatusCode::SEE_OTHER)
-        .header(header::LOCATION, url)
-        .header(header::SET_COOKIE, binding)
         .body("".into())
         .unwrap()
 }

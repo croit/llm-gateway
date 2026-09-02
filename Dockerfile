@@ -94,13 +94,40 @@ COPY --chown=gateway:gateway examples/typst-templates /opt/typst-templates
 # `0644` is enough — it's dlopen'd, not exec'd.
 COPY --chown=root:root --chmod=0644 target/release/libpdfium.so /usr/local/lib/libpdfium.so
 
+# The data directory GATEWAY_DATA_DIR points at, owned by the runtime user.
+# Without this the "one env var and a volume" quickstart fails on Docker: a
+# missing mountpoint is created root:root 0755, and SQLite then gets EACCES
+# opening the database, so the container never boots. (The Quadlet path is
+# saved by `Volume=…:z,U`, which chowns on mount; `docker run` and compose have
+# no equivalent.) Creating it here also covers a run with no volume at all —
+# ephemeral, but it starts.
+RUN mkdir -p /var/lib/gateway && chown gateway:gateway /var/lib/gateway
+
+# Break-glass: `docker compose exec gateway restore-setup` / `podman exec
+# gateway restore-setup` reopens the setup wizard for 30 minutes and prints a
+# one-time link. A one-line wrapper rather than asking operators to remember
+# `/app/gateway restore-setup` — this is the command someone reaches for when
+# they are locked out and stressed. The binary opens the same SQLite database
+# the server is using, so nothing has to be stopped.
+RUN printf '#!/bin/sh\nexec /app/gateway restore-setup "$@"\n' > /usr/local/bin/restore-setup \
+    && chmod 0755 /usr/local/bin/restore-setup
+
 USER gateway
 
 # Rama listens on the address resolved from the IP/PORT env vars; binding
 # 0.0.0.0 inside a container is what makes the published port reachable.
+#
+# GATEWAY_DATA_DIR is the one path knob: every writable path the gateway needs
+# (the SQLite database, the RAG index store) is derived from it, so mounting a
+# volume at /var/lib/gateway is all a deployment has to do to persist state —
+# no config file, and no per-path environment variable each. It is deliberately
+# baked into the image rather than left to the operator, so `docker run` with a
+# volume and nothing else already does the right thing.
+#
 # PDFIUM_LIB_PATH points the PDF reader at the bundled pdfium above.
 ENV IP=0.0.0.0 \
     PORT=8080 \
+    GATEWAY_DATA_DIR=/var/lib/gateway \
     RUST_LOG=info,gateway=info,gateway_core=info,gateway_features=info,gateway_runtime=info,gateway_tools=info,gateway_web=info \
     PDFIUM_LIB_PATH=/usr/local/lib/libpdfium.so
 

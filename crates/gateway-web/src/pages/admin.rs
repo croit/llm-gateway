@@ -182,7 +182,7 @@ pub async fn models_index(State(state): State<Arc<RamaState>>, req: Request) -> 
                 brave_key_set: false,
             }
         });
-    let currency = &state.config.usage.currency;
+    let currency = &state.config().usage.currency;
     let all_models = state.upstreams.all_models();
     let body = render_models_body(
         lang,
@@ -972,13 +972,20 @@ fn render_search_card(lang: Lang, view: &SearchSettingsView) -> Html {
         t(lang, "admin-search-brave-key-unset")
     };
     let url_value = view.searxng_url.clone().unwrap_or_default();
-    let clear_key = super::bool_checkbox(
-        "clear_brave_key",
-        "1",
-        &t(lang, "admin-search-brave-key-clear"),
-        false,
-        false,
-    );
+    // Only offer to remove a key when there is one. Rendering it next to
+    // "No key stored." invites the operator to tick a box that does nothing,
+    // and reads as though something is stored after all.
+    let clear_key = if view.brave_key_set {
+        super::bool_checkbox(
+            "clear_brave_key",
+            "1",
+            &t(lang, "admin-search-brave-key-clear"),
+            false,
+            false,
+        )
+    } else {
+        plait::html! {}.to_html()
+    };
     html! {
         article(class: "card border border-base-300 bg-base-100") {
             div(class: "card-body gap-3") {
@@ -1821,6 +1828,20 @@ mod tests {
             render_search_card(Lang::En, &search_view(SearchProvider::Brave, None, false))
                 .to_string();
         assert!(without.contains("No key stored"), "{without}");
+    }
+
+    #[test]
+    fn search_card_offers_no_clear_checkbox_without_a_stored_key() {
+        // It used to render regardless, so "No key stored." sat next to a
+        // "Remove the stored key" box — a control that does nothing, and one
+        // that reads as though a key is stored after all.
+        let html = render_search_card(Lang::En, &search_view(SearchProvider::Brave, None, false))
+            .to_string();
+        assert!(html.contains("No key stored"), "{html}");
+        assert!(
+            !html.contains(r#"name="clear_brave_key""#),
+            "nothing to remove, so the box must be absent: {html}"
+        );
     }
 
     #[test]

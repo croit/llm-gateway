@@ -55,3 +55,4 @@ error-forbidden-heading = Accès refusé
 nav-groups = Groupes
 
 nav-my-skills = Mes compétences
+nav-settings = Paramètres

@@ -122,6 +122,26 @@ they already hardcode `Theme::Dark`, rather than threading `lang` through
 every one of their ~80 call sites for a page nobody is meant to see twice.
 Don't reach for this pattern for anything a user would routinely encounter.
 
+**Derived keys.** `/admin/settings` is the one page whose keys are computed
+rather than written at the call site. Its spec table
+(`gateway_core::server::settings::SECTIONS`) declares only the TOML path,
+kind, span and restart flag; `FieldSpec::label_key`/`help_key` and
+`SectionSpec::title_key`/`blurb_key` turn that path into a Fluent id by
+replacing dots with dashes (`sandbox.runner_url` →
+`settings-f-sandbox-runner_url`, plus a `-help` sibling). Underscores stay,
+because Fluent identifiers allow `_` and reject `.`, which keeps the mapping
+reversible and greppable both ways.
+
+The point is that the Rust table holds no operator-facing prose at all — two
+copies, one in Rust for `en` and one in Fluent for the rest, would drift on
+the first edit. `en/settings.ftl` is just another locale file, and two drift
+tests in `pages/settings.rs` close the loop the build gate can't see: one
+asserts every derived key resolves in all six languages (a missing key
+resolves to itself, so that is checkable), the other that no
+`settings-s-*`/`settings-f-*` message outlives the field it described. Adding
+a setting is therefore one table entry plus six locale edits, and forgetting
+either half fails a test.
+
 ### Module split
 
 Templates live in a directory module so each page sits in its own file:

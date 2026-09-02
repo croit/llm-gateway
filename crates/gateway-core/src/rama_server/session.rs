@@ -86,16 +86,27 @@ pub enum SessionError {
     Malformed,
 }
 
+/// The two session lifetimes, shared by every clone of a [`SessionStore`].
+///
+/// Behind atomics rather than stored inline because `SessionStore` is `Clone`
+/// and gets cloned into the shared state: plain fields would mean an
+/// `/admin/settings` save updated one copy and left every other reader on the
+/// old policy. Seconds, so the whole policy is two lock-free loads.
+#[derive(Debug)]
+struct Policy {
+    ttl_secs: std::sync::atomic::AtomicU64,
+    absolute_max_secs: std::sync::atomic::AtomicU64,
+}
+
 #[derive(Clone)]
 pub struct SessionStore {
     db: Pool,
     secret: [u8; 32],
-    /// Idle timeout applied to new sessions and to every renewal. See
-    /// [`DEFAULT_TTL`]; set from config at boot via [`SessionStore::with_ttl`].
-    ttl: Duration,
-    /// Hard ceiling on a session's total lifetime, measured from
-    /// `created_at`. See [`DEFAULT_ABSOLUTE_MAX`].
-    absolute_max: Duration,
+    /// Idle timeout applied to new sessions and to every renewal, plus the hard
+    /// ceiling measured from `created_at`. See [`DEFAULT_TTL`] and
+    /// [`DEFAULT_ABSOLUTE_MAX`]; both are set from the operator settings and
+    /// updated live by [`SessionStore::set_policy`].
+    policy: std::sync::Arc<Policy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,44 +133,80 @@ impl SessionStore {
         Self {
             db,
             secret,
-            ttl: DEFAULT_TTL,
-            absolute_max: DEFAULT_ABSOLUTE_MAX,
+            policy: std::sync::Arc::new(Policy {
+                ttl_secs: std::sync::atomic::AtomicU64::new(DEFAULT_TTL.as_secs()),
+                absolute_max_secs: std::sync::atomic::AtomicU64::new(
+                    DEFAULT_ABSOLUTE_MAX.as_secs(),
+                ),
+            }),
         }
     }
 
     /// Overrides the idle timeout new sessions get (and that renewals
-    /// extend by). Called once at boot with `gateway.session_ttl_days`.
-    pub fn with_ttl(mut self, ttl: Duration) -> Self {
-        self.ttl = ttl;
+    /// extend by), from `gateway.session_ttl_days`.
+    pub fn with_ttl(self, ttl: Duration) -> Self {
+        self.policy
+            .ttl_secs
+            .store(ttl.as_secs(), std::sync::atomic::Ordering::Relaxed);
         self
     }
 
-    /// Overrides the absolute lifetime cap. Called once at boot with
+    /// Overrides the absolute lifetime cap, from
     /// `gateway.session_absolute_max_days`.
-    pub fn with_absolute_max(mut self, absolute_max: Duration) -> Self {
-        self.absolute_max = absolute_max;
+    pub fn with_absolute_max(self, absolute_max: Duration) -> Self {
+        self.policy
+            .absolute_max_secs
+            .store(absolute_max.as_secs(), std::sync::atomic::Ordering::Relaxed);
         self
+    }
+
+    /// Apply a new session policy to every clone of this store, live.
+    ///
+    /// Called when `/admin/settings` saves the `[gateway]` section, which is
+    /// why those two fields no longer need a restart. Existing sessions keep
+    /// the deadline they were last stamped with; the new idle timeout applies
+    /// from their next renewal, and the new cap is enforced on the next
+    /// lookup — so shortening it can log someone out, which is the point.
+    pub fn set_policy(&self, ttl: Duration, absolute_max: Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.policy.ttl_secs.store(ttl.as_secs(), Relaxed);
+        self.policy
+            .absolute_max_secs
+            .store(absolute_max.as_secs(), Relaxed);
     }
 
     /// The configured idle timeout — what `create` stamps and what
     /// `lookup` renews to.
     pub fn ttl(&self) -> Duration {
-        self.ttl
+        Duration::from_secs(
+            self.policy
+                .ttl_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// The configured absolute lifetime cap.
+    pub fn absolute_max(&self) -> Duration {
+        Duration::from_secs(
+            self.policy
+                .absolute_max_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn ttl_span(&self) -> SignedDuration {
-        SignedDuration::from_secs(secs(self.ttl))
+        SignedDuration::from_secs(secs(self.ttl()))
     }
 
     fn absolute_max_span(&self) -> SignedDuration {
-        SignedDuration::from_secs(secs(self.absolute_max))
+        SignedDuration::from_secs(secs(self.absolute_max()))
     }
 
     /// Mints a fresh session for `user_id` with the configured idle
     /// timeout, persists it, and returns it. Caller serialises the id
     /// into a cookie via [`Self::cookie`].
     pub async fn create(&self, user_id: &str) -> Result<Session, SessionError> {
-        self.create_with_ttl(user_id, self.ttl).await
+        self.create_with_ttl(user_id, self.ttl()).await
     }
 
     /// Like [`Self::create`] but with an explicit initial lifetime. Note
@@ -296,7 +343,7 @@ impl SessionStore {
         // Half-life as a point in time — jiff's `Timestamp - Timestamp`
         // is a calendar `Span`, so comparing instants is both simpler and
         // free of unit conversions.
-        if now < expires_at - SignedDuration::from_secs(secs(self.ttl) / 2) {
+        if now < expires_at - SignedDuration::from_secs(secs(self.ttl()) / 2) {
             return Ok(expires_at);
         }
         let renewed = (now + self.ttl_span()).min(created_at + self.absolute_max_span());

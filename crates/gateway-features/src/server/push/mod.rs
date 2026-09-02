@@ -251,12 +251,7 @@ async fn load_or_create_vapid(pool: &Pool, crypto: &Crypto) -> anyhow::Result<Va
         );
     }
     let (priv_bytes, vapid) = Vapid::generate()?;
-    let sealed = crypto.seal(&priv_bytes)?;
-    let stored = format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(&sealed.nonce),
-        URL_SAFE_NO_PAD.encode(&sealed.ciphertext),
-    );
+    let stored = crypto.seal_bytes_to_string(&priv_bytes)?;
     db::app_settings::set(pool, VAPID_PRIVATE_KEY_SETTING, &stored).await?;
     tracing::info!("generated a new VAPID keypair for Web Push");
     Ok(vapid)
@@ -265,10 +260,7 @@ async fn load_or_create_vapid(pool: &Pool, crypto: &Crypto) -> anyhow::Result<Va
 /// Parse the `nonce.ciphertext` stored form, decrypt, and load the key.
 /// `None` on any malformation so the caller regenerates rather than failing.
 fn open_sealed(stored: &str, crypto: &Crypto) -> Option<Vapid> {
-    let (nonce_b64, ct_b64) = stored.split_once('.')?;
-    let nonce = b64url_decode(nonce_b64)?;
-    let ct = b64url_decode(ct_b64)?;
-    let priv_bytes = crypto.open(&nonce, &ct).ok()?;
+    let priv_bytes = crypto.open_bytes_from_string(stored)?;
     Vapid::from_private_bytes(&priv_bytes).ok()
 }
 

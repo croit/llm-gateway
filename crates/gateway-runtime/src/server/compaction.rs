@@ -62,7 +62,7 @@ summary\" — output only the summary itself.\n\
 /// is the **resolved real model** (the driver maps any alias first) — used both
 /// to resolve the context window and to route the summariser call.
 pub async fn maybe_autocompact(state: &RamaState, session_id: &str, model: &str) {
-    let cfg = &state.config.chat.compaction;
+    let cfg = &state.config().chat.compaction;
     if !cfg.enabled {
         return;
     }
@@ -134,7 +134,7 @@ async fn run_compaction(
     let existing = chat_compactions::get(&state.db, session_id)
         .await
         .map_err(|e| e.to_string())?;
-    let cfg = &state.config.chat.compaction;
+    let cfg = &state.config().chat.compaction;
 
     let Some(plan) = plan_compaction(&turns, existing.as_ref().map(|c| c.up_to_seq), cfg) else {
         return Ok(false);

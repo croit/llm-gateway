@@ -98,7 +98,7 @@ pub async fn feedback_config(State(state): State<Arc<RamaState>>, req: Request) 
         return resp;
     }
     let enabled = state
-        .config
+        .config()
         .feedback
         .as_ref()
         .map(|f| f.is_configured())
@@ -111,7 +111,7 @@ pub async fn feedback_config(State(state): State<Arc<RamaState>>, req: Request) 
     let voice_enabled = !transcription_models.is_empty() && !chat_models.is_empty();
     let voice_model = resolve_model(
         state
-            .config
+            .config()
             .feedback
             .as_ref()
             .and_then(|f| f.voice_model.clone()),
@@ -190,7 +190,7 @@ pub async fn feedback_extract(State(state): State<Arc<RamaState>>, req: Request)
     let chat_models = state.upstreams.models_for_kind(PoolKind::Chat);
     let model = resolve_model(
         state
-            .config
+            .config()
             .feedback
             .as_ref()
             .and_then(|f| f.extraction_model.clone()),
@@ -406,7 +406,7 @@ pub async fn feedback_submit(State(state): State<Arc<RamaState>>, req: Request) 
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let Some(cfg) = state.config.feedback.clone() else {
+    let Some(cfg) = state.config().feedback.clone() else {
         return json_err(
             StatusCode::SERVICE_UNAVAILABLE,
             &t(lang, "feedback-err-not-configured"),

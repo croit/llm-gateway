@@ -61,7 +61,8 @@ fn mock_backend(name: &str, base_url: &str) -> BackendConfig {
 fn state_from_registry(db_pool: db::Pool, registry: Arc<upstreams::UpstreamRegistry>) -> RamaState {
     let tools = Arc::new(ToolRegistry::new());
     let rbac = Arc::new(Resolver::empty());
-    let app = AppState::new(Config::default(), db_pool.clone(), registry, tools, rbac);
+    let app = AppState::new(Config::default(), db_pool.clone(), registry, tools, rbac)
+        .with_tool_family_builder(gateway::tool_families::typst());
     let sessions = SessionStore::new(db_pool, TEST_SECRET);
     RamaState::new(
         app,
@@ -194,13 +195,18 @@ pub async fn state_with_s3(endpoint: &str) -> RamaState {
         endpoint: endpoint.to_string(),
         region: "us-east-1".into(),
         bucket: TEST_S3_BUCKET.into(),
-        access_key_env: TEST_S3_ACCESS_KEY_ENV.into(),
-        secret_key_env: TEST_S3_SECRET_KEY_ENV.into(),
+        access_key: None,
+        secret_key: None,
+        // The legacy env-var indirection, still honoured — which is what this
+        // fixture happens to exercise, since the harness sets these two.
+        access_key_env: Some(TEST_S3_ACCESS_KEY_ENV.into()),
+        secret_key_env: Some(TEST_S3_SECRET_KEY_ENV.into()),
         key_prefix: TEST_S3_PREFIX.into(),
     });
     let tools = Arc::new(ToolRegistry::new());
     let rbac = Arc::new(Resolver::empty());
-    let app = AppState::new(config, db_pool.clone(), registry, tools, rbac);
+    let app = AppState::new(config, db_pool.clone(), registry, tools, rbac)
+        .with_tool_family_builder(gateway::tool_families::typst());
     let sessions = SessionStore::new(db_pool, TEST_SECRET);
     RamaState::new(
         app,
@@ -387,7 +393,9 @@ pub async fn state_with_admin_rbac_and_comfyui(upstream_url: &str) -> RamaState 
         job_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         chat_updates: gateway_features::server::comfyui::ChatUpdateRegistry::default(),
     });
-    let app = AppState::new(config, pool.clone(), registry, tools, rbac).with_comfyui(comfyui);
+    let app = AppState::new(config, pool.clone(), registry, tools, rbac)
+        .with_comfyui(comfyui)
+        .with_tool_family_builder(gateway::tool_families::typst());
     let sessions = SessionStore::new(pool, TEST_SECRET);
     RamaState::new(
         app,
@@ -457,7 +465,8 @@ async fn state_with_admin_rbac_cfg(upstream_url: &str, allow_impersonation: bool
 
     let mut config = Config::default();
     config.gateway.allow_impersonation = allow_impersonation;
-    let app = AppState::new(config, pool.clone(), registry, tools, rbac);
+    let app = AppState::new(config, pool.clone(), registry, tools, rbac)
+        .with_tool_family_builder(gateway::tool_families::typst());
     let sessions = SessionStore::new(pool, TEST_SECRET);
     RamaState::new(
         app,

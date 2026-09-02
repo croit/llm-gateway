@@ -43,6 +43,8 @@ mod rbac;
 mod readme_routes;
 mod scheduled;
 mod session_routes;
+mod settings_page;
+mod setup_wizard;
 mod sidebar_nav;
 mod skills_user_page;
 mod speech_voice;

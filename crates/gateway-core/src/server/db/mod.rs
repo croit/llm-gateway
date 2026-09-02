@@ -96,30 +96,7 @@ pub(crate) fn parse_optional_ts(
 ///
 /// Pass `:memory:` to use an in-memory database. Used by tests.
 pub async fn open(path: &Path) -> Result<Pool, DbError> {
-    let url = if path == Path::new(":memory:") {
-        "sqlite::memory:".to_string()
-    } else {
-        format!("sqlite://{}?mode=rwc", path.display())
-    };
-
-    let opts = SqliteConnectOptions::from_str(&url)
-        .map_err(|source| DbError::Open {
-            url: url.clone(),
-            source,
-        })?
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .synchronous(SqliteSynchronous::Normal)
-        .foreign_keys(true);
-
-    let pool = SqlitePoolOptions::new()
-        .max_connections(8)
-        .connect_with(opts)
-        .await
-        .map_err(|source| DbError::Open {
-            url: url.clone(),
-            source,
-        })?;
+    let pool = connect(path, true).await?;
 
     sqlx::migrate!("./migrations")
         .run(&pool)
@@ -139,6 +116,48 @@ pub async fn open(path: &Path) -> Result<Pool, DbError> {
     }
 
     Ok(pool)
+}
+
+/// Open a database that **another process owns**, for an out-of-band CLI
+/// command (today: `gateway restore-setup`).
+///
+/// Deliberately not [`open`]: that runs migrations and, worse, sweeps every
+/// `in_progress` assistant turn to `errored` on the assumption that it is the
+/// server starting up and those turns are crash orphans. Against a *live*
+/// gateway both assumptions are wrong — the turns belong to workers that are
+/// streaming right now, and erroring them would turn every user's "thinking"
+/// bubble into a failure just because an operator ran a maintenance command.
+///
+/// It also refuses to create a missing file, so pointing the command at the
+/// wrong path reports that instead of silently making an empty database.
+pub async fn attach(path: &Path) -> Result<Pool, DbError> {
+    connect(path, false).await
+}
+
+/// The connection half shared by [`open`] and [`attach`]. WAL means a second
+/// process can write one row while the server is serving.
+async fn connect(path: &Path, create_if_missing: bool) -> Result<Pool, DbError> {
+    let url = if path == Path::new(":memory:") {
+        "sqlite::memory:".to_string()
+    } else {
+        format!("sqlite://{}?mode=rwc", path.display())
+    };
+
+    let opts = SqliteConnectOptions::from_str(&url)
+        .map_err(|source| DbError::Open {
+            url: url.clone(),
+            source,
+        })?
+        .create_if_missing(create_if_missing)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .foreign_keys(true);
+
+    SqlitePoolOptions::new()
+        .max_connections(8)
+        .connect_with(opts)
+        .await
+        .map_err(|source| DbError::Open { url, source })
 }
 
 /// Schema for a per-collection RAG store (`<data_dir>/<uuid>/rag.sqlite`).
@@ -372,6 +391,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn attach_leaves_in_flight_turns_alone() {
+        // `open` sweeps `in_progress` turns to `errored`, which is right for a
+        // server starting up (they are crash orphans) and catastrophic for a
+        // CLI command run against a LIVE gateway: every user streaming a reply
+        // would watch it turn into an error because an operator ran
+        // `restore-setup`. `attach` is the connection that must not do that.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gateway.sqlite");
+
+        let server = open(&path).await.unwrap();
+        let now = jiff::Timestamp::now();
+        users::upsert(
+            &server,
+            &users::User {
+                id: "u1".into(),
+                email: "u1@example.com".into(),
+                name: None,
+                roles: vec![],
+                created_at: now,
+                updated_at: now,
+                timezone: None,
+                speech_voice: None,
+            },
+        )
+        .await
+        .unwrap();
+        let session = session_core::db::create_session(&server, "u1")
+            .await
+            .unwrap();
+        let live =
+            session_core::db::create_assistant_turn_in_progress(&server, &session.id, "a1", "m")
+                .await
+                .unwrap();
+
+        let cli = attach(&path).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM chat_turns WHERE id = ?")
+            .bind(&live.id)
+            .fetch_one(&cli)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "in_progress",
+            "attaching must not error a turn that is still streaming"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_refuses_to_create_a_missing_database() {
+        // Pointing the CLI at the wrong path must say so, not silently make an
+        // empty database and then report a gateway with no users.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(attach(&dir.path().join("nope.sqlite")).await.is_err());
     }
 
     /// A store written by the previous release must survive the upgrade.

@@ -52,6 +52,37 @@ impl ToolRegistry {
         self
     }
 
+    /// A copy of this registry with every tool whose id starts with `prefix`
+    /// removed, then `replacements` inserted.
+    ///
+    /// The one operation that lets a *settings-dependent tool family* be
+    /// rebuilt without rebuilding the whole registry. Typst registers one
+    /// concrete tool per discovered template, so pointing
+    /// `typst.templates_dir` somewhere else changes which tools should exist —
+    /// and a per-request filter cannot invent a tool that was never
+    /// registered. Swapping the family is the narrow alternative to
+    /// reconstructing all ~40 tools from the boot path.
+    ///
+    /// Unlike [`Self::with`] this does not panic on a duplicate id: the whole
+    /// point is to replace ids that already exist.
+    pub fn with_family_replaced(&self, prefix: &str, replacements: Vec<Arc<dyn Tool>>) -> Self {
+        let mut tools: HashMap<String, Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .filter(|(id, _)| !id.starts_with(prefix))
+            .map(|(id, tool)| (id.clone(), tool.clone()))
+            .collect();
+        for tool in replacements {
+            let id = tool.id().to_string();
+            debug_assert!(
+                id.starts_with(prefix),
+                "replacement tool `{id}` does not belong to the `{prefix}` family"
+            );
+            tools.insert(id, tool);
+        }
+        Self { tools }
+    }
+
     pub fn get(&self, id: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(id)
     }

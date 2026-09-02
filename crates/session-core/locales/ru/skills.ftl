@@ -12,7 +12,7 @@ skills-intro-part1 = Инструкции, установленные опера
 skills-intro-part2 = предназначенный для этого. Загрузите архив
 skills-intro-part3 = ниже — он доступен сразу, без перезапуска.
 skills-empty-loaded = Скиллы пока не загружены. Загрузите архив .skill, чтобы добавить один.
-skills-empty-not-configured = Скиллы не настроены. Укажите [skills] dir в конфигурации шлюза и перезапустите его, чтобы включить их.
+skills-empty-not-configured = Скиллы не настроены. Включите их в /admin/settings (skills.dir) и перезапустите шлюз, чтобы они загрузились.
 
 skills-upload-heading = Добавить скилл
 skills-upload-button = Загрузить .skill

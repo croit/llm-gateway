@@ -83,7 +83,7 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
         // Scoped to the caller unless an admin asked for all users.
         user_id: (!show_all).then(|| user.id.clone()),
     };
-    let retention = state.config.usage.retention_days;
+    let retention = state.config().usage.retention_days;
     let agg = usage::aggregate(&state.db, bounds, &filter, retention, now, show_all)
         .await
         .unwrap_or_default();
@@ -122,7 +122,7 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
         admin,
         show_all,
         state.usage.is_enabled(),
-        &state.config.usage.currency,
+        &state.config().usage.currency,
         &tz,
         period,
         &filter,

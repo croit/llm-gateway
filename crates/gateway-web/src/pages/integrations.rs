@@ -175,8 +175,7 @@ pub async fn integrations_connect(
         return internal_error_html(&user.email, &t(lang, "integrations-error-not-oauth"));
     }
 
-    let public = state.config.gateway.public_url.trim_end_matches('/');
-    let redirect_uri = format!("{public}/integrations/callback");
+    let redirect_uri = format!("{}/integrations/callback", state.public_url());
     let http = state.mcp.http();
     let ov = Overrides {
         authorize_url: connector.authorize_url.clone(),

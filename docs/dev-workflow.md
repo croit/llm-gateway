@@ -82,7 +82,7 @@ Env config is layered through mise, not a `.env` file:
 
 Web-search settings are **not** environment variables any more. Provider, SearXNG URL, and Brave API key live in the database and are set under **Web search** on `/admin/models` (the key sealed at rest like every other gateway secret). `SEARCH_PROVIDER`, `SEARXNG_URL`, and `BRAVE_SEARCH_API_KEY` are still read **once**, at first boot, to fill settings that are still empty — after that they're ignored and the gateway logs that it ignored them.
 
-Secrets never live in `gateway.toml`. The config holds only the *names* of environment variables (e.g. `api_key_env = "GPU01_KEY"`, `session_key_env = "GATEWAY_SESSION_KEY"`); the gateway reads the actual values from its environment at startup.
+Secrets never live in `gateway.toml`. Where the file needs one it holds only the *name* of an environment variable (e.g. `api_key_env = "GPU01_KEY"`) and the gateway reads the value from its environment at startup. `$GATEWAY_SESSION_KEY` is read directly and is mandatory — the old `session_key_env` key that named it is ignored.
 
 Which env vars each subsystem needs is documented in `docs/auth.md` (OIDC) and `docs/upstreams.md` (provider keys).
 
@@ -110,7 +110,11 @@ you deploy this change** — an unchanged filter silently drops page and tool lo
 to whatever the global default is. Note the underscores: crate names are
 normalised, so it's `gateway_core`, not `gateway-core`.
 
-`GATEWAY_SESSION_KEY` — 64 hex chars (32 bytes) for the session-cookie HMAC. When it's unset the binary falls back to an ephemeral random key with a warning; that's fine locally but every restart invalidates open sessions. Generate a stable one with `openssl rand -hex 32`.
+`GATEWAY_SESSION_KEY` — 64 hex chars (32 bytes) for the session-cookie HMAC. **The gateway refuses to boot without it.** It used to fall back to an ephemeral per-process key, which quietly logged every user out on each restart *and* left every sealed secret in the DB unreadable; that failure was invisible until it had already cost data, so it is now a hard startup error carrying the `openssl rand -hex 32` line to fix it.
+
+`mise run dev` handles this for you: it generates `.gateway-dev-session-key` (gitignored, 0600) on first run and reuses it forever after. That is also a fix for local development — with the old ephemeral key, backend API keys and connector secrets stored in your local `gateway.sqlite` were silently unreadable after every restart.
+
+`GATEWAY_DATA_DIR` — root for everything the gateway *writes*: the SQLite database (`<data_dir>/gateway.sqlite`) and the RAG store (`<data_dir>/data/rag`). Unset it stays empty, so a `cargo run` in a checkout writes `./gateway.sqlite` and `./data/rag` exactly as before; the container image sets it to the mounted volume, which is what lets a deployment persist state with no config file. Read-only paths (typst templates, skills bundles) deliberately do *not* hang off it — they ship in the image's read-only layers.
 
 ## Debugging the UI
 

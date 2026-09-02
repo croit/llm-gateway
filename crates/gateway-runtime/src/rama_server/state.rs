@@ -72,7 +72,7 @@ impl RamaState {
     pub fn new(inner: AppState, sessions: SessionStore, usage: UsageHandle) -> Self {
         let enforcer = Arc::new(gateway_core::server::limits::Enforcer::new(
             inner.db.clone(),
-            inner.config.limits.enabled,
+            inner.config().limits.enabled,
         ));
         let ocr = build_ocr(&inner, &usage);
         Self {
@@ -144,7 +144,7 @@ impl RamaState {
 /// reports itself unavailable.
 fn build_ocr(inner: &AppState, usage: &UsageHandle) -> gateway_features::server::ocr::OcrService {
     gateway_features::server::ocr::OcrService::new(
-        inner.config.chat.ocr.clone(),
+        inner.config().chat.ocr.clone(),
         inner.upstreams.clone(),
         inner.http.clone(),
         usage.clone(),

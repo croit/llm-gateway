@@ -12,7 +12,7 @@ skills-intro-part1 = Vom Betreiber installierte Anleitungen, die das Chatmodell 
 skills-intro-part2 = Werkzeug lädt. Laden Sie unten ein
 skills-intro-part3 = Archiv hoch — es ist sofort verfügbar, kein Neustart nötig.
 skills-empty-loaded = Noch keine Skills geladen. Laden Sie ein .skill-Archiv hoch, um eines hinzuzufügen.
-skills-empty-not-configured = Skills sind nicht konfiguriert. Setzen Sie [skills] dir in der Gateway-Konfiguration und starten Sie neu, um sie zu aktivieren.
+skills-empty-not-configured = Skills sind nicht konfiguriert. Aktivieren Sie sie unter /admin/settings (skills.dir) und starten Sie neu, um sie zu laden.
 
 skills-upload-heading = Skill hinzufügen
 skills-upload-button = .skill hochladen

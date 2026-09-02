@@ -54,3 +54,4 @@ error-internal-heading = Interner Fehler
 error-forbidden-heading = Zugriff verweigert
 
 nav-my-skills = Meine Skills
+nav-settings = Einstellungen

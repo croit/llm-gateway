@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
+
 use crate::server::tools::ToolRegistry;
 use gateway_core::server::auth::oidc::OidcClient;
 use gateway_core::server::config::Config;
@@ -14,6 +16,183 @@ use gateway_features::server::geoip::GeoIp;
 use gateway_features::server::rag::worker::Indexer;
 use gateway_features::server::skills::SkillStore;
 
+/// OIDC discovery retry loop: 5 attempts with exponential backoff (500ms → 8s),
+/// then give up and leave the client unset. `/auth/*` reports that cleanly, so
+/// a transient network blip at boot costs a delayed sign-in rather than a crash
+/// loop. Callers that just validated the provider themselves (the setup wizard)
+/// return on the first attempt in practice.
+async fn build_oidc_with_retry(
+    params: &gateway_core::server::auth::oidc::OidcParams,
+    public_url: &str,
+) -> Option<Arc<OidcClient>> {
+    let max_attempts = 5;
+    for attempt in 1..=max_attempts {
+        match OidcClient::build(params, public_url).await {
+            Ok(client) => return Some(client),
+            Err(err) if attempt < max_attempts => {
+                let backoff = std::time::Duration::from_millis(500u64 << (attempt - 1));
+                tracing::warn!(
+                    attempt, max_attempts,
+                    backoff_ms = backoff.as_millis() as u64,
+                    error = %err,
+                    "OIDC discovery failed; retrying",
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(err) => tracing::error!(
+                error = %err,
+                "OIDC discovery failed after {max_attempts} attempts; continuing without \
+                 OIDC — /auth/login + /auth/callback will report it until this is resolved",
+            ),
+        }
+    }
+    None
+}
+
+/// Shared handle to the wizard-owned settings.
+///
+/// Held by [`AppState`], and by the few things constructed *before* it that
+/// still need a live public URL — today the sandbox client, whose artifact
+/// download links would otherwise be frozen at the boot-time fallback
+/// (`http://localhost:8080` on a fresh install) until the next restart.
+pub type RuntimeHandle = Arc<ArcSwap<RuntimeSettings>>;
+
+/// The slice of configuration the setup wizard writes and the gateway
+/// re-reads without restarting. Read it through [`AppState::public_url`],
+/// [`AppState::oidc`] and [`AppState::setup_completed`].
+///
+/// These three are bundled because they are swapped at the same instant — the
+/// moment the wizard finishes — not because they belong together. That means
+/// anything holding a [`RuntimeHandle`] for one of them (the sandbox client
+/// wants only `public_url`) also sees the other two. Acceptable while there are
+/// three; if a fourth arrives that is unrelated to setup, split rather than
+/// widen.
+#[derive(Clone)]
+pub struct RuntimeSettings {
+    /// The gateway's own base URL, no trailing slash. Every absolute link the
+    /// server builds — the OIDC `redirect_uri`, connector callbacks, share
+    /// links — and the `Secure` flag on the session cookie derive from it.
+    pub public_url: String,
+    /// The live OIDC client. `None` before setup, or when the stored provider
+    /// settings could not be turned into a working client (discovery down at
+    /// boot, at-rest key changed); `/auth/login` then reports it cleanly.
+    pub oidc: Option<Arc<OidcClient>>,
+    /// Whether the setup wizard has completed. `false` puts the UI in
+    /// first-run mode: every page redirects to `/setup`.
+    pub setup_completed: bool,
+}
+
+impl RuntimeSettings {
+    /// A fresh handle seeded with the config-file fallback and nothing
+    /// configured. `AppState::reload_runtime` fills in what the database says.
+    pub fn new_handle(config_public_url: &str) -> RuntimeHandle {
+        Arc::new(ArcSwap::from_pointee(Self {
+            public_url: config_public_url.trim_end_matches('/').to_string(),
+            oidc: None,
+            // A gateway that has not consulted the DB yet must not put the UI
+            // into first-run mode; `reload_runtime` corrects this immediately.
+            setup_completed: true,
+        }))
+    }
+}
+
+/// Everything the operator settings can switch on, off or point somewhere
+/// else — rebuilt as one unit whenever those settings change.
+///
+/// These seven were the reason most of `/admin/settings` used to say "takes
+/// effect after a restart": each is an object constructed once at boot from a
+/// config block (a client, a loaded database, a scanned directory, a tool
+/// registry), so changing the block changed nothing until the process came
+/// back. Bundling them makes the rebuild atomic: a save can never leave the
+/// gateway with `sandbox.enabled` on but no sandbox tools registered, because
+/// the registry and the client are replaced in the same swap.
+///
+/// Every one of these is built from a `gateway-features` scanner or a client
+/// this crate owns, so [`AppState::reload_settings`] can rebuild the bundle
+/// itself — no boot-installed callback, even though registering a *tool* would
+/// need `gateway-tools`, which this crate deliberately does not depend on.
+/// That works because tool availability is decided per request by
+/// [`AppState::allowed_tools_for_user`], not at registration time: the registry
+/// holds what the build can do, and the live config decides what this
+/// deployment currently offers.
+/// Rebuilds the one tool family whose membership depends on a setting.
+///
+/// Today that is typst: it registers one concrete tool per discovered
+/// template, so pointing `typst.templates_dir` somewhere else — or switching
+/// typst on at all — changes which tools should exist. A per-request filter
+/// cannot invent a tool that was never registered, which is why this is a
+/// rebuild rather than a filter.
+///
+/// A callback installed at boot rather than a function this crate can call:
+/// naming `TypstRenderTool` means depending on `gateway-tools`, and that crate
+/// depends on this one. The binary crate sees everything, so it supplies the
+/// closure via [`AppState::with_tool_family_builder`], and
+/// [`AppState::reload_settings`] calls it on every settings save. Returning the
+/// tools rather than a whole registry keeps the boot path as the single place
+/// that knows the full tool list.
+pub type ToolFamilyBuilder =
+    Arc<dyn Fn(&Config, &FeatureSurface) -> Vec<Arc<dyn crate::server::tools::Tool>> + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct FeatureSurface {
+    /// Display metadata for the discovered typst templates (manifest title +
+    /// description). The catalog needs it to render a per-template toggle row —
+    /// the human title isn't in the tool schema. Empty when typst is off.
+    pub typst_templates: Arc<Vec<crate::server::tools::catalog::TemplateMeta>>,
+    /// Loaded Agent Skills, itself behind a hot-reloadable store (an admin
+    /// upload re-scans and swaps it). `None` when skills are off; an empty
+    /// store is fine. RBAC narrows which skills each caller sees.
+    pub skills: Option<Arc<SkillStore>>,
+    /// Per-user **private** Agent Skills, under `<skills.dir>/.users/`. Moves
+    /// in lockstep with [`Self::skills`] — same feature toggle, one level
+    /// deeper, so the two scanners never cross.
+    pub user_skills: Option<Arc<gateway_features::server::skills::UserSkillStore>>,
+    /// Client-IP → location resolver for `get_user_location`. `None` when
+    /// GeoIP is off; the tool then relies on the browser-provided position.
+    pub geoip: Option<GeoIp>,
+    /// The sandbox-runner HTTP client, shared so the per-turn code can build a
+    /// lease (one container across a turn's tool rounds). `None` when the
+    /// sandbox is off.
+    pub sandbox_client: Option<Arc<crate::server::tools::sandbox::SandboxClient>>,
+    /// ComfyUI workflow catalog + HTTP client. `None` when ComfyUI is off. The
+    /// tool source reads the live snapshot per request, which is why an admin
+    /// `POST /api/v0/comfyui/reload` already took effect without a restart.
+    pub comfyui: Option<Arc<crate::server::comfyui_tool::ComfyuiHandle>>,
+}
+
+/// Display metadata for the typst templates the current config points at.
+///
+/// The one place that maps a discovered template to its catalog row, so the
+/// boot path and [`AppState::reload_settings`] cannot disagree about the
+/// per-template toggle list. Discovery failures are a warning and an empty
+/// list: a broken templates directory must not keep the gateway from booting.
+pub fn typst_template_metas(config: &Config) -> Vec<crate::server::tools::catalog::TemplateMeta> {
+    let Some(cfg) = config.typst.as_ref() else {
+        return Vec::new();
+    };
+    match gateway_features::server::typst::discover_templates(&cfg.templates_dir) {
+        Ok(templates) => templates
+            .into_iter()
+            .map(|t| crate::server::tools::catalog::TemplateMeta {
+                key: format!(
+                    "{}{}",
+                    gateway_core::server::tool_naming::TYPST_PREFIX,
+                    t.id
+                ),
+                title: t.title,
+                description: t.description,
+            })
+            .collect(),
+        Err(err) => {
+            tracing::warn!(
+                error = %err, dir = %cfg.templates_dir.display(),
+                "could not read the typst templates directory"
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Shared application state injected into Axum handlers.
 ///
 /// Clone is cheap — every field is either Arc-shared or already cloneable
@@ -21,34 +200,52 @@ use gateway_features::server::skills::SkillStore;
 #[derive(Clone)]
 pub struct AppState {
     pub http: reqwest::Client,
-    pub config: Arc<Config>,
+    /// The effective configuration: what the file said, with the twelve
+    /// settings-owned blocks overwritten from the database.
+    ///
+    /// Swappable, because `/admin/settings` has to be able to change them
+    /// without a restart. Read it through [`Self::config`] — one load, then use
+    /// the returned `Arc` for the whole request, so a save landing mid-request
+    /// cannot show that request two different configurations.
+    config: Arc<ArcSwap<Config>>,
     pub db: Pool,
-    pub oidc: Option<Arc<OidcClient>>,
+    /// The settings the setup wizard owns, swappable at runtime.
+    ///
+    /// These are the only three values a running gateway has to be able to
+    /// change without a restart: finishing the wizard has to produce a working
+    /// `/login` right there in the browser, which means installing a live OIDC
+    /// client and the public URL its `redirect_uri` was built from. Everything
+    /// else is either static (`config`) or already hot-reloadable in its own
+    /// right (the upstream registry, the skill store).
+    ///
+    /// Read through [`Self::public_url`] / [`Self::oidc`] /
+    /// [`Self::setup_completed`] rather than touching this field.
+    runtime: Arc<ArcSwap<RuntimeSettings>>,
     pub upstreams: Arc<UpstreamRegistry>,
-    pub tools: Arc<ToolRegistry>,
+    /// The tool surface the model can be offered. Swappable, because a feature
+    /// switched on at runtime has to be able to register its tools — read it
+    /// through [`Self::tools`].
+    tools: Arc<ArcSwap<ToolRegistry>>,
+    /// How to rebuild the settings-dependent tool family. `None` in tests and
+    /// in the dev harness, which build a registry once and never change it;
+    /// production installs one at boot.
+    tool_family_builder: Option<ToolFamilyBuilder>,
     pub rbac: Arc<Resolver>,
-    /// Client-IP → location resolver for the `get_user_location` tool.
-    /// `None` when `[geoip]` isn't configured; the tool then relies on
-    /// the browser-provided position alone. Cheap to clone (Arc inside).
-    pub geoip: Option<GeoIp>,
-    /// RAG indexer + index cache. `None` when `[rag]` isn't configured;
-    /// `rag_search` / `rag_list_collections` then surface a clear "not
-    /// configured" error rather than silently misroute.
+    /// The features the operator settings can switch on, off or repoint —
+    /// swapped as one unit by [`Self::reload_settings`]. Read through
+    /// [`Self::geoip`], [`Self::skills`], [`Self::user_skills`],
+    /// [`Self::typst_templates`], [`Self::sandbox_client`] and
+    /// [`Self::comfyui`] rather than touching this field.
+    surface: Arc<ArcSwap<FeatureSurface>>,
+    /// RAG indexer + index cache. `None` when RAG is off; `rag_search` /
+    /// `rag_list_collections` then surface a clear "not configured" error
+    /// rather than silently misroute.
+    ///
+    /// Deliberately *not* in [`FeatureSurface`]: the indexer owns open handles
+    /// and in-flight jobs, and `rag.data_dir` is the one setting that stays
+    /// restart-only — a hot swap there would strand the existing index tree at
+    /// the old path. See `settings::SECTIONS`.
     pub indexer: Option<Indexer>,
-    /// Loaded Agent Skills, behind a hot-reloadable store (admin upload /
-    /// delete re-scan and swap it live). `None` when `[skills]` isn't
-    /// configured; an empty store is fine (uploads populate it without a
-    /// restart). RBAC narrows which skills each caller sees (see
-    /// [`Self::allowed_skills_for`]).
-    pub skills: Option<Arc<SkillStore>>,
-    /// Per-user **private** Agent Skills (the user-owned counterpart to
-    /// [`Self::skills`]). `None` unless `[skills]` is configured — private
-    /// skills piggyback on the same feature toggle and live under
-    /// `<skills.dir>/.users/`. Ownership is the grant: a user may load any
-    /// skill they own without an RBAC role, and their private skills overlay
-    /// the global set (private shadows global; see
-    /// [`gateway_features::server::skills::combined_registry`]).
-    pub user_skills: Option<Arc<gateway_features::server::skills::UserSkillStore>>,
     /// At-rest encryption for the gateway's database-stored secrets: per-user
     /// MCP OAuth tokens, admin-stored connector client secrets, and upstream
     /// backend API keys. `new()` installs an ephemeral key; production overrides
@@ -60,25 +257,10 @@ pub struct AppState {
     /// one bound to the same pool + ephemeral crypto; production overrides via
     /// [`Self::with_mcp`].
     pub mcp: Arc<crate::server::tools::mcp::manager::McpConnectionManager>,
-    /// Display metadata for the discovered typst templates (manifest title +
-    /// description), snapshotted at startup. The catalog needs it to render a
-    /// per-template toggle row — the human title isn't in the tool schema.
-    /// Empty when `[typst]` isn't configured.
-    pub typst_templates: Arc<Vec<crate::server::tools::catalog::TemplateMeta>>,
     /// Web Push sender (VAPID keypair + HTTP client). `None` when `[push]
     /// enabled = false`; the push endpoints then report "disabled" and the
     /// turn-complete hook is a no-op. Built at startup by [`Self::with_push`].
     pub push: Option<Arc<gateway_features::server::push::PushSender>>,
-    /// The sandbox-runner HTTP client, shared so the per-turn tool context can
-    /// build a [`crate::server::tools::sandbox::SandboxLease`] (the container
-    /// kept alive across a turn's tool rounds). `None` when `[sandbox]` is
-    /// absent/disabled — leasing is off and every sandbox call is single-use.
-    pub sandbox_client: Option<Arc<crate::server::tools::sandbox::SandboxClient>>,
-    /// Hot-reloadable ComfyUI workflow catalog + HTTP client. `None` when
-    /// `[comfyui]` is absent/disabled — no `comfyui_*` tools register. The
-    /// tool source reads the live snapshot per request, so an admin
-    /// `POST /api/v0/comfyui/reload` takes effect immediately.
-    pub comfyui: Option<Arc<crate::server::comfyui_tool::ComfyuiHandle>>,
 }
 
 impl AppState {
@@ -94,24 +276,24 @@ impl AppState {
             db.clone(),
             crypto.clone(),
         );
+        // Seeded from the config file so tests and the dev harness get the
+        // historical behaviour; production replaces it with the shared handle
+        // via `with_runtime_handle` and then fills it in from the DB.
+        let runtime = RuntimeSettings::new_handle(config.public_url_fallback());
         Self {
             http: reqwest::Client::new(),
-            config: Arc::new(config),
+            config: Arc::new(ArcSwap::from_pointee(config)),
             db,
-            oidc: None,
+            runtime,
             upstreams,
-            tools,
+            tools: Arc::new(ArcSwap::from(tools)),
+            tool_family_builder: None,
             rbac,
-            geoip: None,
+            surface: Arc::new(ArcSwap::from_pointee(FeatureSurface::default())),
             indexer: None,
-            skills: None,
-            user_skills: None,
             crypto,
             mcp,
-            typst_templates: Arc::new(Vec::new()),
             push: None,
-            sandbox_client: None,
-            comfyui: None,
         }
     }
 
@@ -119,30 +301,27 @@ impl AppState {
     /// `[sandbox]` is enabled) so per-turn tool contexts can lease a
     /// container. Off → sandbox calls stay single-use.
     pub fn with_sandbox_client(
-        mut self,
+        self,
         client: Arc<crate::server::tools::sandbox::SandboxClient>,
     ) -> Self {
-        self.sandbox_client = Some(client);
+        self.mutate_surface(|s| s.sandbox_client = Some(client));
         self
     }
 
     /// Install the ComfyUI catalog + HTTP client. Built once at startup
     /// when `[comfyui]` is enabled; off → no `comfyui_*` tools register.
-    pub fn with_comfyui(
-        mut self,
-        comfyui: Arc<crate::server::comfyui_tool::ComfyuiHandle>,
-    ) -> Self {
-        self.comfyui = Some(comfyui);
+    pub fn with_comfyui(self, comfyui: Arc<crate::server::comfyui_tool::ComfyuiHandle>) -> Self {
+        self.mutate_surface(|s| s.comfyui = Some(comfyui));
         self
     }
 
     /// Install the discovered typst templates' display metadata (for the
     /// per-template toggle rows in the tool menu / `/tools` page).
     pub fn with_typst_templates(
-        mut self,
+        self,
         templates: Vec<crate::server::tools::catalog::TemplateMeta>,
     ) -> Self {
-        self.typst_templates = Arc::new(templates);
+        self.mutate_surface(|s| s.typst_templates = Arc::new(templates));
         self
     }
 
@@ -157,12 +336,12 @@ impl AppState {
     /// they can't drift, the same way [`Self::allowed_tools_for_user`] anchors
     /// tools.
     pub fn allowed_skills_for(&self, roles: &[String], user_id: &str) -> Vec<String> {
-        let Some(store) = self.skills.as_ref() else {
+        let Some(store) = self.skills() else {
             return Vec::new();
         };
         let role_ids = self.rbac.role_ids_for(roles);
         let mut allowed = self.rbac.allowed_skills(&role_ids, &store.current());
-        if let Some(user_store) = self.user_skills.as_ref() {
+        if let Some(user_store) = self.user_skills() {
             for name in user_store.registry_for(user_id).names() {
                 if !allowed.iter().any(|a| a == name) {
                     allowed.push(name.to_string());
@@ -177,7 +356,7 @@ impl AppState {
     /// the `/skills` nav entry is shown — it's hidden when skills aren't
     /// configured, or the directory can't be read/created.
     pub fn user_skills_enabled(&self) -> bool {
-        self.user_skills
+        self.user_skills()
             .as_ref()
             .is_some_and(|s| gateway_features::server::skills::dir_accessible(s.root()))
     }
@@ -187,7 +366,7 @@ impl AppState {
     /// access" message in this state. `false` when unconfigured (which gets a
     /// different message) or when the directory is fine.
     pub fn skills_dir_inaccessible(&self) -> bool {
-        self.skills
+        self.skills()
             .as_ref()
             .is_some_and(|s| !gateway_features::server::skills::dir_accessible(s.dir()))
     }
@@ -201,8 +380,8 @@ impl AppState {
         &self,
         user_id: &str,
     ) -> Option<Arc<gateway_features::server::skills::SkillRegistry>> {
-        let global = self.skills.as_ref()?.current();
-        match self.user_skills.as_ref() {
+        let global = self.skills()?.current();
+        match self.user_skills() {
             Some(user_store) => {
                 let private = user_store.registry_for(user_id);
                 Some(Arc::new(
@@ -223,7 +402,7 @@ impl AppState {
     /// paths can't drift.
     pub async fn allowed_tools_for_user(&self, roles: &[String], user_id: &str) -> Vec<String> {
         let role_ids = self.rbac.role_ids_for(roles);
-        let mut allowed = self.rbac.allowed_tools(&role_ids, &self.tools);
+        let mut allowed = self.rbac.allowed_tools(&role_ids, &self.tools());
         self.expand_comfyui_tools(&mut allowed, &role_ids);
         let disabled =
             gateway_core::server::db::user_tool_prefs::disabled_for_user(&self.db, user_id)
@@ -239,7 +418,7 @@ impl AppState {
     /// (`/api/v0/me`, `/tools` page, `allowed_tools_for_user`) agrees on
     /// ComfyUI visibility. No-op when `[comfyui]` isn't configured.
     pub fn expand_comfyui_tools(&self, allowed: &mut Vec<String>, role_ids: &[String]) {
-        let Some(handle) = self.comfyui.as_ref() else {
+        let Some(handle) = self.comfyui() else {
             return;
         };
         match self.rbac.grants_comfyui_overlay(role_ids) {
@@ -366,13 +545,293 @@ impl AppState {
         allowed
     }
 
-    pub fn with_oidc(mut self, oidc: Arc<OidcClient>) -> Self {
-        self.oidc = Some(oidc);
+    /// Adopt an externally created handle, so things built before `AppState`
+    /// (the sandbox client) observe the same live settings rather than a
+    /// snapshot. Must be called before anything reads the settings.
+    pub fn with_runtime_handle(mut self, runtime: RuntimeHandle) -> Self {
+        self.runtime = runtime;
         self
     }
 
-    pub fn with_geoip(mut self, geoip: GeoIp) -> Self {
-        self.geoip = Some(geoip);
+    /// Replace the wizard-owned settings wholesale. Tests use it to inject a
+    /// mock OIDC client; production goes through [`Self::reload_runtime`], so
+    /// there is exactly one place that knows how to derive these from the DB.
+    pub fn set_runtime(&self, settings: RuntimeSettings) {
+        self.runtime.store(Arc::new(RuntimeSettings {
+            // Normalise once, here, so no reader has to remember to trim. Every
+            // absolute URL the gateway builds is `public_url` + an absolute
+            // path, and a stored trailing slash would double the separator.
+            public_url: settings.public_url.trim_end_matches('/').to_string(),
+            ..settings
+        }));
+    }
+
+    /// Re-derive the wizard-owned settings from the database and swap them in.
+    ///
+    /// The counterpart to [`Self::reload_rbac`], and for the same reason: the
+    /// DB is the source of truth, so the DB→memory derivation should live in
+    /// one place rather than being written out by every caller. Called once at
+    /// boot and again the moment the setup wizard finishes — which is what
+    /// makes `/login` work immediately, with no restart.
+    ///
+    /// Building the OIDC client does network I/O (provider discovery); a
+    /// failure leaves the client `None`, which `/auth/login` reports cleanly.
+    pub async fn reload_runtime(&self) {
+        use gateway_core::server::{oidc_settings, setup};
+
+        let setup_completed = setup::is_completed(&self.db).await.unwrap_or(false);
+        let public_url = setup::public_url(&self.db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| self.config().public_url_fallback().to_string());
+
+        let oidc = match oidc_settings::params(&self.db, &self.crypto).await {
+            Ok(Some(params)) => build_oidc_with_retry(&params, &public_url).await,
+            Ok(None) => {
+                if setup_completed {
+                    tracing::error!(
+                        "no OIDC provider is configured but setup is marked complete — nobody \
+                         can sign in. Run `restore-setup` on the host to reopen the wizard."
+                    );
+                } else {
+                    tracing::info!(
+                        %public_url,
+                        "no OIDC provider configured yet — open the gateway in a browser to run setup"
+                    );
+                }
+                None
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "reading OIDC settings");
+                None
+            }
+        };
+
+        self.set_runtime(RuntimeSettings {
+            public_url,
+            oidc,
+            setup_completed,
+        });
+    }
+
+    /// The effective configuration.
+    ///
+    /// Returns an owned snapshot rather than a borrow, so a concurrent
+    /// `/admin/settings` save cannot swap the config out from under a request
+    /// halfway through. Bind it once per request (`let config = state.config();`)
+    /// and read fields off that; calling it repeatedly is correct but pointless.
+    pub fn config(&self) -> Arc<Config> {
+        self.config.load_full()
+    }
+
+    /// Re-read the settings-owned blocks from the database and swap in a
+    /// config that has them.
+    ///
+    /// Called once at boot and again whenever `/admin/settings` saves, which is
+    /// what makes an edited value live for the next request without a restart.
+    /// Blocks whose value was baked into something built at boot — the sandbox
+    /// and ComfyUI clients, the loaded GeoIP database, the scanned skills and
+    /// Typst directories, the RAG indexer — are marked `restart` in
+    /// [`SECTIONS`] and genuinely do need one; this swap is what makes every
+    /// *other* field take effect immediately.
+    ///
+    /// Re-applies onto the *current* config, which is safe because [`apply`]
+    /// overwrites all twelve blocks wholesale and touches nothing else:
+    /// `[bind]`, `[db]`, `[gateway]`, the topology and the seed-only blocks
+    /// survive untouched, however many times this runs.
+    ///
+    /// [`SECTIONS`]: gateway_core::server::settings::SECTIONS
+    /// [`apply`]: gateway_core::server::settings::apply
+    pub async fn reload_settings(&self) {
+        use gateway_core::server::settings;
+
+        let stored = match settings::load(&self.db, &self.crypto).await {
+            Ok(s) => s,
+            Err(err) => {
+                // Keep serving on the configuration we already have. The
+                // alternative — reverting to file defaults because one query
+                // failed — would silently turn features off.
+                tracing::error!(error = %err, "reading operator settings; keeping the current configuration");
+                return;
+            }
+        };
+        let mut next = (*self.config()).clone();
+        settings::apply(&stored, &mut next);
+        let next = Arc::new(next);
+        // The features before the config, so nothing can observe a config that
+        // claims a feature is on while its client is still absent. Both are
+        // single `ArcSwap` stores, so a reader sees one or the other, never a
+        // half-built pair.
+        self.rebuild_surface(&next);
+        // The tool family last, from the freshly built bundle: a typst tool
+        // holds the sandbox client (for its PPTX export), so it must be built
+        // against the new one rather than the one being replaced.
+        if let Some(build) = self.tool_family_builder.clone() {
+            let family = build(&next, &self.surface());
+            let rebuilt = self
+                .tools()
+                .with_family_replaced(gateway_core::server::tool_naming::TYPST_PREFIX, family);
+            self.tools.store(Arc::new(rebuilt));
+        }
+        self.config.store(next);
+    }
+
+    /// Rebuild the feature bundle from `config` and swap it in.
+    ///
+    /// This is what makes `/admin/settings` take effect without a restart for
+    /// everything except `rag.data_dir`: each member is re-derived from the
+    /// block that owns it — a client re-pointed at a new URL, a directory
+    /// re-scanned, a database re-opened — and the whole bundle is replaced at
+    /// once.
+    ///
+    /// Failures are per-member and non-fatal. A GeoIP file that has gone
+    /// missing leaves `geoip: None`, which the tool already reports cleanly;
+    /// aborting the reload instead would leave the *other* settings unapplied
+    /// and the operator staring at a form that saved but changed nothing.
+    fn rebuild_surface(&self, config: &Config) {
+        // Display metadata only; the per-template *tools* come from the
+        // family builder further down, which is what actually makes
+        // `typst.templates_dir` take effect without a restart.
+        let typst_templates = Arc::new(typst_template_metas(config));
+        let (skills, user_skills) = match config.skills.as_ref() {
+            Some(cfg) => {
+                let store = Arc::new(SkillStore::load(cfg.dir.clone()));
+                let users_dir = cfg.dir.join(".users");
+                if let Err(err) = std::fs::create_dir_all(&users_dir) {
+                    tracing::warn!(
+                        error = %err, dir = %users_dir.display(),
+                        "could not create the private-skills directory"
+                    );
+                }
+                let user_store = Arc::new(gateway_features::server::skills::UserSkillStore::new(
+                    users_dir,
+                ));
+                (Some(store), Some(user_store))
+            }
+            None => (None, None),
+        };
+        // `GeoIp::new` is lazy and watches its file, so only a changed *path*
+        // needs a new handle. Reuse the existing one when the path is
+        // unchanged, or the watcher would be replaced on every unrelated save.
+        let geoip = match config.geoip.as_ref() {
+            Some(cfg) => {
+                let current = self.surface().geoip.clone();
+                match current {
+                    Some(geo) if geo.db_path() == cfg.db_path => Some(geo),
+                    _ => {
+                        let geo = GeoIp::new(cfg.db_path.clone());
+                        geo.watch();
+                        Some(geo)
+                    }
+                }
+            }
+            None => None,
+        };
+        let sandbox_client = config.sandbox.as_ref().filter(|c| c.enabled).map(|cfg| {
+            crate::server::tools::sandbox::SandboxClient::new(
+                Arc::new(cfg.clone()),
+                self.runtime.clone(),
+            )
+        });
+        // ComfyUI keeps whatever handle it has. The handle owns a workflow
+        // catalog an admin may have reloaded through `/admin/comfyui`, and
+        // rebuilding it here would silently discard that; building a *new* one
+        // also needs the S3 config and the chat-update registry that only the
+        // boot path assembles. Its `restart` badge stays until that moves in
+        // here too — but `/admin/comfyui/reload` already re-scans the catalog
+        // without one.
+        let comfyui = self.surface().comfyui.clone();
+
+        self.set_surface(FeatureSurface {
+            typst_templates,
+            skills,
+            user_skills,
+            geoip,
+            sandbox_client,
+            comfyui,
+        });
+    }
+
+    /// The tool registry. One `ArcSwap` load; bind it once per request rather
+    /// than calling this repeatedly.
+    pub fn tools(&self) -> Arc<ToolRegistry> {
+        self.tools.load_full()
+    }
+
+    /// Install the closure that rebuilds the settings-dependent tool family.
+    /// Called once at boot by the binary crate, the only place that can name
+    /// the concrete tool types. See [`ToolFamilyBuilder`].
+    pub fn with_tool_family_builder(mut self, builder: ToolFamilyBuilder) -> Self {
+        self.tool_family_builder = Some(builder);
+        self
+    }
+
+    /// The live feature bundle. One `ArcSwap` load; bind it once if you need
+    /// several of its members in one request.
+    pub fn surface(&self) -> Arc<FeatureSurface> {
+        self.surface.load_full()
+    }
+
+    /// Read-modify-write one member of the bundle.
+    ///
+    /// Only for the `with_*` builders, which run at boot before anything else
+    /// holds the state, so the read-then-store is not racing a reader. Runtime
+    /// changes go through [`Self::reload_settings`], which builds a whole
+    /// bundle and swaps it once.
+    fn mutate_surface(&self, f: impl FnOnce(&mut FeatureSurface)) {
+        let mut next = (*self.surface()).clone();
+        f(&mut next);
+        self.surface.store(Arc::new(next));
+    }
+
+    /// Replace the feature bundle wholesale. Tests use it to inject a store or
+    /// a client; production goes through [`Self::reload_settings`].
+    pub fn set_surface(&self, surface: FeatureSurface) {
+        self.surface.store(Arc::new(surface));
+    }
+
+    pub fn geoip(&self) -> Option<GeoIp> {
+        self.surface().geoip.clone()
+    }
+
+    pub fn skills(&self) -> Option<Arc<SkillStore>> {
+        self.surface().skills.clone()
+    }
+
+    pub fn user_skills(&self) -> Option<Arc<gateway_features::server::skills::UserSkillStore>> {
+        self.surface().user_skills.clone()
+    }
+
+    pub fn typst_templates(&self) -> Arc<Vec<crate::server::tools::catalog::TemplateMeta>> {
+        self.surface().typst_templates.clone()
+    }
+
+    pub fn sandbox_client(&self) -> Option<Arc<crate::server::tools::sandbox::SandboxClient>> {
+        self.surface().sandbox_client.clone()
+    }
+
+    pub fn comfyui(&self) -> Option<Arc<crate::server::comfyui_tool::ComfyuiHandle>> {
+        self.surface().comfyui.clone()
+    }
+
+    /// The gateway's own base URL, no trailing slash.
+    pub fn public_url(&self) -> String {
+        self.runtime.load().public_url.clone()
+    }
+
+    /// The live OIDC client, or `None` when sign-in is not configured.
+    pub fn oidc(&self) -> Option<Arc<OidcClient>> {
+        self.runtime.load().oidc.clone()
+    }
+
+    /// False while the gateway is in first-run mode.
+    pub fn setup_completed(&self) -> bool {
+        self.runtime.load().setup_completed
+    }
+
+    pub fn with_geoip(self, geoip: GeoIp) -> Self {
+        self.mutate_surface(|s| s.geoip = Some(geoip));
         self
     }
 
@@ -381,8 +840,8 @@ impl AppState {
         self
     }
 
-    pub fn with_skills(mut self, skills: Arc<SkillStore>) -> Self {
-        self.skills = Some(skills);
+    pub fn with_skills(self, skills: Arc<SkillStore>) -> Self {
+        self.mutate_surface(|s| s.skills = Some(skills));
         self
     }
 
@@ -390,10 +849,10 @@ impl AppState {
     /// [`Self::with_skills`] (both gate on `[skills]`), so `user_skills` is
     /// `Some` exactly when `skills` is.
     pub fn with_user_skills(
-        mut self,
+        self,
         user_skills: Arc<gateway_features::server::skills::UserSkillStore>,
     ) -> Self {
-        self.user_skills = Some(user_skills);
+        self.mutate_surface(|s| s.user_skills = Some(user_skills));
         self
     }
 

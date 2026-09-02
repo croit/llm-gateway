@@ -235,8 +235,12 @@ mod tests {
                     endpoint: "http://127.0.0.1:1".into(),
                     region: "us-east-1".into(),
                     bucket: "b".into(),
-                    access_key_env: "UPLOAD_ATTACH_TEST_NOT_SET".into(),
-                    secret_key_env: "UPLOAD_ATTACH_TEST_NOT_SET".into(),
+                    // No credentials stored, so every call fails before it
+                    // touches the network — which is the point of the fixture.
+                    access_key: None,
+                    secret_key: None,
+                    access_key_env: None,
+                    secret_key_env: None,
                     key_prefix: "chat-attachments".into(),
                 },
             )),

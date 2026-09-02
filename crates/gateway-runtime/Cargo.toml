@@ -17,6 +17,9 @@ gateway-features = { path = "../gateway-features" }
 shared = { path = "../shared" }
 session-core = { path = "../session-core" }
 async-trait = { workspace = true }
+# Lock-free swap for the settings the setup wizard rewrites at runtime
+# (`RuntimeSettings`), read on every request that builds an absolute URL.
+arc-swap = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

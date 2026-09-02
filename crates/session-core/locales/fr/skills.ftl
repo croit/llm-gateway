@@ -12,7 +12,7 @@ skills-intro-part1 = Instructions installées par l'opérateur que le modèle de
 skills-intro-part2 = prévu à cet effet. Téléversez une archive
 skills-intro-part3 = ci-dessous — elle est disponible immédiatement, sans redémarrage.
 skills-empty-loaded = Aucun skill chargé pour le moment. Téléversez une archive .skill pour en ajouter un.
-skills-empty-not-configured = Les skills ne sont pas configurés. Définissez [skills] dir dans la configuration de la passerelle et redémarrez pour les activer.
+skills-empty-not-configured = Les skills ne sont pas configurés. Activez-les dans /admin/settings (skills.dir) puis redémarrez pour les charger.
 
 skills-upload-heading = Ajouter un skill
 skills-upload-button = Téléverser .skill

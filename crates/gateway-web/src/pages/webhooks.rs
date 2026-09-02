@@ -944,8 +944,8 @@ pub async fn webhooks_runs(
 /// The full public trigger URL for a plaintext secret, built from the
 /// gateway's configured `public_url`.
 fn trigger_url(state: &RamaState, secret: &str) -> String {
-    let base = state.config.gateway.public_url.trim_end_matches('/');
-    format!("{base}/hooks/{secret}")
+    let base = state.public_url();
+    format!("{}/hooks/{secret}", base.trim_end_matches('/'))
 }
 
 // ---------------------------------------------------------------------------

@@ -396,7 +396,7 @@ pub fn build_tool_context(state: &Arc<RamaState>, facts: TurnFacts) -> ToolConte
         roles,
         db: state.db.clone(),
         s3: state
-            .config
+            .config()
             .chat
             .s3
             .as_ref()
@@ -404,7 +404,7 @@ pub fn build_tool_context(state: &Arc<RamaState>, facts: TurnFacts) -> ToolConte
         assistant_turn_id: Some(assistant_turn_id),
         session_id: Some(session_id),
         client_ip,
-        geoip: state.geoip.clone(),
+        geoip: state.geoip(),
         chat_feedback,
         // Fresh per-turn set so concurrent uploaders (typst,
         // upload_attachment) serialize their filename picks and each get
@@ -427,7 +427,7 @@ pub fn build_tool_context(state: &Arc<RamaState>, facts: TurnFacts) -> ToolConte
         // container (so `/work` persists across rounds). `None` when the
         // sandbox isn't configured. Released in `run_turn` at turn end.
         sandbox_lease: state
-            .sandbox_client
+            .sandbox_client()
             .clone()
             .map(crate::server::tools::sandbox::SandboxLease::new),
         // A second lease for `browse_page`'s browser, so an ordinary offline
@@ -435,7 +435,7 @@ pub fn build_tool_context(state: &Arc<RamaState>, facts: TurnFacts) -> ToolConte
         // container out from under it. Only where the runner has egress — a
         // browser that can't reach anything is not worth a container.
         browser_lease: state
-            .sandbox_client
+            .sandbox_client()
             .clone()
             .filter(|c| c.egress_available())
             .map(crate::server::tools::sandbox::SandboxLease::new),
@@ -675,14 +675,15 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
         .await;
     let comfyui = d
         .state
-        .comfyui
+        .comfyui()
         .as_ref()
         .map(|h| crate::server::comfyui_tool::ComfyuiToolSource::new((**h).clone()));
-    let tool_source = crate::server::tools::mcp::manager::CompositeToolSource::new(
-        d.state.tools.as_ref(),
-        &user_mcp,
-    )
-    .with_comfyui(comfyui.as_ref());
+    // Bound, not chained: `tools()` hands back an owned snapshot, and the
+    // composite source borrows from it for the rest of the turn.
+    let tools = d.state.tools();
+    let tool_source =
+        crate::server::tools::mcp::manager::CompositeToolSource::new(tools.as_ref(), &user_mcp)
+            .with_comfyui(comfyui.as_ref());
 
     // The conversation's model may be an alias (the picker lists them). Resolve
     // it to the real upstream id ONCE per turn and key every per-model lookup
@@ -803,7 +804,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
     // Whether compaction wants the trailing usage frame even when usage metrics
     // are off — the trigger sizes the context from `prompt_tokens`, so we must
     // ask for it. (The threshold check itself still re-reads live config later.)
-    let compaction_enabled = d.state.config.chat.compaction.enabled;
+    let compaction_enabled = d.state.config().chat.compaction.enabled;
 
     // Largest `prompt_tokens` seen across this turn's rounds — a
     // model-tokenizer-accurate measure of how big the replayed context has
@@ -834,7 +835,7 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
     let mut tool_budget = ToolResultBudget::for_window(
         crate::server::compaction::model_context_window(&d.state, &real_model)
             .await
-            .unwrap_or(d.state.config.chat.compaction.default_context_window),
+            .unwrap_or(d.state.config().chat.compaction.default_context_window),
     );
     tracing::debug!(
         model = %real_model,
@@ -1507,7 +1508,7 @@ async fn build_request_context(
     // — domains, not tools, to keep the hint cheap. The model still calls
     // `enable_tools` for the exact keys; connected MCP integrations and skills
     // are listed separately below, so they're excluded here.
-    let domains = crate::server::tools::catalog::capability_domains(d.state.tools.as_ref());
+    let domains = crate::server::tools::catalog::capability_domains(d.state.tools().as_ref());
     let domains_line = if domains.is_empty() {
         String::new()
     } else {

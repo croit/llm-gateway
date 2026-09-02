@@ -3,11 +3,21 @@
 # Install:
 #   sudo cp deploy/quadlet/gateway.container /etc/containers/systemd/
 #   sudo cp deploy/quadlet/gateway.volume    /etc/containers/systemd/
-#   sudo cp deploy/quadlet/gateway.example.env /etc/gateway/gateway.env
-#   sudo cp gateway.example.toml             /etc/gateway/config.toml
-#   sudo $EDITOR /etc/gateway/{gateway.env,config.toml}
+#   sudo mkdir -p /etc/gateway
+#   printf 'GATEWAY_SESSION_KEY=%s\n' "$(openssl rand -hex 32)" \
+#     | sudo tee /etc/gateway/gateway.env >/dev/null
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now gateway.service
+#
+# That is the whole install. No config file: upstream pools, models, groups
+# and the OIDC provider are all configured in the browser and stored in the
+# database. Open the gateway's URL and the setup wizard takes it from there.
+#
+# There is exactly ONE thing you must supply, and it is generated above:
+# GATEWAY_SESSION_KEY. It signs browser sessions and derives the key that
+# seals every secret in the database, so generate it ONCE and keep it — losing
+# it logs everyone out and makes stored backend API keys, connector secrets and
+# OAuth tokens permanently unreadable. Back it up with the volume.
 #
 # Quadlet generates `gateway.service` from this file. `Volume=gateway.volume`
 # resolves against `gateway.volume` (the sibling unit in this directory) and
@@ -21,6 +31,11 @@
 # Rolling back a bad release is just the inverse — bump the tag back and
 # `systemctl restart`. The DB lives in the named volume, so config + state
 # survive image swaps.
+#
+# Locked out (IdP moved, no group maps to admin)? Reopen the setup wizard
+# without disturbing anyone who is still using the gateway:
+#   sudo podman exec gateway restore-setup
+# It prints a one-time URL, valid for 30 minutes. See docs/auth.md.
 
 [Unit]
 Description=LLM Gateway (OpenAI-compatible reverse proxy)
@@ -43,29 +58,41 @@ PublishPort=127.0.0.1:8080:8080
 # Code-execution sandbox (optional): no network change needed here. The
 # sandbox-runner is a host service bound to this host's podman bridge gateway IP
 # (usually 10.88.0.1), which the gateway already reaches over the default
-# network. Just set `[sandbox] runner_url = "http://10.88.0.1:9000"` in
-# config.toml and deploy the runner (deploy/sandbox/setup-sandbox.sh). See
-# docs/sandbox.md.
+# network. Just set `[sandbox] runner_url = "http://10.88.0.1:9000"` in an
+# optional config.toml (see below) and deploy the runner
+# (deploy/sandbox/setup-sandbox.sh). See docs/sandbox.md.
 
-# GATEWAY_SESSION_KEY + GATEWAY_OIDC_CLIENT_SECRET (and any
-# `<POOL>_API_KEY_…` env vars referenced from `config.toml`) live here.
+# GATEWAY_SESSION_KEY lives here — the one required variable.
 EnvironmentFile=/etc/gateway/gateway.env
 
-# Bind-mount the config read-only. `:z` relabels for SELinux; drop it on
-# distros that don't ship SELinux (Debian/Ubuntu) — harmless either way.
-Volume=/etc/gateway/config.toml:/etc/gateway/config.toml:ro,z
-
-# Persistent SQLite + session store. The named volume is declared in the
-# sibling `gateway.volume` unit. The container image runs as uid 1000
-# (`gateway`); `:U` tells Podman to chown the volume to the runtime user on
-# mount, otherwise SQLite gets EACCES on first start because Podman creates
-# named volumes root-owned by default.
+# Persistent SQLite + RAG index store. The named volume is declared in the
+# sibling `gateway.volume` unit; the image's GATEWAY_DATA_DIR already points
+# every writable path at this mount, so nothing else needs configuring. The
+# container runs as uid 1000 (`gateway`); `:U` tells Podman to chown the volume
+# to the runtime user on mount, otherwise SQLite gets EACCES on first start
+# because Podman creates named volumes root-owned by default.
 Volume=gateway.volume:/var/lib/gateway:z,U
 
-# Override the default `gateway.sqlite` (relative path → CWD which is /app
-# and would be ephemeral) to live on the persistent volume.
-Environment=GATEWAY_CONFIG=/etc/gateway/config.toml
 Environment=RUST_LOG=info,gateway=info,gateway_core=info,gateway_features=info,gateway_runtime=info,gateway_tools=info,gateway_web=info
+
+# OPTIONAL config file. You almost certainly do not need one. Pools, backends,
+# models, groups, OIDC and search are configured in the admin UI, and every
+# remaining operator setting — OCR, compaction, attachment storage, sandbox,
+# ComfyUI, RAG, skills, Typst, GeoIP, usage, limits, feedback, push — is at
+# /admin/settings. Only [db] and [gateway] still come from a file at all, and
+# this image already covers the paths through GATEWAY_DATA_DIR. The listen socket
+# is IP/PORT, set in the image.
+#
+# A file is still worth mounting for one thing: migrating an older deployment.
+# Whatever it contains is imported into the database on the first boot and
+# ignored from then on. Drop it in and uncomment the mount below —
+# /etc/gateway/config.toml is one of the paths the gateway probes on its own, so
+# no GATEWAY_CONFIG is needed. `:z` relabels for SELinux; drop it on distros
+# that don't ship SELinux (Debian/Ubuntu).
+#
+#   sudo cp gateway.example.toml /etc/gateway/config.toml
+#
+#Volume=/etc/gateway/config.toml:/etc/gateway/config.toml:ro,z
 
 # Drop all caps, no-new-privs, read-only root FS. The volume above + a small
 # tmpfs cover everything that needs to be writable.

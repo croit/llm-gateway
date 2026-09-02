@@ -26,6 +26,11 @@ deploy/gateway.toml
 
 # Dev-mode SQLite (created by `mise run dev` when no $GATEWAY_CONFIG is set)
 gateway.sqlite*
+
+# Persistent dev session key, generated on first `mise run dev`. It is a real
+# secret (it derives the at-rest key that seals the local DB's stored
+# credentials) — never commit it.
+.gateway-dev-session-key
 /.playwright-cli/
 
 # Local dev RAG storage: the `[rag] data_dir` tree (default ./data/rag).

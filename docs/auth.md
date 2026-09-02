@@ -11,20 +11,65 @@ We use the `openidconnect` crate (PKCE, discovery, code exchange) against any st
 
 ### Config
 
+The provider lives in the **database**, entered through the setup wizard at
+`/setup` (see below). Issuer, client id, scopes and the roles claim are plain
+`app_settings` rows; the client secret is sealed with the at-rest key
+(`gateway_core::server::setup`).
+
+The legacy `[oidc]` block in `gateway.toml` is import-only. On the first boot
+after the setup-wizard release, `setup::import_config_once` copies it into the
+database (resolving `client_secret_env` to its value), marks setup complete —
+the deployment demonstrably already worked — and ignores the block from then
+on. Nothing to do when upgrading; a fresh install has no file and lands in the
+wizard.
+
 ```toml
-# gateway.toml
+# gateway.toml — legacy, import-only. New installs need none of this.
 [oidc]
 issuer = "https://id.example.com/realms/company"
 client_id = "llm-gateway"
-# client_secret comes from $GATEWAY_OIDC_CLIENT_SECRET — never the config file
-redirect_uri = "https://gateway.example.com/auth/callback"
-scopes = ["openid", "profile", "email", "groups"]
-# Optional: which OIDC claim carries role memberships.
-# We map claim values → internal role IDs in [rbac.mapping] (see tools-rbac.md).
+client_secret_env = "GATEWAY_OIDC_CLIENT_SECRET"
+scopes = ["profile", "email", "groups"]
 roles_claim = "groups"
 ```
 
-Required env: `GATEWAY_OIDC_CLIENT_SECRET`.
+### Setup wizard (`/setup`)
+
+Two screens, one proof. Screen 1 takes the public URL and the provider's
+issuer/client id/secret and shows the exact `{public_url}/auth/callback`
+redirect URI to whitelist. Submitting runs a **genuine authorization-code round
+trip** — through that same production redirect URI, marked by
+`pending_logins.purpose = 'setup'` so `/auth/callback` routes it to the wizard
+instead of minting a session. Screen 2 shows the verified ID token's claims and
+asks which claim value grants admin.
+
+The round trip is the point: discovery only proves a URL answers. It does not
+prove the client secret, the redirect whitelisting, or — the thing nobody can
+guess — what the provider calls its groups claim and what values it contains.
+There is no way to reach screen 2 without a login that worked.
+
+Finishing stores the provider, creates an `admins` group (`is_admin`) mapped to
+the chosen value plus a default `users` group, and calls
+`AppState::set_runtime` — so the live OIDC client and public URL are swapped in
+without a restart.
+
+**Access.** `SetupAccess::FirstRun` (nothing configured) is open: there is no
+account to authenticate against and nothing configured worth stealing.
+`SetupAccess::Closed` (configured) 404s. `SetupAccess::Recovery` is opened by
+`restore-setup` on the host for 30 minutes and needs the one-time token that
+command prints, carried afterwards by a `gw_setup` cookie scoped to `/setup`.
+
+**Recovery is not first-run mode.** With a recovery window open the gateway
+keeps serving normally — chats, `/v1`, existing sessions — and only `/setup`
+becomes reachable again. Conflating the two would let one locked-out admin take
+a production gateway offline for everyone else. `setup_wizard.rs` pins this.
+
+The wizard cannot help if the provider itself is gone, since it proves a
+provider by signing in through it. `[gateway].bootstrap_admin_groups` remains
+the break-glass anchor that does not depend on the group tables.
+
+Required env: none for OIDC. `GATEWAY_SESSION_KEY` is required for the gateway
+to boot at all (it signs sessions and derives the at-rest key).
 
 ### Browser flow (web UI users)
 
@@ -43,8 +88,12 @@ Sessions are a hand-rolled `SessionStore` (see `rama_server::session`): an HMAC-
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET  | `/auth/login`        | none | Start browser OIDC flow |
-| GET  | `/auth/callback`     | state cookie | OIDC redirect target |
+| GET  | `/auth/callback`     | state cookie | OIDC redirect target — for a sign-in *and* for the wizard's test login, told apart by `pending_logins.purpose` |
 | POST | `/auth/logout`       | session | Clear session, revoke gateway tokens (optional) |
+| GET  | `/setup`             | open on a first run; one-time token in recovery | Setup wizard |
+| POST | `/setup/test`        | same | Stash the entered provider and start the test login |
+| POST | `/setup/restart`     | same | Discard the proven login, back to screen 1 |
+| POST | `/setup/finish`      | same | Persist, create the admin group, swap the live client in |
 
 ## Ongoing API auth (gateway tokens)
 

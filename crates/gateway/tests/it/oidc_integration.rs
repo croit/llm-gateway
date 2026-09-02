@@ -43,18 +43,18 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const KEY_ID: &str = "test-key";
+pub(crate) const KEY_ID: &str = "test-key";
 const CLIENT_ID: &str = "gateway-test-client";
 const CLIENT_SECRET: &str = "test-client-secret";
 const CLIENT_SECRET_ENV: &str = "GATEWAY_OIDC_TEST_SECRET";
-const SUBJECT: &str = "alice-sub";
-const EMAIL: &str = "alice@example.com";
+pub(crate) const SUBJECT: &str = "alice-sub";
+pub(crate) const EMAIL: &str = "alice@example.com";
 const NAME: &str = "Alice";
 /// A deep-link target (e.g. a shared chat) handed to `/auth/login`; the dance
 /// must carry it all the way to the post-callback redirect.
 const RETURN_TO: &str = "/chat/shared-deadbeef-1111";
 
-fn base64url_nopad(bytes: &[u8]) -> String {
+pub(crate) fn base64url_nopad(bytes: &[u8]) -> String {
     // Hand-rolled to avoid pulling base64 in as a dev-dep — same alphabet
     // as `rama_server::session::base64url_nopad`.
     const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -87,7 +87,7 @@ fn base64url_nopad(bytes: &[u8]) -> String {
 }
 
 /// Build a JWK (RFC 7517) describing the public half of `key`.
-fn jwk_for(key: &RsaPublicKey) -> serde_json::Value {
+pub(crate) fn jwk_for(key: &RsaPublicKey) -> serde_json::Value {
     json!({
         "kty": "RSA",
         "alg": "RS256",
@@ -101,7 +101,12 @@ fn jwk_for(key: &RsaPublicKey) -> serde_json::Value {
 /// Sign an RS256 ID token with the test private key. The pkcs8 → pkcs1
 /// detour is because jsonwebtoken's `EncodingKey::from_rsa_pem` wants
 /// PKCS#1, but the rsa crate emits PKCS#8 by default.
-fn sign_id_token(private_key: &RsaPrivateKey, issuer: &str, audience: &str, nonce: &str) -> String {
+pub(crate) fn sign_id_token(
+    private_key: &RsaPrivateKey,
+    issuer: &str,
+    audience: &str,
+    nonce: &str,
+) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -149,7 +154,7 @@ async fn state_with_oidc(idp_uri: &str, roles_claim: Option<&str>) -> RamaState 
         oidc: Some(oidc_config.clone()),
         ..Default::default()
     };
-    config.gateway.public_url = "http://gateway.test".into();
+    config.gateway.public_url_import_only = "http://gateway.test".into();
 
     let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
     let registry = upstreams::UpstreamRegistry::new(&Default::default()).unwrap();
@@ -169,11 +174,20 @@ async fn state_with_oidc(idp_uri: &str, roles_claim: Option<&str>) -> RamaState 
         backend: vec![],
     };
 
-    let oidc = OidcClient::build(&oidc_config, &config.gateway.public_url)
+    let params = oidc_config
+        .to_params()
+        .expect("client secret env var was planted above");
+    let public_url = config.public_url_fallback().to_string();
+    let oidc = OidcClient::build(&params, &public_url)
         .await
         .expect("build OidcClient against mock IdP");
 
-    let app = AppState::new(config, pool.clone(), registry, tools, rbac).with_oidc(oidc);
+    let app = AppState::new(config, pool.clone(), registry, tools, rbac);
+    app.set_runtime(gateway_runtime::server::state::RuntimeSettings {
+        public_url: public_url.clone(),
+        oidc: Some(oidc),
+        setup_completed: true,
+    });
     let sessions = SessionStore::new(pool, common::TEST_SECRET);
     RamaState::new(
         app,
@@ -188,32 +202,11 @@ async fn full_oidc_dance_completes_and_stamps_the_session() {
     let private_key = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
     let public_key = RsaPublicKey::from(&private_key);
 
-    let idp = MockServer::start().await;
+    // The token endpoint stays unmocked at first — we plug in the matching
+    // response *after* observing the nonce the gateway generates, so the ID
+    // token's `nonce` claim matches.
+    let idp = crate::setup_wizard::mock_idp(&public_key).await;
     let issuer = idp.uri();
-    let discovery = json!({
-        "issuer": issuer,
-        "authorization_endpoint": format!("{issuer}/auth"),
-        "token_endpoint": format!("{issuer}/token"),
-        "jwks_uri": format!("{issuer}/jwks"),
-        "userinfo_endpoint": format!("{issuer}/userinfo"),
-        "response_types_supported": ["code"],
-        "subject_types_supported": ["public"],
-        "id_token_signing_alg_values_supported": ["RS256"],
-    });
-    let jwks = json!({"keys": [jwk_for(&public_key)]});
-    Mock::given(method("GET"))
-        .and(path("/.well-known/openid-configuration"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(discovery))
-        .mount(&idp)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/jwks"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(jwks))
-        .mount(&idp)
-        .await;
-    // The token endpoint stays unmocked at first — we'll plug in the
-    // matching response *after* we've observed the nonce the gateway
-    // generates, so the ID token's `nonce` claim matches.
 
     let state = state_with_oidc(&issuer, Some("groups")).await;
     let app = router(Arc::new(state.clone()));

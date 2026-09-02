@@ -58,3 +58,4 @@ error-internal-heading = Internal error
 error-forbidden-heading = Forbidden
 
 nav-my-skills = My Skills
+nav-settings = Settings

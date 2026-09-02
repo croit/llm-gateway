@@ -42,7 +42,11 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum AttachmentError {
     #[error("chat attachments are not configured (set [chat.s3] in gateway.toml)")]
     NotConfigured,
-    #[error("missing credential env var `{0}`")]
+    /// Names the setting that is empty (e.g. `chat.s3.access_key`), not an
+    /// env var: the credentials moved into sealed settings rows, and an
+    /// operator chasing this message needs the field to fill in at
+    /// `/admin/settings`, not a variable that may no longer exist.
+    #[error("no value for setting `{0}`")]
     MissingCredential(String),
     #[error("filename `{0}` rejected (must not be empty or contain `/`)")]
     BadFilename(String),
@@ -204,10 +208,10 @@ pub async fn delete(cfg: &S3Config, turn_id: &str, filename: &str) -> Result<(),
 fn open_bucket(cfg: &S3Config) -> Result<Bucket, AttachmentError> {
     let access = cfg
         .access_key()
-        .ok_or_else(|| AttachmentError::MissingCredential(cfg.access_key_env.clone()))?;
+        .ok_or_else(|| AttachmentError::MissingCredential("chat.s3.access_key".into()))?;
     let secret = cfg
         .secret_key()
-        .ok_or_else(|| AttachmentError::MissingCredential(cfg.secret_key_env.clone()))?;
+        .ok_or_else(|| AttachmentError::MissingCredential("chat.s3.secret_key".into()))?;
     let creds = Credentials::new(Some(&access), Some(&secret), None, None, None)?;
     let region = Region::Custom {
         region: cfg.region.clone(),

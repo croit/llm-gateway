@@ -45,10 +45,10 @@ impl ToggleCtx {
 /// panel resolve the row list through, so they never drift.
 pub fn entries_for_roles(state: &RamaState, roles: &[String]) -> Vec<ToolEntry> {
     let role_ids = state.rbac.role_ids_for(roles);
-    let mut allowed = state.rbac.allowed_tools(&role_ids, &state.tools);
+    let mut allowed = state.rbac.allowed_tools(&role_ids, &state.tools());
     state.expand_comfyui_tools(&mut allowed, &role_ids);
     let comfyui_metas = state
-        .comfyui
+        .comfyui()
         .as_ref()
         .map(|h| {
             h.store
@@ -64,9 +64,9 @@ pub fn entries_for_roles(state: &RamaState, roles: &[String]) -> Vec<ToolEntry> 
         })
         .unwrap_or_default();
     catalog::entries(
-        &state.tools,
+        &state.tools(),
         &allowed,
-        &state.typst_templates,
+        &state.typst_templates(),
         &comfyui_metas,
     )
 }

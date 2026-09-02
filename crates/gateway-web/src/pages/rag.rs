@@ -444,10 +444,7 @@ pub async fn rag_sync_token(
             return toast(FlashKind::Error, t(lang, "rag-toast-save-failed"));
         }
     };
-    let url = format!(
-        "{}/hooks/rag/{token}",
-        state.config.gateway.public_url.trim_end_matches('/')
-    );
+    let url = format!("{}/hooks/rag/{token}", state.public_url());
     row_patch(
         &state,
         lang,

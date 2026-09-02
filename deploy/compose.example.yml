@@ -26,10 +26,20 @@
 # this file's directory (deploy/), so env/config files live in deploy/.
 #
 # ── Setup (from the repo root) ──────────────────────────────────────────────
-#   cp deploy/quadlet/gateway.example.env               deploy/gateway.env
+#   printf 'GATEWAY_SESSION_KEY=%s\n' "$(openssl rand -hex 32)" > deploy/gateway.env
+#   docker compose -f deploy/compose.example.yml up -d gateway
+#
+# Then open http://localhost:8080 — the setup wizard asks for your OIDC provider,
+# tests the login for real, and hands you an admin account. No config file.
+#
+# Locked out later (IdP moved, no group maps to admin)? Reopen the wizard
+# without disturbing anyone still using the gateway:
+#   docker compose -f deploy/compose.example.yml exec gateway restore-setup
+# It prints a one-time URL, valid for 30 minutes. See docs/auth.md.
+#
+# For the Google Workspace connector, additionally:
 #   cp deploy/quadlet/google-workspace-mcp.example.env  deploy/google-workspace-mcp.env
-#   cp gateway.example.toml                             deploy/gateway.toml
-#   $EDITOR deploy/gateway.env deploy/google-workspace-mcp.env deploy/gateway.toml
+#   $EDITOR deploy/google-workspace-mcp.env
 #
 # ── Local testing on Docker Desktop (recommended) ──────────────────────────
 # Run ONLY the Workspace MCP here and keep the gateway native (`mise run dev`).
@@ -61,17 +71,26 @@ services:
     # Loopback only — front with a TLS-terminating reverse proxy in production.
     ports:
       - "127.0.0.1:8080:8080"
-    # GATEWAY_SESSION_KEY, GATEWAY_OIDC_CLIENT_SECRET, GATEWAY_ENCRYPTION_KEY, and any
-    # per-upstream <POOL>_API_KEY referenced from gateway.toml.
+    # Holds GATEWAY_SESSION_KEY — the one variable a deployment must set.
+    # Everything else (pools, models, groups, OIDC) is configured in the browser
+    # and stored in the database.
     env_file:
       - gateway.env
     environment:
-      GATEWAY_CONFIG: /etc/gateway/config.toml
       RUST_LOG: info,gateway=info,gateway_core=info,gateway_features=info,gateway_runtime=info,gateway_tools=info,gateway_web=info
     volumes:
-      # Mind [db].path = /var/lib/gateway/gateway.sqlite and, on Docker Desktop,
-      # point model upstreams in gateway.toml at host.docker.internal.
-      - ./gateway.toml:/etc/gateway/config.toml:ro
+      # The image's GATEWAY_DATA_DIR=/var/lib/gateway already puts the SQLite
+      # database and the RAG index store on this volume — mounting it is all
+      # that persistence needs.
+      #
+      # OPTIONAL config file. Not needed: OCR, ComfyUI, the sandbox, Typst,
+      # skills, GeoIP and RAG tuning all live at /admin/settings now. Mount one
+      # only to migrate an older install — its contents are imported into the
+      # database on the first boot and ignored afterwards.
+      # /etc/gateway/config.toml is probed automatically, so uncommenting the
+      # mount is enough. On Docker Desktop, point model upstreams at
+      # host.docker.internal.
+      #- ./gateway.toml:/etc/gateway/config.toml:ro
       - gateway-data:/var/lib/gateway
     read_only: true
     tmpfs:
@@ -217,7 +236,9 @@ services:
       - sandbox
     restart: unless-stopped
     # Reachable by the gateway over the compose network as http://sandbox-runner:9000.
-    # Set this in gateway.toml:  [sandbox]\n  runner_url = "http://sandbox-runner:9000"
+    # Point the gateway at it under Code sandbox at /admin/settings:
+    # sandbox.enabled = on, sandbox.runner_url = http://sandbox-runner:9000
+    # (a restart applies it — the field is marked accordingly).
     # NOT published to the host — it executes untrusted code.
     expose:
       - "9000"

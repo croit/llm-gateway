@@ -158,8 +158,12 @@ pub(crate) fn run_in_sandbox_desc(egress: bool) -> String {
 pub struct SandboxClient {
     cfg: Arc<SandboxConfig>,
     /// Gateway public base URL, for building absolute artifact download
-    /// links on the API path. Cloned from `config.gateway.public_url`.
-    public_url: String,
+    /// links on the API path.
+    ///
+    /// The live handle, not a snapshot: the setup wizard can change the public
+    /// URL after this client is built, and a frozen copy would hand users
+    /// download links pointing at the boot-time fallback.
+    runtime: crate::server::state::RuntimeHandle,
     http: reqwest::Client,
     /// What the runner said about egress on the last probe. Three-state, and
     /// the distinction matters: see [`SandboxClient::egress_available`].
@@ -174,7 +178,7 @@ const EGRESS_YES: u8 = 1;
 const EGRESS_NO: u8 = 2;
 
 impl SandboxClient {
-    pub fn new(cfg: Arc<SandboxConfig>, public_url: String) -> Arc<Self> {
+    pub fn new(cfg: Arc<SandboxConfig>, runtime: crate::server::state::RuntimeHandle) -> Arc<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .user_agent(concat!(
@@ -186,7 +190,7 @@ impl SandboxClient {
             .unwrap_or_default();
         Arc::new(Self {
             cfg,
-            public_url,
+            runtime,
             http,
             egress: std::sync::atomic::AtomicU8::new(EGRESS_UNKNOWN),
         })
@@ -484,7 +488,7 @@ impl SandboxClient {
             .map_err(|e| e.to_string())?;
         let url = format!(
             "{}/v1/sandbox/files/{}/{}",
-            self.public_url.trim_end_matches('/'),
+            self.runtime.load().public_url,
             run,
             urlencode_segment(&safe),
         );
@@ -1225,7 +1229,7 @@ mod tests {
                 timeout_secs: 5,
                 max_artifact_bytes: 1024,
             }),
-            "https://gw.example".into(),
+            crate::server::state::RuntimeSettings::new_handle("https://gw.example"),
         )
     }
 
@@ -1238,8 +1242,10 @@ mod tests {
             endpoint: "http://127.0.0.1:1".into(),
             region: "us-east-1".into(),
             bucket: "b".into(),
-            access_key_env: "SANDBOX_STAGE_TEST_UNSET".into(),
-            secret_key_env: "SANDBOX_STAGE_TEST_UNSET".into(),
+            access_key: None,
+            secret_key: None,
+            access_key_env: None,
+            secret_key_env: None,
             key_prefix: "chat-attachments".into(),
         })
     }
@@ -1650,7 +1656,7 @@ mod tests {
                 timeout_secs: 120,
                 max_artifact_bytes: 1024,
             }),
-            "https://gw.example".into(),
+            crate::server::state::RuntimeSettings::new_handle("https://gw.example"),
         );
         assert!(RunInSandbox(real).max_duration().unwrap() > std::time::Duration::from_secs(30));
     }

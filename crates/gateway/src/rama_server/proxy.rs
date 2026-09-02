@@ -268,7 +268,7 @@ fn proxy_tool_ctx(
         roles,
         db: state.db.clone(),
         s3: state
-            .config
+            .config()
             .chat
             .s3
             .as_ref()
@@ -277,7 +277,7 @@ fn proxy_tool_ctx(
         assistant_turn_id: None,
         session_id: None,
         client_ip,
-        geoip: state.geoip.clone(),
+        geoip: state.geoip(),
         // No live turn / browser to prompt on the proxy paths.
         chat_feedback: None,
         // No turn → nothing to reserve filenames against. The upload tools
@@ -297,13 +297,13 @@ fn proxy_tool_ctx(
         // multi-round `run_in_sandbox` reuses one container. `None` when the
         // sandbox isn't configured. Released when the loop ends (see runner).
         sandbox_lease: state
-            .sandbox_client
+            .sandbox_client()
             .clone()
             .map(gateway_runtime::server::tools::sandbox::SandboxLease::new),
         // The browser session's own container (see `ToolContext`), only where
         // the runner reports egress. Released with the loop, below.
         browser_lease: state
-            .sandbox_client
+            .sandbox_client()
             .clone()
             .filter(|c| c.egress_available())
             .map(gateway_runtime::server::tools::sandbox::SandboxLease::new),
@@ -602,11 +602,14 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
 
     // Reuse the layer built once above (same ids we advertised) for dispatch.
     let comfyui = state
-        .comfyui
+        .comfyui()
         .as_ref()
         .map(|h| gateway_runtime::server::comfyui_tool::ComfyuiToolSource::new((**h).clone()));
+    // Bound, not chained: `tools()` returns an owned snapshot and the composite
+    // source borrows from it for the rest of the request.
+    let tools = state.tools();
     let tool_source = gateway_runtime::server::tools::mcp::manager::CompositeToolSource::new(
-        state.tools.as_ref(),
+        tools.as_ref(),
         &user_mcp,
     )
     .with_comfyui(comfyui.as_ref());
@@ -2067,11 +2070,14 @@ async fn forward_streaming_with_tools(
     // Use the layer built once by the caller (same ids it advertised) for
     // injection here and for dispatch inside the loop.
     let comfyui = state
-        .comfyui
+        .comfyui()
         .as_ref()
         .map(|h| gateway_runtime::server::comfyui_tool::ComfyuiToolSource::new((**h).clone()));
+    // Bound, not chained: `tools()` returns an owned snapshot and the composite
+    // source borrows from it for the rest of the request.
+    let tools = state.tools();
     let tool_source = gateway_runtime::server::tools::mcp::manager::CompositeToolSource::new(
-        state.tools.as_ref(),
+        tools.as_ref(),
         &user_mcp,
     )
     .with_comfyui(comfyui.as_ref());
@@ -2286,11 +2292,14 @@ async fn drive_streaming_tool_loop_inner(
     // The caller's connected-connector MCP tools, unioned onto the registry so
     // the ownership split + dispatch below recognise + run them too.
     let comfyui = state
-        .comfyui
+        .comfyui()
         .as_ref()
         .map(|h| gateway_runtime::server::comfyui_tool::ComfyuiToolSource::new((**h).clone()));
+    // Bound, not chained: `tools()` returns an owned snapshot and the composite
+    // source borrows from it for the rest of the request.
+    let tools = state.tools();
     let tool_source = gateway_runtime::server::tools::mcp::manager::CompositeToolSource::new(
-        state.tools.as_ref(),
+        tools.as_ref(),
         &user_mcp,
     )
     .with_comfyui(comfyui.as_ref());

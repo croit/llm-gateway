@@ -86,7 +86,7 @@ The UI is fully localized — English, German, French, Spanish, Russian, and Chi
 | ![The /admin/upstreams page: one card per pool showing its kind and picker-strategy badges, GDPR/NDA/limits compliance flags, and a live health row per backend — status, base URL, in-flight load against capacity, advertised models, and a request sparkline — with inline Edit pool / Delete controls and Add pool / Add backend buttons.](docs/img/upstreams.png) | ![The RAG page: a form to index a new collection from a git repo (embedding model, branch, include/exclude globs, chunk size) and a list of existing collections with their indexing status.](docs/img/rag.png) |
 | **Upstreams** (`/admin/upstreams`) — one page for pools and backends: live health, in-flight load, and discovered models per pool, with inline add/edit/delete of pools and backends (API key stored encrypted, so a new backend goes live on "Apply changes" without a restart). A sticky bar counts unapplied topology edits until you reload the runtime registry. | **RAG** (`/rag`) — index a codebase from a git URL and watch it go from *pending* to *ready*. |
 
-There's also `/tokens` (mint, rotate, and revoke your `gwk_…` API tokens — and scope each token to a subset of your tools), `/usage` (your own request/token usage, plus spend when per-model prices are set), `/memory` (view and edit what the assistant has remembered about you), `/scheduled` (prompts that run on a cron schedule — see [Scheduled actions](#scheduled-actions)), `/admin/models` (server-wide sampling defaults, per-model reasoning budgets, per-model context windows that drive [conversation compaction](#conversation-compaction), per-model **prices** (input/output per 1M tokens) that turn token usage into spend on `/usage`, the per-feature **default model** pre-selected for chat, voice, image generation, and the RAG embedding picker, and the **web-search backend** the `search_web` tool uses — SearXNG URL or Brave API key, the key encrypted at rest), `/admin/limits` (rate limits & quotas — see below), and `/admin/users` (registered users with their resolved roles). The users page can also let an admin **impersonate** another user for debugging — every impersonation is audited and shows a persistent banner, and an impersonation session expires 8 hours after it started (it never gets the sliding renewal an ordinary login does). Impersonation is **opt-in**: it's off unless you set `[gateway].allow_impersonation = true` (default `false`), in which case the Impersonate buttons appear and `POST /admin/users/impersonate` is accepted; otherwise the buttons are hidden and that endpoint returns 403.
+There's also `/tokens` (mint, rotate, and revoke your `gwk_…` API tokens — and scope each token to a subset of your tools), `/usage` (your own request/token usage, plus spend when per-model prices are set), `/memory` (view and edit what the assistant has remembered about you), `/scheduled` (prompts that run on a cron schedule — see [Scheduled actions](#scheduled-actions)), `/admin/models` (server-wide sampling defaults, per-model reasoning budgets, per-model context windows that drive [conversation compaction](#conversation-compaction), per-model **prices** (input/output per 1M tokens) that turn token usage into spend on `/usage`, the per-feature **default model** pre-selected for chat, voice, image generation, and the RAG embedding picker, and the **web-search backend** the `search_web` tool uses — SearXNG URL or Brave API key, the key encrypted at rest), `/admin/limits` (rate limits & quotas — see below), and `/admin/users` (registered users with their resolved roles). The users page can also let an admin **impersonate** another user for debugging — every impersonation is audited and shows a persistent banner, and an impersonation session expires 8 hours after it started (it never gets the sliding renewal an ordinary login does). Impersonation is **opt-in**: it's off unless you enable `gateway.allow_impersonation` at `/admin/settings` (default off), in which case the Impersonate buttons appear and `POST /admin/users/impersonate` is accepted; otherwise the buttons are hidden and that endpoint returns 403.
 
 ![The /admin/models page: a "Default models" card with per-feature model pickers (chat, voice, image generation) above a filterable list of every advertised model — each row showing its kind, input/output price, context window, reasoning settings, and whether it has been configured, expandable for the full per-model editor.](docs/img/models.png)
 
@@ -186,10 +186,16 @@ You need [mise](https://mise.jdx.dev/), which manages the Rust + Node toolchains
 
 ```bash
 mise install                      # Rust 1.95 + Node 24
-cp gateway.example.toml gateway.toml
-$EDITOR gateway.toml              # set [oidc] to sign in + an admin role in [rbac]; add backends in the UI after
 mise run dev                      # runs the gateway (debug build) on http://localhost:8080
 ```
+
+No config file needed: `mise run dev` generates a persistent dev session key on
+first run, and the gateway serves a **setup wizard** at
+<http://localhost:8080/setup> that asks for your OIDC provider, proves it with a
+real sign-in, and lets you pick which claim value grants admin. Everything else
+an operator configures — OCR, compaction, attachment storage, the code sandbox,
+ComfyUI, RAG, skills, Typst, GeoIP, usage, limits, feedback and Web Push — is at
+`/admin/settings`, so no `gateway.toml` is needed at all.
 
 If you're editing the UI, run the asset watchers in separate terminals (the committed bundles mean these are optional for plain backend work):
 
@@ -198,39 +204,69 @@ mise run watch-css                # rebuild app.css on change
 mise run watch-js                 # rebuild app.js on change
 ```
 
-Open <http://localhost:8080>. Signing in / minting tokens needs an `[oidc]` block (see below).
+Open <http://localhost:8080>. An unconfigured gateway sends you to `/setup`; once you finish the wizard, sign in and add backends at `/admin/upstreams`.
 
 **UI-only shortcut (no OIDC):** `mise run dev-ui` boots a real server with mock backends and a pre-seeded session, and prints a session cookie you can paste into a browser or Playwright.
 
 Full developer workflow: [`docs/dev-workflow.md`](docs/dev-workflow.md).
 
+## Setup wizard
+
+A fresh deployment needs **one** environment variable (`GATEWAY_SESSION_KEY`) and a writable volume. Everything else is configured in the browser.
+
+Until setup finishes, every page redirects to `/setup`, which asks two questions:
+
+1. **Your identity provider** — the gateway's public URL (pre-filled from the request that reached it) plus issuer, client id and client secret. It also shows the exact redirect URI to whitelist. Submitting starts a *real* authorization-code login against what you just typed; nothing is saved yet.
+2. **Who administers it** — you come back from your provider with a verified ID token, and the wizard shows you every claim it actually carried. Pick the claim value that should grant admin. This is why the wizard insists on a real sign-in first: the name of your groups claim and the shape of its values are not guessable, and getting them wrong is the classic way to end up locked out of your own gateway.
+
+Finishing writes the provider (client secret sealed with the at-rest key), creates an `admins` group mapped to the value you chose plus a default `users` group, and swaps the live OIDC client in — `/login` works on the very next request, with no restart.
+
+Existing deployments upgrade in place: on the first boot after this release, an `[oidc]` block in the config file is imported into the database once, the gateway marks itself configured, and the block is ignored from then on.
+
+### Recovering access
+
+Locked out — the IdP moved, or no group maps to admin? Reopen the wizard from the host:
+
+```bash
+docker compose exec gateway restore-setup     # compose
+podman exec gateway restore-setup             # quadlet
+```
+
+It prints a one-time link valid for 30 minutes. **The gateway keeps serving while that window is open**: chats, `/v1`, and existing sessions are untouched, and only `/setup` becomes reachable again — so fixing one admin's access never means an outage for everyone else. The link carries a token because, unlike a first run, there is now a live deployment worth protecting; you are already at a terminal reading the output, so copying it costs nothing.
+
+Recovery deletes nothing. Users, chats, pools and the current provider all survive, and the wizard comes up pre-filled with what is configured today.
+
+The one case it cannot fix is a provider that is gone entirely — the wizard proves a provider by signing in through it. Keep at least one group in `[gateway].bootstrap_admin_groups` if you want a break-glass admin that does not depend on the group tables.
+
 ## Configuration
 
-Configuration is a single TOML file — `gateway.toml` in the working directory, or wherever `$GATEWAY_CONFIG` points. [`gateway.example.toml`](gateway.example.toml) is the fully-commented reference; copy it and trim to taste.
+There is **no required configuration file**. Everything an operator configures lives in the database and is edited in the browser: pools, backends and models at `/admin/*`, groups at `/admin/groups`, the OIDC provider at `/setup`, and the remaining operator settings — OCR, conversation compaction, attachment storage, the code sandbox, ComfyUI, RAG, skills, Typst, GeoIP, usage, limits, the feedback widget, Web Push, and session/token lifetimes — at **`/admin/settings`**, grouped into five tabs.
 
-**Secrets never live in the file.** The config holds the *names* of environment variables (e.g. `session_key_env = "GATEWAY_SESSION_KEY"`); the gateway reads the actual values from its own environment at startup.
+**Changes apply immediately.** A save re-derives the affected clients, stores and tool registrations and swaps them in, so the new value is in force on the next request — no restart, and no config file. Five fields are the exception, badged `restart` in the editor: `rag.enabled`, `rag.data_dir`, `rag.clone_concurrency`, `comfyui.base_url` and `comfyui.content_dir`. Each of those owns a long-running background worker (the indexer, the ComfyUI job scheduler), and replacing one means stopping work that is in flight — an aborted ComfyUI poll can leave a job row pending whose asset is never fetched. A restart is the clean way to quiesce that. Saving one leaves a banner on the page until the process comes back, so the person who restarts the container sees what is waiting on them. Every label, card title and line of help text is translated into all six UI languages, and each field also prints the TOML key it replaces underneath, so the mapping from an old config file stays one-to-one and greppable; secrets entered there are sealed at rest.
+
+A `gateway.toml` is still read if present — `gateway.toml` in the working directory, or wherever `$GATEWAY_CONFIG` points — but a deployment no longer needs one at all. Both of the things it still carried have environment equivalents — `$GATEWAY_DB_PATH` for `[db].path` and `$GATEWAY_BOOTSTRAP_ADMIN_GROUPS` for the break-glass admin list — so the file's only remaining job is as a **one-time seed** when upgrading an older install. (The listen socket was never in it either; that is `$IP` / `$PORT`.) On the first boot after upgrading, every block that has moved is copied into the database and then ignored forever after, so an existing file-driven deployment upgrades in place without anyone touching it. [`gateway.example.toml`](gateway.example.toml) remains the annotated reference for that file.
+
+**Secrets never live in the file.** Where the file needs one it holds the *name* of an environment variable (e.g. `api_key_env = "GPU01_KEY"`) and the gateway reads the value from its own environment. Secrets entered at `/admin/settings` or `/setup` instead go into the database **sealed** under the at-rest key, which is why those fields take the credential directly.
 
 A minimal but complete config:
 
 ```toml
-[bind]
-host = "127.0.0.1"     # bind loopback; put a TLS-terminating reverse proxy in front
-port = 8080
-
 [db]
 path = "gateway.sqlite"
 
 [gateway]
 public_url          = "https://gateway.example.com" # external URL; used to build the OIDC callback
+# The four keys below are a SEED: imported once, then edited at /admin/settings
+# under these exact names.
 token_ttl_days      = 90
-session_key_env     = "GATEWAY_SESSION_KEY"          # names the env var holding a 64-hex (32-byte) key
 session_ttl_days    = 30                             # sliding idle timeout for browser logins (renewed on use)
 session_absolute_max_days = 90                       # hard cap since login; activity never extends it
 allow_impersonation = false                          # opt-in admin impersonation (default false); see below
 
-# Needed for sign-in + token minting. Without it, /auth/login and the /login
-# page don't work — and since you configure everything else through the signed-in
-# admin UI, this is what bootstraps a new install.
+# Seed only, and only for an upgrade: a NEW install configures its provider at
+# /setup in the browser instead. On the first boot after upgrading, this block is
+# copied into the database (its client secret resolved from the named env var),
+# after which /setup owns the provider and this block is ignored.
 [oidc]
 issuer            = "https://id.example.com/realms/company"
 client_id         = "llm-gateway"
@@ -264,8 +300,8 @@ skills = ["*"]
 
 **How you configure upstreams and models: through the admin UI, not this file.** Pools, backends, and per-model settings live in the database and are managed entirely at `/admin/*` — there is no TOML for them. A fresh install boots with no upstreams; the setup path for a new operator is:
 
-1. Write `gateway.toml` with the blocks above — `[oidc]` so you can sign in, and `[rbac]` + `[[roles]]` so your account resolves to an `admin = true` role.
-2. Start the gateway and sign in. Your account now reaches the admin UI.
+1. Start the gateway and open it. With nothing configured it sends you to `/setup`, where you enter your OIDC provider, prove it with a real sign-in, and pick the claim value that grants admin — no file involved. (An older deployment instead has its existing `[oidc]` and `[rbac]` blocks imported on that first boot, and skips the wizard.)
+2. Sign in. Your account now reaches the admin UI.
 3. At [`/admin/upstreams`](#the-built-in-web-ui), add a pool (chat / transcription / embedding / image / speech) and its backends — base URL, API key (stored encrypted), weight, max in-flight, aliases, per-pool compliance and rate-limit flags, and unknown-model / all-offline fallbacks. Click **Apply changes** and it goes live — no restart.
 4. At `/admin/models`, set per-model prices, reasoning budgets, context windows, capabilities, sampling defaults, the per-feature default model, and the web-search backend (SearXNG URL or Brave API key) that powers `search_web`.
 
@@ -274,14 +310,27 @@ Routing then needs no static table: the health probe reads each backend's `/mode
 The environment variables that config refers to:
 
 ```bash
-export GATEWAY_SESSION_KEY=$(openssl rand -hex 32)   # 32 random bytes, hex-encoded
-export GATEWAY_OIDC_CLIENT_SECRET=…                  # from your OIDC provider
+export GATEWAY_SESSION_KEY=$(openssl rand -hex 32)    # REQUIRED: 32 random bytes, hex-encoded
+export GATEWAY_DATA_DIR=/var/lib/gateway              # optional: where the DB + RAG store are written
+                                                      # (the container image already sets this)
+export IP=0.0.0.0                                     # optional: listen address, default 127.0.0.1
+export PORT=8080                                      # optional: listen port, default 8080
+                                                      # (the container image already sets both)
+export GATEWAY_DB_PATH=/var/lib/gateway/gateway.sqlite # optional: overrides the path derived from
+                                                      # GATEWAY_DATA_DIR. Setting this AND
+                                                      # [db].path to different values is fatal.
+export GATEWAY_BOOTSTRAP_ADMIN_GROUPS=platform-admins # optional: break-glass admin claim values,
+                                                      # comma-separated; unioned with the config
+                                                      # file's list, never replacing it
+export GATEWAY_OIDC_CLIENT_SECRET=…                   # from your OIDC provider
 export GATEWAY_ENCRYPTION_KEY=$(openssl rand -hex 32) # optional: 32-byte key encrypting the DB's at-rest secrets
 ```
 
-`GATEWAY_SESSION_KEY` must be **stable across restarts**. It is the HMAC key the session cookie is signed with, so a new key means every open cookie fails verification and every user is silently logged out. When the variable is unset the gateway generates a random one per process and logs an error saying so — if people report being logged out "every few hours", check that line in the journal first; it usually means the variable never made it into the service environment.
+`GATEWAY_SESSION_KEY` is **required — the gateway refuses to boot without it** — and must be **stable across restarts**. It is the HMAC key the session cookie is signed with, so a new key means every open cookie fails verification and every user is silently logged out. It also derives the at-rest key (below), so a lost key means lost secrets. Generate it once, keep it for the life of the deployment, and back it up alongside the database.
 
-`GATEWAY_ENCRYPTION_KEY` is optional: it's the AES-256-GCM key under which the gateway's database-stored secrets are encrypted — each user's MCP-connector OAuth tokens, admin-stored connector client secrets, and **upstream backend API keys entered through the admin UI**. If unset, the gateway derives a stable key from `GATEWAY_SESSION_KEY`; if *that's* also unset (dev), an ephemeral key is used and stored secrets won't survive a restart (users reconnect; re-enter backend keys). Set it explicitly if you want at-rest encryption decoupled from session-cookie signing. **Rotating this key invalidates already-stored ciphertext** — re-enter backend keys (or keep them in env vars via `api_key_env`) after a change. *(Formerly `GATEWAY_MCP_KEY`. If you set it explicitly, rename the env var to the same value and nothing else changes. If you relied on the key derived from `GATEWAY_SESSION_KEY` (env unset), the derivation changed in this release — reconnect MCP connectors and re-enter backend keys once after upgrading.)*
+Earlier releases fell back to an ephemeral per-process key and only logged an error. That produced a gateway that looked healthy while logging everyone out on every restart and losing every sealed secret — invisible until it had already cost data. If you are upgrading and see the new startup error, the variable never made it into the service environment; add it to the unit's `EnvironmentFile` and restart.
+
+`GATEWAY_ENCRYPTION_KEY` is optional: it's the AES-256-GCM key under which the gateway's database-stored secrets are encrypted — each user's MCP-connector OAuth tokens, admin-stored connector client secrets, and **upstream backend API keys entered through the admin UI**. If unset, the gateway derives a stable key from `GATEWAY_SESSION_KEY` — which is itself mandatory, so the derived key is always stable. Set it explicitly if you want at-rest encryption decoupled from session-cookie signing (that way the session key can be rotated without destroying stored secrets). **Rotating this key invalidates already-stored ciphertext** — re-enter backend keys (or keep them in env vars via `api_key_env`) after a change. *(Formerly `GATEWAY_MCP_KEY`. If you set it explicitly, rename the env var to the same value and nothing else changes. If you relied on the key derived from `GATEWAY_SESSION_KEY` (env unset), the derivation changed in this release — reconnect MCP connectors and re-enter backend keys once after upgrading.)*
 
 Optional blocks, each documented inline in `gateway.example.toml`:
 
@@ -439,10 +488,11 @@ openai api chat_completions.create -m <model-id> -g user "Hello"
 | `GET /v1/models` | Bearer token | All discovered models across pools (deduplicated by id). |
 | `GET /v1/sandbox/files/{run}/{filename}` | Bearer token | Download a file a sandbox run produced for the caller (scoped to your user). |
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness probes. |
+| `GET /setup`, `POST /setup/test`, `POST /setup/restart`, `POST /setup/finish` | none on a first run; one-time token afterwards | Deployment setup wizard: enter your OIDC provider, prove it with a real sign-in, and pick the claim value that grants admin. Open (and every other page redirects to it) until setup completes; gone afterwards, unless `restore-setup` on the host reopens it for 30 minutes — see [Recovering access](#recovering-access). |
 | `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled`, `/webhooks`, `/integrations`, `/skills`, `/usage` | session cookie | Web UI (`/integrations` is the per-user MCP connector store; `/skills` is the per-user private-skills manager — upload a `.skill` archive or write `SKILL.md` inline, usable only in your own chats; `/webhooks` manages your inbound triggers; `/usage` shows your own request/token usage; admins get an in-page "All users" toggle). |
 | `/hooks/{secret}` | secret in URL | Fire a webhook: runs the owner's saved prompt with the request body appended as an untrusted block. Accepts GET and POST; sync webhooks return the model output as a JSON envelope, async ones return `202`. |
 | `/hooks/rag/{token}` | token in URL | Re-sync one RAG collection. Point a file host's webhook (Nextcloud's `webhook_listeners`, ownCloud's equivalent, or a cron line) at it so a changed folder is searchable in minutes rather than at the next poll. The body is ignored — this is a doorbell, not a change feed; the walk that follows establishes what actually changed. Returns `202` with the number of refs queued. |
-| `/admin/users`, `/admin/groups`, `/rag`, `/admin/models`, `/admin/upstreams`, `/admin/skills`, `/admin/connectors`, `/admin/comfyui`, `/admin/limits` | admin role | Admin UI (the users page lists registered users and starts impersonation; groups maps OIDC claims onto gateway groups and sets per-group tool/skill grants — pools, RAG collections, and MCP connectors then restrict access by group; upstreams edits the pool/backend topology in the DB and hot-reloads it via "Apply changes" — the old `/admin/backends` and `/admin/pools` now redirect here; connectors curates the MCP catalog — see [`docs/connectors.md`](docs/connectors.md) for provider setup; comfyui shows the loaded ComfyUI workflow catalog with a live reload button — see [`docs/comfyui.md`](docs/comfyui.md) for the manifest format; limits sets per-global/role/user rate limits & quotas). |
+| `/admin/users`, `/admin/groups`, `/rag`, `/admin/models`, `/admin/upstreams`, `/admin/skills`, `/admin/connectors`, `/admin/comfyui`, `/admin/limits`, `/admin/settings`, `POST /admin/settings/clear` | admin role | Admin UI (the users page lists registered users and starts impersonation; groups maps OIDC claims onto gateway groups and sets per-group tool/skill grants — pools, RAG collections, and MCP connectors then restrict access by group; upstreams edits the pool/backend topology in the DB and hot-reloads it via "Apply changes" — the old `/admin/backends` and `/admin/pools` now redirect here; connectors curates the MCP catalog — see [`docs/connectors.md`](docs/connectors.md) for provider setup; comfyui shows the loaded ComfyUI workflow catalog with a live reload button — see [`docs/comfyui.md`](docs/comfyui.md) for the manifest format; limits sets per-global/role/user rate limits & quotas; settings edits the operator settings that used to live in `gateway.toml` — OCR, compaction, attachment storage, sandbox, ComfyUI, RAG, skills, Typst, GeoIP, usage, limits, feedback, push and session/token lifetimes — grouped into five tabs, with secrets sealed at rest. Almost everything takes effect on the next request; the handful of fields that own a background worker are badged `restart` and leave a banner until the process comes back). |
 | `POST /impersonate/stop` | session cookie | End an active impersonation and return to your own account. |
 | `/feedback`, `/feedback/extract`, `/feedback/config` | session cookie | Feedback widget: file a GitHub issue, turn a voice transcript into structured fields, and report whether the feature is configured. Enabled by the `[feedback]` config block. |
 | `/api/v0/push/config`, `/api/v0/push/subscribe`, `/api/v0/push/unsubscribe` | session cookie | Web Push (turn-complete notifications): fetch the VAPID public key + enabled flag, register a browser subscription, and forget one. Governed by the `[push]` config block. |
@@ -470,9 +520,8 @@ sudo install -d -m 0750 /etc/gateway
 sudo install -m 0644 deploy/quadlet/gateway.container   /etc/containers/systemd/
 sudo install -m 0644 deploy/quadlet/gateway.volume      /etc/containers/systemd/
 sudo install -m 0600 deploy/quadlet/gateway.example.env /etc/gateway/gateway.env
-sudo install -m 0640 gateway.example.toml               /etc/gateway/config.toml
-sudo $EDITOR /etc/gateway/gateway.env     # GATEWAY_SESSION_KEY, GATEWAY_OIDC_CLIENT_SECRET, …
-sudo $EDITOR /etc/gateway/config.toml     # upstreams, [oidc], and DB path on the volume
+sudo $EDITOR /etc/gateway/gateway.env     # GATEWAY_SESSION_KEY — the only required variable
+# No config.toml: open the gateway's URL and the setup wizard takes it from there.
 sudo systemctl daemon-reload
 sudo systemctl enable --now gateway.service
 ```

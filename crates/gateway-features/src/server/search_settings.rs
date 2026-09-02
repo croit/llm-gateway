@@ -135,7 +135,7 @@ pub async fn set_brave_key(pool: &Pool, crypto: &Crypto, key: &str) -> Result<()
     if key.is_empty() {
         return app_settings::delete(pool, BRAVE_KEY_KEY).await;
     }
-    let Some(stored) = seal_to_string(crypto, key) else {
+    let Ok(stored) = crypto.seal_to_string(key) else {
         // Sealing only fails if the cipher itself fails, which means the
         // at-rest key is unusable — a deployment problem the operator has to
         // see rather than a silently dropped write.
@@ -237,25 +237,11 @@ fn normalized_url(stored: Option<String>) -> Option<String> {
         .filter(|u| !u.is_empty())
 }
 
-/// `nonce.ciphertext`, both base64url without padding — the same stored form
-/// `server::push` uses, so operators see one shape for sealed settings.
-fn seal_to_string(crypto: &Crypto, plaintext: &str) -> Option<String> {
-    let sealed = crypto.seal_str(plaintext).ok()?;
-    Some(format!(
-        "{}.{}",
-        b64url_encode(&sealed.nonce),
-        b64url_encode(&sealed.ciphertext)
-    ))
-}
-
 async fn open_brave_key(pool: &Pool, crypto: &Crypto) -> Result<Option<String>, DbError> {
     let Some(stored) = app_settings::get(pool, BRAVE_KEY_KEY).await? else {
         return Ok(None);
     };
-    let opened = stored
-        .split_once('.')
-        .and_then(|(n, c)| Some((b64url_decode(n)?, b64url_decode(c)?)))
-        .and_then(|(nonce, ct)| crypto.open_str(&nonce, &ct).ok());
+    let opened = crypto.open_from_string(&stored);
     if opened.is_none() {
         // Almost always: GATEWAY_ENCRYPTION_KEY changed. Say so once here;
         // the tool then reports "not configured", which is the actionable
@@ -266,51 +252,6 @@ async fn open_brave_key(pool: &Pool, crypto: &Crypto) -> Result<Option<String>, 
         );
     }
     Ok(opened)
-}
-
-/// base64url, no padding. Hand-rolled to match the rest of the crate's
-/// approach to small codecs (see `chat_attachments::append_base64`).
-fn b64url_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        out.push(ALPHABET[(b0 >> 2) as usize] as char);
-        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        if chunk.len() >= 2 {
-            out.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
-        }
-        if chunk.len() >= 3 {
-            out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
-        }
-    }
-    out
-}
-
-fn b64url_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut bits: u8 = 0;
-    for c in s.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            b'=' => continue,
-            _ => return None,
-        };
-        acc = (acc << 6) | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
 }
 
 #[cfg(test)]
@@ -337,24 +278,6 @@ mod tests {
             Some(SearchProvider::Brave)
         );
         assert_eq!(SearchProvider::from_wire("google"), None);
-    }
-
-    #[test]
-    fn b64url_round_trips_including_unpadded_lengths() {
-        for len in 0..40usize {
-            let bytes: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
-            let encoded = b64url_encode(&bytes);
-            assert!(
-                !encoded.contains('=') && !encoded.contains('+') && !encoded.contains('/'),
-                "must be url-safe and unpadded: {encoded}"
-            );
-            assert_eq!(b64url_decode(&encoded).as_deref(), Some(&bytes[..]));
-        }
-    }
-
-    #[test]
-    fn b64url_decode_rejects_non_alphabet() {
-        assert!(b64url_decode("abc!").is_none());
     }
 
     #[tokio::test]

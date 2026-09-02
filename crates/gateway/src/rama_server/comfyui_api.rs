@@ -29,7 +29,7 @@ pub async fn reload(State(state): State<Arc<RamaState>>, req: Request) -> Respon
     if let Err(resp) = require_admin(&state, &req).await {
         return resp;
     }
-    let Some(handle) = state.comfyui.as_ref() else {
+    let Some(handle) = state.comfyui() else {
         return error_envelope(
             StatusCode::CONFLICT,
             "not_configured",
@@ -66,7 +66,7 @@ pub async fn catalog(State(state): State<Arc<RamaState>>, req: Request) -> Respo
     if let Err(resp) = require_admin(&state, &req).await {
         return resp;
     }
-    let Some(handle) = state.comfyui.as_ref() else {
+    let Some(handle) = state.comfyui() else {
         return json_ok(&CatalogResponse {
             configured: false,
             base_url: None,

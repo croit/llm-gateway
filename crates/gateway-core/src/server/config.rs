@@ -15,6 +15,7 @@
 //! See `gateway.example.toml` at the repo root for the schema.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -37,11 +38,26 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+    /// Two sources name the same thing and disagree, and guessing would be
+    /// worse than stopping. Currently only the database path — see
+    /// [`Config::db_path`].
+    #[error("{0}")]
+    Conflict(String),
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// The file this was read from, or `None` when no config file was found.
+    ///
+    /// Not a config key — filled in by [`Config::load`]. It exists because
+    /// "the operator has no config file" and "the operator's config file was
+    /// not mounted on this boot" produce identical [`Config`] values and must
+    /// not be treated identically: the second is an existing deployment whose
+    /// settings would be silently replaced by defaults. See
+    /// [`crate::server::settings::import_once`].
+    #[serde(skip)]
+    pub loaded_from: Option<PathBuf>,
     pub bind: BindConfig,
     pub db: DbConfig,
     /// Named upstream pools: `[upstream_pools.<name>]` blocks in TOML.
@@ -51,6 +67,13 @@ pub struct Config {
     /// and any model it serves becomes routable automatically.
     #[serde(default)]
     pub upstream_pools: HashMap<String, UpstreamPoolConfig>,
+    /// Legacy OIDC provider block. As of the setup wizard this is **seed-only**,
+    /// exactly like [`Self::rbac`] below: on the first boot after upgrading,
+    /// [`crate::server::setup::import_config_once`] copies it into the database
+    /// (resolving `client_secret_env` to its value) and marks the gateway
+    /// configured; after that `/setup` owns the provider and this block is
+    /// ignored. A new deployment leaves it out and configures the provider in
+    /// the browser.
     pub oidc: Option<OidcConfig>,
     pub gateway: GatewayConfig,
     /// Legacy RBAC config. As of the gateway-groups migration this is a
@@ -58,9 +81,9 @@ pub struct Config {
     /// is empty) `[rbac]` + `[[roles]]` are imported once into the DB, after
     /// which `/admin/groups` owns everything and this block is ignored. Kept so
     /// existing config-driven deployments upgrade in place; new deployments can
-    /// leave it out and manage groups entirely in the UI. The only RBAC bits
-    /// that still live in the config are the OIDC provider setup and
-    /// `[gateway].bootstrap_admin_groups`.
+    /// leave it out and manage groups entirely in the UI. The only RBAC bit
+    /// that still lives in the config is `[gateway].bootstrap_admin_groups`;
+    /// the OIDC provider moved to the setup wizard (see [`Self::oidc`]).
     #[serde(default)]
     pub rbac: RbacConfig,
     #[serde(default, rename = "roles")]
@@ -250,13 +273,10 @@ impl FeedbackConfig {
     /// Resolve the GitHub token: the inline `github_token` first, then the
     /// env var named by `github_token_env`. Empty strings count as unset.
     pub fn github_token(&self) -> Option<String> {
-        if let Some(tok) = self.github_token.as_ref().filter(|v| !v.is_empty()) {
-            return Some(tok.clone());
-        }
-        self.github_token_env
-            .as_ref()
-            .and_then(|name| std::env::var(name).ok())
-            .filter(|v| !v.is_empty())
+        resolve_secret(
+            self.github_token.as_deref(),
+            self.github_token_env.as_deref(),
+        )
     }
 
     /// True when enough is configured to actually open an issue: owner,
@@ -451,7 +471,8 @@ pub struct RagConfig {
     /// a larger or cheaper drive/mount. The gateway `mkdir -p`s this on
     /// startup, so the **parent** must already exist + be writable by the
     /// runtime user (uid 1000 in the container image). Default is
-    /// `data/rag` relative to the gateway's working directory.
+    /// `data/rag` under [`data_dir`] — relative to the working directory in
+    /// dev, and on the mounted volume inside the container.
     #[serde(default = "default_rag_data_dir")]
     pub data_dir: PathBuf,
     /// How many git clones the indexer runs at once, and how many
@@ -474,7 +495,7 @@ impl Default for RagConfig {
 }
 
 fn default_rag_data_dir() -> PathBuf {
-    PathBuf::from("data/rag")
+    data_dir().join("data").join("rag")
 }
 
 fn default_clone_concurrency() -> usize {
@@ -502,6 +523,10 @@ pub struct GeoipConfig {
     /// Unset → no auto-update; operators can drop in their own BIN and it
     /// gets picked up by the hot-reload watcher.
     pub update_token_env: Option<String>,
+    /// The token itself, as entered at `/admin/settings`, where it is sealed at
+    /// rest. Wins over [`Self::update_token_env`].
+    #[serde(default)]
+    pub update_token: Option<String>,
 }
 
 fn default_geoip_db_path() -> PathBuf {
@@ -509,12 +534,13 @@ fn default_geoip_db_path() -> PathBuf {
 }
 
 impl GeoipConfig {
-    /// Resolve the download token from its named env var, if configured.
+    /// The stored download token, else whatever the legacy `update_token_env`
+    /// variable names.
     pub fn update_token(&self) -> Option<String> {
-        self.update_token_env
-            .as_ref()
-            .and_then(|name| std::env::var(name).ok())
-            .filter(|v| !v.is_empty())
+        resolve_secret(
+            self.update_token.as_deref(),
+            self.update_token_env.as_deref(),
+        )
     }
 }
 
@@ -666,12 +692,22 @@ pub struct S3Config {
     /// this is often a placeholder like `us-east-1`.
     pub region: String,
     pub bucket: String,
-    /// Env var holding the AWS access key id. Same pattern as
-    /// `session_key_env` — file holds the env-var NAME so secrets
-    /// stay out of TOML.
-    pub access_key_env: String,
-    /// Env var holding the AWS secret access key.
-    pub secret_key_env: String,
+    /// The credentials themselves, as entered at `/admin/settings`. They may
+    /// live here directly because that store seals them at rest — the reason
+    /// they were kept out of the config file does not apply to a sealed
+    /// database row. Same shape as [`FeedbackConfig::github_token`].
+    #[serde(default)]
+    pub access_key: Option<String>,
+    #[serde(default)]
+    pub secret_key: Option<String>,
+    /// Legacy: the NAME of an env var holding the access key id, so secrets
+    /// stayed out of TOML. Still parsed, so an existing config file imports
+    /// cleanly, and still consulted when no direct value is set.
+    #[serde(default)]
+    pub access_key_env: Option<String>,
+    /// Legacy env-var name for the secret access key. See [`Self::access_key_env`].
+    #[serde(default)]
+    pub secret_key_env: Option<String>,
     /// Object-key prefix under which chat attachments live. Default
     /// `chat-attachments`. Useful when the bucket is shared with
     /// other workloads.
@@ -684,16 +720,30 @@ fn default_s3_prefix() -> String {
 }
 
 impl S3Config {
+    /// The access key id: the stored value, else whatever the legacy
+    /// `access_key_env` variable names. The direct value wins, so a credential
+    /// entered at `/admin/settings` is not shadowed by a stale env var left
+    /// over from before the migration.
     pub fn access_key(&self) -> Option<String> {
-        std::env::var(&self.access_key_env)
-            .ok()
-            .filter(|v| !v.is_empty())
+        resolve_secret(self.access_key.as_deref(), self.access_key_env.as_deref())
     }
+    /// The secret access key. See [`Self::access_key`].
     pub fn secret_key(&self) -> Option<String> {
-        std::env::var(&self.secret_key_env)
-            .ok()
-            .filter(|v| !v.is_empty())
+        resolve_secret(self.secret_key.as_deref(), self.secret_key_env.as_deref())
     }
+}
+
+/// A secret stored directly, else the value of the env var that the legacy
+/// `*_env` field names. Shared by every block that made that move, so the
+/// precedence is written down once instead of three times.
+fn resolve_secret(direct: Option<&str>, env_name: Option<&str>) -> Option<String> {
+    if let Some(v) = direct.filter(|v| !v.is_empty()) {
+        return Some(v.to_owned());
+    }
+    env_name
+        .filter(|n| !n.is_empty())
+        .and_then(|n| std::env::var(n).ok())
+        .filter(|v| !v.is_empty())
 }
 
 /// Knobs the gateway itself needs (separate from `bind` which only describes
@@ -701,15 +751,38 @@ impl S3Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
-    /// Public URL the gateway is reachable at (used to build OIDC redirect URI
-    /// and CLI handoff URLs). E.g. `https://gateway.example.com`.
-    pub public_url: String,
+    /// Public URL the gateway is reachable at, e.g. `https://gateway.example.com`.
+    ///
+    /// **Never read this directly** — call
+    /// [`Config::public_url_fallback`] if you want the fallback, or
+    /// `AppState::public_url()` if you want the live value.
+    ///
+    /// Named for what it is rather than for the TOML key it parses, because
+    /// `public_url` is exactly the name of the accessor that returns the
+    /// *correct* value: with both spelled the same, neither grep nor the
+    /// compiler could tell a right read from a wrong one, and a wrong one
+    /// silently yields `http://localhost:8080` on every wizard-configured
+    /// deployment. `#[serde(rename)]` keeps the config-file key unchanged.
+    #[serde(default = "default_public_url", rename = "public_url")]
+    pub public_url_import_only: String,
     /// How long a freshly minted gateway token is valid for. Default 90 days.
+    ///
+    /// Seed-only, like the three below: imported into the database once and
+    /// then edited at `/admin/settings`. See
+    /// [`crate::server::settings::GATEWAY_KEYS_STAYING_IN_THE_FILE`] for the
+    /// keys in this block that did *not* move.
+    #[serde(default = "default_token_ttl_days")]
     pub token_ttl_days: i64,
-    /// Cookie key for sessions. 64 hex chars (32 bytes). Generate with
-    /// `openssl rand -hex 32` and put it in `$GATEWAY_SESSION_KEY` rather than
-    /// in this file — the file is for the *name* of the env var.
-    pub session_key_env: String,
+    /// **Deprecated and ignored.** It named the environment variable holding
+    /// the session key, back when that was configurable and optional.
+    /// `$GATEWAY_SESSION_KEY` is now read directly and is mandatory, so naming
+    /// a different variable has no effect.
+    ///
+    /// Parsed only so an older config file still loads — same reason as
+    /// [`BindConfig`]. [`Config::warn_about_ignored_blocks`] reports a stale
+    /// value that differs from the variable actually read.
+    #[serde(default)]
+    pub session_key_env: Option<String>,
     /// Browser-session idle timeout in days. Default 30. This is a *sliding*
     /// window: every request renews it (see `rama_server::session`), so it's
     /// how long you can stay away before having to sign in again, not how
@@ -749,15 +822,23 @@ pub struct GatewayConfig {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            public_url: "http://localhost:8080".into(),
-            token_ttl_days: 90,
-            session_key_env: "GATEWAY_SESSION_KEY".into(),
+            public_url_import_only: default_public_url(),
+            token_ttl_days: default_token_ttl_days(),
+            session_key_env: None,
             session_ttl_days: default_session_ttl_days(),
             session_absolute_max_days: default_session_absolute_max_days(),
             allow_impersonation: false,
             bootstrap_admin_groups: Vec::new(),
         }
     }
+}
+
+fn default_public_url() -> String {
+    "http://localhost:8080".into()
+}
+
+fn default_token_ttl_days() -> i64 {
+    90
 }
 
 /// Mirrors `session::DEFAULT_TTL` — 30 days of inactivity.
@@ -798,48 +879,253 @@ impl OidcConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct DbConfig {
     /// SQLite file path. `:memory:` (used in tests) gives an in-memory DB.
-    pub path: PathBuf,
+    ///
+    /// `None` means nobody named one, in which case `$GATEWAY_DB_PATH` decides,
+    /// and failing that `gateway.sqlite` under [`data_dir`] — which is what lets
+    /// a container land on its persistent volume with no config file at all.
+    /// Resolve it with [`Config::db_path`], never by reading this directly.
+    ///
+    /// Optional rather than eagerly defaulted so that "the operator named this
+    /// path" stays distinguishable from "nobody said anything". Pointing a
+    /// gateway at the wrong database does not fail loudly — it comes up empty
+    /// and looks like a fresh install — so the two sources are never silently
+    /// reconciled; see [`Config::db_path`].
+    #[serde(default)]
+    pub path: Option<PathBuf>,
 }
 
-impl Default for DbConfig {
-    fn default() -> Self {
-        Self {
-            path: PathBuf::from("gateway.sqlite"),
-        }
-    }
+/// The database filename, under whichever directory [`data_dir`] resolves to.
+pub const DB_FILENAME: &str = "gateway.sqlite";
+
+pub fn default_db_path() -> PathBuf {
+    data_dir().join(DB_FILENAME)
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Where the default database lived before `GATEWAY_DATA_DIR` existed: the
+/// process working directory.
+///
+/// Derived from the same constant as [`default_db_path`] rather than spelled
+/// out at the one call site that needs it, so renaming the file cannot leave a
+/// stale literal behind in the upgrade guard that depends on it.
+pub fn legacy_default_db_path() -> PathBuf {
+    PathBuf::from(DB_FILENAME)
+}
+
+/// Root for everything the gateway must be able to WRITE: the SQLite
+/// database, the RAG index store, and whatever persistent state gets added
+/// later.
+///
+/// `$GATEWAY_DATA_DIR` when set, otherwise the process working directory —
+/// so a `cargo run` in the repo still writes `./gateway.sqlite` and
+/// `./data/rag` exactly as before. The container image points it at the
+/// mounted volume, which is what makes a fresh container persist its state
+/// without a config file and without a per-path environment variable each.
+///
+/// Read-only paths (typst templates, skills bundles) deliberately do NOT
+/// hang off this — they ship in the image's read-only layers.
+pub fn data_dir() -> PathBuf {
+    data_dir_from(std::env::var_os("GATEWAY_DATA_DIR"))
+}
+
+/// The pure half of [`data_dir`], split out so it can be tested without
+/// mutating process-global environment state (which races every other test
+/// in the binary).
+fn data_dir_from(raw: Option<std::ffi::OsString>) -> PathBuf {
+    raw.filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+/// **Deprecated and ignored.** The listen socket comes from `$IP` / `$PORT`.
+///
+/// Parsed only so that a config file written before this was deprecated still
+/// loads: [`Config`] denies unknown fields, so simply deleting the field would
+/// turn a stale `[bind]` block into a refusal to boot. Both `gateway.toml.example`
+/// and the README used to show one, so real files carry it.
+///
+/// It is a process-level knob, and every other process-level knob this gateway
+/// has — `$GATEWAY_SESSION_KEY`, `$GATEWAY_DATA_DIR`, `$GATEWAY_ENCRYPTION_KEY`,
+/// `$GATEWAY_CONFIG` — is an environment variable, set by the same unit file or
+/// compose stanza that decides where the process runs at all. A container
+/// makes the case plainly: the image binds `0.0.0.0` because anything else is
+/// unreachable through a published port, and the decision of *which host
+/// interface* to expose belongs to `PublishPort=127.0.0.1:8080:8080` on the
+/// outside. There is no deployment where editing a TOML block is the right way
+/// to move the socket.
+///
+/// [`Config::warn_about_ignored_blocks`] tells an operator who has one that it
+/// does nothing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BindConfig {
-    pub host: String,
-    pub port: u16,
+    pub host: Option<String>,
+    pub port: Option<u16>,
 }
 
-impl Default for BindConfig {
-    fn default() -> Self {
-        Self {
-            host: "127.0.0.1".into(),
-            port: 8080,
+/// Loopback, so a gateway that was told nothing does not expose itself to the
+/// network on the strength of a default. The container image overrides it.
+pub const DEFAULT_BIND_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+pub const DEFAULT_BIND_PORT: u16 = 8080;
+
+/// The one variable the session key is read from. Named here so the deprecation
+/// warning for `[gateway].session_key_env` and the boot-time read cannot drift
+/// apart on the spelling.
+pub const SESSION_KEY_VAR: &str = "GATEWAY_SESSION_KEY";
+
+/// Parse a listen-address component, warning instead of failing.
+///
+/// A bad value must not be fatal: refusing to boot over a typo in a field with
+/// a perfectly good default is worse than using the default, and on a PaaS that
+/// injects `$PORT` the operator may not even control the value. Falling back is
+/// the recoverable behaviour — but silently, it would leave the gateway
+/// listening somewhere nobody asked for.
+fn parse_or_warn<T: std::str::FromStr>(raw: &str, what: &str) -> Option<T>
+where
+    T::Err: std::fmt::Display,
+{
+    match raw.trim().parse() {
+        Ok(v) => Some(v),
+        Err(err) => {
+            tracing::warn!("ignoring {what}: {raw:?} is not valid ({err})");
+            None
         }
     }
 }
 
 impl Config {
+    /// The config file's public URL — a *fallback*, used only until the setup
+    /// wizard records the real one, and as the value
+    /// [`crate::server::setup::import_config_once`] carries into the database
+    /// when upgrading a config-file deployment.
+    ///
+    /// The single reader of [`GatewayConfig::public_url_import_only`], so
+    /// "where does the fallback come from" has exactly one answer. For the
+    /// value a request should actually use, call `AppState::public_url()`.
+    pub fn public_url_fallback(&self) -> &str {
+        &self.gateway.public_url_import_only
+    }
+
+    /// The socket to listen on: `$IP` / `$PORT`, else
+    /// [`DEFAULT_BIND_HOST`]`:`[`DEFAULT_BIND_PORT`].
+    ///
+    /// Environment only. This is a property of *where the process runs*, decided
+    /// by the same unit file or compose stanza that starts it, so it sits with
+    /// the other process-level variables rather than in a file the gateway also
+    /// treats as a one-time seed for database settings. See [`BindConfig`] for
+    /// the block that used to be here.
+    ///
+    /// Takes `&self` despite reading nothing from it: the call site has a
+    /// `Config` in hand and this keeps `[bind]`'s replacement discoverable from
+    /// the same place.
+    pub fn bind_address(&self) -> SocketAddr {
+        bind_address_from(
+            std::env::var("IP").ok().as_deref(),
+            std::env::var("PORT").ok().as_deref(),
+        )
+    }
+
+    /// Where the SQLite database lives: `$GATEWAY_DB_PATH`, else `[db].path`,
+    /// else `gateway.sqlite` under [`data_dir`].
+    ///
+    /// The env var exists so a deployment needs no config file for this either.
+    /// It is the last thing that forced one: the gateway has to find the
+    /// database before it can read any setting *out* of the database, so unlike
+    /// the operator settings this genuinely cannot move into it.
+    ///
+    /// **Disagreement is fatal, not resolved.** Every other two-source setting
+    /// here picks a winner and warns, because the cost of picking wrong is a
+    /// wrong port or a stale directory. Here the cost is that the gateway opens
+    /// a database that is not the deployment's, finds no users, concludes it is
+    /// a fresh install, and serves an open setup wizard while the real data sits
+    /// untouched somewhere else — the exact failure
+    /// [`legacy_default_db_path`]'s guard exists to prevent. A boot that stops
+    /// with both paths printed costs an operator a minute; the alternative costs
+    /// them a morning.
+    pub fn db_path(&self) -> Result<PathBuf, ConfigError> {
+        db_path_from(
+            self.db.path.as_deref(),
+            std::env::var("GATEWAY_DB_PATH").ok().as_deref(),
+        )
+    }
+
+    /// Raw OIDC claim values that always resolve to admin: the file's
+    /// `[gateway].bootstrap_admin_groups` **plus** anything in
+    /// `$GATEWAY_BOOTSTRAP_ADMIN_GROUPS` (comma-separated).
+    ///
+    /// A union, not an override, and deliberately: this is the anti-lockout
+    /// anchor, so no source may take an escape hatch *away* from another. An
+    /// operator adding the env var to get back in must not have to notice that
+    /// it silently discarded the group already listed in the file.
+    ///
+    /// The env var exists so this can be set beside `$GATEWAY_SESSION_KEY` in
+    /// the one environment file a deployment already has, instead of being the
+    /// last reason to mount a config file.
+    pub fn bootstrap_admin_groups(&self) -> Vec<String> {
+        bootstrap_admin_groups_from(
+            &self.gateway.bootstrap_admin_groups,
+            std::env::var("GATEWAY_BOOTSTRAP_ADMIN_GROUPS")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// Warn about config blocks that are parsed but no longer do anything, so
+    /// an operator who edits one is not left wondering why nothing changed.
+    ///
+    /// Only for blocks whose *replacement is an environment variable*. The many
+    /// blocks that became database settings are deliberately silent: those are
+    /// imported on the first boot, so they did do something, exactly once, and a
+    /// warning on every subsequent start would be noise.
+    pub fn warn_about_ignored_blocks(&self) {
+        if self.bind.host.is_some() || self.bind.port.is_some() {
+            tracing::warn!(
+                "the config file's `[bind]` block is ignored — set the listen socket with the \
+                 $IP and $PORT environment variables instead (currently {}). You can delete \
+                 the block.",
+                self.bind_address(),
+            );
+        }
+        // Only worth saying when it names something *other* than the variable
+        // actually read: a file that says `session_key_env = "GATEWAY_SESSION_KEY"`
+        // is redundant but not misleading, and warning about it would fire on
+        // every deployment that ever copied the example file.
+        if let Some(named) = self
+            .gateway
+            .session_key_env
+            .as_deref()
+            .filter(|v| !v.is_empty() && *v != SESSION_KEY_VAR)
+        {
+            tracing::warn!(
+                "the config file sets `[gateway].session_key_env = {named:?}`, which is ignored \
+                 — the session key is read from ${SESSION_KEY_VAR} and nothing else. If the key \
+                 lives in {named}, copy it to ${SESSION_KEY_VAR} or the gateway will refuse to \
+                 boot."
+            );
+        }
+    }
+
     /// Resolves the config file path and loads it. Missing files are not an
     /// error — we fall back to defaults so `mise run dev` can start without
     /// any setup.
     pub fn load() -> Result<Self, ConfigError> {
         match Self::resolve_path() {
-            Some(path) => Self::from_path(&path),
+            Some(path) => Self::from_path(&path).map(|mut c| {
+                c.loaded_from = Some(path);
+                c
+            }),
             None => {
-                tracing::warn!(
-                    "no gateway.toml found; running with defaults. \
-                     Proxy routes will return 503 until upstream is configured."
+                // Not a warning any more: booting without a config file is the
+                // supported path for a fresh deployment. Pools, models, groups
+                // and (soon) the OIDC provider are configured through the web
+                // UI and live in the database; the file only carries the
+                // handful of blocks that haven't moved yet.
+                tracing::info!(
+                    data_dir = %data_dir().display(),
+                    "no config file found; using defaults (this is normal for a fresh install)"
                 );
                 Ok(Self::default())
             }
@@ -871,16 +1157,260 @@ impl Config {
     }
 }
 
+/// The pure half of [`Config::bind_address`], split out so it can be tested
+/// without mutating process-global environment state (which races every other
+/// test in the binary) — the same split as [`data_dir_from`].
+///
+/// The two halves resolve independently: a PaaS that injects only `$PORT` must
+/// not also drag the host back from whatever the image set.
+/// The pure half of [`Config::db_path`]. See there for why a conflict is fatal.
+fn db_path_from(file: Option<&Path>, env: Option<&str>) -> Result<PathBuf, ConfigError> {
+    let env = env.map(str::trim).filter(|v| !v.is_empty()).map(Path::new);
+    match (env, file) {
+        (Some(env), Some(file)) if env != file => Err(ConfigError::Conflict(format!(
+            "the database path is set twice and the two disagree: $GATEWAY_DB_PATH says {} and \
+             the config file's `[db].path` says {}. Refusing to guess — opening the wrong one \
+             would look like a fresh install and serve an open setup wizard while your real \
+             data sits untouched. Remove whichever is wrong.",
+            env.display(),
+            file.display(),
+        ))),
+        (Some(p), _) => Ok(p.to_path_buf()),
+        (None, Some(p)) => Ok(p.to_path_buf()),
+        (None, None) => Ok(default_db_path()),
+    }
+}
+
+/// The pure half of [`Config::bootstrap_admin_groups`]: a union, de-duplicated,
+/// preserving the file's order and appending the environment's.
+fn bootstrap_admin_groups_from(file: &[String], env: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = file
+        .iter()
+        .map(|g| g.trim().to_owned())
+        .filter(|g| !g.is_empty())
+        .collect();
+    for group in env.unwrap_or_default().split(',') {
+        let group = group.trim();
+        if !group.is_empty() && !out.iter().any(|g| g == group) {
+            out.push(group.to_owned());
+        }
+    }
+    out
+}
+
+fn bind_address_from(env_ip: Option<&str>, env_port: Option<&str>) -> SocketAddr {
+    SocketAddr::new(
+        env_ip
+            .and_then(|raw| parse_or_warn::<IpAddr>(raw, "$IP"))
+            .unwrap_or(DEFAULT_BIND_HOST),
+        env_port
+            .and_then(|raw| parse_or_warn::<u16>(raw, "$PORT"))
+            .unwrap_or(DEFAULT_BIND_PORT),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn unset_data_dir_keeps_the_historical_relative_paths() {
+        // `cargo run` in a checkout must keep writing ./gateway.sqlite and
+        // ./data/rag — introducing GATEWAY_DATA_DIR must not silently move a
+        // developer's database out from under them.
+        let dir = data_dir_from(None);
+        assert_eq!(dir.join("gateway.sqlite"), PathBuf::from("gateway.sqlite"));
+        assert_eq!(dir.join("data").join("rag"), PathBuf::from("data/rag"));
+    }
+
+    #[test]
+    fn empty_data_dir_is_treated_as_unset() {
+        // An env var set to "" (a common accident in compose/systemd unit
+        // files) must not turn every path into an absolute-root path.
+        assert_eq!(data_dir_from(Some("".into())), PathBuf::new());
+    }
+
+    #[test]
+    fn data_dir_relocates_db_and_rag_together() {
+        // The whole point: ONE variable puts every writable path on the
+        // mounted volume, so the container needs no config file for it.
+        let dir = data_dir_from(Some("/var/lib/gateway".into()));
+        assert_eq!(
+            dir.join("gateway.sqlite"),
+            PathBuf::from("/var/lib/gateway/gateway.sqlite")
+        );
+        assert_eq!(
+            dir.join("data").join("rag"),
+            PathBuf::from("/var/lib/gateway/data/rag")
+        );
+    }
+
+    #[test]
+    fn db_block_may_omit_path() {
+        // A `[db]` block that only sets future keys must still parse — before
+        // `path` became optional, an empty `[db]` was a hard parse error.
+        let c: Config = toml::from_str("[db]\n").unwrap();
+        assert!(c.db.path.is_none(), "nobody named a path");
+        assert_eq!(
+            db_path_from(c.db.path.as_deref(), None).unwrap(),
+            default_db_path()
+        );
+    }
+
+    #[test]
+    fn the_database_path_comes_from_the_environment_or_the_file_or_the_default() {
+        assert_eq!(
+            db_path_from(None, None).unwrap(),
+            default_db_path(),
+            "nobody said anything"
+        );
+        assert_eq!(
+            db_path_from(Some(Path::new("/from/file.sqlite")), None).unwrap(),
+            PathBuf::from("/from/file.sqlite")
+        );
+        assert_eq!(
+            db_path_from(None, Some("/from/env.sqlite")).unwrap(),
+            PathBuf::from("/from/env.sqlite"),
+            "the env var alone is enough — no config file needed for this"
+        );
+        assert_eq!(
+            db_path_from(None, Some("  ")).unwrap(),
+            default_db_path(),
+            "an empty env var (a common compose/systemd accident) is not a path"
+        );
+    }
+
+    #[test]
+    fn two_disagreeing_database_paths_refuse_to_boot() {
+        // Deliberately fatal rather than resolved. Opening the wrong database
+        // finds no users, looks like a fresh install, and serves an open setup
+        // wizard on a production URL while the real data sits elsewhere — so
+        // there is no safe default to fall back on, only a wrong one.
+        let err = db_path_from(Some(Path::new("/a.sqlite")), Some("/b.sqlite"))
+            .expect_err("a disagreement must stop the boot");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/a.sqlite") && msg.contains("/b.sqlite"),
+            "{msg}"
+        );
+        assert!(msg.contains("GATEWAY_DB_PATH"), "{msg}");
+
+        // Agreeing is not a conflict.
+        assert_eq!(
+            db_path_from(Some(Path::new("/same.sqlite")), Some("/same.sqlite")).unwrap(),
+            PathBuf::from("/same.sqlite")
+        );
+    }
+
+    #[test]
+    fn bootstrap_admin_groups_union_never_drops_an_escape_hatch() {
+        // A union, not an override: this is the anti-lockout anchor, so setting
+        // the env var to get back in must not silently discard the group the
+        // file already trusted.
+        let file = vec!["platform-admins".to_string()];
+        assert_eq!(
+            bootstrap_admin_groups_from(&file, Some("ops-oncall")),
+            vec!["platform-admins".to_string(), "ops-oncall".to_string()]
+        );
+        assert_eq!(
+            bootstrap_admin_groups_from(&file, None),
+            vec!["platform-admins".to_string()]
+        );
+        assert_eq!(
+            bootstrap_admin_groups_from(&[], Some("a, b ,, a")),
+            vec!["a".to_string(), "b".to_string()],
+            "trimmed, de-duplicated, and empty entries dropped"
+        );
+        assert!(bootstrap_admin_groups_from(&[], None).is_empty());
+    }
+
+    #[test]
     fn defaults_have_no_upstreams_and_bind_to_localhost() {
         let c = Config::default();
         assert!(c.upstream_pools.is_empty());
-        assert_eq!(c.bind.host, "127.0.0.1");
-        assert_eq!(c.bind.port, 8080);
+        assert_eq!(
+            bind_address_from(None, None),
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            "a gateway told nothing must not expose itself to the network"
+        );
+    }
+
+    #[test]
+    fn the_environment_sets_the_listen_socket() {
+        assert_eq!(
+            bind_address_from(Some("0.0.0.0"), Some("9000")),
+            "0.0.0.0:9000".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn each_half_of_the_socket_falls_back_on_its_own() {
+        // A PaaS injecting only $PORT must not also drag the host back from
+        // whatever the image set, and vice versa.
+        assert_eq!(
+            bind_address_from(None, Some("7000")),
+            "127.0.0.1:7000".parse::<SocketAddr>().unwrap(),
+        );
+        assert_eq!(
+            bind_address_from(Some("0.0.0.0"), None),
+            "0.0.0.0:8080".parse::<SocketAddr>().unwrap(),
+        );
+    }
+
+    #[test]
+    fn a_nonsense_value_falls_back_instead_of_killing_the_boot() {
+        // A typo in a variable with a perfectly good default must not be fatal,
+        // and on a PaaS that injects $PORT the operator may not even control
+        // the value. Each bad source is skipped, not the whole resolution.
+        assert_eq!(
+            bind_address_from(Some("not-an-ip"), Some("not-a-port")),
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+        );
+        assert_eq!(
+            bind_address_from(Some("localhost"), None),
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            "a hostname is not a listen address",
+        );
+    }
+
+    #[test]
+    fn the_shipped_example_config_actually_parses() {
+        // `gateway.example.toml` is the annotated reference an operator copies,
+        // and `Config` denies unknown fields — so a key renamed in code and not
+        // in the example turns the documented starting point into a file that
+        // refuses to boot. Nothing else checked it until this test.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("gateway.example.toml");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let parsed: Result<Config, _> = toml::from_str(&raw);
+        if let Err(e) = parsed {
+            panic!("gateway.example.toml does not parse as a Config: {e}");
+        }
+    }
+
+    #[test]
+    fn a_deprecated_bind_block_still_parses_and_is_ignored() {
+        // `[bind]` is dead but must not become a boot failure: `Config` denies
+        // unknown fields, and both `gateway.example.toml` and the README used
+        // to show the block, so plenty of real files carry one. It parses, it
+        // changes nothing, and `warn_about_ignored_blocks` says so.
+        let c: Config = toml::from_str("[bind]\nhost = \"0.0.0.0\"\nport = 9000\n")
+            .expect("an old config file must still load");
+        assert_eq!(
+            bind_address_from(None, None),
+            "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            "the block must not influence the socket"
+        );
+        // What the warning keys off: something was actually written.
+        assert!(c.bind.host.is_some() || c.bind.port.is_some());
+
+        let empty = Config::default();
+        assert!(
+            empty.bind.host.is_none() && empty.bind.port.is_none(),
+            "no block, so nothing to warn about"
+        );
     }
 
     #[test]
@@ -904,8 +1434,6 @@ mod tests {
             base_url = "http://gpu-02:8000/v1"
         "#;
         let c: Config = toml::from_str(toml).unwrap();
-        assert_eq!(c.bind.host, "0.0.0.0");
-        assert_eq!(c.bind.port, 9000);
         let pool = &c.upstream_pools["local_chat"];
         assert_eq!(pool.backend.len(), 2);
     }

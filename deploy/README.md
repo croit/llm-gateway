@@ -32,16 +32,48 @@ only the `*.example.*` templates are committed.
 
 ```bash
 # from the repo root
-cp deploy/quadlet/gateway.example.env              deploy/gateway.env
-cp deploy/quadlet/google-workspace-mcp.example.env deploy/google-workspace-mcp.env
-cp gateway.example.toml                            deploy/gateway.toml
-$EDITOR deploy/gateway.env deploy/google-workspace-mcp.env deploy/gateway.toml
+printf 'GATEWAY_SESSION_KEY=%s\n' "$(openssl rand -hex 32)" > deploy/gateway.env
+docker compose -f deploy/compose.example.yml up -d gateway
+```
 
+Then open the gateway and finish the **setup wizard** — it asks for your OIDC
+provider, proves it with a real sign-in, and hands you an admin account. There
+is no config file to write: pools, backends, models and groups are all managed
+in the signed-in UI afterwards.
+
+Generate `GATEWAY_SESSION_KEY` once and keep it for the life of the deployment.
+It signs sessions *and* derives the key that seals every secret in the database,
+so back it up together with the volume. The gateway refuses to boot without it.
+
+Optional extras:
+
+```bash
+cp deploy/quadlet/google-workspace-mcp.example.env deploy/google-workspace-mcp.env
+$EDITOR deploy/google-workspace-mcp.env
 docker compose -f deploy/compose.example.yml up -d                 # gateway + workspace MCP
 docker compose -f deploy/compose.example.yml --profile sandbox up -d  # + sandbox runner + egress
 OCR_VLLM_BASE_URL=http://host.docker.internal:8000/v1 \
   docker compose -f deploy/compose.example.yml --profile ocr up -d  # + PDF OCR sidecar
 ```
+
+A `gateway.toml` is not needed. OCR, ComfyUI, the sandbox, Typst, skills, GeoIP
+and RAG tuning are all configured at `/admin/settings`, and the two remaining
+file keys have environment equivalents (`$GATEWAY_DB_PATH`,
+`$GATEWAY_BOOTSTRAP_ADMIN_GROUPS`). Mount one only to migrate an older install:
+whatever it contains is imported into the database on the first boot and ignored
+afterwards. Copy `gateway.example.toml` to `deploy/gateway.toml` and uncomment
+the mount in the compose file for that.
+
+### Locked out?
+
+```bash
+docker compose -f deploy/compose.example.yml exec gateway restore-setup
+podman exec gateway restore-setup     # quadlet
+```
+
+Reopens the setup wizard for 30 minutes and prints a one-time link. The gateway
+keeps serving the whole time — nobody is logged out, nothing is deleted, and the
+wizard comes up pre-filled with the current provider.
 
 Relative paths in the compose file resolve against `deploy/`, so the env/config
 files above live there regardless of your shell's CWD.
@@ -66,13 +98,16 @@ enable --now gateway.service`.
 ## Gateway
 
 - **TLS:** the container binds `127.0.0.1:8080` — terminate HTTPS with a reverse
-  proxy (Caddy/Traefik/nginx). Set `[gateway].public_url` to the external HTTPS
-  URL and register `<public_url>/auth/callback` as an OIDC redirect URI.
-- **State:** point `[db].path` (and `[rag].data_dir`, if used) at the named
-  volume (`/var/lib/gateway`) so they survive image swaps.
-- **Secrets** (`gateway.env`): `GATEWAY_SESSION_KEY`, `GATEWAY_OIDC_CLIENT_SECRET`,
-  optional `GATEWAY_ENCRYPTION_KEY` (encrypts per-user connector tokens at rest), and any
-  per-upstream `<POOL>_API_KEY`.
+  proxy (Caddy/Traefik/nginx). The setup wizard pre-fills the public URL from
+  the request (honouring `X-Forwarded-Proto`) and shows the exact
+  `<public_url>/auth/callback` to register with your provider.
+- **State:** nothing to configure. The image sets
+  `GATEWAY_DATA_DIR=/var/lib/gateway`, so the SQLite database and the RAG index
+  store both land on the named volume and survive image swaps.
+- **Secrets** (`gateway.env`): `GATEWAY_SESSION_KEY` — required, and the only
+  one. Optionally `GATEWAY_ENCRYPTION_KEY` to decouple at-rest encryption from
+  session signing. The OIDC client secret and backend API keys are entered in
+  the UI and stored encrypted in the database.
 
 ## Document OCR
 
@@ -80,7 +115,7 @@ The OCR sidecar is inactive unless all of the following are true:
 
 1. The sidecar is running with `OCR_VLLM_BASE_URL` pointing at an Unlimited-OCR vLLM server.
 2. An `ocr` pool and backend are configured at `/admin/upstreams`, pointing at `http://ocr-sidecar:9100` with `baidu/Unlimited-OCR` in its model list.
-3. `[chat.ocr].enabled = true` is set in `gateway.toml`.
+3. `chat.ocr.enabled` is turned on at `/admin/settings`.
 
 Without an available `ocr` backend the gateway neither fetches attachments for OCR nor sends OCR tools or models to an LLM. The sidecar accepts the original PDF/image at `/ocr`, converts PDFs internally, and calls vLLM with the model-specific request recipe.
 

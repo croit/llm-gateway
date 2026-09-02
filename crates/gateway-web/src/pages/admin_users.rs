@@ -79,7 +79,7 @@ pub async fn users_index(State(state): State<Arc<RamaState>>, req: Request) -> R
         .collect();
     let events = audit::recent(&state.db, 20).await.unwrap_or_default();
 
-    let allow_impersonation = state.config.gateway.allow_impersonation;
+    let allow_impersonation = state.config().gateway.allow_impersonation;
     let body = render_body(lang, &rows, &events, allow_impersonation);
     let chat = fetch_sidebar_chat(&state, &admin.id, None).await;
     let title = t(lang, "admin-users-page-title");
@@ -115,7 +115,7 @@ pub async fn users_impersonate(State(state): State<Arc<RamaState>>, req: Request
     // Kill switch: when impersonation is disabled gateway-wide, the button is
     // already hidden, but reject the POST too so a hand-crafted request can't
     // start one.
-    if !state.config.gateway.allow_impersonation {
+    if !state.config().gateway.allow_impersonation {
         return forbidden_html(&admin.email, "Impersonation is disabled on this gateway.");
     }
     // Refuse to nest: an admin already impersonating must stop first.
@@ -231,7 +231,7 @@ pub async fn impersonate_stop(State(state): State<Arc<RamaState>>, req: Request)
 fn redirect_with_session_cookie(state: &RamaState, session_id: &str, location: &str) -> Response {
     let cookie = state
         .sessions
-        .cookie(session_id, secure_cookies(&state.config.gateway.public_url));
+        .cookie(session_id, secure_cookies(&state.public_url()));
     Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, location)

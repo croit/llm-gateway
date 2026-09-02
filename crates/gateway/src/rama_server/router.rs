@@ -21,15 +21,18 @@
 
 use std::sync::Arc;
 
+use rama::http::StatusCode;
 use rama::http::layer::error_handling::ErrorHandlerLayer;
 use rama::http::server::HttpServer;
 use rama::http::service::web::Router;
+use rama::http::service::web::extract::State;
 use rama::http::service::web::response::Json;
 use rama::layer::{ArcLayer, Layer};
 use rama::net::address::SocketAddress;
 use serde_json::json;
 
 use crate::rama_server::RamaState;
+use crate::rama_server::first_run::FirstRunLayer;
 use crate::rama_server::{api, comfyui_api, oidc_handlers, pages, proxy, rag_api, sandbox_api};
 use gateway_core::rama_server::cors::V1CorsLayer;
 use session_core::assets;
@@ -39,7 +42,20 @@ use session_core::assets;
 pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
     Router::new_with_state(state)
         .with_get("/healthz", async || Json(json!({"status": "ok"})))
-        .with_get("/readyz", async || Json(json!({"status": "ok"})))
+        // `/healthz` is liveness — the process is up. `/readyz` is readiness,
+        // and an unconfigured gateway is not ready: it cannot serve a single
+        // authenticated request, so a load balancer must not route production
+        // traffic to it while an operator is still walking through `/setup`.
+        .with_get("/readyz", async |State(state): State<Arc<RamaState>>| {
+            if state.setup_completed() {
+                (StatusCode::OK, Json(json!({"status": "ok"})))
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"status": "setup_required"})),
+                )
+            }
+        })
         // Static asset bundles, baked in via include_bytes.
         .with_get("/assets/app.css", assets::app_css)
         .with_get("/assets/datastar.js", assets::datastar_js)
@@ -60,6 +76,14 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         // old identity card moved into /tokens.
         .with_get("/", pages::chat_index)
         .with_get("/login", pages::login)
+        // Deployment setup wizard. Un-gated by design on a first run (there is
+        // no account to authenticate against yet); once setup has completed
+        // these 404 unless `restore-setup` opened a recovery window, which the
+        // handlers check for themselves. See `pages::setup`.
+        .with_get("/setup", pages::setup_index)
+        .with_post("/setup/test", pages::setup_test)
+        .with_post("/setup/restart", pages::setup_restart)
+        .with_post("/setup/finish", pages::setup_finish)
         .with_get("/tokens", pages::tokens_index)
         .with_post("/tokens", pages::tokens_create)
         .with_post("/tokens/{id}/revoke", pages::tokens_revoke)
@@ -172,6 +196,11 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/admin/models/defaults", pages::admin_models_defaults_save)
         .with_post("/admin/models/search", pages::admin_models_search_save)
         .with_post("/admin/upstreams/reload", pages::admin_upstreams_reload)
+        // Operator settings: the twelve config blocks that moved out of
+        // gateway.toml and into the database.
+        .with_get("/admin/settings", pages::settings_index)
+        .with_post("/admin/settings", pages::settings_save)
+        .with_post("/admin/settings/clear", pages::settings_clear)
         .with_get("/admin/limits", pages::admin_limits_index)
         .with_post("/admin/limits", pages::admin_limits_save)
         .with_post("/admin/limits/delete", pages::admin_limits_delete)
@@ -329,6 +358,12 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
 /// browser preflight `OPTIONS /v1/…` hits no registered route) and the
 /// bearer-auth 401 — with the CORS headers browser SPAs require. It is
 /// scoped to `/v1`, so the same-origin HTML UI and `/api/v0` are untouched.
+///
+/// `FirstRunLayer` sits outside the error handler for a related reason: on an
+/// unconfigured gateway an unmatched path should land on the setup wizard, not
+/// on a 404 that explains nothing. It is a no-op once setup has completed. See
+/// [`first_run`](crate::rama_server::first_run) for why the gate lives here
+/// rather than in the handlers.
 pub fn service(
     state: Arc<RamaState>,
 ) -> impl rama::Service<
@@ -336,8 +371,15 @@ pub fn service(
     Output = rama::http::Response,
     Error = std::convert::Infallible,
 > + Clone {
+    let first_run = FirstRunLayer::new(state.clone());
     let router = router(state);
-    (V1CorsLayer, ArcLayer::new(), ErrorHandlerLayer::default()).into_layer(router)
+    (
+        V1CorsLayer,
+        first_run,
+        ArcLayer::new(),
+        ErrorHandlerLayer::default(),
+    )
+        .into_layer(router)
 }
 
 /// Convenience: build the service and start serving on `addr`.

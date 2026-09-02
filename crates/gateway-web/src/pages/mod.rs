@@ -112,6 +112,10 @@ enum NavItem {
     /// Admin-only rate-limit / quota editor (`/admin/limits`). Same
     /// `admin`-role gate as the other operator pages.
     Limits,
+    /// Admin-only operator-settings editor (`/admin/settings`) — the twelve
+    /// blocks that used to live in `gateway.toml`. Same `admin`-role gate as
+    /// the other operator pages.
+    Settings,
     /// Admin-only ComfyUI workflow catalog (`/admin/comfyui`) — live
     /// snapshot of the loaded workflows, operator-triggered reload, and
     /// the per-workflow parameter surface. Same admin-role gate as the
@@ -434,6 +438,7 @@ fn render_app_sidebar(
                         (sidebar_nav_link("/admin/connectors", NavItem::Connectors, active, icons::plug(16), &t(lang, "nav-connectors")))
                         (sidebar_nav_link("/admin/comfyui", NavItem::Comfyui, active, icons::sparkles(16), "ComfyUI"))
                         (sidebar_nav_link("/admin/limits", NavItem::Limits, active, icons::sliders(16), &t(lang, "nav-limits")))
+                        (sidebar_nav_link("/admin/settings", NavItem::Settings, active, icons::sliders(16), &t(lang, "nav-settings")))
                     }.to_html()))
                 }
             }
@@ -1144,6 +1149,10 @@ pub(super) async fn require_session_or_redirect(
     state: &RamaState,
     req: &Request,
 ) -> Result<(Session, users::User), Response> {
+    // No first-run check here: `rama_server::first_run` gates the whole HTML
+    // surface before routing, so an unconfigured gateway never reaches a
+    // handler that would call this. Repeating it per-handler is what let
+    // `/auth/login` slip through.
     let session = match state.sessions.lookup_from_headers(req.headers()).await {
         Ok(Some(s)) => s,
         Ok(None) => return Err(login_redirect(req)),
@@ -1181,6 +1190,8 @@ fn login_redirect(req: &Request) -> Response {
 /// GET /login — the standalone sign-in page: a single centered Card
 /// with the "Continue with OIDC" button.
 pub async fn login(State(_state): State<Arc<RamaState>>, req: Request) -> Response {
+    // Unconfigured gateways never get here — `rama_server::first_run`
+    // redirects `/login` to the wizard before routing.
     let theme = Theme::from_headers(req.headers());
     let lang = Lang::from_headers(req.headers());
     // Carry a deep-link target across the OIDC round-trip. `login_redirect`
@@ -1425,6 +1436,18 @@ pub use rag::{
 };
 pub use rag_oauth::{rag_connect, rag_oauth_callback};
 pub use rag_profiles::{profile_create, profile_delete, profile_update, profiles_index};
+
+// The deployment setup wizard (`/setup`). Unlike every other page here it runs
+// with no session and, on a first run, no configuration at all — its own access
+// rules live in the module.
+mod setup;
+pub use setup::{setup_finish, setup_index, setup_probe_callback, setup_restart, setup_test};
+
+// The operator-settings editor (`/admin/settings`) — the twelve config blocks
+// that moved into the database. Rendered from the spec table in
+// `gateway_core::server::settings`, not hand-built per block.
+mod settings;
+pub use settings::{settings_clear, settings_index, settings_save};
 
 // Admin gateway-groups editor (`/admin/groups`) — OIDC→group mappings + per-group
 // tool/skill grants. Same admin gate.

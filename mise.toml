@@ -131,7 +131,21 @@ dir = "{{ config_root }}"
 [tasks.dev]
 description = "Run the gateway (debug build) against the local config. Pair with `mise run watch-css` / `mise run watch-js` in another terminal for live asset reload."
 depends = ["build-assets"]
-run = "cargo run --package gateway"
+run = """
+# GATEWAY_SESSION_KEY is mandatory (the gateway refuses to boot without it —
+# see load_session_secret in crates/gateway/src/main.rs). Generate one on first
+# run and reuse it forever after, so a dev restart no longer logs you out AND
+# secrets sealed into the local gateway.sqlite (backend API keys, connector
+# secrets, OAuth tokens) stay readable across restarts. Previously dev ran on an
+# ephemeral key, so every one of those was silently lost on every restart.
+KEY_FILE=".gateway-dev-session-key"
+if [ ! -f "$KEY_FILE" ]; then
+  openssl rand -hex 32 > "$KEY_FILE"
+  chmod 600 "$KEY_FILE"
+  echo "generated a persistent dev session key at $KEY_FILE (gitignored)"
+fi
+GATEWAY_SESSION_KEY="$(cat "$KEY_FILE")" exec cargo run --package gateway
+"""
 dir = "{{ config_root }}"
 
 [tasks.dev-build]

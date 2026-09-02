@@ -20,7 +20,7 @@ skills-intro-part1 = Operator-installed guidance the chat model loads on demand 
 skills-intro-part2 = tool. Upload a
 skills-intro-part3 = archive below — it's available immediately, no restart.
 skills-empty-loaded = No skills loaded yet. Upload a .skill archive to add one.
-skills-empty-not-configured = Skills aren't configured. Set [skills] dir in the gateway config and restart to enable them.
+skills-empty-not-configured = Skills aren't configured. Enable skills at /admin/settings (set skills.dir) and restart to load them.
 
 skills-upload-heading = Add a skill
 skills-upload-button = Upload .skill

@@ -42,10 +42,7 @@ pub async fn connectors_index(State(state): State<Arc<RamaState>>, req: Request)
     };
 
     let connectors = mcp_catalog::list_all(&state.db).await.unwrap_or_default();
-    let redirect_uri = format!(
-        "{}/integrations/callback",
-        state.config.gateway.public_url.trim_end_matches('/')
-    );
+    let redirect_uri = format!("{}/integrations/callback", state.public_url());
     let body = render_body(lang, &connectors, &redirect_uri);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "connectors-page-title");

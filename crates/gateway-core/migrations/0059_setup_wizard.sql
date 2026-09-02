@@ -1,0 +1,14 @@
+-- Setup wizard: mark what an in-flight OIDC login is FOR.
+--
+-- The wizard proves a provider works by running a real authorization-code
+-- round trip — deliberately through the same `{public_url}/auth/callback`
+-- redirect URI production uses, so the operator whitelists exactly one URI in
+-- their IdP and the test exercises the real code path rather than a parallel
+-- one. `/auth/callback` therefore needs to tell the two apart: a normal login
+-- upserts a user and mints a session, whereas a setup probe must do neither
+-- (there is no admin group yet to authorise anyone against) and instead hands
+-- the verified claims back to the wizard.
+--
+-- 'login' is the default so every existing row, and every insert from the
+-- unchanged login path, keeps its old meaning.
+ALTER TABLE pending_logins ADD COLUMN purpose TEXT NOT NULL DEFAULT 'login';

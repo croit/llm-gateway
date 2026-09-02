@@ -28,6 +28,8 @@
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{Aead, KeyInit};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, Mac};
 use rand::TryRngCore;
 use sha2::Sha256;
@@ -160,11 +162,46 @@ impl Crypto {
         let bytes = self.open(nonce, ciphertext)?;
         String::from_utf8(bytes).map_err(|_| CryptoError::Decrypt)
     }
+
+    /// Seal a string into the single-column `"<nonce>.<ciphertext>"` form
+    /// (base64url, unpadded) used by every secret that lives in an
+    /// `app_settings` row rather than in its own pair of BLOB columns —
+    /// the VAPID private key, the Brave API key, the OIDC client secret.
+    pub fn seal_to_string(&self, plaintext: &str) -> Result<String, CryptoError> {
+        self.seal_bytes_to_string(plaintext.as_bytes())
+    }
+
+    /// [`Self::seal_to_string`] for material that is not UTF-8 — a raw private
+    /// key, say. Same stored shape, so the two are interchangeable at rest.
+    pub fn seal_bytes_to_string(&self, plaintext: &[u8]) -> Result<String, CryptoError> {
+        let sealed = self.seal(plaintext)?;
+        Ok(format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(&sealed.nonce),
+            URL_SAFE_NO_PAD.encode(&sealed.ciphertext)
+        ))
+    }
+
+    /// Inverse of [`Self::seal_to_string`]. `None` covers both a malformed
+    /// value and one sealed under a different key — callers treat either as
+    /// "not configured", which is the actionable truth, and log once.
+    pub fn open_from_string(&self, stored: &str) -> Option<String> {
+        let bytes = self.open_bytes_from_string(stored)?;
+        String::from_utf8(bytes).ok()
+    }
+
+    /// Inverse of [`Self::seal_bytes_to_string`].
+    pub fn open_bytes_from_string(&self, stored: &str) -> Option<Vec<u8>> {
+        let (nonce, ciphertext) = stored.split_once('.')?;
+        let nonce = URL_SAFE_NO_PAD.decode(nonce).ok()?;
+        let ciphertext = URL_SAFE_NO_PAD.decode(ciphertext).ok()?;
+        self.open(&nonce, &ciphertext).ok()
+    }
 }
 
 /// Decode a lowercase/uppercase hex string into bytes. `None` on odd length or
-/// a non-hex digit. Local copy so the crypto module is self-contained.
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
+/// a non-hex digit. The inverse of [`hex_encode`], and the one home for both.
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
     }
@@ -172,6 +209,38 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// Lowercase hex. The one home for it — `auth::token` and `server::setup` both
+/// hash identifiers into this form, and a second implementation is a second
+/// thing to get subtly wrong.
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(*b >> 4) as usize] as char);
+        out.push(HEX[(*b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Lowercase-hex SHA-256. Used wherever a secret is stored as a digest rather
+/// than as itself — API tokens, webhook secrets, the setup recovery token.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    hex_encode(&Sha256::digest(bytes))
+}
+
+/// `n` random bytes, lowercase hex — the shape every opaque credential in the
+/// gateway takes. Panics only if the OS RNG fails, which is not a condition
+/// any caller can sensibly handle.
+pub fn random_hex(n: usize) -> String {
+    let mut bytes = vec![0u8; n];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS RNG must succeed");
+    hex_encode(&bytes)
 }
 
 #[cfg(test)]

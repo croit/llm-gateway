@@ -23,3 +23,4 @@
 //! drive it with `router.serve(req)` without binding a socket.
 
 pub mod rama_server;
+pub mod tool_families;

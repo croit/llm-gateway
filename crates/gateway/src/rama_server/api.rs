@@ -85,13 +85,13 @@ pub(crate) async fn me_response(state: &RamaState, user_id: &str) -> Response {
         }
     };
     let role_ids = state.rbac.role_ids_for(&user.roles);
-    let mut allowed_tool_ids = state.rbac.allowed_tools(&role_ids, &state.tools);
+    let mut allowed_tool_ids = state.rbac.allowed_tools(&role_ids, &state.tools());
     state.expand_comfyui_tools(&mut allowed_tool_ids, &role_ids);
-    let mut allowed_tools = state.tools.summaries_for(&allowed_tool_ids);
+    let mut allowed_tools = state.tools().summaries_for(&allowed_tool_ids);
     // summaries_for only covers the static ToolRegistry; comfyui_* tools
     // live in the hot-reloadable ComfyuiToolSource. Build summaries from
     // the live catalog snapshot for any ids that summaries_for missed.
-    if let Some(handle) = state.comfyui.as_ref() {
+    if let Some(handle) = state.comfyui() {
         let snapshot = handle.store.current();
         for id in &allowed_tool_ids {
             if id.starts_with(gateway_runtime::server::tools::catalog::COMFYUI_PREFIX)
@@ -161,7 +161,7 @@ pub async fn create_token(State(state): State<Arc<RamaState>>, req: Request) -> 
     }
     let ttl_days = body
         .ttl_days
-        .unwrap_or(state.config.gateway.token_ttl_days)
+        .unwrap_or(state.config().gateway.token_ttl_days)
         .clamp(1, 365 * 5);
 
     // Tool config (defaults: off, nothing disabled). Validate the

@@ -10,8 +10,7 @@
 //!   enough: collisions need ~2^128 work, brute-force needs ~2^256. argon2id's
 //!   cost is wasted on a random opaque token, and lookup must be fast for /v1/*.
 
-use rand::TryRngCore;
-use rand::rngs::OsRng;
+use crate::server::crypto::{random_hex, sha256_hex};
 
 pub const TOKEN_PREFIX: &str = "gwk_";
 /// Webhook trigger secrets share the token construction but carry their own
@@ -47,11 +46,7 @@ pub fn hash_webhook_secret(secret: &str) -> Option<String> {
 }
 
 fn mint_with_prefix(prefix: &str) -> (String, String) {
-    let mut bytes = [0u8; TOKEN_BYTES];
-    OsRng
-        .try_fill_bytes(&mut bytes)
-        .expect("OS RNG must succeed");
-    let plaintext = format!("{prefix}{}", hex_encode(&bytes));
+    let plaintext = format!("{prefix}{}", random_hex(TOKEN_BYTES));
     let hash = sha256_hex(plaintext.as_bytes());
     (plaintext, hash)
 }
@@ -66,22 +61,6 @@ fn hash_with_prefix(prefix: &str, s: &str) -> Option<String> {
     }
     Some(sha256_hex(s.as_bytes()))
 }
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    hex_encode(&sha2::Sha256::digest(bytes))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(*b >> 4) as usize] as char);
-        out.push(HEX[(*b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[cfg(test)]
 mod tests {

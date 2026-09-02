@@ -29,7 +29,8 @@ pub async fn download(State(state): State<Arc<RamaState>>, req: Request) -> Resp
         Ok(u) => u,
         Err(resp) => return resp,
     };
-    let Some(cfg) = state.config.chat.s3.as_ref() else {
+    let config = state.config();
+    let Some(cfg) = config.chat.s3.as_ref() else {
         return err(
             StatusCode::SERVICE_UNAVAILABLE,
             "attachment storage not configured",

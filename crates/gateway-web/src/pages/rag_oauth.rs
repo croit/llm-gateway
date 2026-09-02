@@ -88,8 +88,7 @@ pub async fn rag_connect(
         return internal_error_html(&user.email, &t(lang, "rag-oauth-no-client"));
     };
 
-    let public = state.config.gateway.public_url.trim_end_matches('/');
-    let redirect_uri = format!("{public}{CALLBACK_PATH}");
+    let redirect_uri = format!("{}{CALLBACK_PATH}", state.public_url());
     let pkce = mcp_oauth::pkce();
     let oauth_state = mcp_oauth::random_state();
     let scopes: Vec<String> = scopes.iter().map(|s| (*s).to_string()).collect();

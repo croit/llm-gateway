@@ -126,8 +126,56 @@ pub struct OidcClient {
     jwks: RwLock<JwksCache>,
 }
 
+/// Everything [`OidcClient::build`] needs, with the client secret already
+/// resolved to its value.
+///
+/// Two sources feed this. The legacy [`OidcConfig`] names an environment
+/// variable holding the secret ([`OidcConfig::to_params`] resolves it); the
+/// setup wizard stores the secret sealed in the database and hands it over
+/// directly. Funnelling both through one struct keeps a single code path that
+/// knows how to talk to a provider — the wizard's "test this login for real"
+/// button therefore exercises exactly what production will use.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OidcParams {
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: String,
+    /// Requested on top of `openid`, which [`OidcClient::build`] always adds.
+    pub scopes: Vec<String>,
+    /// Claim holding the user's group memberships (e.g. `groups`).
+    pub roles_claim: Option<String>,
+}
+
+/// The redirect URI this gateway hands the IdP.
+///
+/// The one home for it. [`OidcClient::build`] bakes it into every authorization
+/// request, and the setup wizard shows it to the operator to whitelist — and
+/// the wizard's whole claim is that the URI it displays is the one production
+/// uses. Two `format!`s that agree today are two that can disagree later, and a
+/// redirect-URI mismatch is the most common OIDC misconfiguration there is,
+/// reported by providers with famously unhelpful errors.
+pub fn redirect_uri_for(public_url: &str) -> String {
+    format!("{}/auth/callback", public_url.trim_end_matches('/'))
+}
+
+impl OidcConfig {
+    /// Resolve the config-file shape into [`OidcParams`], reading the client
+    /// secret out of the environment variable it names. `None` when that
+    /// variable is unset or empty — the caller reports it as a configuration
+    /// error rather than attempting a doomed discovery round trip.
+    pub fn to_params(&self) -> Option<OidcParams> {
+        Some(OidcParams {
+            issuer: self.issuer.clone(),
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret()?,
+            scopes: self.scopes.clone(),
+            roles_claim: self.roles_claim.clone(),
+        })
+    }
+}
+
 impl OidcClient {
-    pub async fn build(config: &OidcConfig, public_url: &str) -> Result<Arc<Self>, OidcError> {
+    pub async fn build(config: &OidcParams, public_url: &str) -> Result<Arc<Self>, OidcError> {
         // Discovery URL: `<issuer>/.well-known/openid-configuration`. We don't
         // alter the user's issuer string for slash-normalisation — the
         // discovery doc's `issuer` field must match it byte-for-byte (RFC
@@ -178,10 +226,8 @@ impl OidcClient {
             )));
         }
 
-        let client_secret = config
-            .client_secret()
-            .ok_or_else(|| OidcError::MissingClientSecret(config.client_secret_env.clone()))?;
-        let redirect_uri = format!("{}/auth/callback", public_url.trim_end_matches('/'));
+        let client_secret = config.client_secret.clone();
+        let redirect_uri = redirect_uri_for(public_url);
         Url::parse(&redirect_uri).map_err(|_| OidcError::RedirectUrl(redirect_uri.clone()))?;
 
         // openid is always requested; the user can add email/profile/etc on
@@ -390,6 +436,7 @@ impl OidcClient {
             email,
             name,
             roles,
+            raw: claims,
         })
     }
 
@@ -639,6 +686,13 @@ pub struct UserClaims {
     pub email: String,
     pub name: Option<String>,
     pub roles: Vec<String>,
+    /// The whole verified ID-token payload.
+    ///
+    /// The login path ignores it, but the setup wizard shows it to the
+    /// operator: picking which claim carries group membership is guesswork
+    /// unless you can see what your provider actually sent. Never log this —
+    /// it is a verified identity assertion about a real person.
+    pub raw: serde_json::Value,
 }
 
 #[cfg(test)]

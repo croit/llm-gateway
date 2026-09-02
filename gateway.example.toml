@@ -1,17 +1,51 @@
 # gateway.example.toml — copy to `gateway.toml` for local development, or
 # point `$GATEWAY_CONFIG` at this file.
-
-[bind]
-host = "127.0.0.1"
-port = 8080
+#
+# A DEPLOYMENT DOES NOT NEED THIS FILE.
+#
+# Nothing here is required. The two keys that are still read on every boot both
+# have environment equivalents, which is how a container gets by with no file:
+#
+#   [db].path                       → $GATEWAY_DB_PATH
+#                                     (or just $GATEWAY_DATA_DIR, which the
+#                                     image sets, and the path derives from it)
+#   [gateway].bootstrap_admin_groups → $GATEWAY_BOOTSTRAP_ADMIN_GROUPS
+#
+# The listen socket was never here: that is $IP / $PORT.
+#
+# EVERYTHING ELSE BELOW IS A ONE-TIME SEED. On the first boot after upgrading,
+# each block is copied into the database and ignored from then on — editing it
+# here afterwards does nothing. That is what carries an existing file-driven
+# deployment across without anyone touching it. After that boot the same
+# settings are edited in the browser:
+#
+#   [oidc]                                    → /setup (the setup wizard)
+#   [upstream_pools], [[backend]], [fallback] → /admin/upstreams
+#   [rbac], [[roles]]                         → /admin/groups
+#   [chat], [sandbox], [comfyui], [rag],      → /admin/settings
+#   [skills], [typst], [geoip], [usage],
+#   [limits], [feedback], [push],
+#   [gateway] sessions + tokens
+#
+# `/admin/settings` prints each field's TOML key under its label, so the blocks
+# below double as a map of that page. Secrets entered there are sealed at
+# rest, which is why those fields take a credential directly instead of going
+# through the `*_env` indirection this file uses.
 
 [db]
 path = "gateway.sqlite"
 
 [gateway]
+# SEED ONLY. `public_url` moves to /setup on the first boot; the four
+# session/token keys below move to /admin/settings, where they are labelled with
+# exactly these names. `bootstrap_admin_groups` is the one key here that stays,
+# and `$GATEWAY_BOOTSTRAP_ADMIN_GROUPS` covers it too — see the note below.
+#
+# `session_key_env` is gone: the session key is read from $GATEWAY_SESSION_KEY
+# and nowhere else. A file that still names a different variable gets a warning
+# at startup.
 public_url = "http://localhost:8080"
 token_ttl_days = 90
-session_key_env = "GATEWAY_SESSION_KEY"
 # How long a browser login lasts. `session_ttl_days` is a *sliding* idle
 # timeout — every request pushes it forward, so it's how long you may stay
 # away before signing in again. `session_absolute_max_days` is the hard cap
@@ -28,7 +62,9 @@ session_absolute_max_days = 90
 # impersonation still works regardless.
 allow_impersonation = false
 # Break-glass admin: raw OIDC claim values (group names) that ALWAYS resolve to
-# admin, regardless of the DB group tables. Gateway groups — including which are
+# admin, regardless of the DB group tables. NOT a /admin/settings field, and
+# deliberately so: it has to work when the database is what locked you out, so
+# the database is the one place it must not live. Gateway groups — including which are
 # admin — are managed at /admin/groups, but if that mapping is misconfigured you
 # could lock yourself out of the very UI that fixes it. List at least one trusted
 # group here so an operator can always get in. This is the ONE RBAC decision that
@@ -271,7 +307,9 @@ enabled = true
 # SKILL.md body, and any referenced `references/`/`assets/` file (e.g. an SVG
 # logo it inlines into an HTML answer).
 #
-# Drop bundles into `dir` and restart (no hot-reload). A bundle is either a
+# Drop bundles into `dir` and re-save the Skills section at /admin/settings to
+# re-scan it — or upload through /admin/skills, which already re-scans live.
+# A bundle is either a
 # directory holding a `SKILL.md`, or a `*.skill` zip of one (extracted into
 # `<dir>/.cache/` at startup). With no valid bundle the `read_skill` tool
 # isn't even registered.

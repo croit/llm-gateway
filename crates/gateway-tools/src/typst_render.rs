@@ -2449,8 +2449,10 @@ mod tests {
             endpoint: "http://127.0.0.1:1".into(),
             region: "us-east-1".into(),
             bucket: "b".into(),
-            access_key_env: "TYPST_BASE_TEST_NOT_SET".into(),
-            secret_key_env: "TYPST_BASE_TEST_NOT_SET".into(),
+            access_key: None,
+            secret_key: None,
+            access_key_env: None,
+            secret_key_env: None,
             key_prefix: "chat-attachments".into(),
         }
     }
@@ -3297,7 +3299,10 @@ mod tests {
             timeout_secs: 30,
             max_artifact_bytes: 1024,
         });
-        let sandbox = SandboxClient::new(cfg, "http://localhost".into());
+        let sandbox = SandboxClient::new(
+            cfg,
+            gateway_runtime::server::state::RuntimeSettings::new_handle("http://localhost"),
+        );
         let tool = TypstPptxTool::new(std::sync::Arc::new(stub_template()), sandbox);
         assert_eq!(tool.id(), "typst_stub_pptx");
         let def = tool.schema();

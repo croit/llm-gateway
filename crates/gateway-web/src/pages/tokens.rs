@@ -151,7 +151,7 @@ pub async fn tokens_create(State(state): State<Arc<RamaState>>, req: Request) ->
     }
     let ttl_days = form
         .ttl_days
-        .unwrap_or(state.config.gateway.token_ttl_days)
+        .unwrap_or(state.config().gateway.token_ttl_days)
         .clamp(1, 365 * 5);
 
     let now = Timestamp::now();

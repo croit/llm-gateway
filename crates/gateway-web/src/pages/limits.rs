@@ -40,10 +40,10 @@ pub async fn limits_index(State(state): State<Arc<RamaState>>, req: Request) -> 
 
     let rules = limits::list_all(&state.db).await.unwrap_or_default();
     let roster = users::list_all(&state.db).await.unwrap_or_default();
-    let role_ids: Vec<String> = state.config.roles.iter().map(|r| r.id.clone()).collect();
+    let role_ids: Vec<String> = state.config().roles.iter().map(|r| r.id.clone()).collect();
     // Every advertised model across all pools/kinds — the scope dropdown.
     let models = state.upstreams.all_models();
-    let currency = &state.config.usage.currency;
+    let currency = &state.config().usage.currency;
 
     let body = render_body(lang, currency, &rules, &role_ids, &roster, &models);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
@@ -133,7 +133,7 @@ pub async fn limits_save(State(state): State<Arc<RamaState>>, req: Request) -> R
             if id.is_empty() {
                 return toast(FlashKind::Error, t(lang, "limits-missing-subject-id"));
             }
-            if !state.config.roles.iter().any(|r| r.id == id) {
+            if !state.config().roles.iter().any(|r| r.id == id) {
                 return toast(
                     FlashKind::Error,
                     t_args(
@@ -252,7 +252,7 @@ async fn patch_table_response(
 ) -> Response {
     let rules = limits::list_all(&state.db).await.unwrap_or_default();
     let roster = users::list_all(&state.db).await.unwrap_or_default();
-    let currency = &state.config.usage.currency;
+    let currency = &state.config().usage.currency;
     let table = render_table(lang, currency, &rules, &roster).to_string();
     sse_response(&[
         sse_toast(&Flash { kind, message }),
