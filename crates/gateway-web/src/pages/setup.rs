@@ -321,12 +321,15 @@ fn text_field(f: TextField<'_>) -> plait::Html {
         }
         .to_html()
     };
+    // `flex flex-col gap-1`, not daisyUI's `form-control` — that class was
+    // removed in daisyUI 5, so it styles nothing and the label, input and help
+    // text run together inline.
     html! {
-        label(class: "form-control") {
+        label(class: "flex flex-col gap-1") {
             span(class: "label-text font-medium") { (label) }
             (input)
             if let Some(help) = &help {
-                span(class: "label-text-alt text-base-content/60 mt-1") { (help) }
+                span(class: "label-text-alt text-xs text-base-content/60") { (help) }
             }
         }
     }

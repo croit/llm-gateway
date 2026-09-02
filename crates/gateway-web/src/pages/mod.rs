@@ -1550,3 +1550,108 @@ pub(super) fn forbidden_html(user_email: &str, message: &str) -> Response {
 }
 
 // `read_body_to_bytes` lives in `session_core::chrome::read_body_to_bytes`.
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    /// Classes daisyUI 5 removed, which therefore style nothing.
+    ///
+    /// `form-control` is the one that bit us: it was daisyUI 4's
+    /// label-plus-control wrapper, and in 5 it is not a class at all — the
+    /// label component's stylesheet under `ui/node_modules/daisyui/components`
+    /// declares two selectors, and this is not one of them. A label carrying
+    /// it gets no layout, so its `span` and `input` fall back to inline and
+    /// run together on one line — `Name [input]`, with the help text wedged
+    /// between a label and its own box. It presents as a spacing bug, which
+    /// sends you hunting through gap utilities that are not the problem. The
+    /// house pattern is `flex flex-col gap-1`.
+    ///
+    /// Naming a daisyUI class in prose here has a cost, incidentally: the
+    /// Tailwind scanner reads these files and cannot tell a comment from
+    /// markup, so a class named in a doc comment gets emitted into the bundle
+    /// whether or not any page uses it.
+    ///
+    /// `label-text` is inert too, but tolerated: v4 gave it `text-sm`, which
+    /// is what the 58 bare uses now inherit anyway, so removing them all would
+    /// churn every form for no visible change. `label-text-alt` is the
+    /// dangerous half — it also carried the *dimming and shrinking* that makes
+    /// help text read as help text — so it is checked separately below.
+    const REMOVED_IN_DAISYUI_5: [&str; 1] = ["form-control"];
+
+    #[test]
+    fn no_page_uses_a_class_daisyui_dropped() {
+        let mut offenders = Vec::new();
+        for (name, src) in page_sources() {
+            for (n, line) in src.lines().enumerate() {
+                // Only what follows `class:`, so this test's own doc comment
+                // and the const above it do not trip it.
+                let Some(classes) = line.split("class:").nth(1) else {
+                    continue;
+                };
+                for dead in REMOVED_IN_DAISYUI_5 {
+                    if classes.contains(dead) {
+                        offenders.push(format!("{name}:{} uses `{dead}`", n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these classes were removed in daisyUI 5 and style nothing — \
+             use `flex flex-col gap-1` instead: {offenders:#?}"
+        );
+    }
+
+    /// Help text must set its own size, because `label-text-alt` cannot.
+    ///
+    /// The class is gone in daisyUI 5, and unlike its `label-text` sibling it
+    /// was doing visible work: help text under a control rendered at the same
+    /// size and weight as the label above it, so a hint read as a second
+    /// paragraph of the form rather than an aside. Every use has to carry an
+    /// explicit `text-xs`.
+    #[test]
+    fn help_text_sets_its_own_size() {
+        let mut bare = Vec::new();
+        for (name, src) in page_sources() {
+            for (n, line) in src.lines().enumerate() {
+                let Some(classes) = line.split("class:").nth(1) else {
+                    continue;
+                };
+                if classes.contains("label-text-alt") && !classes.contains("text-xs") {
+                    bare.push(format!("{name}:{}", n + 1));
+                }
+            }
+        }
+        assert!(
+            bare.is_empty(),
+            "`label-text-alt` styles nothing in daisyUI 5 — add `text-xs` so the \
+             hint is still smaller than its label: {bare:#?}"
+        );
+    }
+
+    /// Every `.rs` under `src/pages`, as (file name, contents).
+    fn page_sources() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pages")];
+        while let Some(path) = stack.pop() {
+            for entry in fs::read_dir(&path)
+                .expect("pages dir is readable")
+                .flatten()
+            {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                out.push((name, fs::read_to_string(&p).expect("readable")));
+            }
+        }
+        out
+    }
+}

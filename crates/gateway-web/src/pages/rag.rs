@@ -2340,7 +2340,7 @@ fn render_edit_form(
                             placeholder: "developers, network_admin",
                             class: "input input-bordered w-full font-mono"
                         );
-                        div(class: "label") { span(class: "label-text-alt text-base-content/60") { (t(lang, "rag-hint-allowed-groups")) } }
+                        div(class: "label") { span(class: "label-text-alt text-xs text-base-content/60") { (t(lang, "rag-hint-allowed-groups")) } }
                     }
                     div(class: "card-actions justify-end mt-2 gap-2") {
                         form(

@@ -227,13 +227,22 @@ fn render_body(
 ) -> Html {
     let cards: Vec<Html> = views.iter().map(|g| group_card(lang, g)).collect();
     html! {
-        section(class: "max-w-4xl mx-auto p-4 sm:p-6 flex flex-col gap-6") {
+        // The house shell: `pt-14` on mobile clears the floating menu button,
+        // which `p-4` did not — the heading sat under it.
+        section(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6 flex flex-col gap-4") {
             header(class: "flex flex-col gap-1") {
                 h1(class: "text-2xl font-bold") { (t(lang, "groups-heading")) }
                 p(class: "text-base-content/70 text-sm") { (t(lang, "groups-intro")) }
             }
             (datalists(observed, tool_ids, skill_names))
-            (group_form(lang, None))
+            // In a card, like every existing group below it. A bare form next
+            // to a column of cards reads as a fragment of the page rather than
+            // one of its parts.
+            article(class: "card border border-base-300 bg-base-100") {
+                div(class: "card-body gap-3 p-4") {
+                    (group_form(lang, None))
+                }
+            }
             div(class: "flex flex-col gap-4") {
                 h2(class: "text-lg font-semibold") { (t(lang, "groups-existing-heading")) }
                 if views.is_empty() {
@@ -305,33 +314,39 @@ fn group_form(lang: Lang, existing: Option<&GroupView>) -> Html {
     } else {
         t(lang, "groups-new-heading")
     };
+    // Name and description are short, so they pair into one row; the three
+    // comma-separated lists take a row each, because a claim value like
+    // `CN=devs,OU=…` needs the width. Same two-column grid the settings editor
+    // and the connector form use.
     html! {
         form(method: "post", action: "/admin/groups/save", class: "flex flex-col gap-3") {
             h3(class: "font-semibold") { (heading) }
-            label(class: "form-control") {
-                span(class: "label-text") { (t(lang, "groups-field-name")) }
-                (name_input(&name, is_edit))
-            }
-            label(class: "form-control") {
-                span(class: "label-text") { (t(lang, "groups-field-description")) }
-                input(type: "text", name: "description", value: (description), class: "input input-bordered input-sm");
+            div(class: "grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-3") {
+                label(class: "flex flex-col gap-1") {
+                    span(class: "label-text text-xs") { (t(lang, "groups-field-name")) }
+                    (name_input(&name, is_edit))
+                }
+                label(class: "flex flex-col gap-1") {
+                    span(class: "label-text text-xs") { (t(lang, "groups-field-description")) }
+                    input(type: "text", name: "description", value: (description), class: "input input-bordered input-sm w-full");
+                }
             }
             div(class: "flex gap-4 flex-wrap") {
                 (super::bool_checkbox("is_admin", "1", &t(lang, "groups-field-admin"), is_admin, false))
                 (super::bool_checkbox("is_default", "1", &t(lang, "groups-field-default"), is_default, false))
             }
-            label(class: "form-control") {
-                span(class: "label-text") { (t(lang, "groups-field-oidc")) }
-                span(class: "label-text-alt text-base-content/60") { (t(lang, "groups-field-oidc-help")) }
-                input(type: "text", name: "oidc_values", value: (oidc), list: "oidc-values", class: "input input-bordered input-sm", placeholder: "grp-dev, CN=devs,OU=…");
+            label(class: "flex flex-col gap-1") {
+                span(class: "label-text text-xs") { (t(lang, "groups-field-oidc")) }
+                input(type: "text", name: "oidc_values", value: (oidc), list: "oidc-values", class: "input input-bordered input-sm w-full", placeholder: "grp-dev, CN=devs,OU=…");
+                span(class: "label-text-alt text-xs text-base-content/60") { (t(lang, "groups-field-oidc-help")) }
             }
-            label(class: "form-control") {
-                span(class: "label-text") { (t(lang, "groups-field-tools")) }
-                input(type: "text", name: "tools", value: (tools), list: "tool-ids", class: "input input-bordered input-sm", placeholder: "*");
+            label(class: "flex flex-col gap-1") {
+                span(class: "label-text text-xs") { (t(lang, "groups-field-tools")) }
+                input(type: "text", name: "tools", value: (tools), list: "tool-ids", class: "input input-bordered input-sm w-full", placeholder: "*");
             }
-            label(class: "form-control") {
-                span(class: "label-text") { (t(lang, "groups-field-skills")) }
-                input(type: "text", name: "skills", value: (skills), list: "skill-names", class: "input input-bordered input-sm", placeholder: "*");
+            label(class: "flex flex-col gap-1") {
+                span(class: "label-text text-xs") { (t(lang, "groups-field-skills")) }
+                input(type: "text", name: "skills", value: (skills), list: "skill-names", class: "input input-bordered input-sm w-full", placeholder: "*");
             }
             div(class: "flex justify-end") {
                 button(type: "submit", class: "btn btn-sm btn-primary") { (t(lang, "groups-save")) }
@@ -347,12 +362,12 @@ fn group_form(lang: Lang, existing: Option<&GroupView>) -> Html {
 fn name_input(value: &str, readonly: bool) -> Html {
     if readonly {
         html! {
-            input(type: "text", name: "name", value: (value.to_string()), readonly: "readonly", class: "input input-bordered input-sm font-mono bg-base-200");
+            input(type: "text", name: "name", value: (value.to_string()), readonly: "readonly", class: "input input-bordered input-sm font-mono bg-base-200 w-full");
         }
         .to_html()
     } else {
         html! {
-            input(type: "text", name: "name", value: (value.to_string()), required: "required", class: "input input-bordered input-sm font-mono", placeholder: "developers");
+            input(type: "text", name: "name", value: (value.to_string()), required: "required", class: "input input-bordered input-sm font-mono w-full", placeholder: "developers");
         }
         .to_html()
     }

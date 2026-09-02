@@ -879,7 +879,7 @@ fn render_form_fields(
                         option(value: "global") { "Global (one shared identity for everyone)" }
                     }
                 }
-                span(class: "label-text-alt text-base-content/50") {
+                span(class: "label-text-alt text-xs text-base-content/50") {
                     "Global connectors are shared by everyone (RBAC-gated) with no sign-in — a single bot/token for the whole gateway (e.g. Discord). They must use \"No auth\" or \"Bearer token\", not OAuth."
                 }
             }
@@ -912,7 +912,7 @@ fn render_form_fields(
                     span(class: "label-text text-xs") { "Bearer token (shared)" }
                     input(type: "password", name: "client_secret", placeholder: (secret_placeholder),
                           class: "input input-bordered input-sm w-full");
-                    span(class: "label-text-alt text-base-content/50") {
+                    span(class: "label-text-alt text-xs text-base-content/50") {
                         "Sent as " code { "Authorization: Bearer <token>" } " to the MCP server for every user. Stored encrypted."
                     }
                 }
@@ -929,7 +929,7 @@ fn render_form_fields(
                     textarea(name: "client_json", rows: "3", autocomplete: "off",
                              placeholder: "{\"web\":{\"client_id\":\"…\",\"client_secret\":\"…\",\"auth_uri\":\"…\",\"token_uri\":\"…\"}}",
                              class: "textarea textarea-bordered textarea-sm w-full font-mono text-xs") {}
-                    span(class: "label-text-alt text-base-content/50") {
+                    span(class: "label-text-alt text-xs text-base-content/50") {
                         (t(lang, "connectors-field-client-json-help"))
                     }
                 }
@@ -939,7 +939,7 @@ fn render_form_fields(
                         input(type: "text", name: "client_id", value: (client_id),
                               placeholder: (client_id_placeholder),
                               class: "input input-bordered input-sm w-full");
-                        span(class: "label-text-alt text-base-content/50") {
+                        span(class: "label-text-alt text-xs text-base-content/50") {
                             (t(lang, "connectors-field-client-id-help-1")) " "
                             strong { (t(lang, "connectors-term-this-gateway")) } " "
                             (t(lang, "connectors-field-client-id-help-2"))
@@ -949,7 +949,7 @@ fn render_form_fields(
                         span(class: "label-text text-xs") { (t(lang, "connectors-field-client-secret-label")) }
                         input(type: "password", name: "client_secret", placeholder: (secret_placeholder),
                               class: "input input-bordered input-sm w-full");
-                        span(class: "label-text-alt text-base-content/50") {
+                        span(class: "label-text-alt text-xs text-base-content/50") {
                             (t(lang, "connectors-field-client-secret-help"))
                         }
                     }
