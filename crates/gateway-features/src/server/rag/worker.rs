@@ -2432,14 +2432,25 @@ mod tests {
 
     /// A throwaway git repo with one commit on `main`. `None` if `git` isn't
     /// on PATH (CI without git → test skips rather than fails).
+    ///
+    /// The env scrub is not optional. `git` exports `GIT_DIR`,
+    /// `GIT_INDEX_FILE` and friends to hooks and to everything a hook runs, so
+    /// a test suite invoked from a `pre-push` hook inherits them — and then
+    /// every command below aims at the *pushing* repository instead of this
+    /// temp dir. `git add` writes its index, replacing the developer's staged
+    /// state with this fixture's single "hello world" README; `git config`
+    /// writes `t@example.invalid` into their real identity; `git init` has
+    /// been seen to set `core.bare`. All three have actually happened here.
     fn fixture_repo() -> Option<tempfile::TempDir> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let run = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(path)
-                .output()
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(args).current_dir(path);
+            for var in super::git::INHERITED_GIT_VARS {
+                cmd.env_remove(var);
+            }
+            cmd.output()
         };
         let init = run(&["init", "-q", "-b", "main", "."]).ok()?;
         if !init.status.success() {

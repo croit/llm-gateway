@@ -17,9 +17,28 @@ fn main() {
         .ok()
         .map(|s| s.chars().take(12).collect::<String>())
         .or_else(|| {
-            Command::new("git")
-                .args(["rev-parse", "--short=12", "HEAD"])
-                .output()
+            let mut cmd = Command::new("git");
+            cmd.args(["rev-parse", "--short=12", "HEAD"]);
+            // A build run from inside a git hook inherits GIT_DIR and friends,
+            // which would resolve HEAD in whatever repository invoked the hook
+            // rather than this one — and stamp that foreign SHA into the
+            // binary, defeating the point of embedding it. Kept in step with
+            // `gateway_features::server::rag::git::INHERITED_GIT_VARS`; a
+            // build script cannot import from the workspace, so the list is
+            // repeated rather than shared.
+            for var in [
+                "GIT_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_COMMON_DIR",
+                "GIT_NAMESPACE",
+                "GIT_PREFIX",
+            ] {
+                cmd.env_remove(var);
+            }
+            cmd.output()
                 .ok()
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())

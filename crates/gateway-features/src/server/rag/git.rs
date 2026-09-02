@@ -399,4 +399,73 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, GitError::NonZero { .. }), "{err:?}");
     }
+
+    /// Every `git` spawn in the workspace must scrub the inherited git context.
+    ///
+    /// This is a data-integrity guard, not tidiness. `git` exports `GIT_DIR`,
+    /// `GIT_INDEX_FILE`, `GIT_WORK_TREE` and the rest to hooks and to every
+    /// process a hook starts, so anything run from a `pre-commit` or
+    /// `pre-push` hook — the whole test suite, in this repo — inherits a
+    /// pointer to the developer's real repository. An unscrubbed `git add` in
+    /// a test fixture then writes *their* index: 817 staged entries replaced
+    /// by the fixture's one "hello world" README. An unscrubbed `git config`
+    /// rewrites their commit identity. Both have happened here, more than
+    /// once, and neither leaves a reflog entry to explain itself.
+    ///
+    /// So the rule is mechanical: a file that names `Command::new("git")` must
+    /// also name [`INHERITED_GIT_VARS`] or call `env_remove`. Crude, and it
+    /// cannot prove the scrub is wired to the right command — but it makes the
+    /// omission impossible to add silently, which is the failure mode that
+    /// actually bit.
+    #[test]
+    fn every_git_spawn_scrubs_the_inherited_context() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        // …/crates/gateway-features → …/crates
+        let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate lives under crates/")
+            .to_path_buf();
+
+        let mut unscrubbed = Vec::new();
+        let mut stack = vec![crates];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).expect("readable").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // `target` holds generated code and vendored sources that
+                    // are nobody's to fix here.
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let src = fs::read_to_string(&path).expect("readable");
+                if !src.contains("Command::new(\"git\")") {
+                    continue;
+                }
+                if src.contains("INHERITED_GIT_VARS") || src.contains("env_remove") {
+                    continue;
+                }
+                unscrubbed.push(
+                    path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
+        unscrubbed.sort();
+        assert!(
+            unscrubbed.is_empty(),
+            "these spawn `git` without clearing the inherited git context, so \
+             running them from a git hook operates on the caller's repository: \
+             {unscrubbed:#?}"
+        );
+    }
 }
