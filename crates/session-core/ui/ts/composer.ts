@@ -168,7 +168,7 @@ const notifyConversationMutated = (): void => {
     messageInput.value = '';
     // `field-sizing: content` reflows the textarea automatically;
     // dispatching `input` also flips the `:placeholder-shown`-driven
-    // mic ↔ send overlay back to the empty state.
+    // send button back to its empty state (hidden).
     messageInput.dispatchEvent(new Event('input', { bubbles: true }));
     // Attached files were consumed by the server response — drop
     // them from the file input + clear the chip strip.

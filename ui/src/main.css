@@ -2329,21 +2329,35 @@
     }
 
     /* Mic / send toggle. Default state (empty textarea, placeholder
-     * showing): mic visible, send hidden. As soon as the user types,
-     * `:placeholder-shown` flips off → send shows, voice-control hides.
+     * showing): send hidden — there is nothing to send yet.
+     * `:placeholder-shown` flips off as soon as the field holds text and
+     * the send button appears.
      *
      * `:has(.voice-control)` guards the send-hide rule so on
      * voice-less builds the send button is always visible (otherwise
-     * an empty textarea + no mic would leave nothing to click). */
+     * an empty textarea + no mic would leave nothing to click).
+     *
+     * An empty field is not the same as an empty message: an
+     * attachment-only turn (drop a screenshot, hit send) is a valid
+     * submit — `composer.ts`'s `onSubmit` accepts it. So the hide is
+     * additionally gated on the chip strip being empty. Without that,
+     * dropping a file into an untouched composer left no send button,
+     * and Enter-to-submit is desktop-only (`onKeydown` bails unless the
+     * pointer is fine), so a phone had no way to send it at all.
+     *
+     * The mic is NOT part of that swap. Dictation appends to whatever the
+     * field already holds (see `chat/mic.ts`), so hiding it the moment the
+     * field is non-empty took the button away exactly when it was still
+     * useful: right after a transcription landed (the mic vanished under
+     * its own output) and any time the user wanted to dictate a second
+     * sentence onto typed text. It only hides while a turn is streaming. */
     .chat-composer__send {
         display: inline-flex;
     }
-    .chat-composer__field:has(.voice-control):has(.chat-composer__textarea:placeholder-shown)
+    .chat-composer:has(.voice-control):has(.chat-composer__textarea:placeholder-shown):not(
+            :has(.chat-composer__chips > *)
+        )
         .chat-composer__send {
-        display: none;
-    }
-    .chat-composer__field:has(.chat-composer__textarea:not(:placeholder-shown))
-        .voice-control {
         display: none;
     }
     /* Voice activity meter — bars driven by RMS in app.js. */

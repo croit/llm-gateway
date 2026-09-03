@@ -285,6 +285,132 @@ mod tests {
         panic!("no rule for `{sel}` in the compiled CSS bundle");
     }
 
+    /// Every rule in the bundle whose selector list mentions `sel` as a
+    /// selector-list entry substring, as `(selector list, declaration block)`.
+    /// Unlike `rule_for` this keeps going past the first hit — the point is to
+    /// catch *any* rule that touches a class, not just the first one.
+    fn rules_mentioning(sel: &str) -> Vec<(String, String)> {
+        let css = std::str::from_utf8(APP_CSS).expect("bundle is utf-8");
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(hit) = css[from..].find(sel) {
+            let at = from + hit;
+            let start = css[..at].rfind(['}', '{']).map_or(0, |i| i + 1);
+            let open = match css[at..].find('{') {
+                Some(i) => at + i,
+                None => break,
+            };
+            let close = match css[open..].find('}') {
+                Some(i) => open + i,
+                None => break,
+            };
+            out.push((
+                css[start..open].trim().to_string(),
+                css[open + 1..close].to_string(),
+            ));
+            from = open;
+        }
+        out
+    }
+
+    /// Whether `entry` (one selector-list entry) actually *styles* `class` —
+    /// i.e. the class is in the subject compound, not merely named inside a
+    /// functional pseudo-class such as `:has()` / `:is()`, where it only
+    /// qualifies some other element.
+    fn subject_is(entry: &str, class: &str) -> bool {
+        let mut flat = String::new();
+        let mut depth = 0usize;
+        for ch in entry.chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => flat.push(ch),
+                _ => {}
+            }
+        }
+        flat.split_whitespace()
+            .next_back()
+            .is_some_and(|compound| compound.contains(class))
+    }
+
+    /// Dictation appends to whatever the composer already holds, so the mic
+    /// has to stay reachable once there is text in the field.
+    ///
+    /// The bug this pins: the mic and the send button were treated as one
+    /// `:placeholder-shown` swap, so typing (or a transcription landing in the
+    /// field, which is text too) hid the mic. The user could dictate exactly
+    /// once, and the button vanished under its own output.
+    ///
+    /// Hiding it mid-turn (`.chat-composer--streaming`) is the one legitimate
+    /// case — recording into a running turn makes no sense.
+    #[test]
+    fn the_dictation_mic_survives_a_non_empty_composer() {
+        let shown = rule_for(".voice-control");
+        assert!(
+            shown.contains("display:inline-flex"),
+            "the mic cluster is the composer's dictation control and must \
+             render by default; got: {shown}"
+        );
+
+        for (selectors, block) in rules_mentioning(".voice-control") {
+            if !block.contains("display:none") {
+                continue;
+            }
+            // `:has(.voice-control)` guards elsewhere only *mention* the class;
+            // a rule styles the mic when it is the selector's subject.
+            if !selectors
+                .split(',')
+                .any(|entry| subject_is(entry, ".voice-control"))
+            {
+                continue;
+            }
+            assert!(
+                selectors.contains("chat-composer--streaming"),
+                "`{selectors}` hides the dictation mic. The only rule allowed \
+                 to do that is the streaming one; a `:placeholder-shown` swap \
+                 takes the mic away the moment the field holds text — which is \
+                 exactly when dictation still has something to append to."
+            );
+        }
+    }
+
+    /// An attachment with no typed text is a sendable turn — `onSubmit` in
+    /// `composer.ts` explicitly allows it ("drop a screenshot, hit send").
+    ///
+    /// The bug this pins: the send button was hidden on `:placeholder-shown`
+    /// alone, so dropping a file into an untouched composer left nothing to
+    /// click. Enter-to-submit is desktop-only (`onKeydown` bails unless the
+    /// pointer is fine), so on a phone that turn could not be sent at all.
+    /// Any rule hiding send must therefore also clear the chip strip — or be
+    /// the streaming rule, which hides send in favour of stop.
+    #[test]
+    fn the_send_button_survives_an_attachment_only_composer() {
+        let shown = rule_for(".chat-composer__send");
+        assert!(
+            shown.contains("display:inline-flex"),
+            "send renders by default; got: {shown}"
+        );
+
+        for (selectors, block) in rules_mentioning(".chat-composer__send") {
+            if !block.contains("display:none") {
+                continue;
+            }
+            if !selectors
+                .split(',')
+                .any(|entry| subject_is(entry, ".chat-composer__send"))
+            {
+                continue;
+            }
+            assert!(
+                selectors.contains("chat-composer--streaming")
+                    || selectors.contains("chat-composer__chips"),
+                "`{selectors}` hides the send button without checking the chip \
+                 strip. An empty textarea is not an empty message — an \
+                 attachment-only turn is a valid submit and needs a button."
+            );
+        }
+    }
+
     /// The document canvas scrolls only if EVERY link from the column down to
     /// the scroll body has a bounded height. The bug this pins: the panel was
     /// `height: 100%` inside an auto-height slot, so the percentage never
