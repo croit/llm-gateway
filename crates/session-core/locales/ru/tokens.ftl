@@ -92,3 +92,24 @@ tokens-push-unsupported = Этот браузер не поддерживает 
 tokens-push-enabled = Уведомления включены на этом устройстве.
 tokens-push-disabled = Уведомления выключены на этом устройстве.
 tokens-push-error = Не удалось изменить настройки уведомлений.
+
+# Использование, список разрешённых моделей и квота для токена (/tokens).
+tokens-usage-line = в этом месяце: { $requests } запросов · { $tokens } токенов · { $cost }
+tokens-models-summary-all = Модели: все
+tokens-models-summary-restricted = Модели: выбрано { $count }
+tokens-models-help = Если выключено, токен следует вашему собственному доступу, включая модели, добавленные позже. Если включено, он может использовать только отмеченные модели — добавленная после этого модель останется недоступной, пока вы не отметите её здесь.
+tokens-models-restrict-label = Ограничить этот токен определёнными моделями
+tokens-models-none-picked = Отметьте хотя бы одну модель или отключите ограничение.
+tokens-models-save = Сохранить модели
+tokens-models-saved-toast = Токен ограничен { $count } моделями.
+tokens-models-cleared-toast = Токен может использовать все ваши модели.
+tokens-limits-summary-none = Квота: нет
+tokens-limits-summary-some = Квота: правил — { $count }
+tokens-limits-help = Ограничение только для этого токена. Ваш собственный бюджет продолжает действовать, поэтому это может только сузить расход токена, но не расширить его.
+tokens-limits-add = Добавить квоту
+tokens-limits-remove = Удалить
+tokens-limits-saved-toast = Квота токена сохранена.
+tokens-limits-removed-toast = Квота токена удалена.
+tokens-limits-not-yours = Эту квоту вы удалить не можете.
+tokens-limits-admin-set = Эту квоту для токена задал администратор; изменить её можно только на странице лимитов администратора.
+tokens-limits-admin-badge = задано администратором

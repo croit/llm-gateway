@@ -92,3 +92,24 @@ tokens-push-unsupported = Ce navigateur ne prend pas en charge les notifications
 tokens-push-enabled = Notifications activées sur cet appareil.
 tokens-push-disabled = Notifications désactivées sur cet appareil.
 tokens-push-error = Impossible de modifier les paramètres de notification.
+
+# Utilisation, liste de modèles autorisés et quota par jeton (/tokens).
+tokens-usage-line = ce mois-ci : { $requests } requêtes · { $tokens } tokens · { $cost }
+tokens-models-summary-all = Modèles : tous
+tokens-models-summary-restricted = Modèles : { $count } sélectionnés
+tokens-models-help = Désactivé, ce jeton suit votre propre accès, y compris les modèles ajoutés plus tard. Activé, il ne peut utiliser que les modèles cochés — un modèle ajouté ensuite reste bloqué tant que vous ne l'avez pas coché ici aussi.
+tokens-models-restrict-label = Limiter ce jeton à des modèles précis
+tokens-models-none-picked = Cochez au moins un modèle, ou désactivez la limite.
+tokens-models-save = Enregistrer les modèles
+tokens-models-saved-toast = Jeton limité à { $count } modèles.
+tokens-models-cleared-toast = Le jeton peut utiliser tous vos modèles.
+tokens-limits-summary-none = Quota : aucun
+tokens-limits-summary-some = Quota : { $count } règle(s)
+tokens-limits-help = Un plafond pour ce seul jeton. Votre propre budget s'applique toujours : ceci ne peut que restreindre la dépense du jeton, jamais l'élargir.
+tokens-limits-add = Ajouter un quota
+tokens-limits-remove = Supprimer
+tokens-limits-saved-toast = Quota du jeton enregistré.
+tokens-limits-removed-toast = Quota du jeton supprimé.
+tokens-limits-not-yours = Ce quota n'est pas le vôtre à supprimer.
+tokens-limits-admin-set = Un administrateur a défini ce quota sur ce jeton ; il ne peut être modifié que sur la page des limites d'administration.
+tokens-limits-admin-badge = défini par l'administrateur

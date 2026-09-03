@@ -118,6 +118,7 @@ fn ctx(pool: db::Pool, asst_turn: &str) -> ToolContext {
     ToolContext {
         user_id: "u1".into(),
         roles: vec![],
+        pool_access: gateway_core::server::upstreams::PoolAccess::all(),
         db: pool,
         s3: Some(s3_cfg()),
         assistant_turn_id: Some(asst_turn.into()),

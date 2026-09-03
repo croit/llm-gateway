@@ -120,10 +120,16 @@ impl RecordParams {
 /// caller's role ids and consults the shared [`gateway_core::server::limits::Enforcer`].
 async fn limit_check(state: &RamaState, user: &UserCtx) -> Option<Response> {
     let role_ids = state.role_ids_for(&user.roles);
-    match state.enforcer.check(&user.user_id, &role_ids).await {
-        Ok(()) => None,
-        Err(exceeded) => Some(limit_exceeded_response(&exceeded)),
+    if let Err(exceeded) = state.enforcer.check(&user.user_id, &role_ids).await {
+        return Some(limit_exceeded_response(&exceeded));
     }
+    // The token's own rules are an additional ceiling, not an alternative to
+    // the owner's budget: both must pass, so issuing a token can only narrow
+    // what its owner may spend.
+    if let Err(exceeded) = state.enforcer.check_token(&user.token_id).await {
+        return Some(limit_exceeded_response(&exceeded));
+    }
+    None
 }
 
 /// Compact number for limit messages: whole values without a trailing `.0`,
@@ -144,8 +150,16 @@ fn limit_exceeded_response(e: &gateway_core::server::limits::LimitExceeded) -> R
         .as_deref()
         .map(|m| format!(" for model `{m}`"))
         .unwrap_or_default();
+    // Say *whose* ceiling this was. "You are over quota" and "this token is
+    // over its quota" have different fixes — the second is solved by using a
+    // different token, or by raising that token's own rule, and a caller who
+    // cannot tell them apart will chase the wrong one.
+    let subject = match e.subject {
+        gateway_core::server::db::limits::SubjectType::Token => " for this API token",
+        _ => "",
+    };
     let msg = format!(
-        "{} limit reached{scope}: {} per {} (used {}). Try again later.",
+        "{} limit reached{subject}{scope}: {} per {} (used {}). Try again later.",
         e.dimension.as_str(),
         fmt_limit_num(e.limit),
         e.window.as_str(),
@@ -260,12 +274,18 @@ fn proxy_tool_ctx(
     state: &Arc<RamaState>,
     user_id: String,
     roles: Vec<String>,
+    // The caller's resolved access, built once per request from the bearer
+    // token (`pool_access_for_token`). Passed in rather than rebuilt from
+    // `roles`, which cannot express the token's model allowlist — a tool that
+    // routed on roles alone would be a way around it.
+    pool_access: gateway_core::server::upstreams::PoolAccess,
     client_ip: Option<String>,
     model: Option<String>,
 ) -> ToolContext {
     ToolContext {
         user_id,
         roles,
+        pool_access,
         db: state.db.clone(),
         s3: state
             .config()
@@ -521,7 +541,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     // ones through.
     // Per-user pool access: a model served only by pools this caller can't
     // reach routes as `UnknownModel` → 404, identical to a nonexistent model.
-    let access = state.pool_access_for(&user.roles);
+    let access = state.pool_access_for_token(&user);
     if allowed_tools.is_empty() {
         return chat_bytedumb(&state, &user, &model, &access, parts.headers, body).await;
     }
@@ -582,6 +602,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
         &state,
         user.user_id.clone(),
         user.roles.clone(),
+        access.clone(),
         client_ip.clone(),
         Some(real_model.clone()),
     );
@@ -699,7 +720,7 @@ pub async fn transcribe(State(state): State<Arc<RamaState>>, req: Request) -> Re
     // Model is parsed inside; `handle_transcription` fills the real model id
     // and the resolved `enforce_limits` flag into `rec` once routing has run.
     let rec = RecordParams::v1(&user, UsageKind::Transcription, String::new(), true);
-    let access = state.pool_access_for(&user.roles);
+    let access = state.pool_access_for_token(&user);
     handle_transcription(state, parts.headers, body, rec, access).await
 }
 
@@ -1053,7 +1074,7 @@ pub async fn embeddings(State(state): State<Arc<RamaState>>, req: Request) -> Re
     };
     // `route` resolves aliases + fallback and maps an unknown model → 404
     // `model_not_found` / all-down → 503 via `route_error_response`.
-    let access = state.pool_access_for(&user.roles);
+    let access = state.pool_access_for_token(&user);
     let acquired = match state
         .upstreams
         .route_access(&model, PoolKind::Embedding, &access)
@@ -1112,7 +1133,7 @@ pub async fn images_generations(State(state): State<Arc<RamaState>>, req: Reques
             "request body is missing a string `model` field",
         );
     };
-    let access = state.pool_access_for(&user.roles);
+    let access = state.pool_access_for_token(&user);
     let acquired = match state
         .upstreams
         .route_access(&model, PoolKind::Image, &access)
@@ -1181,7 +1202,7 @@ pub async fn images_edits(State(state): State<Arc<RamaState>>, req: Request) -> 
             "multipart body missing required `model` field",
         );
     };
-    let access = state.pool_access_for(&user.roles);
+    let access = state.pool_access_for_token(&user);
     let acquired = match state
         .upstreams
         .route_access(&model, PoolKind::Image, &access)
@@ -1295,7 +1316,7 @@ pub async fn speech(State(state): State<Arc<RamaState>>, req: Request) -> Respon
             "request body is missing a string `model` field",
         );
     };
-    let access = state.pool_access_for(&user.roles);
+    let access = state.pool_access_for_token(&user);
     let acquired = match state
         .upstreams
         .route_access(&model, PoolKind::Speech, &access)
@@ -1532,7 +1553,7 @@ pub async fn list_models(State(state): State<Arc<RamaState>>, req: Request) -> R
     // Per-user model visibility: only models served by a pool this caller may
     // access. A withheld model is also unroutable for them (see `route_access`),
     // so the list is a true capability view, not a cosmetic filter.
-    let access = state.pool_access_for(&user.roles);
+    let access = state.pool_access_for_token(&user);
     let data: Vec<Value> = state
         .upstreams
         .all_models_for(&access)
@@ -1570,7 +1591,7 @@ pub async fn retrieve_model(State(state): State<Arc<RamaState>>, req: Request) -
         .strip_prefix("/v1/models/")
         .unwrap_or_default();
     let id = percent_decode(raw);
-    let access = state.pool_access_for(&user.roles);
+    let access = state.pool_access_for_token(&user);
     if id.is_empty() || !state.upstreams.knows_any_for(&id, &access) {
         return model_not_found_response(&id);
     }
@@ -2090,10 +2111,13 @@ async fn forward_streaming_with_tools(
         obj.insert("stream".into(), Value::Bool(true));
     }
 
+    // Resolved once, then shared by routing and the tool loop.
+    let access = state.pool_access_for_token(&user);
     let tool_ctx = proxy_tool_ctx(
         &state,
         user.user_id.clone(),
         user.roles.clone(),
+        access.clone(),
         client_ip,
         Some(model.clone()),
     );
@@ -2112,7 +2136,6 @@ async fn forward_streaming_with_tools(
     // rama::futures::channel::mpsc::unbounded matches the pattern used by
     // the chat-page SSE producer (`pages/chat/mod.rs`).
     let (mut tx, rx) = mpsc::unbounded::<Result<Bytes, std::io::Error>>();
-    let access = state.pool_access_for(&user.roles);
 
     tokio::spawn(async move {
         if let Err(err) = drive_streaming_tool_loop(
@@ -2652,6 +2675,12 @@ fn route_error_response(err: RouteError) -> Response {
         // so the tool branches surface this too; this arm covers the
         // byte-dumb path and the transcription handler.)
         RouteError::UnknownModel(m) => model_not_found_response(&m),
+        // The model exists and the owner may use it — this particular token
+        // may not. A 403 that names the model, rather than the 404 a
+        // group-withheld model gets: the caller holds the credential whose
+        // allowlist did this and can see that allowlist on /tokens, so
+        // spelling it out is help, not disclosure.
+        RouteError::ModelNotAllowed(m) => model_not_allowed_response(&m),
         RouteError::Acquire(AcquireError::NoHealthyBackend { pool }) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream_unreachable",
@@ -2663,6 +2692,30 @@ fn route_error_response(err: RouteError) -> Response {
             &format!("`{pool}` is saturated"),
         ),
     }
+}
+
+/// `403` for a model this API token's allowlist excludes. Uses OpenAI's
+/// request-error shape with `param: "model"` so clients treat it as a bad
+/// request rather than something to retry, and a `code` of its own so a
+/// caller can tell it from `model_not_found` programmatically.
+fn model_not_allowed_response(model: &str) -> Response {
+    let body = json!({
+        "error": {
+            "message": format!(
+                "The API token used for this request is not allowed to use the model \
+                 `{model}`. Its allowed models are listed on the /tokens page."
+            ),
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": "model_not_allowed",
+        }
+    });
+    (
+        StatusCode::FORBIDDEN,
+        [("content-type", "application/json")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// OpenAI's `404 model_not_found` for a model no backend serves. Distinct

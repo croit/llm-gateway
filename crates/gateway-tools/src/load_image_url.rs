@@ -282,6 +282,7 @@ mod tests {
         ToolContext {
             user_id: "u".into(),
             roles: vec![],
+            pool_access: gateway_core::server::upstreams::PoolAccess::all(),
             db: db::open(std::path::Path::new(":memory:")).await.unwrap(),
             s3: None,
             assistant_turn_id: Some("t-1".into()),

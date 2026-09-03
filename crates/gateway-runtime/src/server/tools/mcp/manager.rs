@@ -1004,6 +1004,7 @@ mod tests {
         let ctx = |db: Pool| ToolContext {
             user_id: "u".into(),
             roles: vec![],
+            pool_access: gateway_core::server::upstreams::PoolAccess::all(),
             db,
             s3: None,
             assistant_turn_id: None,

@@ -1826,6 +1826,8 @@ async fn spawn_assistant_worker(
                 secure: req.secure,
             }),
             model: Some(model.to_string()),
+            // Session path: access is exactly the user's group grant.
+            pool_access: None,
         },
     );
     let driver = Box::new(gateway_runtime::openai_driver::OpenAiDriver {

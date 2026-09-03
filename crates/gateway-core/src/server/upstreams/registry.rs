@@ -412,6 +412,22 @@ pub struct PoolAccess {
     pub role_ids: Vec<String>,
     /// True to bypass every restriction (`Resolver::is_admin`).
     pub is_admin: bool,
+    /// The calling API token's model allowlist, or `None` when the caller is
+    /// unrestricted (no token, or a token with no allowlist — the default).
+    ///
+    /// This rides on `PoolAccess` rather than being checked at each handler
+    /// because `PoolAccess` is already threaded through every listing and
+    /// routing entry point. Putting it here is what makes the restriction
+    /// total: a new `/v1` surface that resolves a model at all cannot forget
+    /// to apply it, and — as with pool groups — a model a token may not use
+    /// is also invisible in its `/v1/models`, so the list stays a true
+    /// capability view rather than a cosmetic filter.
+    ///
+    /// **Admins do not bypass this one.** `is_admin` waives the operator's
+    /// group policy; an allowlist is a property of the credential itself,
+    /// chosen by whoever issued it, and an admin's token that says "only
+    /// these models" means it.
+    pub allowed_models: Option<Arc<HashSet<String>>>,
 }
 
 impl PoolAccess {
@@ -421,7 +437,25 @@ impl PoolAccess {
         Self {
             role_ids: Vec::new(),
             is_admin: true,
+            allowed_models: None,
         }
+    }
+
+    /// Whether the calling token may use `model`. `true` for every caller
+    /// without an allowlist, which is the default for every token.
+    pub fn allows_model(&self, model: &str) -> bool {
+        match &self.allowed_models {
+            None => true,
+            Some(set) => set.contains(model),
+        }
+    }
+
+    /// True when the caller carries a model allowlist at all — lets a handler
+    /// tell "this model does not exist" from "this token may not use it"
+    /// without leaking which models exist to a caller that has no business
+    /// knowing.
+    pub fn is_model_restricted(&self) -> bool {
+        self.allowed_models.is_some()
     }
 
     /// Whether the caller may see/route to `pool`: unrestricted pools are open
@@ -805,6 +839,15 @@ impl UpstreamRegistry {
         out
     }
 
+    /// [`Self::collect_models`], then narrowed to what the calling token may
+    /// use. Every access-scoped listing goes through here so a restricted
+    /// token's `/v1/models` matches exactly what it can route to.
+    fn collect_models_for(&self, access: &PoolAccess, pred: impl Fn(&Pool) -> bool) -> Vec<String> {
+        let mut out = self.collect_models(pred);
+        out.retain(|m| access.allows_model(m));
+        out
+    }
+
     /// Union of every advertised model name across all pools of the given
     /// kind. Used by the chat UI to populate the voice-model dropdown and
     /// by `/api/v0/transcription_models`.
@@ -943,22 +986,24 @@ impl UpstreamRegistry {
     /// per-user `GET /v1/models`. A model withheld here is also unroutable for
     /// the same caller (see [`Self::route_for`]), so the list can't be bypassed.
     pub fn all_models_for(&self, access: &PoolAccess) -> Vec<String> {
-        self.collect_models(|p| !Self::is_internal_kind(p.kind) && access.allows(p))
+        self.collect_models_for(access, |p| {
+            !Self::is_internal_kind(p.kind) && access.allows(p)
+        })
     }
 
     /// Like [`Self::models_for_kind`], but only over pools `access` permits —
     /// the per-user chat / transcription / speech model dropdowns.
     pub fn models_for_kind_for(&self, kind: PoolKind, access: &PoolAccess) -> Vec<String> {
-        self.collect_models(|p| p.kind == kind && access.allows(p))
+        self.collect_models_for(access, |p| p.kind == kind && access.allows(p))
     }
 
     /// True if a pool of *any* kind that `access` permits knows `model`. Backs
     /// the per-user `GET /v1/models/{id}`.
     pub fn knows_any_for(&self, model: &str, access: &PoolAccess) -> bool {
-        self.data()
-            .pools
-            .values()
-            .any(|p| !Self::is_internal_kind(p.kind) && access.allows(p) && p.knows_model(model))
+        access.allows_model(model)
+            && self.data().pools.values().any(|p| {
+                !Self::is_internal_kind(p.kind) && access.allows(p) && p.knows_model(model)
+            })
     }
 
     /// Sorted list of `(model_id, merged_compliance)` for every model served
@@ -1067,6 +1112,28 @@ impl UpstreamRegistry {
         access: &PoolAccess,
     ) -> Result<Acquired, RouteError> {
         let d = self.data();
+        // The token's allowlist is checked before anything is resolved, so a
+        // denied model can never reach a backend — and never silently lands
+        // on the kind's fallback model either (`route_access` only falls back
+        // on `UnknownModel`, and the retry runs through here again, so the
+        // fallback must clear the allowlist on its own account).
+        //
+        // A model the caller could never have used either way is *not*
+        // reported as denied: an id no accessible pool serves is a typo, and
+        // it has to keep behaving exactly as it does for an unrestricted
+        // caller — 404, with the kind's fallback still applying — rather than
+        // becoming an allowlist error that suppresses the fallback.
+        if !access.allows_model(model) {
+            let known = d
+                .pools
+                .values()
+                .any(|p| p.kind == kind && access.allows(p) && p.knows_model(model));
+            return Err(if known {
+                RouteError::ModelNotAllowed(model.to_string())
+            } else {
+                RouteError::UnknownModel(model.to_string())
+            });
+        }
         // First, a pool with a healthy backend that serves the model.
         if let Some(pool) = d
             .pools
@@ -1241,6 +1308,8 @@ pub enum RouteError {
         "no upstream advertises model `{0}` — check that the model is loaded on a backend of the right kind"
     )]
     UnknownModel(String),
+    #[error("the API token used for this request is not allowed to use model `{0}`")]
+    ModelNotAllowed(String),
     #[error(transparent)]
     Acquire(AcquireError),
 }
@@ -1541,10 +1610,12 @@ mod tests {
         let outsider = PoolAccess {
             role_ids: vec!["other".into()],
             is_admin: false,
+            ..Default::default()
         };
         let member = PoolAccess {
             role_ids: vec!["dev".into()],
             is_admin: false,
+            ..Default::default()
         };
         let admin = PoolAccess::all();
 
@@ -1586,6 +1657,166 @@ mod tests {
             reg.acquire_for_access("vip-model", PoolKind::Chat, &admin)
                 .is_ok()
         );
+    }
+
+    /// The allowlist has to bind at the same seam pool groups bind at:
+    /// listing, single-model lookup, and routing all read the same set, so a
+    /// denied model is invisible *and* unroutable rather than merely hidden.
+    #[test]
+    fn a_token_allowlist_narrows_listing_and_routing_together() {
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![backend("a", 16)],
+            ),
+        )]);
+        seed_models(&reg, "chat", 0, &["allowed-model", "denied-model"]);
+
+        let unrestricted = PoolAccess::all();
+        let restricted = PoolAccess {
+            allowed_models: Some(Arc::new(HashSet::from(["allowed-model".to_string()]))),
+            ..PoolAccess::all()
+        };
+
+        // Listing: only the allowed id, even though the caller is an admin —
+        // an allowlist is a property of the credential, not of the operator's
+        // group policy, so `is_admin` must not waive it.
+        assert_eq!(reg.all_models_for(&restricted), vec!["allowed-model"]);
+        assert_eq!(
+            reg.all_models_for(&unrestricted),
+            vec!["allowed-model", "denied-model"]
+        );
+
+        // GET /v1/models/{id} mirrors the listing.
+        assert!(reg.knows_any_for("allowed-model", &restricted));
+        assert!(!reg.knows_any_for("denied-model", &restricted));
+        assert!(reg.knows_any_for("denied-model", &unrestricted));
+
+        // Routing: denied is refused as its own error, distinct from a model
+        // that does not exist — the token's owner chose this restriction and
+        // is entitled to a message that says so.
+        assert!(matches!(
+            reg.acquire_for_access("denied-model", PoolKind::Chat, &restricted),
+            Err(RouteError::ModelNotAllowed(_))
+        ));
+        assert!(
+            reg.acquire_for_access("allowed-model", PoolKind::Chat, &restricted)
+                .is_ok()
+        );
+    }
+
+    /// A token with no allowlist is unrestricted. This is the default every
+    /// token in the field already has, so getting it wrong would revoke
+    /// access from every existing integration at once.
+    #[test]
+    fn no_allowlist_means_every_model_stays_reachable() {
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![backend("a", 16)],
+            ),
+        )]);
+        seed_models(&reg, "chat", 0, &["m1", "m2"]);
+
+        let access = PoolAccess {
+            allowed_models: None,
+            ..Default::default()
+        };
+        assert_eq!(reg.all_models_for(&access), vec!["m1", "m2"]);
+        assert!(
+            reg.acquire_for_access("m2", PoolKind::Chat, &access)
+                .is_ok()
+        );
+    }
+
+    /// The trap this pins: `route_access` answers `UnknownModel` by retrying
+    /// the kind's configured fallback model. If a denied model reported
+    /// `UnknownModel`, a token restricted to a cheap model would silently be
+    /// served by the fallback instead of being refused — the restriction
+    /// would read as enforced while quietly doing nothing.
+    #[test]
+    fn a_denied_model_is_refused_rather_than_sent_to_the_fallback() {
+        let reg = build_with_fallback(
+            vec![(
+                "chat",
+                pool_config(
+                    PoolKind::Chat,
+                    PickerStrategy::RoundRobin,
+                    vec![backend("a", 16)],
+                ),
+            )],
+            FallbackConfig {
+                chat: Some("fallback-model".into()),
+                ..Default::default()
+            },
+        );
+        seed_models(&reg, "chat", 0, &["fallback-model", "expensive-model"]);
+
+        let restricted = PoolAccess {
+            allowed_models: Some(Arc::new(HashSet::from(["fallback-model".to_string()]))),
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                reg.route_access("expensive-model", PoolKind::Chat, &restricted),
+                Err(RouteError::ModelNotAllowed(_))
+            ),
+            "a denied model must never be quietly rerouted to the fallback"
+        );
+
+        // An unknown model still falls back for the same caller, so the guard
+        // above is specific to the allowlist rather than disabling fallback.
+        assert!(
+            reg.route_access("no-such-model", PoolKind::Chat, &restricted)
+                .is_ok()
+        );
+
+        // And when the fallback itself is off the allowlist, the unknown
+        // model is a plain 404 rather than a quiet upgrade to a model the
+        // token was never allowed.
+        let fallback_denied = PoolAccess {
+            allowed_models: Some(Arc::new(HashSet::from(["expensive-model".to_string()]))),
+            ..Default::default()
+        };
+        assert!(matches!(
+            reg.route_access("no-such-model", PoolKind::Chat, &fallback_denied),
+            Err(RouteError::UnknownModel(_))
+        ));
+    }
+
+    /// Aliases are matched as written. The allowlist is applied to the id the
+    /// caller asked for, before alias resolution, so picking `qwen` allows the
+    /// alias and not the underlying real id. Both appear in the picker (they
+    /// both appear in `/v1/models`), so this is a choice the operator makes
+    /// rather than a surprise — but it needs to stay deliberate.
+    #[test]
+    fn an_allowlist_matches_the_requested_id_not_the_resolved_one() {
+        let reg = build(vec![(
+            "chat",
+            pool_config(
+                PoolKind::Chat,
+                PickerStrategy::RoundRobin,
+                vec![backend_alias("a", names(&["qwen"]))],
+            ),
+        )]);
+        seed_models(&reg, "chat", 0, &["Qwen/Qwen3-235B"]);
+
+        let alias_only = PoolAccess {
+            allowed_models: Some(Arc::new(HashSet::from(["qwen".to_string()]))),
+            ..Default::default()
+        };
+        let g = reg
+            .acquire_for_access("qwen", PoolKind::Chat, &alias_only)
+            .expect("the alias itself is allowed");
+        assert_eq!(g.resolved_model(), "Qwen/Qwen3-235B");
+        assert!(matches!(
+            reg.acquire_for_access("Qwen/Qwen3-235B", PoolKind::Chat, &alias_only),
+            Err(RouteError::ModelNotAllowed(_))
+        ));
     }
 
     #[test]

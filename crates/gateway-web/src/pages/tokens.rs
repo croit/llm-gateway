@@ -33,8 +33,9 @@ use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use gateway_core::server::auth::token;
+use gateway_core::server::db::limits::{self, Dimension, ManagedBy, SubjectType, Window};
 use gateway_core::server::db::users::User;
-use gateway_core::server::db::{token_tool_prefs, tokens};
+use gateway_core::server::db::{token_models, token_tool_prefs, tokens, usage};
 use gateway_runtime::rama_server::state::RamaState;
 use gateway_runtime::server::tools::catalog::ToolEntry;
 
@@ -76,17 +77,26 @@ pub async fn tokens_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     // The capability catalog is the same for every token (it's the
     // user's role grants); each token carries its own disabled set.
     let entries = tool_toggles::entries_for_roles(&state, &user.roles);
+    // Period boundaries in the viewer's timezone, like /usage does it.
+    let tz = super::viewer_tz(&session, &user);
+    let extras = token_extras(&state, &user, &tz).await;
     let mut rows: Vec<(TokenRowData, HashSet<String>)> = Vec::with_capacity(list.len());
     for tok in &list {
         let disabled = token_tool_prefs::disabled_for_token(&state.db, &tok.id)
             .await
             .unwrap_or_default();
-        rows.push((
-            row_with_policy(&state.db, TokenRowData::from_token(tok, lang)).await,
-            disabled,
-        ));
+        let row = row_with_policy(&state.db, TokenRowData::from_token(tok, lang)).await;
+        rows.push((extras.apply(row), disabled));
     }
-    let body = render_tokens_body(&rows, &entries, None, &account, state.push.is_some(), lang);
+    let body = render_tokens_body(
+        &rows,
+        &entries,
+        None,
+        &account,
+        state.push.is_some(),
+        &extras,
+        lang,
+    );
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     {
         let pctx = super::PageCtx {
@@ -126,7 +136,7 @@ fn sse_toast_response(kind: FlashKind, message: impl Into<String>) -> Response {
 
 pub async fn tokens_create(State(state): State<Arc<RamaState>>, req: Request) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_session, user) = require_session!(state, req);
+    let (session, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let body = match read_body_to_bytes(body).await {
         Ok(b) => b,
@@ -185,7 +195,11 @@ pub async fn tokens_create(State(state): State<Arc<RamaState>>, req: Request) ->
     let row_data = TokenRowData::from_token(&row, lang);
     // A brand-new token has no disabled keys yet (and tool use is off, so
     // the panel renders collapsed regardless).
-    let row_html = render_token_row(&row_data, &entries, &HashSet::new(), lang).to_string();
+    // A brand-new token has no usage, allowlist or quota yet; it only needs
+    // the page-wide model list and currency the picker renders with.
+    let extras = token_extras_one(&state, &user, &row.id, &super::viewer_tz(&session, &user)).await;
+    let row_html =
+        render_token_row(&row_data, &entries, &HashSet::new(), &extras, lang).to_string();
     let banner_html = render_minted_banner(
         &MintedBanner {
             name: row.name.clone(),
@@ -212,6 +226,7 @@ async fn render_row_after_state_change(
     state: &RamaState,
     user: &User,
     token_id: &str,
+    tz: &str,
     lang: Lang,
 ) -> Option<String> {
     let list = tokens::list_for_user(&state.db, &user.id).await.ok()?;
@@ -221,7 +236,13 @@ async fn render_row_after_state_change(
         .await
         .unwrap_or_default();
     let row = row_with_policy(&state.db, TokenRowData::from_token(token, lang)).await;
-    Some(render_token_row(&row, &entries, &disabled, lang).to_string())
+    // Re-read the extras so a patched row carries the same usage / allowlist /
+    // limits the full page render would have shown — skipping this is how a
+    // surgical patch silently reverts a panel to its defaults — but for this
+    // token only, not the whole user's set.
+    let extras = token_extras_one(state, user, token_id, tz).await;
+    let row = extras.apply(row);
+    Some(render_token_row(&row, &entries, &disabled, &extras, lang).to_string())
 }
 
 /// POST /tokens/{id}/revoke — form action from the row's Revoke
@@ -233,11 +254,17 @@ pub async fn tokens_revoke(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = require_session!(state, req);
+    let (session, user) = require_session!(state, req);
     match tokens::revoke(&state.db, &user.id, &token_id).await {
         Ok(true) => {
-            let Some(row_html) =
-                render_row_after_state_change(&state, &user, &token_id, lang).await
+            let Some(row_html) = render_row_after_state_change(
+                &state,
+                &user,
+                &token_id,
+                &super::viewer_tz(&session, &user),
+                lang,
+            )
+            .await
             else {
                 return sse_toast_response(FlashKind::Error, t(lang, "tokens-revoked-not-found"));
             };
@@ -271,7 +298,7 @@ pub async fn tokens_rotate(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = require_session!(state, req);
+    let (session, user) = require_session!(state, req);
     // Find the live token so we can preserve its name + configured TTL.
     let list = match tokens::list_for_user(&state.db, &user.id).await {
         Ok(l) => l,
@@ -297,8 +324,14 @@ pub async fn tokens_rotate(
 
     match tokens::rotate(&state.db, &user.id, &token_id, &hash, now, expires_at).await {
         Ok(true) => {
-            let Some(row_html) =
-                render_row_after_state_change(&state, &user, &token_id, lang).await
+            let Some(row_html) = render_row_after_state_change(
+                &state,
+                &user,
+                &token_id,
+                &super::viewer_tz(&session, &user),
+                lang,
+            )
+            .await
             else {
                 return sse_toast_response(FlashKind::Error, t(lang, "tokens-rotated-not-found"));
             };
@@ -338,7 +371,7 @@ pub async fn tokens_delete(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = require_session!(state, req);
+    let (_session, user) = require_session!(state, req);
     match tokens::delete_if_revoked(&state.db, &user.id, &token_id).await {
         Ok(true) => {
             let selector = format!("#token-row-{token_id}");
@@ -391,7 +424,7 @@ pub async fn tokens_tools_master(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = require_session!(state, req);
+    let (session, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: MasterForm = match read_form(body).await {
         Ok(f) => f,
@@ -406,7 +439,15 @@ pub async fn tokens_tools_master(
             return sse_toast_response(FlashKind::Error, t(lang, "tokens-update-failed"));
         }
     }
-    let Some(row_html) = render_row_after_state_change(&state, &user, &token_id, lang).await else {
+    let Some(row_html) = render_row_after_state_change(
+        &state,
+        &user,
+        &token_id,
+        &super::viewer_tz(&session, &user),
+        lang,
+    )
+    .await
+    else {
         return sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found"));
     };
     let selector = format!("#token-row-{token_id}");
@@ -424,6 +465,221 @@ pub async fn tokens_tools_master(
     ])
 }
 
+/// POST /tokens/{id}/models — replace this token's model allowlist with the
+/// checked boxes.
+///
+/// The form posts the *selected* models, and a post that names every model
+/// the owner can currently reach clears the restriction instead of storing
+/// today's list. Otherwise opening the panel and saving without changing
+/// anything would silently pin the token to the current catalogue, and the
+/// next model the operator adds would be denied to a token nobody meant to
+/// restrict.
+pub async fn tokens_models(
+    State(state): State<Arc<RamaState>>,
+    Path(token_id): Path<String>,
+    req: Request,
+) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    let (session, user) = require_session!(state, req);
+    let (_, body) = req.into_parts();
+    let pairs: Vec<(String, String)> = match read_form(body).await {
+        Ok(f) => f,
+        Err(resp) => return resp,
+    };
+    if !owns_token(&state, &user.id, &token_id).await {
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found"));
+    }
+    // Restricted-or-not is its own checkbox, never inferred from the ticks.
+    //
+    // Inferring it ("every box ticked means unrestricted") is wrong in both
+    // directions, and silently: a token restricted to exactly the models the
+    // deployment happens to serve today renders fully ticked, so opening the
+    // panel and pressing Save would drop the restriction and hand the token
+    // every model added later. Unticking everything would read as "allow
+    // nothing" to the person doing it and store the unrestricted default.
+    let restrict = super::checkbox_on(super::field(&pairs, "restrict"));
+    let picked = super::fields_all(&pairs, "models");
+    if restrict && picked.is_empty() {
+        // No rows is how "unrestricted" is spelled, so an empty allowlist has
+        // no representation — and would mean the opposite of what was asked.
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-models-none-picked"));
+    }
+    let to_store: Vec<String> = if restrict { picked } else { Vec::new() };
+    if let Err(err) = token_models::set_for_token(&state.db, &token_id, &to_store).await {
+        tracing::warn!(error = %err, %token_id, "saving token model allowlist");
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-update-failed"));
+    }
+    let message = if to_store.is_empty() {
+        t(lang, "tokens-models-cleared-toast")
+    } else {
+        t_args(
+            lang,
+            "tokens-models-saved-toast",
+            &i18n::args([("count", (to_store.len() as i64).into())]),
+        )
+    };
+    patch_row(
+        &state,
+        &user,
+        &token_id,
+        &super::viewer_tz(&session, &user),
+        lang,
+        message,
+    )
+    .await
+}
+
+/// POST /tokens/{id}/limits — add or update one quota rule on this token.
+///
+/// Self-service on purpose: the token is the caller's own, and a rule here can
+/// only ever narrow what they may already spend (the owner's own budget is
+/// checked first and independently). The model scope is deliberately not
+/// offered — the per-token surface is about capping a credential, and a
+/// per-model cap is admin territory on /admin/limits.
+pub async fn tokens_limits_add(
+    State(state): State<Arc<RamaState>>,
+    Path(token_id): Path<String>,
+    req: Request,
+) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    let (session, user) = require_session!(state, req);
+    let (_, body) = req.into_parts();
+    let pairs: Vec<(String, String)> = match read_form(body).await {
+        Ok(f) => f,
+        Err(resp) => return resp,
+    };
+    if !owns_token(&state, &user.id, &token_id).await {
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found"));
+    }
+    // The two selects are server-rendered, so a value that fails to parse is
+    // a hand-crafted post rather than a user mistake — one generic refusal is
+    // the right amount of ceremony.
+    let (Some(dimension), Some(window)) = (
+        Dimension::parse(super::field(&pairs, "dimension")),
+        Window::parse(super::field(&pairs, "window")),
+    ) else {
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-update-failed"));
+    };
+    let raw = super::field(&pairs, "value").trim().replace(',', ".");
+    let value: f64 = match raw.parse::<f64>() {
+        // `is_finite` matters as much as the sign: "inf" parses, survives
+        // `value.max(0.0)`, and stores a quota that can never be reached and
+        // renders as `inf`. The admin form guards this the same way.
+        Ok(v) if v.is_finite() && v >= 0.0 => v,
+        _ => {
+            return sse_toast_response(
+                FlashKind::Error,
+                t_args(
+                    lang,
+                    "limits-invalid-value",
+                    &i18n::args([("value", raw.into())]),
+                ),
+            );
+        }
+    };
+    match limits::upsert_checked(
+        &state.db,
+        SubjectType::Token,
+        &token_id,
+        None,
+        dimension,
+        window,
+        value,
+        // Self-service: creates or updates the owner's own rule, and is
+        // refused rather than overwriting an admin's cap on the same token.
+        ManagedBy::Owner,
+    )
+    .await
+    {
+        Ok(limits::Upserted::Created | limits::Upserted::Updated) => {}
+        // The refusal is a decision the write already made, reported as a
+        // value — not reconstructed here from a storage error.
+        Ok(limits::Upserted::RefusedAdminOwned) => {
+            return sse_toast_response(FlashKind::Error, t(lang, "tokens-limits-admin-set"));
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, %token_id, "saving token limit");
+            return sse_toast_response(FlashKind::Error, t(lang, "tokens-update-failed"));
+        }
+    }
+    patch_row(
+        &state,
+        &user,
+        &token_id,
+        &super::viewer_tz(&session, &user),
+        lang,
+        t(lang, "tokens-limits-saved-toast"),
+    )
+    .await
+}
+
+/// POST /tokens/{id}/limits/delete — drop one of this token's own rules.
+pub async fn tokens_limits_delete(
+    State(state): State<Arc<RamaState>>,
+    Path(token_id): Path<String>,
+    req: Request,
+) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    let (session, user) = require_session!(state, req);
+    let (_, body) = req.into_parts();
+    let pairs: Vec<(String, String)> = match read_form(body).await {
+        Ok(f) => f,
+        Err(resp) => return resp,
+    };
+    if !owns_token(&state, &user.id, &token_id).await {
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found"));
+    }
+    let rule_id = super::field(&pairs, "id");
+    // The scoping lives in the DELETE itself — by id *and* this token *and*
+    // `managed_by = 'owner'`. The rule id arrives from the client, so a
+    // plain delete-by-id would remove a global rule for anyone who guessed
+    // one; and an admin's cap on this very token must survive its owner
+    // pressing Remove, or capping a token would be a suggestion.
+    match limits::delete_owner_rule(&state.db, &token_id, rule_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return sse_toast_response(FlashKind::Error, t(lang, "tokens-limits-not-yours"));
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, %token_id, "deleting token limit");
+            return sse_toast_response(FlashKind::Error, t(lang, "tokens-update-failed"));
+        }
+    }
+    patch_row(
+        &state,
+        &user,
+        &token_id,
+        &super::viewer_tz(&session, &user),
+        lang,
+        t(lang, "tokens-limits-removed-toast"),
+    )
+    .await
+}
+
+/// Re-render one row in place with a toast — the tail every per-token
+/// settings write shares.
+async fn patch_row(
+    state: &RamaState,
+    user: &User,
+    token_id: &str,
+    tz: &str,
+    lang: Lang,
+    message: String,
+) -> Response {
+    let Some(row_html) = render_row_after_state_change(state, user, token_id, tz, lang).await
+    else {
+        return sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found"));
+    };
+    let selector = format!("#token-row-{token_id}");
+    sse_response(&[
+        sse_patch(Some(&selector), Some("outer"), &row_html),
+        sse_toast(&Flash {
+            kind: FlashKind::Success,
+            message,
+        }),
+    ])
+}
+
 /// POST /tokens/{id}/mcp-policy — set whether this token may use `ask`-mode
 /// MCP connector tools over the API (the `'*'` default policy). Ownership is
 /// verified before the write; the row is re-rendered so the toggle reflects
@@ -435,7 +691,7 @@ pub async fn tokens_mcp_policy(
 ) -> Response {
     use gateway_core::server::db::user_mcp::{AskOverApi, set_token_policy};
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = require_session!(state, req);
+    let (session, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: MasterForm = match read_form(body).await {
         Ok(f) => f,
@@ -458,7 +714,15 @@ pub async fn tokens_mcp_policy(
         tracing::warn!(error = %err, %token_id, "set token mcp policy");
         return sse_toast_response(FlashKind::Error, t(lang, "tokens-update-failed"));
     }
-    let Some(row_html) = render_row_after_state_change(&state, &user, &token_id, lang).await else {
+    let Some(row_html) = render_row_after_state_change(
+        &state,
+        &user,
+        &token_id,
+        &super::viewer_tz(&session, &user),
+        lang,
+    )
+    .await
+    else {
         return sse_toast_response(FlashKind::Error, t(lang, "tokens-not-found"));
     };
     let selector = format!("#token-row-{token_id}");
@@ -484,7 +748,7 @@ pub async fn tokens_tools_toggle(
     req: Request,
 ) -> Response {
     let lang = Lang::from_headers(req.headers());
-    let (_, user) = require_session!(state, req);
+    let (_session, user) = require_session!(state, req);
     let (_, body) = req.into_parts();
     let form: ToolToggleForm = match read_form(body).await {
         Ok(f) => f,
@@ -601,6 +865,7 @@ fn render_tokens_body(
     minted: Option<&MintedBanner>,
     account: &AccountSummary,
     push_enabled: bool,
+    extras: &TokenExtras,
     lang: Lang,
 ) -> Html {
     // The banner is either the rendered minted-card or an empty
@@ -691,7 +956,7 @@ fn render_tokens_body(
                     class: "token-list flex flex-col divide-y divide-base-300"
                 ) {
                     for (r, disabled) in rows.iter() {
-                        (render_token_row(r, entries, disabled, lang))
+                        (render_token_row(r, entries, disabled, extras, lang))
                     }
                 }
                 p(class: "token-list-empty text-base-content/60 text-sm") {
@@ -722,6 +987,14 @@ struct TokenRowData {
     /// Whether this token allows `ask`-mode MCP connector tools over the API
     /// (the `'*'` default policy). Defaults false; set via `row_with_policy`.
     mcp_allow: bool,
+    /// This token's model allowlist. `None` = unrestricted (no rows), which
+    /// is every token's default — not the same as an empty list.
+    allowed_models: Option<Vec<String>>,
+    /// Usage attributable to this token in the current calendar month, or
+    /// `None` when usage recording is off.
+    usage: Option<super::TokenUsage>,
+    /// The token's own limit rules (the additional ceiling), if any.
+    limits: Vec<limits::LimitRule>,
 }
 
 impl TokenRowData {
@@ -776,7 +1049,138 @@ impl TokenRowData {
             delete_action: format!("/tokens/{}/delete", token.id),
             tools_enabled: token.tools_enabled,
             mcp_allow: false,
+            allowed_models: None,
+            usage: None,
+            limits: Vec::new(),
         }
+    }
+}
+
+/// Everything the token rows need beyond the `tokens` table itself, read
+/// once per page rather than once per row: month-to-date usage per token, the
+/// model allowlists, and the per-token limit rules.
+struct TokenExtras {
+    usage: std::collections::HashMap<String, super::TokenUsage>,
+    allowlists: std::collections::HashMap<String, Vec<String>>,
+    /// Indexed by token id, so applying them to a row is a lookup rather than
+    /// a scan of every rule the user owns.
+    limits: std::collections::HashMap<String, Vec<limits::LimitRule>>,
+    /// Usage recording is off, so the usage column is meaningless rather than
+    /// zero. Worth distinguishing: "no traffic" and "we are not counting" look
+    /// identical otherwise.
+    usage_enabled: bool,
+    /// Every model the owner can reach — the allowlist picker's universe.
+    models: Vec<String>,
+    /// The deployment currency, for the usage line and the quota labels.
+    currency: String,
+}
+
+/// Read the extras for one user's tokens. Three queries for the whole page.
+async fn token_extras(state: &RamaState, user: &User, tz: &str) -> TokenExtras {
+    let user_id = user.id.as_str();
+    // The allowlist can only narrow what the owner's groups already reach, so
+    // the picker's universe is exactly that.
+    let models = state
+        .upstreams
+        .all_models_for(&state.pool_access_for(&user.roles));
+    let now = Timestamp::now();
+    let bounds = usage::period_bounds(usage::Period::ThisMonth, tz, now);
+    let by_token = usage::by_token(
+        &state.db,
+        bounds,
+        Some(user_id),
+        state.config().usage.retention_days,
+        now,
+    )
+    .await
+    .unwrap_or_default();
+    TokenExtras {
+        usage: by_token
+            .iter()
+            .filter(|g| !g.key.is_empty())
+            .map(|g| (g.key.clone(), super::TokenUsage::from(g)))
+            .collect(),
+        allowlists: token_models::for_user(&state.db, user_id)
+            .await
+            .unwrap_or_default(),
+        limits: group_by_token(
+            limits::for_tokens_of_user(&state.db, user_id)
+                .await
+                .unwrap_or_default(),
+        ),
+        usage_enabled: state.usage.is_enabled(),
+        models,
+        currency: state.config().usage.currency.clone(),
+    }
+}
+
+/// The extras for a *single* token — what the SSE patch path needs.
+///
+/// The page-wide loader reads one user's whole set, which is right for a full
+/// render and wrong for redrawing one row after a button press: it would run
+/// the month-to-date scan and both bulk reads to use one entry of each.
+async fn token_extras_one(state: &RamaState, user: &User, token_id: &str, tz: &str) -> TokenExtras {
+    let user_id = user.id.as_str();
+    let models = state
+        .upstreams
+        .all_models_for(&state.pool_access_for(&user.roles));
+    let now = Timestamp::now();
+    let bounds = usage::period_bounds(usage::Period::ThisMonth, tz, now);
+    let by_token = usage::by_token(
+        &state.db,
+        bounds,
+        Some(user_id),
+        state.config().usage.retention_days,
+        now,
+    )
+    .await
+    .unwrap_or_default();
+    let mut allowlists = std::collections::HashMap::new();
+    if let Ok(Some(list)) = token_models::for_token(&state.db, token_id).await {
+        let mut list: Vec<String> = list.into_iter().collect();
+        list.sort();
+        allowlists.insert(token_id.to_string(), list);
+    }
+    TokenExtras {
+        usage: by_token
+            .iter()
+            .filter(|g| g.key == token_id)
+            .map(|g| (g.key.clone(), super::TokenUsage::from(g)))
+            .collect(),
+        allowlists,
+        limits: group_by_token(
+            limits::applicable_for_token(&state.db, token_id)
+                .await
+                .unwrap_or_default(),
+        ),
+        usage_enabled: state.usage.is_enabled(),
+        models,
+        currency: state.config().usage.currency.clone(),
+    }
+}
+
+/// Index rules by their subject token once, rather than rescanning the whole
+/// list per row (`O(rows × rules)` on a page that renders every token).
+fn group_by_token(
+    rules: Vec<limits::LimitRule>,
+) -> std::collections::HashMap<String, Vec<limits::LimitRule>> {
+    let mut out: std::collections::HashMap<String, Vec<limits::LimitRule>> =
+        std::collections::HashMap::new();
+    for r in rules {
+        out.entry(r.subject_id.clone()).or_default().push(r);
+    }
+    out
+}
+
+impl TokenExtras {
+    /// Apply this page's extras to one row.
+    fn apply(&self, mut row: TokenRowData) -> TokenRowData {
+        row.allowed_models = self.allowlists.get(&row.id).cloned();
+        row.usage = self
+            .usage_enabled
+            .then(|| self.usage.get(&row.id).cloned().unwrap_or_default());
+        row.limits = self.limits.get(&row.id).cloned().unwrap_or_default();
+        row
     }
 }
 
@@ -902,6 +1306,238 @@ fn render_token_mcp_policy(token_id: &str, allow: bool, lang: Lang) -> Html {
     .to_html()
 }
 
+/// The token's month-to-date usage, as a compact line under the name. Shown
+/// for every token including revoked ones — a revoked token's spend is
+/// exactly what someone auditing the page came to see.
+fn render_token_usage(u: &super::TokenUsage, currency: &str, lang: Lang) -> Html {
+    let cost = format!("{:.2} {currency}", u.cost);
+    let line = t_args(
+        lang,
+        "tokens-usage-line",
+        &i18n::args([
+            ("requests", u.requests.into()),
+            ("tokens", u.tokens.into()),
+            ("cost", cost.into()),
+        ]),
+    );
+    html! {
+        div(class: "text-xs text-base-content/60") { (line) }
+    }
+    .to_html()
+}
+
+/// The per-token model allowlist editor.
+///
+/// Two controls, deliberately: a "limit this token" checkbox that decides
+/// *whether* there is an allowlist, and the per-model ticks that say what is
+/// on it. The state "restricted to everything currently available" and the
+/// state "unrestricted" look identical in the ticks alone but behave
+/// differently the next time the operator adds a model, so the form has to
+/// carry the difference explicitly rather than infer it.
+///
+/// An unrestricted token renders every box ticked, so switching the limit on
+/// starts from "everything" and the owner unticks what they don't want.
+fn render_token_models(
+    token_id: &str,
+    allowed: Option<&Vec<String>>,
+    available: &[String],
+    lang: Lang,
+) -> Html {
+    let action = format!("/tokens/{token_id}/models");
+    let directive = format!("@post('{action}', {{contentType: 'form'}})");
+    let restricted = allowed.is_some();
+    let boxes: Vec<Html> = available
+        .iter()
+        .map(|m| {
+            // Unrestricted = every model ticked. A restricted token ticks
+            // only what it lists.
+            let on = match allowed {
+                None => true,
+                Some(list) => list.iter().any(|a| a == m),
+            };
+            super::bool_checkbox("models", m, m, on, true)
+        })
+        .collect();
+    // A model on the allowlist that no pool serves any more: keep it, ticked,
+    // as its own row. Dropping it silently on the next save would widen the
+    // token without anyone asking.
+    let stale: Vec<Html> = allowed
+        .map(|list| {
+            list.iter()
+                .filter(|m| !available.iter().any(|a| a == *m))
+                .map(|m| super::bool_checkbox("models", m, m, true, true))
+                .collect()
+        })
+        .unwrap_or_default();
+    let summary = if restricted {
+        t_args(
+            lang,
+            "tokens-models-summary-restricted",
+            &i18n::args([("count", (allowed.map_or(0, Vec::len) as i64).into())]),
+        )
+    } else {
+        t(lang, "tokens-models-summary-all")
+    };
+    html! {
+        details(class: "mt-2") {
+            summary(class: "text-sm text-base-content/70 cursor-pointer select-none") {
+                (summary)
+            }
+            form(
+                action: (action),
+                method: "post",
+                class: "m-0 mt-2 flex flex-col gap-2",
+                "data-on:submit__prevent": (directive)
+            ) {
+                p(class: "text-xs text-base-content/60") {
+                    (t(lang, "tokens-models-help"))
+                }
+                (super::bool_checkbox(
+                    "restrict",
+                    "on",
+                    &t(lang, "tokens-models-restrict-label"),
+                    restricted,
+                    false,
+                ))
+                div(class: "flex flex-wrap gap-x-4 gap-y-1") {
+                    for b in boxes.iter() { (b.clone()) }
+                    for b in stale.iter() { (b.clone()) }
+                }
+                div {
+                    button(type: "submit", class: "btn btn-outline btn-sm") {
+                        (t(lang, "tokens-models-save"))
+                    }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+/// The token's own quota rules plus a one-line editor to add another. This is
+/// the *additional* ceiling: the owner's personal budget still applies, so
+/// nothing here can widen what the token may spend.
+fn render_token_limits(
+    token_id: &str,
+    rules: &[limits::LimitRule],
+    currency: &str,
+    lang: Lang,
+) -> Html {
+    let action = format!("/tokens/{token_id}/limits");
+    let directive = format!("@post('{action}', {{contentType: 'form'}})");
+    let del_action = format!("/tokens/{token_id}/limits/delete");
+    let rows: Vec<Html> = rules
+        .iter()
+        .map(|r| render_token_limit_row(r, &del_action, currency, lang))
+        .collect();
+    let dim_opts: Vec<Html> = [Dimension::Requests, Dimension::Tokens, Dimension::Cost]
+        .into_iter()
+        .map(|d| {
+            super::select_option(
+                d.as_str(),
+                &super::dim_label(lang, d, Some(currency)),
+                d == Dimension::Requests,
+            )
+        })
+        .collect();
+    let win_opts: Vec<Html> = Window::ALL
+        .into_iter()
+        .map(|w| super::select_option(w.as_str(), &super::win_label(lang, w), w == Window::Day))
+        .collect();
+    let summary = if rules.is_empty() {
+        t(lang, "tokens-limits-summary-none")
+    } else {
+        t_args(
+            lang,
+            "tokens-limits-summary-some",
+            &i18n::args([("count", (rules.len() as i64).into())]),
+        )
+    };
+    html! {
+        details(class: "mt-2") {
+            summary(class: "text-sm text-base-content/70 cursor-pointer select-none") {
+                (summary)
+            }
+            div(class: "mt-2 flex flex-col gap-2") {
+                p(class: "text-xs text-base-content/60") { (t(lang, "tokens-limits-help")) }
+                if !rows.is_empty() {
+                    ul(class: "flex flex-col gap-1") {
+                        for r in rows.iter() { (r.clone()) }
+                    }
+                }
+                form(
+                    action: (action),
+                    method: "post",
+                    class: "m-0 flex flex-wrap items-end gap-2",
+                    "data-on:submit__prevent": (directive)
+                ) {
+                    label(class: "flex flex-col gap-1") {
+                        span(class: "label-text text-xs opacity-70") { (t(lang, "limits-field-dimension")) }
+                        select(name: "dimension", class: "select select-bordered select-sm") {
+                            for o in dim_opts.iter() { (o.clone()) }
+                        }
+                    }
+                    label(class: "flex flex-col gap-1") {
+                        span(class: "label-text text-xs opacity-70") { (t(lang, "limits-field-window")) }
+                        select(name: "window", class: "select select-bordered select-sm") {
+                            for o in win_opts.iter() { (o.clone()) }
+                        }
+                    }
+                    label(class: "flex flex-col gap-1") {
+                        span(class: "label-text text-xs opacity-70") { (t(lang, "limits-field-value")) }
+                        input(
+                            type: "text", name: "value", inputmode: "decimal",
+                            class: "input input-bordered input-sm w-28"
+                        );
+                    }
+                    button(type: "submit", class: "btn btn-outline btn-sm") {
+                        (t(lang, "tokens-limits-add"))
+                    }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
+fn render_token_limit_row(
+    r: &limits::LimitRule,
+    del_action: &str,
+    currency: &str,
+    lang: Lang,
+) -> Html {
+    let text = super::describe_rule(lang, r, currency);
+    let directive = format!("@post('{del_action}', {{contentType: 'form'}})");
+    let id = r.id.clone();
+    // An operator's cap is shown here — the owner should know why their token
+    // stops — but it is theirs to see, not to remove. The handler enforces
+    // this independently; hiding the button just keeps the UI honest.
+    let admin_set = r.managed_by == ManagedBy::Admin;
+    html! {
+        li(class: "flex items-center gap-2 text-sm") {
+            span(class: "tabular-nums") { (text) }
+            if admin_set {
+                span(class: "badge badge-ghost badge-sm") {
+                    (t(lang, "tokens-limits-admin-badge"))
+                }
+            } else {
+                form(
+                    action: (del_action.to_string()),
+                    method: "post",
+                    class: "m-0",
+                    "data-on:submit__prevent": (directive)
+                ) {
+                    input(type: "hidden", name: "id", value: (id));
+                    button(type: "submit", class: "btn btn-ghost btn-xs") {
+                        (t(lang, "tokens-limits-remove"))
+                    }
+                }
+            }
+        }
+    }
+    .to_html()
+}
+
 /// Single row in the token list. Single source of truth for both the
 /// initial page render and the datastar SSE patches that surgically
 /// swap (revoke) or replace (active ↔ revoked) a row in place. Active
@@ -911,14 +1547,27 @@ fn render_token_row(
     r: &TokenRowData,
     entries: &[ToolEntry],
     disabled: &HashSet<String>,
+    extras: &TokenExtras,
     lang: Lang,
 ) -> Html {
+    let (models, currency) = (extras.models.as_slice(), extras.currency.as_str());
     let dom_id = r.dom_id();
     // A revoked token can't authenticate, so its tool config is moot — no
     // panel there.
     let panel = (!r.revoked).then(|| {
         render_token_tools_panel(&r.id, r.tools_enabled, r.mcp_allow, entries, disabled, lang)
     });
+    // Scope and quota panels, same rule: nothing to configure on a token that
+    // can no longer authenticate.
+    let models_panel =
+        (!r.revoked).then(|| render_token_models(&r.id, r.allowed_models.as_ref(), models, lang));
+    let limits_panel = (!r.revoked).then(|| render_token_limits(&r.id, &r.limits, currency, lang));
+    // Usage stays on a revoked row: what it spent before it was revoked is
+    // exactly what an audit is looking for.
+    let usage_line = r
+        .usage
+        .as_ref()
+        .map(|u| render_token_usage(u, currency, lang));
     html! {
         li(id: (dom_id), class: "py-3") {
         div(class: "flex items-center gap-4") {
@@ -927,6 +1576,7 @@ fn render_token_row(
                     (r.name.clone())
                 }
                 div(class: "text-xs text-base-content/60") { (r.meta.clone()) }
+                if let Some(u) = &usage_line { (u) }
             }
             if r.revoked {
                 // shadcn destructive badge: filled error background,
@@ -989,6 +1639,12 @@ fn render_token_row(
             }
         }
         if let Some(panel) = &panel {
+            (panel)
+        }
+        if let Some(panel) = &models_panel {
+            (panel)
+        }
+        if let Some(panel) = &limits_panel {
             (panel)
         }
         }

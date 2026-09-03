@@ -95,3 +95,24 @@ tokens-push-unsupported = This browser doesn't support notifications.
 tokens-push-enabled = Notifications enabled on this device.
 tokens-push-disabled = Notifications disabled on this device.
 tokens-push-error = Could not change notification settings.
+
+# Per-token usage, model allowlist, and quota (the /tokens row panels).
+tokens-usage-line = this month: { $requests } requests · { $tokens } tokens · { $cost }
+tokens-models-summary-all = Models: all
+tokens-models-summary-restricted = Models: { $count } selected
+tokens-models-help = Off, this token follows your own access, including models added later. On, it may use only the models you tick — a model added to the gateway afterwards stays blocked until you tick it here too.
+tokens-models-restrict-label = Limit this token to specific models
+tokens-models-none-picked = Tick at least one model, or turn the limit off.
+tokens-models-save = Save models
+tokens-models-saved-toast = Token limited to { $count } models.
+tokens-models-cleared-toast = Token can use every model you can.
+tokens-limits-summary-none = Quota: none
+tokens-limits-summary-some = Quota: { $count } rule(s)
+tokens-limits-help = A cap on this token alone. Your own budget still applies, so this can only narrow what the token may spend, never widen it.
+tokens-limits-add = Add quota
+tokens-limits-remove = Remove
+tokens-limits-saved-toast = Token quota saved.
+tokens-limits-removed-toast = Token quota removed.
+tokens-limits-not-yours = That quota isn't yours to remove.
+tokens-limits-admin-set = An administrator set that quota on this token; it can only be changed on the admin limits page.
+tokens-limits-admin-badge = set by admin

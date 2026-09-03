@@ -256,13 +256,17 @@ pub async fn insert_batch(pool: &Pool, recs: &[UsageRecord]) -> Result<(), DbErr
         .await?;
 
         let is_error = i64::from(r.status >= 400);
+        // `token_id` is part of the rollup key, so the "no token" case is ''
+        // rather than NULL — see migration 0060: a NULL in a non-INTEGER
+        // SQLite primary key compares distinct every time and would defeat
+        // the upsert.
         sqlx::query(
             "INSERT INTO usage_daily
-               (day, user_id, user_email, source, kind, backend, model,
+               (day, user_id, user_email, token_id, token_name, source, kind, backend, model,
                  req_count, error_count, prompt_tokens, completion_tokens, total_tokens,
                  input_units, output_units, cost)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(day, user_id, source, kind, backend, model) DO UPDATE SET
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(day, user_id, token_id, source, kind, backend, model) DO UPDATE SET
                 req_count         = req_count         + 1,
                 error_count       = error_count       + excluded.error_count,
                 prompt_tokens     = prompt_tokens     + excluded.prompt_tokens,
@@ -275,6 +279,8 @@ pub async fn insert_batch(pool: &Pool, recs: &[UsageRecord]) -> Result<(), DbErr
         .bind(&day)
         .bind(&r.user_id)
         .bind(r.user_email.as_deref())
+        .bind(r.token_id.as_deref().unwrap_or(""))
+        .bind(r.token_name.as_deref())
         .bind(r.source.as_str())
         .bind(r.kind.as_str())
         .bind(&r.backend)
@@ -441,10 +447,18 @@ pub struct Filter {
     pub backend: Option<String>,
     /// Scopes results to one user — set for the self-view, `None` for admin.
     pub user_id: Option<String>,
+    /// Scopes results to one API token — the per-token drill-down.
+    /// `Some(id)` is that token, `Some("")` is everything that arrived
+    /// without one (chat, scheduled runs), and `None` is no filter at all.
+    pub token_id: Option<String>,
 }
 
 impl Filter {
-    fn where_sql(&self) -> (String, Vec<String>) {
+    /// `rollup` selects the `usage_daily` spelling of "no token" (`''`, the
+    /// column is NOT NULL) over the raw table's (NULL). It matters for more
+    /// than tidiness: wrapping the column in `COALESCE` makes SQLite ignore
+    /// `usage_daily_token`, so the drill-down would range-scan by day.
+    fn where_sql(&self, rollup: bool) -> (String, Vec<String>) {
         let mut sql = String::new();
         let mut binds = Vec::new();
         if let Some(s) = self.source.as_ref().filter(|s| !s.is_empty()) {
@@ -458,6 +472,18 @@ impl Filter {
         if let Some(u) = self.user_id.as_ref().filter(|s| !s.is_empty()) {
             sql.push_str(" AND user_id = ?");
             binds.push(u.clone());
+        }
+        // Any `Some` applies, empty string included: '' is not "no filter"
+        // here, it selects the rows that carry no token at all (chat and
+        // scheduled traffic). "No filter" is `None`.
+        if let Some(t) = self.token_id.as_ref() {
+            if rollup {
+                sql.push_str(" AND token_id = ?");
+            } else {
+                // The raw table spells "no token" NULL.
+                sql.push_str(" AND COALESCE(token_id, '') = ?");
+            }
+            binds.push(t.clone());
         }
         (sql, binds)
     }
@@ -474,12 +500,13 @@ pub struct Summary {
     pub errors: i64,
 }
 
-/// One grouped breakdown row (by user / backend / source / model).
+/// One grouped breakdown row (by user / token / backend / source / model).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupCount {
-    /// The grouping key (user_id, backend name, source, or model).
+    /// The grouping key (user_id, token id, backend name, source, or model).
     pub key: String,
-    /// Display label (user email for by-user; same as key otherwise).
+    /// Display label (user email for by-user, token name for by-token; same
+    /// as key otherwise).
     pub label: String,
     pub requests: i64,
     pub total_tokens: i64,
@@ -495,10 +522,19 @@ pub struct Aggregates {
     pub summary: Summary,
     /// Empty for the self-view (a user is the only user in their own data).
     pub by_user: Vec<GroupCount>,
+    /// Per-API-token breakdown. Keyed by `tokens.id`, labelled with the
+    /// denormalised token name; the '' key is everything that arrived
+    /// without a token (chat, scheduled runs).
+    pub by_token: Vec<GroupCount>,
     pub by_backend: Vec<GroupCount>,
     pub by_source: Vec<GroupCount>,
     pub by_model: Vec<GroupCount>,
 }
+
+/// Group key for a per-token breakdown. `usage_events` spells "no token"
+/// NULL and `usage_daily` spells it '', so the key normalises both to '' —
+/// otherwise a window spanning both tables splits one token in two.
+const TOKEN_KEY: &str = "COALESCE(token_id, '')";
 
 /// Which physical table answers a window. Raw is precise (and serves every
 /// UI period); daily rollups serve ranges older than the retention window.
@@ -542,12 +578,46 @@ pub async fn aggregate(
     // Clamp to ≥1 day (a zero/negative window would route every query to the
     // coarser rollups); `saturating_mul` guards an absurd config from
     // overflowing.
+    let plan = read_plan(bounds, retention_days, now);
+
+    let summary = query_summary(pool, &plan, filter).await?;
+    let by_backend = query_group(pool, &plan, filter, "backend", "backend").await?;
+    let by_source = query_group(pool, &plan, filter, "source", "source").await?;
+    let by_model = query_group(pool, &plan, filter, "model", "model").await?;
+    let by_user = if include_by_user {
+        query_group(pool, &plan, filter, "user_id", "MAX(user_email)").await?
+    } else {
+        Vec::new()
+    };
+    // Both tables carry the token, but they spell "no token" differently
+    // (NULL on the raw rows, '' on the rollups) — normalise so a period that
+    // crosses into the rollups doesn't split one token into two rows.
+    let by_token = query_group(pool, &plan, filter, TOKEN_KEY, "MAX(token_name)").await?;
+
+    Ok(Aggregates {
+        summary,
+        by_user,
+        by_token,
+        by_backend,
+        by_source,
+        by_model,
+    })
+}
+
+/// Which physical table answers a window: the raw events while they are still
+/// retained (precise, and every UI period lands here), the daily rollups
+/// beyond that. Shared by [`aggregate`] and [`by_token`] so a caller cannot
+/// pick a different table for the same window.
+fn read_plan(bounds: Bounds, retention_days: i64, now: Timestamp) -> ReadPlan {
+    // Clamp to >= 1 day (a zero/negative window would route every query to
+    // the coarser rollups); `saturating_mul` guards an absurd config from
+    // overflowing.
     let horizon = now
         .checked_sub(SignedDuration::from_hours(
             retention_days.max(1).saturating_mul(24),
         ))
         .unwrap_or(now);
-    let plan = if bounds.start < horizon {
+    if bounds.start < horizon {
         ReadPlan {
             table: "usage_daily",
             time_col: "day",
@@ -563,29 +633,11 @@ pub async fn aggregate(
             end: fmt_ts(bounds.end),
             rollup: false,
         }
-    };
-
-    let summary = query_summary(pool, &plan, filter).await?;
-    let by_backend = query_group(pool, &plan, filter, "backend", "backend").await?;
-    let by_source = query_group(pool, &plan, filter, "source", "source").await?;
-    let by_model = query_group(pool, &plan, filter, "model", "model").await?;
-    let by_user = if include_by_user {
-        query_group(pool, &plan, filter, "user_id", "MAX(user_email)").await?
-    } else {
-        Vec::new()
-    };
-
-    Ok(Aggregates {
-        summary,
-        by_user,
-        by_backend,
-        by_source,
-        by_model,
-    })
+    }
 }
 
 async fn query_summary(pool: &Pool, plan: &ReadPlan, filter: &Filter) -> Result<Summary, DbError> {
-    let (fsql, binds) = filter.where_sql();
+    let (fsql, binds) = filter.where_sql(plan.rollup);
     let sql = format!(
         "SELECT {req} AS requests, COALESCE(SUM(total_tokens), 0) AS total_tokens, \
                 COALESCE(SUM(cost), 0) AS total_cost, \
@@ -617,7 +669,7 @@ async fn query_group(
     key_col: &str,
     label_expr: &str,
 ) -> Result<Vec<GroupCount>, DbError> {
-    let (fsql, binds) = filter.where_sql();
+    let (fsql, binds) = filter.where_sql(plan.rollup);
     let sql = format!(
         "SELECT {key} AS k, {label} AS label, {req} AS requests, \
                 COALESCE(SUM(total_tokens), 0) AS total_tokens, \
@@ -726,6 +778,39 @@ pub async fn distinct_backends(pool: &Pool, bounds: Bounds) -> Result<Vec<String
     rows.iter().map(|r| Ok(r.try_get("backend")?)).collect()
 }
 
+/// Distinct `(token_id, token_name)` seen in a window, for the `/usage` token
+/// picker. Scoped to one user when `user_id` is set (the self view).
+///
+/// Deliberately *not* derived from the page's filtered aggregate: a picker
+/// built from filtered rows collapses to the option already selected, so
+/// there is no way to switch to another token without first clearing the
+/// filter — and none at all when the selected token has no traffic in the
+/// chosen period. `distinct_backends` has the same shape for the same reason.
+pub async fn distinct_tokens(
+    pool: &Pool,
+    bounds: Bounds,
+    user_id: Option<&str>,
+) -> Result<Vec<(String, String)>, DbError> {
+    let mut sql = String::from(
+        "SELECT COALESCE(token_id, '') AS k, COALESCE(MAX(token_name), '') AS label \
+         FROM usage_events WHERE created_at >= ? AND created_at < ?",
+    );
+    if user_id.is_some() {
+        sql.push_str(" AND user_id = ?");
+    }
+    sql.push_str(" GROUP BY COALESCE(token_id, '') ORDER BY label, k");
+    let mut q = sqlx::query(&sql)
+        .bind(fmt_ts(bounds.start))
+        .bind(fmt_ts(bounds.end));
+    if let Some(u) = user_id {
+        q = q.bind(u);
+    }
+    let rows = q.fetch_all(pool).await?;
+    rows.iter()
+        .map(|r| Ok((r.try_get("k")?, r.try_get("label")?)))
+        .collect()
+}
+
 /// One user's usage accumulated since an instant — the read behind limit
 /// enforcement (`server::limits`). Counts only `enforce_limits = 1` rows (exempt
 /// pools never consume a budget) and, when `model` is set, narrows to that
@@ -738,22 +823,78 @@ pub struct WindowUsage {
     pub cost: f64,
 }
 
+/// Month-to-date-style per-token totals for a window — one query, where
+/// [`aggregate`] would run five and discard four.
+///
+/// `user_id` scopes it to one owner (the `/tokens` page); `None` covers the
+/// whole deployment (the admin register). Shared by both so the two pages
+/// cannot drift on what "this token's usage" counts.
+pub async fn by_token(
+    pool: &Pool,
+    bounds: Bounds,
+    user_id: Option<&str>,
+    retention_days: i64,
+    now: Timestamp,
+) -> Result<Vec<GroupCount>, DbError> {
+    let filter = Filter {
+        user_id: user_id.map(str::to_string),
+        ..Default::default()
+    };
+    let plan = read_plan(bounds, retention_days, now);
+    query_group(pool, &plan, &filter, TOKEN_KEY, "MAX(token_name)").await
+}
+
+/// Whose usage a window read measures.
+///
+/// The two subjects differ only in which column they filter, so they share
+/// one query rather than two copies of the model-narrowing and bind logic.
+/// Lives here, next to that query, so the enforcer does not have to keep its
+/// own enum just to pick between two functions.
+#[derive(Debug, Clone, Copy)]
+pub enum Subject<'a> {
+    /// A user's whole budget: every token, plus chat and scheduled runs.
+    User(&'a str),
+    /// One API token's own slice of it.
+    Token(&'a str),
+}
+
+impl<'a> Subject<'a> {
+    /// The column this subject filters on. A compile-time literal, never
+    /// caller input, so interpolating it into the SQL is safe.
+    fn column(self) -> &'static str {
+        match self {
+            Subject::User(_) => "user_id",
+            Subject::Token(_) => "token_id",
+        }
+    }
+    fn id(self) -> &'a str {
+        match self {
+            Subject::User(id) | Subject::Token(id) => id,
+        }
+    }
+}
+
+/// Usage accumulated since an instant, for one subject — the read behind
+/// limit enforcement (`server::limits`). Counts only `enforce_limits = 1`
+/// rows (exempt pools never consume a budget) and, when `model` is set,
+/// narrows to that single model; `None` sums across all metered models.
 pub async fn usage_in_window(
     pool: &Pool,
-    user_id: &str,
+    subject: Subject<'_>,
     since: Timestamp,
     model: Option<&str>,
 ) -> Result<WindowUsage, DbError> {
-    let mut sql = String::from(
+    let mut sql = format!(
         "SELECT COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens, \
                 COALESCE(SUM(cost), 0) AS cost \
          FROM usage_events \
-         WHERE user_id = ? AND created_at >= ? AND enforce_limits = 1",
+         WHERE {} = ? AND created_at >= ? AND enforce_limits = 1",
+        subject.column(),
     );
     if model.is_some() {
         sql.push_str(" AND model = ?");
     }
-    let mut q = sqlx::query(&sql).bind(user_id).bind(fmt_ts(since));
+    let mut q = sqlx::query(&sql).bind(subject.id()).bind(fmt_ts(since));
     if let Some(m) = model {
         q = q.bind(m);
     }
@@ -801,6 +942,186 @@ mod tests {
             output_units: None,
             enforce_limits: true,
         }
+    }
+
+    /// A record with a token, for the per-token accounting tests.
+    fn rec_with_token(user: &str, token: Option<&str>, total: i64, at: Timestamp) -> UsageRecord {
+        UsageRecord {
+            token_id: token.map(str::to_string),
+            token_name: token.map(|t| format!("{t}-name")),
+            source: UsageSource::V1Api,
+            ..rec(user, "b", UsageSource::V1Api, total, at)
+        }
+    }
+
+    /// The rollup keys on the token, and the "no token" case must collapse
+    /// into a single row per day.
+    ///
+    /// The trap this pins: SQLite allows NULLs in a non-INTEGER primary key
+    /// and treats every one as distinct, so keying the rollup on a nullable
+    /// `token_id` would stop `ON CONFLICT` firing for chat traffic — one
+    /// `usage_daily` row per request instead of per day, forever.
+    #[tokio::test]
+    async fn the_daily_rollup_keys_on_the_token_without_splitting_on_null() {
+        let pool = pool().await;
+        let now = Timestamp::now();
+        insert_batch(
+            &pool,
+            &[
+                rec_with_token("alice", Some("tok-a"), 10, now),
+                rec_with_token("alice", Some("tok-a"), 10, now),
+                rec_with_token("alice", Some("tok-b"), 5, now),
+                rec_with_token("alice", None, 7, now),
+                rec_with_token("alice", None, 7, now),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Three rollup rows: tok-a, tok-b, and one for all the token-less
+        // traffic — not five.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_daily")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 3, "one rollup row per (day, token), not per request");
+
+        let none_reqs: i64 =
+            sqlx::query_scalar("SELECT req_count FROM usage_daily WHERE token_id = ''")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(none_reqs, 2, "token-less requests accumulate into one row");
+
+        let a_tokens: i64 =
+            sqlx::query_scalar("SELECT total_tokens FROM usage_daily WHERE token_id = 'tok-a'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(a_tokens, 20);
+    }
+
+    #[tokio::test]
+    async fn aggregate_breaks_down_by_token() {
+        let pool = pool().await;
+        let now = Timestamp::now();
+        insert_batch(
+            &pool,
+            &[
+                rec_with_token("alice", Some("tok-a"), 10, now),
+                rec_with_token("alice", Some("tok-b"), 5, now),
+                rec_with_token("alice", None, 7, now),
+            ],
+        )
+        .await
+        .unwrap();
+        let bounds = Bounds {
+            start: now - SignedDuration::from_hours(1),
+            end: now + SignedDuration::from_hours(1),
+        };
+        let agg = aggregate(&pool, bounds, &Filter::default(), 90, now, false)
+            .await
+            .unwrap();
+        assert_eq!(agg.by_token.len(), 3, "{:?}", agg.by_token);
+        let a = agg
+            .by_token
+            .iter()
+            .find(|g| g.key == "tok-a")
+            .expect("tok-a row");
+        assert_eq!(a.total_tokens, 10);
+        assert_eq!(a.label, "tok-a-name", "the denormalised name is the label");
+        assert!(
+            agg.by_token.iter().any(|g| g.key.is_empty()),
+            "token-less traffic gets its own row: {:?}",
+            agg.by_token
+        );
+    }
+
+    /// `Some("")` selects the token-less rows; `None` is no filter at all.
+    /// Conflating the two is easy — the other filter fields *do* treat empty
+    /// as absent — and it would make the "chat & scheduled" drill-down on
+    /// /usage silently show everything instead.
+    #[tokio::test]
+    async fn an_empty_token_filter_selects_the_token_less_rows() {
+        let pool = pool().await;
+        let now = Timestamp::now();
+        insert_batch(
+            &pool,
+            &[
+                rec_with_token("alice", Some("tok-a"), 10, now),
+                rec_with_token("alice", None, 7, now),
+            ],
+        )
+        .await
+        .unwrap();
+        let bounds = Bounds {
+            start: now - SignedDuration::from_hours(1),
+            end: now + SignedDuration::from_hours(1),
+        };
+
+        let none = aggregate(
+            &pool,
+            bounds,
+            &Filter {
+                token_id: Some(String::new()),
+                ..Default::default()
+            },
+            90,
+            now,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(none.summary.requests, 1);
+        assert_eq!(none.summary.total_tokens, 7);
+
+        let one = aggregate(
+            &pool,
+            bounds,
+            &Filter {
+                token_id: Some("tok-a".into()),
+                ..Default::default()
+            },
+            90,
+            now,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(one.summary.total_tokens, 10);
+
+        let unfiltered = aggregate(&pool, bounds, &Filter::default(), 90, now, false)
+            .await
+            .unwrap();
+        assert_eq!(unfiltered.summary.requests, 2);
+    }
+
+    /// A token's window read must count only that token — the whole point of
+    /// the second ceiling.
+    #[tokio::test]
+    async fn usage_in_window_for_token_counts_only_that_token() {
+        let pool = pool().await;
+        let now = Timestamp::now();
+        insert_batch(
+            &pool,
+            &[
+                rec_with_token("alice", Some("tok-a"), 10, now),
+                rec_with_token("alice", Some("tok-b"), 100, now),
+                rec_with_token("alice", None, 1000, now),
+            ],
+        )
+        .await
+        .unwrap();
+        let since = now - SignedDuration::from_hours(1);
+        let a = usage_in_window(&pool, Subject::Token("tok-a"), since, None)
+            .await
+            .unwrap();
+        assert_eq!((a.requests, a.tokens), (1, 10));
+        // The owner's own budget still sees everything they spent.
+        let user = usage_in_window(&pool, Subject::User("alice"), since, None)
+            .await
+            .unwrap();
+        assert_eq!((user.requests, user.tokens), (3, 1110));
     }
 
     #[test]

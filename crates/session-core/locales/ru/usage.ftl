@@ -61,3 +61,9 @@ usage-limits-heading = Ваши лимиты
 usage-limit-used = использовано { $percent } %
 usage-limit-refreshes = обновится { $time }
 usage-unpriced-warning = Расходы не включают модели без цены: { $models }. Задайте цены в /admin/models, чтобы учитывать их.
+
+usage-table-by-token = По API-токену
+usage-key-token = API-токен
+usage-token-none = Чат и запланированные запуски (без токена)
+usage-token-all = Все токены
+usage-filter-token = Токен

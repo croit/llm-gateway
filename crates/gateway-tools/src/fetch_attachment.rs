@@ -1116,6 +1116,7 @@ mod tests {
         ToolContext {
             user_id: "u1".into(),
             roles: vec![],
+            pool_access: gateway_core::server::upstreams::PoolAccess::all(),
             db: pool,
             s3: None,
             assistant_turn_id: None,
@@ -1159,6 +1160,7 @@ mod tests {
         let ctx = ToolContext {
             user_id: "u".into(),
             roles: vec![],
+            pool_access: gateway_core::server::upstreams::PoolAccess::all(),
             db: pool,
             // Deliberately Some so we'd reach the s3 call if validation slipped —
             // the test asserts we don't get that far.

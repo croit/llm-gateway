@@ -31,6 +31,7 @@ pub mod rag_documents;
 pub mod rag_oauth;
 pub mod reseal;
 pub mod skill_grants;
+pub mod token_models;
 pub mod token_tool_prefs;
 pub mod tokens;
 pub mod upstreams_config;

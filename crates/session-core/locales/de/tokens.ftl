@@ -92,3 +92,24 @@ tokens-push-unsupported = Dieser Browser unterstützt keine Benachrichtigungen.
 tokens-push-enabled = Benachrichtigungen auf diesem Gerät aktiviert.
 tokens-push-disabled = Benachrichtigungen auf diesem Gerät deaktiviert.
 tokens-push-error = Benachrichtigungseinstellungen konnten nicht geändert werden.
+
+# Nutzung, Modell-Freigabeliste und Kontingent pro Token (/tokens).
+tokens-usage-line = diesen Monat: { $requests } Anfragen · { $tokens } Tokens · { $cost }
+tokens-models-summary-all = Modelle: alle
+tokens-models-summary-restricted = Modelle: { $count } ausgewählt
+tokens-models-help = Ausgeschaltet folgt dieses Token Ihrem eigenen Zugriff, auch bei später hinzugefügten Modellen. Eingeschaltet darf es nur die angehakten Modelle verwenden — ein danach hinzugefügtes Modell bleibt gesperrt, bis Sie es hier ebenfalls anhaken.
+tokens-models-restrict-label = Dieses Token auf bestimmte Modelle beschränken
+tokens-models-none-picked = Haken Sie mindestens ein Modell an oder schalten Sie die Beschränkung aus.
+tokens-models-save = Modelle speichern
+tokens-models-saved-toast = Token auf { $count } Modelle beschränkt.
+tokens-models-cleared-toast = Token darf alle Ihre Modelle verwenden.
+tokens-limits-summary-none = Kontingent: keines
+tokens-limits-summary-some = Kontingent: { $count } Regel(n)
+tokens-limits-help = Eine Obergrenze allein für dieses Token. Ihr eigenes Budget gilt weiterhin — das hier kann den Verbrauch nur enger fassen, nie erweitern.
+tokens-limits-add = Kontingent hinzufügen
+tokens-limits-remove = Entfernen
+tokens-limits-saved-toast = Token-Kontingent gespeichert.
+tokens-limits-removed-toast = Token-Kontingent entfernt.
+tokens-limits-not-yours = Dieses Kontingent können Sie nicht entfernen.
+tokens-limits-admin-set = Ein Administrator hat dieses Kontingent für dieses Token gesetzt; es lässt sich nur auf der Admin-Limits-Seite ändern.
+tokens-limits-admin-badge = vom Administrator gesetzt

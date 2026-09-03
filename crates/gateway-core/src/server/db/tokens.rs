@@ -164,6 +164,20 @@ pub async fn find_active_by_hash(pool: &Pool, hash: &str) -> Result<Option<Token
     row.as_ref().map(map_row).transpose()
 }
 
+/// Whether `token_id` exists and belongs to `user_id` — the ownership gate on
+/// every per-token settings write. One row, one column: the alternative
+/// (fetching the user's whole token list and scanning it) decodes every
+/// column of every token, timestamps included, to answer a boolean.
+pub async fn belongs_to(pool: &Pool, user_id: &str, token_id: &str) -> Result<bool, DbError> {
+    let found: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM tokens WHERE id = ? AND user_id = ?")
+            .bind(token_id)
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(found.is_some())
+}
+
 /// All non-deleted tokens for a user, newest first. Includes revoked and
 /// expired tokens — the UI shows the full history and lets users see when
 /// something was revoked.
@@ -173,6 +187,70 @@ pub async fn list_for_user(pool: &Pool, user_id: &str) -> Result<Vec<Token>, DbE
         .fetch_all(pool)
         .await?;
     rows.iter().map(map_row).collect()
+}
+
+/// One token plus who owns it — the admin-wide list. Never carries `hash`:
+/// the plaintext is unrecoverable by construction (only a SHA-256 of it is
+/// stored), and an admin has no more business with the digest than anyone
+/// else. This is the same view a user gets of their own tokens, with the
+/// owner's identity added.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenWithOwner {
+    pub id: String,
+    pub name: String,
+    pub user_id: String,
+    /// The owner's email, or their id when the user row has since been
+    /// deleted and the token outlived it.
+    pub user_email: String,
+    pub created_at: Timestamp,
+    pub last_used_at: Option<Timestamp>,
+    pub expires_at: Timestamp,
+    pub revoked_at: Option<Timestamp>,
+    pub tools_enabled: bool,
+}
+
+/// One token by id, regardless of owner — the admin path, and the lookup that
+/// turns a token id typed into the `/limits` form into a real subject.
+pub async fn find_by_id(pool: &Pool, token_id: &str) -> Result<Option<Token>, DbError> {
+    let row = sqlx::query("SELECT * FROM tokens WHERE id = ?")
+        .bind(token_id)
+        .fetch_optional(pool)
+        .await?;
+    row.as_ref().map(map_row).transpose()
+}
+
+/// Every token in the deployment with its owner, newest first. Backs the
+/// admin token list.
+pub async fn list_all_with_owner(pool: &Pool) -> Result<Vec<TokenWithOwner>, DbError> {
+    // LEFT JOIN, not JOIN: a token whose user row was deleted still matters to
+    // an admin looking for stray credentials, and hiding it would be the worst
+    // possible failure mode for this page.
+    let rows = sqlx::query(
+        "SELECT t.id, t.user_id, t.name, t.created_at, t.last_used_at, t.expires_at,
+                t.revoked_at, t.tools_enabled, u.email AS user_email
+           FROM tokens t
+           LEFT JOIN users u ON u.id = t.user_id
+          ORDER BY t.created_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            let user_id: String = r.try_get("user_id")?;
+            let email: Option<String> = r.try_get("user_email")?;
+            Ok(TokenWithOwner {
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
+                user_email: email.unwrap_or_else(|| user_id.clone()),
+                user_id,
+                created_at: super::parse_ts(r.try_get("created_at")?, "created_at")?,
+                last_used_at: super::parse_optional_ts(r.try_get("last_used_at")?, "last_used_at")?,
+                expires_at: super::parse_ts(r.try_get("expires_at")?, "expires_at")?,
+                revoked_at: super::parse_optional_ts(r.try_get("revoked_at")?, "revoked_at")?,
+                tools_enabled: r.try_get::<i64, _>("tools_enabled")? != 0,
+            })
+        })
+        .collect()
 }
 
 /// Marks a token revoked. Returns `Ok(false)` if the token didn't exist or
@@ -203,6 +281,7 @@ pub async fn delete_if_revoked(
     user_id: &str,
     token_id: &str,
 ) -> Result<bool, DbError> {
+    let mut tx = pool.begin().await?;
     let result = sqlx::query(
         r#"DELETE FROM tokens
             WHERE id = ?
@@ -211,8 +290,16 @@ pub async fn delete_if_revoked(
     )
     .bind(token_id)
     .bind(user_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    if result.rows_affected() > 0 {
+        // `token_models` cascades on the foreign key, but `limits` cannot
+        // have one — its subject is polymorphic (global / role / user /
+        // token all live in the same table), so the rows have to be swept
+        // explicitly, inside this transaction.
+        super::limits::delete_for_token(&mut *tx, token_id).await?;
+    }
+    tx.commit().await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -253,6 +340,89 @@ mod tests {
         .await
         .unwrap();
         (pool, user_id)
+    }
+
+    /// `limits` cannot carry a foreign key onto `tokens` — its subject is
+    /// polymorphic — so deleting a token has to sweep its rules explicitly.
+    /// Left behind, they show up on /admin/limits under an id that resolves
+    /// to nothing and can never be reached again.
+    #[tokio::test]
+    async fn deleting_a_token_sweeps_its_limit_rules() {
+        use super::super::limits;
+        let (pool, user_id) = setup().await;
+        insert(&pool, &fixture(&user_id, "tok-a", "hash-a"))
+            .await
+            .unwrap();
+        limits::upsert(
+            &pool,
+            limits::SubjectType::Token,
+            "tok-a",
+            None,
+            limits::Dimension::Requests,
+            limits::Window::Day,
+            10.0,
+        )
+        .await
+        .unwrap();
+        // A rule for a *different* subject must survive the sweep.
+        limits::upsert(
+            &pool,
+            limits::SubjectType::Global,
+            "",
+            None,
+            limits::Dimension::Requests,
+            limits::Window::Day,
+            99.0,
+        )
+        .await
+        .unwrap();
+
+        assert!(revoke(&pool, &user_id, "tok-a").await.unwrap());
+        assert!(delete_if_revoked(&pool, &user_id, "tok-a").await.unwrap());
+
+        assert!(
+            limits::applicable_for_token(&pool, "tok-a")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the deleted token's rules are gone"
+        );
+        assert_eq!(
+            limits::list_all(&pool).await.unwrap().len(),
+            1,
+            "and nothing else was swept with them"
+        );
+    }
+
+    /// The sweep must not fire when the delete itself is refused — an active
+    /// token keeps its quota.
+    #[tokio::test]
+    async fn a_refused_delete_leaves_the_limit_rules_alone() {
+        use super::super::limits;
+        let (pool, user_id) = setup().await;
+        insert(&pool, &fixture(&user_id, "tok-a", "hash-a"))
+            .await
+            .unwrap();
+        limits::upsert(
+            &pool,
+            limits::SubjectType::Token,
+            "tok-a",
+            None,
+            limits::Dimension::Requests,
+            limits::Window::Day,
+            10.0,
+        )
+        .await
+        .unwrap();
+        // Never revoked, so the delete is a no-op.
+        assert!(!delete_if_revoked(&pool, &user_id, "tok-a").await.unwrap());
+        assert_eq!(
+            limits::applicable_for_token(&pool, "tok-a")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     fn fixture(user_id: &str, id: &str, hash: &str) -> Token {

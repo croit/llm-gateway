@@ -30,7 +30,7 @@ use session_core::chrome::{NavSections, Theme, is_datastar_request};
 use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
-use gateway_core::server::db::limits::{Dimension, Window};
+use gateway_core::server::db::limits::Dimension;
 use gateway_core::server::db::usage::{self, Aggregates, Filter, GroupCount, Period};
 use gateway_core::server::limits::LimitStatus;
 use gateway_runtime::rama_server::state::RamaState;
@@ -46,6 +46,11 @@ struct UsageQuery {
     source: Option<String>,
     #[serde(default)]
     backend: Option<String>,
+    /// Drill down to one API token. `''` is the token-less traffic (chat and
+    /// scheduled runs), which is a real selection rather than "no filter" —
+    /// hence the explicit `none` sentinel below.
+    #[serde(default)]
+    token: Option<String>,
     #[serde(default)]
     scope: Option<String>,
 }
@@ -82,12 +87,24 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
         backend: q.backend.clone().filter(|s| !s.is_empty()),
         // Scoped to the caller unless an admin asked for all users.
         user_id: (!show_all).then(|| user.id.clone()),
+        // `none` selects the rows that carry no token at all. An empty value
+        // means "every token", so the two cannot share a spelling.
+        token_id: match q.token.as_deref() {
+            None | Some("") => None,
+            Some(NO_TOKEN_FILTER) => Some(String::new()),
+            Some(id) => Some(id.to_string()),
+        },
     };
     let retention = state.config().usage.retention_days;
     let agg = usage::aggregate(&state.db, bounds, &filter, retention, now, show_all)
         .await
         .unwrap_or_default();
     let backends = usage::distinct_backends(&state.db, bounds)
+        .await
+        .unwrap_or_default();
+    // Unfiltered, and scoped to the caller unless this is the all-users view
+    // — so the picker still offers every other token once one is selected.
+    let tokens = usage::distinct_tokens(&state.db, bounds, (!show_all).then_some(user.id.as_str()))
         .await
         .unwrap_or_default();
 
@@ -127,6 +144,7 @@ pub async fn usage_index(State(state): State<Arc<RamaState>>, req: Request) -> R
         period,
         &filter,
         &backends,
+        &tokens,
         &agg,
         &limit_status,
         &unpriced,
@@ -170,6 +188,7 @@ fn render_body(
     period: Period,
     filter: &Filter,
     backends: &[String],
+    tokens: &[(String, String)],
     agg: &Aggregates,
     limit_status: &[LimitStatus],
     unpriced: &[String],
@@ -232,7 +251,7 @@ fn render_body(
         .to_html()
     };
 
-    let filter_bar = render_filter_bar(lang, period, filter, backends, show_all);
+    let filter_bar = render_filter_bar(lang, period, filter, backends, tokens, show_all);
     // Empty fragment for non-admins (no "All users" toggle).
     let scope_toggle = if admin {
         render_scope_toggle(lang, show_all, period, filter)
@@ -278,6 +297,25 @@ fn render_body(
         currency,
         &agg.by_model,
     ));
+    // Relabelled before rendering: the generic row renderer shows `label`, and
+    // for tokens that is a name that may be missing or a '' key that means
+    // something specific.
+    let by_token: Vec<GroupCount> = agg
+        .by_token
+        .iter()
+        .map(|r| GroupCount {
+            label: token_label(lang, &r.key, &r.label),
+            ..r.clone()
+        })
+        .collect();
+    tables.push(render_table(
+        lang,
+        "usage-table-by-token",
+        "usage-key-token",
+        show_cost,
+        currency,
+        &by_token,
+    ));
 
     html! {
         section(class: "max-w-5xl mx-auto p-4 sm:p-6 flex flex-col gap-4") {
@@ -317,6 +355,17 @@ fn usage_href(scope_all: bool, period: Period, filter: &Filter) -> String {
     if let Some(b) = filter.backend.as_deref().filter(|s| !s.is_empty()) {
         q.push_str("&backend=");
         q.push_str(b);
+    }
+    // The token drill-down is a filter like the others, and the scope toggle
+    // claims to preserve them all. `Some("")` is a real selection (the
+    // token-less rows) and spells itself `none` in the query string.
+    match filter.token_id.as_deref() {
+        None => {}
+        Some("") => q.push_str(&format!("&token={NO_TOKEN_FILTER}")),
+        Some(id) => {
+            q.push_str("&token=");
+            q.push_str(id);
+        }
     }
     q
 }
@@ -360,15 +409,42 @@ fn opt(value: &str, label: &str, selected: bool) -> Html {
     }
 }
 
+/// Query value that selects traffic with no API token (the chat UI and
+/// scheduled runs). An empty `?token=` means "every token", so the two need
+/// different spellings.
+const NO_TOKEN_FILTER: &str = "none";
+
+/// Label a token by its `(key, name)`. The rollup keys token-less traffic as
+/// '', and rows written before the token name was denormalised (or after the
+/// token was deleted) carry no name — fall back to the id rather than
+/// rendering a blank option nobody can pick out of a list.
+fn token_label(lang: Lang, key: &str, name: &str) -> String {
+    if key.is_empty() {
+        return t(lang, "usage-token-none");
+    }
+    if name.is_empty() {
+        return key.to_string();
+    }
+    name.to_string()
+}
+
 fn render_filter_bar(
     lang: Lang,
     period: Period,
     filter: &Filter,
     backends: &[String],
+    tokens: &[(String, String)],
     show_all: bool,
 ) -> Html {
     let cur_source = filter.source.clone().unwrap_or_default();
     let cur_backend = filter.backend.clone().unwrap_or_default();
+    // `None` = no filter; `Some("")` = the token-less rows, which the query
+    // string spells `none`.
+    let cur_token = match filter.token_id.as_deref() {
+        None => String::new(),
+        Some("") => NO_TOKEN_FILTER.to_string(),
+        Some(id) => id.to_string(),
+    };
     // Native GET submit on change — no datastar dependency; the URL fully
     // describes the view, and the server re-renders.
     let on_change = "evt.target.form.requestSubmit()";
@@ -386,12 +462,35 @@ fn render_filter_bar(
     for b in backends {
         backend_opts.push(opt(b, b, *b == cur_backend));
     }
+    // Only tokens that actually saw traffic in this window are offered — the
+    // list is a drill-down into what is on screen, not a token manager.
+    let all_tokens_label = t(lang, "usage-token-all");
+    let mut token_opts: Vec<Html> = vec![opt("", &all_tokens_label, cur_token.is_empty())];
+    let mut selected_offered = cur_token.is_empty();
+    for (key, label) in tokens {
+        let value = if key.is_empty() {
+            NO_TOKEN_FILTER
+        } else {
+            key.as_str()
+        };
+        let selected = value == cur_token;
+        selected_offered |= selected;
+        token_opts.push(opt(value, &token_label(lang, key, label), selected));
+    }
+    // A token with no traffic in this period isn't in the list, and a select
+    // with nothing selected displays its first option — the picker would read
+    // "All tokens" while the URL still filters, and the next change would
+    // silently drop the drill-down. Offer the selection explicitly instead.
+    if !selected_offered {
+        token_opts.push(opt(&cur_token, &cur_token, true));
+    }
     // Preserve the admin "all users" scope across filter changes (the
     // form's GET would otherwise drop it). Empty for the self view.
     let scope_value = if show_all { "all" } else { "" };
     let period_label = t(lang, "usage-filter-period");
     let source_label = t(lang, "usage-filter-source");
     let backend_label = t(lang, "usage-filter-backend");
+    let token_label = t(lang, "usage-filter-token");
     let apply_label = t(lang, "usage-apply");
 
     html! {
@@ -415,6 +514,12 @@ fn render_filter_bar(
                     for o in backend_opts.iter() { (o.clone()) }
                 }
             }
+            label(class: "flex flex-col gap-1") {
+                span(class: "label-text text-xs text-base-content/60") { (token_label) }
+                select(name: "token", class: "select select-bordered select-sm", "data-on:change": (on_change)) {
+                    for o in token_opts.iter() { (o.clone()) }
+                }
+            }
             // Fallback for clients without JS: an explicit apply.
             noscript {
                 button(type: "submit", class: "btn btn-sm btn-primary") { (apply_label) }
@@ -431,11 +536,11 @@ fn render_stats(
     currency: &str,
     s: &usage::Summary,
 ) -> Html {
-    let requests = fmt_int(s.requests);
-    let tokens = fmt_int(s.total_tokens);
-    let errors = fmt_int(s.errors);
-    let users = fmt_int(s.unique_users);
-    let cost = fmt_cost(s.total_cost, currency);
+    let requests = super::fmt_int(s.requests);
+    let tokens = super::fmt_int(s.total_tokens);
+    let errors = super::fmt_int(s.errors);
+    let users = super::fmt_int(s.unique_users);
+    let cost = super::fmt_cost(s.total_cost, currency);
     let requests_title = t(lang, "usage-stat-requests-title");
     let requests_desc = t(lang, "usage-stat-requests-desc");
     let tokens_title = t(lang, "usage-stat-tokens-title");
@@ -523,9 +628,9 @@ fn render_limit_bar(
         .unwrap_or_else(|| t(lang, "limits-all-models"));
     let title = format!(
         "{} · {} · {}",
-        dim_label(lang, s.dimension),
+        super::dim_label(lang, s.dimension, None),
         scope,
-        win_label(lang, s.window),
+        super::win_label(lang, s.window),
     );
     let amounts = format!(
         "{} / {}",
@@ -565,29 +670,12 @@ fn render_limit_bar(
     .to_html()
 }
 
-fn dim_label(lang: Lang, d: Dimension) -> String {
-    match d {
-        Dimension::Requests => t(lang, "limits-dim-requests"),
-        Dimension::Tokens => t(lang, "limits-dim-tokens"),
-        Dimension::Cost => t(lang, "limits-dim-cost-short"),
-    }
-}
-
-fn win_label(lang: Lang, w: Window) -> String {
-    match w {
-        Window::Hour => t(lang, "limits-win-hour"),
-        Window::Day => t(lang, "limits-win-day"),
-        Window::Week => t(lang, "limits-win-week"),
-        Window::Month => t(lang, "limits-win-month"),
-    }
-}
-
 /// Format a limit amount for its dimension: cost with currency, else a
 /// grouped integer.
 fn fmt_amount(dim: Dimension, v: f64, currency: &str) -> String {
     match dim {
-        Dimension::Cost => fmt_cost(v, currency),
-        _ => fmt_int(v as i64),
+        Dimension::Cost => super::fmt_cost(v, currency),
+        _ => super::fmt_int(v as i64),
     }
 }
 
@@ -648,10 +736,10 @@ fn render_row(r: &GroupCount, show_cost: bool, currency: &str) -> Html {
     } else {
         r.label.clone()
     };
-    let requests = fmt_int(r.requests);
-    let tokens = fmt_int(r.total_tokens);
-    let cost = fmt_cost(r.cost, currency);
-    let errors = fmt_int(r.errors);
+    let requests = super::fmt_int(r.requests);
+    let tokens = super::fmt_int(r.total_tokens);
+    let cost = super::fmt_cost(r.cost, currency);
+    let errors = super::fmt_int(r.errors);
     let err_class = if r.errors > 0 {
         "text-right tabular-nums text-error"
     } else {
@@ -671,53 +759,8 @@ fn render_row(r: &GroupCount, show_cost: bool, currency: &str) -> Html {
     .to_html()
 }
 
-/// Group an integer with thin spaces every three digits for readability
-/// (locale-agnostic — no comma/period ambiguity across DE/EN).
-fn fmt_int(n: i64) -> String {
-    let digits = n.unsigned_abs().to_string();
-    let len = digits.len();
-    let mut out = String::with_capacity(len + len / 3 + 1);
-    if n < 0 {
-        out.push('-');
-    }
-    for (i, c) in digits.chars().enumerate() {
-        if i != 0 && (len - i).is_multiple_of(3) {
-            out.push('\u{202f}'); // narrow no-break space, every 3 from the right
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Money display: integer part grouped like [`fmt_int`], two decimals, and
-/// the deployment currency label appended (e.g. `1 234.56 USD`). Cost is
-/// always ≥ 0, so no sign handling is needed.
-fn fmt_cost(cost: f64, currency: &str) -> String {
-    let cents = (cost * 100.0).round() as i64;
-    let int_part = cents / 100;
-    let frac = (cents % 100).abs();
-    format!("{}.{:02}\u{202f}{}", fmt_int(int_part), frac, currency)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{fmt_cost, fmt_int};
-
-    #[test]
-    fn fmt_cost_two_decimals_grouped_with_currency() {
-        assert_eq!(fmt_cost(0.0, "USD"), "0.00\u{202f}USD");
-        assert_eq!(fmt_cost(1234.5, "USD"), "1\u{202f}234.50\u{202f}USD");
-        assert_eq!(fmt_cost(0.019, "EUR"), "0.02\u{202f}EUR");
-    }
-
-    #[test]
-    fn fmt_int_groups_thousands() {
-        assert_eq!(fmt_int(0), "0");
-        assert_eq!(fmt_int(42), "42");
-        assert_eq!(fmt_int(1234), "1\u{202f}234");
-        assert_eq!(fmt_int(1234567), "1\u{202f}234\u{202f}567");
-        assert_eq!(fmt_int(-1000), "-1\u{202f}000");
-    }
 
     #[test]
     fn source_options_match_enum_strings() {

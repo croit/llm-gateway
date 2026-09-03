@@ -149,6 +149,7 @@ impl Tool for EditImage {
                     &source.mime,
                     &args.prompt,
                     args.size.as_deref(),
+                    &ctx.pool_access,
                     &meta,
                 )
                 .await
@@ -202,6 +203,7 @@ mod tests {
         ToolContext {
             user_id: "u".into(),
             roles: vec![],
+            pool_access: gateway_core::server::upstreams::PoolAccess::all(),
             db: gateway_core::server::db::open(std::path::Path::new(":memory:"))
                 .await
                 .unwrap(),

@@ -9,6 +9,7 @@ nav-tools = Outils
 nav-tokens = Jetons
 nav-usage = Utilisation
 nav-users = Utilisateurs
+nav-admin-tokens = Jetons d'API
 nav-models = Modèles
 nav-upstreams = Amonts
 nav-rag = RAG

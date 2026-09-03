@@ -143,6 +143,27 @@ const TOOL_RESULT_SINGLE_SHARE: f64 = 0.15;
 const TOOL_RESULTS_TURN_FLOOR: usize = 16_384;
 const TOOL_RESULT_SINGLE_FLOOR: usize = 8_192;
 
+/// The smallest slice a single result may ever be cut to, *including* when the
+/// turn's cumulative allowance is already spent.
+///
+/// Without this floor the cap is `per_result.min(remaining)`, and `remaining`
+/// walks to zero over a long tool loop — so the eleventh call in a turn gets
+/// its result truncated to **nothing**: a 324-byte answer arrives as 0 bytes
+/// plus a note. The tool had already done the work (a RAG grep really does
+/// scan every chunk), the model cannot page the rest back in, and the note's
+/// advice — narrow the request — is powerless, because it is the accumulated
+/// turn, not this payload, that is over.
+///
+/// A floor bounds the overrun instead. The turn share stops being a hard
+/// ceiling and becomes a soft one: a turn can exceed it by at most
+/// `max_rounds` × (calls per round) × this many bytes. At the deepest effort
+/// (64 rounds) that is a few tens of KB against a window measured in
+/// hundreds — a far better trade than a model reasoning from nothing.
+///
+/// Sized to carry a real answer — a match count, a handful of hits, a short
+/// JSON object — rather than a token of one.
+const TOOL_RESULT_MIN_BYTES: usize = 2_048;
+
 /// How much of the prompt this turn's tool results may still take up.
 ///
 /// A tool result went upstream at whatever size the tool produced it. One ERP
@@ -178,15 +199,45 @@ impl ToolResultBudget {
         }
     }
 
-    /// The cap the next result must fit in: its own share, or whatever is left
-    /// of the turn's allowance, whichever is smaller.
-    fn cap(&self) -> usize {
-        self.per_result.min(self.remaining)
+    /// The cap the next result must fit in, and why: its own share, or
+    /// whatever is left of the turn's allowance, whichever is smaller — but
+    /// never less than [`TOOL_RESULT_MIN_BYTES`], so a result is always worth
+    /// reading.
+    ///
+    /// The reason rides along because it decides what the model should do
+    /// next, and the two answers are opposites: a payload over its own share
+    /// can be narrowed and re-fetched, while an exhausted turn budget cannot
+    /// be — calling again only burns another round.
+    fn cap(&self) -> (usize, CapReason) {
+        if self.remaining < self.per_result {
+            // Never below the floor, and never above this model's own
+            // per-result share — a tiny window must not be handed a bigger
+            // slice through the floor than it would grant normally.
+            (
+                self.remaining
+                    .max(TOOL_RESULT_MIN_BYTES.min(self.per_result)),
+                CapReason::TurnBudget,
+            )
+        } else {
+            (self.per_result, CapReason::Payload)
+        }
     }
 
     fn spend(&mut self, bytes: usize) {
         self.remaining = self.remaining.saturating_sub(bytes);
     }
+}
+
+/// Which limit cut a tool result short — and so what the model can do about
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapReason {
+    /// This one payload is larger than a single result's share. Narrowing the
+    /// request genuinely helps.
+    Payload,
+    /// The turn's cumulative allowance is spent. Narrowing does nothing; the
+    /// model should work with what it has.
+    TurnBudget,
 }
 
 /// Cut `body` down to `cap` bytes if it is over, appending a note that says so.
@@ -201,7 +252,7 @@ impl ToolResultBudget {
 /// Splits on a char boundary (`floor_char_boundary` is unstable, so walk back
 /// by hand); a payload cut mid-codepoint is invalid UTF-8 that some backends
 /// reject outright.
-fn cap_tool_result(body: String, cap: usize) -> String {
+fn cap_tool_result(body: String, cap: usize, reason: CapReason) -> String {
     if body.len() <= cap {
         return body;
     }
@@ -212,12 +263,25 @@ fn cap_tool_result(body: String, cap: usize) -> String {
     }
     let mut out = body;
     out.truncate(end);
+    let advice = match reason {
+        CapReason::Payload => {
+            "If you need the missing part, call the tool again with a narrower request \
+             (filters, a smaller page size, fewer fields), and tell the user the result was \
+             too large to read in full."
+        }
+        // Deliberately the opposite advice. Telling a model to retry when the
+        // turn's allowance is gone sends it into a loop of calls that each
+        // come back just as short.
+        CapReason::TurnBudget => {
+            "This turn has already used its budget for tool output, so calling again — even \
+             with a narrower request — will not return more. Work with what you have, and \
+             tell the user which part you could not read."
+        }
+    };
     out.push_str(&format!(
         "\n\n[truncated by the gateway: this is the first {end} bytes of a {original}-byte \
-         result, which does not fit in this model's context window. The rest was NOT sent to \
-         you — do not treat what you see as the complete answer. If you need the missing part, \
-         call the tool again with a narrower request (filters, a smaller page size, fewer \
-         fields), and tell the user the result was too large to read in full.]"
+         result. The rest was NOT sent to you — do not treat what you see as the complete \
+         answer. {advice}]"
     ));
     out
 }
@@ -379,6 +443,11 @@ pub struct TurnFacts {
     /// The model this turn runs on, so a tool that creates work to be run
     /// *later* (`schedule_action`) inherits it instead of guessing a pool id.
     pub model: Option<String>,
+    /// The caller's upstream access, when the caller has one that `roles`
+    /// alone cannot express — i.e. a bearer request, whose token may carry a
+    /// model allowlist. `None` on the session paths, where access is exactly
+    /// what the user's groups grant and is derived from `roles` below.
+    pub pool_access: Option<gateway_core::server::upstreams::PoolAccess>,
 }
 
 pub fn build_tool_context(state: &Arc<RamaState>, facts: TurnFacts) -> ToolContext {
@@ -390,10 +459,15 @@ pub fn build_tool_context(state: &Arc<RamaState>, facts: TurnFacts) -> ToolConte
         client_ip,
         chat_feedback,
         model,
+        pool_access,
     } = facts;
+    // Session paths: whatever the user's groups reach. Bearer paths hand in
+    // their own, already narrowed by the token's allowlist.
+    let pool_access = pool_access.unwrap_or_else(|| state.pool_access_for(&roles));
     ToolContext {
         user_id,
         roles,
+        pool_access,
         db: state.db.clone(),
         s3: state
             .config()
@@ -1430,8 +1504,24 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
                 None => {
                     // The DB/operator copy above keeps the full payload; only
                     // what goes upstream is budgeted.
-                    let capped = cap_tool_result(output_str, tool_budget.cap());
+                    let (cap, reason) = tool_budget.cap();
+                    let original_len = output_str.len();
+                    let capped = cap_tool_result(output_str, cap, reason);
                     tool_budget.spend(capped.len());
+                    if capped.len() < original_len {
+                        // The one line that says whether a truncation was this
+                        // payload's fault or the turn's — without it, "the
+                        // result was too big" is unfalsifiable from the logs.
+                        tracing::warn!(
+                            tool = %call.name,
+                            original_bytes = original_len,
+                            kept_bytes = cap,
+                            cap_reason = ?reason,
+                            per_result = tool_budget.per_result,
+                            turn_remaining = tool_budget.remaining,
+                            "tool result truncated to fit the turn's budget"
+                        );
+                    }
                     serde_json::Value::String(capped)
                 }
             };
@@ -3001,12 +3091,15 @@ mod tests {
 
 #[cfg(test)]
 mod tool_budget_tests {
-    use super::{ToolResultBudget, cap_tool_result, context_overflow};
+    use super::{CapReason, ToolResultBudget, cap_tool_result, context_overflow};
 
     #[test]
     fn small_results_pass_through_untouched() {
         let body = r#"{"ok":true}"#.to_string();
-        assert_eq!(cap_tool_result(body.clone(), 8_192), body);
+        assert_eq!(
+            cap_tool_result(body.clone(), 8_192, CapReason::Payload),
+            body
+        );
     }
 
     /// The reported failure: one tool result larger than the whole context
@@ -3015,7 +3108,7 @@ mod tool_budget_tests {
     #[test]
     fn oversized_results_are_cut_and_labelled() {
         let huge = "x".repeat(2_000_000);
-        let out = cap_tool_result(huge.clone(), 10_000);
+        let out = cap_tool_result(huge.clone(), 10_000, CapReason::Payload);
         assert!(out.len() < huge.len() / 100, "expected a hard cut");
         assert!(out.contains("truncated by the gateway"), "{out}");
         assert!(
@@ -3037,7 +3130,7 @@ mod tool_budget_tests {
         // Cap lands mid-emoji: a naive byte slice is invalid UTF-8, which
         // some backends reject outright.
         let payload = format!("{}\u{1F600}\u{1F600}", "x".repeat(99));
-        let out = cap_tool_result(payload, 100);
+        let out = cap_tool_result(payload, 100, CapReason::Payload);
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 
@@ -3050,7 +3143,8 @@ mod tool_budget_tests {
         let per_result = budget.per_result;
         let mut total = 0usize;
         for _ in 0..12 {
-            let out = cap_tool_result("y".repeat(5_000_000), budget.cap());
+            let (cap, reason) = budget.cap();
+            let out = cap_tool_result("y".repeat(5_000_000), cap, reason);
             budget.spend(out.len());
             total += out.len();
         }
@@ -3058,11 +3152,78 @@ mod tool_budget_tests {
             total < per_result * 12,
             "a cumulative budget must bite before 12 max-size results: {total}"
         );
-        // Everything sent still fits the turn share of the window.
+        // Everything sent still fits the turn share, plus the bounded slack
+        // the per-result floor deliberately allows: once the share is spent
+        // each further result still carries `TOOL_RESULT_MIN_BYTES`, because
+        // handing the model a 0-byte result is the worse failure. The point
+        // of the assertion is that the slack stays *bounded* and small.
         let window_bytes = 262_144 * super::CHARS_PER_TOKEN;
+        let share = (window_bytes as f64 * super::TOOL_RESULTS_TURN_SHARE) as usize;
+        let slack = 12 * (super::TOOL_RESULT_MIN_BYTES + 512);
         assert!(
-            total <= (window_bytes as f64 * super::TOOL_RESULTS_TURN_SHARE) as usize + 12 * 512,
-            "turn total {total} overruns the budgeted share"
+            total <= share + slack,
+            "turn total {total} overruns the budgeted share {share} by more than {slack}"
+        );
+    }
+
+    /// The reported failure, reproduced: a long tool loop spends the turn's
+    /// allowance, and every later result comes back as **0 bytes** plus a
+    /// note. The tool had already done the work; the model got nothing.
+    ///
+    /// A small result late in a turn must still arrive intact.
+    #[test]
+    fn a_late_result_is_never_clamped_to_nothing() {
+        let mut budget = ToolResultBudget::for_window(262_144);
+        // Burn the whole turn allowance on big results, as a 19-call RAG
+        // session does.
+        for _ in 0..12 {
+            let (cap, reason) = budget.cap();
+            let out = cap_tool_result("y".repeat(5_000_000), cap, reason);
+            budget.spend(out.len());
+        }
+        assert_eq!(budget.remaining, 0, "the turn allowance should be spent");
+
+        // The 324-byte grep result from the report.
+        let small = "m".repeat(324);
+        let (cap, reason) = budget.cap();
+        assert_eq!(reason, CapReason::TurnBudget);
+        let out = cap_tool_result(small.clone(), cap, reason);
+        assert_eq!(
+            out, small,
+            "a result that fits the floor must arrive whole, not as a note"
+        );
+
+        // And a large one still carries a readable head rather than nothing.
+        let (cap, reason) = budget.cap();
+        let out = cap_tool_result("z".repeat(50_000), cap, reason);
+        let body = out.split("\n\n[truncated").next().unwrap();
+        assert!(
+            body.len() >= super::TOOL_RESULT_MIN_BYTES,
+            "kept only {} bytes; a truncated result must still say something",
+            body.len()
+        );
+    }
+
+    /// Retrying cannot help once the turn's allowance is gone, so the note
+    /// must not tell the model to retry — that is how a model burns its
+    /// remaining rounds on calls that each come back just as short.
+    #[test]
+    fn an_exhausted_turn_budget_does_not_advise_a_narrower_call() {
+        let payload = "q".repeat(100_000);
+        let narrow = cap_tool_result(payload.clone(), 1_000, CapReason::Payload);
+        assert!(
+            narrow.contains("narrower request"),
+            "an oversized payload can genuinely be narrowed: {narrow}"
+        );
+
+        let spent = cap_tool_result(payload, 1_000, CapReason::TurnBudget);
+        assert!(
+            spent.contains("will not return more"),
+            "an exhausted turn must say so: {spent}"
+        );
+        assert!(
+            !spent.contains("call the tool again with a narrower request"),
+            "and must not send the model back for another round: {spent}"
         );
     }
 

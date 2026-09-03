@@ -236,12 +236,15 @@ impl Tool for RagSearch {
                                         that directory, at any depth), `*.rs`, \
                                         `*/tests/*`. Matched against the indexed file path \
                                         with glob syntax (`*` any characters, `?` one, \
-                                        `[abc]` a set) and case-sensitively. On an \
-                                        aggregate collection paths start with the source \
-                                        repo, e.g. `pve-manager/*`. Narrows the search \
-                                        rather than guaranteeing every match under the \
-                                        path — leave it off unless the user pointed at a \
-                                        specific area."
+                                        `[abc]` a set) and case-sensitively. Paths are \
+                                        relative to each source's own root and carry NO \
+                                        repo prefix, on aggregate collections too — \
+                                        `PVE/API2/Nodes.pm`, not `pve-manager/PVE/...`, \
+                                        so a glob like `pve-manager/*` matches nothing \
+                                        at all. Narrows the search rather than \
+                                        guaranteeing every match under the path — leave \
+                                        it off unless the user pointed at a specific \
+                                        area."
                     },
                     "top_k": {
                         "type": "integer",
@@ -446,8 +449,10 @@ impl Tool for RagGrep {
                         "description": "Path filter, e.g. `src/osd/*`, `*.rs`, `*/tests/*`. \
                                         Glob syntax, case-sensitive, matched against the \
                                         indexed path (on an aggregate collection paths \
-                                        start with the source repo). Strongly preferred \
-                                        when you know roughly where to look — it is what \
+                                        are relative to each source's own root and \
+                                        carry NO repo prefix, so `pve-manager/*` matches \
+                                        nothing — use `PVE/*`). Strongly preferred when \
+                                        you know roughly where to look — it is what \
                                         keeps the scan cheap."
                     },
                     "ignore_case": {
@@ -894,6 +899,7 @@ mod tests {
         ToolContext {
             user_id: "u".into(),
             roles: vec![],
+            pool_access: gateway_core::server::upstreams::PoolAccess::all(),
             db: indexer.db().clone(),
             s3: None,
             assistant_turn_id: None,

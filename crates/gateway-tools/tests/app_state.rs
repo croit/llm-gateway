@@ -154,6 +154,9 @@ mod token_gate_tests {
             token_name: token_id.into(),
             roles: vec![], // empty → default role "all" applies
             tools_enabled,
+            // These tests are about tool grants, not model scope; `None` is
+            // the unrestricted default every token has.
+            allowed_models: None,
         }
     }
 

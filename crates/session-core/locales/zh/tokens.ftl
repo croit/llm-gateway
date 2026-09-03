@@ -92,3 +92,24 @@ tokens-push-unsupported = 此浏览器不支持通知。
 tokens-push-enabled = 已在此设备上启用通知。
 tokens-push-disabled = 已在此设备上停用通知。
 tokens-push-error = 无法更改通知设置。
+
+# 每个令牌的用量、模型白名单与配额（/tokens）。
+tokens-usage-line = 本月：{ $requests } 次请求 · { $tokens } tokens · { $cost }
+tokens-models-summary-all = 模型：全部
+tokens-models-summary-restricted = 模型：已选 { $count } 个
+tokens-models-help = 关闭时，此令牌跟随你自己的访问权限，包括以后新增的模型。开启时，它只能使用你勾选的模型——之后新增的模型在你于此处勾选之前都会被拒绝。
+tokens-models-restrict-label = 将此令牌限制为特定模型
+tokens-models-none-picked = 请至少勾选一个模型，或关闭该限制。
+tokens-models-save = 保存模型
+tokens-models-saved-toast = 令牌已限制为 { $count } 个模型。
+tokens-models-cleared-toast = 令牌可使用你的全部模型。
+tokens-limits-summary-none = 配额：无
+tokens-limits-summary-some = 配额：{ $count } 条规则
+tokens-limits-help = 仅针对此令牌的上限。你自己的预算仍然有效，因此这只会收紧该令牌的用量，绝不会放宽。
+tokens-limits-add = 添加配额
+tokens-limits-remove = 移除
+tokens-limits-saved-toast = 令牌配额已保存。
+tokens-limits-removed-toast = 令牌配额已移除。
+tokens-limits-not-yours = 该配额不由你移除。
+tokens-limits-admin-set = 该配额由管理员为此令牌设置，只能在管理员限额页面更改。
+tokens-limits-admin-badge = 由管理员设置

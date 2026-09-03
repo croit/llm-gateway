@@ -31,7 +31,9 @@ use crate::server::chat_attachments;
 use gateway_core::server::db::Pool;
 use gateway_core::server::db::usage::{UnitUsage, UsageKind, UsageRecord, UsageSource};
 use gateway_core::server::feature_defaults::{self, Feature};
-use gateway_core::server::upstreams::{PoolKind, UpstreamRegistry, registry::RouteError};
+use gateway_core::server::upstreams::{
+    PoolAccess, PoolKind, UpstreamRegistry, registry::RouteError,
+};
 use gateway_core::server::usage::UsageHandle;
 
 /// Cap on the decoded image we keep in memory / hand to S3. Matches the
@@ -166,23 +168,31 @@ impl ImageGenerator {
         model: Option<&str>,
         prompt: &str,
         size: Option<&str>,
+        access: &PoolAccess,
         meta: &UsageMeta,
     ) -> Result<GeneratedImage, ImageGenError> {
         let requested = match model {
             Some(m) => m.to_string(),
             None => self
-                .default_model()
+                .default_model(access)
                 .await
                 .ok_or_else(|| ImageGenError::NoBackend(String::new()))?,
         };
 
         // Route + hold an inflight slot for the duration of the call, exactly
         // like the proxy paths.
+        // `route_access`, not `route`: a tool call names its own model, so
+        // this is a caller-chosen route and has to clear the same gates the
+        // `/v1` handlers do — pool groups, and the calling token's model
+        // allowlist. Routing bare here would let a model reach an expensive
+        // image pool mid-completion whatever the token was scoped to.
         let acquired = self
             .upstreams
-            .route(&requested, PoolKind::Image)
+            .route_access(&requested, PoolKind::Image, access)
             .map_err(|e| match e {
-                RouteError::UnknownModel(m) => ImageGenError::NoBackend(m),
+                RouteError::UnknownModel(m) | RouteError::ModelNotAllowed(m) => {
+                    ImageGenError::NoBackend(m)
+                }
                 other => ImageGenError::Upstream(other.to_string()),
             })?;
         let real_model = acquired.resolved_model().to_string();
@@ -222,6 +232,7 @@ impl ImageGenerator {
     /// — because it uploads *existing user content* to the provider — refuses
     /// to run against a backend whose pool is flagged non-GDPR-compliant.
     /// Posts an OpenAI `/images/edits`-shaped multipart body.
+    #[allow(clippy::too_many_arguments)]
     pub async fn edit(
         &self,
         model: Option<&str>,
@@ -229,21 +240,29 @@ impl ImageGenerator {
         image_mime: &str,
         prompt: &str,
         size: Option<&str>,
+        access: &PoolAccess,
         meta: &UsageMeta,
     ) -> Result<GeneratedImage, ImageGenError> {
         let requested = match model {
             Some(m) => m.to_string(),
             None => self
-                .default_model()
+                .default_model(access)
                 .await
                 .ok_or_else(|| ImageGenError::NoBackend(String::new()))?,
         };
 
+        // `route_access`, not `route`: a tool call names its own model, so
+        // this is a caller-chosen route and has to clear the same gates the
+        // `/v1` handlers do — pool groups, and the calling token's model
+        // allowlist. Routing bare here would let a model reach an expensive
+        // image pool mid-completion whatever the token was scoped to.
         let acquired = self
             .upstreams
-            .route(&requested, PoolKind::Image)
+            .route_access(&requested, PoolKind::Image, access)
             .map_err(|e| match e {
-                RouteError::UnknownModel(m) => ImageGenError::NoBackend(m),
+                RouteError::UnknownModel(m) | RouteError::ModelNotAllowed(m) => {
+                    ImageGenError::NoBackend(m)
+                }
                 other => ImageGenError::Upstream(other.to_string()),
             })?;
         let real_model = acquired.resolved_model().to_string();
@@ -393,8 +412,10 @@ impl ImageGenerator {
     /// The model id the image pool advertises, if exactly one is discoverable.
     /// Lets `generate_image` be called without an explicit `model` on the
     /// common single-model deployment.
-    async fn default_model(&self) -> Option<String> {
-        let mut models: Vec<String> = self.upstreams.models_for_kind(PoolKind::Image);
+    async fn default_model(&self, access: &PoolAccess) -> Option<String> {
+        // Scoped too: picking a default the caller may not use would turn an
+        // omitted `model` into a way around the allowlist.
+        let mut models: Vec<String> = self.upstreams.models_for_kind_for(PoolKind::Image, access);
         models.sort();
         // Honour the operator-configured default when it's still being served;
         // otherwise fall back to the alphabetically-first model (the historical
@@ -631,11 +652,83 @@ mod tests {
 
         let imggen = generator(Some(image_pool(&server.uri()))).await;
         let img = imggen
-            .generate(Some("test-image"), "a cat", None, &meta())
+            .generate(
+                Some("test-image"),
+                "a cat",
+                None,
+                &PoolAccess::all(),
+                &meta(),
+            )
             .await
             .expect("b64 image");
         assert_eq!(img.mime, "image/png");
         assert_eq!(img.bytes, PNG);
+    }
+
+    /// The hole this closes: `generate_image` runs *inside* a completion, and
+    /// resolved its model through the bare `route`. So a token scoped to a
+    /// cheap chat model could still drive an expensive image pool by asking
+    /// the model to generate a picture — the allowlist gated `/v1` and not the
+    /// tool loop behind it.
+    #[tokio::test]
+    async fn a_token_allowlist_gates_image_generation_too() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(j!({
+                "data": [{ "url": format!("{}/img.png", server.uri()) }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(PNG),
+            )
+            .mount(&server)
+            .await;
+        let imggen = generator(Some(image_pool(&server.uri()))).await;
+
+        let restricted = PoolAccess {
+            allowed_models: Some(std::sync::Arc::new(
+                ["some-cheap-chat-model".to_string()].into_iter().collect(),
+            )),
+            ..PoolAccess::all()
+        };
+        let err = imggen
+            .generate(Some("test-image"), "a cat", None, &restricted, &meta())
+            .await
+            .expect_err("a model off the token's allowlist must not route");
+        assert!(
+            matches!(err, ImageGenError::NoBackend(_)),
+            "unexpected error: {err:?}"
+        );
+
+        // Omitting the model must not be a way round it either — the default
+        // is picked from what this caller may actually use.
+        let err = imggen
+            .generate(None, "a cat", None, &restricted, &meta())
+            .await
+            .expect_err("no default may be picked from models the token lacks");
+        assert!(
+            matches!(err, ImageGenError::NoBackend(_)),
+            "unexpected error: {err:?}"
+        );
+
+        // An unrestricted caller still works, so the gate is the allowlist
+        // and not a broken route.
+        imggen
+            .generate(
+                Some("test-image"),
+                "a cat",
+                None,
+                &PoolAccess::all(),
+                &meta(),
+            )
+            .await
+            .expect("unrestricted callers are unaffected");
     }
 
     #[tokio::test]
@@ -660,7 +753,13 @@ mod tests {
 
         let imggen = generator(Some(image_pool(&server.uri()))).await;
         let img = imggen
-            .generate(Some("test-image"), "a dog", None, &meta())
+            .generate(
+                Some("test-image"),
+                "a dog",
+                None,
+                &PoolAccess::all(),
+                &meta(),
+            )
             .await
             .expect("url image");
         assert_eq!(img.mime, "image/png");
@@ -677,7 +776,7 @@ mod tests {
             .await;
         let imggen = generator(Some(image_pool(&server.uri()))).await;
         let err = imggen
-            .generate(Some("test-image"), "x", None, &meta())
+            .generate(Some("test-image"), "x", None, &PoolAccess::all(), &meta())
             .await
             .unwrap_err();
         assert!(matches!(err, ImageGenError::BadResponse(_)), "{err:?}");
@@ -704,7 +803,7 @@ mod tests {
             .await;
         let imggen = generator(Some(image_pool(&server.uri()))).await;
         let err = imggen
-            .generate(Some("test-image"), "x", None, &meta())
+            .generate(Some("test-image"), "x", None, &PoolAccess::all(), &meta())
             .await
             .unwrap_err();
         assert!(matches!(err, ImageGenError::BadResponse(_)), "{err:?}");
@@ -714,7 +813,7 @@ mod tests {
     async fn errors_when_no_image_pool_configured() {
         let imggen = generator(None).await;
         let err = imggen
-            .generate(Some("test-image"), "x", None, &meta())
+            .generate(Some("test-image"), "x", None, &PoolAccess::all(), &meta())
             .await
             .unwrap_err();
         assert!(matches!(err, ImageGenError::NoBackend(_)), "{err:?}");
@@ -730,7 +829,7 @@ mod tests {
             .await;
         let imggen = generator(Some(image_pool(&server.uri()))).await;
         let err = imggen
-            .generate(Some("test-image"), "x", None, &meta())
+            .generate(Some("test-image"), "x", None, &PoolAccess::all(), &meta())
             .await
             .unwrap_err();
         assert!(matches!(err, ImageGenError::Upstream(_)), "{err:?}");
@@ -755,6 +854,7 @@ mod tests {
                 "image/png",
                 "make the sky blue",
                 None,
+                &PoolAccess::all(),
                 &meta(),
             )
             .await
@@ -774,6 +874,7 @@ mod tests {
                 "image/png",
                 "x",
                 None,
+                &PoolAccess::all(),
                 &meta(),
             )
             .await
@@ -792,6 +893,7 @@ mod tests {
                 "image/png",
                 "x",
                 None,
+                &PoolAccess::all(),
                 &meta(),
             )
             .await

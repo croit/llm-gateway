@@ -61,3 +61,9 @@ usage-limits-heading = 你的限额
 usage-limit-used = 已使用 { $percent }%
 usage-limit-refreshes = { $time } 刷新
 usage-unpriced-warning = 支出不包含未定价的模型：{ $models }。请在 /admin/models 中设置价格以计入。
+
+usage-table-by-token = 按 API 令牌
+usage-key-token = API 令牌
+usage-token-none = 聊天与定时任务（无令牌）
+usage-token-all = 全部令牌
+usage-filter-token = 令牌

@@ -2423,6 +2423,7 @@ mod tests {
         ToolContext {
             user_id: "u1".into(),
             roles: vec![],
+            pool_access: gateway_core::server::upstreams::PoolAccess::all(),
             db: pool,
             s3: None,
             assistant_turn_id: Some("t1".into()),

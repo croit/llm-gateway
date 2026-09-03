@@ -906,7 +906,29 @@ impl AppState {
     pub fn pool_access_for(&self, roles: &[String]) -> gateway_core::server::upstreams::PoolAccess {
         let role_ids = self.rbac.role_ids_for(roles);
         let is_admin = self.rbac.is_admin(&role_ids);
-        gateway_core::server::upstreams::PoolAccess { role_ids, is_admin }
+        gateway_core::server::upstreams::PoolAccess {
+            role_ids,
+            is_admin,
+            allowed_models: None,
+        }
+    }
+
+    /// [`Self::pool_access_for`] plus the calling API token's model
+    /// allowlist — the `/v1` variant. Every bearer-authenticated handler
+    /// builds its access this way, so a token's model restriction applies to
+    /// listing and routing alike without each handler remembering to ask.
+    ///
+    /// No database read: the allowlist was resolved during auth (see
+    /// `require_bearer`), where a failure to read it fails the request rather
+    /// than downgrading the token to unrestricted.
+    pub fn pool_access_for_token(
+        &self,
+        ctx: &gateway_core::server::auth::UserCtx,
+    ) -> gateway_core::server::upstreams::PoolAccess {
+        gateway_core::server::upstreams::PoolAccess {
+            allowed_models: ctx.allowed_models.clone(),
+            ..self.pool_access_for(&ctx.roles)
+        }
     }
 
     /// Reload the RBAC resolver from the DB after an admin edit to groups,

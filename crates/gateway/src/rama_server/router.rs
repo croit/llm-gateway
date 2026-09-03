@@ -92,6 +92,12 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/tokens/{id}/tools/master", pages::tokens_tools_master)
         .with_post("/tokens/{id}/tools/toggle", pages::tokens_tools_toggle)
         .with_post("/tokens/{id}/mcp-policy", pages::tokens_mcp_policy)
+        .with_post("/tokens/{id}/models", pages::tokens_models)
+        // `/limits/delete` before `/limits` would be harmless here (they are
+        // distinct static paths, not a param overlap), but registration order
+        // is how this router disambiguates — keep the more specific first.
+        .with_post("/tokens/{id}/limits/delete", pages::tokens_limits_delete)
+        .with_post("/tokens/{id}/limits", pages::tokens_limits_add)
         .with_get("/tools", pages::tools_index)
         .with_post("/tools/toggle", pages::tools_toggle)
         .with_get("/memory", pages::memory_index)
@@ -215,6 +221,7 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/admin/pools/save", pages::admin_pools_save)
         .with_post("/admin/pools/delete", pages::admin_pools_delete)
         .with_post("/admin/pools/fallback", pages::admin_pools_fallback_save)
+        .with_get("/admin/tokens", pages::admin_tokens_index)
         .with_get("/admin/users", pages::admin_users_index)
         // Target id rides in the POST body (not the path) — rama lowercases
         // path segments, which would mangle case-sensitive OIDC subjects.

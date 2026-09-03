@@ -548,6 +548,13 @@ pub async fn seed_session(state: &RamaState, user_id: &str, email: &str) -> Stri
 /// Seed a user + an active session + a bearer token. Returns the
 /// plaintext bearer suitable for an `Authorization: Bearer …` header.
 pub async fn seed_user_with_token(state: &RamaState, user_id: &str) -> String {
+    seed_user_with_token_id(state, user_id).await.0
+}
+
+/// [`seed_user_with_token`], also handing back the token's id — needed by
+/// anything that configures the token itself (model allowlist, per-token
+/// quota) rather than just authenticating with it.
+pub async fn seed_user_with_token_id(state: &RamaState, user_id: &str) -> (String, String) {
     use gateway_core::server::auth::token;
     use gateway_core::server::db::{tokens, users};
     use jiff::{SignedDuration, Timestamp};
@@ -569,10 +576,11 @@ pub async fn seed_user_with_token(state: &RamaState, user_id: &str) -> String {
     .await
     .unwrap();
     let (plaintext, hash) = token::mint();
+    let token_id = Uuid::new_v4().to_string();
     tokens::insert(
         &state.db,
         &tokens::Token {
-            id: Uuid::new_v4().to_string(),
+            id: token_id.clone(),
             user_id: user_id.into(),
             name: "test".into(),
             hash,
@@ -587,5 +595,5 @@ pub async fn seed_user_with_token(state: &RamaState, user_id: &str) -> String {
     )
     .await
     .unwrap();
-    plaintext
+    (plaintext, token_id)
 }

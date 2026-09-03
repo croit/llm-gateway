@@ -24,6 +24,7 @@ use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use gateway_core::rama_server::session::Session;
+use gateway_core::server::db::limits::{Dimension, LimitRule, Window};
 use gateway_core::server::db::users;
 use gateway_runtime::rama_server::state::RamaState;
 
@@ -103,6 +104,10 @@ enum NavItem {
     /// Admin-only registered-users roster + impersonation (`/admin/users`).
     /// Same `admin`-role gate as the other admin entries.
     Users,
+    /// Admin-only deployment-wide API-token register (`/admin/tokens`). Its
+    /// own variant, not [`NavItem::Tokens`], so the sidebar highlight lands
+    /// on the admin page rather than the account one.
+    AdminTokens,
     /// Admin-only installed-skills overview (`/admin/skills`). Same
     /// `admin`-role gate as the other operator pages.
     Skills,
@@ -153,6 +158,118 @@ fn sidebar_nav_directive(href: &str) -> String {
 /// renders the literal `="false"` form, so it can't express "unselected" — the
 /// attribute must be omitted entirely. These helpers do that, keeping the two
 /// admin CRUD pages (backends/pools) and the capability selects correct.
+/// Group an integer's digits with a narrow no-break space every three places
+/// — locale-agnostic, dodging the comma/period ambiguity across DE/EN.
+/// `1000000` → `1 000 000`.
+pub(super) fn fmt_int(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let len = digits.len();
+    let mut out = String::with_capacity(len + len / 3 + 1);
+    if n < 0 {
+        out.push('-');
+    }
+    for (i, c) in digits.chars().enumerate() {
+        if i != 0 && (len - i).is_multiple_of(3) {
+            out.push('\u{202f}');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Money display: integer part grouped like [`fmt_int`], two decimals, and
+/// the deployment currency after a narrow no-break space.
+pub(super) fn fmt_cost(cost: f64, currency: &str) -> String {
+    let cents = (cost * 100.0).round() as i64;
+    let int_part = cents / 100;
+    let frac = (cents % 100).abs();
+    format!("{}.{:02}\u{202f}{}", fmt_int(int_part), frac, currency)
+}
+
+/// A limit dimension's label. `currency` renders the cost dimension as
+/// "Cost (USD)"; `None` picks the short form for a column that already says
+/// which currency it is in.
+pub(super) fn dim_label(lang: Lang, d: Dimension, currency: Option<&str>) -> String {
+    match (d, currency) {
+        (Dimension::Requests, _) => t(lang, "limits-dim-requests"),
+        (Dimension::Tokens, _) => t(lang, "limits-dim-tokens"),
+        (Dimension::Cost, None) => t(lang, "limits-dim-cost-short"),
+        (Dimension::Cost, Some(cur)) => t_args(
+            lang,
+            "limits-dim-cost",
+            &i18n::args([("cur", cur.to_string().into())]),
+        ),
+    }
+}
+
+/// A limit window's label.
+pub(super) fn win_label(lang: Lang, w: Window) -> String {
+    match w {
+        Window::Hour => t(lang, "limits-win-hour"),
+        Window::Day => t(lang, "limits-win-day"),
+        Window::Week => t(lang, "limits-win-week"),
+        Window::Month => t(lang, "limits-win-month"),
+    }
+}
+
+/// A rule's value: cost with two decimals + currency, requests/tokens as
+/// grouped whole numbers (`5 000 000`, not `5000000`).
+pub(super) fn fmt_rule_value(r: &LimitRule, currency: &str) -> String {
+    match r.dimension {
+        Dimension::Cost => fmt_cost(r.value, currency),
+        _ => fmt_int(r.value as i64),
+    }
+}
+
+/// One limit rule as a sentence — "500 Tokens / Day", plus the model scope
+/// when the rule is narrowed to one. The single spelling for every page that
+/// lists rules; four copies of these three matches is how a new `Dimension`
+/// variant ends up labelled three different ways.
+pub(super) fn describe_rule(lang: Lang, r: &LimitRule, currency: &str) -> String {
+    let value = fmt_rule_value(r, currency);
+    let dim = dim_label(lang, r.dimension, None);
+    let win = win_label(lang, r.window);
+    match r.model.as_deref() {
+        Some(m) => format!("{value} {dim} / {win} · {m}"),
+        None => format!("{value} {dim} / {win}"),
+    }
+}
+
+/// The viewer's timezone: their session's, else their profile's, else UTC.
+/// One home for the precedence, so a page and the SSE patch that redraws part
+/// of it cannot compute a different day boundary.
+pub(super) fn viewer_tz(session: &Session, user: &users::User) -> String {
+    session
+        .timezone
+        .clone()
+        .or_else(|| user.timezone.clone())
+        .unwrap_or_else(|| "UTC".to_string())
+}
+
+/// One token's slice of the usage table. `Option<TokenUsage>` is how both
+/// token pages spell "or usage recording is off" — which is not the same as
+/// zero, and would otherwise need a second `usage_enabled` flag threaded
+/// through every render function that shows a number.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct TokenUsage {
+    pub requests: i64,
+    pub tokens: i64,
+    pub cost: f64,
+}
+
+impl From<&gateway_core::server::db::usage::GroupCount> for TokenUsage {
+    fn from(g: &gateway_core::server::db::usage::GroupCount) -> Self {
+        Self {
+            requests: g.requests,
+            tokens: g.total_tokens,
+            cost: g.cost,
+        }
+    }
+}
+
+/// Placeholder for a value that does not exist (never used, no data).
+pub(super) const DASH: &str = "—";
+
 pub(super) fn select_option(value: &str, label: &str, selected: bool) -> plait::Html {
     use plait::{ToHtml, html};
     if selected {
@@ -430,6 +547,7 @@ fn render_app_sidebar(
                 if is_admin {
                     (nav_group(lang, "admin", &t(lang, "nav-group-admin"), html! {
                         (sidebar_nav_link("/admin/users", NavItem::Users, active, icons::users(16), &t(lang, "nav-users")))
+                        (sidebar_nav_link("/admin/tokens", NavItem::AdminTokens, active, icons::key(16), &t(lang, "nav-admin-tokens")))
                         (sidebar_nav_link("/admin/groups", NavItem::Groups, active, icons::users(16), &t(lang, "nav-groups")))
                         (sidebar_nav_link("/admin/upstreams", NavItem::Upstreams, active, icons::cube(16), &t(lang, "nav-upstreams")))
                         (sidebar_nav_link("/admin/models", NavItem::Admin, active, icons::cpu(16), &t(lang, "nav-models")))
@@ -1289,8 +1407,9 @@ pub use tool_toggles::{entries_for_roles, valid_keys};
 
 mod tokens;
 pub use tokens::{
-    tokens_create, tokens_delete, tokens_index, tokens_mcp_policy, tokens_revoke, tokens_rotate,
-    tokens_tools_master, tokens_tools_toggle,
+    tokens_create, tokens_delete, tokens_index, tokens_limits_add, tokens_limits_delete,
+    tokens_mcp_policy, tokens_models, tokens_revoke, tokens_rotate, tokens_tools_master,
+    tokens_tools_toggle,
 };
 
 // ---------------------------------------------------------------------------
@@ -1463,6 +1582,13 @@ pub use groups::{
 mod admin_users;
 pub use admin_users::{impersonate_stop, users_impersonate, users_index as admin_users_index};
 
+// Deployment-wide API-token register (`/admin/tokens`) — every token with its
+// owner, month-to-date spend, model allowlist and quota. Read-only: the
+// plaintext is unrecoverable by construction, and the write paths stay on the
+// owner's own `/tokens` page.
+mod admin_tokens;
+pub use admin_tokens::admin_tokens_index;
+
 // Usage statistics: `/usage` for every signed-in user (scoped to their own
 // requests), with an admin-only in-page "All users" toggle (`?scope=all`).
 mod usage;
@@ -1553,6 +1679,24 @@ pub(super) fn forbidden_html(user_email: &str, message: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use super::{fmt_cost, fmt_int};
+
+    #[test]
+    fn fmt_cost_two_decimals_grouped_with_currency() {
+        assert_eq!(fmt_cost(0.0, "USD"), "0.00\u{202f}USD");
+        assert_eq!(fmt_cost(1234.5, "USD"), "1\u{202f}234.50\u{202f}USD");
+        assert_eq!(fmt_cost(0.019, "EUR"), "0.02\u{202f}EUR");
+    }
+
+    #[test]
+    fn fmt_int_groups_thousands() {
+        assert_eq!(fmt_int(0), "0");
+        assert_eq!(fmt_int(42), "42");
+        assert_eq!(fmt_int(1234), "1\u{202f}234");
+        assert_eq!(fmt_int(1234567), "1\u{202f}234\u{202f}567");
+        assert_eq!(fmt_int(-1000), "-1\u{202f}000");
+    }
+
     use std::fs;
     use std::path::Path;
 

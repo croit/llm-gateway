@@ -58,3 +58,9 @@ usage-col-cost = Cost
 usage-col-errors = Errors
 
 usage-no-activity = No activity in this range.
+
+usage-table-by-token = By API token
+usage-key-token = API token
+usage-token-none = Chat & scheduled (no token)
+usage-token-all = All tokens
+usage-filter-token = Token

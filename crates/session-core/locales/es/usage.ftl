@@ -61,3 +61,9 @@ usage-limits-heading = Tus límites
 usage-limit-used = { $percent } % usado
 usage-limit-refreshes = se renueva { $time }
 usage-unpriced-warning = El gasto excluye modelos sin precio: { $models }. Configura precios en /admin/models para contarlos.
+
+usage-table-by-token = Por token de API
+usage-key-token = Token de API
+usage-token-none = Chat y tareas programadas (sin token)
+usage-token-all = Todos los tokens
+usage-filter-token = Token

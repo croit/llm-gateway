@@ -61,3 +61,9 @@ usage-limits-heading = Deine Limits
 usage-limit-used = { $percent } % genutzt
 usage-limit-refreshes = wird { $time } zurückgesetzt
 usage-unpriced-warning = Ausgaben schließen nicht bepreiste Modelle aus: { $models }. Preise in /admin/models setzen, um sie zu erfassen.
+
+usage-table-by-token = Nach API-Token
+usage-key-token = API-Token
+usage-token-none = Chat & geplante Läufe (ohne Token)
+usage-token-all = Alle Tokens
+usage-filter-token = Token

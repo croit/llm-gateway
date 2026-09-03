@@ -39,6 +39,19 @@ pub use registry::{ToolRegistry, ToolSource};
 pub struct ToolContext {
     pub user_id: String,
     pub roles: Vec<String>,
+    /// The caller's resolved upstream access — pool `allowed_groups` plus, on
+    /// a bearer request, the calling API token's model allowlist.
+    ///
+    /// Tools that route to an upstream must go through this. `roles` above is
+    /// not enough: it cannot express a token's allowlist at all, and every
+    /// tool would have to re-resolve the groups itself. A tool that resolves a
+    /// *caller-named* model without it is a hole straight through both
+    /// controls — the model asks for an expensive image pool mid-completion
+    /// and gets it, whatever the token was scoped to.
+    ///
+    /// Defaults to [`PoolAccess::all`] for internal callers with no user
+    /// behind them (background workers, tests); request paths overwrite it.
+    pub pool_access: gateway_core::server::upstreams::PoolAccess,
     /// Handle to the gateway's SQLite pool. Tools that need anything
     /// from `users` / `sessions` / etc. query it here keyed by
     /// `user_id` (e.g. the time tool reads `users.timezone`).
@@ -157,6 +170,8 @@ impl ToolContext {
         Self {
             user_id: "u".into(),
             roles: vec![],
+            // Unrestricted: a test that cares about scoping sets it.
+            pool_access: gateway_core::server::upstreams::PoolAccess::all(),
             db,
             s3: None,
             assistant_turn_id: None,

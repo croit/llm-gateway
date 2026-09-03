@@ -36,13 +36,33 @@ pub async fn require_bearer(state: &RamaState, headers: &HeaderMap) -> Result<Us
         })?
         .ok_or_else(unauthorized)?;
 
-    let user = db::users::find_by_id(&state.db, &token_row.user_id)
-        .await
-        .map_err(|err| {
-            tracing::warn!(error = %err, "user lookup failed");
-            internal_error("user lookup failed")
-        })?
-        .ok_or_else(|| internal_error("token references missing user"))?;
+    // Both reads depend only on `token_row` and nothing orders them, so they
+    // go out together: this is every `/v1` request's critical path, and
+    // awaiting them in sequence would spend two round-trips where one does.
+    //
+    // The allowlist gets the same failure posture as the lookups around it —
+    // a database error is a 500, never a silent promotion to unrestricted.
+    // `None` means the token genuinely has no allowlist.
+    let (user, allowed_models) = tokio::try_join!(
+        async {
+            db::users::find_by_id(&state.db, &token_row.user_id)
+                .await
+                .map_err(|err| {
+                    tracing::warn!(error = %err, "user lookup failed");
+                    internal_error("user lookup failed")
+                })
+        },
+        async {
+            db::token_models::for_token(&state.db, &token_row.id)
+                .await
+                .map_err(|err| {
+                    tracing::warn!(error = %err, "token model allowlist lookup failed");
+                    internal_error("token model allowlist lookup failed")
+                })
+        }
+    )?;
+    let user = user.ok_or_else(|| internal_error("token references missing user"))?;
+    let allowed_models = allowed_models.map(std::sync::Arc::new);
 
     // Fire-and-forget last_used_at bump. Same pattern as the axum
     // middleware so behaviour on the wire is identical.
@@ -61,6 +81,7 @@ pub async fn require_bearer(state: &RamaState, headers: &HeaderMap) -> Result<Us
         token_name: token_row.name,
         roles: user.roles,
         tools_enabled: token_row.tools_enabled,
+        allowed_models,
     })
 }
 

@@ -2,11 +2,11 @@
 
 # Admin-Editor für Ratenlimits / Kontingente (/admin/limits).
 limits-heading = Ratenlimits & Kontingente
-limits-intro = Begrenzen Sie, wie viele Anfragen, wie viele Token oder wie viel Ausgaben ein Aufrufer über ein gleitendes Zeitfenster nutzen darf. Regeln werden von der spezifischsten zur allgemeinsten aufgelöst: Die eigene Regel eines Benutzers gewinnt, sonst die großzügigste seiner Rollen, sonst die globale Vorgabe. Ohne Regeln ist jeder unbegrenzt. Nur abgerechnete Pools zählen (selbst gehostete Pools mit enforce_limits = false sind ausgenommen), und das gesamte Budget eines Benutzers wird über seine API-Tokens, den Chat und geplante Ausführungen hinweg geteilt.
+limits-intro = Begrenzen Sie, wie viele Anfragen, wie viele Token oder wie viel Ausgaben ein Aufrufer über ein gleitendes Zeitfenster nutzen darf. Regeln werden von der spezifischsten zur allgemeinsten aufgelöst: Die eigene Regel eines Benutzers gewinnt, sonst die großzügigste seiner Rollen, sonst die globale Vorgabe. Ohne Regeln ist jeder unbegrenzt. Eine Regel für ein API-Token ist eine zusätzliche Obergrenze, die neben dem Budget des Besitzers geprüft wird — sie kann den Verbrauch dieses Tokens also nur enger fassen. Nur abgerechnete Pools zählen (selbst gehostete Pools mit enforce_limits = false sind ausgenommen), und das gesamte Budget eines Benutzers wird über seine API-Tokens, den Chat und geplante Ausführungen hinweg geteilt.
 limits-add-heading = Limit hinzufügen oder aktualisieren
 limits-field-subject = Gilt für
-limits-field-subject-id = Rolle / Benutzer
-limits-field-subject-id-ph = Rollen-ID oder Benutzer-E-Mail
+limits-field-subject-id = Rolle / Benutzer / Token
+limits-field-subject-id-ph = Rollen-ID, Benutzer-E-Mail oder Token-ID
 limits-field-model = Modell
 limits-field-model-ph = alle Modelle
 limits-field-dimension = Limit
@@ -38,4 +38,6 @@ limits-deleted = Limit entfernt
 limits-invalid-value = Wert `{ $value }` muss eine nicht-negative Zahl sein
 limits-unknown-role = unbekannte Rolle `{ $role }`
 limits-unknown-user = kein Benutzer passt zu `{ $user }`
-limits-missing-subject-id = Rollen-ID oder Benutzer-E-Mail eingeben
+limits-missing-subject-id = Rollen-ID, Benutzer-E-Mail oder Token-ID eingeben
+limits-subject-token = API-Token
+limits-unknown-token = kein Token passt zu `{ $token }`

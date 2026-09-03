@@ -92,3 +92,24 @@ tokens-push-unsupported = Este navegador no admite notificaciones.
 tokens-push-enabled = Notificaciones activadas en este dispositivo.
 tokens-push-disabled = Notificaciones desactivadas en este dispositivo.
 tokens-push-error = No se pudo cambiar la configuración de notificaciones.
+
+# Uso, lista de modelos permitidos y cuota por token (/tokens).
+tokens-usage-line = este mes: { $requests } solicitudes · { $tokens } tokens · { $cost }
+tokens-models-summary-all = Modelos: todos
+tokens-models-summary-restricted = Modelos: { $count } seleccionados
+tokens-models-help = Desactivado, este token sigue tu propio acceso, incluidos los modelos añadidos más adelante. Activado, solo puede usar los modelos que marques: un modelo añadido después queda bloqueado hasta que también lo marques aquí.
+tokens-models-restrict-label = Limitar este token a modelos concretos
+tokens-models-none-picked = Marca al menos un modelo o desactiva el límite.
+tokens-models-save = Guardar modelos
+tokens-models-saved-toast = Token limitado a { $count } modelos.
+tokens-models-cleared-toast = El token puede usar todos tus modelos.
+tokens-limits-summary-none = Cuota: ninguna
+tokens-limits-summary-some = Cuota: { $count } regla(s)
+tokens-limits-help = Un tope solo para este token. Tu propio presupuesto sigue aplicándose, así que esto solo puede reducir lo que el token gasta, nunca ampliarlo.
+tokens-limits-add = Añadir cuota
+tokens-limits-remove = Quitar
+tokens-limits-saved-toast = Cuota del token guardada.
+tokens-limits-removed-toast = Cuota del token eliminada.
+tokens-limits-not-yours = Esa cuota no es tuya para eliminarla.
+tokens-limits-admin-set = Un administrador fijó esa cuota en este token; solo puede cambiarse en la página de límites de administración.
+tokens-limits-admin-badge = fijada por el administrador

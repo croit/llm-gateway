@@ -1,0 +1,11 @@
+admin-tokens-page-title = API tokens
+admin-tokens-heading = API tokens
+admin-tokens-blurb = Every API token in this deployment and who owns it. The token itself is never shown — only a SHA-256 of it is stored, so it cannot be recovered here. Quotas are set per token on the limits page; a token's model allowlist is set by its owner.
+admin-tokens-none = No API tokens have been created yet.
+admin-tokens-count = { $count } token(s)
+admin-tokens-col-name = Token
+admin-tokens-col-owner = Owner
+admin-tokens-col-state = State
+admin-tokens-col-dates = Created / used / expires
+admin-tokens-col-scope = Models & quota
+admin-tokens-badge-expired = Expired

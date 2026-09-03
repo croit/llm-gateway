@@ -48,6 +48,7 @@ mod setup_wizard;
 mod sidebar_nav;
 mod skills_user_page;
 mod speech_voice;
+mod token_scope;
 mod tool_loop;
 mod tool_prefs;
 mod tools_inventory;

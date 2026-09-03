@@ -9,6 +9,7 @@ nav-tools = 工具
 nav-tokens = 令牌
 nav-usage = 用量
 nav-users = 用户
+nav-admin-tokens = API 令牌
 nav-models = 模型
 nav-upstreams = 上游
 nav-rag = RAG

@@ -89,6 +89,11 @@ pub struct LimitExceeded {
     pub used: f64,
     /// Seconds until the window next advances — served as `Retry-After`.
     pub retry_after_secs: i64,
+    /// Which ceiling refused the call: `Token` for the calling token's own
+    /// rule, anything else for the owner's global/role/user budget. The 429
+    /// says which, because "you are over quota" and "this token is over its
+    /// quota" call for different fixes.
+    pub subject: SubjectType,
 }
 
 impl Enforcer {
@@ -115,6 +120,40 @@ impl Enforcer {
             return Vec::new();
         }
         let effective = limits::effective_limits(&rules);
+        self.statuses_for(usage::Subject::User(user_id), effective)
+            .await
+    }
+
+    /// The rules attached to one API token, paired with that token's own
+    /// usage. Independent of [`Self::statuses`]: this is the second ceiling,
+    /// not another tier of the owner's hierarchy.
+    pub async fn token_statuses(&self, token_id: &str) -> Vec<LimitStatus> {
+        if !self.enabled || token_id.is_empty() {
+            return Vec::new();
+        }
+        let rules = match limits::applicable_for_token(&self.db, token_id).await {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(error = %err, "limits: applicable_for_token() failed; allowing");
+                return Vec::new();
+            }
+        };
+        if rules.is_empty() {
+            return Vec::new();
+        }
+        let effective = limits::effective_limits(&rules);
+        self.statuses_for(usage::Subject::Token(token_id), effective)
+            .await
+    }
+
+    /// Pair each in-force rule with the matching slice of `subject`'s usage.
+    /// Shared by the user and token views so the two can never drift in how
+    /// they read a window.
+    async fn statuses_for(
+        &self,
+        subject: usage::Subject<'_>,
+        effective: Vec<limits::EffectiveLimit>,
+    ) -> Vec<LimitStatus> {
         let now = Timestamp::now();
         // One usage read per distinct (model-scope, window); the three
         // dimensions share it.
@@ -126,7 +165,7 @@ impl Enforcer {
                 Some(u) => *u,
                 None => {
                     let since = lim.window.since(now);
-                    let u = usage::usage_in_window(&self.db, user_id, since, lim.model.as_deref())
+                    let u = usage::usage_in_window(&self.db, subject, since, lim.model.as_deref())
                         .await
                         .unwrap_or_default();
                     cache.insert(key, u);
@@ -155,22 +194,37 @@ impl Enforcer {
     /// (post-hoc debt: a limit already at/over its ceiling blocks the *next*
     /// call). Unlimited callers and disabled enforcement pass instantly.
     pub async fn check(&self, user_id: &str, role_ids: &[String]) -> Result<(), LimitExceeded> {
-        let now = Timestamp::now();
-        for s in self.statuses(user_id, role_ids).await {
-            if s.exceeded() {
-                let retry = (s.refreshes_at.as_second() - now.as_second()).max(1);
-                return Err(LimitExceeded {
-                    model: s.model,
-                    dimension: s.dimension,
-                    window: s.window,
-                    limit: s.limit,
-                    used: s.used,
-                    retry_after_secs: retry,
-                });
-            }
-        }
-        Ok(())
+        first_breach(self.statuses(user_id, role_ids).await)
     }
+
+    /// Gate a call against the calling token's own rules — the *additional*
+    /// ceiling. A caller under their personal budget can still be refused
+    /// here, and a token rule can never grant more than the owner's budget
+    /// allows, because both gates must pass. No rules on the token (the
+    /// default for every token ever issued) passes instantly.
+    pub async fn check_token(&self, token_id: &str) -> Result<(), LimitExceeded> {
+        first_breach(self.token_statuses(token_id).await)
+    }
+}
+
+/// The first status already at/over its ceiling, as the refusal to send.
+fn first_breach(statuses: Vec<LimitStatus>) -> Result<(), LimitExceeded> {
+    let now = Timestamp::now();
+    for s in statuses {
+        if s.exceeded() {
+            let retry = (s.refreshes_at.as_second() - now.as_second()).max(1);
+            return Err(LimitExceeded {
+                model: s.model,
+                dimension: s.dimension,
+                window: s.window,
+                limit: s.limit,
+                used: s.used,
+                retry_after_secs: retry,
+                subject: s.source,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -236,6 +290,148 @@ mod tests {
         .unwrap();
         let enf = Enforcer::new(pool, false);
         assert!(enf.check("alice", &[]).await.is_ok());
+    }
+
+    /// An event attributed to one API token.
+    fn token_event(user: &str, token: &str, total: i64, at: Timestamp) -> UsageRecord {
+        UsageRecord {
+            token_id: Some(token.to_string()),
+            token_name: Some(token.to_string()),
+            ..event(user, "gpt", total, true, at)
+        }
+    }
+
+    /// The default: a token with no rules of its own is never blocked by the
+    /// token gate. Every token issued before per-token quotas existed is in
+    /// this state, so a mistake here would 429 the entire installed base.
+    #[tokio::test]
+    async fn a_token_without_rules_is_never_blocked() {
+        let pool = pool().await;
+        let enf = Enforcer::new(pool, true);
+        assert!(enf.check_token("tok-a").await.is_ok());
+        assert!(enf.check_token("").await.is_ok(), "no token id at all");
+        assert!(enf.token_statuses("tok-a").await.is_empty());
+    }
+
+    /// A token rule counts only that token's own traffic. If it read the
+    /// owner's usage instead, a busy second token would exhaust a quiet
+    /// token's quota.
+    #[tokio::test]
+    async fn a_token_quota_measures_only_that_tokens_usage() {
+        let pool = pool().await;
+        limits::upsert(
+            &pool,
+            SubjectType::Token,
+            "tok-a",
+            None,
+            Dimension::Requests,
+            Window::Hour,
+            2.0,
+        )
+        .await
+        .unwrap();
+        let enf = Enforcer::new(pool.clone(), true);
+        let now = Timestamp::now();
+
+        // Three requests on a *different* token must not touch tok-a's quota.
+        usage::insert_batch(
+            &pool,
+            &[
+                token_event("alice", "tok-b", 1, now),
+                token_event("alice", "tok-b", 1, now),
+                token_event("alice", "tok-b", 1, now),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(enf.check_token("tok-a").await.is_ok());
+
+        // Its own two requests do.
+        usage::insert_batch(
+            &pool,
+            &[
+                token_event("alice", "tok-a", 1, now),
+                token_event("alice", "tok-a", 1, now),
+            ],
+        )
+        .await
+        .unwrap();
+        let err = enf.check_token("tok-a").await.unwrap_err();
+        assert_eq!(err.limit, 2.0);
+        assert_eq!(
+            err.subject,
+            SubjectType::Token,
+            "the 429 has to say which ceiling tripped"
+        );
+        // …and tok-b, which has no rule, still passes.
+        assert!(enf.check_token("tok-b").await.is_ok());
+    }
+
+    /// A token rule is an *additional* ceiling, never a replacement. The
+    /// failure this rules out: treating `token` as another tier of the
+    /// hierarchy, where a generous token rule would override — and so widen —
+    /// its owner's budget. Minting a token must not be a way out of a quota.
+    #[tokio::test]
+    async fn a_generous_token_rule_cannot_widen_the_owners_budget() {
+        let pool = pool().await;
+        // The user may make 1 request/hour; the token says 100.
+        limits::upsert(
+            &pool,
+            SubjectType::User,
+            "alice",
+            None,
+            Dimension::Requests,
+            Window::Hour,
+            1.0,
+        )
+        .await
+        .unwrap();
+        limits::upsert(
+            &pool,
+            SubjectType::Token,
+            "tok-a",
+            None,
+            Dimension::Requests,
+            Window::Hour,
+            100.0,
+        )
+        .await
+        .unwrap();
+        let enf = Enforcer::new(pool.clone(), true);
+        let now = Timestamp::now();
+        usage::insert_batch(&pool, &[token_event("alice", "tok-a", 1, now)])
+            .await
+            .unwrap();
+
+        // The token's own gate is happy (1 of 100)…
+        assert!(enf.check_token("tok-a").await.is_ok());
+        // …but the owner's budget is spent, and that gate is checked too.
+        let err = enf.check("alice", &[]).await.unwrap_err();
+        assert_eq!(err.limit, 1.0);
+        assert_eq!(err.subject, SubjectType::User);
+    }
+
+    /// The user rule must not leak into the token's own resolution either:
+    /// `applicable_for_token` returns token rules only.
+    #[tokio::test]
+    async fn token_statuses_ignore_the_owners_rules() {
+        let pool = pool().await;
+        limits::upsert(
+            &pool,
+            SubjectType::Global,
+            "",
+            None,
+            Dimension::Requests,
+            Window::Hour,
+            5.0,
+        )
+        .await
+        .unwrap();
+        let enf = Enforcer::new(pool, true);
+        assert!(
+            enf.token_statuses("tok-a").await.is_empty(),
+            "a global rule is the owner's budget, not the token's"
+        );
     }
 
     #[tokio::test]

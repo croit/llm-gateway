@@ -24,6 +24,7 @@ use session_core::i18n::{self, Lang, t, t_args};
 use session_core::icons;
 
 use gateway_core::server::db::limits::{self, Dimension, LimitRule, SubjectType, Window};
+use gateway_core::server::db::tokens;
 use gateway_core::server::db::users;
 use gateway_runtime::rama_server::state::RamaState;
 
@@ -45,7 +46,8 @@ pub async fn limits_index(State(state): State<Arc<RamaState>>, req: Request) -> 
     let models = state.upstreams.all_models();
     let currency = &state.config().usage.currency;
 
-    let body = render_body(lang, currency, &rules, &role_ids, &roster, &models);
+    let toks = token_labels(&state).await;
+    let body = render_body(lang, currency, &rules, &role_ids, &roster, &toks, &models);
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "limits-heading");
     {
@@ -145,6 +147,29 @@ pub async fn limits_save(State(state): State<Arc<RamaState>>, req: Request) -> R
             }
             (id.to_string(), id.to_string())
         }
+        SubjectType::Token => {
+            // Token ids are opaque uuids, so unlike users there is no
+            // friendlier spelling to accept — but a bad id must not create a
+            // rule that can never fire, which is exactly what an unvalidated
+            // free-text subject would do.
+            let id = form.subject_id.trim();
+            if id.is_empty() {
+                return toast(FlashKind::Error, t(lang, "limits-missing-subject-id"));
+            }
+            match tokens::find_by_id(&state.db, id).await {
+                Ok(Some(tok)) => (tok.id.clone(), tok.name.clone()),
+                _ => {
+                    return toast(
+                        FlashKind::Error,
+                        t_args(
+                            lang,
+                            "limits-unknown-token",
+                            &i18n::args([("token", id.to_string().into())]),
+                        ),
+                    );
+                }
+            }
+        }
         SubjectType::User => {
             let needle = form.subject_id.trim();
             if needle.is_empty() {
@@ -183,6 +208,8 @@ pub async fn limits_save(State(state): State<Arc<RamaState>>, req: Request) -> R
         dimension,
         window,
         value,
+        // This page is the operator's. A rule written here outranks the
+        // token owner's own, and /tokens refuses to touch it.
     )
     .await
     {
@@ -253,7 +280,8 @@ async fn patch_table_response(
     let rules = limits::list_all(&state.db).await.unwrap_or_default();
     let roster = users::list_all(&state.db).await.unwrap_or_default();
     let currency = &state.config().usage.currency;
-    let table = render_table(lang, currency, &rules, &roster).to_string();
+    let toks = token_labels(state).await;
+    let table = render_table(lang, currency, &rules, &roster, &toks).to_string();
     sse_response(&[
         sse_toast(&Flash { kind, message }),
         sse_patch(Some("#limits-table"), Some("inner"), &table),
@@ -276,6 +304,7 @@ fn render_body(
     rules: &[LimitRule],
     role_ids: &[String],
     roster: &[users::User],
+    tokens: &[(String, String)],
     models: &[String],
 ) -> Html {
     html! {
@@ -284,9 +313,9 @@ fn render_body(
                 h1(class: "text-2xl font-bold") { (t(lang, "limits-heading")) }
                 p(class: "text-base-content/70 text-sm") { (t(lang, "limits-intro")) }
             }
-            (render_add_form(lang, currency, role_ids, roster, models))
+            (render_add_form(lang, currency, role_ids, roster, tokens, models))
             div(id: "limits-table") {
-                (render_table(lang, currency, rules, roster))
+                (render_table(lang, currency, rules, roster, tokens))
             }
         }
     }
@@ -302,6 +331,7 @@ fn render_add_form(
     currency: &str,
     role_ids: &[String],
     roster: &[users::User],
+    tokens: &[(String, String)],
     models: &[String],
 ) -> Html {
     let action = "/admin/limits";
@@ -316,6 +346,9 @@ fn render_add_form(
     // practice, and the handler validates whichever the admin picks).
     let mut suggestions: Vec<Html> = role_ids.iter().map(|r| opt_bare(r)).collect();
     suggestions.extend(roster.iter().map(|u| opt_bare(&u.email)));
+    // Token ids are uuids nobody types from memory, so they are offered with
+    // the owner spelled out in the option label while the value stays the id.
+    suggestions.extend(tokens.iter().map(|(id, label)| opt_labelled(id, label)));
 
     html! {
         article(class: "card border border-base-300 bg-base-100") {
@@ -333,6 +366,7 @@ fn render_add_form(
                             (opt("global", &t(lang, "limits-subject-global")))
                             (opt("role", &t(lang, "limits-subject-role")))
                             (opt("user", &t(lang, "limits-subject-user")))
+                            (opt("token", &t(lang, "limits-subject-token")))
                         }
                     }
                     label(class: "flex flex-col gap-1") {
@@ -393,16 +427,47 @@ fn render_add_form(
     .to_html()
 }
 
+/// `token id → "name (owner email)"` for every token in the deployment — the
+/// labels a token-subject rule and the subject datalist both need. Owned
+/// pairs so the borrowed map in `render_table` can point at them.
+async fn token_labels(state: &RamaState) -> Vec<(String, String)> {
+    tokens::list_all_with_owner(&state.db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| (t.id.clone(), format!("{} ({})", t.name, t.user_email)))
+        .collect()
+}
+
 fn opt_bare(value: &str) -> Html {
     html! { option(value: (value.to_string())) {} }.to_html()
 }
 
-fn render_table(lang: Lang, currency: &str, rules: &[LimitRule], roster: &[users::User]) -> Html {
-    // id → email, so a per-user rule shows the friendly address.
-    let emails: HashMap<&str, &str> = roster
+/// A datalist option whose value is the id but which reads as the label — how
+/// a browser offers "CI token (alice@example.com)" for an opaque uuid.
+fn opt_labelled(value: &str, label: &str) -> Html {
+    html! { option(value: (value.to_string()), label: (label.to_string())) {} }.to_html()
+}
+
+fn render_table(
+    lang: Lang,
+    currency: &str,
+    rules: &[LimitRule],
+    roster: &[users::User],
+    tokens: &[(String, String)],
+) -> Html {
+    // subject id → friendly name. Users and tokens share the map because
+    // their ids come from the same uuid space and never collide, and
+    // `subject_label` already knows which kind it is looking at.
+    let mut emails: HashMap<&str, &str> = roster
         .iter()
         .map(|u| (u.id.as_str(), u.email.as_str()))
         .collect();
+    emails.extend(
+        tokens
+            .iter()
+            .map(|(id, label)| (id.as_str(), label.as_str())),
+    );
     let rows: Vec<Html> = rules
         .iter()
         .map(|r| render_row(lang, currency, r, &emails))
@@ -437,23 +502,6 @@ fn render_table(lang: Lang, currency: &str, rules: &[LimitRule], roster: &[users
     .to_html()
 }
 
-fn dim_label(lang: Lang, d: Dimension) -> String {
-    match d {
-        Dimension::Requests => t(lang, "limits-dim-requests"),
-        Dimension::Tokens => t(lang, "limits-dim-tokens"),
-        Dimension::Cost => t(lang, "limits-dim-cost-short"),
-    }
-}
-
-fn win_label(lang: Lang, w: Window) -> String {
-    match w {
-        Window::Hour => t(lang, "limits-win-hour"),
-        Window::Day => t(lang, "limits-win-day"),
-        Window::Week => t(lang, "limits-win-week"),
-        Window::Month => t(lang, "limits-win-month"),
-    }
-}
-
 fn subject_label(lang: Lang, r: &LimitRule, emails: &HashMap<&str, &str>) -> String {
     match r.subject_type {
         SubjectType::Global => t(lang, "limits-subject-global"),
@@ -465,38 +513,17 @@ fn subject_label(lang: Lang, r: &LimitRule, emails: &HashMap<&str, &str>) -> Str
                 .unwrap_or(r.subject_id.as_str());
             format!("{}: {}", t(lang, "limits-subject-user"), who)
         }
-    }
-}
-
-/// Group an integer's digits with a thin no-break space every three places
-/// (locale-agnostic — dodges the comma/period ambiguity across DE/EN). Matches
-/// the `/usage` page's `fmt_int`. `1000000` → `1 000 000`.
-fn group_int(n: i64) -> String {
-    let digits = n.unsigned_abs().to_string();
-    let len = digits.len();
-    let mut out = String::with_capacity(len + len / 3 + 1);
-    if n < 0 {
-        out.push('-');
-    }
-    for (i, c) in digits.chars().enumerate() {
-        if i != 0 && (len - i).is_multiple_of(3) {
-            out.push('\u{202f}');
+        SubjectType::Token => {
+            // `emails` doubles as the token-id → "name (owner)" map for these
+            // rows; an id with no entry is a token deleted since the rule was
+            // written, which is worth showing as the raw id rather than
+            // hiding.
+            let what = emails
+                .get(r.subject_id.as_str())
+                .copied()
+                .unwrap_or(r.subject_id.as_str());
+            format!("{}: {}", t(lang, "limits-subject-token"), what)
         }
-        out.push(c);
-    }
-    out
-}
-
-/// Format a rule's value for the table: cost with two decimals + currency,
-/// requests/tokens as grouped whole numbers (`5 000 000`, not `5000000`).
-fn fmt_value(r: &LimitRule, currency: &str) -> String {
-    match r.dimension {
-        Dimension::Cost => {
-            let whole = r.value.trunc() as i64;
-            let cents = ((r.value - r.value.trunc()) * 100.0).round().abs() as i64;
-            format!("{}.{:02}\u{202f}{}", group_int(whole), cents, currency)
-        }
-        _ => group_int(r.value as i64),
     }
 }
 
@@ -511,9 +538,9 @@ fn render_row(lang: Lang, currency: &str, r: &LimitRule, emails: &HashMap<&str, 
         tr {
             td { (subject_label(lang, r, emails)) }
             td(class: "font-mono break-all") { (scope) }
-            td { (dim_label(lang, r.dimension)) }
-            td { (win_label(lang, r.window)) }
-            td(class: "text-right tabular-nums") { (fmt_value(r, currency)) }
+            td { (super::dim_label(lang, r.dimension, None)) }
+            td { (super::win_label(lang, r.window)) }
+            td(class: "text-right tabular-nums") { (super::fmt_rule_value(r, currency)) }
             td(class: "text-right") {
                 form(method: "post", action: (del), "data-on:submit__prevent": (del_submit), class: "m-0 inline") {
                     input(type: "hidden", name: "id", value: (r.id.clone()));

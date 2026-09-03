@@ -132,6 +132,9 @@ impl Tool for GenerateImage {
                     args.model.as_deref(),
                     &args.prompt,
                     args.size.as_deref(),
+                    // The caller's own upstream access, so a model named here
+                    // clears the same gates a /v1 request would.
+                    &ctx.pool_access,
                     &meta,
                 )
                 .await
@@ -204,6 +207,7 @@ mod tests {
         ToolContext {
             user_id: "u".into(),
             roles: vec![],
+            pool_access: gateway_core::server::upstreams::PoolAccess::all(),
             db: gateway_core::server::db::open(std::path::Path::new(":memory:"))
                 .await
                 .unwrap(),

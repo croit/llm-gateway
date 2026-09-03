@@ -26,6 +26,12 @@ pub enum SubjectType {
     Global,
     Role,
     User,
+    /// One API token (`subject_id` = `tokens.id`). Unlike the other three,
+    /// a token rule is not part of the global → role → user hierarchy: it is
+    /// an *additional* ceiling checked alongside the owner's budget, so a
+    /// token can only ever narrow what its owner may spend. See
+    /// `limits::Enforcer::check_token`.
+    Token,
 }
 
 impl SubjectType {
@@ -34,6 +40,7 @@ impl SubjectType {
             SubjectType::Global => "global",
             SubjectType::Role => "role",
             SubjectType::User => "user",
+            SubjectType::Token => "token",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -41,6 +48,7 @@ impl SubjectType {
             "global" => Some(SubjectType::Global),
             "role" => Some(SubjectType::Role),
             "user" => Some(SubjectType::User),
+            "token" => Some(SubjectType::Token),
             _ => None,
         }
     }
@@ -140,6 +148,37 @@ fn hour_floor(now: Timestamp) -> Timestamp {
     Timestamp::from_second(secs - secs.rem_euclid(3_600)).unwrap_or(now)
 }
 
+/// Who set a rule, and therefore who may change it.
+///
+/// Only token rules have two possible authors. An owner may edit their own
+/// token's self-service rules; an admin's cap on that same token is
+/// read-only to them, or capping a token would be advisory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedBy {
+    /// Set on `/admin/limits`. Every global / role / user rule is this.
+    Admin,
+    /// Set by the token's owner on `/tokens`.
+    Owner,
+}
+
+impl ManagedBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ManagedBy::Admin => "admin",
+            ManagedBy::Owner => "owner",
+        }
+    }
+    /// Unknown values read as `Admin`: the stricter of the two, so a row
+    /// written by some future version is never editable by an owner on the
+    /// strength of a string this build does not understand.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "owner" => ManagedBy::Owner,
+            _ => ManagedBy::Admin,
+        }
+    }
+}
+
 /// One stored rule.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LimitRule {
@@ -151,6 +190,8 @@ pub struct LimitRule {
     pub dimension: Dimension,
     pub window: Window,
     pub value: f64,
+    /// Who set this rule — the gate on who may edit or delete it.
+    pub managed_by: ManagedBy,
 }
 
 fn map_row(row: &SqliteRow) -> Result<LimitRule, DbError> {
@@ -169,11 +210,12 @@ fn map_row(row: &SqliteRow) -> Result<LimitRule, DbError> {
         dimension: Dimension::parse(&dimension_s).ok_or_else(|| decode("dimension"))?,
         window: Window::parse(&window_s).ok_or_else(|| decode("window_kind"))?,
         value: row.try_get("value")?,
+        managed_by: ManagedBy::parse(&row.try_get::<String, _>("managed_by")?),
     })
 }
 
-const SELECT_COLS: &str =
-    "id, subject_type, subject_id, model, dimension, window_kind, value FROM limits";
+const SELECT_COLS: &str = "id, subject_type, subject_id, model, dimension, window_kind, value, \
+     managed_by FROM limits";
 
 /// Normalise a model scope: an empty/whitespace string means "all models".
 fn norm_model(model: Option<&str>) -> Option<String> {
@@ -183,10 +225,33 @@ fn norm_model(model: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// What an [`upsert`] did — an authorization outcome the caller can act on.
+///
+/// The refusal is a *decision*, not a storage error. Letting it surface as a
+/// UNIQUE violation would make every other integrity failure look like an
+/// admin-owned rule, and force the caller to re-query to reconstruct a reason
+/// this transaction already knew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upserted {
+    Created,
+    Updated,
+    /// An admin owns the rule at these coordinates and the caller is the
+    /// token's owner. Nothing was written.
+    RefusedAdminOwned,
+}
+
 /// Insert a rule, or update the `value` of the existing rule at the same
 /// (subject, model-scope, dimension, window) coordinates. `value` is clamped
 /// to ≥ 0. Runs in a transaction so the check-then-write can't race the unique
 /// index.
+/// Admin-managed only, and deliberately so: it discards the outcome, which is
+/// safe when the writer is an admin (their save is never refused) and unsafe
+/// for anyone else. An owner's save *can* be refused, and routing it through
+/// here would swallow that refusal as `Ok(())` — the token owner would be told
+/// their quota was saved while the admin's cap stood. Self-service writes go
+/// through [`upsert_checked`] and must handle [`Upserted::RefusedAdminOwned`];
+/// leaving `managed_by` off this signature is what makes the mistake
+/// impossible to make.
 pub async fn upsert(
     pool: &Pool,
     subject_type: SubjectType,
@@ -196,17 +261,68 @@ pub async fn upsert(
     window: Window,
     value: f64,
 ) -> Result<(), DbError> {
+    upsert_checked(
+        pool,
+        subject_type,
+        subject_id,
+        model,
+        dimension,
+        window,
+        value,
+        ManagedBy::Admin,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`upsert`], reporting what it did. The self-service path needs to tell a
+/// refusal from a write; the admin path, which may overwrite anything, does
+/// not.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_checked(
+    pool: &Pool,
+    subject_type: SubjectType,
+    subject_id: &str,
+    model: Option<&str>,
+    dimension: Dimension,
+    window: Window,
+    value: f64,
+    managed_by: ManagedBy,
+) -> Result<Upserted, DbError> {
     let now = Timestamp::now().to_string();
     let value = value.max(0.0);
     let model = norm_model(model);
     let mut tx = pool.begin().await?;
+    // Who, if anyone, already holds these coordinates. Read inside the
+    // transaction so the answer cannot change before the write, and stated as
+    // a decision rather than left to the unique index to signal.
+    let held: Option<String> = sqlx::query_scalar(
+        "SELECT managed_by FROM limits \
+         WHERE subject_type = ? AND subject_id = ? AND IFNULL(model, '') = IFNULL(?, '') \
+           AND dimension = ? AND window_kind = ?",
+    )
+    .bind(subject_type.as_str())
+    .bind(subject_id)
+    .bind(model.as_deref())
+    .bind(dimension.as_str())
+    .bind(window.as_str())
+    .fetch_optional(&mut *tx)
+    .await?;
+    // An owner never overwrites an admin's rule; an admin may overwrite
+    // either, because an operator's cap outranks the token owner's own.
+    if managed_by == ManagedBy::Owner
+        && held.as_deref().map(ManagedBy::parse) == Some(ManagedBy::Admin)
+    {
+        return Ok(Upserted::RefusedAdminOwned);
+    }
     let updated = sqlx::query(
-        "UPDATE limits SET value = ?, updated_at = ? \
+        "UPDATE limits SET value = ?, updated_at = ?, managed_by = ? \
          WHERE subject_type = ? AND subject_id = ? AND IFNULL(model, '') = IFNULL(?, '') \
            AND dimension = ? AND window_kind = ?",
     )
     .bind(value)
     .bind(&now)
+    .bind(managed_by.as_str())
     .bind(subject_type.as_str())
     .bind(subject_id)
     .bind(model.as_deref())
@@ -214,11 +330,12 @@ pub async fn upsert(
     .bind(window.as_str())
     .execute(&mut *tx)
     .await?;
-    if updated.rows_affected() == 0 {
+    let outcome = if updated.rows_affected() == 0 {
         sqlx::query(
             "INSERT INTO limits \
-               (id, subject_type, subject_id, model, dimension, window_kind, value, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (id, subject_type, subject_id, model, dimension, window_kind, value, created_at, \
+                updated_at, managed_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(subject_type.as_str())
@@ -229,11 +346,15 @@ pub async fn upsert(
         .bind(value)
         .bind(&now)
         .bind(&now)
+        .bind(managed_by.as_str())
         .execute(&mut *tx)
         .await?;
-    }
+        Upserted::Created
+    } else {
+        Upserted::Updated
+    };
     tx.commit().await?;
-    Ok(())
+    Ok(outcome)
 }
 
 /// Delete a rule by id. No-op if it's gone.
@@ -241,6 +362,39 @@ pub async fn delete(pool: &Pool, id: &str) -> Result<(), DbError> {
     sqlx::query("DELETE FROM limits WHERE id = ?")
         .bind(id)
         .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Delete one of a token's *own* rules — the self-service path. Scoped to the
+/// token and to `managed_by = 'owner'` in the statement itself rather than
+/// checked beforehand, so neither another subject's rule nor an admin's cap
+/// on this token can be removed by id. `Ok(false)` when nothing matched.
+pub async fn delete_owner_rule(pool: &Pool, token_id: &str, id: &str) -> Result<bool, DbError> {
+    let res = sqlx::query(
+        "DELETE FROM limits \
+         WHERE id = ? AND subject_type = 'token' AND subject_id = ? AND managed_by = 'owner'",
+    )
+    .bind(id)
+    .bind(token_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Drop every rule attached to a token — called when the token itself is
+/// deleted. `limits` has no foreign key onto `tokens` (its subject is
+/// polymorphic), so without this a deleted token's rules linger forever on
+/// `/admin/limits` under an id nothing resolves any more.
+/// Takes an executor rather than the pool so a token delete can run it inside
+/// its own transaction: the token row and its rules go together or not at all.
+pub async fn delete_for_token<'e, E>(exec: E, token_id: &str) -> Result<(), DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query("DELETE FROM limits WHERE subject_type = 'token' AND subject_id = ?")
+        .bind(token_id)
+        .execute(exec)
         .await?;
     Ok(())
 }
@@ -284,6 +438,28 @@ pub async fn applicable(
     rows.iter().map(map_row).collect()
 }
 
+/// The rules attached to one API token. Deliberately separate from
+/// [`applicable`]: token rules are a second, independent ceiling rather than
+/// another tier of the global → role → user hierarchy, so they are never
+/// collapsed together with the owner's budget. Feed the result through
+/// [`effective_limits`] to get the same per-cell shape.
+pub async fn applicable_for_token(pool: &Pool, token_id: &str) -> Result<Vec<LimitRule>, DbError> {
+    let sql = format!("SELECT {SELECT_COLS} WHERE subject_type = 'token' AND subject_id = ?");
+    let rows = sqlx::query(&sql).bind(token_id).fetch_all(pool).await?;
+    rows.iter().map(map_row).collect()
+}
+
+/// Every rule attached to any token owned by `user_id`, paired with its token
+/// id — the admin's per-token limit column, in one query instead of N.
+pub async fn for_tokens_of_user(pool: &Pool, user_id: &str) -> Result<Vec<LimitRule>, DbError> {
+    let sql = format!(
+        "SELECT {SELECT_COLS} WHERE subject_type = 'token' \
+         AND subject_id IN (SELECT id FROM tokens WHERE user_id = ?)"
+    );
+    let rows = sqlx::query(&sql).bind(user_id).fetch_all(pool).await?;
+    rows.iter().map(map_row).collect()
+}
+
 /// A resolved, in-force limit for a caller: exactly one per
 /// (model-scope, dimension, window) cell after the hierarchy is applied.
 #[derive(Debug, Clone, PartialEq)]
@@ -309,7 +485,12 @@ pub fn effective_limits(rules: &[LimitRule]) -> Vec<EffectiveLimit> {
     // Precedence rank: user (2) beats role (1) beats global (0). Within the
     // same level (only possible for roles), the larger value wins.
     let rank = |s: SubjectType| match s {
-        SubjectType::User => 2u8,
+        // A token rule is only ever resolved against other token rules (see
+        // `applicable_for_token`), where the unique index already guarantees
+        // one per cell. Ranking it highest is belt-and-braces: if one ever
+        // reached the user hierarchy it would narrow, never widen.
+        SubjectType::Token => 3u8,
+        SubjectType::User => 2,
         SubjectType::Role => 1,
         SubjectType::Global => 0,
     };
@@ -386,6 +567,157 @@ mod tests {
                 .unwrap()
                 .to_string()
         );
+    }
+
+    /// An owner's save must not touch an admin's rule at the same
+    /// coordinates. Without the `managed_by` clause the UPDATE matches it and
+    /// silently rewrites the cap — which would make an admin's per-token
+    /// limit advisory, since the owner could simply raise it.
+    #[tokio::test]
+    async fn an_owner_save_cannot_overwrite_an_admin_rule() {
+        let pool = pool().await;
+        upsert(
+            &pool,
+            SubjectType::Token,
+            "tok-a",
+            None,
+            Dimension::Requests,
+            Window::Day,
+            10.0,
+        )
+        .await
+        .unwrap();
+
+        // The owner tries to raise it to 10_000 at the same coordinates.
+        let res = upsert_checked(
+            &pool,
+            SubjectType::Token,
+            "tok-a",
+            None,
+            Dimension::Requests,
+            Window::Day,
+            10_000.0,
+            ManagedBy::Owner,
+        )
+        .await
+        .expect("a refusal is an outcome, not a storage error");
+        assert_eq!(
+            res,
+            Upserted::RefusedAdminOwned,
+            "the write must report the refusal, not swallow it"
+        );
+
+        let rules = applicable_for_token(&pool, "tok-a").await.unwrap();
+        assert_eq!(rules.len(), 1, "no second rule at the same slot: {rules:?}");
+        assert_eq!(rules[0].value, 10.0, "the admin's value stands");
+        assert_eq!(rules[0].managed_by, ManagedBy::Admin);
+    }
+
+    /// The owner still owns their own rules — this must narrow, not freeze.
+    #[tokio::test]
+    async fn an_owner_can_update_and_delete_their_own_rule() {
+        let pool = pool().await;
+        upsert_checked(
+            &pool,
+            SubjectType::Token,
+            "tok-a",
+            None,
+            Dimension::Requests,
+            Window::Day,
+            10.0,
+            ManagedBy::Owner,
+        )
+        .await
+        .unwrap();
+        upsert_checked(
+            &pool,
+            SubjectType::Token,
+            "tok-a",
+            None,
+            Dimension::Requests,
+            Window::Day,
+            5.0,
+            ManagedBy::Owner,
+        )
+        .await
+        .unwrap();
+        let rules = applicable_for_token(&pool, "tok-a").await.unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].value, 5.0);
+
+        assert!(
+            delete_owner_rule(&pool, "tok-a", &rules[0].id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            applicable_for_token(&pool, "tok-a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `delete_owner_rule` is scoped in the statement: not another subject's
+    /// rule (the id comes from the client), and not an admin's cap on this
+    /// very token.
+    #[tokio::test]
+    async fn delete_owner_rule_refuses_admin_and_foreign_rules() {
+        let pool = pool().await;
+        upsert(
+            &pool,
+            SubjectType::Token,
+            "tok-a",
+            None,
+            Dimension::Requests,
+            Window::Day,
+            10.0,
+        )
+        .await
+        .unwrap();
+        upsert(
+            &pool,
+            SubjectType::Global,
+            "",
+            None,
+            Dimension::Requests,
+            Window::Day,
+            99.0,
+        )
+        .await
+        .unwrap();
+        let all = list_all(&pool).await.unwrap();
+        let admin_cap = all
+            .iter()
+            .find(|r| r.subject_type == SubjectType::Token)
+            .unwrap();
+        let global = all
+            .iter()
+            .find(|r| r.subject_type == SubjectType::Global)
+            .unwrap();
+
+        assert!(
+            !delete_owner_rule(&pool, "tok-a", &admin_cap.id)
+                .await
+                .unwrap(),
+            "an admin's cap on this token is not the owner's to delete"
+        );
+        assert!(
+            !delete_owner_rule(&pool, "tok-a", &global.id).await.unwrap(),
+            "a global rule must not be deletable via a token's own endpoint"
+        );
+        assert_eq!(list_all(&pool).await.unwrap().len(), 2, "nothing removed");
+    }
+
+    /// An unknown `managed_by` string reads as admin — the stricter side, so
+    /// a row from a future version is never editable by an owner on the
+    /// strength of a value this build doesn't understand.
+    #[test]
+    fn unknown_managed_by_values_read_as_admin() {
+        assert_eq!(ManagedBy::parse("owner"), ManagedBy::Owner);
+        assert_eq!(ManagedBy::parse("admin"), ManagedBy::Admin);
+        assert_eq!(ManagedBy::parse("something-new"), ManagedBy::Admin);
+        assert_eq!(ManagedBy::parse(""), ManagedBy::Admin);
     }
 
     #[tokio::test]

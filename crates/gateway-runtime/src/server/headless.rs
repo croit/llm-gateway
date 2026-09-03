@@ -99,6 +99,8 @@ pub async fn drive(state: &Arc<RamaState>, p: DriveParams) {
             client_ip: None,
             chat_feedback: None,
             model: Some(p.model.clone()),
+            // Session path: access is exactly the user's group grant.
+            pool_access: None,
         },
     );
     let driver = Box::new(crate::openai_driver::OpenAiDriver {

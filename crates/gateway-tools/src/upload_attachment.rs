@@ -229,6 +229,7 @@ mod tests {
         let ctx = ToolContext {
             user_id: "u".into(),
             roles: vec![],
+            pool_access: gateway_core::server::upstreams::PoolAccess::all(),
             db: pool,
             s3: Some(std::sync::Arc::new(
                 gateway_core::server::config::S3Config {
@@ -284,6 +285,7 @@ mod tests {
         let ctx = ToolContext {
             user_id: "u".into(),
             roles: vec![],
+            pool_access: gateway_core::server::upstreams::PoolAccess::all(),
             db: pool,
             s3: None,
             assistant_turn_id: Some("t-1".into()),
