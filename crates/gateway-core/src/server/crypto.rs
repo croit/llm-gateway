@@ -50,6 +50,22 @@ pub enum CryptoError {
 #[derive(Clone)]
 pub struct Crypto {
     key: [u8; 32],
+    /// The key the *previous* derivation label produced from the same session
+    /// secret, tried by [`Crypto::open`] when the current key fails.
+    ///
+    /// The label was renamed from `mcp-token-encryption/v1` to
+    /// `at-rest-encryption/v1` when at-rest sealing grew beyond MCP tokens, and
+    /// that shipped with no migration: every value sealed before it — backend
+    /// API keys, connector client secrets, each user's OAuth tokens — became
+    /// undecryptable, and the release notes told operators to re-enter them.
+    /// Re-entering an upstream credential is not a migration path, so the old
+    /// key is kept and tried as a fallback. [`Self::is_legacy_sealed`] lets a
+    /// caller notice and re-seal.
+    ///
+    /// `None` when the key came from `$GATEWAY_ENCRYPTION_KEY`: an explicit key
+    /// is used verbatim, so no label was ever involved and there is nothing to
+    /// fall back to.
+    legacy: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for Crypto {
@@ -67,10 +83,40 @@ pub struct Sealed {
     pub ciphertext: Vec<u8>,
 }
 
+/// Domain-separation label for the at-rest key.
+///
+/// Changing it derives a different key and orphans everything already sealed,
+/// so it is not a knob: a deliberate rotation means moving the current value to
+/// [`LEGACY_LABEL`] and writing the re-seal pass, not editing this in place.
+pub(crate) const LABEL: &[u8] = b"croit-llm-gateway/at-rest-encryption/v1";
+
+/// The label this key had while at-rest sealing was only used for MCP tokens.
+/// Kept so values sealed under it stay readable — see [`Crypto::legacy`].
+pub(crate) const LEGACY_LABEL: &[u8] = b"croit-llm-gateway/mcp-token-encryption/v1";
+
+/// HKDF-lite: HMAC-SHA256(session_secret, label).
+pub(crate) fn derive(session_secret: &[u8; 32], label: &[u8]) -> [u8; 32] {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(session_secret).expect("HMAC accepts any key length");
+    mac.update(label);
+    let derived = mac.finalize().into_bytes();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&derived);
+    key
+}
+
+fn open_with(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let nonce_arr: [u8; 12] = nonce.try_into().map_err(|_| CryptoError::Decrypt)?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::Decrypt)?;
+    cipher
+        .decrypt(&GenericArray::from(nonce_arr), ciphertext)
+        .map_err(|_| CryptoError::Decrypt)
+}
+
 impl Crypto {
     /// Build from explicit 32-byte key material (used by tests).
     pub fn from_key(key: [u8; 32]) -> Self {
-        Self { key }
+        Self { key, legacy: None }
     }
 
     /// A random, process-lifetime key. Used as the `AppState::new` default so
@@ -84,7 +130,7 @@ impl Crypto {
         if rand::rngs::OsRng.try_fill_bytes(&mut key).is_err() {
             key = [0u8; 32];
         }
-        Self { key }
+        Self { key, legacy: None }
     }
 
     /// Resolve the key: `$GATEWAY_ENCRYPTION_KEY` (64 hex chars) wins; otherwise
@@ -99,7 +145,7 @@ impl Crypto {
                 Some(bytes) if bytes.len() == 32 => {
                     let mut key = [0u8; 32];
                     key.copy_from_slice(&bytes);
-                    return Self { key };
+                    return Self { key, legacy: None };
                 }
                 _ => {
                     tracing::warn!(
@@ -109,18 +155,20 @@ impl Crypto {
                 }
             }
         }
-        // HKDF-lite: HMAC-SHA256(session_secret, domain-separation label). The
-        // label names this key's purpose (general at-rest encryption) and is
-        // what separates it from any other key derived from the same session
-        // secret; changing it derives a different key, so bump the version
-        // suffix if the derivation ever needs to be rotated deliberately.
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(session_secret)
-            .expect("HMAC accepts any key length");
-        mac.update(b"croit-llm-gateway/at-rest-encryption/v1");
-        let derived = mac.finalize().into_bytes();
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&derived);
-        Self { key }
+        Self::from_session(session_secret)
+    }
+
+    /// The derived path on its own, without consulting the environment.
+    ///
+    /// HKDF-lite: HMAC-SHA256(session_secret, [`LABEL`]). The label names this
+    /// key's purpose and is what separates it from any other key derived from
+    /// the same session secret. [`LEGACY_LABEL`] is derived alongside it so
+    /// values written before the rename still open — see [`Self::legacy`].
+    pub fn from_session(session_secret: &[u8; 32]) -> Self {
+        Self {
+            key: derive(session_secret, LABEL),
+            legacy: Some(derive(session_secret, LEGACY_LABEL)),
+        }
     }
 
     /// Encrypt `plaintext` under a fresh random nonce.
@@ -149,12 +197,41 @@ impl Crypto {
 
     /// Decrypt a `(nonce, ciphertext)` pair.
     pub fn open(&self, nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let nonce_arr: [u8; 12] = nonce.try_into().map_err(|_| CryptoError::Decrypt)?;
-        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| CryptoError::Decrypt)?;
-        let nonce = GenericArray::from(nonce_arr);
-        cipher
-            .decrypt(&nonce, ciphertext)
-            .map_err(|_| CryptoError::Decrypt)
+        if let Ok(plain) = open_with(&self.key, nonce, ciphertext) {
+            return Ok(plain);
+        }
+        // Sealed before the derivation label was renamed. Opening it is the
+        // whole point — the alternative shipped once already, and it was
+        // "re-enter every upstream credential".
+        match self.legacy {
+            Some(legacy) => open_with(&legacy, nonce, ciphertext),
+            None => Err(CryptoError::Decrypt),
+        }
+    }
+
+    /// Whether `nonce`/`ciphertext` needs the pre-rename key, i.e. whether it
+    /// should be re-sealed. `false` for anything the current key opens, and for
+    /// anything neither key opens (that is not a migration, it is a wrong key).
+    pub fn is_legacy_sealed(&self, nonce: &[u8], ciphertext: &[u8]) -> bool {
+        if open_with(&self.key, nonce, ciphertext).is_ok() {
+            return false;
+        }
+        self.legacy
+            .is_some_and(|legacy| open_with(&legacy, nonce, ciphertext).is_ok())
+    }
+
+    /// [`Self::is_legacy_sealed`] for the `"<nonce>.<ciphertext>"` string form.
+    pub fn is_legacy_sealed_string(&self, stored: &str) -> bool {
+        let Some((nonce, ciphertext)) = stored.split_once('.') else {
+            return false;
+        };
+        let Some(nonce) = URL_SAFE_NO_PAD.decode(nonce).ok() else {
+            return false;
+        };
+        let Some(ciphertext) = URL_SAFE_NO_PAD.decode(ciphertext).ok() else {
+            return false;
+        };
+        self.is_legacy_sealed(&nonce, &ciphertext)
     }
 
     /// Convenience: decrypt to a UTF-8 string.
@@ -302,5 +379,97 @@ mod tests {
     fn bad_nonce_length_rejected() {
         let c = crypto();
         assert!(c.open(&[0u8; 8], &[0u8; 32]).is_err());
+    }
+
+    /// A value sealed before the derivation label was renamed must still open.
+    ///
+    /// This is the regression that matters: `7e7ec42` renamed the label with no
+    /// migration, so every backend API key, connector client secret and stored
+    /// OAuth token from before it became undecryptable — and the release notes
+    /// answered "re-enter them". Verified against a real database before this
+    /// fix: the July-era `backends.api_key_ct` row opened under
+    /// `mcp-token-encryption/v1` and not under the current label.
+    #[test]
+    fn a_value_sealed_under_the_previous_label_still_opens() {
+        let session = [42u8; 32];
+        // What the pre-rename build would have written.
+        let old = Crypto::from_key(derive(&session, LEGACY_LABEL));
+        let sealed = old.seal(b"sk-upstream-secret").unwrap();
+
+        // What this build derives — the current label, legacy kept as fallback.
+        let now = Crypto {
+            key: derive(&session, LABEL),
+            legacy: Some(derive(&session, LEGACY_LABEL)),
+        };
+        assert_ne!(now.key, old.key, "the labels must derive different keys");
+        assert_eq!(
+            now.open(&sealed.nonce, &sealed.ciphertext).unwrap(),
+            b"sk-upstream-secret",
+            "a legacy-sealed value must still be readable"
+        );
+        assert!(
+            now.is_legacy_sealed(&sealed.nonce, &sealed.ciphertext),
+            "and must be reported as needing a re-seal"
+        );
+    }
+
+    #[test]
+    fn a_value_sealed_under_the_current_label_needs_no_reseal() {
+        let session = [42u8; 32];
+        let now = Crypto {
+            key: derive(&session, LABEL),
+            legacy: Some(derive(&session, LEGACY_LABEL)),
+        };
+        let sealed = now.seal(b"fresh").unwrap();
+        assert_eq!(
+            now.open(&sealed.nonce, &sealed.ciphertext).unwrap(),
+            b"fresh"
+        );
+        assert!(!now.is_legacy_sealed(&sealed.nonce, &sealed.ciphertext));
+    }
+
+    /// The fallback must not weaken the failure case: a genuinely wrong key
+    /// still fails, and is not misreported as a migration.
+    #[test]
+    fn an_unrelated_key_is_not_mistaken_for_a_legacy_seal() {
+        let stranger = Crypto::from_key([9u8; 32]);
+        let sealed = stranger.seal(b"other deployment").unwrap();
+
+        let session = [42u8; 32];
+        let now = Crypto {
+            key: derive(&session, LABEL),
+            legacy: Some(derive(&session, LEGACY_LABEL)),
+        };
+        assert!(now.open(&sealed.nonce, &sealed.ciphertext).is_err());
+        assert!(!now.is_legacy_sealed(&sealed.nonce, &sealed.ciphertext));
+    }
+
+    /// An explicit `$GATEWAY_ENCRYPTION_KEY` is used verbatim, so there is no
+    /// label and nothing to fall back to — a legacy value must NOT open, or the
+    /// fallback would be silently widening which keys can read a database.
+    #[test]
+    fn an_explicit_key_has_no_legacy_fallback() {
+        let session = [42u8; 32];
+        let old = Crypto::from_key(derive(&session, LEGACY_LABEL));
+        let sealed = old.seal(b"secret").unwrap();
+
+        let explicit = Crypto::from_key([1u8; 32]);
+        assert!(explicit.legacy.is_none());
+        assert!(explicit.open(&sealed.nonce, &sealed.ciphertext).is_err());
+    }
+
+    #[test]
+    fn the_string_form_reports_a_legacy_seal_too() {
+        let session = [42u8; 32];
+        let old = Crypto::from_key(derive(&session, LEGACY_LABEL));
+        let stored = old.seal_to_string("vapid-ish").unwrap();
+
+        let now = Crypto {
+            key: derive(&session, LABEL),
+            legacy: Some(derive(&session, LEGACY_LABEL)),
+        };
+        assert_eq!(now.open_from_string(&stored).as_deref(), Some("vapid-ish"));
+        assert!(now.is_legacy_sealed_string(&stored));
+        assert!(!now.is_legacy_sealed_string("not-even-two-parts"));
     }
 }

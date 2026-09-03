@@ -7,7 +7,7 @@ This directory holds the design docs for the LLM gateway. The agent-facing entry
 | Doc | What it covers |
 |---|---|
 | [`architecture.md`](architecture.md) | High-level system diagram, request flow, crate boundaries |
-| [`dev-workflow.md`](dev-workflow.md) | mise tasks, two-terminal dev loop (cargo + tailwind --watch) |
+| [`dev-workflow.md`](dev-workflow.md) | mise tasks, two-terminal dev loop (cargo + tailwind --watch), and the traps that have cost us time (git-env leaks through hooks, pushing at a sibling worktree, daisyUI 4 classes) |
 | [`dependencies.md`](dependencies.md) | Dep policy + the current allowed list and rationale |
 | [`auth.md`](auth.md) | OIDC discovery, gateway-minted tokens, sessions |
 | [`gateway-api.md`](gateway-api.md) | OpenAI-compatible HTTP API, streaming, transcription |

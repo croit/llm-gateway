@@ -493,11 +493,19 @@ hostile git repo, but anyone can mail you a hostile invoice.
 
 ## Operating it
 
-```toml
-[rag]
-data_dir          = "/mnt/data/gateway-rag"
-clone_concurrency = 4
-```
+Configured at **`/admin/settings` → Content & data → RAG indexing**, not in a
+file. All three fields are **restart-only**: the indexer is a long-running
+worker, and `rag.data_dir` additionally does not carry existing indexes with it
+— point it somewhere new and everything is reindexed from scratch.
+
+| Field | Meaning |
+|---|---|
+| `rag.enabled` | Run the indexer at all |
+| `rag.data_dir` | Index store, e.g. `/mnt/data/gateway-rag`. Must be on the persistent volume, or every restart reindexes |
+| `rag.clone_concurrency` | How many clones and indexing jobs run at once |
+
+A legacy `[rag]` block in `gateway.toml` is imported once on the first boot that
+sees the file and ignored afterwards.
 
 Optional capability pools, each of which simply switches a stage on:
 
@@ -508,7 +516,7 @@ Optional capability pools, each of which simply switches a stage on:
 | `chat` | the profile extraction pass |
 | `rerank` | cross-encoder reranking |
 
-Plus `[sandbox]` for office documents. Every one of them degrades to "that
+Plus the code sandbox (`/admin/settings` → Tools) for office documents. Every one of them degrades to "that
 stage is skipped, and says so" rather than to a failure.
 
 On `/rag`: pick a **source kind**, fill in the provider's own fields, hit

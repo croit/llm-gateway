@@ -29,6 +29,7 @@ pub mod push_subscriptions;
 pub mod rag;
 pub mod rag_documents;
 pub mod rag_oauth;
+pub mod reseal;
 pub mod skill_grants;
 pub mod token_tool_prefs;
 pub mod tokens;

@@ -25,21 +25,27 @@ browser → gateway (OpenAI-compatible API + chat UI + RBAC + tools)
               GPU + models (mounted read-only)
 ```
 
-ComfyUI is **not** exposed publicly. The gateway reaches it at `base_url` from `[comfyui]`. Multiple gateway replicas can share one ComfyUI worker, but the worker itself serialises per GPU.
+ComfyUI is **not** exposed publicly. The gateway reaches it at the configured base URL. Multiple gateway replicas can share one ComfyUI worker, but the worker itself serialises per GPU.
 
 ## Operator config
 
-`[comfyui]` is optional. With no block, no ComfyUI tools register and the gateway boots fine.
+Configured at **`/admin/settings` → Tools → ComfyUI image & video**, not in a
+file. Off by default: with the switch off, no ComfyUI tools register and the
+gateway boots fine.
 
-```toml
-[comfyui]
-enabled = true
-base_url = "http://comfyui-worker:8188"
-content_dir = "/opt/llm-content"   # workflows + manifests live here
-timeout_secs = 600                  # per workflow execution
-queue_poll_interval_ms = 500        # /history poll cadence
-max_concurrent_jobs = 1             # 24 GB VRAM realistically allows 1
-```
+| Field | Meaning |
+|---|---|
+| `comfyui.enabled` | Register the `comfyui_*` tools |
+| `comfyui.base_url` | e.g. `http://comfyui-worker:8188`. No authentication, so it must be reachable only from the gateway. **Restart-only** — the job scheduler polling it is a running task |
+| `comfyui.content_dir` | Workflows + manifests, e.g. `/opt/llm-content`. **Restart-only**, but `/admin/comfyui` has a reload button for the common case of adding a workflow |
+| `comfyui.timeout_secs` | Deadline per workflow execution |
+| `comfyui.queue_poll_interval_ms` | `/history` poll cadence |
+| `comfyui.max_concurrent_jobs` | 24 GB VRAM realistically allows 1 |
+
+The field names are the TOML paths these settings had before they moved into the
+database; `/admin/settings` prints each one under its label. A legacy
+`[comfyui]` block in `gateway.toml` is imported once on the first boot that sees
+the file and ignored afterwards.
 
 The `content_dir` is **not** part of the public repo. It is a private, operator-managed directory holding workflows, manifests, and — at the operator's discretion — model files (or symlinks to a shared model volume). The gateway reads from it at startup; nothing in `content_dir` is ever written by the gateway or shipped to the browser.
 

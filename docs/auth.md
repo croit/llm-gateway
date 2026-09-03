@@ -23,6 +23,13 @@ the deployment demonstrably already worked — and ignores the block from then
 on. Nothing to do when upgrading; a fresh install has no file and lands in the
 wizard.
 
+The import is only *finalised* once it has actually happened. A boot that finds
+no config file, or one whose `client_secret_env` is not set yet, imports nothing
+and leaves the marker unset so the next boot can still import. Burning it early
+was a real bug: an existing deployment that booted once without its file — a
+volume mounted late — ended up with no provider, `setup.completed` set from
+`has_been_used`, and therefore no way in except `restore-setup`.
+
 ```toml
 # gateway.toml — legacy, import-only. New installs need none of this.
 [oidc]

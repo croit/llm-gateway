@@ -182,3 +182,147 @@ The production `Dockerfile` is **runtime-only** — it compiles nothing. Startin
 The CSS, `datastar.js`, and JS bundles are `include_bytes!`'d into the binary, so the runtime image ships no separate asset directory. No `cargo`, `npm`, or `tailwindcss` runs in the image build — those all happen in the `ci` job, and the binaries arrive as artifacts.
 
 CI never invokes `cargo`, `npm`, or `tailwindcss` directly; everything routes through mise tasks. If you need a new CI step, add a `[tasks.…]` entry to `mise.toml` and call it from the workflow.
+
+## Traps that have actually cost us time
+
+Each of these has bitten at least once, each presents as something other than
+what it is, and each now has a test that fails if it comes back. They are
+written down because the symptom never points at the cause.
+
+### A test fixture that shells out to `git` can rewrite *your* repository
+
+**Symptom.** Any of: your commit identity silently becomes
+`t <t@example.invalid>`; `core.bare = true` appears in `.git/config` and every
+worktree command starts failing with `fatal: this operation must be run in a
+work tree` while `git log` still works; or `git status` shows your entire tree
+staged as deleted, with a single `README.md` left in the index whose blob is
+`hello world\n`. Nothing in any reflog explains it.
+
+**Cause.** `git` exports `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE` and
+friends to hooks and to every process a hook starts. `.githooks/pre-push` runs
+the whole test suite, so the suite inherits a pointer to the real repository —
+and a fixture that spawns `git` without clearing those variables operates on
+*that* repo instead of its tempdir. `git config` overwrites your identity,
+`git init` sets `core.bare`, `git add` replaces your index.
+
+The damage is confined to the index and config: **working-tree files are never
+touched**, so a wiped index is repaired with plain `git reset` (never
+`--hard`), which rebuilds it from `HEAD`.
+
+**Prevention.** `INHERITED_GIT_VARS` in
+`crates/gateway-features/src/server/rag/git.rs` lists the variables; every
+`git` spawn clears them. `every_git_spawn_scrubs_the_inherited_context` (same
+file) scans `crates/` and fails if a file naming `Command::new("git")` does
+not also name `INHERITED_GIT_VARS` or `env_remove`. It cannot prove the scrub
+reaches the right command, but the failure mode that actually bit was a silent
+omission in a new fixture, and that is now impossible to add unnoticed.
+
+Build scripts need the same treatment and cannot import from the workspace —
+`crates/gateway-web/build.rs` repeats the list. A build run from inside a hook
+would otherwise resolve `HEAD` in the calling repository and stamp a foreign
+SHA into `GATEWAY_GIT_SHA`, defeating the AGPL §13 source link it exists for.
+
+### A seed/import marker may only be burned once the decision is final
+
+**Symptom.** An upgraded deployment comes up missing something it had in its
+config file — no upstream pools, no groups, or no OIDC provider at all — and no
+amount of restarting brings it back. With OIDC it is worse than missing: the
+gateway marks itself configured because the database has users, so `/setup`
+404s and the only way in is `restore-setup` on the host.
+
+**Cause.** Four `app_settings` rows gate one-time work: `topology.seeded`,
+`rbac.seeded`, `setup.config_imported` and `settings.imported`. Each existed to
+stop a config file resurrecting values an admin deleted in the UI. Three of the
+four burned the marker unconditionally, including on a boot that found **no
+config file at all** — a volume mounted late, a bind mount not ready, a binary
+started from the wrong directory. That boot seeds nothing, records "done", and
+the file is never read again.
+
+All three had shipped. It was found by starting the gateway once in a checkout
+whose config lived under a different filename, which is exactly how an operator
+would hit it.
+
+**Prevention.** The rule is now uniform: burn the marker only when the work
+actually happened, or when there was a file to do it from
+(`Config::loaded_from.is_some()`). `settings::import_once` had it right from the
+start and is the reference; `setup::import_config_once` carries the reasoning in
+its `settled` flag, with regression tests
+(`a_boot_without_a_config_file_does_not_lock_out_a_later_import`,
+`a_provider_already_in_the_database_settles_the_decision`) covering both
+directions.
+
+If you add a fifth marker, the question to answer in a comment is not "has this
+run?" but **"could a later boot still have something to do here?"** — and a boot
+with no config file always could.
+
+### Never `git push .` at a branch checked out in a sibling worktree
+
+**Symptom.** The push succeeds, the branch moves, and the other checkout now
+shows the entire changeset as unstaged deletions — as though someone reverted
+the work. Nothing is lost, but it reads as catastrophic.
+
+**Cause.** `git push .` updates a ref. It does not touch the working tree or
+index of the worktree that has that branch checked out, which is then stale
+against its own `HEAD`. The `receive.denyCurrentBranch` guard that exists to
+prevent exactly this does **not** fire, because for a push originating in a
+linked worktree the target branch is not receive-pack's "current" branch —
+and for the same reason `receive.denyCurrentBranch = updateInstead` does not
+help either. Both were tried.
+
+**Prevention.** To move a branch that is checked out somewhere else, run the
+merge *in that checkout*:
+
+```
+cd <the checkout that has the branch>
+git status --short          # confirm it is clean
+git merge --ff-only <source-branch>
+```
+
+`--ff-only` updates ref and working tree together and refuses outright if the
+tree is dirty, so it cannot overwrite anything. If a `git push .` has already
+left a checkout stale, `git reset --hard <branch>` in that checkout repairs it
+— safe only once `git status` there shows nothing but the expected diff, since
+a stale index makes genuine local edits indistinguishable from the inverse of
+the incoming commits.
+
+### daisyUI 5 deleted classes that daisyUI 4 relied on
+
+**Symptom.** A form looks like its spacing is broken: label and input sit side
+by side (`Name [input]`), help text is wedged between a label and its own box,
+and the vertical gaps are enormous. Adjusting `gap-*` utilities changes
+nothing, because the gaps are the line height of a wrapping inline paragraph.
+
+**Cause.** `form-control` was daisyUI 4's label-plus-control wrapper and does
+not exist in 5 — the label component's stylesheet under
+`ui/node_modules/daisyui/components` declares two selectors and that is not
+one of them. A label carrying it gets no layout at all, so its children fall
+back to `inline`. `label-text-alt` is gone the same way, and it carried the
+shrink and dim that make a hint read as an aside rather than another paragraph.
+
+**Prevention.** Two tests in `crates/gateway-web/src/pages/mod.rs`:
+`no_page_uses_a_class_daisyui_dropped` fails on `form-control` in any class
+string, and `help_text_sets_its_own_size` fails on a `label-text-alt` without
+an explicit `text-xs`. The house pattern for a labelled control is
+`label(class: "flex flex-col gap-1")` with the help `<span>` **after** the
+input. `label-text` is inert too but deliberately left alone: daisyUI 4 gave
+it `text-sm`, which its ~99 bare uses now inherit anyway.
+
+### Tailwind scans Rust source, including comments
+
+**Symptom.** The committed `crates/session-core/assets/app.css` grows by a
+kilobyte or two, with a component nothing on the page uses.
+
+**Cause.** The Tailwind scanner reads these files looking for class-name
+candidates and cannot tell a doc comment from markup. Naming a daisyUI class
+in prose is enough to emit its CSS.
+
+**Prevention.** No test for this one — describe a class rather than spelling
+it, and when the CSS bundle changes, check *which* selectors moved rather than
+just that it changed:
+
+```
+tr '}' '\n' < crates/session-core/assets/app.css | grep -oE '^\.[a-zA-Z0-9\\:_-]+' | sort -u
+```
+
+Diff that list before and after. The only entries should be ones your markup
+change explains.

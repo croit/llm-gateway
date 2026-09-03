@@ -304,29 +304,43 @@ pub async fn import_config_once(
         return Ok(false);
     }
     let mut imported = false;
-    // Whether the decision is final. A config file that *has* an `[oidc]` block
-    // we could not resolve is not final — the client-secret env var may simply
-    // be missing on this one boot (an `EnvironmentFile` not yet in place), and
-    // burning the marker would ignore that block forever afterwards.
+    // Whether the decision is final, i.e. whether the marker may be burned.
+    //
+    // Only two boots are final: one that imported a provider, and one that
+    // found a provider already in the database. Everything else has to be
+    // retried, because the *reason* nothing was imported may not survive to
+    // the next boot:
+    //
+    // - the `[oidc]` block resolved to nothing because its client-secret env
+    //   var is unset on this boot (an `EnvironmentFile` not yet in place);
+    // - there was no config file at all — a volume mounted late, a bind mount
+    //   not ready, or an operator starting the binary once from the wrong
+    //   directory.
+    //
+    // The second case is the one that bit: a single boot without the file used
+    // to burn the marker, and the deployment was then stuck with no provider
+    // and no way to import one, reachable only through `restore-setup`. Same
+    // rule `settings::import_once` follows for the operator settings.
     let mut settled = true;
 
-    if let Some(cfg) = oidc
-        && oidc_settings::params(pool, crypto).await?.is_none()
-    {
-        match cfg.to_params() {
-            Some(params) => {
-                oidc_settings::set_params(pool, crypto, &params).await?;
-                imported = true;
-            }
-            None => {
-                settled = false;
-                tracing::warn!(
-                    env = %cfg.client_secret_env,
-                    "config file has an [oidc] block but its client-secret env var is unset, \
-                     so there is nothing to import; set it and restart, or configure the \
-                     provider at /setup"
-                );
-            }
+    if oidc_settings::params(pool, crypto).await?.is_none() {
+        match oidc {
+            Some(cfg) => match cfg.to_params() {
+                Some(params) => {
+                    oidc_settings::set_params(pool, crypto, &params).await?;
+                    imported = true;
+                }
+                None => {
+                    settled = false;
+                    tracing::warn!(
+                        env = %cfg.client_secret_env,
+                        "config file has an [oidc] block but its client-secret env var is \
+                         unset, so there is nothing to import; set it and restart, or \
+                         configure the provider at /setup"
+                    );
+                }
+            },
+            None => settled = false,
         }
     }
 
@@ -574,5 +588,84 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[tokio::test]
+    async fn a_boot_without_a_config_file_does_not_lock_out_a_later_import() {
+        // The sequence that actually happened: an existing deployment (users in
+        // the DB, provider still only in `gateway.toml`) booted once without
+        // the file — a bind mount not ready, or the binary started from the
+        // wrong directory. That boot must not burn the import marker, or the
+        // deployment is stuck forever with no provider: everyone is locked out
+        // of sign-in and `/setup` is closed because setup reads as complete.
+        let pool = fresh().await;
+        seed_a_user(&pool).await;
+
+        assert!(
+            !import_config_once(&pool, &crypto(), None, "https://gw.example.com")
+                .await
+                .unwrap(),
+            "nothing to import with no config file"
+        );
+        assert!(
+            app_settings::get(&pool, IMPORT_MARKER_KEY)
+                .await
+                .unwrap()
+                .is_none(),
+            "no file was seen, so the decision cannot be final"
+        );
+
+        // The file shows up on the next boot and must still be imported.
+        // SAFETY: this test's own env var, read synchronously below.
+        unsafe { std::env::set_var("GATEWAY_SETUP_TEST_SECRET", "s3cret") };
+        let cfg = OidcConfig {
+            issuer: "https://id.example.com".into(),
+            client_id: "gw".into(),
+            client_secret_env: "GATEWAY_SETUP_TEST_SECRET".into(),
+            scopes: vec![],
+            roles_claim: None,
+        };
+        assert!(
+            import_config_once(&pool, &crypto(), Some(&cfg), "https://gw.example.com")
+                .await
+                .unwrap(),
+            "the provider from the config file must still be importable"
+        );
+        assert!(
+            oidc_settings::params(&pool, &crypto())
+                .await
+                .unwrap()
+                .is_some(),
+            "and sign-in must work afterwards"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_already_in_the_database_settles_the_decision() {
+        // The counterpart: once the DB has a provider, there is nothing a
+        // config file could add, so the marker is burned and later boots skip
+        // the whole check.
+        let pool = fresh().await;
+        // SAFETY: this test's own env var, read synchronously below.
+        unsafe { std::env::set_var("GATEWAY_SETUP_TEST_SECRET", "s3cret") };
+        let cfg = OidcConfig {
+            issuer: "https://id.example.com".into(),
+            client_id: "gw".into(),
+            client_secret_env: "GATEWAY_SETUP_TEST_SECRET".into(),
+            scopes: vec![],
+            roles_claim: None,
+        };
+        assert!(
+            import_config_once(&pool, &crypto(), Some(&cfg), "https://gw.example.com")
+                .await
+                .unwrap()
+        );
+        assert!(
+            app_settings::get(&pool, IMPORT_MARKER_KEY)
+                .await
+                .unwrap()
+                .is_some(),
+            "an import that succeeded is final"
+        );
     }
 }

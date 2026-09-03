@@ -221,7 +221,7 @@ Until setup finishes, every page redirects to `/setup`, which asks two questions
 
 Finishing writes the provider (client secret sealed with the at-rest key), creates an `admins` group mapped to the value you chose plus a default `users` group, and swaps the live OIDC client in — `/login` works on the very next request, with no restart.
 
-Existing deployments upgrade in place: on the first boot after this release, an `[oidc]` block in the config file is imported into the database once, the gateway marks itself configured, and the block is ignored from then on.
+Existing deployments upgrade in place: on the first boot that finds the config file, an `[oidc]` block in it is imported into the database once, the gateway marks itself configured, and the block is ignored from then on. A boot that cannot see the file (or whose client-secret env var is not set yet) imports nothing and changes nothing, so the next one still can — the import is only finalised once it has actually happened.
 
 ### Recovering access
 
@@ -244,7 +244,7 @@ There is **no required configuration file**. Everything an operator configures l
 
 **Changes apply immediately.** A save re-derives the affected clients, stores and tool registrations and swaps them in, so the new value is in force on the next request — no restart, and no config file. Five fields are the exception, badged `restart` in the editor: `rag.enabled`, `rag.data_dir`, `rag.clone_concurrency`, `comfyui.base_url` and `comfyui.content_dir`. Each of those owns a long-running background worker (the indexer, the ComfyUI job scheduler), and replacing one means stopping work that is in flight — an aborted ComfyUI poll can leave a job row pending whose asset is never fetched. A restart is the clean way to quiesce that. Saving one leaves a banner on the page until the process comes back, so the person who restarts the container sees what is waiting on them. Every label, card title and line of help text is translated into all six UI languages, and each field also prints the TOML key it replaces underneath, so the mapping from an old config file stays one-to-one and greppable; secrets entered there are sealed at rest.
 
-A `gateway.toml` is still read if present — `gateway.toml` in the working directory, or wherever `$GATEWAY_CONFIG` points — but a deployment no longer needs one at all. Both of the things it still carried have environment equivalents — `$GATEWAY_DB_PATH` for `[db].path` and `$GATEWAY_BOOTSTRAP_ADMIN_GROUPS` for the break-glass admin list — so the file's only remaining job is as a **one-time seed** when upgrading an older install. (The listen socket was never in it either; that is `$IP` / `$PORT`.) On the first boot after upgrading, every block that has moved is copied into the database and then ignored forever after, so an existing file-driven deployment upgrades in place without anyone touching it. [`gateway.example.toml`](gateway.example.toml) remains the annotated reference for that file.
+A `gateway.toml` is still read if present. Three locations are probed, in order: wherever `$GATEWAY_CONFIG` points, then `./gateway.toml`, then `/etc/gateway/config.toml` — the last is why the container images need no `$GATEWAY_CONFIG` at all, just the mount. But a deployment no longer needs a file of any kind. Both of the things it still carried have environment equivalents — `$GATEWAY_DB_PATH` for `[db].path` and `$GATEWAY_BOOTSTRAP_ADMIN_GROUPS` for the break-glass admin list — so the file's only remaining job is as a **one-time seed** when upgrading an older install. (The listen socket was never in it either; that is `$IP` / `$PORT`.) On the first boot that actually **sees** the file, every block that has moved is copied into the database and then ignored forever after, so an existing file-driven deployment upgrades in place without anyone touching it. "Sees" matters: a boot that finds no file — a volume mounted late, or the binary started from the wrong directory — imports nothing and leaves the decision open, so the next boot that does find it still imports. Nothing is settled until there is either something imported or a provider already in the database. [`gateway.example.toml`](gateway.example.toml) remains the annotated reference for that file.
 
 **Secrets never live in the file.** Where the file needs one it holds the *name* of an environment variable (e.g. `api_key_env = "GPU01_KEY"`) and the gateway reads the value from its own environment. Secrets entered at `/admin/settings` or `/setup` instead go into the database **sealed** under the at-rest key, which is why those fields take the credential directly.
 
@@ -330,19 +330,32 @@ export GATEWAY_ENCRYPTION_KEY=$(openssl rand -hex 32) # optional: 32-byte key en
 
 Earlier releases fell back to an ephemeral per-process key and only logged an error. That produced a gateway that looked healthy while logging everyone out on every restart and losing every sealed secret — invisible until it had already cost data. If you are upgrading and see the new startup error, the variable never made it into the service environment; add it to the unit's `EnvironmentFile` and restart.
 
-`GATEWAY_ENCRYPTION_KEY` is optional: it's the AES-256-GCM key under which the gateway's database-stored secrets are encrypted — each user's MCP-connector OAuth tokens, admin-stored connector client secrets, and **upstream backend API keys entered through the admin UI**. If unset, the gateway derives a stable key from `GATEWAY_SESSION_KEY` — which is itself mandatory, so the derived key is always stable. Set it explicitly if you want at-rest encryption decoupled from session-cookie signing (that way the session key can be rotated without destroying stored secrets). **Rotating this key invalidates already-stored ciphertext** — re-enter backend keys (or keep them in env vars via `api_key_env`) after a change. *(Formerly `GATEWAY_MCP_KEY`. If you set it explicitly, rename the env var to the same value and nothing else changes. If you relied on the key derived from `GATEWAY_SESSION_KEY` (env unset), the derivation changed in this release — reconnect MCP connectors and re-enter backend keys once after upgrading.)*
+`GATEWAY_ENCRYPTION_KEY` is optional: it's the AES-256-GCM key under which the gateway's database-stored secrets are encrypted — each user's MCP-connector OAuth tokens, admin-stored connector client secrets, and **upstream backend API keys entered through the admin UI**. If unset, the gateway derives a stable key from `GATEWAY_SESSION_KEY` — which is itself mandatory, so the derived key is always stable. Set it explicitly if you want at-rest encryption decoupled from session-cookie signing (that way the session key can be rotated without destroying stored secrets). **Rotating this key invalidates already-stored ciphertext** — re-enter backend keys (or keep them in env vars via `api_key_env`) after a change. *(Formerly `GATEWAY_MCP_KEY`. If you set it explicitly, rename the env var to the same value and nothing else changes. If you rely on the key derived from `GATEWAY_SESSION_KEY` (env unset), the derivation label was renamed once, when at-rest sealing grew beyond MCP tokens — and that shipped without a migration, so an earlier release did lose access to secrets sealed before it. That is fixed: the gateway now reads values sealed under the old key and rewrites them under the current one on the first boot, logging how many it moved. Nothing to re-enter.)*
 
-Optional blocks, each documented inline in `gateway.example.toml`:
+The blocks a legacy file may still carry — **none of these is where you configure the feature any more.** Each is imported once, on the first boot that sees the file, and ignored from then on; the right-hand column is where it lives now. They stay documented inline in `gateway.example.toml` for anyone migrating.
 
-- `[rbac]` + `[[roles]]` — map OIDC claim values to roles, and gate models/tools per role.
-- `[chat.s3]` — store chat attachments in S3 / MinIO / R2 / Backblaze B2 (see below).
-- `[chat.ocr]` — opt into automatic PDF/image OCR through a configured internal `ocr` pool (see [`docs/ocr.md`](docs/ocr.md)).
-- `[typst]` — register document-rendering tools from a templates directory.
-- `[sandbox]` — enable the code-execution + document tools by pointing at a sandbox-runner service (see [`docs/sandbox.md`](docs/sandbox.md)).
-- `[geoip]` — IP→location for the `get_user_location` tool (IP2Location LITE database).
-- `[rag]` — index git repos and search them from chat (see [RAG](#rag-codebase-search)).
-- `[usage]` — request/token usage accounting behind the `/usage` page (retention-pruned; on by default).
-- `[feedback]` — the in-UI feedback widget that files GitHub issues.
+| Legacy block | Feature | Now configured at |
+|---|---|---|
+| `[rbac]` + `[[roles]]` | OIDC claim → group mapping, and what each group grants | `/admin/groups` |
+| `[chat.s3]` | Chat attachments in S3 / MinIO / R2 / Backblaze B2 | `/admin/settings` → Content & data |
+| `[chat.ocr]` | Automatic PDF/image OCR via an internal `ocr` pool ([`docs/ocr.md`](docs/ocr.md)) | `/admin/settings` → Chat |
+| `[chat.compaction]` | Summarising long conversations | `/admin/settings` → Chat |
+| `[typst]` | Document-rendering tools from a templates directory | `/admin/settings` → Tools |
+| `[sandbox]` | Code-execution + document tools ([`docs/sandbox.md`](docs/sandbox.md)) | `/admin/settings` → Tools |
+| `[comfyui]` | Image + video generation tools | `/admin/settings` → Tools |
+| `[geoip]` | IP→location for `get_user_location` | `/admin/settings` → Tools |
+| `[skills]` | Skill bundles | `/admin/settings` → Content & data |
+| `[rag]` | Index sources and search them from chat ([RAG](#rag-codebase-search)) | `/admin/settings` → Content & data |
+| `[usage]` | Request/token accounting behind `/usage` | `/admin/settings` → Access & usage |
+| `[limits]` | Rate limits and quotas | `/admin/limits` (master switch under Access & usage) |
+| `[feedback]` | The in-UI feedback widget that files GitHub issues | `/admin/settings` → Notifications |
+| `[push]` | Web Push turn-complete notifications | `/admin/settings` → Notifications |
+| `[gateway]` | Session + API-token lifetimes, and whether admins may impersonate | `/admin/settings` → Access & usage |
+| `[gateway].public_url` | The gateway's own base URL | `/setup` |
+| `[gateway].bootstrap_admin_groups` | Break-glass admin claim values | Stays in the file (or `$GATEWAY_BOOTSTRAP_ADMIN_GROUPS`) — deliberately **not** in the DB, so a broken group table cannot lock everyone out |
+| `[db].path` | Where the SQLite database lives | Stays in the file (or `$GATEWAY_DB_PATH`) — it has to be found before anything can be read *out* of the database |
+| `[oidc]` | The identity provider | `/setup` |
+| `[bind]` | The listen socket | **Removed** — use `$IP` / `$PORT` |
 
 ### Chat attachments (S3)
 

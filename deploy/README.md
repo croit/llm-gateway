@@ -21,10 +21,12 @@ deployment methods are provided — pick one:
 | **ocr-sidecar** | local `deploy/ocr-sidecar` image | PDF-aware Unlimited-OCR adapter. Optional; needs an external Unlimited-OCR vLLM service. |
 | sandbox workload | `ghcr.io/croit/llm-gateway-sandbox` | The "gold image" the runner spawns per job (pulled by the runner, not run directly). |
 
-Secrets and per-host config live in env files + a config TOML; the SQLite DB
-(also the session store) lives in a named volume. Real secret files
-(`gateway.env`, `google-workspace-mcp.env`, `gateway.toml`) are git-ignored —
-only the `*.example.*` templates are committed.
+Per-host secrets live in env files; everything an operator would once have put
+in a config TOML now lives in the database and is edited in the browser. The
+SQLite DB (also the session store) lives in a named volume. Real secret files
+(`gateway.env`, `google-workspace-mcp.env`) are git-ignored — only the
+`*.example.*` templates are committed. A `gateway.toml` is optional and only
+used to migrate an older install (see below); it is git-ignored too.
 
 ---
 

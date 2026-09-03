@@ -75,6 +75,25 @@ async fn main() -> anyhow::Result<()> {
     let session_secret = load_session_secret(&state_session_key())?;
     let crypto = std::sync::Arc::new(srv::crypto::Crypto::from_env_or_session(&session_secret));
 
+    // Rewrite anything still sealed under the pre-rename at-rest key. Runs
+    // before any of it is read, so a boot either migrates a value or reads it
+    // through the compatibility path — never neither. Idempotent, and a no-op
+    // on every boot after the first. Not fatal: a failure here leaves the
+    // values readable via the fallback, which is strictly better than refusing
+    // to start.
+    match srv::db::reseal::legacy_sealed_values(&db, &crypto).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            count = n,
+            "re-sealed secrets that were still encrypted under the previous at-rest key"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "re-sealing secrets under the current at-rest key; they remain readable through \
+             the compatibility path"
+        ),
+    }
+
     // Setup state, resolved before anything that needs the public URL. A config
     // file's `[oidc]` block is imported into the DB once — that is what carries
     // an existing deployment across this release without an operator touching
@@ -179,9 +198,17 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("seeding upstream topology from config.toml: {e:#}"))?;
         }
-        srv::db::app_settings::set(&db, SEED_MARKER, "1")
-            .await
-            .map_err(|e| anyhow::anyhow!("recording topology seed marker: {e:#}"))?;
+        // Only final once a file was actually read. Without this, a boot that
+        // found no config file — a volume mounted late, or the binary started
+        // from the wrong directory — burns the marker having seeded nothing,
+        // and the deployment silently loses its whole topology: the pools stay
+        // absent for good and the file is never looked at again. Same rule
+        // `settings::import_once` and `setup::import_config_once` follow.
+        if config.loaded_from.is_some() {
+            srv::db::app_settings::set(&db, SEED_MARKER, "1")
+                .await
+                .map_err(|e| anyhow::anyhow!("recording topology seed marker: {e:#}"))?;
+        }
     }
 
     // Web-search settings used to be env-only. Take over whatever the
@@ -238,9 +265,16 @@ async fn main() -> anyhow::Result<()> {
         srv::db::gateway_groups::seed_from_config(&db, &config.rbac, &config.roles)
             .await
             .map_err(|e| anyhow::anyhow!("seeding RBAC groups from config: {e:#}"))?;
-        srv::db::app_settings::set(&db, RBAC_SEED_MARKER, "1")
-            .await
-            .map_err(|e| anyhow::anyhow!("recording rbac seed marker: {e:#}"))?;
+        // Only final once there was a file to seed *from*. A boot that found no
+        // config file — a volume mounted late, or the binary started from the
+        // wrong directory — has seeded nothing, and burning the marker there
+        // would ignore the file for good when it does turn up. Same rule
+        // `settings::import_once` and `setup::import_config_once` follow.
+        if config.loaded_from.is_some() {
+            srv::db::app_settings::set(&db, RBAC_SEED_MARKER, "1")
+                .await
+                .map_err(|e| anyhow::anyhow!("recording rbac seed marker: {e:#}"))?;
+        }
     }
 
     // Build the RBAC resolver from the DB snapshot: the `read_skill` tool holds

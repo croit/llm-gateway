@@ -23,9 +23,9 @@ The admin sets capabilities per model via `/admin/models` → expandable "Capabi
 
 When the gateway forwards a request and the upstream returns a 400 that matches a known
 capability-rejection pattern (e.g. GLM's `"messages.content.type is invalid"`), the
-[`error_classify`](../../crates/gateway-core/src/server/upstreams/error_classify.rs) module
+[`error_classify`](../crates/gateway-core/src/server/upstreams/error_classify.rs) module
 identifies which capability was rejected and records it in the DB via
-[`mark_unsupported`](../../crates/gateway-core/src/server/db/model_defaults.rs).
+[`mark_unsupported`](../crates/gateway-core/src/server/db/model_defaults.rs).
 
 Key property: **auto-learning never overwrites an admin-set `Enabled`** — the SQL uses
 `CASE WHEN col = 1 THEN 1 ELSE 0 END` to preserve explicit `Some(true)` values. Only

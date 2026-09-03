@@ -944,7 +944,7 @@ fn data_dir_from(raw: Option<std::ffi::OsString>) -> PathBuf {
 ///
 /// Parsed only so that a config file written before this was deprecated still
 /// loads: [`Config`] denies unknown fields, so simply deleting the field would
-/// turn a stale `[bind]` block into a refusal to boot. Both `gateway.toml.example`
+/// turn a stale `[bind]` block into a refusal to boot. Both `gateway.example.toml`
 /// and the README used to show one, so real files carry it.
 ///
 /// It is a process-level knob, and every other process-level knob this gateway
@@ -1388,6 +1388,45 @@ mod tests {
         if let Err(e) = parsed {
             panic!("gateway.example.toml does not parse as a Config: {e}");
         }
+    }
+
+    /// The *previous* release's reference config must still parse.
+    ///
+    /// `the_shipped_example_config_actually_parses` only covers the file as it
+    /// looks now, which says nothing about the file an operator is actually
+    /// running when they pull this release. `Config` denies unknown fields in
+    /// nineteen places, so one key dropped from a struct turns a live
+    /// deployment's `gateway.toml` into a refusal to boot — the worst kind of
+    /// upgrade failure, because it happens before anything can log why.
+    ///
+    /// The fixture is `gateway.example.toml` as committed on the previous
+    /// release, vendored verbatim. Refresh it when a release ships, do not edit
+    /// it to make this pass: if it stops parsing, the fix is a parse-only field
+    /// plus a deprecation warning (see `[bind]` and
+    /// `[gateway].session_key_env`), not a change to the fixture.
+    #[test]
+    fn the_previous_releases_config_still_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/previous-release-gateway.toml");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let parsed: Config = toml::from_str(&raw).unwrap_or_else(|e| {
+            panic!(
+                "a config file from the previous release no longer parses, so upgrading to \
+                 this build would stop the gateway from booting: {e}"
+            )
+        });
+
+        // And the two keys that release documented but this one no longer acts
+        // on must be accepted rather than rejected.
+        assert!(
+            parsed.bind.host.is_some() && parsed.bind.port.is_some(),
+            "[bind]'s host and port must still be accepted (and then ignored)"
+        );
+        assert!(
+            parsed.gateway.session_key_env.is_some(),
+            "[gateway].session_key_env must still be accepted (and then ignored)"
+        );
     }
 
     #[test]
