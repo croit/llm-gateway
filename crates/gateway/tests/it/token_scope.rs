@@ -90,7 +90,7 @@ async fn a_restricted_token_is_refused_the_models_it_does_not_list() {
     mount_chat(&upstream).await;
     let state = state_with_two_models(&upstream).await;
     let (bearer, token_id) = common::seed_user_with_token_id(&state, "alice").await;
-    token_models::set_for_token(&state.db, &token_id, &["model-a".into()])
+    token_models::set_for_token(&state.db, &token_id, &["model-a".into()], ManagedBy::Owner)
         .await
         .unwrap();
     let app = common::app(state);
@@ -137,10 +137,10 @@ async fn clearing_the_allowlist_restores_full_access() {
     mount_chat(&upstream).await;
     let state = state_with_two_models(&upstream).await;
     let (bearer, token_id) = common::seed_user_with_token_id(&state, "alice").await;
-    token_models::set_for_token(&state.db, &token_id, &["model-a".into()])
+    token_models::set_for_token(&state.db, &token_id, &["model-a".into()], ManagedBy::Owner)
         .await
         .unwrap();
-    token_models::set_for_token(&state.db, &token_id, &[])
+    token_models::set_for_token(&state.db, &token_id, &[], ManagedBy::Owner)
         .await
         .unwrap();
     let app = common::app(state);
@@ -222,13 +222,7 @@ async fn session_for(state: &gateway_runtime::rama_server::state::RamaState, use
 }
 
 fn models_post(cookie: &str, token_id: &str, body: &str) -> Request {
-    Request::builder()
-        .method(Method::POST)
-        .uri(format!("/tokens/{token_id}/models"))
-        .header("cookie", format!("id={cookie}"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from(body.to_string()))
-        .unwrap()
+    common::post_form(&format!("/tokens/{token_id}/models"), cookie, body)
 }
 
 /// The trap: a token restricted to exactly the models the deployment happens
@@ -241,9 +235,14 @@ async fn saving_an_all_ticked_picker_keeps_an_existing_restriction() {
     let state = state_with_two_models(&upstream).await;
     let (_, token_id) = common::seed_user_with_token_id(&state, "alice").await;
     // Restricted to every model that currently exists.
-    token_models::set_for_token(&state.db, &token_id, &["model-a".into(), "model-b".into()])
-        .await
-        .unwrap();
+    token_models::set_for_token(
+        &state.db,
+        &token_id,
+        &["model-a".into(), "model-b".into()],
+        ManagedBy::Owner,
+    )
+    .await
+    .unwrap();
     let cookie = session_for(&state, "alice").await;
     let db = state.db.clone();
     let app = common::app(state);
@@ -274,7 +273,7 @@ async fn unchecking_the_limit_clears_the_allowlist() {
     let upstream = MockServer::start().await;
     let state = state_with_two_models(&upstream).await;
     let (_, token_id) = common::seed_user_with_token_id(&state, "alice").await;
-    token_models::set_for_token(&state.db, &token_id, &["model-a".into()])
+    token_models::set_for_token(&state.db, &token_id, &["model-a".into()], ManagedBy::Owner)
         .await
         .unwrap();
     let cookie = session_for(&state, "alice").await;
@@ -298,7 +297,7 @@ async fn restricting_to_nothing_is_refused_rather_than_inverted() {
     let upstream = MockServer::start().await;
     let state = state_with_two_models(&upstream).await;
     let (_, token_id) = common::seed_user_with_token_id(&state, "alice").await;
-    token_models::set_for_token(&state.db, &token_id, &["model-a".into()])
+    token_models::set_for_token(&state.db, &token_id, &["model-a".into()], ManagedBy::Owner)
         .await
         .unwrap();
     let cookie = session_for(&state, "alice").await;
@@ -331,9 +330,14 @@ async fn a_stale_allowlist_entry_survives_a_save() {
     let upstream = MockServer::start().await;
     let state = state_with_two_models(&upstream).await;
     let (_, token_id) = common::seed_user_with_token_id(&state, "alice").await;
-    token_models::set_for_token(&state.db, &token_id, &["model-a".into(), "retired".into()])
-        .await
-        .unwrap();
+    token_models::set_for_token(
+        &state.db,
+        &token_id,
+        &["model-a".into(), "retired".into()],
+        ManagedBy::Owner,
+    )
+    .await
+    .unwrap();
     let cookie = session_for(&state, "alice").await;
     let db = state.db.clone();
     let app = common::app(state);
@@ -406,15 +410,11 @@ async fn an_owner_cannot_raise_or_delete_an_admin_set_quota() {
 
     // Raise it via the self-service form.
     let resp = app
-        .serve(
-            Request::builder()
-                .method(Method::POST)
-                .uri(format!("/tokens/{token_id}/limits"))
-                .header("cookie", format!("id={cookie}"))
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from("dimension=requests&window=day&value=99999"))
-                .unwrap(),
-        )
+        .serve(common::post_form(
+            &format!("/tokens/{token_id}/limits"),
+            &cookie,
+            "dimension=requests&window=day&value=99999",
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "SSE toast");
@@ -424,15 +424,11 @@ async fn an_owner_cannot_raise_or_delete_an_admin_set_quota() {
 
     // …and delete it.
     let resp = app
-        .serve(
-            Request::builder()
-                .method(Method::POST)
-                .uri(format!("/tokens/{token_id}/limits/delete"))
-                .header("cookie", format!("id={cookie}"))
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from(format!("id={}", rules[0].id)))
-                .unwrap(),
-        )
+        .serve(common::post_form(
+            &format!("/tokens/{token_id}/limits/delete"),
+            &cookie,
+            &format!("id={}", rules[0].id),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "SSE toast");
@@ -457,15 +453,11 @@ async fn an_owner_can_still_manage_their_own_quota() {
     let app = common::app(state);
 
     let resp = app
-        .serve(
-            Request::builder()
-                .method(Method::POST)
-                .uri(format!("/tokens/{token_id}/limits"))
-                .header("cookie", format!("id={cookie}"))
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from("dimension=tokens&window=day&value=500"))
-                .unwrap(),
-        )
+        .serve(common::post_form(
+            &format!("/tokens/{token_id}/limits"),
+            &cookie,
+            "dimension=tokens&window=day&value=500",
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -475,15 +467,11 @@ async fn an_owner_can_still_manage_their_own_quota() {
     assert_eq!(rules[0].managed_by, ManagedBy::Owner);
 
     let resp = app
-        .serve(
-            Request::builder()
-                .method(Method::POST)
-                .uri(format!("/tokens/{token_id}/limits/delete"))
-                .header("cookie", format!("id={cookie}"))
-                .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from(format!("id={}", rules[0].id)))
-                .unwrap(),
-        )
+        .serve(common::post_form(
+            &format!("/tokens/{token_id}/limits/delete"),
+            &cookie,
+            &format!("id={}", rules[0].id),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -508,17 +496,11 @@ async fn a_non_finite_quota_is_rejected() {
 
     for value in ["inf", "NaN", "-1"] {
         let resp = app
-            .serve(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("/tokens/{token_id}/limits"))
-                    .header("cookie", format!("id={cookie}"))
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from(format!(
-                        "dimension=requests&window=day&value={value}"
-                    )))
-                    .unwrap(),
-            )
+            .serve(common::post_form(
+                &format!("/tokens/{token_id}/limits"),
+                &cookie,
+                &format!("dimension=requests&window=day&value={value}"),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "SSE toast");
@@ -530,4 +512,84 @@ async fn a_non_finite_quota_is_rejected() {
             "`{value}` must not be stored as a quota"
         );
     }
+}
+
+/// The operator's list and the owner's are separate, and routing enforces the
+/// intersection — the asymmetry this closes is that an admin could cap a
+/// token's spend but had no say at all over its reach.
+#[tokio::test]
+async fn an_operator_restriction_narrows_a_token_the_owner_cannot_widen() {
+    let upstream = MockServer::start().await;
+    mount_chat(&upstream).await;
+    let state = state_with_two_models(&upstream).await;
+    let (bearer, token_id) = common::seed_user_with_token_id(&state, "alice").await;
+
+    // The operator allows only model-a.
+    token_models::set_for_token(&state.db, &token_id, &["model-a".into()], ManagedBy::Admin)
+        .await
+        .unwrap();
+    // The owner tries to grant themselves both.
+    token_models::set_for_token(
+        &state.db,
+        &token_id,
+        &["model-a".into(), "model-b".into()],
+        ManagedBy::Owner,
+    )
+    .await
+    .unwrap();
+
+    let app = common::app(state);
+    let resp = app.serve(chat_req(&bearer, "model-a")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "both lists allow model-a");
+
+    let resp = app.serve(chat_req(&bearer, "model-b")).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "the owner cannot grant past the operator's list"
+    );
+
+    // And the listing agrees.
+    let resp = app.serve(models_req(&bearer)).await.unwrap();
+    let body = common::read_body(resp).await;
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let ids: Vec<&str> = parsed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["model-a"], "{parsed}");
+}
+
+/// Clearing the owner's list must not clear the operator's.
+#[tokio::test]
+async fn an_owner_clearing_their_list_does_not_lift_the_operator_restriction() {
+    let upstream = MockServer::start().await;
+    mount_chat(&upstream).await;
+    let state = state_with_two_models(&upstream).await;
+    let (bearer, token_id) = common::seed_user_with_token_id(&state, "alice").await;
+    token_models::set_for_token(&state.db, &token_id, &["model-a".into()], ManagedBy::Admin)
+        .await
+        .unwrap();
+    let cookie = session_for(&state, "alice").await;
+    let app = common::app(state);
+
+    // Owner turns their own restriction off entirely.
+    let resp = app
+        .serve(models_post(
+            &cookie,
+            &token_id,
+            "models=model-a&models=model-b",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app.serve(chat_req(&bearer, "model-b")).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "the operator's restriction survives the owner clearing theirs"
+    );
 }

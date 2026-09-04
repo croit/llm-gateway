@@ -113,3 +113,4 @@ tokens-limits-removed-toast = Quota du jeton supprimé.
 tokens-limits-not-yours = Ce quota n'est pas le vôtre à supprimer.
 tokens-limits-admin-set = Un administrateur a défini ce quota sur ce jeton ; il ne peut être modifié que sur la page des limites d'administration.
 tokens-limits-admin-badge = défini par l'administrateur
+tokens-models-admin-set = Un opérateur restreint aussi ce jeton à : { $models }. Votre sélection ne peut que réduire cela, pas l'élargir.

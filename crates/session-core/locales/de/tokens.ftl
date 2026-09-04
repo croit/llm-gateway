@@ -113,3 +113,4 @@ tokens-limits-removed-toast = Token-Kontingent entfernt.
 tokens-limits-not-yours = Dieses Kontingent können Sie nicht entfernen.
 tokens-limits-admin-set = Ein Administrator hat dieses Kontingent für dieses Token gesetzt; es lässt sich nur auf der Admin-Limits-Seite ändern.
 tokens-limits-admin-badge = vom Administrator gesetzt
+tokens-models-admin-set = Ein Betreiber beschränkt dieses Token zusätzlich auf: { $models }. Ihre eigene Auswahl kann das nur weiter einschränken, nicht erweitern.

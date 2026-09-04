@@ -116,3 +116,4 @@ tokens-limits-removed-toast = Token quota removed.
 tokens-limits-not-yours = That quota isn't yours to remove.
 tokens-limits-admin-set = An administrator set that quota on this token; it can only be changed on the admin limits page.
 tokens-limits-admin-badge = set by admin
+tokens-models-admin-set = An operator also restricts this token to: { $models }. Your own selection narrows that further; it cannot widen it.

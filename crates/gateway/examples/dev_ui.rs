@@ -826,8 +826,10 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
         ("CI pipeline", 15i64, "revoked"),
         ("Local laptop", 4i64, "unused"),
     ];
+    let mut token_ids: Vec<(String, String)> = Vec::new();
     for (name, age_days, state_kind) in seed_tokens {
         let id = uuid::Uuid::new_v4().to_string();
+        token_ids.push((name.to_string(), id.clone()));
         tokens::insert(
             &state.db,
             &tokens::Token {
@@ -850,6 +852,40 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
             }
             _ => {}
         }
+    }
+
+    // Per-token scope + quota, so the /tokens panels and the /admin/tokens
+    // register show a configured token rather than three default ones.
+    if let Some((_, prod_id)) = token_ids.iter().find(|(n, _)| n == "Production API") {
+        // The owner limits their own token to the two chat models.
+        gateway_core::server::db::token_models::set_for_token(
+            &state.db,
+            prod_id,
+            &["demo-model".into(), "demo-model-pro".into()],
+            limits::ManagedBy::Owner,
+        )
+        .await?;
+        // …and the operator caps what that token may spend.
+        limits::upsert(
+            &state.db,
+            SubjectType::Token,
+            prod_id,
+            None,
+            Dimension::Cost,
+            Window::Month,
+            25.0,
+        )
+        .await?;
+    }
+    if let Some((_, ci_id)) = token_ids.iter().find(|(n, _)| n == "CI pipeline") {
+        // An operator-set restriction, to show the two-list shape.
+        gateway_core::server::db::token_models::set_for_token(
+            &state.db,
+            ci_id,
+            &["demo-model".into()],
+            limits::ManagedBy::Admin,
+        )
+        .await?;
     }
 
     // --- Additional users (for /admin/users) with distinct OIDC groups so the
@@ -907,6 +943,12 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
     use gateway_core::server::db::usage as usage_db;
     use usage_db::{UsageKind, UsageRecord, UsageSource};
     let mut usage_rows: Vec<UsageRecord> = Vec::new();
+    // Attribute the API traffic to the seeded token, so the per-token
+    // breakdown on /usage and the spend line on /tokens have real data.
+    let prod_token_id: Option<String> = token_ids
+        .iter()
+        .find(|(n, _)| n == "Production API")
+        .map(|(_, id)| id.clone());
     // (hours-ago, source, kind, model, status, prompt, completion)
     let events: &[(i64, UsageSource, UsageKind, &str, u16, i64, i64)] = &[
         (
@@ -1047,7 +1089,9 @@ async fn seed_demo_data(state: &RamaState) -> anyhow::Result<()> {
             created_at: unow2 - h.hours(),
             user_id: "dev".into(),
             user_email: Some("dev@example.com".into()),
-            token_id: None,
+            token_id: (source == UsageSource::V1Api)
+                .then(|| prod_token_id.clone())
+                .flatten(),
             token_name: (source == UsageSource::V1Api).then(|| "Production API".to_string()),
             source,
             kind,

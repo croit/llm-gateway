@@ -505,7 +505,9 @@ pub async fn tokens_models(
         return sse_toast_response(FlashKind::Error, t(lang, "tokens-models-none-picked"));
     }
     let to_store: Vec<String> = if restrict { picked } else { Vec::new() };
-    if let Err(err) = token_models::set_for_token(&state.db, &token_id, &to_store).await {
+    if let Err(err) =
+        token_models::set_for_token(&state.db, &token_id, &to_store, ManagedBy::Owner).await
+    {
         tracing::warn!(error = %err, %token_id, "saving token model allowlist");
         return sse_toast_response(FlashKind::Error, t(lang, "tokens-update-failed"));
     }
@@ -987,9 +989,10 @@ struct TokenRowData {
     /// Whether this token allows `ask`-mode MCP connector tools over the API
     /// (the `'*'` default policy). Defaults false; set via `row_with_policy`.
     mcp_allow: bool,
-    /// This token's model allowlist. `None` = unrestricted (no rows), which
-    /// is every token's default — not the same as an empty list.
-    allowed_models: Option<Vec<String>>,
+    /// This token's two model lists: the owner's, which this page edits, and
+    /// the operator's, which it only displays. `None` on a side means that
+    /// author has set nothing; what the gateway enforces is the intersection.
+    model_lists: token_models::TokenModelLists,
     /// Usage attributable to this token in the current calendar month, or
     /// `None` when usage recording is off.
     usage: Option<super::TokenUsage>,
@@ -1049,7 +1052,7 @@ impl TokenRowData {
             delete_action: format!("/tokens/{}/delete", token.id),
             tools_enabled: token.tools_enabled,
             mcp_allow: false,
-            allowed_models: None,
+            model_lists: token_models::TokenModelLists::default(),
             usage: None,
             limits: Vec::new(),
         }
@@ -1061,7 +1064,7 @@ impl TokenRowData {
 /// model allowlists, and the per-token limit rules.
 struct TokenExtras {
     usage: std::collections::HashMap<String, super::TokenUsage>,
-    allowlists: std::collections::HashMap<String, Vec<String>>,
+    allowlists: std::collections::HashMap<String, token_models::TokenModelLists>,
     /// Indexed by token id, so applying them to a row is a lookup rather than
     /// a scan of every rule the user owns.
     limits: std::collections::HashMap<String, Vec<limits::LimitRule>>,
@@ -1100,7 +1103,8 @@ async fn token_extras(state: &RamaState, user: &User, tz: &str) -> TokenExtras {
             .filter(|g| !g.key.is_empty())
             .map(|g| (g.key.clone(), super::TokenUsage::from(g)))
             .collect(),
-        allowlists: token_models::for_user(&state.db, user_id)
+        // The editor needs the two lists apart, not the resolved one.
+        allowlists: token_models::lists_for_user(&state.db, user_id)
             .await
             .unwrap_or_default(),
         limits: group_by_token(
@@ -1136,10 +1140,8 @@ async fn token_extras_one(state: &RamaState, user: &User, token_id: &str, tz: &s
     .await
     .unwrap_or_default();
     let mut allowlists = std::collections::HashMap::new();
-    if let Ok(Some(list)) = token_models::for_token(&state.db, token_id).await {
-        let mut list: Vec<String> = list.into_iter().collect();
-        list.sort();
-        allowlists.insert(token_id.to_string(), list);
+    if let Ok(lists) = token_models::lists_for_token(&state.db, token_id).await {
+        allowlists.insert(token_id.to_string(), lists);
     }
     TokenExtras {
         usage: by_token
@@ -1175,7 +1177,7 @@ fn group_by_token(
 impl TokenExtras {
     /// Apply this page's extras to one row.
     fn apply(&self, mut row: TokenRowData) -> TokenRowData {
-        row.allowed_models = self.allowlists.get(&row.id).cloned();
+        row.model_lists = self.allowlists.get(&row.id).cloned().unwrap_or_default();
         row.usage = self
             .usage_enabled
             .then(|| self.usage.get(&row.id).cloned().unwrap_or_default());
@@ -1339,13 +1341,24 @@ fn render_token_usage(u: &super::TokenUsage, currency: &str, lang: Lang) -> Html
 /// starts from "everything" and the owner unticks what they don't want.
 fn render_token_models(
     token_id: &str,
-    allowed: Option<&Vec<String>>,
+    lists: &token_models::TokenModelLists,
     available: &[String],
     lang: Lang,
 ) -> Html {
     let action = format!("/tokens/{token_id}/models");
     let directive = format!("@post('{action}', {{contentType: 'form'}})");
+    // This form edits the *owner's* list. An operator's list, when there is
+    // one, is shown below it and is not editable here — it narrows this
+    // token regardless of what the owner ticks.
+    let allowed = lists.owner.as_ref();
     let restricted = allowed.is_some();
+    let admin_note = lists.admin.as_ref().map(|a| {
+        t_args(
+            lang,
+            "tokens-models-admin-set",
+            &i18n::args([("models", a.join(", ").into())]),
+        )
+    });
     let boxes: Vec<Html> = available
         .iter()
         .map(|m| {
@@ -1391,6 +1404,9 @@ fn render_token_models(
             ) {
                 p(class: "text-xs text-base-content/60") {
                     (t(lang, "tokens-models-help"))
+                }
+                if let Some(note) = &admin_note {
+                    p(class: "text-xs text-warning") { (note.clone()) }
                 }
                 (super::bool_checkbox(
                     "restrict",
@@ -1560,7 +1576,7 @@ fn render_token_row(
     // Scope and quota panels, same rule: nothing to configure on a token that
     // can no longer authenticate.
     let models_panel =
-        (!r.revoked).then(|| render_token_models(&r.id, r.allowed_models.as_ref(), models, lang));
+        (!r.revoked).then(|| render_token_models(&r.id, &r.model_lists, models, lang));
     let limits_panel = (!r.revoked).then(|| render_token_limits(&r.id, &r.limits, currency, lang));
     // Usage stays on a revoked row: what it spent before it was revoked is
     // exactly what an audit is looking for.

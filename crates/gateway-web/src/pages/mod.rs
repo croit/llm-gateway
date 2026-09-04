@@ -1587,7 +1587,7 @@ pub use admin_users::{impersonate_stop, users_impersonate, users_index as admin_
 // plaintext is unrecoverable by construction, and the write paths stay on the
 // owner's own `/tokens` page.
 mod admin_tokens;
-pub use admin_tokens::admin_tokens_index;
+pub use admin_tokens::{admin_tokens_index, admin_tokens_models};
 
 // Usage statistics: `/usage` for every signed-in user (scoped to their own
 // requests), with an admin-only in-page "All users" toggle (`?scope=all`).

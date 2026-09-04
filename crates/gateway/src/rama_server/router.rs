@@ -222,6 +222,7 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         .with_post("/admin/pools/delete", pages::admin_pools_delete)
         .with_post("/admin/pools/fallback", pages::admin_pools_fallback_save)
         .with_get("/admin/tokens", pages::admin_tokens_index)
+        .with_post("/admin/tokens/{id}/models", pages::admin_tokens_models)
         .with_get("/admin/users", pages::admin_users_index)
         // Target id rides in the POST body (not the path) — rama lowercases
         // path segments, which would mangle case-sensitive OIDC subjects.

@@ -113,3 +113,4 @@ tokens-limits-removed-toast = Cuota del token eliminada.
 tokens-limits-not-yours = Esa cuota no es tuya para eliminarla.
 tokens-limits-admin-set = Un administrador fijó esa cuota en este token; solo puede cambiarse en la página de límites de administración.
 tokens-limits-admin-badge = fijada por el administrador
+tokens-models-admin-set = Un operador también restringe este token a: { $models }. Tu selección solo puede reducir eso, no ampliarlo.

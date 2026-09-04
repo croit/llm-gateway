@@ -113,3 +113,4 @@ tokens-limits-removed-toast = 令牌配额已移除。
 tokens-limits-not-yours = 该配额不由你移除。
 tokens-limits-admin-set = 该配额由管理员为此令牌设置，只能在管理员限额页面更改。
 tokens-limits-admin-badge = 由管理员设置
+tokens-models-admin-set = 运营方还将此令牌限制为：{ $models }。你的选择只能在此基础上进一步收紧，无法放宽。

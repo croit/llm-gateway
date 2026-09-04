@@ -14,24 +14,32 @@
 //! a way to recover one. An admin who needs a working token for someone mints
 //! a new one, or impersonates and rotates.
 //!
-//! Read-only by design. Editing a token's allowlist or quota from here would
-//! need a second set of write paths with a different ownership rule than the
-//! self-service ones on `/tokens`; an admin who must change one can set the
-//! quota on `/admin/limits` (subject `token`) or impersonate the owner. What
-//! this page owes its reader is the whole picture in one place.
+//! Mostly read-only: the one thing an operator can change here is a token's
+//! **model allowlist**, because nothing else could. A quota already has an
+//! operator path (`/admin/limits`, subject `token`), but the allowlist had
+//! none — so an operator could pin a token's spend and not its reach, and the
+//! owner could clear their own restriction at will.
+//!
+//! The operator's list is its own list, not an edit of the owner's: the two
+//! intersect, so each side may only narrow (see migration 0061). That keeps
+//! this page's write path from needing an ownership rule at all — it writes
+//! the admin rows, `/tokens` writes the owner rows, and neither can widen the
+//! other.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use plait::{Html, ToHtml, html};
-use rama::http::service::web::extract::State;
+use rama::http::service::web::extract::{Path, State};
 use rama::http::{Request, Response};
 
 use super::{NavItem, fetch_sidebar_chat, is_admin, nav_or_html_page, require_admin_or_403};
-use session_core::chrome::{NavSections, Theme, is_datastar_request};
+use session_core::chrome::{
+    Flash, FlashKind, NavSections, Theme, is_datastar_request, sse_response, sse_script, sse_toast,
+};
 use session_core::i18n::{self, Lang, t, t_args};
 
-use gateway_core::server::db::limits::{LimitRule, SubjectType};
+use gateway_core::server::db::limits::{LimitRule, ManagedBy, SubjectType};
 use gateway_core::server::db::{limits, token_models, tokens, usage};
 use gateway_runtime::rama_server::state::RamaState;
 
@@ -79,6 +87,13 @@ pub async fn admin_tokens_index(State(state): State<Arc<RamaState>>, req: Reques
         agg.by_token.iter().map(|g| (g.key.as_str(), g)).collect();
 
     let allowlists = token_models::all(&state.db).await.unwrap_or_default();
+    let lists = token_models::lists_all(&state.db).await.unwrap_or_default();
+    // Every model this deployment serves. An operator's list is not bounded
+    // by the token owner's groups — the intersection with the owner's own
+    // reach happens at routing time, via `PoolAccess`.
+    let available = state
+        .upstreams
+        .all_models_for(&gateway_core::server::upstreams::PoolAccess::all());
     let usage_on = state.usage.is_enabled();
     let rules = limits::list_all(&state.db).await.unwrap_or_default();
     // Indexed once: scanning every rule per token row is O(tokens × rules).
@@ -117,6 +132,7 @@ pub async fn admin_tokens_index(State(state): State<Arc<RamaState>>, req: Reques
                 // the same distinction /tokens draws, drawn the same way.
                 usage: usage_on.then(|| u.map(|g| super::TokenUsage::from(*g)).unwrap_or_default()),
                 models: allowlists.get(&t.id).cloned(),
+                lists: lists.get(&t.id).cloned().unwrap_or_default(),
                 limits: rules_by_token
                     .get(t.id.as_str())
                     .map(|v| v.iter().map(|r| (*r).clone()).collect())
@@ -125,7 +141,7 @@ pub async fn admin_tokens_index(State(state): State<Arc<RamaState>>, req: Reques
         })
         .collect();
 
-    let body = render_body(lang, &rows, &currency);
+    let body = render_body(lang, &rows, &currency, &available);
     let chat = fetch_sidebar_chat(&state, &admin.id, None).await;
     let title = t(lang, "admin-tokens-page-title");
     {
@@ -150,6 +166,74 @@ pub async fn admin_tokens_index(State(state): State<Arc<RamaState>>, req: Reques
     }
 }
 
+/// POST /admin/tokens/{id}/models — replace the *operator's* list for a token.
+///
+/// Admin-gated, and it writes only the admin rows: the owner's list is
+/// untouched, and the effective allowlist is the intersection of the two. So
+/// this narrows a token without needing an ownership rule, and without the
+/// owner being able to undo it from `/tokens`.
+pub async fn admin_tokens_models(
+    State(state): State<Arc<RamaState>>,
+    Path(token_id): Path<String>,
+    req: Request,
+) -> Response {
+    let lang = Lang::from_headers(req.headers());
+    if let Err(resp) = super::require_admin_or_403(&state, &req).await {
+        return resp;
+    }
+    let (_, body) = req.into_parts();
+    let pairs: Vec<(String, String)> = match super::read_form(body).await {
+        Ok(f) => f,
+        Err(resp) => return resp,
+    };
+    // The token must exist — a rule against an unknown id can never fire and
+    // would sit on this page forever.
+    if !matches!(
+        gateway_core::server::db::tokens::find_by_id(&state.db, &token_id).await,
+        Ok(Some(_))
+    ) {
+        return toast(FlashKind::Error, t(lang, "tokens-not-found"));
+    }
+    let restrict = super::checkbox_on(super::field(&pairs, "restrict"));
+    let picked = super::fields_all(&pairs, "models");
+    if restrict && picked.is_empty() {
+        return toast(FlashKind::Error, t(lang, "tokens-models-none-picked"));
+    }
+    let to_store: Vec<String> = if restrict { picked } else { Vec::new() };
+    if let Err(err) =
+        token_models::set_for_token(&state.db, &token_id, &to_store, ManagedBy::Admin).await
+    {
+        tracing::warn!(error = %err, %token_id, "saving admin token model allowlist");
+        return toast(FlashKind::Error, t(lang, "tokens-update-failed"));
+    }
+    let message = if to_store.is_empty() {
+        t(lang, "admin-tokens-models-cleared-toast")
+    } else {
+        t_args(
+            lang,
+            "admin-tokens-models-saved-toast",
+            &i18n::args([("count", (to_store.len() as i64).into())]),
+        )
+    };
+    // A full reload is the honest refresh here: the page is one table built
+    // from four bulk reads, and this write changes the resolved-allowlist
+    // column as well as the editor that produced it.
+    sse_response(&[
+        sse_toast(&Flash {
+            kind: FlashKind::Success,
+            message,
+        }),
+        sse_script("window.location.reload()"),
+    ])
+}
+
+fn toast(kind: FlashKind, message: impl Into<String>) -> Response {
+    sse_response(&[sse_toast(&Flash {
+        kind,
+        message: message.into(),
+    })])
+}
+
 struct TokenRow {
     name: String,
     id: String,
@@ -162,15 +246,21 @@ struct TokenRow {
     /// `None` = usage recording is off, so the numbers are unknown rather
     /// than zero.
     usage: Option<super::TokenUsage>,
-    /// `None` = unrestricted, the default.
+    /// The operator's own list (editable here) and the owner's (shown as
+    /// context). What the gateway enforces is their intersection.
+    lists: token_models::TokenModelLists,
+    /// The resolved allowlist — what this token may actually reach.
     models: Option<Vec<String>>,
     limits: Vec<LimitRule>,
 }
 
-fn render_body(lang: Lang, rows: &[TokenRow], currency: &str) -> Html {
+fn render_body(lang: Lang, rows: &[TokenRow], currency: &str, available: &[String]) -> Html {
     let heading = t(lang, "admin-tokens-heading");
     let blurb = t(lang, "admin-tokens-blurb");
-    let body: Vec<Html> = rows.iter().map(|r| render_row(lang, r, currency)).collect();
+    let body: Vec<Html> = rows
+        .iter()
+        .map(|r| render_row(lang, r, currency, available))
+        .collect();
     let count = t_args(
         lang,
         "admin-tokens-count",
@@ -215,7 +305,7 @@ fn render_body(lang: Lang, rows: &[TokenRow], currency: &str) -> Html {
     .to_html()
 }
 
-fn render_row(lang: Lang, r: &TokenRow, currency: &str) -> Html {
+fn render_row(lang: Lang, r: &TokenRow, currency: &str, available: &[String]) -> Html {
     let dates = t_args(
         lang,
         // The same labelled triple the owner sees on /tokens, rather than a
@@ -241,7 +331,7 @@ fn render_row(lang: Lang, r: &TokenRow, currency: &str) -> Html {
             super::DASH.to_string(),
         ),
     };
-    let scope = render_scope(lang, r, currency);
+    let scope = render_scope(lang, r, currency, available);
     html! {
         tr {
             td {
@@ -274,7 +364,7 @@ fn render_state(lang: Lang, r: &TokenRow) -> Html {
 
 /// The token's scope column: its model allowlist and its own quota rules —
 /// the two things that make one token different from another.
-fn render_scope(lang: Lang, r: &TokenRow, currency: &str) -> Html {
+fn render_scope(lang: Lang, r: &TokenRow, currency: &str, available: &[String]) -> Html {
     let models = match &r.models {
         None => t(lang, "limits-all-models"),
         Some(list) => list.join(", "),
@@ -289,11 +379,95 @@ fn render_scope(lang: Lang, r: &TokenRow, currency: &str) -> Html {
         .iter()
         .map(|rule| super::describe_rule(lang, rule, currency))
         .collect();
+    let editor = (!r.revoked).then(|| render_admin_models(&r.id, &r.lists, available, lang));
     html! {
         div(class: "flex flex-col gap-1") {
             div(class: (model_class)) { (models) }
             if !rules.is_empty() {
                 div(class: "text-xs text-base-content/70") { (rules.join(" · ")) }
+            }
+            if let Some(e) = &editor { (e) }
+        }
+    }
+    .to_html()
+}
+
+/// The operator's model allowlist for one token.
+///
+/// Its own list, deliberately — not an edit of the owner's. The two intersect,
+/// so ticking a model here cannot grant one the owner has excluded, and the
+/// owner cannot re-grant one removed here. Same two-control shape as the
+/// owner's editor: whether there is a restriction is a checkbox of its own,
+/// never inferred from the ticks.
+fn render_admin_models(
+    token_id: &str,
+    lists: &token_models::TokenModelLists,
+    available: &[String],
+    lang: Lang,
+) -> Html {
+    let action = format!("/admin/tokens/{token_id}/models");
+    let directive = format!("@post('{action}', {{contentType: 'form'}})");
+    let allowed = lists.admin.as_ref();
+    let restricted = allowed.is_some();
+    let boxes: Vec<Html> = available
+        .iter()
+        .map(|m| {
+            let on = match allowed {
+                None => true,
+                Some(list) => list.iter().any(|a| a == m),
+            };
+            super::bool_checkbox("models", m, m, on, true)
+        })
+        .collect();
+    // A model the operator listed that no pool serves any more stays ticked,
+    // so saving cannot silently widen the token.
+    let stale: Vec<Html> = allowed
+        .map(|list| {
+            list.iter()
+                .filter(|m| !available.iter().any(|a| a == *m))
+                .map(|m| super::bool_checkbox("models", m, m, true, true))
+                .collect()
+        })
+        .unwrap_or_default();
+    let summary = if restricted {
+        t_args(
+            lang,
+            "admin-tokens-models-summary-restricted",
+            &i18n::args([("count", (allowed.map_or(0, Vec::len) as i64).into())]),
+        )
+    } else {
+        t(lang, "admin-tokens-models-summary-all")
+    };
+    html! {
+        details(class: "mt-1") {
+            summary(class: "text-xs text-base-content/70 cursor-pointer select-none") {
+                (summary)
+            }
+            form(
+                action: (action),
+                method: "post",
+                class: "m-0 mt-2 flex flex-col gap-2",
+                "data-on:submit__prevent": (directive)
+            ) {
+                p(class: "text-xs text-base-content/60") {
+                    (t(lang, "admin-tokens-models-help"))
+                }
+                (super::bool_checkbox(
+                    "restrict",
+                    "on",
+                    &t(lang, "admin-tokens-models-restrict-label"),
+                    restricted,
+                    false,
+                ))
+                div(class: "flex flex-wrap gap-x-4 gap-y-1") {
+                    for b in boxes.iter() { (b.clone()) }
+                    for b in stale.iter() { (b.clone()) }
+                }
+                div {
+                    button(type: "submit", class: "btn btn-outline btn-xs") {
+                        (t(lang, "tokens-models-save"))
+                    }
+                }
             }
         }
     }
