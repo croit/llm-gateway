@@ -1311,6 +1311,41 @@ pub async fn list_log_entries(
     rows.iter().map(map_log_row).collect()
 }
 
+/// The most recent per-source file count each ref reported, keyed by ref id.
+///
+/// The aggregate build records what every source contributed (see the walk
+/// loop in `rag::worker`), which is the only place that number exists — the
+/// refs table carries a *status*, and a source can be `ready` while having
+/// put nothing in the index. This is what lets the UI and
+/// `rag_list_collections` say "32 sources, 3 of them empty" instead of "32
+/// sources ready".
+pub async fn latest_source_files(
+    pool: &Pool,
+    collection_id: i64,
+) -> Result<std::collections::HashMap<i64, i64>, DbError> {
+    // The newest row per ref that actually carried a file count. `MAX(id)`
+    // picks the latest build; older rows for the same ref are ignored.
+    let rows = sqlx::query(
+        "SELECT ref_id, files FROM rag_index_log \
+         WHERE id IN ( \
+             SELECT MAX(id) FROM rag_index_log \
+             WHERE collection_id = ? AND files IS NOT NULL \
+             GROUP BY ref_id \
+         )",
+    )
+    .bind(collection_id)
+    .fetch_all(pool)
+    .await?;
+    let mut out = std::collections::HashMap::with_capacity(rows.len());
+    for r in &rows {
+        out.insert(
+            r.try_get::<i64, _>("ref_id")?,
+            r.try_get::<i64, _>("files")?,
+        );
+    }
+    Ok(out)
+}
+
 /// Trim a ref's log to its newest `keep` rows. Called after each insert so
 /// a long-lived, frequently-reindexed ref doesn't grow its log unbounded.
 /// Returns how many rows were pruned.
@@ -2362,6 +2397,63 @@ mod tests {
             find_ref_by_id(&pool, r.id).await.unwrap().unwrap().status,
             CollectionStatus::Pending
         );
+    }
+
+    /// `latest_source_files` is what lets a UI (and the model) tell "this
+    /// source is ready" from "this source put nothing in the index" — the
+    /// distinction a collection reporting `32 sources ready` cannot make on
+    /// its own, and the one that let a whole repo go missing unnoticed.
+    #[tokio::test]
+    async fn latest_source_files_reports_the_newest_count_per_ref() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let a = add_ref(&pool, c.id, "a", None, true).await.unwrap();
+        let b = add_ref(&pool, c.id, "b", None, false).await.unwrap();
+
+        let entry = |ref_id, files: Option<i64>| NewLogEntry {
+            ref_id,
+            collection_id: c.id,
+            level: LogLevel::Info,
+            phase: "indexing".into(),
+            message: "contributed".into(),
+            commit_sha: None,
+            files,
+            chunks: None,
+            duration_ms: None,
+        };
+        // An older build for `a`, then a newer one — the newer must win.
+        insert_log_entry(&pool, &entry(a.id, Some(500)))
+            .await
+            .unwrap();
+        insert_log_entry(&pool, &entry(a.id, Some(312)))
+            .await
+            .unwrap();
+        // `b` contributed nothing at its last build.
+        insert_log_entry(&pool, &entry(b.id, Some(0)))
+            .await
+            .unwrap();
+        // A row with no file count must not overwrite a real one.
+        insert_log_entry(&pool, &entry(a.id, None)).await.unwrap();
+
+        let map = latest_source_files(&pool, c.id).await.unwrap();
+        assert_eq!(map.get(&a.id), Some(&312), "newest count wins: {map:?}");
+        assert_eq!(
+            map.get(&b.id),
+            Some(&0),
+            "zero is a reportable value, not an absence: {map:?}"
+        );
+    }
+
+    /// A ref that has never reported a count is absent from the map — callers
+    /// render nothing rather than claiming zero, which would libel a source
+    /// indexed before this tracking existed.
+    #[tokio::test]
+    async fn a_ref_that_never_reported_is_absent_rather_than_zero() {
+        let pool = fresh().await;
+        let c = create_collection(&pool, &sample_new()).await.unwrap();
+        let r = add_ref(&pool, c.id, "main", None, true).await.unwrap();
+        let map = latest_source_files(&pool, c.id).await.unwrap();
+        assert!(!map.contains_key(&r.id), "{map:?}");
     }
 
     #[tokio::test]

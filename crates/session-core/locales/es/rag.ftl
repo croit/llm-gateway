@@ -224,3 +224,5 @@ rag-oauth-provider-refused = El proveedor rechazó la autorización: { $error }
 rag-oauth-exchange-failed = Falló el intercambio del código de autorización: { $error }
 rag-oauth-no-refresh-token = El proveedor no devolvió un token de actualización, por lo que la indexación desatendida no sería posible. Revoque el acceso de la pasarela en su cuenta del proveedor y vuelva a conectar.
 rag-oauth-store-failed = No se pudieron guardar las credenciales.
+rag-badge-no-files = sin archivos indexados
+rag-ref-files = { $files } archivos

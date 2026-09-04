@@ -224,3 +224,5 @@ rag-oauth-provider-refused = Der Anbieter hat die Autorisierung abgelehnt: { $er
 rag-oauth-exchange-failed = Der Tausch des Autorisierungscodes ist fehlgeschlagen: { $error }
 rag-oauth-no-refresh-token = Der Anbieter hat kein Refresh-Token geliefert; unbeaufsichtigtes Indexieren wäre damit nicht möglich. Entziehen Sie dem Gateway im Anbieterkonto den Zugriff und verbinden Sie erneut.
 rag-oauth-store-failed = Die Zugangsdaten konnten nicht gespeichert werden.
+rag-badge-no-files = keine Dateien indexiert
+rag-ref-files = { $files } Dateien

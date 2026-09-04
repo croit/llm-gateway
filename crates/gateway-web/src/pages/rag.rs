@@ -108,6 +108,13 @@ pub async fn rag_index(State(state): State<Arc<RamaState>>, req: Request) -> Res
     )
     .await
     .filter(|m| embedding_models.iter().any(|a| a == m));
+    // One map for the whole page: every collection's per-source file counts.
+    let mut files_by_ref: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for (c, _) in &rows {
+        if let Ok(m) = rag_db::latest_source_files(&state.db, c.id).await {
+            files_by_ref.extend(m);
+        }
+    }
     let body = render_body(
         lang,
         &rows,
@@ -115,6 +122,7 @@ pub async fn rag_index(State(state): State<Arc<RamaState>>, req: Request) -> Res
         default_embedding.as_deref(),
         providers(&state),
         &docs_db::list_profiles(&state.db).await.unwrap_or_default(),
+        &files_by_ref,
     );
     let chat = fetch_sidebar_chat(&state, &user.id, None).await;
     let title = t(lang, "rag-page-title");
@@ -214,7 +222,10 @@ pub async fn rag_create(State(state): State<Arc<RamaState>>, req: Request) -> Re
     let refs = rag_db::list_refs(&state.db, created.id)
         .await
         .unwrap_or_default();
-    let row_html = render_row(lang, &created, &refs).to_string();
+    let files_by_ref = rag_db::latest_source_files(&state.db, created.id)
+        .await
+        .unwrap_or_default();
+    let row_html = render_row(lang, &created, &refs, &files_by_ref).to_string();
     sse_response(&[
         sse_patch(Some("#rag-list"), Some("append"), &row_html),
         sse_script("document.getElementById('rag-create-form').reset()"),
@@ -1114,9 +1125,13 @@ pub async fn rag_status(State(state): State<Arc<RamaState>>, req: Request) -> Re
     for c in &collections {
         let refs = rag_db::list_refs(&state.db, c.id).await.unwrap_or_default();
         let primary = refs.iter().find(|r| r.is_primary);
+        let files_by_ref = rag_db::latest_source_files(&state.db, c.id)
+            .await
+            .unwrap_or_default();
         for r in &refs {
             let selector = format!("#rag-ref-{}", r.id);
-            let html = render_ref(lang, c, r, primary).to_string();
+            let html =
+                render_ref(lang, c, r, primary, files_by_ref.get(&r.id).copied()).to_string();
             events.push(sse_patch(Some(&selector), Some("outer"), &html));
         }
     }
@@ -1417,7 +1432,15 @@ pub async fn rag_update(
         sse_patch(
             Some(&selector),
             Some("outer"),
-            &render_row(lang, &updated, &refs).to_string(),
+            &render_row(
+                lang,
+                &updated,
+                &refs,
+                &rag_db::latest_source_files(&state.db, updated.id)
+                    .await
+                    .unwrap_or_default(),
+            )
+            .to_string(),
         ),
         sse_toast(&Flash {
             kind: FlashKind::Success,
@@ -1586,7 +1609,12 @@ fn status_badge(lang: Lang, status: rag_db::CollectionStatus) -> Html {
     .to_html()
 }
 
-fn render_row(lang: Lang, c: &rag_db::Collection, refs: &[rag_db::CollectionRef]) -> Html {
+fn render_row(
+    lang: Lang,
+    c: &rag_db::Collection,
+    refs: &[rag_db::CollectionRef],
+    files_by_ref: &std::collections::HashMap<i64, i64>,
+) -> Html {
     let dom_id = format!("rag-row-{}", c.id);
     let delete_action = format!("/rag/{}/delete", c.id);
     let edit_action = format!("/rag/{}/edit-form", c.id);
@@ -1711,7 +1739,7 @@ fn render_row(lang: Lang, c: &rag_db::Collection, refs: &[rag_db::CollectionRef]
             // Per-ref/source rows: each indexed independently in its own store.
             div(class: "mt-1 pl-3 border-l border-base-300 flex flex-col gap-1.5") {
                 for r in refs.iter() {
-                    (render_ref(lang, c, r, primary))
+                    (render_ref(lang, c, r, primary, files_by_ref.get(&r.id).copied()))
                     // Empty container the "Log" button fills in on demand. Kept
                     // OUTSIDE `render_ref` so the status poll (which re-patches
                     // `#rag-ref-{id}`) doesn't wipe an opened log.
@@ -1815,6 +1843,10 @@ fn render_ref(
     c: &rag_db::Collection,
     r: &rag_db::CollectionRef,
     primary: Option<&rag_db::CollectionRef>,
+    // What this source contributed at the last index, when known. `Some(0)` is
+    // the case worth seeing: the row says `ready` and the collection counts it
+    // among its sources, yet none of its content is searchable.
+    files: Option<i64>,
 ) -> Html {
     let dom_id = format!("rag-ref-{}", r.id);
     let reindex_action = format!("/rag/refs/{}/reindex", r.id);
@@ -1877,6 +1909,17 @@ fn render_ref(
             (status_badge(lang, s.status))
             span(class: "text-xs text-base-content/60") {
                 (indexed_line)
+            }
+            if let Some(n) = files {
+                if n == 0 {
+                    span(class: "badge badge-sm badge-warning") {
+                        (t(lang, "rag-badge-no-files"))
+                    }
+                } else {
+                    span(class: "text-xs text-base-content/60") {
+                        (t_args(lang, "rag-ref-files", &i18n::args([("files", n.into())])))
+                    }
+                }
             }
             if let Some(err) = s.last_error.as_ref() {
                 // Headline the most recent error/advisory; the Log button
@@ -1973,7 +2016,10 @@ async fn row_html(state: &RamaState, lang: Lang, collection_id: i64) -> Option<S
     let refs = rag_db::list_refs(&state.db, collection_id)
         .await
         .unwrap_or_default();
-    Some(render_row(lang, &c, &refs).to_string())
+    let files_by_ref = rag_db::latest_source_files(&state.db, c.id)
+        .await
+        .unwrap_or_default();
+    Some(render_row(lang, &c, &refs, &files_by_ref).to_string())
 }
 
 fn render_create_form(
@@ -2468,6 +2514,7 @@ fn embedding_model_field(lang: Lang, models: &[String], selected: Option<&str>) 
     .to_html()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_body(
     lang: Lang,
     list: &[(rag_db::Collection, Vec<rag_db::CollectionRef>)],
@@ -2475,6 +2522,9 @@ fn render_body(
     default_embedding: Option<&str>,
     registry: &ProviderRegistry,
     profiles: &[docs_db::Profile],
+    // Per-source file counts, keyed by ref id, across every collection on the
+    // page — see `latest_source_files`.
+    files_by_ref: &std::collections::HashMap<i64, i64>,
 ) -> Html {
     html! {
         div(class: "max-w-5xl mx-auto w-full px-4 sm:px-6 pt-14 sm:pt-6 pb-6") {
@@ -2519,7 +2569,7 @@ fn render_body(
                         "data-on-interval__duration.4s": (if list.is_empty() { "" } else { "@get('/rag/status')" })
                     ) {
                         for (c, refs) in list.iter() {
-                            (render_row(lang, c, refs))
+                            (render_row(lang, c, refs, files_by_ref))
                         }
                     }
                     if list.is_empty() {
@@ -2759,7 +2809,7 @@ mod tests {
             rag_db::CollectionStatus::Error,
             Some("Branch 'x' does not exist"),
         );
-        let html = render_ref(Lang::En, &c, &r, Some(&r)).to_string();
+        let html = render_ref(Lang::En, &c, &r, Some(&r), None).to_string();
         // (plait HTML-escapes attribute values, so match escaping-safe
         // substrings — the stable id and the endpoint path.)
         assert!(html.contains("rag-ref-42"), "{html}");
@@ -2786,7 +2836,7 @@ mod tests {
         let mut other = cref(2, rag_db::CollectionStatus::Ready, None);
         other.is_primary = false;
 
-        let html = render_ref(Lang::En, &c, &other, Some(&primary)).to_string();
+        let html = render_ref(Lang::En, &c, &other, Some(&primary), None).to_string();
         // The non-primary row shows the primary's live status, not its own.
         assert!(
             html.contains("cloning"),
@@ -2822,7 +2872,7 @@ mod tests {
         let mut other = cref(2, rag_db::CollectionStatus::Ready, None);
         other.is_primary = false;
 
-        let html = render_ref(Lang::En, &c, &other, Some(&primary)).to_string();
+        let html = render_ref(Lang::En, &c, &other, Some(&primary), None).to_string();
         assert!(
             html.contains("2026-07-06"),
             "non-primary row must show the primary's indexed date, not 'never': {html}"
@@ -2846,7 +2896,7 @@ mod tests {
         let primary = cref(1, rag_db::CollectionStatus::Cloning, None);
         let mut other = cref(2, rag_db::CollectionStatus::Ready, None);
         other.is_primary = false;
-        let html = render_ref(Lang::En, &c, &other, Some(&primary)).to_string();
+        let html = render_ref(Lang::En, &c, &other, Some(&primary), None).to_string();
         assert!(
             html.contains("ready"),
             "versioned row shows its own status: {html}"
@@ -2867,7 +2917,7 @@ mod tests {
         c.search_mode = rag_db::SearchMode::Aggregate;
         let mut r = cref(7, rag_db::CollectionStatus::Ready, None);
         r.is_primary = false;
-        let html = render_ref(Lang::En, &c, &r, Some(&r)).to_string();
+        let html = render_ref(Lang::En, &c, &r, Some(&r), None).to_string();
         assert!(html.contains("Edit"), "{html}");
         assert!(html.contains("/rag/refs/7/edit-form"), "{html}");
     }
@@ -2904,6 +2954,7 @@ mod tests {
             None,
             &registry,
             &[],
+            &Default::default(),
         )
         .to_string();
         assert!(html.contains("data-on-interval__duration.4s"), "{html}");
@@ -2915,7 +2966,16 @@ mod tests {
     #[test]
     fn render_body_empty_list_does_not_poll() {
         let registry = ProviderRegistry::with_builtins();
-        let html = render_body(Lang::En, &[], &["embed".into()], None, &registry, &[]).to_string();
+        let html = render_body(
+            Lang::En,
+            &[],
+            &["embed".into()],
+            None,
+            &registry,
+            &[],
+            &Default::default(),
+        )
+        .to_string();
         assert!(!html.contains("/rag/status"), "{html}");
     }
 

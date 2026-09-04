@@ -992,11 +992,55 @@ impl Indexer {
             cloned.sort_by_key(|(i, ..)| *i);
             let mut files: Vec<walk::WalkedFile> = Vec::new();
             let mut commits: Vec<String> = Vec::new();
-            for (_, label, sub, sha) in &cloned {
+            for (idx, label, sub, sha) in &cloned {
                 commits.push(format!("{label}:{sha}"));
+                let before = files.len();
                 for mut wf in walk::walk(sub, &filter)? {
                     wf.rel_path = format!("{label}/{}", wf.rel_path);
                     files.push(wf);
+                }
+                let contributed = files.len() - before;
+                // Record what each source actually contributed, against that
+                // source's own ref.
+                //
+                // Only the primary ref runs an aggregate build, so without
+                // this every other source's Log pane is permanently empty —
+                // and "no events recorded" reads exactly like "this source
+                // indexed fine", when it may have contributed nothing at all.
+                // That is precisely how a collection can report 32 sources
+                // ready while a repo's content is missing from the index.
+                //
+                // Zero files is a warning, not an info: a source that matches
+                // nothing is either a bad glob or a clone that produced an
+                // empty tree, and both are silent failures worth seeing.
+                let source_ref_id = sources.get(*idx).map(|s| s.id);
+                if let Some(source_ref_id) = source_ref_id {
+                    let (level, message) = if contributed == 0 {
+                        (
+                            rag_db::LogLevel::Warn,
+                            format!(
+                                "`{label}` contributed 0 files to the index — check the \
+                                 include/exclude globs and that the branch has content."
+                            ),
+                        )
+                    } else {
+                        (
+                            rag_db::LogLevel::Info,
+                            format!("`{label}` contributed {contributed} files."),
+                        )
+                    };
+                    self.log_event(rag_db::NewLogEntry {
+                        ref_id: source_ref_id,
+                        collection_id: collection.id,
+                        level,
+                        phase: "indexing".into(),
+                        message,
+                        commit_sha: Some(sha.clone()),
+                        files: Some(contributed as i64),
+                        chunks: None,
+                        duration_ms: None,
+                    })
+                    .await;
                 }
             }
             // Deterministic order across runs (and a stable commit marker that

@@ -226,3 +226,5 @@ rag-oauth-provider-refused = The provider refused the authorization: { $error }
 rag-oauth-exchange-failed = Exchanging the authorization code failed: { $error }
 rag-oauth-no-refresh-token = The provider returned no refresh token, so the gateway could not keep indexing unattended. Remove the gateway's access in your provider account and connect again.
 rag-oauth-store-failed = Could not store the credentials.
+rag-badge-no-files = no files indexed
+rag-ref-files = { $files } files

@@ -224,3 +224,5 @@ rag-oauth-provider-refused = Le fournisseur a refusé l'autorisation : { $error 
 rag-oauth-exchange-failed = L'échange du code d'autorisation a échoué : { $error }
 rag-oauth-no-refresh-token = Le fournisseur n'a renvoyé aucun jeton de rafraîchissement ; l'indexation autonome serait impossible. Révoquez l'accès de la passerelle dans votre compte fournisseur puis reconnectez.
 rag-oauth-store-failed = Impossible d'enregistrer les identifiants.
+rag-badge-no-files = aucun fichier indexé
+rag-ref-files = { $files } fichiers

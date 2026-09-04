@@ -224,3 +224,5 @@ rag-oauth-provider-refused = 提供方拒绝了授权：{ $error }
 rag-oauth-exchange-failed = 交换授权码失败：{ $error }
 rag-oauth-no-refresh-token = 提供方未返回刷新令牌，网关将无法在无人值守时继续索引。请在提供方账号中撤销网关的访问权限后重新连接。
 rag-oauth-store-failed = 无法保存凭据。
+rag-badge-no-files = 未索引任何文件
+rag-ref-files = { $files } 个文件

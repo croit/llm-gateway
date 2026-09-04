@@ -224,3 +224,5 @@ rag-oauth-provider-refused = Провайдер отклонил авториз�
 rag-oauth-exchange-failed = Не удалось обменять код авторизации: { $error }
 rag-oauth-no-refresh-token = Провайдер не вернул refresh-токен, поэтому автономная индексация невозможна. Отзовите доступ шлюза в учётной записи провайдера и подключитесь снова.
 rag-oauth-store-failed = Не удалось сохранить учётные данные.
+rag-badge-no-files = файлы не проиндексированы
+rag-ref-files = файлов: { $files }

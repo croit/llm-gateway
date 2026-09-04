@@ -109,16 +109,43 @@ impl Tool for RagListCollections {
                     // them all tempts the model into searching them one-by-one.
                     // One rag_search with no `ref` already covers every source
                     // (it's a single unified index).
-                    rag_db::SearchMode::Aggregate => json!({
-                        "name": c.name,
-                        "description": c.description,
-                        "mode": "aggregate",
-                        "sources": refs.len(),
-                        "usage": "Search the WHOLE collection in a SINGLE rag_search call \
-                                  with no `ref` — it is one unified index over all source \
-                                  repos. Prefer one broad query; result paths are prefixed \
-                                  with the source repo (e.g. `pve-manager/...`).",
-                    }),
+                    rag_db::SearchMode::Aggregate => {
+                        // A source can be `ready` and still have contributed
+                        // nothing — a bad glob, an empty branch, a clone that
+                        // produced no matching files. Reporting only the source
+                        // *count* is how a collection advertises 32 repos while
+                        // some of them are absent from the index, and the model
+                        // then reports "not in the source" for code that simply
+                        // was never indexed. Name the empty ones.
+                        let files_by_ref = rag_db::latest_source_files(indexer.db(), c.id)
+                            .await
+                            .unwrap_or_default();
+                        let empty: Vec<String> = refs
+                            .iter()
+                            .filter(|r| files_by_ref.get(&r.id).copied() == Some(0))
+                            .map(|r| r.source_label(c))
+                            .collect();
+                        let mut entry = json!({
+                            "name": c.name,
+                            "description": c.description,
+                            "mode": "aggregate",
+                            "sources": refs.len(),
+                            "usage": "Search the WHOLE collection in a SINGLE rag_search call \
+                                      with no `ref` — it is one unified index over all source \
+                                      repos. Prefer one broad query; result paths are prefixed \
+                                      with the source repo (e.g. `pve-manager/...`).",
+                        });
+                        if !empty.is_empty() {
+                            entry["sources_empty"] = json!(empty);
+                            entry["caveat"] = json!(
+                                "These sources contributed 0 files at the last index, so \
+                                 their content is NOT searchable here. If a question is \
+                                 about one of them, say the source is not indexed rather \
+                                 than concluding the code does not exist."
+                            );
+                        }
+                        entry
+                    }
                     // Versioned: the refs ARE distinct versions, so list them —
                     // the caller needs to pick (or rely on the primary).
                     rag_db::SearchMode::Versioned => {
@@ -236,15 +263,15 @@ impl Tool for RagSearch {
                                         that directory, at any depth), `*.rs`, \
                                         `*/tests/*`. Matched against the indexed file path \
                                         with glob syntax (`*` any characters, `?` one, \
-                                        `[abc]` a set) and case-sensitively. Paths are \
-                                        relative to each source's own root and carry NO \
-                                        repo prefix, on aggregate collections too — \
-                                        `PVE/API2/Nodes.pm`, not `pve-manager/PVE/...`, \
-                                        so a glob like `pve-manager/*` matches nothing \
-                                        at all. Narrows the search rather than \
-                                        guaranteeing every match under the path — leave \
-                                        it off unless the user pointed at a specific \
-                                        area."
+                                        `[abc]` a set) and case-sensitively. On an \
+                                        aggregate collection every path is prefixed with \
+                                        its source repo (the git URL's basename), e.g. \
+                                        `pve-container/src/PVE/LXC.pm` — so \
+                                        `pve-manager/*` scopes to one repo. A \
+                                        single-source collection has no such prefix. \
+                                        Narrows the search rather than guaranteeing \
+                                        every match under the path — leave it off unless \
+                                        the user pointed at a specific area."
                     },
                     "top_k": {
                         "type": "integer",
@@ -449,11 +476,11 @@ impl Tool for RagGrep {
                         "description": "Path filter, e.g. `src/osd/*`, `*.rs`, `*/tests/*`. \
                                         Glob syntax, case-sensitive, matched against the \
                                         indexed path (on an aggregate collection paths \
-                                        are relative to each source's own root and \
-                                        carry NO repo prefix, so `pve-manager/*` matches \
-                                        nothing — use `PVE/*`). Strongly preferred when \
-                                        you know roughly where to look — it is what \
-                                        keeps the scan cheap."
+                                        on an aggregate collection are prefixed with \
+                                        their source repo, so `pve-manager/*` scopes to \
+                                        that repo). Strongly preferred when you know \
+                                        roughly where to look — it is what keeps the \
+                                        scan cheap."
                     },
                     "ignore_case": {
                         "type": "boolean",
