@@ -13,19 +13,9 @@ use std::sync::Arc;
 
 use common::Service as _;
 use gateway::rama_server::router::router;
+use rama::http::StatusCode;
 use rama::http::body::util::BodyExt;
-use rama::http::{Body, Method, Request, StatusCode};
 use session_core::db::{self as chat, TurnRole, TurnStatus};
-
-fn post_form(uri: &str, cookie: &str, body: &str) -> Request {
-    Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("cookie", format!("id={cookie}"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from(body.to_string()))
-        .unwrap()
-}
 
 /// Seed a session with the given (role, id) turns. Assistant turns are
 /// finalized as completed so they look like real past replies.
@@ -61,7 +51,7 @@ async fn retry_drops_the_reply_and_everything_below_then_regenerates() {
 
     // Retry the FIRST assistant reply (a1): drops a1, u2, a3.
     let resp = app
-        .serve(post_form(
+        .serve(common::post_form(
             &format!("/chat/{session_id}/turns/a1/retry"),
             &cookie,
             "model=model-a",
@@ -104,7 +94,7 @@ async fn edit_rewrites_the_message_drops_below_then_regenerates() {
 
     // Edit the FIRST user turn (u0): rewrite text, drop a1/u2/a3.
     let resp = app
-        .serve(post_form(
+        .serve(common::post_form(
             &format!("/chat/{session_id}/turns/u0/edit"),
             &cookie,
             "model=model-a&message=rewritten+question",
@@ -135,7 +125,7 @@ async fn retry_on_a_user_turn_is_rejected() {
     let app = router(state.clone());
 
     let resp = app
-        .serve(post_form(
+        .serve(common::post_form(
             &format!("/chat/{session_id}/turns/u0/retry"),
             &cookie,
             "model=model-a",
@@ -156,7 +146,7 @@ async fn edit_on_an_assistant_turn_is_rejected() {
     let app = router(state.clone());
 
     let resp = app
-        .serve(post_form(
+        .serve(common::post_form(
             &format!("/chat/{session_id}/turns/a1/edit"),
             &cookie,
             "model=model-a&message=hack",
@@ -195,7 +185,7 @@ async fn retry_and_edit_streams_arm_the_stop_control() {
         let app = router(state.clone());
 
         let resp = app
-            .serve(post_form(
+            .serve(common::post_form(
                 &format!("/chat/{session_id}/{action}"),
                 &cookie,
                 form,
@@ -230,7 +220,7 @@ async fn cannot_retry_in_someone_elses_session() {
 
     // Bob (authenticated) tries to retry inside Alice's session.
     let resp = app
-        .serve(post_form(
+        .serve(common::post_form(
             &format!("/chat/{session_id}/turns/a1/retry"),
             &bob,
             "model=model-a",

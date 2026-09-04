@@ -14,16 +14,6 @@ use gateway::rama_server::router::router;
 use rama::http::{Body, Method, Request, StatusCode};
 use session_core::db as chat;
 
-fn post_form(uri: &str, cookie: &str, body: &str) -> Request {
-    Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("cookie", format!("id={cookie}"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from(body.to_string()))
-        .unwrap()
-}
-
 /// A datastar-issued POST (the `datastar-request: true` header is what
 /// `is_datastar_request` keys on) — exercises the SSE branch.
 fn datastar_post(uri: &str, cookie: &str, body: &str) -> Request {
@@ -55,7 +45,7 @@ async fn owner_pin_toggle_flips_the_flag() {
 
     // Pin.
     let resp = app
-        .serve(post_form(&format!("/chat/{sid}/pin"), &alice, ""))
+        .serve(common::post_form(&format!("/chat/{sid}/pin"), &alice, ""))
         .await
         .unwrap();
     assert!(resp.status().is_redirection());
@@ -68,7 +58,7 @@ async fn owner_pin_toggle_flips_the_flag() {
     );
 
     // Unpin (toggle back).
-    app.serve(post_form(&format!("/chat/{sid}/pin"), &alice, ""))
+    app.serve(common::post_form(&format!("/chat/{sid}/pin"), &alice, ""))
         .await
         .unwrap();
     assert!(
@@ -89,7 +79,7 @@ async fn non_owner_pin_toggle_is_a_noop() {
     let app = router(state.clone());
 
     let resp = app
-        .serve(post_form(&format!("/chat/{sid}/pin"), &bob, ""))
+        .serve(common::post_form(&format!("/chat/{sid}/pin"), &bob, ""))
         .await
         .unwrap();
     assert!(resp.status().is_redirection());

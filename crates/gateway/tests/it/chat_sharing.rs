@@ -22,16 +22,6 @@ fn get(uri: &str, cookie: &str) -> Request {
         .unwrap()
 }
 
-fn post_form(uri: &str, cookie: &str, body: &str) -> Request {
-    Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("cookie", format!("id={cookie}"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from(body.to_string()))
-        .unwrap()
-}
-
 /// A datastar-issued POST (the `datastar-request: true` header is what
 /// `is_datastar_request` keys on) — exercises the SSE branch rather than the
 /// no-JS redirect fallback.
@@ -72,7 +62,7 @@ async fn shared_session_is_readable_read_only_by_other_user() {
 
     // Owner shares.
     let resp = app
-        .serve(post_form(&format!("/chat/{sid}/share"), &alice, ""))
+        .serve(common::post_form(&format!("/chat/{sid}/share"), &alice, ""))
         .await
         .unwrap();
     assert!(resp.status().is_redirection());
@@ -108,12 +98,12 @@ async fn non_owner_share_toggle_is_a_noop() {
     let sid = chat::create_session(&state.db, "alice").await.unwrap().id;
     let app = router(state.clone());
 
-    app.serve(post_form(&format!("/chat/{sid}/share"), &alice, ""))
+    app.serve(common::post_form(&format!("/chat/{sid}/share"), &alice, ""))
         .await
         .unwrap();
     // Bob's toggle would unshare it — must have no effect.
     let resp = app
-        .serve(post_form(&format!("/chat/{sid}/share"), &bob, ""))
+        .serve(common::post_form(&format!("/chat/{sid}/share"), &bob, ""))
         .await
         .unwrap();
     assert!(resp.status().is_redirection());
@@ -309,12 +299,12 @@ async fn non_owner_cannot_post_messages_even_when_shared() {
     let sid = chat::create_session(&state.db, "alice").await.unwrap().id;
     let app = router(state.clone());
 
-    app.serve(post_form(&format!("/chat/{sid}/share"), &alice, ""))
+    app.serve(common::post_form(&format!("/chat/{sid}/share"), &alice, ""))
         .await
         .unwrap();
     // Bob tries to post into the shared (read-only-for-him) chat.
     let _ = app
-        .serve(post_form(
+        .serve(common::post_form(
             &format!("/chat/{sid}/messages"),
             &bob,
             "model=model-a&message=hi",

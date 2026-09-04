@@ -12,18 +12,7 @@ use std::sync::Arc;
 
 use common::Service as _;
 use gateway::rama_server::router::router;
-use rama::http::{Body, Method, Request};
 use session_core::db as chat;
-
-fn post_form(uri: &str, cookie: &str, body: &str) -> Request {
-    Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("cookie", format!("id={cookie}"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from(body.to_string()))
-        .unwrap()
-}
 
 /// Seed a small two-turn conversation owned by `owner` and mark it shared.
 async fn shared_convo(state: &gateway::rama_server::RamaState, owner: &str) -> String {
@@ -59,7 +48,7 @@ async fn recipient_forks_shared_chat_into_own_account() {
 
     // Bob (the recipient) forks it.
     let resp = app
-        .serve(post_form(&format!("/chat/{sid}/fork"), &bob, ""))
+        .serve(common::post_form(&format!("/chat/{sid}/fork"), &bob, ""))
         .await
         .unwrap();
     assert!(
@@ -110,7 +99,7 @@ async fn owner_fork_is_a_noop() {
 
     // Alice forks her own chat — recipient-only, so nothing is copied.
     let resp = app
-        .serve(post_form(&format!("/chat/{sid}/fork"), &alice, ""))
+        .serve(common::post_form(&format!("/chat/{sid}/fork"), &alice, ""))
         .await
         .unwrap();
     assert!(resp.status().is_redirection());
@@ -134,7 +123,7 @@ async fn non_owner_cannot_fork_unshared_chat() {
     let app = router(state.clone());
 
     let resp = app
-        .serve(post_form(&format!("/chat/{sid}/fork"), &bob, ""))
+        .serve(common::post_form(&format!("/chat/{sid}/fork"), &bob, ""))
         .await
         .unwrap();
     assert!(

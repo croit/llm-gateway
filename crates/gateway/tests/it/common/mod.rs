@@ -545,6 +545,18 @@ pub async fn seed_session(state: &RamaState, user_id: &str, email: &str) -> Stri
     state.sessions.sign(&session.id)
 }
 
+/// A session-authenticated form POST — the shape every datastar-driven page
+/// action takes. Six test modules had grown their own identical copy.
+pub fn post_form(uri: &str, cookie: &str, body: &str) -> rama::http::Request {
+    rama::http::Request::builder()
+        .method(rama::http::Method::POST)
+        .uri(uri)
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
 /// Seed a user + an active session + a bearer token. Returns the
 /// plaintext bearer suitable for an `Authorization: Bearer …` header.
 pub async fn seed_user_with_token(state: &RamaState, user_id: &str) -> String {

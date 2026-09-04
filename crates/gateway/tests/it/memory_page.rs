@@ -13,16 +13,6 @@ use gateway::rama_server::router::router;
 use gateway_core::server::db::user_memories::{self, MemoryKind};
 use rama::http::{Body, Method, Request, StatusCode};
 
-fn post_form(uri: &str, cookie: &str, body: &str) -> Request {
-    Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("cookie", format!("id={cookie}"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from(body.to_string()))
-        .unwrap()
-}
-
 fn get(uri: &str, cookie: &str) -> Request {
     Request::builder()
         .method(Method::GET)
@@ -95,7 +85,7 @@ async fn create_appends_and_persists() {
     let app = router(state.clone());
 
     let resp = app
-        .serve(post_form(
+        .serve(common::post_form(
             "/memory",
             &cookie,
             "kind=preference&content=likes+concise+answers",
@@ -131,7 +121,7 @@ async fn edit_updates_content() {
     let app = router(state.clone());
 
     let resp = app
-        .serve(post_form(
+        .serve(common::post_form(
             &format!("/memory/{}/edit", m.id),
             &cookie,
             "content=new+text",
@@ -160,7 +150,11 @@ async fn delete_removes_the_row() {
     let app = router(state.clone());
 
     let resp = app
-        .serve(post_form(&format!("/memory/{}/delete", m.id), &cookie, ""))
+        .serve(common::post_form(
+            &format!("/memory/{}/delete", m.id),
+            &cookie,
+            "",
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -190,7 +184,7 @@ async fn cannot_edit_another_users_memory() {
 
     // Bob tries to edit Alice's memory → rejected, Alice's row untouched.
     let resp = app
-        .serve(post_form(
+        .serve(common::post_form(
             &format!("/memory/{}/edit", m.id),
             &bob_cookie,
             "content=pwned",

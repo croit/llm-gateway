@@ -20,16 +20,6 @@ use gateway_core::server::db::documents::{self, DocumentFormat, VersionAuthor};
 use rama::http::{Body, Method, Request, StatusCode};
 use session_core::db as chat;
 
-fn post_form(uri: &str, cookie: &str, body: &str) -> Request {
-    Request::builder()
-        .method(Method::POST)
-        .uri(uri)
-        .header("cookie", format!("id={cookie}"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(Body::from(body.to_string()))
-        .unwrap()
-}
-
 async fn seed_document(
     state: &gateway::rama_server::RamaState,
     session_id: &str,
@@ -61,7 +51,7 @@ async fn a_hand_edit_saves_a_user_authored_version() {
     let app = router(state.clone());
 
     let resp = app
-        .serve(post_form(
+        .serve(common::post_form(
             &format!("/chat/{}/document/{doc_id}/edit", session.id),
             &cookie,
             // Browsers submit CRLF per the HTML spec; the handler normalises
@@ -106,7 +96,7 @@ async fn saving_an_unchanged_document_mints_no_version() {
     let app = router(state.clone());
 
     let resp = app
-        .serve(post_form(
+        .serve(common::post_form(
             &format!("/chat/{}/document/{doc_id}/edit", session.id),
             &cookie,
             "content=same%0A",
@@ -135,7 +125,7 @@ async fn a_shared_viewer_cannot_write_to_someone_elses_document() {
     let app = router(state.clone());
 
     let resp = app
-        .serve(post_form(
+        .serve(common::post_form(
             &format!("/chat/{}/document/{doc_id}/edit", session.id),
             &intruder,
             "content=bob+was+here%0A",
@@ -166,7 +156,7 @@ async fn a_deleted_document_refuses_the_edit() {
     let app = router(state.clone());
 
     let resp = app
-        .serve(post_form(
+        .serve(common::post_form(
             &format!("/chat/{}/document/{doc_id}/edit", session.id),
             &cookie,
             "content=resurrected%0A",
