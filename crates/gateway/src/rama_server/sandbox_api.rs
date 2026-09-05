@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use rama::http::service::web::extract::State;
+use rama::http::service::web::response::IntoResponse;
 use rama::http::{Request, Response, StatusCode, header};
 
 use gateway_features::server::chat_attachments;
@@ -27,7 +28,7 @@ pub async fn download(State(state): State<Arc<RamaState>>, req: Request) -> Resp
     let (parts, _body) = req.into_parts();
     let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
-        Err(resp) => return resp,
+        Err(refusal) => return refusal.into_response(),
     };
     let config = state.config();
     let Some(cfg) = config.chat.s3.as_ref() else {

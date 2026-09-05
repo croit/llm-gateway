@@ -1314,6 +1314,43 @@ pub enum RouteError {
     Acquire(AcquireError),
 }
 
+impl RouteError {
+    /// The HTTP status this failure means, and the sentence to show for it.
+    ///
+    /// The *decision* — an unserved model is a `404`, a token-forbidden one a
+    /// `403`, an unreachable pool a `503` — is gateway policy, not wire
+    /// format. It lives here, next to the variants that produce it, so the
+    /// OpenAI and Anthropic renderers can only disagree about the envelope
+    /// they wrap it in, never about what the failure was.
+    pub fn status_and_message(&self) -> (u16, String) {
+        match self {
+            // No backend serves this id at all — not a transient 5xx.
+            Self::UnknownModel(m) => (
+                404,
+                format!("The model `{m}` does not exist or you do not have access to it."),
+            ),
+            // The model exists and the owner may use it; this token may not.
+            // A 403 that names the model, rather than the 404 a group-withheld
+            // model gets: the caller holds the credential whose allowlist did
+            // this and can see that allowlist on /tokens, so spelling it out is
+            // help, not disclosure.
+            Self::ModelNotAllowed(m) => (
+                403,
+                format!(
+                    "The API token used for this request is not allowed to use the model \
+                     `{m}`. Its allowed models are listed on the /tokens page."
+                ),
+            ),
+            Self::Acquire(AcquireError::NoHealthyBackend { pool }) => {
+                (503, format!("no healthy backend in `{pool}`"))
+            }
+            Self::Acquire(AcquireError::Saturated { pool }) => {
+                (503, format!("`{pool}` is saturated"))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

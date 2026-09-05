@@ -789,19 +789,8 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
             .flatten()
             .as_deref(),
     );
-    let (reasoning_style, reasoning_overrides) = {
-        let row = gateway_core::server::db::model_defaults::get(&d.state.db, &real_model)
-            .await
-            .ok()
-            .flatten();
-        let explicit = row.as_ref().and_then(|r| r.reasoning_style.as_deref());
-        let style = gateway_core::server::reasoning::ReasoningStyle::resolve(explicit, &real_model);
-        let overrides = row
-            .as_ref()
-            .map(reasoning_overrides_from_row)
-            .unwrap_or_default();
-        (style, overrides)
-    };
+    let (reasoning_style, reasoning_overrides) =
+        gateway_core::server::reasoning::resolve_for_model(&d.state.db, &real_model).await;
     let max_rounds = effort.max_rounds();
 
     let turns = chat::list_turns(&d.state.db, &ctx.session_id)
@@ -2446,20 +2435,6 @@ where
 /// `apply_effort` consumes. Budgets are SQLite INTEGERs; a negative / oversized
 /// value can't be a token count, so it degrades to `None` (built-in default)
 /// rather than poisoning the request.
-fn reasoning_overrides_from_row(
-    row: &gateway_core::server::db::model_defaults::ModelDefaults,
-) -> gateway_core::server::reasoning::ReasoningOverrides {
-    let budget = |v: Option<i64>| v.and_then(|n| u32::try_from(n).ok());
-    gateway_core::server::reasoning::ReasoningOverrides {
-        budget_standard: budget(row.thinking_budget_standard),
-        budget_deep: budget(row.thinking_budget_deep),
-        budget_max: budget(row.thinking_budget_max),
-        effort_standard: row.reasoning_effort_standard.clone(),
-        effort_deep: row.reasoning_effort_deep.clone(),
-        effort_max: row.reasoning_effort_max.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{

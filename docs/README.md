@@ -12,6 +12,7 @@ This directory holds the design docs for the LLM gateway. The agent-facing entry
 | [`auth.md`](auth.md) | OIDC discovery, gateway-minted tokens, sessions |
 | [`gateway-api.md`](gateway-api.md) | OpenAI-compatible HTTP API, streaming, transcription |
 | [`upstreams.md`](upstreams.md) | Provider config, model→backend routing, load balancing, health |
+| [`claude-code.md`](claude-code.md) | **Claude Code through the gateway** — the Anthropic Messages compatibility layer at `/v1/messages`: setup, model aliasing, what is translated, and the known limits |
 | [`tools-rbac.md`](tools-rbac.md) | Tool registry, role→tool mapping, server-side execution loop |
 | [`tools-inventory.md`](tools-inventory.md) | Every tool id with its registration gate, toggle key, and whether it is chat-only (CI-drift-guarded) |
 | [`file-conversions.md`](file-conversions.md) | How uploads are read and documents produced/converted — tools, formats, expectations, limitations, gaps |

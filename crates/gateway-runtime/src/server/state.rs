@@ -952,6 +952,52 @@ impl AppState {
     /// already-resolved registry `allowed` set. Keeping the layer the *single*
     /// source of both the advertised ids and the executing
     /// `CompositeToolSource` is what guarantees they can't diverge.
+    /// The complete tool surface a bearer (`/v1`) request may use: the ids to
+    /// advertise, and the caller's connected-connector overlay that can
+    /// dispatch them.
+    ///
+    /// Four coupled steps whose order is load-bearing — RBAC-and-toggles,
+    /// then the caller's MCP layer, then the union so advertise and execute
+    /// can't drift, then the session-only filter. Every `/v1` surface needs
+    /// all four, and stating them per endpoint is how the fourth one (the
+    /// policy that a sessionless request must not be offered a chat-only
+    /// tool) ends up fixed in one copy and not the other.
+    pub async fn api_tool_layer(
+        &self,
+        user: &gateway_core::server::auth::UserCtx,
+    ) -> (
+        Vec<String>,
+        crate::server::tools::mcp::manager::UserMcpLayer,
+    ) {
+        let mut allowed = self.allowed_tools_for_token(user).await;
+        // Built once per request so the ids advertised are exactly the ids the
+        // composite source can dispatch. Empty and cheap when the token's
+        // master tool switch is off, which is the default.
+        let layer = if user.tools_enabled {
+            let role_ids = self.role_ids_for(&user.roles);
+            let is_admin = self.rbac.is_admin(&role_ids);
+            self.mcp
+                .layer_for_user(
+                    &user.user_id,
+                    &role_ids,
+                    is_admin,
+                    crate::server::tools::mcp::manager::AskContext::Api {
+                        token_id: &user.token_id,
+                    },
+                )
+                .await
+        } else {
+            crate::server::tools::mcp::manager::UserMcpLayer::default()
+        };
+        self.union_mcp_tool_ids(&mut allowed, &layer);
+        // No chat session on a `/v1` path, so the typst family, the
+        // document-canvas tools and `upload_attachment` can't run: advertising
+        // one only lets the model pick it and get an error instead of an
+        // answer.
+        allowed.retain(|id| !crate::server::tools::catalog::requires_chat_session(id));
+        (allowed, layer)
+    }
+
     pub fn union_mcp_tool_ids(
         &self,
         allowed: &mut Vec<String>,

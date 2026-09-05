@@ -6,7 +6,7 @@ This file is the canonical entry point for any AI agent (or new human contributo
 
 A single Rust binary plus the supporting crates it lives on:
 
-- **`gateway`** — authenticated, OpenAI-compatible LLM proxy. Speaks `/v1/chat/completions`, `/v1/audio/transcriptions`, `/v1/models` so any OpenAI SDK talks to it. OIDC browser login + gateway-minted bearer tokens. Routes across **multiple upstream LLM backends** with health checks + RAII in-flight accounting. Injects **company-specific tools** gated by **RBAC**. Server-rendered HTML UI (dashboard / tokens / persisted multi-conversation chat).
+- **`gateway`** — authenticated, OpenAI-compatible LLM proxy. Speaks `/v1/chat/completions`, `/v1/audio/transcriptions`, `/v1/models` so any OpenAI SDK talks to it, and `/v1/messages` in the Anthropic dialect so Claude Code can be pointed at it. OIDC browser login + gateway-minted bearer tokens. Routes across **multiple upstream LLM backends** with health checks + RAII in-flight accounting. Injects **company-specific tools** gated by **RBAC**. Server-rendered HTML UI (dashboard / tokens / persisted multi-conversation chat).
 
 Shared crates:
 - **`session-core`** — chat-style UI substrate (Plait renderers + SSE primitives + DB schema + worker registry + `SessionDriver` trait). The gateway plugs in an `OpenAiDriver`; the trait keeps the renderers driver-agnostic so a future second consumer can paint the same chat surface without forking.
@@ -219,6 +219,7 @@ Start in [`docs/README.md`](docs/README.md) for the index. The topical docs:
 | Dependency policy + the current allowed list | [`docs/dependencies.md`](docs/dependencies.md) |
 | OIDC login + gateway-minted tokens | [`docs/auth.md`](docs/auth.md) |
 | OpenAI-compat endpoints, streaming, transcription | [`docs/gateway-api.md`](docs/gateway-api.md) |
+| Claude Code / Anthropic Messages compatibility (`/v1/messages`) | [`docs/claude-code.md`](docs/claude-code.md) |
 | Multi-provider routing, load balancing, health checks | [`docs/upstreams.md`](docs/upstreams.md) |
 | Tool registry, role→tool mapping, execution loop | [`docs/tools-rbac.md`](docs/tools-rbac.md) |
 | Which tools exist, their gates and toggle keys | [`docs/tools-inventory.md`](docs/tools-inventory.md) |

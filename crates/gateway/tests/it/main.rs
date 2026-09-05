@@ -9,6 +9,7 @@
 
 mod admin_models;
 mod admin_users;
+mod anthropic_messages;
 mod ask_feedback;
 mod chat_actions;
 mod chat_attachment;

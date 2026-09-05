@@ -99,6 +99,25 @@ pub enum LoopError {
     LoopExhausted(u32),
 }
 
+impl LoopError {
+    /// The HTTP status this failure means, and the sentence to show for it.
+    ///
+    /// Lives here for the same reason [`RouteError::status_and_message`] does:
+    /// whether a tool loop that ran out of rounds is the caller's fault or
+    /// ours is gateway policy, and both `/v1` wire formats must answer it the
+    /// same way.
+    ///
+    /// [`RouteError::status_and_message`]: gateway_core::server::upstreams::registry::RouteError::status_and_message
+    pub fn status_and_message(&self) -> (u16, String) {
+        match self {
+            Self::MalformedRequest(m) => (400, m.clone()),
+            Self::Upstream(m) => (503, m.clone()),
+            Self::MalformedUpstream(m) => (500, format!("upstream returned unparseable JSON: {m}")),
+            Self::LoopExhausted(n) => (500, format!("tool-call loop exhausted after {n} rounds")),
+        }
+    }
+}
+
 /// Outcome of [`run_with_tools`].
 #[derive(Debug)]
 pub struct LoopOutput {
@@ -395,34 +414,11 @@ fn split_tool_calls(response: &Value, tools: &dyn ToolSource) -> ToolCallSplit {
     }
 }
 
-/// Coerce a model-supplied tool-call `arguments` payload into a valid JSON
-/// **object** value. Returns an empty object when the payload is missing,
-/// empty/whitespace, non-JSON (a truncated `{`, a Python-`repr` dict with
-/// single quotes, …), or a JSON value that isn't an object.
-///
-/// `arguments` is spec'd as a JSON-encoded object, but real models emit all
-/// of the above — especially an empty string for a no-argument tool. Both
-/// executing the call and *replaying it into history* must survive that, and
-/// must agree: a strict upstream re-parses this field when it applies its
-/// chat template (Mistral/Voxtral via `mistral_common` runs
-/// `json.loads(arguments)`), and a non-JSON value there is a hard
-/// `400 Bad Request` — "Expecting property name enclosed in double quotes:
-/// line 1 column 2 (char 1)" for a bare `{`, the char-0 variant for `""`.
-pub(crate) fn tool_arguments_object(raw: &str) -> Value {
-    match serde_json::from_str::<Value>(raw) {
-        Ok(v @ Value::Object(_)) => v,
-        _ => Value::Object(serde_json::Map::new()),
-    }
-}
-
-/// String form of [`tool_arguments_object`] — the canonical JSON-object text
-/// to embed in a `tool_calls[].function.arguments` field we replay upstream.
-/// Always valid JSON, so it can't 400 a strict re-parse; identical to the
-/// value [`execute_tool_calls`] runs the tool with, so history never diverges
-/// from what actually happened.
-pub fn normalize_tool_arguments(raw: &str) -> String {
-    tool_arguments_object(raw).to_string()
-}
+pub use gateway_core::server::tool_args::normalize_tool_arguments;
+/// Re-exported so the tool loop's call sites keep reading as one vocabulary;
+/// the rule itself lives in `gateway-core` because the Anthropic translation
+/// layer needs the identical coercion (see that module's docs).
+pub(crate) use gateway_core::server::tool_args::tool_arguments_object;
 
 /// Rewrite every `tool_calls[].function.arguments` inside an assistant message
 /// to its [`normalize_tool_arguments`] form, in place. Used on the buffered

@@ -15,6 +15,9 @@
 //!     `/v1/embeddings`, `/v1/images/generations` — token-
 //!     authenticated, forwarded to the upstream pool selected by
 //!     model.
+//!   - **Anthropic-compatible proxy**: `/v1/messages` — the same
+//!     pipeline behind the Messages API wire format, so Claude Code
+//!     and other Anthropic-format clients can be pointed here.
 //!   - **Auth + session API**: `/auth/*` (OIDC + CLI device flow) and
 //!     `/api/v0/*` (session-scoped token CRUD + transcription used by
 //!     the chat composer).
@@ -35,7 +38,9 @@ use serde_json::json;
 
 use crate::rama_server::RamaState;
 use crate::rama_server::first_run::FirstRunLayer;
-use crate::rama_server::{api, comfyui_api, oidc_handlers, pages, proxy, rag_api, sandbox_api};
+use crate::rama_server::{
+    api, comfyui_api, messages, oidc_handlers, pages, proxy, rag_api, sandbox_api,
+};
 use gateway_core::rama_server::cors::V1CorsLayer;
 use session_core::assets;
 
@@ -307,6 +312,13 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         // `mistralai/Voxtral-Mini-4B-Realtime-2602`).
         .with_get("/v1/models/{*id}", proxy::retrieve_model)
         .with_post("/v1/chat/completions", proxy::chat_completions)
+        // Anthropic Messages format — what Claude Code speaks. Same pipeline
+        // as `/v1/chat/completions` (routing, limits, tool loop, usage); only
+        // the wire format differs. See `rama_server::messages`.
+        // The more specific path first, matching how this router
+        // disambiguates everywhere else.
+        .with_post("/v1/messages/count_tokens", messages::count_tokens)
+        .with_post("/v1/messages", messages::messages)
         .with_post("/v1/audio/transcriptions", proxy::transcribe)
         .with_post("/v1/audio/speech", proxy::speech)
         .with_post("/v1/embeddings", proxy::embeddings)
@@ -315,6 +327,10 @@ pub fn router(state: Arc<RamaState>) -> Router<Arc<RamaState>> {
         // Bearer-authed download of a file a sandbox run produced for an
         // API caller (scoped to the caller's user; see `sandbox_api`).
         .with_get("/v1/sandbox/files/{run}/{filename}", sandbox_api::download)
+        // Connection-warming probe an Anthropic-format client sends at
+        // startup. Unauthenticated: it carries no request and reveals only
+        // that something is listening.
+        .with_head("/api/hello", messages::hello)
         .with_get("/auth/login", oidc_handlers::login)
         .with_get("/auth/callback", oidc_handlers::callback)
         .with_post("/auth/logout", oidc_handlers::logout)

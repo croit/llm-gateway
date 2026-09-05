@@ -7,6 +7,7 @@
 //! consumed by `rama_server` for I/O, but they could just as well be
 //! reused by tests, a CLI tool, or a future second binding.
 
+pub mod anthropic;
 pub mod auth;
 pub mod capabilities;
 pub mod config;
@@ -21,6 +22,7 @@ pub mod reasoning;
 pub mod settings;
 pub mod setup;
 pub mod sse;
+pub mod tool_args;
 pub mod tool_naming;
 pub mod upstreams;
 pub mod usage;

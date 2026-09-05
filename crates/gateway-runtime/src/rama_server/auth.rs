@@ -9,6 +9,14 @@
 //! tower-style Layer. Rama supports layers too, but for the small set
 //! of bearer-gated routes we have, in-handler is more readable and
 //! avoids the extension/context plumbing.
+//!
+//! `x-api-key` is accepted as a second spelling of the same credential.
+//! Anthropic-format clients put the key in whichever header their
+//! configuration implies — Claude Code sends `Authorization: Bearer` for
+//! `ANTHROPIC_AUTH_TOKEN`, `x-api-key` for `ANTHROPIC_API_KEY`, and *both*
+//! on its model-discovery request — so reading only one header would make
+//! authentication depend on which environment variable a developer happened
+//! to be told to set. Same token, same lookup, same 401.
 
 use rama::http::header::{AUTHORIZATION, HeaderValue};
 use rama::http::service::web::response::IntoResponse;
@@ -20,12 +28,20 @@ use gateway_core::server::auth::UserCtx;
 use gateway_core::server::auth::token;
 use gateway_core::server::db;
 
+/// The second header the same gateway token may arrive in. Lowercase because
+/// `HeaderMap` lookups by `&str` are case-insensitive only for the canonical
+/// (lowercase) spelling.
+const API_KEY_HEADER: &str = "x-api-key";
+
 /// Reads + validates the bearer token from `headers`, returning the
 /// user context or a fully-built 401 response. Background-bumps the
 /// token's `last_used_at` on success; failures of that bump don't
 /// affect the request (logged + dropped).
-pub async fn require_bearer(state: &RamaState, headers: &HeaderMap) -> Result<UserCtx, Response> {
-    let bearer = parse_bearer(headers.get(AUTHORIZATION)).ok_or_else(unauthorized)?;
+pub async fn require_bearer(
+    state: &RamaState,
+    headers: &HeaderMap,
+) -> Result<UserCtx, AuthRefusal> {
+    let bearer = credential(headers).ok_or_else(unauthorized)?;
     let hash = token::hash_bearer(bearer).ok_or_else(unauthorized)?;
 
     let token_row = db::tokens::find_active_by_hash(&state.db, &hash)
@@ -85,6 +101,14 @@ pub async fn require_bearer(state: &RamaState, headers: &HeaderMap) -> Result<Us
     })
 }
 
+/// The caller's token from either header it may arrive in: `Authorization:
+/// Bearer …` first, then `x-api-key`. A client that sends both (Claude Code's
+/// model discovery does) carries the same value in each, so first-wins is
+/// safe.
+fn credential(headers: &HeaderMap) -> Option<&str> {
+    parse_bearer(headers.get(AUTHORIZATION)).or_else(|| parse_api_key(headers.get(API_KEY_HEADER)))
+}
+
 fn parse_bearer(value: Option<&HeaderValue>) -> Option<&str> {
     let s = value?.to_str().ok()?;
     let rest = s.strip_prefix("Bearer ")?;
@@ -92,41 +116,74 @@ fn parse_bearer(value: Option<&HeaderValue>) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
-fn unauthorized() -> Response {
-    let body = json!({
-        "error": {
-            "message": "missing or invalid bearer token",
-            "type": "unauthorized",
-            "code": "unauthorized",
-        }
-    });
-    (
-        StatusCode::UNAUTHORIZED,
-        [
-            ("content-type", "application/json"),
-            // OAuth 2.0 §3.1 conformance: tell the client which scheme
-            // we expected. Same value the axum side emits.
-            ("www-authenticate", r#"Bearer realm="gateway""#),
-        ],
-        body.to_string(),
-    )
-        .into_response()
+/// `x-api-key` carries the bare token — no scheme prefix.
+fn parse_api_key(value: Option<&HeaderValue>) -> Option<&str> {
+    let trimmed = value?.to_str().ok()?.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
-fn internal_error(message: &str) -> Response {
-    let body = json!({
-        "error": {
-            "message": message,
-            "type": "internal_error",
-            "code": "internal_error",
+/// Why a request was refused, before anything decides how to say so.
+///
+/// `require_bearer` used to hand back a rendered OpenAI-shaped `Response`,
+/// which works only while every caller speaks OpenAI. The Anthropic endpoints
+/// have to say the same thing in their own envelope, and reconstructing it
+/// from a rendered response means sniffing the status and inventing a message
+/// — which loses the distinction between "your token is not valid" and "the
+/// user lookup failed". Carrying the two facts and rendering late keeps that.
+#[derive(Debug, Clone)]
+pub struct AuthRefusal {
+    pub status: StatusCode,
+    pub message: String,
+    /// Whether to advertise the expected scheme (OAuth 2.0 §3.1). Only a 401
+    /// carries it.
+    challenge: bool,
+}
+
+impl IntoResponse for AuthRefusal {
+    /// The OpenAI-shaped envelope every existing caller already returns.
+    fn into_response(self) -> Response {
+        let code = if self.status == StatusCode::UNAUTHORIZED {
+            "unauthorized"
+        } else {
+            "internal_error"
+        };
+        let body = json!({
+            "error": {
+                "message": self.message,
+                "type": code,
+                "code": code,
+            }
+        });
+        let mut resp = (
+            self.status,
+            [("content-type", "application/json")],
+            body.to_string(),
+        )
+            .into_response();
+        if self.challenge {
+            resp.headers_mut().insert(
+                rama::http::header::WWW_AUTHENTICATE,
+                HeaderValue::from_static(r#"Bearer realm="gateway""#),
+            );
         }
-    });
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        [("content-type", "application/json")],
-        body.to_string(),
-    )
-        .into_response()
+        resp
+    }
+}
+
+fn unauthorized() -> AuthRefusal {
+    AuthRefusal {
+        status: StatusCode::UNAUTHORIZED,
+        message: "missing or invalid bearer token".into(),
+        challenge: true,
+    }
+}
+
+fn internal_error(message: &str) -> AuthRefusal {
+    AuthRefusal {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: message.to_string(),
+        challenge: false,
+    }
 }
 
 #[cfg(test)]
@@ -164,5 +221,59 @@ mod tests {
     #[test]
     fn parse_bearer_rejects_missing_header() {
         assert!(parse_bearer(None).is_none());
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                rama::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                header_value(value),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn credential_reads_the_authorization_header() {
+        let h = headers(&[("authorization", "Bearer gwk_abc")]);
+        assert_eq!(credential(&h), Some("gwk_abc"));
+    }
+
+    /// `ANTHROPIC_API_KEY` puts the credential here, with no scheme prefix.
+    #[test]
+    fn credential_falls_back_to_x_api_key() {
+        let h = headers(&[("x-api-key", "gwk_abc")]);
+        assert_eq!(credential(&h), Some("gwk_abc"));
+    }
+
+    /// Claude Code's model-discovery request sends both headers.
+    #[test]
+    fn credential_prefers_authorization_when_both_are_present() {
+        let h = headers(&[
+            ("authorization", "Bearer gwk_auth"),
+            ("x-api-key", "gwk_key"),
+        ]);
+        assert_eq!(credential(&h), Some("gwk_auth"));
+    }
+
+    /// A malformed `Authorization` doesn't shadow a usable `x-api-key` — the
+    /// two headers are alternatives, not a chain that fails closed on the
+    /// first one.
+    #[test]
+    fn a_malformed_authorization_falls_through_to_x_api_key() {
+        let h = headers(&[("authorization", "Basic nope"), ("x-api-key", "gwk_key")]);
+        assert_eq!(credential(&h), Some("gwk_key"));
+    }
+
+    #[test]
+    fn credential_rejects_an_empty_x_api_key() {
+        let h = headers(&[("x-api-key", "   ")]);
+        assert!(credential(&h).is_none());
+    }
+
+    #[test]
+    fn credential_rejects_no_headers_at_all() {
+        assert!(credential(&HeaderMap::new()).is_none());
     }
 }

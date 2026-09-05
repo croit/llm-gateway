@@ -16,6 +16,7 @@
 pub mod api;
 pub mod comfyui_api;
 pub mod first_run;
+pub mod messages;
 pub mod oidc_handlers;
 pub mod proxy;
 pub mod rag_api;

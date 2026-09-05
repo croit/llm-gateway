@@ -17,6 +17,7 @@
 - [Voice conversation](#voice-conversation)
 - [Built with](#built-with)
 - [Integrations (per-user MCP connectors)](#integrations-per-user-mcp-connectors)
+- [Claude Code against your own models](#claude-code-against-your-own-models)
 - [Quick start (local development)](#quick-start-local-development)
 - [Setup wizard](#setup-wizard)
 - [Configuration](#configuration)
@@ -34,6 +35,7 @@
 ## What it does
 
 - **OpenAI-compatible API** — `POST /v1/chat/completions` (streaming + non-streaming), `POST /v1/embeddings`, `POST /v1/images/generations` + `POST /v1/images/edits`, `POST /v1/audio/transcriptions`, `POST /v1/audio/speech` (text-to-speech, when a speech pool is configured), and `GET /v1/models`. Point any OpenAI SDK at it.
+- **Anthropic-compatible API** — `POST /v1/messages` (streaming + non-streaming) and `POST /v1/messages/count_tokens`, so **[Claude Code](#claude-code-against-your-own-models) can be pointed straight at the gateway** and run against whatever models you serve. Same routing, tokens, limits, tools and usage accounting as the OpenAI surface; the gateway translates between the two dialects.
 - **Multi-backend routing** — named upstream pools (`chat` / `transcription` / `embedding` / `image` / `speech` kinds). Each pool load-balances across its backends (round-robin or least-in-flight) with per-backend health probes. Models are discovered live from each backend's `/models` endpoint, so loading a model on a backend makes it routable with no config change.
 - **Model aliases + fallback** — give clients a stable name (a per-backend alias like `qwen`) that routes to whatever real model is loaded, so swapping the model needs no client change; the same alias on several backends is a load-balanced group. Optional fallbacks cover an unknown model name or a known model whose backends are all down. All configured per backend/pool at `/admin/upstreams`. See [`docs/upstreams.md`](docs/upstreams.md#model-aliases).
 - **OIDC login** — browser sign-in against your identity provider; the gateway then issues its own `gwk_…` API tokens. Provider secrets come only from the environment.
@@ -58,11 +60,11 @@ Every tool is **RBAC-gated per role**, and each user can flip their own grants o
 |---|---|---|
 | **Web & retrieval** | `search_web`, `fetch_url`, `wikipedia` | Search the web (SearXNG or Brave — configured under **Web search** on `/admin/models`, with optional per-query domain and recency filters), fetch any URL (**HTML is reduced to readable text** — headings, lists, links, tables and code survive, scripts and markup don't, so a page costs a few KB instead of a few hundred; `raw: true` when the markup itself is the point — images → viewable, other binary → metadata), and pull encyclopedic summaries. |
 | **Documents** | `fetch_attachment`, `upload_attachment`, `offer_download`, `import_file`, `list_attachments`, `typst_*` | Read files the user attached — including **two-tier PDF** reading (extract the text layer first; rasterize scanned pages for a vision model if that comes back empty) with **page ranges** so a long document is read one window at a time instead of only its first pages — attach files back into its own reply, **hand over any file the conversation already holds** as a download (copied inside storage, so a big payload never gets pasted into the reply as text), **pull a text file into the editable canvas** so it can be changed a passage at a time instead of rewritten, list every file in the conversation (uploads + earlier tool outputs) so assets get **reused instead of regenerated** (attachments resolve by id *or* bare filename, newest wins), and render **PDF/PNG documents** from operator-defined Typst templates (invoices, letters, reports) whose **field data lives in the canvas** — visible, versioned, downloadable, and editable by hand. |
-| **Automatic document OCR** *(opt-in)* | `baidu/Unlimited-OCR` via the internal `ocr` pool | Send uploaded images, and PDFs without a usable text layer, to the PDF-aware OCR sidecar and add the result as untrusted document context — cached by document hash, page-ordered, metered, with per-document status in the chat UI. The feature is inactive unless `[chat.ocr].enabled = true` and a healthy `ocr` backend are both configured. See [`docs/ocr.md`](docs/ocr.md). |
+| **Automatic document OCR** *(opt-in)* | `baidu/Unlimited-OCR` via the internal `ocr` pool | Send uploaded images, and PDFs without a usable text layer, to the PDF-aware OCR sidecar and add the result as untrusted document context — cached by document hash, page-ordered, metered, with per-document status in the chat UI. The feature is inactive until you enable OCR at `/admin/settings` → Chat *and* a healthy `ocr` backend is configured. See [`docs/ocr.md`](docs/ocr.md). |
 | **Document canvas** | `create_document`, `edit_document`, `delete_document`, … | Build up a long document (report, spec, article) across turns and edit it section-by-section in a live side panel, then export it to PDF/DOCX/PPTX — instead of regenerating the whole thing every reply. Every change is a new version; the model can list the history and roll back (`list_document_versions`, `restore_document_version`), and several documents can coexist per conversation. **You can edit any document by hand** in the panel — your save is a version of its own, labelled as yours, and the assistant is told the document moved under it (with the id to re-read) so its next edit builds on your wording instead of reverting it. Abandoned drafts can be **cleared away without losing anything**: `delete_document` is a soft delete — the document leaves the canvas and the model's listing but keeps its history, and `undelete_document` brings it back. Formats: markdown, text, html, json, toml, **typst** (draft the source in the canvas, render via `render_typst`/`export_document` — sections anchor on `=` headings), and yaml (text-edited so comments survive). See [`docs/file-conversions.md`](docs/file-conversions.md). |
 | **Images** | `generate_image`, `edit_image` | Generate an image from a text prompt (diagrams, mockups, marketing visuals) and, where the backend supports it, edit an existing image (image-to-image) — rendered inline in the reply. Routes to an `image`-kind upstream pool (any OpenAI `/images/*`-compatible backend: a hosted provider or a self-hosted model). `edit_image` appears only when a backend advertises edit support, and is refused against non-GDPR-compliant backends. |
 | **QR codes** | `generate_qr_code` | Generate a QR code natively in the gateway (no sandbox, no backend) — URLs, WiFi access, vCard/MeCard contacts, `mailto:`/`tel:`/`geo:`, SEPA GiroCode payments — as PNG or SVG, with custom colors and an optional centered logo from a chat attachment (error correction auto-raised to H). Attached inline in the reply. |
-| **Code & sandbox** *(opt-in)* | `run_in_sandbox`, `generate_document`, `export_document`, `convert_document`, `edit_presentation`, `capture_webpage`, `browse_page`, `render_typst`, `render_excalidraw`, `read_sandbox_output` | Run Python/shell in an isolated gVisor VM (data crunching, format conversion, plotting; `run_in_sandbox` persists its workdir across a conversation turn so the model can iterate), turn Markdown into PDF/DOCX/PPTX, convert between office/PDF/image formats, edit an uploaded `.pptx` in place, screenshot a web page, **drive a browser across several steps** (`browse_page` — click, fill a form, get past a consent banner, then read the result: the session stays open for the whole turn), render Typst or Excalidraw, and page through a large sandbox result without pulling it all into context. The web tools appear **only when the sandbox runner is configured for network egress** — the gateway asks it at startup, so on an offline runner the model is never offered a browser it cannot use, and `run_in_sandbox` doesn't even show a `network` option. Enabled by the `[sandbox]` block — see [`docs/sandbox.md`](docs/sandbox.md) and [`docs/file-conversions.md`](docs/file-conversions.md). |
+| **Code & sandbox** *(opt-in)* | `run_in_sandbox`, `generate_document`, `export_document`, `convert_document`, `edit_presentation`, `capture_webpage`, `browse_page`, `render_typst`, `render_excalidraw`, `read_sandbox_output` | Run Python/shell in an isolated gVisor VM (data crunching, format conversion, plotting; `run_in_sandbox` persists its workdir across a conversation turn so the model can iterate), turn Markdown into PDF/DOCX/PPTX, convert between office/PDF/image formats, edit an uploaded `.pptx` in place, screenshot a web page, **drive a browser across several steps** (`browse_page` — click, fill a form, get past a consent banner, then read the result: the session stays open for the whole turn), render Typst or Excalidraw, and page through a large sandbox result without pulling it all into context. The web tools appear **only when the sandbox runner is configured for network egress** — the gateway asks it at startup, so on an offline runner the model is never offered a browser it cannot use, and `run_in_sandbox` doesn't even show a `network` option. Enabled at `/admin/settings` → Tools — see [`docs/sandbox.md`](docs/sandbox.md) and [`docs/file-conversions.md`](docs/file-conversions.md). |
 | **Memory** | `remember`, `recall`, `update_memory`, `forget` | Persist durable facts about the user (preferences, projects) and recall them in later conversations — and **correct or drop** one when it changes, so a changed fact replaces the old one instead of leaving two contradicting memories behind. |
 | **Scheduled actions** | `schedule_action`, `list_scheduled_actions`, `delete_scheduled_action` | Set up recurring prompts from inside a conversation — "every Monday, summarise last week's tickets" — reaching the same cron scheduler the [`/scheduled`](#scheduled-actions) page drives. Each run opens a conversation you can read afterwards, on the model you were talking to. Creating or deleting one **needs your confirmation** (via `ask_user`) and an action created this way always runs **without tools**: a scheduled prompt later runs *as you*, unattended, so it is not something a model should be able to plant on its own. |
 | **Notifications** | `notify_user` | Reach you when you're not watching the conversation — long sandbox work finished, or a scheduled action found something worth knowing — as a Web Push notification on your phone or desktop. Hard-limited to one per reply, and only where you enabled notifications. |
@@ -151,7 +153,7 @@ A chat replays its whole history to the model on every turn, so a long conversat
 
 Nothing is lost from the UI — the summarised turns stay in the transcript, scrollable above an "earlier messages condensed" divider; they're just not sent upstream. Tool results from the folded turns are fed into the summariser (they're never replayed as normal history, yet are often the load-bearing context).
 
-Tuning lives in `[chat.compaction]` (all optional): `enabled` (default `true`), `trigger_ratio` (fraction of the window at which it fires, default `0.7`), `default_context_window` (fallback window in tokens for models without a per-model value, default `32768`), `keep_recent_turns` (how many recent turns stay verbatim, default `6`), `min_turns_to_compact` (anti-thrash floor, default `4`), and `summary_max_tokens` (default `1024`). Per-model context windows are set in `/admin/models`; a blank field falls back to `default_context_window`.
+Tuning lives at `/admin/settings` → Chat (all optional): `enabled` (default `true`), `trigger_ratio` (fraction of the window at which it fires, default `0.7`), `default_context_window` (fallback window in tokens for models without a per-model value, default `32768`), `keep_recent_turns` (how many recent turns stay verbatim, default `6`), `min_turns_to_compact` (anti-thrash floor, default `4`), and `summary_max_tokens` (default `1024`). Per-model context windows are set at `/admin/models`; a blank field falls back to `default_context_window`.
 
 ## Voice conversation
 
@@ -174,7 +176,7 @@ It appears in the chat composer **only when a `speech` upstream pool is configur
 - **[plait](https://github.com/devashishdxt/plait)** — type-checked, auto-escaping server-rendered HTML (`html! { … }`).
 - **[datastar](https://data-star.dev/)** — client-side reactivity over SSE, self-hosted from the binary.
 - **[daisyUI v5](https://daisyui.com/) + Tailwind v4** — design system, compiled to a single CSS file at build time.
-- **sqlx + SQLite** — persistent state (users, tokens, sessions, chat history, RAG collection registry). Bulk RAG content — chunk text, lexical index, vectors — lives in per-collection stores under `[rag].data_dir`, not in the main DB.
+- **sqlx + SQLite** — persistent state (users, tokens, sessions, chat history, RAG collection registry). Bulk RAG content — chunk text, lexical index, vectors — lives in per-collection stores under the RAG data directory, not in the main DB.
 
 The CSS bundle and `datastar.js` are baked into the binary via `include_bytes!`, so the runtime image needs no asset directory.
 
@@ -192,6 +194,22 @@ An admin curates which servers the catalog offers at `/admin/connectors`; users 
 - **None** — a public, unauthenticated server (e.g. Kiwi.com flight search); users still connect individually to opt its tools into their own chats.
 
 Per-user OAuth tokens are **encrypted at rest** (AES-256-GCM) and **refreshed in the background** so connections don't silently expire. Each connected server's tools are namespaced (`mcp__<server>__*`) and obey the same per-tool always/ask/off controls as the built-in tools. Provider and deployment setup — including the self-hosted Google Workspace and GitLab CE bridges — is in [`deploy/README.md`](deploy/README.md) and [`docs/connectors.md`](docs/connectors.md).
+
+## Claude Code against your own models
+
+Claude Code speaks the Anthropic Messages API, and the gateway serves it at `POST /v1/messages`. Point it here and it runs on the models *you* host — with your auth, your rate limits, your usage tracking and your server-side tools in front of them. Nothing about Claude Code is patched or wrapped; it is configured through the environment variables it already supports:
+
+```bash
+export ANTHROPIC_BASE_URL=https://gateway.example.com
+export ANTHROPIC_AUTH_TOKEN=gwk_…   # a token from /tokens
+claude
+```
+
+Then alias the model ids Claude Code asks for (`claude-sonnet-4-6`, `claude-haiku-4-5`, …) onto the models you actually serve, on `/admin/upstreams` — the same alias also makes them discoverable in Claude Code's `/model` picker. Any id you don't alias falls through to the pool's configured unknown-model fallback, so a working setup can be one alias or none.
+
+Everything the normal workflow needs works: streaming, tool calls (including several per turn), multi-turn context, model selection, and errors surfaced with the backend's own wording so Claude Code's built-in retries still fire. Token counting is answered from the serving model's own tokenizer, not an estimate. The gateway's server-side tools are available to it too — web search, RAG, the sandbox, your MCP connectors — when the token has tool use enabled, in which case the gateway runs its own tools invisibly and hands Claude Code's back for it to execute.
+
+Setup, the full translation table, and the known limits are in [`docs/claude-code.md`](docs/claude-code.md).
 
 ## Quick start (local development)
 
@@ -249,7 +267,7 @@ It prints a one-time link valid for 30 minutes. **The gateway keeps serving whil
 
 Recovery deletes nothing. Users, chats, pools and the current provider all survive, and the wizard comes up pre-filled with what is configured today.
 
-The one case it cannot fix is a provider that is gone entirely — the wizard proves a provider by signing in through it. Keep at least one group in `[gateway].bootstrap_admin_groups` if you want a break-glass admin that does not depend on the group tables.
+The one case it cannot fix is a provider that is gone entirely — the wizard proves a provider by signing in through it. Keep at least one group in `$GATEWAY_BOOTSTRAP_ADMIN_GROUPS` if you want a break-glass admin that does not depend on the group tables.
 
 ## Configuration
 
@@ -257,61 +275,28 @@ There is **no required configuration file**. Everything an operator configures l
 
 **Changes apply immediately.** A save re-derives the affected clients, stores and tool registrations and swaps them in, so the new value is in force on the next request — no restart, and no config file. Five fields are the exception, badged `restart` in the editor: `rag.enabled`, `rag.data_dir`, `rag.clone_concurrency`, `comfyui.base_url` and `comfyui.content_dir`. Each of those owns a long-running background worker (the indexer, the ComfyUI job scheduler), and replacing one means stopping work that is in flight — an aborted ComfyUI poll can leave a job row pending whose asset is never fetched. A restart is the clean way to quiesce that. Saving one leaves a banner on the page until the process comes back, so the person who restarts the container sees what is waiting on them. Every label, card title and line of help text is translated into all six UI languages, and each field also prints the TOML key it replaces underneath, so the mapping from an old config file stays one-to-one and greppable; secrets entered there are sealed at rest.
 
-A `gateway.toml` is still read if present. Three locations are probed, in order: wherever `$GATEWAY_CONFIG` points, then `./gateway.toml`, then `/etc/gateway/config.toml` — the last is why the container images need no `$GATEWAY_CONFIG` at all, just the mount. But a deployment no longer needs a file of any kind. Both of the things it still carried have environment equivalents — `$GATEWAY_DB_PATH` for `[db].path` and `$GATEWAY_BOOTSTRAP_ADMIN_GROUPS` for the break-glass admin list — so the file's only remaining job is as a **one-time seed** when upgrading an older install. (The listen socket was never in it either; that is `$IP` / `$PORT`.) On the first boot that actually **sees** the file, every block that has moved is copied into the database and then ignored forever after, so an existing file-driven deployment upgrades in place without anyone touching it. "Sees" matters: a boot that finds no file — a volume mounted late, or the binary started from the wrong directory — imports nothing and leaves the decision open, so the next boot that does find it still imports. Nothing is settled until there is either something imported or a provider already in the database. [`gateway.example.toml`](gateway.example.toml) remains the annotated reference for that file.
+**Is there still a config file?** Only for upgrades. A `gateway.toml` is read
+if one is present — `$GATEWAY_CONFIG`, then `./gateway.toml`, then
+`/etc/gateway/config.toml` — and on the first boot that actually sees it, every
+block that has moved is copied into the database and ignored from then on. That
+is its entire remaining job: an existing file-driven deployment upgrades in
+place without anyone touching it. A new install should not write one.
+[`gateway.example.toml`](gateway.example.toml) stays as the annotated reference
+for whoever is migrating, and the table below says where each block lives now.
 
-**Secrets never live in the file.** Where the file needs one it holds the *name* of an environment variable (e.g. `api_key_env = "GPU01_KEY"`) and the gateway reads the value from its own environment. Secrets entered at `/admin/settings` or `/setup` instead go into the database **sealed** under the at-rest key, which is why those fields take the credential directly.
+Two things never moved into the database, because both have to be resolved
+*before* it can be read: where the database is (`$GATEWAY_DB_PATH`) and the
+break-glass admin list (`$GATEWAY_BOOTSTRAP_ADMIN_GROUPS`). Both are
+environment variables, so a deployment still needs no file. The listen socket
+was never in the file either — that is `$IP` / `$PORT`.
 
-A minimal but complete config:
+**Secrets never live in a file.** Where the legacy file needs one it holds the
+*name* of an environment variable (e.g. `api_key_env = "GPU01_KEY"`) and the
+gateway reads the value from its own environment. Secrets entered at `/setup`
+or `/admin/settings` go into the database **sealed** under the at-rest key,
+which is why those fields take the credential directly.
 
-```toml
-[db]
-path = "gateway.sqlite"
-
-[gateway]
-public_url          = "https://gateway.example.com" # external URL; used to build the OIDC callback
-# The four keys below are a SEED: imported once, then edited at /admin/settings
-# under these exact names.
-token_ttl_days      = 90
-session_ttl_days    = 30                             # sliding idle timeout for browser logins (renewed on use)
-session_absolute_max_days = 90                       # hard cap since login; activity never extends it
-allow_impersonation = false                          # opt-in admin impersonation (default false); see below
-
-# Seed only, and only for an upgrade: a NEW install configures its provider at
-# /setup in the browser instead. On the first boot after upgrading, this block is
-# copied into the database (its client secret resolved from the named env var),
-# after which /setup owns the provider and this block is ignored.
-[oidc]
-issuer            = "https://id.example.com/realms/company"
-client_id         = "llm-gateway"
-client_secret_env = "GATEWAY_OIDC_CLIENT_SECRET"
-scopes            = ["email", "profile", "groups"]
-roles_claim       = "groups"
-
-# Make your own account an admin so you can reach /admin/*. An admin role is a
-# role flagged `admin = true`; you hold it by mapping one of your OIDC groups to
-# it. Without this, nobody can open the admin UI — where all upstream and model
-# config now lives — so a new install needs it to get off the ground.
-[rbac]
-default_role = "user"                    # every signed-in user gets this baseline role
-
-[[rbac.mapping]]
-oidc_claim = "groups"
-oidc_value = "platform-admins"           # an OIDC group you belong to
-role       = "admin"
-
-[[roles]]
-id = "user"                              # baseline: can chat, mint tokens, use tools
-models = ["*"]
-
-[[roles]]
-id = "admin"                             # `admin = true` is what unlocks /admin/*
-admin = true
-models = ["*"]
-tools = ["*"]
-skills = ["*"]
-```
-
-**How you configure upstreams and models: through the admin UI, not this file.** Pools, backends, and per-model settings live in the database and are managed entirely at `/admin/*` — there is no TOML for them. A fresh install boots with no upstreams; the setup path for a new operator is:
+**How you configure upstreams and models: in the browser.** Pools, backends, and per-model settings live in the database and are managed entirely at `/admin/*` — there has never been TOML for them. A fresh install boots with no upstreams; the setup path for a new operator is:
 
 1. Start the gateway and open it. With nothing configured it sends you to `/setup`, where you enter your OIDC provider, prove it with a real sign-in, and pick the claim value that grants admin — no file involved. (An older deployment instead has its existing `[oidc]` and `[rbac]` blocks imported on that first boot, and skips the wizard.)
 2. Sign in. Your account now reaches the admin UI.
@@ -320,7 +305,7 @@ skills = ["*"]
 
 Routing then needs no static table: the health probe reads each backend's `/models` endpoint and routes by what it advertises. See [`docs/upstreams.md`](docs/upstreams.md) for the routing model.
 
-The environment variables that config refers to:
+The environment variables a deployment can set:
 
 ```bash
 export GATEWAY_SESSION_KEY=$(openssl rand -hex 32)    # REQUIRED: 32 random bytes, hex-encoded
@@ -330,12 +315,14 @@ export IP=0.0.0.0                                     # optional: listen address
 export PORT=8080                                      # optional: listen port, default 8080
                                                       # (the container image already sets both)
 export GATEWAY_DB_PATH=/var/lib/gateway/gateway.sqlite # optional: overrides the path derived from
-                                                      # GATEWAY_DATA_DIR. Setting this AND
-                                                      # [db].path to different values is fatal.
+                                                      # GATEWAY_DATA_DIR. On an upgrade, setting
+                                                      # this AND a different [db].path is fatal.
 export GATEWAY_BOOTSTRAP_ADMIN_GROUPS=platform-admins # optional: break-glass admin claim values,
-                                                      # comma-separated; unioned with the config
+                                                      # comma-separated; unioned with a legacy
                                                       # file's list, never replacing it
-export GATEWAY_OIDC_CLIENT_SECRET=…                   # from your OIDC provider
+export GATEWAY_OIDC_CLIENT_SECRET=…                   # only for an upgrade: resolves the legacy
+                                                      # [oidc] block's client_secret_env on import.
+                                                      # A new install enters the secret at /setup
 export GATEWAY_ENCRYPTION_KEY=$(openssl rand -hex 32) # optional: 32-byte key encrypting the DB's at-rest secrets
 ```
 
@@ -343,7 +330,7 @@ export GATEWAY_ENCRYPTION_KEY=$(openssl rand -hex 32) # optional: 32-byte key en
 
 Earlier releases fell back to an ephemeral per-process key and only logged an error. That produced a gateway that looked healthy while logging everyone out on every restart and losing every sealed secret — invisible until it had already cost data. If you are upgrading and see the new startup error, the variable never made it into the service environment; add it to the unit's `EnvironmentFile` and restart.
 
-`GATEWAY_ENCRYPTION_KEY` is optional: it's the AES-256-GCM key under which the gateway's database-stored secrets are encrypted — each user's MCP-connector OAuth tokens, admin-stored connector client secrets, and **upstream backend API keys entered through the admin UI**. If unset, the gateway derives a stable key from `GATEWAY_SESSION_KEY` — which is itself mandatory, so the derived key is always stable. Set it explicitly if you want at-rest encryption decoupled from session-cookie signing (that way the session key can be rotated without destroying stored secrets). **Rotating this key invalidates already-stored ciphertext** — re-enter backend keys (or keep them in env vars via `api_key_env`) after a change. *(Formerly `GATEWAY_MCP_KEY`. If you set it explicitly, rename the env var to the same value and nothing else changes. If you rely on the key derived from `GATEWAY_SESSION_KEY` (env unset), the derivation label was renamed once, when at-rest sealing grew beyond MCP tokens — and that shipped without a migration, so an earlier release did lose access to secrets sealed before it. That is fixed: the gateway now reads values sealed under the old key and rewrites them under the current one on the first boot, logging how many it moved. Nothing to re-enter.)*
+`GATEWAY_ENCRYPTION_KEY` is optional: it's the AES-256-GCM key under which the gateway's database-stored secrets are encrypted — each user's MCP-connector OAuth tokens, admin-stored connector client secrets, and **upstream backend API keys entered through the admin UI**. If unset, the gateway derives a stable key from `GATEWAY_SESSION_KEY` — which is itself mandatory, so the derived key is always stable. Set it explicitly if you want at-rest encryption decoupled from session-cookie signing (that way the session key can be rotated without destroying stored secrets). **Rotating this key invalidates already-stored ciphertext** — re-enter backend keys at `/admin/upstreams` after a change. *(Formerly `GATEWAY_MCP_KEY`. If you set it explicitly, rename the env var to the same value and nothing else changes. If you rely on the key derived from `GATEWAY_SESSION_KEY` (env unset), the derivation label was renamed once, when at-rest sealing grew beyond MCP tokens — and that shipped without a migration, so an earlier release did lose access to secrets sealed before it. That is fixed: the gateway now reads values sealed under the old key and rewrites them under the current one on the first boot, logging how many it moved. Nothing to re-enter.)*
 
 The blocks a legacy file may still carry — **none of these is where you configure the feature any more.** Each is imported once, on the first boot that sees the file, and ignored from then on; the right-hand column is where it lives now. They stay documented inline in `gateway.example.toml` for anyone migrating.
 
@@ -372,24 +359,13 @@ The blocks a legacy file may still carry — **none of these is where you config
 
 ### Chat attachments (S3)
 
-The chat composer accepts any file via paperclip / drag-drop / clipboard paste. Each file is uploaded to S3 (or any S3-compatible store) and either inlined into the user message as a fenced text block (CSV / JSON / source code / …) or referenced via `image_url` content parts on the OpenAI request (images). Add a `[chat.s3]` block:
+The chat composer accepts any file via paperclip / drag-drop / clipboard paste. Each file is uploaded to S3 (or any S3-compatible store) and either inlined into the user message as a fenced text block (CSV / JSON / source code / …) or referenced via `image_url` content parts on the OpenAI request (images).
 
-```toml
-[chat.s3]
-endpoint        = "https://s3.eu-central-1.amazonaws.com"
-region          = "eu-central-1"
-bucket          = "my-gateway-attachments"
-access_key_env  = "GATEWAY_S3_ACCESS_KEY"
-secret_key_env  = "GATEWAY_S3_SECRET_KEY"
-# key_prefix    = "chat-attachments"   # optional, this is the default
-```
-
-…and export the credentials in the gateway's environment:
-
-```bash
-export GATEWAY_S3_ACCESS_KEY=AKIA…
-export GATEWAY_S3_SECRET_KEY=…
-```
+**Configure it at `/admin/settings` → Content & data:** endpoint, region,
+bucket, an optional key prefix (default `chat-attachments`), and the access /
+secret key. The two keys are secret fields — they go into the database sealed
+under the at-rest key, so there is nothing to export into the environment and
+nothing to keep in a file.
 
 Notes:
 - The bucket can stay **fully private** (no public-read ACL, no presign capability needed on the credentials): the gateway fetches every byte **server-side** and hands it to the upstream LLM inline — images as a `data:` URI in the request, other files as text. So `endpoint` only needs to be reachable from the **gateway**, not from the upstream LLM's network. Path-style requests are always used, so DNS-style bucket subdomains aren't required; the same shape works for MinIO, Backblaze B2, and R2.
@@ -429,14 +405,9 @@ Two profiles ship seeded — `invoice` and `project_document` — and you pick o
 
 Normalisation happens in the prompt, not in code: `31.12.2025` and `12/31/2025` both come back as one ISO date, `1.234,56 €` and `$1,234.56` as a decimal plus a currency code. That is what makes one code path serve a German and English corpus.
 
-**Requirements:** an `embedding`-kind upstream pool (chunks and queries are embedded through it), `git` on the host PATH for git collections (the indexer shells out to it — the container image ships it), and a `[rag]` block. The block is optional; its main knob is `data_dir` (a second, `clone_concurrency`, is documented in `gateway.example.toml`):
+**Requirements:** an `embedding`-kind upstream pool (chunks and queries are embedded through it), and `git` on the host PATH for git collections (the indexer shells out to it — the container image ships it). Turn RAG on at `/admin/settings` → Content & data, where its two knobs also live: `data_dir` (default `./data/rag`) and `clone_concurrency`. Both own the indexer process, so they are badged `restart`.
 
-```toml
-[rag]
-data_dir = "/mnt/data/gateway-rag"   # optional; default ./data/rag
-```
-
-Each collection gets a self-contained folder `<data_dir>/<uuid>/` holding its SQLite store (chunk text + lexical index), its `index.usearch` (vectors), and the git `clone/`. This is the heavy, fully regenerable state — put `data_dir` on a big/cheap disk, separate from the small `[db].path` you actually back up. Deleting a collection in the UI removes its folder.
+Each collection gets a self-contained folder `<data_dir>/<uuid>/` holding its SQLite store (chunk text + lexical index), its `index.usearch` (vectors), and the git `clone/`. This is the heavy, fully regenerable state — put `data_dir` on a big/cheap disk, separate from the small database you actually back up. Deleting a collection in the UI removes its folder.
 
 **Adding a collection.** As an admin, open `/rag` (or `POST /api/v0/rag/collections`) and provide: a name, git URL + branch/tag, an optional PAT for private repos, the embedding model id, include/exclude globs, and chunk size/overlap (characters; default 800/100). A background worker clones and embeds it; status moves `pending → cloning → indexing → ready` (or `error`, with the message shown). A collection can aggregate **several git sources** (multiple repos or branches), each managed and re-indexed independently. **Re-index** re-pulls the sources and rebuilds the collection.
 
@@ -461,12 +432,7 @@ Skills are operator-installed instruction bundles the chat model loads on demand
 
 ![The /admin/skills page: an upload control, the list of loaded skills with the selected bundle's file tree, and that skill's rendered SKILL.md alongside which roles it's granted to.](docs/img/skills.png)
 
-**Managing skills.** Point `[skills]` at a directory and drop bundles in:
-
-```toml
-[skills]
-dir = "/var/lib/gateway/skills"   # optional; default ./data/skills
-```
+**Managing skills.** Point the skills directory at wherever you keep bundles — `/admin/settings` → Content & data, `dir` (default `./data/skills`) — and drop bundles in.
 
 As an admin, open `/admin/skills` to **upload** a `.skill` archive (a zip of a `SKILL.md` bundle), **view** a skill's rendered `SKILL.md` + file tree, and **delete** one — all live, with no restart: the store re-scans the directory and hot-swaps the loaded set. RBAC gates which roles may use which skill; `read_skill` rides along automatically for any role that's been granted a skill. Grants come from two sources, unioned: each role's static `skills` list in the config (`["*"]` for all, exactly like `tools`), plus a **per-skill grant editor in the UI** — click **Granted to** on a skill to pick the roles allowed to load it. UI grants are stored in the DB and take effect immediately; config grants stay authoritative and show read-only in the dialog.
 
@@ -500,6 +466,8 @@ openai api chat_completions.create -m <model-id> -g user "Hello"
 
 `GET /v1/models` lists every model the gateway has discovered across all pools — pick a `model` id from there.
 
+**2b — Or point Claude Code at it** by setting `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` — see [Claude Code against your own models](#claude-code-against-your-own-models).
+
 **3 — Or just use the chat UI** at `/chat`: pick a model, attach files, and chat with streaming replies. Conversations persist server-side and resume on reconnect.
 
 ### HTTP endpoints
@@ -507,6 +475,8 @@ openai api chat_completions.create -m <model-id> -g user "Hello"
 | Endpoint | Auth | Purpose |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer token | Chat completions (streaming + non-streaming). |
+| `POST /v1/messages` | Bearer token or `x-api-key` | **Anthropic Messages API** (streaming + non-streaming) — the compatibility layer Claude Code talks to. Same routing, limits, tool loop and usage accounting as `/v1/chat/completions`; only the wire format differs. See [`docs/claude-code.md`](docs/claude-code.md). |
+| `POST /v1/messages/count_tokens` | Bearer token or `x-api-key` | Exact token count for an Anthropic-shaped request, from the serving model's own tokenizer (vLLM's `/tokenize`). `404` when the backend exposes none, which is the client's signal to count from response `usage` instead. |
 | `POST /v1/embeddings` | Bearer token | Embeddings. |
 | `POST /v1/images/generations` | Bearer token | Image generation (routes to an `image`-kind pool). |
 | `POST /v1/images/edits` | Bearer token | Image editing (multipart: `image` + `prompt`); routes to an `image`-kind pool. |
@@ -514,6 +484,7 @@ openai api chat_completions.create -m <model-id> -g user "Hello"
 | `POST /v1/audio/speech` | Bearer token | Text-to-speech (OpenAI-shaped). Only served when a `speech` upstream pool is configured. |
 | `GET /v1/models` | Bearer token | All discovered models across pools (deduplicated by id). |
 | `GET /v1/sandbox/files/{run}/{filename}` | Bearer token | Download a file a sandbox run produced for the caller (scoped to your user). |
+| `HEAD /api/hello` | none | Connection-warming probe an Anthropic-format client sends at startup. |
 | `GET /healthz`, `GET /readyz` | none | Liveness / readiness probes. |
 | `GET /setup`, `POST /setup/test`, `POST /setup/restart`, `POST /setup/finish` | none on a first run; one-time token afterwards | Deployment setup wizard: enter your OIDC provider, prove it with a real sign-in, and pick the claim value that grants admin. Open (and every other page redirects to it) until setup completes; gone afterwards, unless `restore-setup` on the host reopens it for 30 minutes — see [Recovering access](#recovering-access). |
 | `/`, `/login`, `/chat`, `/tokens`, `/tools`, `/memory`, `/scheduled`, `/webhooks`, `/integrations`, `/skills`, `/usage` | session cookie | Web UI (`/integrations` is the per-user MCP connector store; `/skills` is the per-user private-skills manager — upload a `.skill` archive or write `SKILL.md` inline, usable only in your own chats; `/webhooks` manages your inbound triggers; `/usage` shows your own request/token usage; admins get an in-page "All users" toggle). |
@@ -521,15 +492,15 @@ openai api chat_completions.create -m <model-id> -g user "Hello"
 | `/hooks/rag/{token}` | token in URL | Re-sync one RAG collection. Point a file host's webhook (Nextcloud's `webhook_listeners`, ownCloud's equivalent, or a cron line) at it so a changed folder is searchable in minutes rather than at the next poll. The body is ignored — this is a doorbell, not a change feed; the walk that follows establishes what actually changed. Returns `202` with the number of refs queued. |
 | `/admin/users`, `/admin/tokens`, `/admin/groups`, `/rag`, `/admin/models`, `/admin/upstreams`, `/admin/skills`, `/admin/connectors`, `/admin/comfyui`, `/admin/limits`, `/admin/settings`, `POST /admin/settings/clear` | admin role | Admin UI (the users page lists registered users and starts impersonation; tokens is the deployment-wide API-token register — every token with its owner, month-to-date spend, model allowlist and quota; the secret itself is unrecoverable (only a SHA-256 of it is stored), and the one thing editable there is an operator model restriction, which intersects with the owner's own so neither side can widen the other; groups maps OIDC claims onto gateway groups and sets per-group tool/skill grants — pools, RAG collections, and MCP connectors then restrict access by group; upstreams edits the pool/backend topology in the DB and hot-reloads it via "Apply changes" — the old `/admin/backends` and `/admin/pools` now redirect here; connectors curates the MCP catalog — see [`docs/connectors.md`](docs/connectors.md) for provider setup; comfyui shows the loaded ComfyUI workflow catalog with a live reload button — see [`docs/comfyui.md`](docs/comfyui.md) for the manifest format; limits sets global / role / user / API-token rate limits & quotas; settings edits the operator settings that used to live in `gateway.toml` — OCR, compaction, attachment storage, sandbox, ComfyUI, RAG, skills, Typst, GeoIP, usage, limits, feedback, push and session/token lifetimes — grouped into five tabs, with secrets sealed at rest. Almost everything takes effect on the next request; the handful of fields that own a background worker are badged `restart` and leave a banner until the process comes back). |
 | `POST /impersonate/stop` | session cookie | End an active impersonation and return to your own account. |
-| `/feedback`, `/feedback/extract`, `/feedback/config` | session cookie | Feedback widget: file a GitHub issue, turn a voice transcript into structured fields, and report whether the feature is configured. Enabled by the `[feedback]` config block. |
-| `/api/v0/push/config`, `/api/v0/push/subscribe`, `/api/v0/push/unsubscribe` | session cookie | Web Push (turn-complete notifications): fetch the VAPID public key + enabled flag, register a browser subscription, and forget one. Governed by the `[push]` config block. |
+| `/feedback`, `/feedback/extract`, `/feedback/config` | session cookie | Feedback widget: file a GitHub issue, turn a voice transcript into structured fields, and report whether the feature is configured. Enabled at `/admin/settings` → Notifications. |
+| `/api/v0/push/config`, `/api/v0/push/subscribe`, `/api/v0/push/unsubscribe` | session cookie | Web Push (turn-complete notifications): fetch the VAPID public key + enabled flag, register a browser subscription, and forget one. Governed by the Web Push settings at `/admin/settings` → Notifications. |
 | `/api/v0/*` | session cookie | JSON APIs backing the UI. |
 
-The `/v1/*` endpoints require `Authorization: Bearer gwk_…`. Client `Authorization` headers are dropped at the proxy and the configured upstream key (if any) is injected; hop-by-hop headers are filtered both ways; upstream 4xx/5xx are relayed verbatim. The UI pages use the signed session cookie minted at OIDC login.
+The `/v1/*` endpoints require `Authorization: Bearer gwk_…` (`/v1/messages` also accepts the same token in `x-api-key`, which is where an Anthropic-format client puts it). Client `Authorization` headers are dropped at the proxy and the configured upstream key (if any) is injected; hop-by-hop headers are filtered both ways; upstream 4xx/5xx are relayed verbatim. The UI pages use the signed session cookie minted at OIDC login.
 
 The UI is an installable **PWA** — `/manifest.webmanifest`, `/sw.js`, `/favicon.ico`, and `/icons/*` are public (no auth). The service worker cache-firsts the immutable content-hashed `/assets/*` bundles for fast loads, network-firsts the PWA metadata/icons so their short cache headers govern freshness, passes through all streaming/API traffic without buffering, and shows a localized offline fallback page for navigations — authed HTML is never cached (it's per-user and often a streaming SSE payload). Installability requires HTTPS (localhost exempt for dev).
 
-When `[push]` is enabled (default), the PWA can also deliver **Web Push** notifications: after a user opts in from the `/tokens` page, the service worker shows a notification when an assistant turn they started finishes while the app isn't focused. This uses a self-generated VAPID keypair (persisted, private half sealed under the at-rest key) and RFC 8291 payload encryption — no third-party push provider or account is involved beyond the browser's own push service.
+When Web Push is enabled (the default), the PWA can also deliver **Web Push** notifications: after a user opts in from the `/tokens` page, the service worker shows a notification when an assistant turn they started finishes while the app isn't focused. This uses a self-generated VAPID keypair (persisted, private half sealed under the at-rest key) and RFC 8291 payload encryption — no third-party push provider or account is involved beyond the browser's own push service.
 
 ## Production deployment (container + systemd)
 
@@ -554,8 +525,8 @@ sudo systemctl enable --now gateway.service
 ```
 
 Operational notes:
-- **TLS:** the unit binds `127.0.0.1:8080` — terminate HTTPS with a reverse proxy (Caddy / Traefik / nginx) in front. Set `[gateway].public_url` to the external HTTPS URL so the OIDC callback is correct, and register `<public_url>/auth/callback` as a redirect URI on your OIDC client.
-- **State:** the SQLite DB + session store live in a Podman-managed named volume and survive image swaps. Point `[db].path` (and `[rag].data_dir`, if used) at that volume.
+- **TLS:** the unit binds `127.0.0.1:8080` — terminate HTTPS with a reverse proxy (Caddy / Traefik / nginx) in front. Set the gateway's public URL to the external HTTPS URL at `/setup` so the OIDC callback is correct, and register `<public_url>/auth/callback` as a redirect URI on your OIDC client.
+- **State:** the SQLite DB + session store live in a Podman-managed named volume and survive image swaps. Point `$GATEWAY_DB_PATH` (and, if you use RAG, its `data_dir` at `/admin/settings`) at that volume.
 - **Updates:** Quadlet treats `Image=` as the source of truth and won't re-pull `:latest` on restart — pin a digest or a `:<git-sha>` tag in production.
 
 ### Docker Compose

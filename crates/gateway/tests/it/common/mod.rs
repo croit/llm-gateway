@@ -40,7 +40,7 @@ pub const TEST_SECRET: [u8; 32] = [7u8; 32];
 
 /// A backend with the standard test config, pointed at `base_url` (a wiremock
 /// uri, or `http://unused.invalid` when no request should be forwarded).
-fn mock_backend(name: &str, base_url: &str) -> BackendConfig {
+pub fn mock_backend(name: &str, base_url: &str) -> BackendConfig {
     BackendConfig {
         alias: None,
         probe_models: true,
@@ -58,7 +58,10 @@ fn mock_backend(name: &str, base_url: &str) -> BackendConfig {
 
 /// Assemble a `RamaState` from an already-seeded registry plus the shared
 /// in-memory db — the identical tail every pool builder repeats.
-fn state_from_registry(db_pool: db::Pool, registry: Arc<upstreams::UpstreamRegistry>) -> RamaState {
+pub fn state_from_registry(
+    db_pool: db::Pool,
+    registry: Arc<upstreams::UpstreamRegistry>,
+) -> RamaState {
     let tools = Arc::new(ToolRegistry::new());
     let rbac = Arc::new(Resolver::empty());
     let app = AppState::new(Config::default(), db_pool.clone(), registry, tools, rbac)
@@ -130,6 +133,38 @@ pub async fn state_with_pool(upstream_url: &str, kind: PoolKind, model_name: &st
     );
     let registry = upstreams::UpstreamRegistry::new(&pools).unwrap();
     seed_pool_models(&registry, "pool", 0, &[model_name]);
+    state_from_registry(db_pool, registry)
+}
+
+/// [`state_with_pool`] plus a client-facing alias on the backend: `alias`
+/// routes to `real_model`. Backs the Anthropic-format tests, where the model
+/// ids a client sends (`claude-sonnet-4-6`) are names no self-hosted backend
+/// serves.
+pub async fn state_with_alias(upstream_url: &str, alias: &str, real_model: &str) -> RamaState {
+    let db_pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+    let mut backend = mock_backend("mock", upstream_url);
+    backend.alias = Some(upstreams::config::AliasSpec::Targets(HashMap::from([(
+        alias.to_string(),
+        real_model.to_string(),
+    )])));
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool".to_string(),
+        UpstreamPoolConfig {
+            voices: Default::default(),
+            offer_voices: Vec::new(),
+            allowed_groups: Vec::new(),
+            fallback_offline: None,
+            compliance: Default::default(),
+            enforce_limits: true,
+            kind: PoolKind::Chat,
+            strategy: PickerStrategy::RoundRobin,
+            models: Vec::new(),
+            backend: vec![backend],
+        },
+    );
+    let registry = upstreams::UpstreamRegistry::new(&pools).unwrap();
+    seed_pool_models(&registry, "pool", 0, &[real_model]);
     state_from_registry(db_pool, registry)
 }
 

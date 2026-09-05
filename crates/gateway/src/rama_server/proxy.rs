@@ -29,8 +29,8 @@ use jiff::Timestamp;
 use crate::rama_server::vad;
 use gateway_core::server::auth::UserCtx;
 use gateway_core::server::db::usage::{self, UnitUsage, UsageKind, UsageRecord, UsageSource};
+use gateway_core::server::upstreams::PoolKind;
 use gateway_core::server::upstreams::registry::{Acquired, RouteError};
-use gateway_core::server::upstreams::{AcquireError, PoolKind};
 use gateway_core::server::usage::UsageHandle;
 use gateway_features::server::speech::{self, SpokenMarkers};
 use gateway_runtime::rama_server::auth::require_bearer;
@@ -119,15 +119,27 @@ impl RecordParams {
 /// `429` to send when the caller is over a limit, else `None`. Resolves the
 /// caller's role ids and consults the shared [`gateway_core::server::limits::Enforcer`].
 async fn limit_check(state: &RamaState, user: &UserCtx) -> Option<Response> {
+    limit_exceeded(state, user)
+        .await
+        .map(|e| limit_exceeded_response(&e))
+}
+
+/// The breached limit, if any — [`limit_check`] without the OpenAI-shaped
+/// rendering, so a caller that owes its client a different error envelope
+/// (the Anthropic `/v1/messages` path) can enforce the same ceilings.
+pub(crate) async fn limit_exceeded(
+    state: &RamaState,
+    user: &UserCtx,
+) -> Option<gateway_core::server::limits::LimitExceeded> {
     let role_ids = state.role_ids_for(&user.roles);
     if let Err(exceeded) = state.enforcer.check(&user.user_id, &role_ids).await {
-        return Some(limit_exceeded_response(&exceeded));
+        return Some(exceeded);
     }
     // The token's own rules are an additional ceiling, not an alternative to
     // the owner's budget: both must pass, so issuing a token can only narrow
     // what its owner may spend.
     if let Err(exceeded) = state.enforcer.check_token(&user.token_id).await {
-        return Some(limit_exceeded_response(&exceeded));
+        return Some(exceeded);
     }
     None
 }
@@ -145,26 +157,7 @@ fn fmt_limit_num(n: f64) -> String {
 /// A `429 Too Many Requests` with an OpenAI-shaped error envelope and a
 /// `Retry-After` header, naming the breached limit.
 fn limit_exceeded_response(e: &gateway_core::server::limits::LimitExceeded) -> Response {
-    let scope = e
-        .model
-        .as_deref()
-        .map(|m| format!(" for model `{m}`"))
-        .unwrap_or_default();
-    // Say *whose* ceiling this was. "You are over quota" and "this token is
-    // over its quota" have different fixes — the second is solved by using a
-    // different token, or by raising that token's own rule, and a caller who
-    // cannot tell them apart will chase the wrong one.
-    let subject = match e.subject {
-        gateway_core::server::db::limits::SubjectType::Token => " for this API token",
-        _ => "",
-    };
-    let msg = format!(
-        "{} limit reached{subject}{scope}: {} per {} (used {}). Try again later.",
-        e.dimension.as_str(),
-        fmt_limit_num(e.limit),
-        e.window.as_str(),
-        fmt_limit_num(e.used),
-    );
+    let msg = limit_message(e);
     let body = json!({
         "error": {
             "message": msg,
@@ -185,6 +178,32 @@ fn limit_exceeded_response(e: &gateway_core::server::limits::LimitExceeded) -> R
         })
 }
 
+/// The human-readable "you are over a limit" sentence, shared by every wire
+/// format so a developer reads the same explanation whichever endpoint they
+/// hit.
+pub(crate) fn limit_message(e: &gateway_core::server::limits::LimitExceeded) -> String {
+    let scope = e
+        .model
+        .as_deref()
+        .map(|m| format!(" for model `{m}`"))
+        .unwrap_or_default();
+    // Say *whose* ceiling this was. "You are over quota" and "this token is
+    // over its quota" have different fixes — the second is solved by using a
+    // different token, or by raising that token's own rule, and a caller who
+    // cannot tell them apart will chase the wrong one.
+    let subject = match e.subject {
+        gateway_core::server::db::limits::SubjectType::Token => " for this API token",
+        _ => "",
+    };
+    format!(
+        "{} limit reached{subject}{scope}: {} per {} (used {}). Try again later.",
+        e.dimension.as_str(),
+        fmt_limit_num(e.limit),
+        e.window.as_str(),
+        fmt_limit_num(e.used),
+    )
+}
+
 /// Token counts from a buffered JSON body (or `(None, None, None)` if it
 /// doesn't parse / carries no `usage`).
 fn tokens_from_bytes(bytes: &Bytes) -> (Option<i64>, Option<i64>, Option<i64>) {
@@ -193,7 +212,7 @@ fn tokens_from_bytes(bytes: &Bytes) -> (Option<i64>, Option<i64>, Option<i64>) {
         .unwrap_or((None, None, None))
 }
 
-type TokenUsage = (Option<i64>, Option<i64>, Option<i64>);
+pub(crate) type TokenUsage = (Option<i64>, Option<i64>, Option<i64>);
 
 fn response_metrics(kind: UsageKind, bytes: &Bytes) -> (TokenUsage, UnitUsage) {
     let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
@@ -251,7 +270,7 @@ fn prefer_positive(primary: Option<f64>, fallback: Option<f64>) -> Option<f64> {
 ///   grants, *including* when the client also brought its own `tools`
 ///   array. `runner::inject_tools` unions the gateway definitions into
 ///   the client's set (de-duped by name), then we either stream (via
-///   `forward_streaming_with_tools`) or buffer (via
+///   `stream_with_tools`) or buffer (via
 ///   `runner::run_with_tools`). Both flavours intercept gateway-owned
 ///   `tool_calls`, run the tool server-side, and continue the loop —
 ///   the client never sees those calls. Client-owned `tool_calls` are
@@ -268,7 +287,7 @@ fn prefer_positive(primary: Option<f64>, fallback: Option<f64>) -> Option<f64> {
 /// persisted chat turn — so there is no `session_id`/`assistant_turn_id`, no
 /// filename reservation set, and no live browser to prompt (`chat_feedback`).
 /// Both the buffered (`chat_completions`) and streaming
-/// (`forward_streaming_with_tools`) loops build the context through here so
+/// (`stream_with_tools`) loops build the context through here so
 /// the ~15-field literal lives in exactly one place and can't drift.
 fn proxy_tool_ctx(
     state: &Arc<RamaState>,
@@ -476,7 +495,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
     let (parts, body) = req.into_parts();
     let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
-        Err(resp) => return resp,
+        Err(refusal) => return refusal.into_response(),
     };
     if let Some(resp) = limit_check(&state, &user).await {
         return resp;
@@ -494,43 +513,11 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
         );
     };
 
-    // Per-token resolution: RBAC − the user's global /tools toggles −
-    // this token's disabled capabilities, gated behind the token's master
-    // "tool use" switch (off by default → empty → byte-dumb passthrough
-    // below). One call covers buffered, streaming, and passthrough.
-    let mut allowed_tools = state.allowed_tools_for_token(&user).await;
-
-    // Build the caller's connected-connector MCP overlay ONCE for this request
-    // and union its ids into the advertised set, so the tools we advertise are
-    // exactly the tools the `CompositeToolSource` below can dispatch (no
-    // advertise/execute drift). Empty + cheap when nothing is connected. Only
-    // when the token's master tool switch is on (else the per-token resolution
-    // already returned empty and we keep the byte-dumb path).
-    let user_mcp = if user.tools_enabled {
-        let role_ids = state.role_ids_for(&user.roles);
-        let is_admin = state.rbac.is_admin(&role_ids);
-        state
-            .mcp
-            .layer_for_user(
-                &user.user_id,
-                &role_ids,
-                is_admin,
-                gateway_runtime::server::tools::mcp::manager::AskContext::Api {
-                    token_id: &user.token_id,
-                },
-            )
-            .await
-    } else {
-        gateway_runtime::server::tools::mcp::manager::UserMcpLayer::default()
-    };
-    state.union_mcp_tool_ids(&mut allowed_tools, &user_mcp);
-
-    // Drop chat-session-only tools: the `/v1` proxy paths carry no session
-    // (`assistant_turn_id`/`session_id` are None below), so the typst render
-    // family, the document-canvas tools, and `upload_attachment` can't run
-    // here — advertising them just lets the model pick one and hit a
-    // "only available inside a chat session" error instead of a completion.
-    allowed_tools.retain(|id| !gateway_runtime::server::tools::catalog::requires_chat_session(id));
+    // The token's whole tool surface, resolved in one place (see
+    // `api_tool_layer`): what to advertise, and the overlay that dispatches it.
+    // Empty when the token's master tool switch is off (the default), which is
+    // what selects the byte-dumb passthrough below.
+    let (allowed_tools, user_mcp) = state.api_tool_layer(&user).await;
 
     // Byte-dumb proxy: only when the user has no gateway tool grants.
     // There's nothing to inject, so route bytes 1:1 and leave any
@@ -585,7 +572,7 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
     if wants_streaming {
-        let resp = forward_streaming_with_tools(
+        let resp = stream_with_tools(
             state.clone(),
             user.clone(),
             real_model.clone(),
@@ -594,74 +581,28 @@ pub async fn chat_completions(State(state): State<Arc<RamaState>>, req: Request)
             request_body,
             allowed_tools,
             user_mcp,
+            Box::new(OpenAiSink),
         )
         .await;
         return with_resolved_model_header(resp, &model, &real_model);
     }
-    let tool_ctx = proxy_tool_ctx(
+    let outcome = buffered_with_tools(
         &state,
-        user.user_id.clone(),
-        user.roles.clone(),
-        access.clone(),
-        client_ip.clone(),
-        Some(real_model.clone()),
-    );
-    let state_clone = state.clone();
-    let model_clone = real_model.clone();
-    let access_clone = access.clone();
-    let headers_clone = parts.headers.clone();
-    // One usage row per upstream round — built per request, finished off
-    // with backend/status/latency/tokens inside the loop closure.
-    let rec = RecordParams::v1(
         &user,
-        UsageKind::Chat,
-        real_model.clone(),
-        state
-            .upstreams
-            .enforce_limits_for_model(&real_model, PoolKind::Chat),
-    );
-
-    // Reuse the layer built once above (same ids we advertised) for dispatch.
-    let comfyui = state
-        .comfyui()
-        .as_ref()
-        .map(|h| gateway_runtime::server::comfyui_tool::ComfyuiToolSource::new((**h).clone()));
-    // Bound, not chained: `tools()` returns an owned snapshot and the composite
-    // source borrows from it for the rest of the request.
-    let tools = state.tools();
-    let tool_source = gateway_runtime::server::tools::mcp::manager::CompositeToolSource::new(
-        tools.as_ref(),
+        &real_model,
+        access,
+        parts.headers,
+        client_ip,
+        request_body,
+        &allowed_tools,
         &user_mcp,
     )
-    .with_comfyui(comfyui.as_ref());
-
-    let outcome =
-        runner::run_with_tools(
-            &tool_source,
-            &allowed_tools,
-            &tool_ctx,
-            request_body,
-            move |body_value| {
-                let state = state_clone.clone();
-                let model = model_clone.clone();
-                let access = access_clone.clone();
-                let headers = headers_clone.clone();
-                let rec = rec.clone();
-                async move {
-                    forward_one_round(&state, &model, &access, &headers, &rec, body_value).await
-                }
-            },
-        )
-        .await;
+    .await;
 
     let outcome = match outcome {
         Ok(o) => o,
         Err(err) => return loop_error_response(err),
     };
-
-    if outcome.status >= 400 {
-        maybe_learn_capability(&state, &real_model, outcome.status, &outcome.body);
-    }
 
     let resp = Response::builder()
         .status(StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::OK))
@@ -708,7 +649,7 @@ pub async fn transcribe(State(state): State<Arc<RamaState>>, req: Request) -> Re
     let (parts, body) = req.into_parts();
     let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
-        Err(resp) => return resp,
+        Err(refusal) => return refusal.into_response(),
     };
     if let Some(resp) = limit_check(&state, &user).await {
         return resp;
@@ -1036,7 +977,7 @@ fn build_multipart(fields: &[MultipartField]) -> Result<(Bytes, String), String>
 /// Drains a rama HTTP body into a single `Bytes`. The upstream relay
 /// works on whole buffers right now; SSE streaming will need a different
 /// shape that consumes the body progressively.
-async fn read_body_to_bytes(body: rama::http::Body) -> Result<Bytes, String> {
+pub(crate) async fn read_body_to_bytes(body: rama::http::Body) -> Result<Bytes, String> {
     use rama::http::body::util::BodyExt;
     body.collect()
         .await
@@ -1056,7 +997,7 @@ pub async fn embeddings(State(state): State<Arc<RamaState>>, req: Request) -> Re
     // Bearer required; no per-model RBAC gate here, matching the chat path.
     let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
-        Err(resp) => return resp,
+        Err(refusal) => return refusal.into_response(),
     };
     if let Some(resp) = limit_check(&state, &user).await {
         return resp;
@@ -1117,7 +1058,7 @@ pub async fn images_generations(State(state): State<Arc<RamaState>>, req: Reques
     let (parts, body) = req.into_parts();
     let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
-        Err(resp) => return resp,
+        Err(refusal) => return refusal.into_response(),
     };
     if let Some(resp) = limit_check(&state, &user).await {
         return resp;
@@ -1175,7 +1116,7 @@ pub async fn images_edits(State(state): State<Arc<RamaState>>, req: Request) -> 
     let (parts, body) = req.into_parts();
     let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
-        Err(resp) => return resp,
+        Err(refusal) => return refusal.into_response(),
     };
     if let Some(resp) = limit_check(&state, &user).await {
         return resp;
@@ -1300,7 +1241,7 @@ pub async fn speech(State(state): State<Arc<RamaState>>, req: Request) -> Respon
     let (parts, body) = req.into_parts();
     let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
-        Err(resp) => return resp,
+        Err(refusal) => return refusal.into_response(),
     };
     if let Some(resp) = limit_check(&state, &user).await {
         return resp;
@@ -1548,7 +1489,7 @@ pub async fn list_models(State(state): State<Arc<RamaState>>, req: Request) -> R
     let (parts, _body) = req.into_parts();
     let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
-        Err(resp) => return resp,
+        Err(refusal) => return refusal.into_response(),
     };
     // Per-user model visibility: only models served by a pool this caller may
     // access. A withheld model is also unroutable for them (see `route_access`),
@@ -1583,7 +1524,7 @@ pub async fn retrieve_model(State(state): State<Arc<RamaState>>, req: Request) -
     let (parts, _body) = req.into_parts();
     let user = match require_bearer(&state, &parts.headers).await {
         Ok(u) => u,
-        Err(resp) => return resp,
+        Err(refusal) => return refusal.into_response(),
     };
     let raw = parts
         .uri
@@ -2058,6 +1999,211 @@ async fn forward_streaming(
     })
 }
 
+/// Why a streamed turn ended early, carrying the upstream status where there
+/// was one.
+///
+/// The status matters because the headers have already shipped by the time
+/// anything can go wrong: a `503` and a `400` both arrive as a `200` plus an
+/// in-band error, and a client deciding whether to retry has only the error's
+/// *type* to go on. Losing the status turns "the backend was momentarily
+/// busy" into "this request is hopeless".
+#[derive(Debug)]
+pub(crate) struct StreamFailure {
+    /// Upstream HTTP status, when the failure was an upstream response rather
+    /// than a transport error or a decision of ours.
+    pub(crate) status: Option<u16>,
+    pub(crate) message: String,
+}
+
+impl StreamFailure {
+    fn with_status(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status: Some(status),
+            message: message.into(),
+        }
+    }
+}
+
+/// Every `?` inside the loop yields a bare message; those are ours, not an
+/// upstream's, so they carry no status.
+impl From<String> for StreamFailure {
+    fn from(message: String) -> Self {
+        Self {
+            status: None,
+            message,
+        }
+    }
+}
+
+/// Where the streaming tool loop writes its output — and, with it, *in which
+/// wire format*.
+///
+/// The loop below is the gateway's whole agentic turn: it acquires a backend
+/// per round, hides the tool calls it owns, runs them, re-submits, and hands
+/// back the calls it doesn't own. None of that is format-specific, but the
+/// bytes it emits are: an OpenAI client wants `chat.completion.chunk` frames
+/// terminated by `data: [DONE]`, an Anthropic client wants a named event
+/// sequence from `message_start` to `message_stop`. Putting the difference
+/// behind this trait keeps *one* loop — the alternative, a second copy for
+/// `/v1/messages`, is how the two formats would drift apart on the next fix.
+///
+/// [`OpenAiSink`] is byte-for-byte what the loop used to emit inline; the
+/// Anthropic implementation lives in [`crate::rama_server::messages`].
+pub(crate) trait StreamSink: Send {
+    /// Frames to write before the loop starts, while the first backend slot
+    /// is still being acquired.
+    fn prologue(&mut self) -> Vec<Bytes> {
+        Vec::new()
+    }
+
+    /// One upstream event the client should see. `chunk` is its parsed
+    /// `data:` payload when it had one; `raw` is the event verbatim.
+    fn visible_chunk(&mut self, chunk: Option<&Value>, raw: Vec<u8>) -> Vec<Bytes>;
+
+    /// The round's final token counts — the same numbers, at the same moment,
+    /// that the usage row is billed on. Called once per round rather than per
+    /// chunk so a backend that repeats cumulative usage across several frames
+    /// can't make the client-visible totals disagree with the billed ones.
+    fn round_usage(&mut self, tokens: TokenUsage) {
+        let _ = tokens;
+    }
+
+    /// The turn calls a tool the gateway doesn't own: the client must run it
+    /// and re-submit, so it needs the whole turn back.
+    fn client_tool_calls(
+        &mut self,
+        meta: &ChunkMeta,
+        acc: &BTreeMap<usize, ToolCallAcc>,
+    ) -> Vec<Bytes>;
+
+    /// The loop ended normally.
+    fn finish(&mut self) -> Vec<Bytes>;
+
+    /// The loop failed.
+    fn error(&mut self, failure: &StreamFailure) -> Vec<Bytes>;
+
+    /// Keep-alive cadence and frame, for a format whose client watches for
+    /// silence. `None` (the default) means no keep-alives.
+    fn heartbeat(&self) -> Option<(std::time::Duration, Bytes)> {
+        None
+    }
+}
+
+/// The OpenAI sink: relay upstream events verbatim, terminate with `[DONE]`.
+struct OpenAiSink;
+
+impl StreamSink for OpenAiSink {
+    fn visible_chunk(&mut self, _chunk: Option<&Value>, raw: Vec<u8>) -> Vec<Bytes> {
+        vec![Bytes::from(raw)]
+    }
+
+    fn client_tool_calls(
+        &mut self,
+        meta: &ChunkMeta,
+        acc: &BTreeMap<usize, ToolCallAcc>,
+    ) -> Vec<Bytes> {
+        synth_client_tool_call_chunks(meta, acc)
+    }
+
+    fn finish(&mut self) -> Vec<Bytes> {
+        vec![Bytes::from_static(b"data: [DONE]\n\n")]
+    }
+
+    fn error(&mut self, failure: &StreamFailure) -> Vec<Bytes> {
+        let chunk = format!(
+            "data: {}\n\n",
+            json!({"error": {"message": failure.message, "type": "internal_error"}})
+        );
+        vec![Bytes::from(chunk), Bytes::from_static(b"data: [DONE]\n\n")]
+    }
+}
+
+/// One whole buffered agentic turn: inject the gateway's tools, run the
+/// tool loop to the model's final answer (or to the point where it calls a
+/// tool the client owns), and hand back the raw result.
+///
+/// The buffered counterpart of [`stream_with_tools`], and it exists for the
+/// same reason: everything up to the final `LoopOutput` — the tool context,
+/// the per-round usage row, the composite tool source, the round callback — is
+/// format-neutral, and the only difference between the two `/v1` surfaces is
+/// how they render the result. No trait is needed here because the shared half
+/// ends in a value rather than a stream.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn buffered_with_tools(
+    state: &Arc<RamaState>,
+    user: &UserCtx,
+    real_model: &str,
+    access: gateway_core::server::upstreams::PoolAccess,
+    headers: HeaderMap,
+    client_ip: Option<String>,
+    request_body: Value,
+    allowed_tools: &[String],
+    user_mcp: &gateway_runtime::server::tools::mcp::manager::UserMcpLayer,
+) -> Result<runner::LoopOutput, LoopError> {
+    let tool_ctx = proxy_tool_ctx(
+        state,
+        user.user_id.clone(),
+        user.roles.clone(),
+        access.clone(),
+        client_ip,
+        Some(real_model.to_string()),
+    );
+    // One usage row per upstream round — built per request, finished off with
+    // backend/status/latency/tokens inside the loop closure.
+    let rec = RecordParams::v1(
+        user,
+        UsageKind::Chat,
+        real_model.to_string(),
+        state
+            .upstreams
+            .enforce_limits_for_model(real_model, PoolKind::Chat),
+    );
+
+    // Reuse the layer the caller built (same ids it advertised) for dispatch.
+    let comfyui = state
+        .comfyui()
+        .as_ref()
+        .map(|h| gateway_runtime::server::comfyui_tool::ComfyuiToolSource::new((**h).clone()));
+    // Bound, not chained: `tools()` returns an owned snapshot and the composite
+    // source borrows from it for the rest of the request.
+    let tools = state.tools();
+    let tool_source = gateway_runtime::server::tools::mcp::manager::CompositeToolSource::new(
+        tools.as_ref(),
+        user_mcp,
+    )
+    .with_comfyui(comfyui.as_ref());
+
+    let round_state = state.clone();
+    let round_model = real_model.to_string();
+    let outcome =
+        runner::run_with_tools(
+            &tool_source,
+            allowed_tools,
+            &tool_ctx,
+            request_body,
+            move |body_value| {
+                let state = round_state.clone();
+                let model = round_model.clone();
+                let access = access.clone();
+                let headers = headers.clone();
+                let rec = rec.clone();
+                async move {
+                    forward_one_round(&state, &model, &access, &headers, &rec, body_value).await
+                }
+            },
+        )
+        .await;
+
+    // An upstream that rejected a capability teaches the model registry, once,
+    // wherever the turn was driven from.
+    if let Ok(out) = &outcome
+        && out.status >= 400
+    {
+        maybe_learn_capability(state, real_model, out.status, &out.body);
+    }
+    outcome
+}
+
 /// Streaming variant of the tool path. Forwards each upstream SSE
 /// chunk to the client *and* accumulates `delta.tool_calls` in
 /// parallel; when an upstream round ends, runs gateway-owned tools
@@ -2077,8 +2223,11 @@ async fn forward_streaming(
 /// Errors mid-stream surface as a `data: {"error": …}` chunk
 /// followed by `[DONE]` — we can't change the response status after
 /// the headers have shipped.
+///
+/// The frames themselves come from the [`StreamSink`]: [`OpenAiSink`] relays
+/// the upstream's own chunks, the Anthropic sink re-encodes them.
 #[allow(clippy::too_many_arguments)]
-async fn forward_streaming_with_tools(
+pub(crate) async fn stream_with_tools(
     state: Arc<RamaState>,
     user: UserCtx,
     model: String,
@@ -2087,6 +2236,7 @@ async fn forward_streaming_with_tools(
     mut request_body: Value,
     allowed_tools: Vec<String>,
     user_mcp: gateway_runtime::server::tools::mcp::manager::UserMcpLayer,
+    mut sink: Box<dyn StreamSink>,
 ) -> Response {
     // Use the layer built once by the caller (same ids it advertised) for
     // injection here and for dispatch inside the loop.
@@ -2138,7 +2288,26 @@ async fn forward_streaming_with_tools(
     let (mut tx, rx) = mpsc::unbounded::<Result<Bytes, std::io::Error>>();
 
     tokio::spawn(async move {
-        if let Err(err) = drive_streaming_tool_loop(
+        for frame in sink.prologue() {
+            let _ = tx.unbounded_send(Ok(frame));
+        }
+        // Keep-alives, where the format's client expects them. A round that
+        // runs a slow gateway tool (a sandbox command, a web fetch) relays no
+        // upstream bytes for its whole duration, and a client watching for
+        // silence would abort a turn that is merely working.
+        let heartbeat = sink.heartbeat().map(|(every, frame)| {
+            let ping_tx = tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(every).await;
+                    if ping_tx.unbounded_send(Ok(frame.clone())).is_err() {
+                        return;
+                    }
+                }
+            })
+        });
+
+        let outcome = drive_streaming_tool_loop(
             state,
             model,
             request_body,
@@ -2147,17 +2316,22 @@ async fn forward_streaming_with_tools(
             rec,
             user_mcp,
             access,
+            sink.as_mut(),
             &mut tx,
         )
-        .await
-        {
-            let err_chunk = format!(
-                "data: {}\n\n",
-                json!({"error": {"message": err, "type": "internal_error"}})
-            );
-            let _ = tx.unbounded_send(Ok(Bytes::from(err_chunk)));
+        .await;
+        // Stop pinging before the terminators, so no keep-alive can land
+        // after the frame that ends the message.
+        if let Some(handle) = heartbeat {
+            handle.abort();
         }
-        let _ = tx.unbounded_send(Ok(Bytes::from("data: [DONE]\n\n")));
+        let closing = match outcome {
+            Ok(()) => sink.finish(),
+            Err(failure) => sink.error(&failure),
+        };
+        for frame in closing {
+            let _ = tx.unbounded_send(Ok(frame));
+        }
     });
 
     Response::builder()
@@ -2186,7 +2360,7 @@ use runner::MAX_TOOL_ROUNDS as STREAM_TOOL_LOOP_MAX_ROUNDS;
 /// every chunk repeats every field (`system_fingerprint` often rides only
 /// the first).
 #[derive(Default)]
-struct ChunkMeta {
+pub(crate) struct ChunkMeta {
     id: Value,
     created: Value,
     model: Value,
@@ -2269,8 +2443,9 @@ async fn drive_streaming_tool_loop(
     rec: RecordParams,
     user_mcp: gateway_runtime::server::tools::mcp::manager::UserMcpLayer,
     access: gateway_core::server::upstreams::PoolAccess,
+    sink: &mut dyn StreamSink,
     tx: &mut mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
-) -> Result<(), String> {
+) -> Result<(), StreamFailure> {
     // Free the turn's sandbox lease on every exit of the loop below — the
     // explicit, awaited counterpart to the chat path's `run_turn` and the
     // buffered path's `run_with_tools` wrapper (the `Drop` guard is only the
@@ -2286,6 +2461,7 @@ async fn drive_streaming_tool_loop(
         rec,
         user_mcp,
         access,
+        sink,
         tx,
     )
     .await;
@@ -2308,8 +2484,9 @@ async fn drive_streaming_tool_loop_inner(
     rec: RecordParams,
     user_mcp: gateway_runtime::server::tools::mcp::manager::UserMcpLayer,
     access: gateway_core::server::upstreams::PoolAccess,
+    sink: &mut dyn StreamSink,
     tx: &mut mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
-) -> Result<(), String> {
+) -> Result<(), StreamFailure> {
     use rama::futures::StreamExt;
 
     // The caller's connected-connector MCP tools, unioned onto the registry so
@@ -2346,7 +2523,9 @@ async fn drive_streaming_tool_loop_inner(
         let acquired = state
             .upstreams
             .acquire_for_access(&model, PoolKind::Chat, &access)
-            .map_err(|e| e.to_string())?;
+            // No slot to be had is the backend being unavailable, not the
+            // request being wrong — say so, so a client can retry.
+            .map_err(|e| StreamFailure::with_status(503, e.to_string()))?;
         let backend_name = acquired.backend().name.clone();
         let started = Instant::now();
         let url = format!("{}/chat/completions", acquired.backend().base_url);
@@ -2383,7 +2562,13 @@ async fn drive_streaming_tool_loop_inner(
                     started,
                     (None, None, None),
                 );
-                return Err(e.to_string());
+                // A backend we couldn't reach at all: the same 502 the
+                // buffered path records, so a client sees a transport
+                // failure rather than a request error.
+                return Err(StreamFailure::with_status(
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                    e.to_string(),
+                ));
             }
         };
         if !upstream.status().is_success() {
@@ -2402,7 +2587,10 @@ async fn drive_streaming_tool_loop_inner(
                 .take(500)
                 .collect::<String>();
             maybe_learn_capability(&state, &model, status.as_u16(), &bytes);
-            return Err(format!("upstream {status}: {body_str}"));
+            return Err(StreamFailure::with_status(
+                status.as_u16(),
+                format!("upstream {status}: {body_str}"),
+            ));
         }
         let status_code = upstream.status().as_u16();
 
@@ -2432,6 +2620,10 @@ async fn drive_streaming_tool_loop_inner(
 
                 let mut is_done = false;
                 let mut hide_event = false;
+                // The event's parsed payload, kept for the sink: a format
+                // that re-encodes (rather than relays) needs the chunk, not
+                // the bytes.
+                let mut parsed: Option<Value> = None;
 
                 for line in event_str.lines() {
                     // NB: this loop needs the `[DONE]` sentinel itself (it
@@ -2450,6 +2642,10 @@ async fn drive_streaming_tool_loop_inner(
                     };
                     chunk_meta.absorb(&v);
                     if let Some(t) = gateway_core::server::sse::usage_tokens(&v) {
+                        // Last-wins, matching what the usage row is billed on:
+                        // a backend that repeats cumulative usage across frames
+                        // reports a total, not an increment. Handed to the sink
+                        // once the round ends, alongside `rec.emit`.
                         round_tokens = t;
                         // Hide the trailing usage-only frame (empty `choices`)
                         // from a client that didn't opt into it.
@@ -2461,12 +2657,12 @@ async fn drive_streaming_tool_loop_inner(
                     if let Some(t) = delta.content()
                         && content_guard.push(t)
                     {
-                        return Err(gateway_runtime::loop_guard::LOOP_MESSAGE.to_string());
+                        return Err(gateway_runtime::loop_guard::LOOP_MESSAGE.to_string().into());
                     }
                     if let Some(t) = delta.reasoning()
                         && reasoning_guard.push(t)
                     {
-                        return Err(gateway_runtime::loop_guard::LOOP_MESSAGE.to_string());
+                        return Err(gateway_runtime::loop_guard::LOOP_MESSAGE.to_string().into());
                     }
                     if let Some(tcs) = delta.tool_calls() {
                         hide_event = true;
@@ -2483,13 +2679,16 @@ async fn drive_streaming_tool_loop_inner(
                     {
                         hide_event = true;
                     }
+                    parsed = Some(v);
                 }
 
                 if is_done || hide_event {
                     continue;
                 }
-                tx.unbounded_send(Ok(Bytes::from(event_bytes)))
-                    .map_err(|e| format!("client disconnected: {e}"))?;
+                for frame in sink.visible_chunk(parsed.as_ref(), event_bytes) {
+                    tx.unbounded_send(Ok(frame))
+                        .map_err(|e| format!("client disconnected: {e}"))?;
+                }
             }
         }
         rec.emit(
@@ -2499,6 +2698,9 @@ async fn drive_streaming_tool_loop_inner(
             started,
             round_tokens,
         );
+        // The same numbers the row above was billed on, so a re-encoding sink's
+        // client-visible usage report can't drift from the accounting.
+        sink.round_usage(round_tokens);
         drop(acquired);
 
         if tool_acc.is_empty() {
@@ -2517,8 +2719,8 @@ async fn drive_streaming_tool_loop_inner(
             .values()
             .any(|acc| !acc.name.is_empty() && !tool_source.contains(&acc.name));
         if has_client_owned {
-            for chunk in synth_client_tool_call_chunks(&chunk_meta, &tool_acc) {
-                tx.unbounded_send(Ok(chunk))
+            for frame in sink.client_tool_calls(&chunk_meta, &tool_acc) {
+                tx.unbounded_send(Ok(frame))
                     .map_err(|e| format!("client disconnected: {e}"))?;
             }
             return Ok(());
@@ -2583,9 +2785,7 @@ async fn drive_streaming_tool_loop_inner(
         }
     }
 
-    Err(format!(
-        "tool-call loop exhausted after {STREAM_TOOL_LOOP_MAX_ROUNDS} rounds"
-    ))
+    Err(format!("tool-call loop exhausted after {STREAM_TOOL_LOOP_MAX_ROUNDS} rounds").into())
 }
 
 /// vLLM hard-rejects `stream_options` when `stream` isn't `true`
@@ -2647,7 +2847,7 @@ fn rewrite_model_in_bytes(body: Bytes, real_model: &str) -> Bytes {
 
 /// Set the `model` field of a parsed JSON body to `real_model` (the tool-loop
 /// paths carry the body as a `Value`, so no re-parse is needed).
-fn set_model_in_value(body: &mut Value, real_model: &str) {
+pub(crate) fn set_model_in_value(body: &mut Value, real_model: &str) {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("model".into(), json!(real_model));
     }
@@ -2659,7 +2859,11 @@ fn set_model_in_value(body: &mut Value, real_model: &str) {
 /// `Response` before it's returned, so it lands in the header block ahead of
 /// any streamed body. A non-ASCII model id (never the case for real ids) is
 /// silently skipped rather than failing the response.
-fn with_resolved_model_header(mut resp: Response, requested: &str, resolved: &str) -> Response {
+pub(crate) fn with_resolved_model_header(
+    mut resp: Response,
+    requested: &str,
+    resolved: &str,
+) -> Response {
     if requested != resolved
         && let Ok(val) = rama::http::HeaderValue::from_str(resolved)
     {
@@ -2669,76 +2873,45 @@ fn with_resolved_model_header(mut resp: Response, requested: &str, resolved: &st
 }
 
 fn route_error_response(err: RouteError) -> Response {
-    match err {
-        // No backend serves this id at all → OpenAI's 404 `model_not_found`,
-        // not a transient 5xx. (The chat path also pre-checks `knows_model`
-        // so the tool branches surface this too; this arm covers the
-        // byte-dumb path and the transcription handler.)
-        RouteError::UnknownModel(m) => model_not_found_response(&m),
-        // The model exists and the owner may use it — this particular token
-        // may not. A 403 that names the model, rather than the 404 a
-        // group-withheld model gets: the caller holds the credential whose
-        // allowlist did this and can see that allowlist on /tokens, so
-        // spelling it out is help, not disclosure.
-        RouteError::ModelNotAllowed(m) => model_not_allowed_response(&m),
-        RouteError::Acquire(AcquireError::NoHealthyBackend { pool }) => error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "upstream_unreachable",
-            &format!("no healthy backend in `{pool}`"),
-        ),
-        RouteError::Acquire(AcquireError::Saturated { pool }) => error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "upstream_unreachable",
-            &format!("`{pool}` is saturated"),
-        ),
+    // The status and wording are the error's own (see
+    // `RouteError::status_and_message`); only the envelope is OpenAI's. The
+    // two model errors keep their distinct shapes — OpenAI clients (the Vercel
+    // AI SDK among them) branch on `param` and `code`, not on the message.
+    let (status, message) = err.status_and_message();
+    let code = match err {
+        RouteError::UnknownModel(_) => "model_not_found",
+        RouteError::ModelNotAllowed(_) => "model_not_allowed",
+        RouteError::Acquire(_) => "upstream_unreachable",
+    };
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if matches!(err, RouteError::Acquire(_)) {
+        return error_response(status, code, &message);
     }
-}
-
-/// `403` for a model this API token's allowlist excludes. Uses OpenAI's
-/// request-error shape with `param: "model"` so clients treat it as a bad
-/// request rather than something to retry, and a `code` of its own so a
-/// caller can tell it from `model_not_found` programmatically.
-fn model_not_allowed_response(model: &str) -> Response {
+    // OpenAI's request-error shape, with `param: "model"` so clients treat it
+    // as a bad request rather than something to retry.
     let body = json!({
         "error": {
-            "message": format!(
-                "The API token used for this request is not allowed to use the model \
-                 `{model}`. Its allowed models are listed on the /tokens page."
-            ),
+            "message": message,
             "type": "invalid_request_error",
             "param": "model",
-            "code": "model_not_allowed",
+            "code": code,
         }
     });
     (
-        StatusCode::FORBIDDEN,
+        status,
         [("content-type", "application/json")],
         body.to_string(),
     )
         .into_response()
 }
 
-/// OpenAI's `404 model_not_found` for a model no backend serves. Distinct
-/// shape from `error_response`: `type` is `invalid_request_error` and it
-/// carries `param: "model"`, matching OpenAI exactly so clients (incl. the
-/// Vercel AI SDK) treat it as a request error, not a retryable 5xx.
+/// OpenAI's `404 model_not_found` for a model no backend serves.
+///
+/// Still its own function because `GET /v1/models/{id}` produces this without
+/// a `RouteError` to ask — but it asks one anyway, so the wording has a single
+/// source.
 fn model_not_found_response(model: &str) -> Response {
-    let body = json!({
-        "error": {
-            "message": format!(
-                "The model `{model}` does not exist or you do not have access to it."
-            ),
-            "type": "invalid_request_error",
-            "param": "model",
-            "code": "model_not_found",
-        }
-    });
-    (
-        StatusCode::NOT_FOUND,
-        [("content-type", "application/json")],
-        body.to_string(),
-    )
-        .into_response()
+    route_error_response(RouteError::UnknownModel(model.to_string()))
 }
 
 /// OpenAI-shaped error envelope. Matches the axum side so existing
@@ -2761,6 +2934,10 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
 
 const REQUEST_HEADER_DENYLIST: &[&str] = &[
     "authorization",
+    // The same gateway credential in its other spelling (an Anthropic-format
+    // client sets one or the other, and Claude Code's model discovery sets
+    // both). Forwarding it would hand our caller's token to the backend.
+    "x-api-key",
     "host",
     "content-length",
     "connection",

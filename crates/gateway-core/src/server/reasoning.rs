@@ -274,7 +274,51 @@ pub struct ReasoningOverrides {
     pub effort_max: Option<String>,
 }
 
+/// The model's reasoning configuration: how it spells "think harder", and the
+/// per-level budgets an admin tuned for it on `/admin/models`.
+///
+/// Both halves come from the same `model_defaults` row, and every caller that
+/// wants one wants the other — the chat driver and the `/v1/messages`
+/// compatibility layer had the identical three-step lookup before this
+/// existed. A model with no row resolves by name and takes the built-in
+/// budgets, which is the common case.
+pub async fn resolve_for_model(
+    pool: &crate::server::db::Pool,
+    model: &str,
+) -> (ReasoningStyle, ReasoningOverrides) {
+    let row = crate::server::db::model_defaults::get(pool, model)
+        .await
+        .ok()
+        .flatten();
+    let style = ReasoningStyle::resolve(
+        row.as_ref().and_then(|r| r.reasoning_style.as_deref()),
+        model,
+    );
+    let overrides = row
+        .as_ref()
+        .map(ReasoningOverrides::from_row)
+        .unwrap_or_default();
+    (style, overrides)
+}
+
 impl ReasoningOverrides {
+    /// The per-model overrides an admin set on `/admin/models`.
+    ///
+    /// Lives here rather than at a call site because every path that resolves
+    /// a reasoning parameter — the chat driver, the `/v1/messages`
+    /// compatibility layer — needs the same translation from the stored row.
+    pub fn from_row(row: &crate::server::db::model_defaults::ModelDefaults) -> Self {
+        let budget = |v: Option<i64>| v.and_then(|n| u32::try_from(n).ok());
+        Self {
+            budget_standard: budget(row.thinking_budget_standard),
+            budget_deep: budget(row.thinking_budget_deep),
+            budget_max: budget(row.thinking_budget_max),
+            effort_standard: row.reasoning_effort_standard.clone(),
+            effort_deep: row.reasoning_effort_deep.clone(),
+            effort_max: row.reasoning_effort_max.clone(),
+        }
+    }
+
     /// The token-budget override for `effort`, if any. Fast never has one.
     fn budget(&self, effort: Effort) -> Option<u32> {
         match effort {
