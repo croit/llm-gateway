@@ -9,3 +9,8 @@ chrome-lang-switcher-aria = Sprache wählen
 push-untitled-conversation = Neue Unterhaltung
 push-turn-complete-body = Ihre Antwort ist fertig.
 push-turn-error-body = Die Anfrage endete mit einem Fehler.
+
+# Web Push: Die Autorisierung eines Konnektors ist abgelaufen (proaktiver
+# Refresh-Lauf, `tools::mcp::worker`). { $connector } ist der Anzeigename.
+push-connector-reconnect-title = Verbindung braucht Ihre Anmeldung
+push-connector-reconnect-body = { $connector } wurde getrennt — öffnen Sie „Integrationen“, um erneut zu verbinden.

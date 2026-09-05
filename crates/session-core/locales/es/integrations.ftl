@@ -20,6 +20,7 @@ integrations-token-placeholder = pegue su token
 
 integrations-tools-error-prefix = No se pudieron cargar las herramientas de este conector:
 integrations-tools-error-hint = Compruebe la URL del servidor MCP / su token y luego use Reconectar arriba.
+integrations-tools-error-hint-reauth = Su autorización ya no es válida: use Reconectar arriba para iniciar sesión de nuevo.
 integrations-tools-empty = Este conector no expone ninguna herramienta.
 integrations-tools-header = Permisos de herramientas ({ $count })
 integrations-set-all-label = Establecer todo:

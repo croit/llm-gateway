@@ -776,7 +776,11 @@ fn render_connector_card(
     tool_error: Option<&str>,
 ) -> Html {
     let connected = connection.is_some();
-    let errored = connection.map(|c| c.status == "error").unwrap_or(false);
+    let errored = connection.map(|c| c.is_errored()).unwrap_or(false);
+    // A dead credential (the server rejected our grant/client) needs a new
+    // sign-in — pointing at the URL or the token would just send the user
+    // looking in the wrong place.
+    let needs_reauth = connection.map(|c| c.needs_reauth()).unwrap_or(false);
     let is_global = connector.is_global();
     let icon_text = connector.icon.clone().unwrap_or_default();
     let logo = session_core::icons::connector_logo(&connector.key, 26).unwrap_or_else(|| {
@@ -821,7 +825,7 @@ fn render_connector_card(
                 // connectors are always live, so always show them (with the same
                 // per-user always/ask/off pickers).
                 if is_global || connected {
-                    (render_tools(lang, &key, tools, tool_error))
+                    (render_tools(lang, &key, tools, tool_error, needs_reauth))
                 }
             }
         }
@@ -904,6 +908,7 @@ fn render_tools(
     key: &str,
     tools: Option<&[ToolInfo]>,
     tool_error: Option<&str>,
+    needs_reauth: bool,
 ) -> Html {
     let Some(tools) = tools else {
         // Show the real connection/transport/auth error, not a generic line —
@@ -912,13 +917,18 @@ fn render_tools(
         let detail = tool_error
             .map(str::to_string)
             .unwrap_or_else(|| t(lang, "integrations-error-connection-unavailable"));
+        let hint = if needs_reauth {
+            "integrations-tools-error-hint-reauth"
+        } else {
+            "integrations-tools-error-hint"
+        };
         return html! {
             div(class: "border-t border-base-300 pt-3") {
                 p(class: "text-error text-xs m-0") {
                     (t(lang, "integrations-tools-error-prefix")) " " (detail)
                 }
                 p(class: "text-base-content/50 text-xs m-0 mt-1") {
-                    (t(lang, "integrations-tools-error-hint"))
+                    (t(lang, hint))
                 }
             }
         }
@@ -1039,4 +1049,105 @@ fn render_mode_picker(lang: Lang, action: &str, tool: &str, current: ToolMode) -
         }
     }
     .to_html()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gateway_core::server::db::mcp_catalog::Scope;
+
+    fn connector() -> Connector {
+        Connector {
+            key: "google_workspace".into(),
+            name: "Google Workspace".into(),
+            description: Some("Gmail, Calendar, Drive".into()),
+            icon: None,
+            category: None,
+            url: "https://gworkspace-mcp.example.com/mcp".into(),
+            auth: AuthKind::OAuth2,
+            scope: Scope::PerUser,
+            audit: false,
+            use_dcr: true,
+            client_id: None,
+            client_secret_ct: None,
+            client_secret_nonce: None,
+            authorize_url: None,
+            token_url: None,
+            registration_url: None,
+            scopes: Vec::new(),
+            allowed_groups: Vec::new(),
+            enabled: true,
+            seeded: true,
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    fn connection(status: &str) -> user_mcp::Connection {
+        user_mcp::Connection {
+            id: "c1".into(),
+            user_id: "u1".into(),
+            connector_key: "google_workspace".into(),
+            status: status.into(),
+            access_token_ct: None,
+            access_token_nonce: None,
+            refresh_token_ct: None,
+            refresh_token_nonce: None,
+            token_expires_at: None,
+            scopes: Vec::new(),
+            dcr_client_id: Some("dcr-1".into()),
+            dcr_client_secret_ct: None,
+            dcr_client_secret_nonce: None,
+            token_url: Some("https://gworkspace-mcp.example.com/token".into()),
+            last_error: Some("token refresh: … invalid_client: Invalid client_id".into()),
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    /// A dead credential must ask for a new sign-in. Pointing the user at the
+    /// server URL or "your token" (the generic hint) sends them looking in the
+    /// wrong place — the URL is right and there is no token to check.
+    #[test]
+    fn reauth_connection_gets_the_sign_in_hint() {
+        let conn = connection("reauth");
+        let card = render_connector_card(
+            Lang::En,
+            &connector(),
+            Some(&conn),
+            None,
+            Some("token refresh: … invalid_client: Invalid client_id"),
+        );
+        let html = card.to_string();
+        assert!(
+            html.contains(&t(Lang::En, "integrations-tools-error-hint-reauth")),
+            "reauth card must ask for a new sign-in: {html}"
+        );
+        assert!(
+            !html.contains(&t(Lang::En, "integrations-tools-error-hint")),
+            "reauth card must not show the generic URL/token hint"
+        );
+        assert!(
+            html.contains(&t(Lang::En, "integrations-badge-needs-reconnect")),
+            "reauth is an error state, so the badge still shows"
+        );
+    }
+
+    /// A failure that might pass keeps the generic hint — the URL or the token
+    /// really could be the problem there.
+    #[test]
+    fn transient_error_keeps_the_generic_hint() {
+        let conn = connection("error");
+        let card = render_connector_card(
+            Lang::En,
+            &connector(),
+            Some(&conn),
+            None,
+            Some("connect failed: connection refused"),
+        );
+        let html = card.to_string();
+        assert!(html.contains(&t(Lang::En, "integrations-tools-error-hint")));
+        assert!(!html.contains(&t(Lang::En, "integrations-tools-error-hint-reauth")));
+        assert!(html.contains(&t(Lang::En, "integrations-badge-needs-reconnect")));
+    }
 }

@@ -22,6 +22,7 @@ integrations-token-placeholder = paste your token
 
 integrations-tools-error-prefix = Couldn't load this connector's tools:
 integrations-tools-error-hint = Check the MCP server URL / your token, then use Reconnect above.
+integrations-tools-error-hint-reauth = Your authorization is no longer valid — use Reconnect above to sign in again.
 integrations-tools-empty = This connector exposes no tools.
 integrations-tools-header = Tool permissions ({ $count })
 integrations-set-all-label = Set all:

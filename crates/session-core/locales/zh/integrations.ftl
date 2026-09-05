@@ -20,6 +20,7 @@ integrations-token-placeholder = 粘贴您的令牌
 
 integrations-tools-error-prefix = 无法加载此连接器的工具：
 integrations-tools-error-hint = 请检查 MCP 服务器 URL / 您的令牌，然后使用上方的“重新连接”。
+integrations-tools-error-hint-reauth = 您的授权已失效 — 请使用上方的“重新连接”重新登录。
 integrations-tools-empty = 此连接器不提供任何工具。
 integrations-tools-header = 工具权限（{ $count }）
 integrations-set-all-label = 全部设置：

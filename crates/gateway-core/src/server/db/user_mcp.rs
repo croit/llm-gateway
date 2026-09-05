@@ -74,6 +74,17 @@ impl AskOverApi {
     }
 }
 
+/// `status` of a usable connection.
+pub const STATUS_CONNECTED: &str = "connected";
+/// `status` after a failure we might recover from on our own (server down,
+/// TLS/transport error, a token the server refused for an unclear reason).
+pub const STATUS_ERROR: &str = "error";
+/// `status` after the authorization server declared the stored credential dead
+/// (`invalid_grant` / `invalid_client` / `unauthorized_client`). Nothing but a
+/// fresh user authorization brings it back, so the store says so plainly
+/// instead of pointing at the URL or the token.
+pub const STATUS_REAUTH: &str = "reauth";
+
 /// A user's connection to one connector.
 #[derive(Debug, Clone)]
 pub struct Connection {
@@ -95,6 +106,18 @@ pub struct Connection {
     pub last_error: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+}
+
+impl Connection {
+    /// Anything but `connected` — the store shows "Needs reconnect".
+    pub fn is_errored(&self) -> bool {
+        self.status != STATUS_CONNECTED
+    }
+
+    /// The credential is dead; only re-authorizing helps. See [`STATUS_REAUTH`].
+    pub fn needs_reauth(&self) -> bool {
+        self.status == STATUS_REAUTH
+    }
 }
 
 /// Everything needed to persist a freshly-completed OAuth connection. Tokens
@@ -232,16 +255,27 @@ pub async fn update_tokens(
 }
 
 /// Mark a connection as errored (e.g. refresh failed, server rejected token).
+///
+/// `needs_reauth` separates a dead credential ([`STATUS_REAUTH`]) from a
+/// failure that may pass ([`STATUS_ERROR`]); both drop the connector out of
+/// [`connected_keys`] and out of the proactive-refresh sweep.
 pub async fn mark_error(
     pool: &Pool,
     user_id: &str,
     connector_key: &str,
     error: &str,
+    needs_reauth: bool,
 ) -> Result<(), DbError> {
+    let status = if needs_reauth {
+        STATUS_REAUTH
+    } else {
+        STATUS_ERROR
+    };
     sqlx::query(
-        "UPDATE user_mcp_connections SET status = 'error', last_error = ?, updated_at = ? \
+        "UPDATE user_mcp_connections SET status = ?, last_error = ?, updated_at = ? \
          WHERE user_id = ? AND connector_key = ?",
     )
+    .bind(status)
     .bind(error)
     .bind(Timestamp::now().to_string())
     .bind(user_id)
@@ -671,6 +705,67 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn mark_error_records_whether_the_user_must_reauthorize() {
+        let pool = pool().await;
+
+        // A failure that may pass: parked as `error`, hint stays generic.
+        upsert_connection(&pool, new_conn()).await.unwrap();
+        mark_error(&pool, "u1", "gmail", "server unreachable", false)
+            .await
+            .unwrap();
+        let c = get_connection(&pool, "u1", "gmail").await.unwrap().unwrap();
+        assert_eq!(c.status, STATUS_ERROR);
+        assert!(c.is_errored());
+        assert!(!c.needs_reauth());
+        assert_eq!(c.last_error.as_deref(), Some("server unreachable"));
+
+        // A dead credential: parked as `reauth` so the store asks for a new
+        // sign-in instead of pointing at the URL or the token.
+        mark_error(
+            &pool,
+            "u1",
+            "gmail",
+            "token refresh: token exchange failed: provider rejected the request \
+             — invalid_client: Invalid client_id",
+            true,
+        )
+        .await
+        .unwrap();
+        let c = get_connection(&pool, "u1", "gmail").await.unwrap().unwrap();
+        assert_eq!(c.status, STATUS_REAUTH);
+        assert!(c.is_errored());
+        assert!(c.needs_reauth());
+
+        // Either way the connector stops being offered to the model, and the
+        // proactive sweep leaves it alone rather than re-failing every pass.
+        assert!(connected_keys(&pool, "u1").await.unwrap().is_empty());
+        let near: Timestamp = "2031-01-01T00:00:00Z".parse().unwrap();
+        let stale: Timestamp = "2000-01-01T00:00:00Z".parse().unwrap();
+        assert!(
+            connections_due_for_refresh(&pool, near, stale)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnecting_clears_the_reauth_state() {
+        let pool = pool().await;
+        upsert_connection(&pool, new_conn()).await.unwrap();
+        mark_error(&pool, "u1", "gmail", "invalid_client", true)
+            .await
+            .unwrap();
+        // The user reconnects: a fresh authorization overwrites the row.
+        upsert_connection(&pool, new_conn()).await.unwrap();
+        let c = get_connection(&pool, "u1", "gmail").await.unwrap().unwrap();
+        assert_eq!(c.status, STATUS_CONNECTED);
+        assert!(!c.is_errored());
+        assert!(c.last_error.is_none(), "stale error text must not linger");
+        assert_eq!(connected_keys(&pool, "u1").await.unwrap(), vec!["gmail"]);
     }
 
     #[tokio::test]

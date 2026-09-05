@@ -51,6 +51,37 @@ struct Cached {
     fetched_at: Instant,
 }
 
+/// Why a connection couldn't produce a usable access token, plus the one bit
+/// the caller acts on: whether the credential is dead (only the user can fix
+/// it, by authorizing again) or the failure might simply pass.
+#[derive(Debug, Clone)]
+pub struct TokenError {
+    pub message: String,
+    pub needs_reauth: bool,
+}
+
+impl TokenError {
+    /// A failure we may recover from on our own.
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            needs_reauth: false,
+        }
+    }
+}
+
+impl std::fmt::Display for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<TokenError> for String {
+    fn from(e: TokenError) -> String {
+        e.message
+    }
+}
+
 /// How `ask`-mode tools are treated when building a user's overlay.
 #[derive(Clone, Copy)]
 pub enum AskContext<'a> {
@@ -285,7 +316,10 @@ impl McpConnectionManager {
         let connected = if connector.auth == mcp_catalog::AuthKind::None {
             connect_http_server(&connector.key, &connector.url, None).await?
         } else {
-            let (access, refreshed) = self.access_token(user_id, connector, &conn).await?;
+            let (access, refreshed) = self
+                .access_token(user_id, connector, &conn)
+                .await
+                .map_err(String::from)?;
             match connect_http_server(&connector.key, &connector.url, Some(&access)).await {
                 Ok(s) => s,
                 // The server rejected a token we didn't think was expired
@@ -295,10 +329,23 @@ impl McpConnectionManager {
                 Err(e) if !refreshed && conn.refresh_token_ct.is_some() => {
                     tracing::info!(user = %user_id, connector = %connector.key,
                     "MCP connect failed; forcing token refresh + one retry");
-                    let new_access = self
-                        .refresh(user_id, connector, true)
-                        .await
-                        .map_err(|re| format!("{e}; forced refresh also failed: {re}"))?;
+                    let new_access = match self.refresh(user_id, connector, true).await {
+                        Ok(access) => access,
+                        Err(re) => {
+                            // Park the connection with the right reason, same as
+                            // the expiry-driven refresh path below does.
+                            let msg = format!("{e}; forced refresh also failed: {re}");
+                            let _ = user_mcp::mark_error(
+                                &self.db,
+                                user_id,
+                                &connector.key,
+                                &msg,
+                                re.needs_reauth,
+                            )
+                            .await;
+                            return Err(msg);
+                        }
+                    };
                     connect_http_server(&connector.key, &connector.url, Some(&new_access))
                         .await
                         .map_err(|e2| format!("reconnect after refresh failed: {e2}"))?
@@ -354,7 +401,7 @@ impl McpConnectionManager {
         user_id: &str,
         connector: &Connector,
         conn: &Connection,
-    ) -> Result<(String, bool), String> {
+    ) -> Result<(String, bool), TokenError> {
         let fresh_enough = conn
             .token_expires_at
             .map(|exp| exp > Timestamp::now() + jiff::Span::new().seconds(REFRESH_SKEW_SECS))
@@ -363,14 +410,18 @@ impl McpConnectionManager {
             return match self.decrypt_access(conn) {
                 Ok(token) => Ok((token, false)),
                 // A decrypt failure won't self-heal — the encryption key changed
-                // or the value was sealed under a different key. Mark the
-                // connection errored (like the refresh path below) so it drops
-                // out of `connected_keys`, stops silently re-failing every turn,
-                // and the store UI prompts a reconnect instead of showing a stale
-                // "connected".
+                // or the value was sealed under a different key. The stored
+                // credential is unreadable, so this is a reauth case: the
+                // connection drops out of `connected_keys`, stops silently
+                // re-failing every turn, and the store asks for a new sign-in
+                // instead of showing a stale "connected".
                 Err(err) => {
-                    let _ = user_mcp::mark_error(&self.db, user_id, &connector.key, &err).await;
-                    Err(err)
+                    let _ =
+                        user_mcp::mark_error(&self.db, user_id, &connector.key, &err, true).await;
+                    Err(TokenError {
+                        message: err,
+                        needs_reauth: true,
+                    })
                 }
             };
         }
@@ -378,7 +429,14 @@ impl McpConnectionManager {
         match self.refresh(user_id, connector, false).await {
             Ok(token) => Ok((token, true)),
             Err(err) => {
-                let _ = user_mcp::mark_error(&self.db, user_id, &connector.key, &err).await;
+                let _ = user_mcp::mark_error(
+                    &self.db,
+                    user_id,
+                    &connector.key,
+                    &err.message,
+                    err.needs_reauth,
+                )
+                .await;
                 Err(err)
             }
         }
@@ -392,18 +450,25 @@ impl McpConnectionManager {
         &self,
         user_id: &str,
         connector_key: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), TokenError> {
         let connector = mcp_catalog::get(&self.db, connector_key)
             .await
-            .map_err(|e| format!("loading connector: {e}"))?
-            .ok_or_else(|| "connector no longer in catalog".to_string())?;
+            .map_err(|e| TokenError::transient(format!("loading connector: {e}")))?
+            .ok_or_else(|| TokenError::transient("connector no longer in catalog"))?;
         match self.refresh(user_id, &connector, true).await {
             Ok(_) => {
                 self.invalidate(user_id, connector_key).await;
                 Ok(())
             }
             Err(err) => {
-                let _ = user_mcp::mark_error(&self.db, user_id, connector_key, &err).await;
+                let _ = user_mcp::mark_error(
+                    &self.db,
+                    user_id,
+                    connector_key,
+                    &err.message,
+                    err.needs_reauth,
+                )
+                .await;
                 Err(err)
             }
         }
@@ -429,14 +494,14 @@ impl McpConnectionManager {
         user_id: &str,
         connector: &Connector,
         force: bool,
-    ) -> Result<String, String> {
+    ) -> Result<String, TokenError> {
         let lock = self.refresh_lock(user_id, &connector.key).await;
         let _held = lock.lock().await;
         // Reload under the lock so we see any refresh a concurrent task just did.
         let conn = user_mcp::get_connection(&self.db, user_id, &connector.key)
             .await
-            .map_err(|e| format!("loading connection: {e}"))?
-            .ok_or_else(|| "not connected".to_string())?;
+            .map_err(|e| TokenError::transient(format!("loading connection: {e}")))?
+            .ok_or_else(|| TokenError::transient("not connected"))?;
         if !force
             && conn
                 .token_expires_at
@@ -444,16 +509,23 @@ impl McpConnectionManager {
                 .unwrap_or(false)
         {
             // A concurrent refresh already produced a fresh token — reuse it.
-            return self.decrypt_access(&conn);
+            return self.decrypt_access(&conn).map_err(TokenError::transient);
         }
         let (rt_ct, rt_nonce) = match (&conn.refresh_token_ct, &conn.refresh_token_nonce) {
             (Some(ct), Some(nonce)) => (ct, nonce),
-            _ => return Err("access token expired and no refresh token stored — reconnect".into()),
+            // Nothing to refresh *with*: only a new authorization can help,
+            // so this is a reauth case rather than a retryable error.
+            _ => {
+                return Err(TokenError {
+                    message: "access token expired and no refresh token stored — reconnect".into(),
+                    needs_reauth: true,
+                });
+            }
         };
         let refresh_token = self
             .crypto
             .open_str(rt_nonce, rt_ct)
-            .map_err(|e| format!("decrypting refresh token: {e}"))?;
+            .map_err(|e| TokenError::transient(format!("decrypting refresh token: {e}")))?;
 
         // Reuse the token endpoint resolved + persisted at connect time; only
         // re-run discovery for older connections that predate persistence.
@@ -469,12 +541,18 @@ impl McpConnectionManager {
                 };
                 mcp_oauth::discover(&self.http, &connector.url, &ov)
                     .await
-                    .map_err(|e| format!("discovery for refresh: {e}"))?
+                    .map_err(|e| TokenError::transient(format!("discovery for refresh: {e}")))?
                     .token_url
             }
         };
 
-        let (client_id, client_secret) = self.client_credentials(connector, &conn)?;
+        let (client_id, client_secret) = self
+            .client_credentials(connector, &conn)
+            .map_err(TokenError::transient)?;
+        // `needs_reauth` rides along: an `invalid_grant` / `invalid_client` here
+        // is the authorization server telling us this credential is finished —
+        // a dead refresh token, or (for a DCR client) a server that no longer
+        // knows the client we registered, e.g. after it lost its OAuth store.
         let tokens = mcp_oauth::refresh(
             &self.http,
             &token_url,
@@ -483,17 +561,20 @@ impl McpConnectionManager {
             client_secret.as_deref(),
         )
         .await
-        .map_err(|e| format!("token refresh: {e}"))?;
+        .map_err(|e| TokenError {
+            message: format!("token refresh: {e}"),
+            needs_reauth: e.needs_reauth(),
+        })?;
 
         let access_sealed = self
             .crypto
             .seal_str(&tokens.access_token)
-            .map_err(|e| format!("sealing access token: {e}"))?;
+            .map_err(|e| TokenError::transient(format!("sealing access token: {e}")))?;
         let refresh_sealed = match tokens.refresh_token.as_deref() {
             Some(rt) => Some(
                 self.crypto
                     .seal_str(rt)
-                    .map_err(|e| format!("sealing refresh token: {e}"))?,
+                    .map_err(|e| TokenError::transient(format!("sealing refresh token: {e}")))?,
             ),
             None => None,
         };
@@ -508,7 +589,7 @@ impl McpConnectionManager {
             tokens.expires_at,
         )
         .await
-        .map_err(|e| format!("persisting refreshed tokens: {e}"))?;
+        .map_err(|e| TokenError::transient(format!("persisting refreshed tokens: {e}")))?;
 
         Ok(tokens.access_token)
     }
@@ -1162,13 +1243,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_token_decrypt_failure_marks_connection_errored() {
+    async fn access_token_decrypt_failure_marks_connection_needing_reauth() {
         // Regression: a stored token sealed under a different key can't be
         // decrypted and won't self-heal (e.g. the encryption key changed). The
-        // connection must flip from `connected` to `error` so it drops out of
+        // connection must flip from `connected` to `reauth` so it drops out of
         // `connected_keys`, stops silently re-failing (and log-spamming) every
-        // turn, and the store UI prompts a reconnect instead of showing a stale
-        // green "connected".
+        // turn, and the store UI asks for a new sign-in — the only thing that
+        // actually fixes it — instead of showing a stale green "connected".
         let mgr = manager().await;
         // FK: user_mcp_connections references users(id).
         sqlx::query(
@@ -1207,16 +1288,23 @@ mod tests {
             .expect("connection was just inserted");
         assert_eq!(conn.status, "connected", "starts life connected");
 
-        let res = mgr.access_token("u1", &connector, &conn).await;
-        assert!(res.is_err(), "decrypt under the wrong key must fail");
+        let err = mgr
+            .access_token("u1", &connector, &conn)
+            .await
+            .expect_err("decrypt under the wrong key must fail");
+        assert!(
+            err.needs_reauth,
+            "an unreadable credential is only fixable by authorizing again"
+        );
 
         let after = user_mcp::get_connection(&mgr.db, "u1", "discord")
             .await
             .unwrap()
             .expect("connection still present");
         assert_eq!(
-            after.status, "error",
-            "a non-self-healing decrypt failure must mark the connection errored"
+            after.status,
+            user_mcp::STATUS_REAUTH,
+            "a non-self-healing decrypt failure must ask the user to reconnect"
         );
         assert!(
             after.last_error.unwrap_or_default().contains("decrypt"),

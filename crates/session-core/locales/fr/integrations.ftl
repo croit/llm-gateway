@@ -20,6 +20,7 @@ integrations-token-placeholder = collez votre jeton
 
 integrations-tools-error-prefix = Impossible de charger les outils de ce connecteur :
 integrations-tools-error-hint = Vérifiez l'URL du serveur MCP / votre jeton, puis utilisez Reconnecter ci-dessus.
+integrations-tools-error-hint-reauth = Votre autorisation n'est plus valide — utilisez Reconnecter ci-dessus pour vous reconnecter.
 integrations-tools-empty = Ce connecteur n'expose aucun outil.
 integrations-tools-header = Autorisations des outils ({ $count })
 integrations-set-all-label = Tout définir :

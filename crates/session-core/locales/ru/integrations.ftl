@@ -20,6 +20,7 @@ integrations-token-placeholder = вставьте ваш токен
 
 integrations-tools-error-prefix = Не удалось загрузить инструменты этого коннектора:
 integrations-tools-error-hint = Проверьте URL MCP-сервера / ваш токен, затем используйте «Переподключить» выше.
+integrations-tools-error-hint-reauth = Ваша авторизация больше не действует — нажмите «Переподключить» выше и войдите заново.
 integrations-tools-empty = Этот коннектор не предоставляет инструментов.
 integrations-tools-header = Права на инструменты ({ $count })
 integrations-set-all-label = Установить все:

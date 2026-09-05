@@ -38,8 +38,48 @@ pub enum OauthError {
     Registration(String),
     #[error("token exchange failed: {0}")]
     Exchange(String),
+    /// The authorization server answered with a structured OAuth error
+    /// (RFC 6749 §5.2). Kept apart from [`OauthError::Exchange`] because the
+    /// `error` code is the one bit callers can *act* on — see
+    /// [`OauthError::needs_reauth`].
+    #[error("token exchange failed: provider rejected the request — {}", provider_detail(.code, .description))]
+    Provider { code: String, description: String },
     #[error("invalid URL `{0}`")]
     Url(String),
+}
+
+impl OauthError {
+    /// Whether the stored credential is dead rather than the request being at
+    /// fault — no retry, no re-registration and no amount of waiting fixes it;
+    /// only a fresh user authorization does.
+    ///
+    /// - `invalid_grant`: the refresh token was revoked, expired or already
+    ///   spent.
+    /// - `invalid_client` / `unauthorized_client`: the AS no longer knows the
+    ///   client we authenticate as. For a dynamically-registered client that
+    ///   means the server lost our registration — e.g. a self-hosted MCP server
+    ///   whose OAuth store didn't survive a restart. Registering again would
+    ///   mint a *new* client the old grant isn't bound to, so the user has to
+    ///   re-authorize.
+    pub fn needs_reauth(&self) -> bool {
+        matches!(
+            self,
+            OauthError::Provider { code, .. }
+                if matches!(
+                    code.as_str(),
+                    "invalid_grant" | "invalid_client" | "unauthorized_client"
+                )
+        )
+    }
+}
+
+/// `code: description`, or just the code when the server sent no description.
+fn provider_detail(code: &str, description: &str) -> String {
+    if description.is_empty() {
+        code.to_string()
+    } else {
+        format!("{code}: {description}")
+    }
 }
 
 /// The OAuth endpoints a connector authorizes against.
@@ -545,10 +585,10 @@ async fn post_token(
             .get("error_description")
             .and_then(|d| d.as_str())
             .unwrap_or("");
-        let sep = if desc.is_empty() { "" } else { ": " };
-        return Err(OauthError::Exchange(format!(
-            "provider rejected the request — {err}{sep}{desc}"
-        )));
+        return Err(OauthError::Provider {
+            code: err.to_string(),
+            description: desc.to_string(),
+        });
     }
     if !status.is_success() {
         return Err(OauthError::Exchange(format!(
@@ -721,6 +761,66 @@ mod tests {
         assert!(validate_outbound_url("https://10.1.2.3/token").is_ok());
         // garbage.
         assert!(validate_outbound_url("not a url").is_err());
+    }
+
+    #[test]
+    fn provider_error_keeps_its_code_and_reads_like_before() {
+        // The wire shape a self-hosted MCP server returns once it has lost the
+        // client we registered (MCP SDK: ClientAuthenticator → "Invalid
+        // client_id", wrapped as `invalid_client` by the token handler).
+        let err = OauthError::Provider {
+            code: "invalid_client".into(),
+            description: "Invalid client_id".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "token exchange failed: provider rejected the request — invalid_client: Invalid client_id"
+        );
+        assert!(err.needs_reauth());
+
+        // No description → no dangling separator.
+        let bare = OauthError::Provider {
+            code: "invalid_grant".into(),
+            description: String::new(),
+        };
+        assert_eq!(
+            bare.to_string(),
+            "token exchange failed: provider rejected the request — invalid_grant"
+        );
+        assert!(bare.needs_reauth());
+    }
+
+    #[test]
+    fn only_dead_credential_codes_ask_for_reauth() {
+        for code in ["invalid_grant", "invalid_client", "unauthorized_client"] {
+            assert!(
+                OauthError::Provider {
+                    code: code.into(),
+                    description: String::new()
+                }
+                .needs_reauth(),
+                "{code} must ask the user to reconnect"
+            );
+        }
+        // A malformed request or a server-side hiccup is ours to fix, not the
+        // user's — reconnecting wouldn't help.
+        for code in [
+            "invalid_request",
+            "temporarily_unavailable",
+            "invalid_scope",
+        ] {
+            assert!(
+                !OauthError::Provider {
+                    code: code.into(),
+                    description: String::new()
+                }
+                .needs_reauth(),
+                "{code} must not ask the user to reconnect"
+            );
+        }
+        // Transport / discovery failures are transient by nature.
+        assert!(!OauthError::Exchange("POST …: connection refused".into()).needs_reauth());
+        assert!(!OauthError::Discover("no AS metadata".into()).needs_reauth());
     }
 
     #[test]

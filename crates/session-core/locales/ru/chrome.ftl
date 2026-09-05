@@ -9,3 +9,8 @@ chrome-lang-switcher-aria = Выбрать язык
 push-untitled-conversation = Новый разговор
 push-turn-complete-body = Ваш ответ готов.
 push-turn-error-body = Запрос завершился ошибкой.
+
+# Web Push: авторизация коннектора перестала действовать (фоновое обновление,
+# `tools::mcp::worker`). { $connector } — отображаемое имя коннектора.
+push-connector-reconnect-title = Подключение требует входа
+push-connector-reconnect-body = { $connector } отключён — откройте «Интеграции», чтобы подключить заново.

@@ -20,6 +20,7 @@ integrations-token-placeholder = Token einfügen
 
 integrations-tools-error-prefix = Die Werkzeuge dieses Konnektors konnten nicht geladen werden:
 integrations-tools-error-hint = Prüfen Sie die MCP-Server-URL / Ihr Token und verwenden Sie dann oben „Erneut verbinden“.
+integrations-tools-error-hint-reauth = Ihre Autorisierung ist nicht mehr gültig — melden Sie sich über „Erneut verbinden“ oben neu an.
 integrations-tools-empty = Dieser Konnektor stellt keine Werkzeuge bereit.
 integrations-tools-header = Werkzeugberechtigungen ({ $count })
 integrations-set-all-label = Alle setzen:

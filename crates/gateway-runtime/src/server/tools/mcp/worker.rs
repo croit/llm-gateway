@@ -14,8 +14,11 @@
 //! Refreshes go through [`super::manager::McpConnectionManager::refresh_connection`],
 //! which serializes per `(user, connector)` so the worker can't race a live
 //! request and double-spend a rotating refresh token. A connection whose
-//! refresh ultimately fails is marked `error` (the store shows "needs
-//! reconnect"); the loop never panics — a failed pass is logged and retried.
+//! refresh ultimately fails is parked (the store shows "needs reconnect") as
+//! either `error` or — when the authorization server declared the credential
+//! dead — `reauth`, which also pushes a notification, since only the user can
+//! fix that one and they'd otherwise discover it mid-conversation. The loop
+//! never panics — a failed pass is logged and retried.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,10 +78,74 @@ async fn drain_once(state: &Arc<RamaState>) -> Result<(), DbError> {
             .await
         {
             tracing::warn!(
-                user = %conn.user_id, connector = %conn.connector_key, error = %err,
+                user = %conn.user_id, connector = %conn.connector_key,
+                error = %err, needs_reauth = err.needs_reauth,
                 "proactive MCP token refresh failed — connection marked needs-reconnect"
             );
+            // A dead credential is the user's to fix and they'd otherwise find
+            // out mid-conversation, when a tool call quietly goes missing. A
+            // transient failure gets no ping — the next pass may well fix it.
+            if err.needs_reauth {
+                notify_needs_reconnect(state, &conn.user_id, &conn.connector_key).await;
+            }
         }
     }
     Ok(())
+}
+
+/// Ping the user's subscribed browsers that a connector needs re-authorizing.
+///
+/// Best-effort and quiet: no-op unless push is configured and the user has a
+/// subscription, every failure only logged. Fires at most once per disconnect —
+/// the connection has just left `connected`, so the sweep won't pick it up
+/// again until the user reconnects.
+async fn notify_needs_reconnect(state: &Arc<RamaState>, user_id: &str, connector_key: &str) {
+    use gateway_core::server::db::{mcp_catalog, push_subscriptions};
+    use gateway_features::server::push::{PushMessage, SendOutcome};
+    use session_core::i18n::{self, Lang, t, t_args};
+
+    let Some(push) = state.push.clone() else {
+        return;
+    };
+    let subs = match push_subscriptions::list_for_user(&state.db, user_id).await {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => return,
+        Err(err) => {
+            tracing::warn!(error = %err, "push: listing subscriptions for connector reconnect");
+            return;
+        }
+    };
+    // The display name the user knows the connector by ("Google Workspace"),
+    // falling back to its key if the catalog row went away underneath us.
+    let name = mcp_catalog::get(&state.db, connector_key)
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.name)
+        .unwrap_or_else(|| connector_key.to_string());
+
+    for sub in subs {
+        let lang = sub
+            .lang
+            .as_deref()
+            .and_then(Lang::from_code)
+            .unwrap_or(Lang::En);
+        let message = PushMessage {
+            title: t(lang, "push-connector-reconnect-title"),
+            body: t_args(
+                lang,
+                "push-connector-reconnect-body",
+                &i18n::args([("connector", name.clone().into())]),
+            ),
+            url: "/integrations".to_string(),
+            // One connector, one notification — a later ping for the same
+            // connector replaces it rather than stacking.
+            tag: format!("connector-{connector_key}"),
+        };
+        if push.send(&sub, &message).await == SendOutcome::Gone
+            && let Err(err) = push_subscriptions::delete(&state.db, &sub.id).await
+        {
+            tracing::warn!(error = %err, "push: pruning gone subscription");
+        }
+    }
 }

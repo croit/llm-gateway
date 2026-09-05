@@ -10,3 +10,8 @@ chrome-lang-switcher-aria = Choose language
 push-untitled-conversation = New conversation
 push-turn-complete-body = Your answer is ready.
 push-turn-error-body = The turn ended with an error.
+
+# Web Push: a connector's authorization died (proactive-refresh sweep,
+# `tools::mcp::worker`). { $connector } is the connector's display name.
+push-connector-reconnect-title = Connection needs your sign-in
+push-connector-reconnect-body = { $connector } was disconnected — open Integrations to reconnect.
