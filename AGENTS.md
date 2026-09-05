@@ -184,9 +184,14 @@ mise run dev               # debug-mode `cargo run --package gateway`
 # Other day-to-day tasks
 mise run dev-build         # debug build only (target/debug/gateway), ~2 s incremental
 mise run build-css         # one-shot CSS build
-mise run test              # cargo test --workspace
-mise run lint              # cargo fmt --check + clippy -D warnings
 mise run fmt               # cargo fmt
+
+# Verifying a change — climb this ladder, don't start at the top
+mise run check                     # workspace type-check, seconds
+mise run test-crate <crate> [filt] # tests for the crate you touched
+mise run lint-crate <crate>        # clippy for that crate
+mise run verify                    # ONCE before pushing: lint + all tests (~20 min)
+mise run test / mise run lint      # the whole-workspace halves of `verify`
 
 # Browser-driven UI debugging (no OIDC required)
 mise run dev-ui            # real rama server on :8080 + wiremock chat &
@@ -200,6 +205,14 @@ mise run dev-ui            # real rama server on :8080 + wiremock chat &
 # Slow path — DON'T use for iteration
 mise run build             # cargo build --release. ~12 s incremental, ~70 s clean.
                            # Only for deploys / perf measurement.
+mise run ci                # verify + the release build. 20-25 min. CI runs this
+                           # on every push; you almost never need it locally.
+
+# Housekeeping
+mise run setup-hooks       # once per clone: git hooks + keep Spotlight out of target/
+mise run sweep-target      # reclaim target/ (cargo never GCs it; it hit 1.16M
+                           # files / 327 GB here, 99% of it dead, and cargo
+                           # scans that directory on every invocation)
 ```
 
 **Debug, not release.** `mise run dev` and `mise run dev-build` produce debug binaries — runtime perf is identical to release for anything you'd interact with manually (the entire UI surface, smoke testing). Use `mise run build` only when you're shipping or actually benchmarking; rebuilding release on every iteration wastes 10 s per cycle for no gain.
@@ -233,5 +246,6 @@ Start in [`docs/README.md`](docs/README.md) for the index. The topical docs:
 - **Plan before you implement.** For anything that touches more than one file or one concept, draft an approach and confirm before writing code.
 - **Update docs in the same change as the code.** If you change the auth flow, update `docs/auth.md` in the same commit. Stale docs are worse than no docs.
 - **When you discover a missing piece** — an undocumented invariant, a non-obvious gotcha — add it to the relevant doc. Don't rely on conversation history.
-- **Tests live next to the code.** Unit tests in `#[cfg(test)] mod tests`, integration tests in `crates/gateway/tests/`. Run `mise run test` before declaring a task done.
+- **Tests live next to the code.** Unit tests in `#[cfg(test)] mod tests`, integration tests in `crates/gateway/tests/`. Run `mise run verify` before declaring a task done.
+- **Verify cheaply, then once for real.** Compiling dominates this workspace: a full `mise run verify` is ~20 minutes, of which ~19 are linking test binaries, not running tests. Iterate with `mise run test-crate <crate>` (seconds), then run the full gate **once**, at the end, after every fix you already know about is in. Starting it earlier means paying it twice. Don't kill a cargo process to unstick a parallel mise task — they share one `target/` lock, and killing one fails its sibling. See [`docs/dev-workflow.md`](docs/dev-workflow.md) → "The feedback ladder".
 - **If a hard rule is in your way**, surface it to the user. Don't quietly bypass.

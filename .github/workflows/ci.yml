@@ -42,7 +42,10 @@ env:
   # The workspace compiles 2-3x in one job (clippy debug + test debug +
   # release build) and lumis pulls in ~116 tree-sitter grammars, so the
   # default-runner disk fills up. Dropping debuginfo from the dev/test
-  # profiles roughly halves target/ size (CI-only; no effect on local builds).
+  # profiles roughly halves target/ size. The root Cargo.toml already trims it
+  # (`line-tables-only` for workspace crates, none for dependencies) so local
+  # builds get most of this; these go one step further — env beats the
+  # manifest — because the runner wants disk, not backtraces with line numbers.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 

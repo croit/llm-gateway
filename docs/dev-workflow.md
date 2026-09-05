@@ -23,8 +23,10 @@ The gateway binary `include_bytes!`s its static assets (`app.css`, `datastar.js`
 | Build the gateway debug binary (no run) | `mise run dev-build` |
 | Fast type-check across the workspace | `mise run check` |
 | **Release** build (slow, for deploys) | `mise run build` |
-| Tests | `mise run test` |
+| Tests — one crate (the iteration loop) | `mise run test-crate <crate> [filter]` |
+| Tests — whole workspace | `mise run test` |
 | Tests with stdout visible | `mise run test-nocapture` |
+| Lint — one crate | `mise run lint-crate <crate>` |
 | Lint (clippy `-D warnings` + `fmt --check` + `tsc --noEmit`) | `mise run lint` |
 | Apply Rust formatting | `mise run fmt` |
 | Tailwind / daisyUI CSS — one-shot | `mise run build-css` |
@@ -32,6 +34,8 @@ The gateway binary `include_bytes!`s its static assets (`app.css`, `datastar.js`
 | Bundle the TypeScript page glue — one-shot | `mise run build-js` |
 | Bundle the TypeScript page glue — live rebuild | `mise run watch-js` |
 | TypeScript type-check only (`tsc --noEmit`) | `mise run typecheck` |
+| The pre-push gate (lint + tests, no release build) | `mise run verify` |
+| Reclaim `target/` (stale artifacts) | `mise run sweep-target [days]` |
 | Everything CI runs (lint + test + release build) | `mise run ci` |
 | Scan the whole git history for committed secrets | `mise run secrets` |
 | Scan only the staged diff for secrets | `mise run secrets-staged` |
@@ -52,6 +56,128 @@ CI runs the same scan in a dedicated `secret scan` job with `fetch-depth: 0`, wh
 Credentials belong in `mise.local.toml`, `gateway.toml` or the DB (sealed under `GATEWAY_ENCRYPTION_KEY`) — all gitignored or outside the tree. Tool configs that carry tokens (`.codex/`, editor/agent configs) should live in `$HOME`, not in the repo.
 
 Anything not covered: add a task to `mise.toml` rather than typing the raw command into a script. Discoverability matters.
+
+## The feedback ladder — don't run the full gate to check one change
+
+A full `mise run ci` on this workspace is **20–25 minutes**, and almost none of
+that is running tests. Measured on an M-series laptop, one full run:
+
+| Task | Wall clock | What it actually spends it on |
+|---|---|---|
+| `build` (release) | ~100 s | a third compile of the workspace |
+| `lint` | ~170 s | clippy — its own profile, so its own compile |
+| `test` | ~1200 s | **~19 min compiling and linking the 17 test binaries**, then 33 s running 2365 tests |
+
+The shape to internalise: **compiling and linking dominates; running tests is
+noise.** Clippy (`dev`), nextest (`test`) and the release build are three
+different profiles, so `ci` compiles the workspace three times over — and
+touching a root crate like `gateway-core` invalidates all six crates above it.
+Rebuilding just the `gateway` crate's test binaries after such a touch took
+414 s before the profile change below.
+
+So climb the ladder, and only step up when the rung below is green:
+
+```bash
+mise run check                      # ~seconds — does it type-check at all?
+mise run test-crate gateway-web     # the crate you're editing (+ optional filter)
+mise run lint-crate gateway-web     # clippy for that crate
+mise run verify                     # ONCE, before pushing: lint + all tests
+```
+
+`mise run ci` adds the release build on top of `verify`; you only need it if
+you're actually shipping a binary — CI builds it on every push anyway. The
+pre-push hook runs `verify`, so a normal `git push` is already the gate.
+
+Two habits that cost more than any tooling change:
+
+- **Running the full gate more than once per change set.** Fix everything you
+  know about first — a `verify` started before a fix lands is 20 minutes you
+  pay twice.
+- **Killing a cargo process to "unstick" a parallel task.** They share one
+  `target/` and one lock; `Blocking waiting for file lock` is normal, and
+  killing one of them fails its sibling task and buys another full run.
+
+### Why the build profiles look like that
+
+The root `Cargo.toml` sets `debug = "line-tables-only"` for the workspace and
+`debug = false` for every dependency. Debuginfo was the single biggest lever on
+link time here — the 17 test binaries each dragged
+the full DWARF of every dependency behind them, and `target/` had
+grown past 300 GB.
+
+What you keep: function names **and** `file:line` in every panic and backtrace,
+for gateway code. What you give up: stepping through code in a debugger with
+locals. If you need that for one crate, build it with
+`RUSTFLAGS="-C debuginfo=2"`. CI goes one step further and sets
+`CARGO_PROFILE_DEV_DEBUG=0` / `CARGO_PROFILE_TEST_DEBUG=0` (env beats the
+manifest) because the runner has a disk quota, not a debugger.
+
+### `target/` hygiene — the slowest thing in this repo was the build directory
+
+Cargo has **no garbage collector**. Every fingerprint change — a profile flag, a
+feature, a dependency bump, a branch switch, a toolchain update — writes a
+complete new artifact set and keeps the old one *forever*. On macOS the dev
+default is `split-debuginfo=unpacked`, so each unit's object files stay in
+`deps/` too (that's where the debug info lives), and a dev build emits up to
+`codegen-units` objects per crate.
+
+Measured here before the cleanup:
+
+| | |
+|---|---|
+| `target/` | **327 GB** |
+| files in `target/debug/deps` | **1,165,431** — of which **1,154,133 (99%) superseded garbage** |
+| `ls -f target/debug/deps` | **66 seconds** (a bare listing, no stat, no sort) |
+| stale copies of the 260 MB `gateway` test binary | **19** |
+
+That last row is the point: cargo scans that directory on **every** invocation,
+so a million dead files taxed every `cargo check`, every test run, every build.
+Two OS daemons piled on — Spotlight (`mds` + `mds_stores` + `mdworker` at ~60%
+CPU combined, mid-build, with 8 k `.rmeta` files already indexed) and
+`syspolicyd` at ~30% (Gatekeeper validating every freshly linked binary).
+
+So:
+
+```bash
+mise run sweep-target        # delete artifacts nothing rebuilt in 14 days
+mise run sweep-target 3      # more aggressive
+```
+
+It touches only cargo's own artifact directories (`{debug,release}/{deps,build,
+incremental,.fingerprint}`) — never the top of `target/release`, which also
+holds the `typst` and `libpdfium.so` binaries the fetch tasks put there and no
+rebuild would restore. The pre-push hook kicks the same sweep off **detached, at
+most weekly**, so this can't silently rot again; `target/.last-sweep` is the
+marker it checks.
+
+`mise run setup-hooks` also drops a `.metadata_never_index` file into `target/`,
+which is what Spotlight looks for to skip a tree. Run it once per clone.
+
+Caveat on the sweep: it goes by mtime, and a *valid* artifact nothing has
+rebuilt in 14 days looks identical to a dead one, so a sweep can cost you a
+recompile of long-untouched units. That's the trade — a million-file directory
+costs more, every day.
+
+For one crate specifically, `cargo clean -p <crate>` is precise. A full
+`cargo clean` costs a cold rebuild (**186 minutes** on this workspace — 621
+units, including ~116 tree-sitter grammars and two C++ builds), so it is a last
+resort, not routine hygiene.
+
+### Optional, per-developer: sccache + incremental
+
+Not in the repo, because it's a machine-level choice: a user-global
+`~/.cargo/config.toml` can add `[build] rustc-wrapper = "<path to sccache>"`
+(sccache is already in the mise toolset) and `incremental = true` on the `dev`
+and `test` profiles. They do **not** conflict — cargo compiles only *workspace*
+crates incrementally and never registry dependencies, so incremental owns the
+edit loop while sccache owns the dependency graph across cold builds, branch
+switches and profile changes. Measured here, one-line edit in `gateway-web`
+then `cargo nextest run --workspace`: **102 s → 59 s**. Give sccache a cache
+big enough for this dependency graph (100 GiB in its own config file); at the
+10 GiB default it evicted as fast as it wrote and measured a 0% hit rate.
+
+CI deliberately doesn't use sccache — `Swatinem/rust-cache` caches the registry
+and `target/` there instead.
 
 ## Layout while developing
 
@@ -188,6 +314,27 @@ CI never invokes `cargo`, `npm`, or `tailwindcss` directly; everything routes th
 Each of these has bitten at least once, each presents as something other than
 what it is, and each now has a test that fails if it comes back. They are
 written down because the symptom never points at the cause.
+
+### Changing a build setting invalidates the whole graph, not just your crate
+
+Editing a profile flag (`debug`, `incremental`, `opt-level`), `RUSTC_WRAPPER`
+or `CARGO_INCREMENTAL` changes the fingerprint of **every** unit and every
+sccache key, so the next build is a cold one — for this workspace, tens of
+minutes, because the dependency graph includes ~116 tree-sitter grammars and
+two C++ builds (usearch, pdfium). It has cost an hour twice now: once
+A/B-testing sccache settings, once tightening the debuginfo profile.
+
+Two rules follow:
+
+1. **A/B build settings in a separate `CARGO_TARGET_DIR`**, never by flipping
+   the setting back and forth in the shared one.
+2. **Check what's already set before you change anything.** Build settings
+   arrive from three places, and the repo only owns one of them: the root
+   `Cargo.toml` (committed, everyone), `~/.cargo/config.toml` (that
+   developer's machine only — `cargo config get` prints the merged result) and
+   the environment (`CARGO_PROFILE_*`, which beats both — that's how CI drops
+   debuginfo entirely). A setting that looks missing from the manifest may
+   already be in effect locally.
 
 ### A test fixture that shells out to `git` can rewrite *your* repository
 

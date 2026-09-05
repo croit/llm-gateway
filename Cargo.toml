@@ -278,3 +278,26 @@ fluent-bundle = "0.16"
 # falls back to its built-in distance kernels, which is plenty for our
 # scale (codebase RAG, tens of thousands of chunks per collection).
 usearch = { version = "2.25", default-features = false }
+
+# ── Build profiles ──────────────────────────────────────────────────────────
+# The dev/test loop is dominated by codegen + linking, and most of that cost is
+# debuginfo we never look at: the 17 test binaries each drag the full DWARF of
+# every dependency behind them. Trimming it is
+# the single biggest lever on `mise run test` wall-clock (and on the size of
+# `target/`, which had grown past 300 GB).
+#
+# `line-tables-only` keeps what we actually use — function names AND
+# file:line in every backtrace and panic — and drops the type/variable/scope
+# DWARF a step debugger would want. If you need to step through gateway code
+# in lldb, build that one crate with `RUSTFLAGS="-C debuginfo=2"`.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies get no debuginfo at all: a backtrace through them still shows
+# symbol names, and nobody debugs inside `reqwest` from here. This is where
+# most of the saving comes from — the workspace's own code is a small slice of
+# what gets compiled and linked. It covers the test loop too: `cargo test` /
+# nextest build dependencies with the `dev` profile and only the test targets
+# themselves with `test` (which inherits from `dev` anyway).
+[profile.dev.package."*"]
+debug = false

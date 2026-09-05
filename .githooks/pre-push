@@ -3,10 +3,10 @@
 #
 # Runs the same lint + test that CI's `ci` job runs (via the very same
 # mise tasks, so this can't drift from `.github/workflows/ci.yml` → `mise run ci`):
-#   - mise run lint  → cargo fmt --all --check, clippy --workspace
-#                      --all-targets -D warnings, tsc --noEmit
-#   - mise run test  → cargo test --workspace
-#   - mise run test-js → node --test over the browser TS unit tests
+#   - mise run verify → lint (cargo fmt --all --check, clippy --workspace
+#                       --all-targets -D warnings, tsc --noEmit)
+#                     + test (cargo nextest run --workspace)
+#                     + test-js (node --test over the browser TS unit tests)
 # It does NOT run the release builds — those are slow and a compile error
 # surfaces in the test step anyway.
 #
@@ -26,15 +26,28 @@ if ! command -v mise >/dev/null 2>&1; then
 fi
 
 echo "pre-push: running lint + workspace tests (mirrors CI; bypass with --no-verify)…"
-# Separate invocations: `mise run lint test` would pass "test" as an argument
-# to the lint task, not run it as a second task. set -e aborts on the first
-# failure.
 # Secrets first, and over the full history rather than just the staged diff:
 # push is the last moment before something becomes public, and it's the one
 # gate that also covers commits made with `--no-verify` or on a clone where
 # `mise run setup-hooks` was never run. ~1.3 s, so it costs nothing here.
 mise run secrets
-mise run lint
-mise run test
-mise run test-js
+# One task, so the hook can't drift from what `mise run verify` means: lint +
+# workspace tests + browser-TS tests. (`mise run lint test` would pass "test"
+# as an *argument* to the lint task, which is why this is a single task rather
+# than a list.) The release build stays out — CI does it, and no compile error
+# survives the test step.
+mise run verify
 echo "pre-push: all checks passed ✓"
+
+# Housekeeping, detached so it never delays a push: cargo has no garbage
+# collector, so target/ grows without bound — every fingerprint change leaves a
+# full artifact set behind forever. It reached 1.16M files / 327 GB on this
+# machine, 99% of it superseded, and at that size the directory scan cargo does
+# on *every* invocation took over a minute. Sweep at most weekly, and only
+# artifacts nothing has rebuilt in 14 days.
+sweep_marker="$(git rev-parse --show-toplevel)/target/.last-sweep"
+if [ -d "$(dirname "$sweep_marker")" ] &&
+   { [ ! -f "$sweep_marker" ] || [ -z "$(find "$sweep_marker" -mtime -7 2>/dev/null)" ]; }; then
+  echo "pre-push: sweeping stale target/ artifacts in the background (mise run sweep-target)"
+  nohup nice -n 10 mise run sweep-target >/dev/null 2>&1 &
+fi

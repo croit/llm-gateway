@@ -299,8 +299,27 @@ description = "Scan only the staged diff for secrets (gitleaks). Run by the pre-
 run = "gitleaks git . --staged --redact --no-banner"
 
 [tasks.ci]
-description = "Everything CI runs: lint + tests (Rust + browser TS) + release build of the gateway binary. mise fans out via the DAG."
+description = "Everything CI runs: lint + tests (Rust + browser TS) + release build of the gateway binary. mise fans out via the DAG. Locally prefer `verify` — same gate, minus the release build you don't need."
 depends = ["lint", "test", "test-js", "build"]
+
+[tasks.verify]
+description = "The local pre-push gate: lint + Rust tests + browser-TS tests. Same checks as `ci` minus the release build — nothing in `ci` catches a compile error that `test` doesn't, and the release build is a THIRD full compile of the workspace (dev for clippy, test for nextest, release for the binary). Run this once before pushing; use `test-crate` / `lint-crate` while iterating."
+depends = ["lint", "test", "test-js"]
+
+[tasks.test-crate]
+description = "Tests for ONE crate — the iteration loop. `mise run test-crate gateway-web [filter]`. Seconds instead of the ~20 min a full `test` costs after touching a root crate, because it links that crate's test binaries only."
+depends = ["build-assets"]
+usage = '''
+arg "<crate>" help="workspace crate, e.g. gateway-web"
+arg "[filter]" help="optional nextest name filter"
+'''
+run = 'cargo nextest run -p "$usage_crate" ${usage_filter:-}'
+
+[tasks.lint-crate]
+description = "Clippy for ONE crate: `mise run lint-crate gateway-web`. Use while iterating; `mise run verify` before pushing."
+depends = ["build-assets"]
+usage = 'arg "<crate>" help="workspace crate, e.g. gateway-web"'
+run = 'cargo clippy -p "$usage_crate" --all-targets -- -D warnings'
 
 [tasks.e2e]
 description = "Browser + HTTP end-to-end tests (Playwright via node:test). Needs `mise run dev` running in another terminal. Not part of `ci`. Set CHROMIUM_HEADED=1 to watch the browser, GATEWAY_URL=… to target a remote gateway. See e2e/README.md for first-time Chromium setup."
@@ -319,11 +338,51 @@ description = "Apply rustfmt across the workspace."
 run = "cargo fmt --all"
 
 [tasks.setup-hooks]
-description = "Enable the version-controlled git hooks in .githooks/ (pre-commit secret scan, pre-push CI gate, commit-msg trailer check)."
-run = "git config core.hooksPath .githooks"
+description = "One-time per clone: enable the version-controlled git hooks in .githooks/ (pre-commit secret scan, pre-push CI gate, commit-msg trailer check) and mark target/ so the OS indexer leaves it alone."
+run = """
+set -eu
+git config core.hooksPath .githooks
+# Keep macOS Spotlight out of target/. A build writes hundreds of thousands of
+# files; left unmarked, `mds`/`mdworker` index every one of them and burn real
+# CPU during every compile (measured here: ~8 k .rmeta files already indexed,
+# mds + mds_stores at 60% CPU mid-build). The marker file is what Spotlight
+# looks for to skip a directory tree; it is harmless on Linux.
+mkdir -p target
+touch target/.metadata_never_index
+echo "hooks enabled; target/ marked non-indexable"
+"""
+
+[tasks.sweep-target]
+description = "Reclaim target/: delete build artifacts nothing has rebuilt in N days (default 14). Cargo has NO garbage collector — every fingerprint change (a profile flag, a feature, a dep bump, a branch switch, a toolchain update) writes a new artifact set and keeps the old one forever. This directory reached 1.16M files / 327 GB here, of which 99% was superseded garbage, and at that size a plain `ls` of target/debug/deps took 66 s — a tax cargo pays on every single invocation. Run it when target/ gets uncomfortable; the pre-push hook also kicks it off in the background at most weekly."
+usage = 'arg "[days]" help="delete artifacts older than this many days (default 14)"'
+run = """
+set -eu
+days="${usage_days:-14}"
+root="{{config_root}}/target"
+[ -d "$root" ] || { echo "no target/ yet — nothing to sweep"; exit 0; }
+
+# Only cargo's own artifact directories. NEVER the top of target/release: it
+# also holds binaries fetched by `fetch-typst-cli` / `fetch-pdfium`, which no
+# rebuild would put back and which the container image build needs.
+swept=0
+for profile in debug release; do
+    for sub in deps build incremental .fingerprint; do
+        dir="$root/$profile/$sub"
+        [ -d "$dir" ] || continue
+        before=$(find "$dir" -type f 2>/dev/null | wc -l | tr -d " ")
+        find "$dir" -type f -mtime "+$days" -delete 2>/dev/null || true
+        find "$dir" -type d -empty -delete 2>/dev/null || true
+        after=$(find "$dir" -type f 2>/dev/null | wc -l | tr -d " ")
+        echo "$profile/$sub: $before -> $after files"
+        swept=$((swept + before - after))
+    done
+done
+date -u +%Y-%m-%dT%H:%M:%SZ > "$root/.last-sweep"
+echo "swept $swept files older than ${days}d"
+"""
 
 [tasks.check]
-description = "Fast type-check across the workspace (no codegen)."
+description = "Fast type-check across the workspace (no codegen). The cheapest rung of the ladder: check → test-crate/lint-crate → verify → ci."
 run = "cargo check --workspace --all-targets"
 
 
