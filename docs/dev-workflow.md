@@ -59,21 +59,22 @@ Anything not covered: add a task to `mise.toml` rather than typing the raw comma
 
 ## The feedback ladder — don't run the full gate to check one change
 
-A full `mise run ci` on this workspace is **20–25 minutes**, and almost none of
-that is running tests. Measured on an M-series laptop, one full run:
+Measured on an M-series laptop, editing `gateway-core` (the root of the crate
+graph — everything above it rebuilds), before and after the `target/` cleanup
+and profile trim described below:
 
-| Task | Wall clock | What it actually spends it on |
+| Operation | Before | After |
 |---|---|---|
-| `build` (release) | ~100 s | a third compile of the workspace |
-| `lint` | ~170 s | clippy — its own profile, so its own compile |
-| `test` | ~1200 s | **~19 min compiling and linking the 17 test binaries**, then 33 s running 2365 tests |
+| `ls -f target/debug/deps` | **66 s** | **0.065 s** |
+| touch `gateway-core` → `gateway` test binaries linked | **414 s** | **14–18 s** |
+| touch `gateway-core` → `mise run test` (all 2365 tests) | **~20 min** | **40 s** |
+| `target/` on disk | 327 GB, 1.16M files in `deps` | ~30 GB, ~12 k files |
 
 The shape to internalise: **compiling and linking dominates; running tests is
-noise.** Clippy (`dev`), nextest (`test`) and the release build are three
-different profiles, so `ci` compiles the workspace three times over — and
-touching a root crate like `gateway-core` invalidates all six crates above it.
-Rebuilding just the `gateway` crate's test binaries after such a touch took
-414 s before the profile change below.
+noise** (2365 tests execute in 13 s). Clippy (`dev`), nextest (`test`) and the
+release build are three *different* profiles, so `mise run ci` compiles the
+workspace three times over — that's why it's still ~20 minutes even now, and
+why it belongs at the end of a change set exactly once, not in the loop.
 
 So climb the ladder, and only step up when the rung below is green:
 
@@ -100,10 +101,15 @@ Two habits that cost more than any tooling change:
 ### Why the build profiles look like that
 
 The root `Cargo.toml` sets `debug = "line-tables-only"` for the workspace and
-`debug = false` for every dependency. Debuginfo was the single biggest lever on
-link time here — the 17 test binaries each dragged
-the full DWARF of every dependency behind them, and `target/` had
-grown past 300 GB.
+`debug = false` for every dependency: the 17 test binaries each dragged the
+full DWARF of every dependency behind them.
+
+Honest accounting, since both changes landed together: the debuginfo trim is
+worth maybe 15% of the incremental rebuild on its own (414 s → 353 s measured),
+and it halves what a build writes to disk. The 20× came from the `target/`
+cleanup below. The profile still earns its place — CI was already dropping
+debuginfo via `CARGO_PROFILE_*`, so only local builds were paying full DWARF,
+and less written per build is less to clean up later.
 
 What you keep: function names **and** `file:line` in every panic and backtrace,
 for gateway code. What you give up: stepping through code in a debugger with
@@ -129,6 +135,9 @@ Measured here before the cleanup:
 | files in `target/debug/deps` | **1,165,431** — of which **1,154,133 (99%) superseded garbage** |
 | `ls -f target/debug/deps` | **66 seconds** (a bare listing, no stat, no sort) |
 | stale copies of the 260 MB `gateway` test binary | **19** |
+
+Cleaning it out took the incremental loop from 414 s to 14 s and the full test
+run from ~20 min to 40 s. Nothing about the code changed.
 
 That last row is the point: cargo scans that directory on **every** invocation,
 so a million dead files taxed every `cargo check`, every test run, every build.
