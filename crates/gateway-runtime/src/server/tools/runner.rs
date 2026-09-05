@@ -626,6 +626,41 @@ fn enforce_tool_output_budget(
     let Some(messages) = request.get_mut("messages").and_then(|v| v.as_array_mut()) else {
         return;
     };
+    stub_old_tool_results(messages, budget, keep_full, stub_threshold);
+}
+
+/// Bytes of `role:"tool"` string content currently sitting in `messages`.
+///
+/// This is the number that actually costs context, which is why the chat
+/// driver budgets against it rather than against a running total of everything
+/// it has ever appended: a result that has since been stubbed is no longer in
+/// the prompt and must stop being charged for.
+pub(crate) fn tool_output_bytes(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .map(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .map(str::len)
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// The eviction itself, over a plain message list. Split out of
+/// [`enforce_tool_output_budget`] so the chat-UI driver — which keeps its
+/// messages as a `Vec`, not inside a request body — runs the same policy
+/// instead of growing a second one.
+///
+/// Returns the number of bytes it freed, which is what lets a caller give the
+/// reclaimed room back to a turn's tool-output allowance.
+pub(crate) fn stub_old_tool_results(
+    messages: &mut [Value],
+    budget: usize,
+    keep_full: usize,
+    stub_threshold: usize,
+) -> usize {
     let content_len = |m: &Value| -> usize {
         m.get("content")
             .and_then(|c| c.as_str())
@@ -639,14 +674,15 @@ fn enforce_tool_output_budget(
         .map(|(i, _)| i)
         .collect();
     if tool_idxs.len() <= keep_full {
-        return;
+        return 0;
     }
     // Trigger only when we're actually over budget.
     let total: usize = tool_idxs.iter().map(|&i| content_len(&messages[i])).sum();
     if total <= budget {
-        return;
+        return 0;
     }
     let stub_until = tool_idxs.len() - keep_full;
+    let mut freed = 0usize;
     for &i in &tool_idxs[..stub_until] {
         let len = content_len(&messages[i]);
         if len <= stub_threshold {
@@ -661,7 +697,9 @@ fn enforce_tool_output_budget(
             "[earlier tool output cleared to save context ({len} chars). Re-run the tool to \
              regenerate it{ref_hint}.]"
         ));
+        freed += len.saturating_sub(content_len(&messages[i]));
     }
+    freed
 }
 
 /// If a stubbed tool result carried `full_output_ref`(s) (the sandbox preview
@@ -1231,6 +1269,34 @@ mod tests {
             .to_string();
         assert!(stub.contains("read_sandbox_output"), "{stub}");
         assert!(stub.contains("t-1/stdout.txt"), "{stub}");
+    }
+
+    /// Eviction reports what it freed, and the count of what is still in the
+    /// prompt covers only tool results. Together those are what let the chat
+    /// driver hand the reclaimed room back to the turn's tool-output
+    /// allowance instead of charging it for results it has since replaced
+    /// with a 90-byte stub.
+    #[test]
+    fn eviction_reports_the_room_it_freed() {
+        let big = "z".repeat(9_000);
+        let mut body = body_with_tool_results(&[
+            ("a", big.clone()),
+            ("b", big.clone()),
+            ("c", big.clone()),
+            ("d", big.clone()),
+        ]);
+        let messages = body["messages"].as_array_mut().unwrap();
+        let before = tool_output_bytes(messages);
+        let freed = stub_old_tool_results(messages, 4096, 3, 4096);
+        assert!(freed > 8_000, "one 9 KB result was stubbed: freed {freed}");
+        assert_eq!(
+            tool_output_bytes(messages),
+            before - freed,
+            "the freed bytes must be exactly what left the prompt"
+        );
+        // Non-tool messages are none of this budget's business.
+        messages.push(json!({"role": "assistant", "content": "y".repeat(5_000)}));
+        assert_eq!(tool_output_bytes(messages), before - freed);
     }
 
     #[test]

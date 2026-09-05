@@ -1376,3 +1376,341 @@ async fn the_turn_discipline_rule_actually_reaches_the_upstream_request() {
     assert_eq!(messages[1]["role"], "user");
     assert_eq!(messages[1]["content"], "make me a report");
 }
+
+// ---- tool-loop wiring on the chat driver ----------------------------------
+//
+// The two failures reported against the chat UI, both of which only appear
+// after several tool rounds and so are invisible to any single-round test.
+
+/// Chat state whose registry holds `company_echo`, granted to role `engineer`.
+/// Echo returns its argument verbatim, which is the cheapest way to make a
+/// tool result of an arbitrary, controlled size.
+async fn state_with_echo_tool(upstream_uri: &str) -> RamaState {
+    use gateway_core::server::rbac::config::{RbacConfig, RoleConfig, RoleMapping};
+    use gateway_runtime::server::tools::echo::Echo;
+
+    let pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+    let mut pools = HashMap::new();
+    pools.insert(
+        "pool".to_string(),
+        UpstreamPoolConfig {
+            voices: Default::default(),
+            offer_voices: Vec::new(),
+            allowed_groups: Vec::new(),
+            fallback_offline: None,
+            compliance: Default::default(),
+            enforce_limits: true,
+            kind: PoolKind::Chat,
+            strategy: PickerStrategy::RoundRobin,
+            models: Vec::new(),
+            backend: vec![BackendConfig {
+                alias: None,
+                probe_models: true,
+                supports_edit: false,
+                name: "mock".into(),
+                base_url: upstream_uri.into(),
+                api_key_env: None,
+                api_key: None,
+                weight: 1,
+                max_inflight: 16,
+                health_path: "/models".into(),
+                models: Vec::new(),
+            }],
+        },
+    );
+    let registry = upstreams::UpstreamRegistry::new(&pools).unwrap();
+    common::seed_pool_models(&registry, "pool", 0, &["model-a"]);
+    let rbac = Resolver::build(
+        RbacConfig {
+            default_role: None,
+            mappings: vec![RoleMapping {
+                oidc_claim: "groups".into(),
+                oidc_value: "engineering".into(),
+                role: "engineer".into(),
+            }],
+        },
+        vec![RoleConfig {
+            id: "engineer".into(),
+            admin: false,
+            models: vec!["*".into()],
+            tools: vec!["company_echo".into()],
+            skills: vec![],
+        }],
+    )
+    .unwrap();
+    let app = AppState::new(
+        Config::default(),
+        pool.clone(),
+        registry,
+        Arc::new(ToolRegistry::new().with(Echo)),
+        Arc::new(rbac),
+    );
+    let sessions = SessionStore::new(pool, common::TEST_SECRET);
+    RamaState::new(
+        app,
+        sessions,
+        gateway_core::server::usage::UsageHandle::disabled(),
+    )
+}
+
+/// A chat session belonging to an engineer, with `company_echo` switched on
+/// for the conversation (tools are per-conversation opt-in) and `effort` set
+/// so the round cap is known.
+async fn echo_session(state: &RamaState, effort: &str) -> (String, String) {
+    use gateway_core::server::db::users;
+    use jiff::Timestamp;
+    let now = Timestamp::now();
+    users::upsert(
+        &state.db,
+        &users::User {
+            id: "alice".into(),
+            email: "alice@example.com".into(),
+            name: None,
+            roles: vec!["engineering".into()],
+            created_at: now,
+            updated_at: now,
+            timezone: None,
+            speech_voice: None,
+        },
+    )
+    .await
+    .unwrap();
+    let sess = state.sessions.create("alice").await.unwrap();
+    let cookie = state.sessions.sign(&sess.id);
+    let chat_session = chat::create_session(&state.db, "alice").await.unwrap();
+    gateway_core::server::db::chat_session_tools::set(
+        &state.db,
+        &chat_session.id,
+        gateway_runtime::server::tools::catalog::entry_key_for("company_echo"),
+        true,
+        "manual",
+    )
+    .await
+    .unwrap();
+    gateway_core::server::db::chat_session_settings::set_effort(
+        &state.db,
+        &chat_session.id,
+        effort,
+    )
+    .await
+    .unwrap();
+    (cookie, chat_session.id)
+}
+
+/// An upstream that asks for `rounds` tool calls, each echoing `payload`, and
+/// then answers. `stream: true` requests only — the title pass shares the mock.
+async fn echoing_upstream(rounds: usize, payload: String) -> MockServer {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let upstream = MockServer::start().await;
+    let seen = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |req: &wiremock::Request| {
+            let streaming = serde_json::from_slice::<serde_json::Value>(&req.body)
+                .map(|b| b["stream"] == serde_json::json!(true))
+                .unwrap_or(false);
+            if !streaming {
+                // The title-generation pass.
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "t"}}]
+                }));
+            }
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            let body = if n < rounds {
+                let args =
+                    serde_json::to_string(&serde_json::json!({"message": payload})).expect("args");
+                format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    serde_json::json!({"choices": [{"delta": {"role": "assistant",
+                        "content": null,
+                        "tool_calls": [{"index": 0, "id": format!("call_{n}"),
+                            "type": "function",
+                            "function": {"name": "company_echo", "arguments": args}}]},
+                        "finish_reason": null}]}),
+                    serde_json::json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+                )
+            } else {
+                format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    serde_json::json!({"choices": [{"delta": {"content": "done"}}]}),
+                )
+            };
+            ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+        })
+        .mount(&upstream)
+        .await;
+    upstream
+}
+
+fn send_message(session_id: &str, cookie: &str) -> Request {
+    let (ct, body) = multipart_text(&[("model", "model-a"), ("message", "read the whole file")]);
+    Request::builder()
+        .method(Method::POST)
+        .uri(format!("/chat/{session_id}/messages"))
+        .header("cookie", format!("id={cookie}"))
+        .header("content-type", ct)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// Every streamed (turn) request the upstream saw, oldest first.
+async fn streamed_requests(upstream: &MockServer) -> Vec<serde_json::Value> {
+    upstream
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .iter()
+        .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+        .filter(|b| b["stream"] == serde_json::json!(true))
+        .collect()
+}
+
+/// The reported RAG failure, at the level it actually happens: a turn that
+/// keeps calling tools runs the prompt past the turn's tool-output allowance,
+/// and from then on every result — including the one that would finally read
+/// the document — arrives clamped to the 2 KB floor with a note saying not to
+/// ask again.
+///
+/// The chat driver was the one tool loop that never reclaimed anything: it
+/// accumulated every result verbatim *and* charged the turn for all of them.
+/// So the guard is two-sided — older results must be traded for a re-callable
+/// stub, and a late result must still come back at a useful size.
+#[tokio::test]
+async fn a_long_tool_loop_reclaims_context_instead_of_starving_later_results() {
+    // Comfortably under the per-result share (19_660 bytes at the 32k default
+    // window) but four of them blow the turn's 45_875-byte allowance.
+    let payload = "y".repeat(15_000);
+    let upstream = echoing_upstream(6, payload).await;
+    let state = Arc::new(state_with_echo_tool(&upstream.uri()).await);
+    let (cookie, session_id) = echo_session(&state, "standard").await;
+    let app = router(state.clone());
+
+    let resp = app.serve(send_message(&session_id, &cookie)).await.unwrap();
+    let _ = resp.into_body().collect().await.unwrap().to_bytes();
+
+    let sent = streamed_requests(&upstream).await;
+    assert!(
+        sent.len() >= 6,
+        "expected a multi-round turn, got {}",
+        sent.len()
+    );
+    let last = sent.last().expect("a final round");
+    let tool_results: Vec<&str> = last["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    assert!(tool_results.len() >= 5, "{tool_results:?}");
+
+    assert!(
+        tool_results
+            .iter()
+            .any(|c| c.contains("earlier tool output cleared to save context")),
+        "older results must be evicted to make room; sizes: {:?}",
+        tool_results.iter().map(|c| c.len()).collect::<Vec<_>>()
+    );
+    // The point of evicting: the room comes back. Before the fix the last
+    // result was clamped to the 2 KB floor no matter how much had been freed.
+    let last_result = tool_results.last().expect("a most recent result");
+    assert!(
+        last_result.len() > 8_192,
+        "a late result was starved to {} bytes: {}",
+        last_result.len(),
+        &last_result[..last_result.len().min(200)]
+    );
+}
+
+/// The other half of the same root cause: the gateway knew the real context
+/// window all along and threw it away. The `/models` probe reads
+/// `max_model_len`; nothing carried it to the budget, so every model fell back
+/// to the global 32768 default. A model actually serving 262144 got an eighth
+/// of the tool-output allowance it should have — which is what made a
+/// six-search turn overflow in the first place.
+///
+/// With the discovered window in place the same turn fits comfortably: every
+/// result arrives whole and nothing has to be evicted at all.
+#[tokio::test]
+async fn a_discovered_context_window_sizes_the_tool_budget() {
+    let payload = "y".repeat(15_000);
+    let upstream = echoing_upstream(6, payload).await;
+    let state = Arc::new(state_with_echo_tool(&upstream.uri()).await);
+    // What the probe learns from a real vLLM `/models` response.
+    for pool in state.upstreams.pools() {
+        for backend in &pool.backends {
+            backend.set_context_windows(HashMap::from([("model-a".to_string(), 262_144i64)]));
+        }
+    }
+    let (cookie, session_id) = echo_session(&state, "standard").await;
+    let app = router(state.clone());
+
+    let resp = app.serve(send_message(&session_id, &cookie)).await.unwrap();
+    let _ = resp.into_body().collect().await.unwrap().to_bytes();
+
+    let sent = streamed_requests(&upstream).await;
+    let tool_results: Vec<&str> = sent.last().expect("a final round")["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    assert_eq!(tool_results.len(), 6, "{tool_results:?}");
+    assert!(
+        tool_results.iter().all(|c| c.len() > 14_000),
+        "nothing should be cut at the real window; sizes: {:?}",
+        tool_results.iter().map(|c| c.len()).collect::<Vec<_>>()
+    );
+    assert!(
+        !tool_results
+            .iter()
+            .any(|c| c.contains("earlier tool output cleared")),
+        "and nothing should need evicting"
+    );
+}
+
+/// The reported 400, at the level it happens. On its final round the driver
+/// tells the model, in words, that no further tool call can run. Appending
+/// that as a second `system` message is rejected outright by the Qwen3 vLLM
+/// chat template ("System message must be at the beginning"), which killed
+/// every round-budget-exhausting turn *after* all its tool work was done.
+///
+/// `effort=fast` caps the loop at 8 rounds so the final one is reached cheaply.
+#[tokio::test]
+async fn the_final_round_reaches_the_upstream_with_one_leading_system_message() {
+    // More tool calls than the round budget, so the loop runs out.
+    let upstream = echoing_upstream(50, "small".into()).await;
+    let state = Arc::new(state_with_echo_tool(&upstream.uri()).await);
+    let (cookie, session_id) = echo_session(&state, "fast").await;
+    let app = router(state.clone());
+
+    let resp = app.serve(send_message(&session_id, &cookie)).await.unwrap();
+    let _ = resp.into_body().collect().await.unwrap().to_bytes();
+
+    let sent = streamed_requests(&upstream).await;
+    let last = sent.last().expect("a final round");
+    let messages = last["messages"].as_array().expect("messages");
+    let system_idxs: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m["role"] == "system")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        system_idxs,
+        vec![0],
+        "exactly one system message, at the front — anything else is a 400 on \
+         Qwen3 vLLM: {messages:#?}"
+    );
+    let system = messages[0]["content"].as_str().expect("string content");
+    assert!(
+        system.contains("FINAL round"),
+        "the final-round notice must still reach the model: {system}"
+    );
+    assert_eq!(
+        last["tool_choice"],
+        serde_json::json!("none"),
+        "and the tools must be withheld on that round"
+    );
+}

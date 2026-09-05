@@ -117,6 +117,16 @@ pub(crate) async fn model_context_window(state: &RamaState, model: &str) -> Opti
         .flatten()
         .and_then(|row| row.context_window)
         .filter(|w| *w > 0)
+        // Nothing configured: ask the backend. The health probe already reads
+        // `/models`, where vLLM reports each model's `max_model_len`, so the
+        // real window is known without an operator having to type it in.
+        //
+        // It matters more than it looks. Falling through to the global
+        // `default_context_window` (32768) for a model actually serving 262144
+        // shrank the turn's tool-output allowance to an eighth of its size —
+        // which is what starved a multi-step retrieval turn into 2 KB tool
+        // results and made it report that it could not read a file.
+        .or_else(|| state.upstreams.probed_context_window(model))
 }
 
 /// Load the session, plan the fold, call the summariser, and persist the

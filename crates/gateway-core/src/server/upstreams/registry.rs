@@ -86,6 +86,18 @@ pub struct Backend {
     /// a disabled alias stops resolving until the ambiguity clears. Map-form
     /// aliases are never disabled (they name their target explicitly).
     disabled_aliases: RwLock<HashSet<String>>,
+    /// Context window per model, as the last `/models` probe reported it
+    /// (vLLM and friends put `max_model_len` on each entry). Empty for
+    /// backends whose `/models` omits it, which is most hosted APIs.
+    ///
+    /// The probe already reads this response; discarding the window meant
+    /// every model fell back to the global `default_context_window` — 32768,
+    /// eight times smaller than what a Qwen3 deployment actually serves —
+    /// which silently shrank both the compaction trigger and the turn's
+    /// tool-output allowance. Discovered rather than configured, because an
+    /// operator has to notice the field exists before they can set it, and
+    /// the backend already knows the answer.
+    context_windows: RwLock<HashMap<String, i64>>,
 }
 
 impl Backend {
@@ -115,6 +127,7 @@ impl Backend {
             config_models,
             aliases,
             disabled_aliases: RwLock::new(HashSet::new()),
+            context_windows: RwLock::new(HashMap::new()),
         };
         // Evaluate against the config-model set now, so a bare alias declared
         // alongside multiple static models is disabled (and logged) from the
@@ -263,6 +276,24 @@ impl Backend {
             *guard = models;
         }
         self.reevaluate_aliases();
+    }
+
+    /// Record the context windows the last `/models` probe reported, keyed by
+    /// model id. Entries for models this backend no longer serves are dropped
+    /// with the rest — the map is replaced, not merged.
+    pub fn set_context_windows(&self, windows: HashMap<String, i64>) {
+        if let Ok(mut guard) = self.context_windows.write() {
+            *guard = windows;
+        }
+    }
+
+    /// The probed context window for one model, if this backend reported one.
+    pub fn context_window(&self, model: &str) -> Option<i64> {
+        self.context_windows
+            .read()
+            .ok()
+            .and_then(|g| g.get(model).copied())
+            .filter(|w| *w > 0)
     }
 
     /// Effective advertised-model set: the live probe set if it reported
@@ -816,6 +847,19 @@ impl UpstreamRegistry {
     /// Load the current data snapshot. Lock-free read + one atomic Arc clone.
     fn data(&self) -> Arc<RegistryData> {
         self.inner.load_full()
+    }
+
+    /// The context window one model actually has, as reported by whichever
+    /// backends serve it. When several disagree the smallest wins: a request
+    /// may land on any of them, so the budget has to fit the tightest.
+    /// `None` when no backend reported a window for it.
+    pub fn probed_context_window(&self, model: &str) -> Option<i64> {
+        self.data()
+            .pools
+            .values()
+            .flat_map(|p| p.backends.iter())
+            .filter_map(|b| b.context_window(model))
+            .min()
     }
 
     pub fn pools(&self) -> Vec<Arc<Pool>> {

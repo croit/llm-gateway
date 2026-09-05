@@ -162,7 +162,15 @@ const TOOL_RESULT_SINGLE_FLOOR: usize = 8_192;
 ///
 /// Sized to carry a real answer — a match count, a handful of hits, a short
 /// JSON object — rather than a token of one.
+///
+/// Doubles as the chat driver's eviction threshold: a result smaller than the
+/// slice every result is guaranteed anyway is not worth clearing.
 const TOOL_RESULT_MIN_BYTES: usize = 2_048;
+
+/// How many of the most recent tool results survive an eviction pass verbatim.
+/// The model is usually still reasoning about the last couple; older ones it
+/// has either used or moved past, and the stub tells it how to get them back.
+const EVICTED_TOOL_RESULTS_KEEP_FULL: usize = 3;
 
 /// How much of the prompt this turn's tool results may still take up.
 ///
@@ -181,6 +189,9 @@ const TOOL_RESULT_MIN_BYTES: usize = 2_048;
 #[derive(Debug, Clone, Copy)]
 struct ToolResultBudget {
     per_result: usize,
+    /// The turn's whole allowance. Fixed once, and the number `remaining` is
+    /// measured back from after each round's eviction.
+    allowance: usize,
     remaining: usize,
 }
 
@@ -191,11 +202,12 @@ impl ToolResultBudget {
         let window_bytes = window.max(0) as usize * CHARS_PER_TOKEN;
         let per_result = ((window_bytes as f64 * TOOL_RESULT_SINGLE_SHARE) as usize)
             .max(TOOL_RESULT_SINGLE_FLOOR);
-        let remaining =
+        let allowance =
             ((window_bytes as f64 * TOOL_RESULTS_TURN_SHARE) as usize).max(TOOL_RESULTS_TURN_FLOOR);
         Self {
             per_result,
-            remaining,
+            allowance,
+            remaining: allowance,
         }
     }
 
@@ -225,6 +237,21 @@ impl ToolResultBudget {
 
     fn spend(&mut self, bytes: usize) {
         self.remaining = self.remaining.saturating_sub(bytes);
+    }
+
+    /// Re-measure the allowance against what tool output is *actually* in the
+    /// prompt right now.
+    ///
+    /// `spend` alone made the budget a one-way ratchet: it charged for every
+    /// result the turn had ever produced, including ones since replaced by a
+    /// short re-callable stub. A turn doing genuine multi-step retrieval
+    /// therefore hit zero after three or four calls and spent the rest of its
+    /// rounds getting [`TOOL_RESULT_MIN_BYTES`] slices of work it had already
+    /// paid for in full — the "it can't read the whole file" failure. Charging
+    /// for what is in the prompt instead means evicting an old result gives
+    /// the room back, which is the whole point of evicting it.
+    fn resync(&mut self, in_prompt_bytes: usize) {
+        self.remaining = self.allowance.saturating_sub(in_prompt_bytes);
     }
 }
 
@@ -269,13 +296,15 @@ fn cap_tool_result(body: String, cap: usize, reason: CapReason) -> String {
              (filters, a smaller page size, fewer fields), and tell the user the result was \
              too large to read in full."
         }
-        // Deliberately the opposite advice. Telling a model to retry when the
-        // turn's allowance is gone sends it into a loop of calls that each
-        // come back just as short.
+        // Deliberately the opposite advice. Telling a model to retry *now*
+        // when the turn's allowance is full sends it into a loop of calls that
+        // each come back just as short. It no longer claims the turn can never
+        // return more, because that stopped being true: older results are
+        // evicted as the turn goes on and the room they held comes back.
         CapReason::TurnBudget => {
-            "This turn has already used its budget for tool output, so calling again — even \
-             with a narrower request — will not return more. Work with what you have, and \
-             tell the user which part you could not read."
+            "The turn's allowance for tool output is currently full, so repeating this call \
+             right now — even narrowed — will not return more of it. Work with what you \
+             have, and tell the user plainly which part you could not read."
         }
     };
     out.push_str(&format!(
@@ -1541,6 +1570,33 @@ async fn run_one_turn(d: &OpenAiDriver, ctx: SessionContext) -> Result<TurnOutco
                 "tool_call_id": &call.id,
                 "content": content,
             }));
+        }
+
+        // Round over. Evict the older, bulky tool results the same way the
+        // `/v1` loop does, then re-measure the allowance against what is
+        // actually left in the prompt.
+        //
+        // Without this the chat driver was the one tool loop that never
+        // reclaimed anything: it accumulated every result verbatim for the
+        // whole turn *and* charged the turn for all of them, so a genuine
+        // multi-step retrieval turn ran dry after three or four calls and
+        // spent its remaining rounds getting 2 KB slices of searches that had
+        // already run in full. Eviction bounds the prompt; `resync` is what
+        // turns the reclaimed room back into budget the next round can spend.
+        let freed = runner::stub_old_tool_results(
+            &mut messages,
+            tool_budget.allowance,
+            EVICTED_TOOL_RESULTS_KEEP_FULL,
+            TOOL_RESULT_MIN_BYTES,
+        );
+        tool_budget.resync(runner::tool_output_bytes(&messages));
+        if freed > 0 {
+            tracing::debug!(
+                round,
+                freed_bytes = freed,
+                turn_remaining = tool_budget.remaining,
+                "cleared older tool results to make room in the turn's budget"
+            );
         }
     }
     Ok(TurnOutcome::default())
@@ -3151,6 +3207,7 @@ mod tests {
 #[cfg(test)]
 mod tool_budget_tests {
     use super::{CapReason, ToolResultBudget, cap_tool_result, context_overflow};
+    use crate::server::tools::runner;
 
     #[test]
     fn small_results_pass_through_untouched() {
@@ -3283,6 +3340,78 @@ mod tool_budget_tests {
         assert!(
             !spent.contains("call the tool again with a narrower request"),
             "and must not send the model back for another round: {spent}"
+        );
+    }
+
+    /// The reported failure, end to end: a turn doing real multi-step
+    /// retrieval spends its whole allowance on the first few searches, and
+    /// from then on every call — including the one that would finally read the
+    /// document the user asked about — comes back as a 2 KB slice telling the
+    /// model to give up. It duly did, and told the user the file was "cut off".
+    ///
+    /// The round boundary has to give the room back. Sized with the fallback
+    /// 32k window, which is what an unconfigured model actually runs on.
+    #[test]
+    fn evicting_old_results_gives_the_turn_its_budget_back() {
+        let mut budget = ToolResultBudget::for_window(32_768);
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "rules"}),
+            serde_json::json!({"role": "user", "content": "list every entry in that config"}),
+        ];
+        // Six repo-wide searches, each the size of the grep in the report.
+        for i in 0..6 {
+            let (cap, reason) = budget.cap();
+            let out = cap_tool_result("y".repeat(16_500), cap, reason);
+            budget.spend(out.len());
+            messages.push(serde_json::json!({
+                "role": "tool", "tool_call_id": format!("c{i}"), "content": out,
+            }));
+        }
+        assert_eq!(budget.remaining, 0, "the allowance is spent, as reported");
+        assert_eq!(
+            budget.cap(),
+            (super::TOOL_RESULT_MIN_BYTES, CapReason::TurnBudget),
+            "and every later result would arrive as a 2 KB stub"
+        );
+
+        // What the end of a round now does.
+        let freed = runner::stub_old_tool_results(
+            &mut messages,
+            budget.allowance,
+            super::EVICTED_TOOL_RESULTS_KEEP_FULL,
+            super::TOOL_RESULT_MIN_BYTES,
+        );
+        assert!(freed > 30_000, "eviction reclaimed almost nothing: {freed}");
+        budget.resync(runner::tool_output_bytes(&messages));
+
+        let (cap, reason) = budget.cap();
+        assert_eq!(
+            reason,
+            CapReason::Payload,
+            "the room the stubs freed must be spendable again"
+        );
+        assert_eq!(
+            cap, budget.per_result,
+            "and the next call gets a full share, not the floor"
+        );
+
+        // The three most recent results are what the model is still reasoning
+        // about; only the older ones are traded for a re-callable stub.
+        let tool_msgs: Vec<&str> = messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(tool_msgs.len(), 6, "no result is dropped, only shortened");
+        assert!(
+            tool_msgs[..3]
+                .iter()
+                .all(|c| c.contains("Re-run the tool to regenerate it")),
+            "older results must say how to get them back: {tool_msgs:?}"
+        );
+        assert!(
+            tool_msgs[3..].iter().all(|c| c.starts_with("yyy")),
+            "the recent results must survive verbatim"
         );
     }
 

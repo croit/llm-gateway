@@ -21,7 +21,7 @@
 //! serving traffic with empty model sets — the first `POST /v1/chat/
 //! completions` lands on a registry that already knows what's where.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,6 +47,10 @@ struct ModelsEnvelope {
 #[derive(Deserialize)]
 struct ModelEntry {
     id: String,
+    /// vLLM (and several other OpenAI-compatible servers) report each model's
+    /// real context window here. Absent on most hosted APIs, hence optional.
+    #[serde(default)]
+    max_model_len: Option<i64>,
 }
 
 /// reqwest client for health probes: NO idle connection pooling. Probes fire
@@ -239,6 +243,18 @@ async fn probe_once(http: &reqwest::Client, pool_name: &str, backend: &Backend) 
             return ProbeOutcome::AliveNoData;
         }
     };
+    // Keep the windows the response carried before folding the entries down
+    // to a bare id set. This is the only place the gateway ever sees them.
+    let windows: HashMap<String, i64> = envelope
+        .data
+        .iter()
+        .filter(|m| !m.id.is_empty())
+        .filter_map(|m| {
+            m.max_model_len
+                .filter(|w| *w > 0)
+                .map(|w| (m.id.clone(), w))
+        })
+        .collect();
     let mut new_set: HashSet<String> = envelope.data.into_iter().map(|m| m.id).collect();
     new_set.retain(|s| !s.is_empty());
 
@@ -254,6 +270,7 @@ async fn probe_once(http: &reqwest::Client, pool_name: &str, backend: &Backend) 
         );
     }
     backend.set_models(new_set);
+    backend.set_context_windows(windows);
 
     ProbeOutcome::AliveWithModels
 }
@@ -478,6 +495,41 @@ mod tests {
             .unwrap()
             .backends[0]
             .clone()
+    }
+
+    /// A vLLM `/models` response carries each model's real context window in
+    /// `max_model_len`. The probe used to read this response and throw that
+    /// field away, so every model fell back to the global 32768 default — a
+    /// model actually serving 262144 got an eighth of the tool-output
+    /// allowance it should have, which is what starved long retrieval turns.
+    #[tokio::test]
+    async fn the_probe_learns_each_model_s_real_context_window() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "glm-image", "max_model_len": 262_144},
+                    // Hosted APIs omit the field; that model simply has none.
+                    {"id": "hosted-model"},
+                    // A nonsense value must not become a budget.
+                    {"id": "broken", "max_model_len": 0},
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let backend = backend_arc(&server.uri(), true);
+
+        let outcome = probe_once(&reqwest::Client::new(), "images", &backend).await;
+        assert!(
+            matches!(outcome, ProbeOutcome::AliveWithModels),
+            "expected AliveWithModels, got {outcome:?}"
+        );
+        assert_eq!(backend.context_window("glm-image"), Some(262_144));
+        assert_eq!(backend.context_window("hosted-model"), None);
+        assert_eq!(backend.context_window("broken"), None, "0 is not a window");
+        assert_eq!(backend.context_window("never-heard-of-it"), None);
     }
 
     #[tokio::test]
