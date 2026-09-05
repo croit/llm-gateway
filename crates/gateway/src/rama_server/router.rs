@@ -20,6 +20,7 @@
 //!     the chat composer).
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rama::http::StatusCode;
 use rama::http::layer::error_handling::ErrorHandlerLayer;
@@ -29,6 +30,7 @@ use rama::http::service::web::extract::State;
 use rama::http::service::web::response::Json;
 use rama::layer::{ArcLayer, Layer};
 use rama::net::address::SocketAddress;
+use rama::rt::Executor;
 use serde_json::json;
 
 use crate::rama_server::RamaState;
@@ -390,11 +392,238 @@ pub fn service(
         .into_layer(router)
 }
 
-/// Convenience: build the service and start serving on `addr`.
+/// How long a shutdown waits for open connections to drain before it stops
+/// waiting on them. Streaming responses (the chat SSE tail, a `/v1` stream)
+/// are the ones this is for.
+const CONNECTION_DRAIN: Duration = Duration::from_secs(15);
+
+/// How long, after connections are done, to wait for assistant turns still
+/// running in background tasks.
+///
+/// A turn outlives its HTTP connection by design — that is what makes
+/// resume-on-reconnect work — so draining connections does not drain work.
+/// Without this wait, every deploy kills turns mid-write and the next boot
+/// sweeps them to `errored` (see `sweep_in_progress_at_startup`, which exists
+/// precisely because this used to be the only outcome).
+///
+/// Deliberately shorter than a typical orchestrator stop grace (systemd's
+/// `TimeoutStopSec` defaults to 90s): exceeding that buys nothing, because the
+/// SIGKILL lands anyway and we are back to the behaviour this replaces.
+const TURN_DRAIN: Duration = Duration::from_secs(45);
+
+/// Polling interval while waiting for turns to finish.
+const TURN_POLL: Duration = Duration::from_millis(250);
+
+/// Convenience: build the service and start serving on `addr`, shutting down
+/// gracefully on SIGINT / SIGTERM.
 pub async fn serve(state: Arc<RamaState>, addr: SocketAddress) -> anyhow::Result<()> {
-    HttpServer::default()
-        .listen(addr, service(state))
-        .await
-        .map_err(|e| anyhow::anyhow!("rama listen: {e}"))?;
+    // `Shutdown::default()` installs the platform's usual signal handling
+    // (SIGINT + SIGTERM); the guard handed to the task is what `listen`
+    // threads into each connection so a signal stops accepting and lets
+    // in-flight requests finish.
+    let graceful = rama::graceful::Shutdown::default();
+    let chats = state.chats.clone();
+    let svc = service(state);
+
+    // A listen failure has to reach the caller, not just the log. `listen` runs
+    // inside a graceful task now, so its error no longer propagates out of
+    // `serve` on its own — and `shutdown_with_limit` waits for a *signal*
+    // before it waits for guards. Without this channel a bind failure (port
+    // taken, bad bind address) leaves the process alive and waiting forever
+    // with nothing listening, which an orchestrator reads as a healthy unit.
+    let (listen_err_tx, listen_err_rx) = tokio::sync::oneshot::channel::<String>();
+    graceful.spawn_task_fn(async move |guard| {
+        let exec = Executor::graceful(guard);
+        if let Err(err) = HttpServer::auto(exec).listen(addr, svc).await {
+            tracing::error!(error = %err, "rama listen");
+            let _ = listen_err_tx.send(err.to_string());
+        }
+    });
+
+    tokio::select! {
+        drained = graceful.shutdown_with_limit(CONNECTION_DRAIN) => {
+            // A drain *timeout* is not a reason to skip the turn drain below —
+            // it is the reason to run it. The chat SSE tail holds its
+            // connection open for the whole turn, so an in-flight turn is
+            // exactly the case that overruns this budget, and returning here
+            // would kill it mid-write: the outcome `drain_turns` exists to
+            // prevent.
+            if let Err(err) = drained {
+                tracing::warn!(
+                    error = %err,
+                    "connections still open at the drain deadline; draining turns anyway"
+                );
+            }
+        }
+        Ok(err) = listen_err_rx => {
+            // Never served a request; nothing to drain.
+            return Err(anyhow::anyhow!("rama listen: {err}"));
+        }
+    }
+
+    drain_turns(&chats, TURN_DRAIN, TURN_POLL).await;
     Ok(())
+}
+
+/// Wait for in-flight assistant turns, then ask any stragglers to stop.
+///
+/// Two phases on purpose. A turn that finishes on its own writes a complete
+/// row; one that is cancelled writes a terminal row saying so. Both beat being
+/// killed mid-write, and the difference between them is only how long we were
+/// willing to wait.
+async fn drain_turns(chats: &session_core::SessionWorkers, budget: Duration, poll: Duration) {
+    let active = chats.active_count();
+    if active == 0 {
+        return;
+    }
+    tracing::info!(
+        active,
+        drain_secs = budget.as_secs(),
+        "waiting for in-flight assistant turns before exit"
+    );
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if chats.active_count() == 0 {
+            tracing::info!("all in-flight turns finished; exiting cleanly");
+            return;
+        }
+        tokio::time::sleep(poll).await;
+    }
+    // Out of budget: ask them to stop at their next checkpoint and give that
+    // a brief moment to land, so the turn row is finalised by the turn itself
+    // rather than swept as an orphan on the next boot.
+    let remaining = chats.cancel_all();
+    tracing::warn!(
+        remaining,
+        "turns still running at the drain deadline; cancelling them"
+    );
+    let grace = Instant::now() + (poll * 12);
+    while Instant::now() < grace && chats.active_count() > 0 {
+        tokio::time::sleep(poll).await;
+    }
+    let stuck = chats.active_count();
+    if stuck > 0 {
+        tracing::warn!(
+            stuck,
+            "exiting with turns still running; they will be swept on next boot"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use session_core::{RegisterOutcome, SessionWorkers};
+
+    /// The smallest `RamaState` that can be served: in-memory database, no
+    /// upstreams, no tools. Enough for the tests here, which never route a
+    /// request — they exercise `serve`'s own lifecycle.
+    async fn minimal_state() -> RamaState {
+        use gateway_core::server::rbac::Resolver;
+        use gateway_core::server::{Config, db, upstreams};
+        use gateway_runtime::server::AppState;
+        use gateway_runtime::server::tools::ToolRegistry;
+
+        let db_pool = db::open(std::path::Path::new(":memory:")).await.unwrap();
+        let registry = upstreams::UpstreamRegistry::new(&std::collections::HashMap::new()).unwrap();
+        let app = AppState::new(
+            Config::default(),
+            db_pool.clone(),
+            registry,
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Resolver::empty()),
+        );
+        RamaState::new(
+            app,
+            crate::rama_server::SessionStore::new(db_pool, [3u8; 32]),
+            gateway_core::server::usage::UsageHandle::disabled(),
+        )
+    }
+
+    /// An idle gateway exits immediately — the common deploy must not sit out
+    /// a drain budget waiting for work that isn't there.
+    #[tokio::test]
+    async fn draining_an_idle_gateway_returns_at_once() {
+        let chats = SessionWorkers::default();
+        let start = Instant::now();
+        drain_turns(&chats, Duration::from_secs(30), Duration::from_millis(10)).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "idle drain took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A turn that finishes on its own releases the shutdown as soon as it
+    /// does — the wait is bounded *above* by the budget, not equal to it.
+    #[tokio::test]
+    async fn a_finishing_turn_releases_the_drain_early() {
+        let chats = std::sync::Arc::new(SessionWorkers::default());
+        let RegisterOutcome::Registered { worker } = chats.register("u1", "t1", "s1") else {
+            panic!("registered");
+        };
+        let bg = chats.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            bg.clear("u1", &worker);
+        });
+
+        let start = Instant::now();
+        drain_turns(&chats, Duration::from_secs(30), Duration::from_millis(10)).await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(70),
+            "returned too early: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "waited the whole budget instead of noticing the turn finished: {waited:?}"
+        );
+    }
+
+    /// A listener that never comes up must fail the process, not leave it
+    /// waiting for a shutdown signal with nothing bound. An orchestrator reads
+    /// a still-running unit as healthy, so this is the difference between a
+    /// crash-loop it can act on and a silent outage.
+    #[tokio::test]
+    async fn a_bind_failure_returns_an_error_instead_of_hanging() {
+        // Hold the port so the gateway's own bind is guaranteed to fail.
+        let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = squatter.local_addr().unwrap();
+
+        let state = Arc::new(minimal_state().await);
+        let served = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve(state, SocketAddress::from(addr)),
+        )
+        .await;
+
+        match served {
+            Err(_) => panic!("serve() hung on a failed bind instead of returning"),
+            Ok(Ok(())) => panic!("serve() reported success without ever listening"),
+            Ok(Err(err)) => assert!(
+                err.to_string().contains("listen"),
+                "unexpected error: {err}"
+            ),
+        }
+    }
+
+    /// A turn that overruns the budget is asked to stop rather than being
+    /// killed mid-write — that is the difference between a finalised row and
+    /// one swept as `errored` on the next boot.
+    #[tokio::test]
+    async fn an_overrunning_turn_is_cancelled_at_the_deadline() {
+        let chats = SessionWorkers::default();
+        let RegisterOutcome::Registered { worker } = chats.register("u1", "t1", "s1") else {
+            panic!("registered");
+        };
+        assert!(!worker.cancel.load(std::sync::atomic::Ordering::SeqCst));
+
+        drain_turns(&chats, Duration::from_millis(50), Duration::from_millis(10)).await;
+
+        assert!(
+            worker.cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "a straggler must be signalled to stop at its next checkpoint"
+        );
+    }
 }

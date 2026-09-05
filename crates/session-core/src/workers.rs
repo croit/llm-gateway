@@ -125,6 +125,28 @@ impl SessionWorkers {
         RegisterOutcome::Registered { worker }
     }
 
+    /// How many turns are running right now — what a shutdown waits on.
+    ///
+    /// A turn outlives the HTTP connection that started it (that is what makes
+    /// resume-on-reconnect work), so draining connections says nothing about
+    /// whether work is still in flight. This is the number that does.
+    pub fn active_count(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    /// Ask every running turn to stop at its next checkpoint.
+    ///
+    /// Used on shutdown once the drain deadline is in sight: a turn that
+    /// notices the flag finalises its own row, which is strictly better than
+    /// being killed mid-write and swept as `errored` on the next boot.
+    pub fn cancel_all(&self) -> usize {
+        let g = self.inner.lock().unwrap();
+        for w in g.values() {
+            w.cancel.store(true, Ordering::SeqCst);
+        }
+        g.len()
+    }
+
     /// Hand out the current worker (if any) — used by the tail handler
     /// to attach to a still-running stream.
     pub fn get(&self, user_id: &str) -> Option<ActiveWorker> {
@@ -158,6 +180,53 @@ impl SessionWorkers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a shutdown waits on. A turn outlives its HTTP connection, so
+    /// draining connections proves nothing about work in flight — this count
+    /// is the only thing that does.
+    #[test]
+    fn active_count_tracks_registered_turns() {
+        let r = SessionWorkers::default();
+        assert_eq!(r.active_count(), 0);
+
+        let RegisterOutcome::Registered { worker: w1 } = r.register("u1", "t1", "s1") else {
+            panic!("expected a fresh registration");
+        };
+        r.register("u2", "t2", "s2");
+        assert_eq!(r.active_count(), 2);
+
+        r.clear("u1", &w1);
+        assert_eq!(r.active_count(), 1, "a finished turn stops being counted");
+    }
+
+    /// At the drain deadline every straggler is asked to stop, so it finalises
+    /// its own row instead of being killed mid-write and swept as an orphan on
+    /// the next boot.
+    #[test]
+    fn cancel_all_flags_every_running_turn() {
+        let r = SessionWorkers::default();
+        let RegisterOutcome::Registered { worker: a } = r.register("u1", "t1", "s1") else {
+            panic!("registered");
+        };
+        let RegisterOutcome::Registered { worker: b } = r.register("u2", "t2", "s2") else {
+            panic!("registered");
+        };
+        assert!(!a.cancel.load(Ordering::SeqCst));
+        assert!(!b.cancel.load(Ordering::SeqCst));
+
+        assert_eq!(r.cancel_all(), 2, "reports how many it signalled");
+        assert!(a.cancel.load(Ordering::SeqCst));
+        assert!(b.cancel.load(Ordering::SeqCst));
+    }
+
+    /// Cancelling nothing is not an error — the common shutdown, on an idle
+    /// gateway, must not log or behave as if work were lost.
+    #[test]
+    fn cancel_all_on_an_idle_registry_is_a_no_op() {
+        let r = SessionWorkers::default();
+        assert_eq!(r.cancel_all(), 0);
+        assert_eq!(r.active_count(), 0);
+    }
 
     #[test]
     fn register_returns_registered_when_empty() {
