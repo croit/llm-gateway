@@ -338,26 +338,48 @@ fn configure_final_tool_round(body: &mut serde_json::Value) {
 /// finished turn from a hung one, and asking "did that complete?" gets an answer
 /// built from what the model *meant* to do rather than what it did.
 ///
-/// So the mechanical signal gets a stated one alongside it. Appended to the
-/// request only — never to the persisted `messages` — so it applies to this
+/// So the mechanical signal gets a stated one alongside it. Written into the
+/// request only — never into the persisted `messages` — so it applies to this
 /// round and leaves no trace in the conversation.
+///
+/// It is *merged into the leading system message* rather than appended as a
+/// second one. Appending was a hard bug: the Qwen3 vLLM chat template rejects
+/// any `system` turn that is not first ("System message must be at the
+/// beginning"), so on that backend every turn that exhausted its round budget
+/// died on a 400 — throwing away a full turn of completed tool work at the
+/// exact moment the model was about to report it. The same one-system-turn
+/// invariant [`leading_system_message`] exists to keep.
 ///
 /// This is the *budget-spent* case only. The same failure with rounds still on
 /// the clock — the model simply stops calling tools after announcing its plan —
 /// is addressed by [`TURN_DISCIPLINE`], which rides in every round.
 fn announce_final_round(body: &mut serde_json::Value) {
+    const NOTICE: &str = "This is your FINAL round for this turn: your tool budget is spent and \
+                          no further tool call can run, so nothing you say you are about to do \
+                          will happen. Answer now, from what you already have. State plainly \
+                          what you did and did not manage to finish; do not write a preamble \
+                          for work you cannot do, and do not claim any file was produced, \
+                          attached or made downloadable unless a tool result in this turn \
+                          actually says so.";
+
     let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;
     };
-    messages.push(serde_json::json!({
-        "role": "system",
-        "content": "This is your FINAL round for this turn: your tool budget is spent and no \
-                    further tool call can run, so nothing you say you are about to do will \
-                    happen. Answer now, from what you already have. State plainly what you did \
-                    and did not manage to finish; do not write a preamble for work you cannot \
-                    do, and do not claim any file was produced, attached or made downloadable \
-                    unless a tool result in this turn actually says so.",
-    }));
+    // The driver always puts a system message at index 0 (see
+    // `leading_system_message`), so this is the merge path in practice; the
+    // insert is for callers that don't, and it still lands at the front.
+    match messages.first_mut() {
+        Some(first) if first.get("role").and_then(|r| r.as_str()) == Some("system") => {
+            // String content is the shape this driver builds. A block-array
+            // system message (a `/v1` caller's shape) is left alone rather
+            // than stringified, which would flatten a structure the upstream
+            // may need — the mechanical `tool_choice: none` still applies.
+            if let Some(text) = first.get("content").and_then(|c| c.as_str()) {
+                first["content"] = serde_json::json!(format!("{text}\n\n---\n\n{NOTICE}"));
+            }
+        }
+        _ => messages.insert(0, serde_json::json!({"role": "system", "content": NOTICE})),
+    }
 }
 
 /// Ensure every tool call in one round has a non-empty id that is unique
@@ -2606,18 +2628,80 @@ mod tests {
     #[test]
     fn the_final_round_tells_the_model_it_is_the_final_round() {
         let mut body = serde_json::json!({
-            "messages": [{"role": "user", "content": "make me the docs"}]
+            "messages": [
+                {"role": "system", "content": "the standing rules"},
+                {"role": "user", "content": "make me the docs"},
+            ]
         });
         announce_final_round(&mut body);
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2, "appended, not replaced");
-        assert_eq!(messages[0]["content"], "make me the docs");
-        let note = messages[1]["content"].as_str().unwrap();
-        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(messages.len(), 2, "merged, not appended");
+        assert_eq!(messages[1]["content"], "make me the docs");
+        let note = messages[0]["content"].as_str().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert!(note.starts_with("the standing rules"), "{note}");
         assert!(note.contains("FINAL round"), "{note}");
         // The two failure modes it exists to head off.
         assert!(note.contains("do not write a preamble"), "{note}");
         assert!(note.contains("do not claim any file"), "{note}");
+    }
+
+    /// The regression this function was rewritten for. Appending the notice as
+    /// a *second* `system` message is rejected outright by the Qwen3 vLLM chat
+    /// template ("System message must be at the beginning"), so a turn that
+    /// exhausted its round budget died on a 400 and threw away every tool
+    /// result it had already paid for. Whatever the incoming shape, the request
+    /// must leave here with at most one `system` message, at index 0.
+    #[test]
+    fn the_final_round_notice_never_makes_a_second_system_message() {
+        let shapes = [
+            serde_json::json!({"messages": [
+                {"role": "system", "content": "rules"},
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": null, "tool_calls": []},
+                {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+            ]}),
+            // No leading system message: the notice becomes one, at the front.
+            serde_json::json!({"messages": [{"role": "user", "content": "go"}]}),
+            // Empty conversation — still no trailing system turn.
+            serde_json::json!({"messages": []}),
+        ];
+        for mut body in shapes {
+            announce_final_round(&mut body);
+            let messages = body["messages"].as_array().unwrap().clone();
+            let system_idxs: Vec<usize> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m["role"] == "system")
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                system_idxs.as_slice() == [0] || system_idxs.is_empty(),
+                "a system message somewhere other than the front: {system_idxs:?} in {messages:?}"
+            );
+            assert!(
+                messages.iter().any(|m| m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("FINAL round"))),
+                "the notice went missing: {messages:?}"
+            );
+        }
+    }
+
+    /// A `/v1` caller's system message can be a block array. Flattening it to a
+    /// string to append the notice would destroy a structure the upstream may
+    /// need (cache breakpoints, for one), so that shape is left untouched —
+    /// `tool_choice: none` still forces the final answer.
+    #[test]
+    fn a_block_array_system_message_is_left_intact() {
+        let mut body = serde_json::json!({"messages": [
+            {"role": "system", "content": [{"type": "text", "text": "rules"}]},
+            {"role": "user", "content": "go"},
+        ]});
+        announce_final_round(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "no message added");
+        assert_eq!(messages[0]["content"][0]["text"], "rules", "left as blocks");
     }
 
     /// The truncation guard keys on the two spellings backends actually use,
