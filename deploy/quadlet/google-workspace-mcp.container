@@ -8,7 +8,8 @@
 # today, one OAuth sign-in per user. See docs/connectors.md.
 #
 # Install:
-#   sudo cp deploy/quadlet/google-workspace-mcp.container /etc/containers/systemd/
+#   sudo cp deploy/quadlet/google-workspace-mcp.container \
+#           deploy/quadlet/gworkspace-mcp-oauth.volume /etc/containers/systemd/
 #   sudo install -m 0600 deploy/quadlet/google-workspace-mcp.example.env \
 #        /etc/gateway/google-workspace-mcp.env
 #   sudo $EDITOR /etc/gateway/google-workspace-mcp.env   # client id/secret + URLs
@@ -38,8 +39,22 @@ Image=ghcr.io/taylorwilsdon/google_workspace_mcp:latest
 PublishPort=127.0.0.1:8000:8000
 
 # Secrets + deployment URLs: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET,
-# WORKSPACE_EXTERNAL_URL, WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS.
+# WORKSPACE_EXTERNAL_URL, WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS,
+# FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY.
 EnvironmentFile=/etc/gateway/google-workspace-mcp.env
+
+# OAuth state MUST outlive the container. This server's FastMCP OAuth proxy keeps
+# *everything* in one store: the gateway's dynamically-registered client, the
+# authorization codes, its own issued refresh tokens and the upstream Google
+# tokens. Left unconfigured it writes them under $HOME inside the container —
+# and Quadlet *recreates* the container on every `systemctl restart` / image
+# update, so that state is destroyed. Every user is then disconnected within one
+# access-token lifetime (~30 min), the gateway's stored client_id no longer
+# exists, and its next token refresh fails with
+# `invalid_client: Invalid client_id` → "Needs reconnect" in the connector store.
+# So: pin the store into a named volume. `:U` chowns it to the image's non-root
+# `app` user.
+Volume=gworkspace-mcp-oauth.volume:/var/lib/gworkspace-mcp:z,U
 
 # Non-secret runtime config. The image's ENTRYPOINT is `/bin/sh -c` and its
 # default CMD already runs `uv run main.py --transport streamable-http` — do NOT
@@ -53,6 +68,14 @@ Environment=WORKSPACE_MCP_PORT=8000
 Environment=TOOL_TIER=core
 Environment=UV_CACHE_DIR=/tmp/uv-cache
 Environment=XDG_CACHE_HOME=/tmp
+
+# Put the OAuth-proxy store on the volume above (see the Volume= comment). The
+# server reads these three; the signing key lives in the env file because it is
+# a secret. Without an explicit key the store's encryption key is derived from
+# GOOGLE_OAUTH_CLIENT_SECRET, so rotating that secret would orphan every
+# connection just like a restart used to.
+Environment=WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND=disk
+Environment=WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY=/var/lib/gworkspace-mcp/oauth-proxy
 
 # Secrets + deployment URLs come from the env file above.
 NoNewPrivileges=true

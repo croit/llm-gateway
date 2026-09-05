@@ -166,9 +166,43 @@ default CMD that already runs `uv run main.py --transport streamable-http`):
 | `WORKSPACE_EXTERNAL_URL` | `https://<mcp-host>` | Public URL the browser reaches during consent. |
 | `WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS` | `https://<gateway-host>/integrations/callback` | The gateway's callback (DCR allowlist). |
 | `UV_CACHE_DIR` / `XDG_CACHE_HOME` | `/tmp/uv-cache` / `/tmp` | uv builds an editable install at startup; **the rootfs must stay writable** (no read-only) and the cache is redirected to tmpfs. |
+| `WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND` | `disk` | **Required.** See *OAuth state must survive restarts* below. |
+| `WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY` | `/var/lib/gworkspace-mcp/oauth-proxy` | Path **on the mounted volume**. |
+| `FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY` | `openssl rand -hex 32` | Secret (env file). Signs issued tokens and encrypts the store. |
 
 Do **not** set a `command:`/`Exec=` override — it would be parsed as
 `sh -c --transport …` and fail.
+
+#### OAuth state must survive restarts
+
+This server *is* the authorization server, and its FastMCP OAuth proxy keeps
+everything in one store: the client the gateway registered via DCR, the
+authorization codes, the refresh tokens it issues to the gateway, and the
+upstream Google tokens. Left unconfigured it writes them under `$HOME` **inside
+the container** — and Quadlet recreates the container on every `systemctl
+restart` (as does `--force-recreate` / an image update), destroying it.
+
+The symptom is unmistakable once you know it: **every** user's card flips to
+*Needs reconnect* with
+
+```
+token refresh: token exchange failed: provider rejected the request
+  — invalid_client: Invalid client_id
+```
+
+within ~30 minutes of the restart (that's the server's access-token lifetime).
+The gateway is fine; the server simply no longer knows the client it issued.
+
+So the shipped units mount a named volume (`gworkspace-mcp-oauth.volume` for
+Quadlet, `gworkspace-mcp-oauth` for Compose) and point the store at it with the
+three env vars above. The signing key matters too: unset, it's derived from
+`GOOGLE_OAUTH_CLIENT_SECRET`, so rotating the Google secret wipes the store in
+the same way. Set it once and back it up. The volume holds live Google refresh
+tokens (encrypted at rest) — treat it as secret material; deleting it forces
+everyone to reconnect.
+
+Running more than one replica? Use `…_STORAGE_BACKEND=valkey` with
+`WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST` — the disk store is single-node.
 
 ### 3. Not an internal sidecar — needs a public URL
 

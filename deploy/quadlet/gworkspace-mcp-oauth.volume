@@ -1,0 +1,15 @@
+# Named volume for the Google Workspace MCP server's OAuth-proxy state: the
+# gateway's dynamically-registered client, authorization codes, the server's own
+# issued refresh tokens and the upstream Google tokens. Lives under
+# /var/lib/containers/storage/volumes/gworkspace-mcp-oauth/_data on the host.
+#
+# Without it that state sits in the container's writable layer, which Quadlet
+# throws away on every `systemctl restart` / image update — disconnecting every
+# user (`invalid_client: Invalid client_id` on the next token refresh).
+#
+# Contents are encrypted at rest by the server (Fernet, key derived from
+# FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY), but treat the volume as secret
+# material: it holds live Google refresh tokens.
+
+[Volume]
+VolumeName=gworkspace-mcp-oauth

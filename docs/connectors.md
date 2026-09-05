@@ -138,6 +138,43 @@ Workspace connector*. Two things worth flagging here:
 Each user then opens `/integrations → Google Workspace → Connect` and authorizes
 once with their own Google account — no per-user setup, no preview.
 
+### The server's OAuth state must be persisted
+
+The self-hosted server is the authorization server here, and its FastMCP OAuth
+proxy keeps **all** of the state in one store: the client the gateway registered
+via DCR, the authorization codes, the refresh tokens it issues to the gateway,
+and the upstream Google tokens. Unconfigured, that store lands under `$HOME`
+**inside the container**, i.e. in the writable layer that a `systemctl restart`
+(Quadlet recreates the container), a `--force-recreate`, or an image update
+throws away.
+
+When it's gone, the gateway's stored `client_id` no longer exists server-side,
+`POST /token` answers `401 invalid_client: Invalid client_id`, and every user's
+card flips to **Needs reconnect** — within one access-token lifetime (~30 min)
+of the restart, because that's how long the server's access tokens live. It
+looks like a flaky connector; it's an ephemeral filesystem.
+
+So the shipped units mount a named volume and point the store at it:
+
+```ini
+Volume=gworkspace-mcp-oauth.volume:/var/lib/gworkspace-mcp:z,U
+Environment=WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND=disk
+Environment=WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY=/var/lib/gworkspace-mcp/oauth-proxy
+```
+
+plus `FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY` (a `openssl rand -hex 32`) in
+the env file. That key signs the tokens the server issues **and** derives the
+store's encryption key; leave it unset and both fall back to a value derived
+from `GOOGLE_OAUTH_CLIENT_SECRET`, so rotating the Google secret disconnects
+everyone in exactly the same way. Set it once, back it up, don't rotate it
+casually — and treat the volume as secret material: it holds live Google refresh
+tokens (encrypted at rest, but still).
+
+A production alternative to the disk store is Valkey/Redis
+(`WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND=valkey` +
+`WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST`), which is what you want if you ever run
+more than one replica of the server — the disk store is single-node.
+
 ---
 
 ## GitHub
@@ -239,6 +276,7 @@ needs a toggle flipped — it's not a gateway problem.
 | `Couldn't load tools` right after connecting | Wrong endpoint transport (e.g. an `/sse` URL where the gateway needs streamable-HTTP `/mcp`), TLS/URL error, or the server rejected the token. The connector card shows the real error; check the gateway log too. |
 | OAuth `missing field access_token` / token-exchange errors | The provider returned an OAuth error body instead of a token (bad client secret, wrong redirect URI, unsupported grant). The gateway surfaces the provider's `error_description`. |
 | Refresh tokens die after ~7 days (Google) | App is **External + Testing**. Publish to production or switch the audience to **Internal**. |
+| `invalid_client: Invalid client_id` on refresh, everyone "Needs reconnect" at once, recurring | The MCP server lost the OAuth store that holds the gateway's registered client — an ephemeral container filesystem (no volume), or a changed `FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY` / `GOOGLE_OAUTH_CLIENT_SECRET`. See *The server's OAuth state must be persisted*. Users must reconnect once after fixing it; the old grants are unrecoverable. |
 | `MCP integrations are not enabled on this installation` (404) | Server-side: the target MCP server hasn't enabled its MCP endpoint. Not a gateway issue. |
 
 The gateway logs each failed tool call as `tool failed tool=mcp__… error=…`

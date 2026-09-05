@@ -138,14 +138,28 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     # GOOGLE_OAUTH_CLIENT_ID/SECRET, WORKSPACE_EXTERNAL_URL,
-    # WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS.
+    # WORKSPACE_MCP_ALLOWED_CLIENT_REDIRECT_URIS,
+    # FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY.
     env_file:
       - google-workspace-mcp.env
+    # OAuth state MUST outlive the container. This server's FastMCP OAuth proxy
+    # keeps *everything* in one store: the gateway's dynamically-registered
+    # client, authorization codes, the refresh tokens it issues and the upstream
+    # Google tokens. Unconfigured it writes them under $HOME in the container's
+    # writable layer, which is gone after `docker compose up --force-recreate` or
+    # an image update — and then every user is disconnected within one
+    # access-token lifetime (~30 min) with `invalid_client: Invalid client_id` on
+    # the next refresh. So keep it on a named volume.
+    volumes:
+      - gworkspace-mcp-oauth:/var/lib/gworkspace-mcp
     environment:
       MCP_ENABLE_OAUTH21: "true"
       WORKSPACE_MCP_STATELESS_MODE: "true"
       WORKSPACE_MCP_PORT: "8000"
       TOOL_TIER: core # core | extended | complete (consumed by the image CMD)
+      # Persist the OAuth store on the volume above.
+      WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND: disk
+      WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY: /var/lib/gworkspace-mcp/oauth-proxy
       # Keep the rootfs read-only: redirect uv's cache/home onto the /tmp tmpfs
       # (the entrypoint runs `uv run`, which needs a writable cache dir).
       UV_CACHE_DIR: /tmp/uv-cache
@@ -285,3 +299,6 @@ networks:
 
 volumes:
   gateway-data:
+  # Google Workspace MCP OAuth state — encrypted at rest by the server, but it
+  # holds live Google refresh tokens. Deleting it forces every user to reconnect.
+  gworkspace-mcp-oauth:

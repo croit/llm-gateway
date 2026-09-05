@@ -12,6 +12,7 @@ deploy/quadlet/
 ├── gateway.volume                     # named volume for /var/lib/gateway
 ├── gateway.example.env                # template for gateway secrets
 ├── google-workspace-mcp.container     # optional: Google Workspace MCP sidecar
+├── gworkspace-mcp-oauth.volume        #   its OAuth store (must persist!)
 ├── google-workspace-mcp.example.env
 ├── gitlab-mcp.container               # optional: GitLab (self-managed/CE) MCP bridge
 ├── gitlab-mcp.example.env
@@ -100,13 +101,23 @@ and don't scale to per-user use (see [`docs/connectors.md`](../../docs/connector
 Ship it as a second Quadlet next to the gateway:
 
 ```bash
-sudo cp deploy/quadlet/google-workspace-mcp.container /etc/containers/systemd/
+sudo cp deploy/quadlet/google-workspace-mcp.container \
+        deploy/quadlet/gworkspace-mcp-oauth.volume /etc/containers/systemd/
 sudo install -m 0600 deploy/quadlet/google-workspace-mcp.example.env \
      /etc/gateway/google-workspace-mcp.env
-sudo $EDITOR /etc/gateway/google-workspace-mcp.env     # OAuth client + URLs
+sudo $EDITOR /etc/gateway/google-workspace-mcp.env     # OAuth client + URLs + signing key
 sudo systemctl daemon-reload
 sudo systemctl enable --now google-workspace-mcp.service
 ```
+
+**Don't drop the `.volume` unit.** This server is the authorization server for
+the connector, and its OAuth proxy keeps the gateway's registered client, the
+refresh tokens it issues and the upstream Google tokens in one on-disk store.
+Without the volume that store lives in the container's writable layer, which
+Quadlet discards on every `systemctl restart` — and then every user is
+disconnected within ~30 minutes with `invalid_client: Invalid client_id`. Same
+if `FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY` changes (unset, it derives from
+the Google client secret). Details: [`../README.md`](../README.md#oauth-state-must-survive-restarts).
 
 **This is not a purely internal sidecar.** The OAuth consent runs in the user's
 browser (gateway → this server's `/authorize` → Google → this server's
