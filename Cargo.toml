@@ -118,7 +118,7 @@ wiremock = "0.6"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate"] }
 rand = "0.10"
 sha2 = "0.10"
-hmac = "0.12"
+hmac = "0.13"
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
 # Pinned to the `aws_lc_rs` backend: v10 dropped the bundled crypto provider,
