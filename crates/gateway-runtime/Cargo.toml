@@ -40,7 +40,7 @@ rama = { workspace = true }
 # MCP client: stdio + streamable-HTTP transports. `reqwest` feature is required
 # because rmcp pulls its own reqwest, which Cargo does not feature-unify with
 # the workspace one, so it would otherwise have no TLS backend.
-rmcp = { version = "1.7", default-features = false, features = [
+rmcp = { version = "3.3", default-features = false, features = [
     "client",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",

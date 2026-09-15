@@ -37,7 +37,7 @@ regex = { workspace = true }
 # `server::tools::mcp`). `default-features = false` drops the server side +
 # derive macros we don't use; the HTTP transport's reqwest shares the
 # workspace reqwest (inheriting rustls-tls) via Cargo feature unification.
-rmcp = { version = "1.7", default-features = false, features = [
+rmcp = { version = "3.3", default-features = false, features = [
     "client",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
