@@ -35,7 +35,7 @@ tempfile = { workspace = true }
 rust-s3 = { workspace = true }
 # Web Push: VAPID signing (P-256 ECDSA) + RFC 8291 payload encryption
 # (P-256 ECDH -> HKDF-SHA256 -> AES-128-GCM).
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 p256 = { version = "0.13", features = ["ecdh"] }
 hkdf = "0.12"
 sha2 = { workspace = true }
