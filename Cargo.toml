@@ -155,7 +155,7 @@ rama = { git = "https://github.com/plabayo/rama", rev = "5ba0ada6b89defec9eb8cbd
 # crate's `all-languages` feature and confirm no new GPL/AGPL grammars
 # were added (check tree-sitter-* license fields).
 markdown = "1"
-lumis = { version = "0.9", default-features = false, features = [
+lumis = { version = "0.13", default-features = false, features = [
     "lang-arduino",
     "lang-angular",
     "lang-asm",
